@@ -91,6 +91,41 @@ impl ShardedBackend {
         }
         out
     }
+
+    /// Restore the contiguity invariant `read`/`len` rely on (only the *trailing*
+    /// chunk may be short or absent) before a write lands in chunk `i0`.
+    ///
+    /// A sparse write that jumps past the current end would otherwise leave the
+    /// old short tail and/or interior chunks missing: `len` walks from chunk 0 and
+    /// stops at the first chunk that is short or absent, so any data written
+    /// beyond that gap becomes invisible (the file reads as truncated). Padding
+    /// every chunk below `i0` to a full stripe keeps the walk contiguous.
+    ///
+    /// Cost is bounded by the gap, not the file size: the downward walk stops at
+    /// the first already-full chunk, so an ordinary append or in-place rewrite
+    /// pays a single `len` probe. Newly materialized chunks are sparse on the
+    /// member filesystem (grown via `truncate`), so they consume no real blocks
+    /// until actually written.
+    fn pad_below(&self, l: &Layout, i0: u64) -> io::Result<()> {
+        let mut j = i0;
+        while j > 0 {
+            j -= 1;
+            let (s, ck) = self.chunk(l, j);
+            match self.servers[s].len(&ck) {
+                // Full here implies full further down (we maintain the invariant),
+                // so stop — everything below `j` already reads as contiguous.
+                Ok(c) if c >= l.stripe => break,
+                // Present but short: this was the old EOF tail; pad it to a stripe.
+                Ok(_) => self.servers[s].truncate(&ck, l.stripe)?,
+                // Absent: a hole. Create + grow to a full stripe (sparse on disk).
+                Err(_) => {
+                    self.servers[s].create(&ck)?;
+                    self.servers[s].truncate(&ck, l.stripe)?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl StorageBackend for ShardedBackend {
@@ -189,6 +224,13 @@ impl StorageBackend for ShardedBackend {
             None => return self.servers[0].write(key, offset, data),
         };
         let ranges = self.chunks_for(&l, offset, data.len());
+        // A write that jumps past the current end must first make every chunk
+        // below its target contiguous, or `len` would stop at the old short tail
+        // / a missing interior chunk and hide the data beyond the gap. No-op for
+        // in-place rewrites and ordinary appends (see [`Self::pad_below`]).
+        if !data.is_empty() {
+            self.pad_below(&l, offset / l.stripe)?;
+        }
         let mut written = 0usize;
         if ranges.len() <= 1 {
             for (i, sub_off, sub_len) in ranges {
@@ -245,9 +287,10 @@ impl StorageBackend for ShardedBackend {
             None => return self.servers[0].len(key),
         };
         // Walk chunks from 0; the file ends at the first chunk shorter than the
-        // stripe (partial tail) or absent (not yet written). Exact for
-        // contiguous files, which is the striping target; a sparse hole would
-        // under-report (documented limitation, mirrors nothing the tests use).
+        // stripe (partial tail) or absent (not yet written). This is exact because
+        // `write` keeps chunks contiguous below any new write (see `pad_below`):
+        // sparse writes materialize the gap rather than leaving interior chunks
+        // missing, so there are never holes the walk could stop at prematurely.
         let mut total = 0u64;
         let mut i = 0u64;
         loop {
@@ -488,6 +531,49 @@ mod tests {
         // truncate to zero empties the object but keeps it existing
         sb.truncate(&key, 0).unwrap();
         assert_eq!(sb.len(&key).unwrap(), 0);
+        for r in roots {
+            let _ = std::fs::remove_dir_all(r);
+        }
+    }
+
+    #[test]
+    fn sparse_write_past_eof_is_not_hidden() {
+        // Regression for the striping hole bug: a write that jumps past the
+        // current end (lseek + write, e.g. `dd seek=`) used to leave the old short
+        // tail and interior chunks absent, so `len` stopped at the first short /
+        // missing chunk and everything beyond the gap read as truncated. `write`
+        // now materializes the gap (pad_below), so the sparse region reads back
+        // as zeros and the far data is visible.
+        let roots = tmp_root("sparse", 2);
+        let stripe = 4096u64;
+        let sb = ShardedBackend::new(members(&roots), stripe);
+        let key = sb.new_key("sp1");
+        sb.create(&key).unwrap();
+
+        // 100 bytes at the start -> chunk 0 becomes a short tail (len 100).
+        let head: Vec<u8> = (0..100u32).map(|i| i as u8).collect();
+        sb.write(&key, 0, &head).unwrap();
+        assert_eq!(sb.len(&key).unwrap(), 100);
+
+        // Jump way past the end: write 50 bytes at offset 10000 (chunk 2),
+        // leaving a ~9900-byte hole across chunks 0 (short), 1 (absent), 2 (lead).
+        let tail: Vec<u8> = (200..250u32).map(|i| i as u8).collect();
+        let off = 10_000u64;
+        sb.write(&key, off, &tail).unwrap();
+
+        // The far write must be reflected in the length, not hidden by the hole.
+        assert_eq!(sb.len(&key).unwrap(), off + tail.len() as u64, "len must span the hole");
+
+        // Head intact, hole reads as zeros, tail intact — full reconstruction.
+        let all = sb.read(&key, 0, (off as usize) + tail.len()).unwrap();
+        assert_eq!(&all[..100], &head[..], "head preserved");
+        assert!(all[100..(off as usize)].iter().all(|&b| b == 0), "hole must read as zeros");
+        assert_eq!(&all[(off as usize)..], &tail[..], "far tail preserved");
+
+        // Targeted reads at the boundaries.
+        assert_eq!(sb.read(&key, off, 50).unwrap(), tail);
+        assert_eq!(sb.read(&key, 5000, 10).unwrap(), vec![0u8; 10]); // inside the hole
+        sb.remove(&key).unwrap();
         for r in roots {
             let _ = std::fs::remove_dir_all(r);
         }
