@@ -1,0 +1,29 @@
+# Rust build artifacts
+/target/
+
+# Runtime / test scratch mounts and data dirs created by the suites
+/.bench/
+/.blk/
+/.br/
+/.ctest/
+/.demo_real/
+/.demo_srv/
+/.etest/
+/.fresh/
+/.ha/
+/.ha_sync_test/
+/.locks/
+/.msrv/
+/.ptest/
+/.rtest/
+/.striping/
+/.test/
+/.xtest/
+
+# .build-bin tracks the test/bench scripts and the pkg-config wrapper,
+# but never its run output or captured logs.
+/.build-bin/logs/
+/.build-bin/*.out
+
+# Stray ad-hoc run logs
+/edge_run.txt

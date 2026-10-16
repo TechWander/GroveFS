@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>yourfs 使用说明 · 用户视图 FUSE 文件系统</title>
+<style>
+  :root{
+    --bg:#0f1117; --panel:#161a23; --card:#1b2029; --border:#2a3140;
+    --fg:#e6edf3; --muted:#9aa7b8; --accent:#4ea1ff; --accent2:#35c39a;
+    --warn:#f0a35e; --code:#0b0e14; --nav-w:248px;
+  }
+  @media (prefers-color-scheme: light){
+    :root{ --bg:#f6f8fa; --panel:#fff; --card:#fff; --border:#d8dee6;
+      --fg:#1f2328; --muted:#5b6675; --accent:#0969da; --accent2:#1a7f5a;
+      --warn:#9a6700; --code:#f3f5f7; }
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0; background:var(--bg); color:var(--fg);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans SC","PingFang SC","Microsoft YaHei",sans-serif;
+    line-height:1.7; font-size:15px;
+  }
+  a{color:var(--accent); text-decoration:none}
+  a:hover{text-decoration:underline}
+  /* layout */
+  .wrap{display:flex; max-width:1280px; margin:0 auto; align-items:flex-start}
+  nav{
+    position:sticky; top:0; width:var(--nav-w); flex:0 0 var(--nav-w);
+    height:100vh; overflow-y:auto; padding:22px 16px; border-right:1px solid var(--border);
+    background:var(--panel);
+  }
+  nav h2{font-size:13px; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); margin:18px 0 6px}
+  nav ol{list-style:none; margin:0; padding:0}
+  nav li{margin:2px 0}
+  nav a{display:block; padding:5px 10px; border-radius:7px; color:var(--fg); font-size:14px}
+  nav a:hover{background:var(--card); text-decoration:none}
+  main{flex:1 1 auto; min-width:0; padding:32px 44px 120px}
+  /* hero */
+  .hero{padding:30px 32px; border:1px solid var(--border); border-radius:16px;
+    background:linear-gradient(135deg,var(--panel),var(--card)); margin-bottom:30px}
+  .hero h1{margin:0 0 8px; font-size:32px}
+  .hero p{margin:6px 0; color:var(--muted); max-width:70ch}
+  .badges{margin-top:14px; display:flex; flex-wrap:wrap; gap:8px}
+  .badge{font-size:12px; padding:4px 10px; border-radius:999px; border:1px solid var(--border); color:var(--muted)}
+  .badge b{color:var(--accent2)}
+  /* sections */
+  section{margin:42px 0; scroll-margin-top:20px}
+  h2.title{font-size:23px; margin:0 0 6px; padding-bottom:8px; border-bottom:2px solid var(--border)}
+  h2.title .num{color:var(--accent); font-variant-numeric:tabular-nums; margin-right:10px}
+  h3{font-size:17px; margin:26px 0 8px}
+  p{margin:10px 0}
+  .lead{color:var(--muted)}
+  /* code */
+  pre{background:var(--code); border:1px solid var(--border); border-radius:10px;
+    padding:14px 16px; overflow-x:auto; font-size:13.5px; line-height:1.55}
+  code{font-family:"SF Mono",JetBrains Mono,Fira Code,Consolas,monospace}
+  p code,li code,td code{background:var(--code); padding:2px 6px; border-radius:6px;
+    border:1px solid var(--border); font-size:13px}
+  .cmt{color:var(--muted)}
+  /* tables */
+  table{width:100%; border-collapse:collapse; margin:14px 0; font-size:14px; overflow:hidden;
+    border-radius:10px; border:1px solid var(--border)}
+  th,td{padding:9px 13px; text-align:left; border-bottom:1px solid var(--border); vertical-align:top}
+  th{background:var(--card); color:var(--fg); font-weight:600}
+  tr:last-child td{border-bottom:none}
+  td code{white-space:nowrap}
+  /* cards */
+  .grid{display:grid; gap:14px; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); margin:14px 0}
+  .card{border:1px solid var(--border); border-radius:12px; padding:16px 18px; background:var(--card)}
+  .card h4{margin:0 0 6px; font-size:15px; color:var(--accent)}
+  .card p{margin:0; font-size:13.5px; color:var(--muted)}
+  /* callouts */
+  .note,.warn,.ok{border-radius:10px; padding:12px 16px; margin:14px 0; border:1px solid var(--border); font-size:14px}
+  .note{background:rgba(78,161,255,.08); border-color:rgba(78,161,255,.35)}
+  .warn{background:rgba(240,163,94,.10); border-color:rgba(240,163,94,.4)}
+  .ok{background:rgba(53,195,154,.08); border-color:rgba(53,195,154,.35)}
+  .warn b{color:var(--warn)} .note b{color:var(--accent)} .ok b{color:var(--accent2)}
+  /* tree diagram */
+  .tree{font-family:"SF Mono",Consolas,monospace; font-size:13px; line-height:1.6; color:var(--fg)}
+  .tree .k{color:var(--accent2)} .tree .c{color:var(--muted)}
+  ul{margin:8px 0} li{margin:4px 0}
+  footer{margin-top:50px; padding-top:18px; border-top:1px solid var(--border); color:var(--muted); font-size:13px}
+  .pill{display:inline-block; font-size:12px; padding:1px 8px; border-radius:6px; background:var(--code); border:1px solid var(--border); color:var(--muted)}
+  @media (max-width:820px){ .wrap{flex-direction:column} nav{position:static;width:auto;height:auto;border-right:none;border-bottom:1px solid var(--border)} main{padding:20px} }
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav>
+  <h2>目录</h2>
+  <ol>
+    <li><a href="#intro">1 · 是什么 / 核心概念</a></li>
+    <li><a href="#arch">2 · 架构与原理</a></li>
+    <li><a href="#quick">3 · 快速上手(单机)</a></li>
+    <li><a href="#manifest">4 · 自定义层级</a></li>
+    <li><a href="#prod">5 · 生产拓扑(LAN 多机)</a></li>
+    <li><a href="#consistency">6 · 跨客户端一致性</a></li>
+    <li><a href="#data">7 · 如何处理数据</a></li>
+    <li><a href="#ha">8 · 高可用主备</a></li>
+    <li><a href="#security">9 · 鉴权 / 只读 / 性能</a></li>
+    <li><a href="#ops">10 · 运维与验证</a></li>
+    <li><a href="#ref">11 · 命令速查</a></li>
+    <li><a href="#honest">12 · 诚实标注边界</a></li>
+  </ol>
+</nav>
+
+<main>
+  <div class="hero">
+    <h1>yourfs <span class="pill">使用说明</span></h1>
+    <p class="lead">一种<strong>用户视图 FUSE 文件系统</strong>:物理数据集中存放在硬盘,不同用户挂载各自看到独立的文件列表,列表支持自定义文件夹层级,彻底脱离 NFS。</p>
+    <div class="badges">
+      <span class="badge">语言 <b>Rust</b></span>
+      <span class="badge">FUSE <b>fuser 0.18</b> 多线程</span>
+      <span class="badge">元数据 <b>SQLite</b>(rusqlite bundled)</span>
+      <span class="badge">传输 <b>自定义 TCP 帧</b>(非 NFS/gRPC)</span>
+      <span class="badge">全板 GREEN <b>14 套件</b>(build+unit+posix+edge+e2e+remote+errors+resilience+concurrent+metasrv+ha+striping+locks+freshness)</span>
+    </div>
+  </div>
+
+  <!-- 1 -->
+  <section id="intro">
+    <h2 class="title"><span class="num">1</span>是什么 / 核心概念</h2>
+    <p>一句话:把「谁能看到什么(视图)」和「数据实际存在哪(对象)」彻底分开。每个用户一棵独立目录树,互不可见;字节统一存在物理块目录里。</p>
+    <div class="grid">
+      <div class="card"><h4>视图 view</h4><p>每个用户一棵独立目录树(含自定义层级),存在一个 SQLite 库:<code>&lt;home&gt;/meta/&lt;user&gt;.db</code>。不同用户互不可见。</p></div>
+      <div class="card"><h4>数据对象 object</h4><p>文件的真实字节。一个文件 = <code>blocks/</code> 下一个以 UUID 命名的对象(或条带化的多个分块)。视图目录项指向对象 key。</p></div>
+      <div class="card"><h4>基目录 <code>--home</code></h4><p>同时容纳 <code>blocks/</code>(数据)和 <code>meta/</code>(视图)的物理根。默认 <code>$YOURFS_HOME</code> 或 <code>~/.yourfs</code>。</p></div>
+    </div>
+    <div class="note"><b>关键:</b>视图与数据天然分离。视图只是「目录树 + 指针」,字节永远在 <code>blocks/</code>。这正是"不同用户挂载显示不同列表、数据都在硬盘上"的实现基础。</div>
+  </section>
+
+  <!-- 2 -->
+  <section id="arch">
+    <h2 class="title"><span class="num">2</span>架构与原理</h2>
+    <p>三层解耦,全走 trait 抽象:</p>
+    <pre class="tree">
+┌─ <span class="k">FUSE 挂载进程</span>  <span class="c">fs_impl.rs:YourFS(&self, 多线程安全)</span>
+│    ├── <span class="k">MetaProvider</span> trait  <span class="c">视图树访问(12 方法)</span>
+│    │     ├── 本地:  <span class="c">MetaEngine</span>  → <span class="c">&lt;home&gt;/meta/&lt;user&gt;.db</span>
+│    │     └── 远程:  <span class="c">RemoteMeta</span>  → <span class="c">meta-server(中心权威)</span>
+│    └── <span class="k">StorageBackend</span> trait <span class="c">数据对象 IO</span>
+│          ├── 本地:  <span class="c">LocalBackend</span> → <span class="c">&lt;home&gt;/blocks/&lt;key&gt;</span>
+│          ├── 远程:  <span class="c">RemoteBackend</span> → <span class="c">data-server</span>
+│          └── 条带:  <span class="c">ShardedBackend</span> → 多 data-server
+└─ <span class="c">传输:自定义二进制帧 over TCP(定长头+变长体),连接池并发</span></pre>
+    <h3>为什么这样设计</h3>
+    <ul>
+      <li><b>trait 接缝可插拔</b>:本地/远程/条带对上层透明,切换只是换个实现。</li>
+      <li><b>中心 MetaServer</b>:同一用户在多客户机共享<b>一份权威视图</b>,不再各存各的副本导致分叉。</li>
+      <li><b>事件总线 + Notifier</b>:写成功后向订阅者推送失效,解决"默认缓存下内容新鲜度"。</li>
+      <li><b>fuser 0.18 多线程</b>:每线程独立 <code>/dev/fuse</code> fd(<code>clone_fd</code>),请求并发派发不串行。</li>
+    </ul>
+  </section>
+
+  <!-- 3 -->
+  <section id="quick">
+    <h2 class="title"><span class="num">3</span>快速上手(单机本地模式)</h2>
+    <p class="lead">数据和视图都在本机同一个 <code>--home</code>,无需任何 server,先体验功能最快。</p>
+    <pre><code>Y=./target/release/yourfs
+BASE=/data/myfs                       <span class="cmt"># 物理基目录</span>
+
+<span class="cmt"># 1) 初始化两个用户的视图</span>
+$Y --home $BASE init --user alice
+$Y --home $BASE init --user bob
+
+<span class="cmt"># 2) 挂载(前台运行,Ctrl-C 即卸载;或加 & 后台)</span>
+$Y --home $BASE mount --user alice --mountpoint /mnt/alice
+$Y --home $BASE mount --user bob   --mountpoint /mnt/bob     <span class="cmt"># 另一终端</span>
+
+<span class="cmt"># 3) 像普通目录一样读写、建自定义层级</span>
+mkdir -p /mnt/alice/projects/2026
+echo "年度报告" &gt; /mnt/alice/projects/2026/报告.txt
+ls /mnt/bob                                      <span class="cmt"># bob 看不到 alice 的文件</span>
+
+<span class="cmt"># 4) 卸载</span>
+$Y umount --mountpoint /mnt/alice</code></pre>
+    <div class="ok"><b>视图隔离</b>:/mnt/alice 与 /mnt/bob 是两棵独立的树,互不可见;层级(mkdir 嵌套目录)完全自定义。</div>
+  </section>
+
+  <!-- 4 -->
+  <section id="manifest">
+    <h2 class="title"><span class="num">4</span>用 manifest 预建自定义层级</h2>
+    <p><code>init --manifest</code> 在建视图时一次性铺好目录骨架。每行仅两种指令:<code>mkdir &lt;path&gt;</code> 或 <code>touch &lt;path&gt;</code>,行首 <code>#</code> 为注释。</p>
+    <pre><code><span class="cmt"># seed.txt</span>
+mkdir projects
+mkdir projects/2026
+touch projects/2026/README.txt</code></pre>
+    <pre><code>$Y --home $BASE init --user alice --manifest ./seed.txt
+<span class="cmt"># 输出:applied seed manifest ./seed.txt</span></code></pre>
+    <p>挂载后即见预建层级;重复 mkdir/touch 幂等,不报错。</p>
+  </section>
+
+  <!-- 5 -->
+  <section id="prod">
+    <h2 class="title"><span class="num">5</span>生产拓扑:中心存储 + 多客户机 LAN 挂载</h2>
+    <p>真实场景:数据放中心集群,多台客户机经 LAN 挂载,同一用户跨机器看到同一份权威视图。拆成两个服务:</p>
+    <pre><code><span class="cmt"># ===== 中心节点 =====</span>
+$Y data-server --listen 0.0.0.0:50100 --root /data/cluster/blocks
+$Y --home /data/cluster meta-server --listen 0.0.0.0:50110
+
+<span class="cmt"># ===== 每台客户机(有本地 --home,但不存权威数据/视图) =====</span>
+$Y --home /local/home mount --user alice \
+     --data 10.0.0.5:50100 --meta 10.0.0.5:50110 /mnt/alice</code></pre>
+    <table>
+      <tr><th>选项</th><th>作用</th></tr>
+      <tr><td><code>--data host:port</code></td><td>文件 IO 走网络到 data-server,不碰客户机本地盘(非 NFS)。</td></tr>
+      <tr><td><code>--meta host:port</code></td><td>视图由中心 meta-server 提供 → 多客户机挂同一用户 = 共享同一棵权威树。</td></tr>
+      <tr><td><code>--data a,b,c</code></td><td>逗号分隔多地址 → 启用跨 server 确定性条带(见 §7.2)。</td></tr>
+      <tr><td><code>--meta 主,备</code></td><td>故障转移列表,主挂自动切备(见 §8)。</td></tr>
+    </table>
+    <p>客户机本地<b>不留视图副本</b>,<code>--home</code> 只放临时缓存。</p>
+  </section>
+
+  <!-- 6 -->
+  <section id="consistency">
+    <h2 class="title"><span class="num">6</span>跨客户端一致性</h2>
+    <table>
+      <tr><th>模式</th><th>命令</th><th>行为</th></tr>
+      <tr><td><b>实时失效推送</b>(默认,推荐)</td><td>仅 <code>--meta</code></td><td>一客户端写成功后,meta-server 经事件总线向同用户其它订阅者广播失效(<code>inval_entry</code>+<code>inval_inode</code>),对端下次访问<b>即时可见</b>,无需轮询。</td></tr>
+      <tr><td><code>--strict</code> 强一致兜底</td><td>加 <code>--strict</code></td><td>关闭内核属性/dentry 缓存并 <code>FOPEN_DIRECT_IO</code> 直读,写立即可见。代价:零客户端缓存,往返更多。</td></tr>
+    </table>
+    <div class="note"><b>失效须成对推送</b>:<code>inval_entry</code>(目录项)与 <code>inval_inode</code>(inode)要一起发,否则对端可能拿到陈旧属性。</div>
+    <div class="note"><b>默认即新鲜</b>:非 <code>--strict</code> 的推送失效模型已保证「A 写成功 → B 下次访问即时可见」,无需轮询、无需 <code>--strict</code>(由 <code>.build-bin/test_freshness.sh</code> 端到端证明:顺序追加 100 行 / 截断 / 反向读三类场景均在 &lt;500ms 内对端可见)。<code>--strict</code> <b>不是</b>保新鲜的唯一通道,只是在 writeback 脏页 flush 与远端失效交错的极端竞争窗口下,选择完全旁路内核缓存的更保守兜底。</div>
+    <div class="note"><b>分布式 advisory 锁</b>:<code>flock</code> / <code>fcntl F_SETLK/F_GETLK</code> 经 meta-server 的 <code>locks</code> 表(SQLite)集中仲裁,<b>跨进程、跨机生效</b>;主备切换后锁状态随快照复制存活。锁回收两条路径:①<b>持锁进程崩溃</b>——内核关 fd 触发 FUSE <code>release</code>(携带匹配 <code>lock_owner</code>),锁行<b>即时删除</b>,远小于 lease;②<b>mount daemon 整机崩溃</b>——无 <code>release</code> 也无续约,锁在一个<b>短 lease(默认 15s)内</b>过期被扫;存活持有者由 daemon <b>续约心跳</b>(每 lease/3)持续续期,<b>永不超时</b>。非合作应用(cp/dd)仍不阻塞,与 NFS/SMB advisory 语义一致(由 <code>test_locks.sh</code> 段 4 崩溃即时回收 / 段 4b 续约跨过 lease 证明)。</div>
+  </section>
+
+  <!-- 7 -->
+  <section id="data">
+    <h2 class="title"><span class="num">7</span>如何处理数据(重点)</h2>
+
+    <h3>7.1 物理布局</h3>
+    <ul>
+      <li><b>单对象</b>:<code>blocks/&lt;key&gt;</code>,一文件=一对象文件,扁平存放(不用深层目录,避免 inode/目录项膨胀)。</li>
+      <li><b>key 命名</b>:写入时生成 UUID 作对象 key,存进视图 <code>data_ref</code> 字段。</li>
+      <li><b>条带编码</b>:<code>data_ref</code> = <code>s&lt;N&gt;:&lt;stripe_bytes&gt;:&lt;uuid&gt;</code>,第 i 块 key = <code>{uuid}#{i}</code>,落在 <code>servers[i % N]</code>。<b>无 <code>s</code> 前缀 = 旧单对象</b>,天然向后兼容。</li>
+    </ul>
+
+    <h3>7.2 多 data-server 条带(聚合容量/带宽)</h3>
+    <pre><code>$Y --home /local/home mount --user alice \
+     --data 10.0.0.5:50100,10.0.0.6:50100 --meta 10.0.0.5:50110 /mnt/alice</code></pre>
+    <ul>
+      <li>文件 ≥ <b>16 MiB</b> 才分块;小文件自然只落 chunk0(单节点)。</li>
+      <li>条带读写内部复用分块并行 IO 原语。</li>
+      <li>单地址 <code>--data host:port</code> 与旧行为完全一致。</li>
+    </ul>
+    <div class="warn"><b>诚实:</b>条带的价值是把大文件摊到多节点的<b>聚合容量</b>。单条已饱和链路(loopback/单网卡)上实测<b>无吞吐增益</b>,须真独立链路才能测出收益——无实测数字不声称收益。</div>
+
+    <h3>7.3 删除 / GC</h3>
+    <p><code>unlink</code> 后视图解除引用,后端据 key 尽力删全部分块;条带 <code>remove</code> 展开删所有 chunk,<b>幂等</b>(残留块可被 GC 清)。</p>
+
+    <h3>7.4 备份与迁移</h3>
+    <ul>
+      <li><b>数据对象</b>:<code>blocks/</code> 就是普通文件目录,可直接 <code>rsync</code>/文件系统快照备份。</li>
+      <li><b>视图库</b>:SQLite <code>&lt;home&gt;/meta/&lt;user&gt;.db</code>。<b>勿在有写活动时裸拷 DB 文件</b>;单机先停写或 checkpoint 后再拷,HA 模式由 meta-server 用备份 API 复制(见 §8)。</li>
+    </ul>
+  </section>
+
+  <!-- 8 -->
+  <section id="ha">
+    <h2 class="title"><span class="num">8</span>高可用:meta-server 主备</h2>
+    <pre><code><span class="cmt"># 主:读写,并把快照周期推送给备</span>
+$Y --home /data/nodeA meta-server --listen 10.0.0.5:50110 --role primary --peer 10.0.0.6:50111
+<span class="cmt"># 备:只读服务,主心跳丢失后自动提升为 primary</span>
+$Y --home /data/nodeB meta-server --listen 10.0.0.6:50111 --role standby --peer 10.0.0.5:50110
+<span class="cmt"># 主(可选 RPO=0):加 --sync-repl,写返回前同步等备落盘 ACK</span>
+$Y --home /data/nodeA meta-server --listen 10.0.0.5:50110 --role primary --peer 10.0.0.6:50111 --sync-repl
+<span class="cmt"># 真 fencing(opt-in):加 --witness &lt;逗号分隔的 data-server 仲裁者列表,推荐奇数 N&gt;,多数派授权把双写窗口收敛为有界(fail-safe)</span>
+$Y --home /data/nodeA meta-server --listen 10.0.0.5:50110 --role primary --peer 10.0.0.6:50111 --witness 10.0.0.7:50100,10.0.0.8:50100,10.0.0.9:50100
+<span class="cmt"># 客户端故障转移列表:主挂自动切备继续读写</span>
+$Y --home /local/home mount --user alice \
+     --meta 10.0.0.5:50110,10.0.0.6:50111 --data 10.0.0.5:50100 /mnt/alice</code></pre>
+    <ul>
+      <li>两节点必须用<b>各自独立的 <code>--home</code></b>(各存一份视图副本,节点间靠快照复制)。</li>
+      <li>primary 每 ~500ms 推快照 + 心跳 epoch;standby 心跳超时后提升并 epoch+1,旧主恢复发现更高 epoch 自动降级。</li>
+      <li><code>--sync-repl</code>(opt-in,默认关闭):写 op 返回客户端前同步推快照并等备 fsync + 原子 rename 的 ACK,把 <b>RPO 从 ~500ms 降到 0</b>;代价为多一个控制通道 RTT + 一次 <code>VACUUM INTO</code> fsync。备不可达/超时时<b>诚实降级为 async 并打 warn</b>(不谎报 0)。由 <code>test_ha.sh</code> 段 7(RPO=0)/段 8(分区降级)证明。</li>
+      <li><code>--witness &lt;addr[,addr...]&gt;</code>(opt-in,默认关闭):用主备都能访问的一个或多个共享 <code>data-server</code> 作<b>独立仲裁者集合</b>(逗号分隔,推荐奇数 N;N=1 即退化为单仲裁、行为与旧版完全一致)。权威需<b>严格多数派</b> <code>quorum_size(N)=N/2+1</code> 个仲裁者同时授予——每个仲裁者都是下述相同的 <code>Fence</code> 租约节点,meta 侧对全列表并发 fan-out 并按多数派判决(<code>witness_quorum</code>)。<b>多数派交叠</b>保证正确:两个多数派集合必交于≥一个仲裁者,该仲裁者只把 token 顶高给第一个 claimer(第二个见 <code>prev==我</code> 只算续约不算顶高),故同值碰撞天然只有一主。每个仲裁者维护单调 <code>fence</code> token(<code>OP_FENCE</code> 的 <code>fetch_max</code> CAS 回传<b>折入前的值 <code>prev</code></b>):claim 赢当且仅当 <code>prev &lt; 我的 epoch</code>,<code>prev &gt;= 我</code> 则被 fence(对端胜出或同值碰撞)——用 <code>prev</code> 而非折后 max 正是为了在仲裁者恢复时区分同值碰撞、绝不双主。在任 primary 每 tick 向多数派 <b>续一份有界租约(lease,默认 3s)</b>(多数报 <code>prev&gt;我</code>则自降级);每个仲裁者<b>拒绝重叠租约</b>——同一时刻至多一份活租约,故<b>多数活租约本身即独占权威的证明</b>,写请求由<b>本地租约有效性</b>直接放行(不再每写一个仲裁 RTT,仅每续租一次,摊薄到整个窗口),被 fence 的过期主在租约到点后的下一次复证即拒绝;提升方亦<b>非重叠</b>——须待前任租约到期才可抢占(<code>prev&gt;=candidate</code> 同值碰撞/对端更高,或前任租约尚活,则拒绝/延后,旧主可证明地已停)。<b>数据面同遭门控</b>:元数据面复证拦不住内容字节(<code>write()</code> 先落 backend、再 debounced touch meta),故客户端把其实时 epoch 贴到每个<b>写意图数据帧</b>(create/write/truncate/remove/fsync),作为 witness 的 data-server 对 <code>epoch &lt; token</code> 的帧直接回 <code>EROFS</code>,过期主无法绕过元数据面静默写入内容;被封帧会向权威重取 epoch 并自动重试一次(自愈)。更关键的是 data-server 把「epoch 校验 + 落盘」与「仲裁 claim」用读写锁<b>线性化</b>(claim 取独占会等在途写排空),而 witness 与存储同在一节点,故过期写的字节不可能与新主写交叠——<b>内容撕裂写在仲裁节点上被真正闭合</b>(不再是“有界窗口”)。<b>部署前提</b>:该数据面门控只对被 quorum 顶高过 token 的 data-server(即 <code>--witness</code> 列表内的节点)生效,故须把 witness 与客户端实际写入的内容盘同节点部署;若内容盘在 witness 集合之外,它的 token 恒为 0、数据面 gate 不生效,仅剩元数据面 fence 兜底(不会双主,但少了内容层的第二道防线)。<b>部署前提</b>:该数据面门控只对被 quorum 顶高过 token 的 data-server(即 <code>--witness</code> 列表内的节点)生效,故应将 witness 与客户端实际写入的内容盘同节点部署;若内容盘在 witness 集合之外,它的 token 恒为 0、数据面 gate 不生效,仅剩元数据面 fence 兜底(不会双主,但少了内容层的第二道防线)。<b>FAIL-SAFE</b>:配置了 witness 却<b>组不到租约多数派</b>连续 &gt;宽限(3s)时,节点放弃写权限——primary 自降级、standby 拒绝提升(<b>写冻结</b>,宁牺牲可用也不冒双写;瞬时仲裁错误不误伤单写,持续故障才由宽限兼底)。<b>相比单仲裁的可用性提升</b>:宕掉<b>少数</b>仲裁者仍能组多数续租、<b>不冻结写</b>,且少数仲裁者的 <code>.fence_token</code> 盘丢也不会复活过期主(多数仍保单调 token);唯<b>失去多数</b>才 fail-safe 冻结。每个仲裁者各自持久化 token 到 <code>&lt;root&gt;/.fence_token</code>,其重启不清零。由此双写窗口被<b>租约安全余量</b>(<code>WITNESS_LEASE_SLACK</code>=500ms)界定——对端只能在我方租约到点后取 token,而我方提前该余量停止信任本地缓存租约(而非 peer-only 的不封顶)。由 <code>test_ha.sh</code> 段 9(过期 primary 重启被挡成 standby + token 持久化)、段 10(杀单 witness→自降级 & 拒绝盲升→恢复→恰好一主)、段 11(3 仲裁者宕 1 仍续租不冻、宕 2 破多数才 fail-safe)证明。</li>
+    </ul>
+    <div class="warn"><b>诚实标注:</b>① 默认 async <b>RPO ≈ 500ms</b>,极端故障下最后 &lt;500ms 的写可能丢失;加 <code>--sync-repl</code> 可把这批写的 RPO 降到 0。② fencing 需要第三仲裁者:严格两节点、<b>不配 <code>--witness</code></b> 时无法防脑裂(CAP/共识硬边界,peer-only 双写窗口<b>不封顶</b>);<b>配了 <code>--witness</code> 即 fail-safe</b>——仲裁者<b>多数派不可达</b>时<b>冻结写</b>而非盲写/盲升;primary 持一份不重叠的有界<b>租约</b>(仲裁者拒发重叠租约,多数活租约即独占证明),写由本地租约校验放行、每续租一次对全列表 fan-out(摊薄到整窗),并对内容数据帧按 token 门控,把双写窗口收敛到<b>租约安全余量内</b>且保证收敛单主。<b>多数派仲裁的可用性红利</b>:<code>--witness</code> 取逗号分隔的 N 个独立仲裁者(推荐奇数),权威需多数派 <code>N/2+1</code>——<b>宕掉少数仲裁者仍不冻结写</b>(仅失去多数才停写),比单仲裁消除了 witness 这个单点可用性依赖(N=1 则退化为单仲裁旧行为)。代价:每续租一次向仲裁列表 fan-out。</div>
+  </section>
+
+  <!-- 9 -->
+  <section id="security">
+    <h2 class="title"><span class="num">9</span>鉴权 / 只读 / 性能</h2>
+    <h3>Token 双面鉴权</h3>
+    <p>中心 server 若裸监听 LAN,任何同网段主机都能按 key 读写对象/打开他人视图。加共享口令(同时覆盖数据面 <code>OP_OPEN</code> 与元数据面 <code>M_OPEN</code>):</p>
+    <pre><code>$Y data-server     --listen 0.0.0.0:50100 --root /data/cluster/blocks --token s3cr3t
+$Y --home ... meta-server --listen 0.0.0.0:50110 --token s3cr3t
+$Y --home /local/home mount --user alice --data ... --meta ... --token s3cr3t /mnt/alice</code></pre>
+    <p>token 不匹配 → 连接时直接 <span class="pill">PermissionDenied</span>,不重试。空 token(默认)= LAN-trusted 无鉴权,仅限可信内网。</p>
+
+    <h3>只读挂载</h3>
+    <pre><code>$Y --home $BASE mount --user alice --mountpoint /mnt/alice_ro --ro</code></pre>
+    <p>所有写操作返回 <code>EROFS</code>(内核 <code>MS_RDONLY</code> + 文件系统侧守卫双保险)。适合分发/归档视图。</p>
+
+    <h3>性能旋钮</h3>
+    <table>
+      <tr><th>项</th><th>说明</th></tr>
+      <tr><td><code>--threads N</code>(默认 4)</td><td>FUSE 并发派发工作线程,每线程独立 <code>/dev/fuse</code> fd(<code>clone_fd</code>,Linux 4.5+)。<code>0</code>=单线程(遗留/AB 对照)。</td></tr>
+      <tr><td>分块并行 IO</td><td>客户端读 ≥1MiB 按 1MiB 切片并发;写 ≥4MiB 分片并发(零协议改动)。</td></tr>
+      <tr><td><code>--o allow_other</code></td><td>额外 fuser 挂载选项透传。</td></tr>
+      <tr><td>touch 去抖</td><td><code>write()</code> 对同 inode 200ms 窗口去抖 <code>touch_mtime</code>,减少元数据面 RPC 与 HA 日志量(<code>setattr-size</code> 不去抖,语义要求即时)。</td></tr>
+    </table>
+  </section>
+
+  <!-- 10 -->
+  <section id="ops">
+    <h2 class="title"><span class="num">10</span>运维与验证</h2>
+    <pre><code>$Y umount --mountpoint /mnt/alice     <span class="cmt"># 卸载</span>
+fusermount -u /mnt/alice              <span class="cmt"># 等价(前台进程 Ctrl-C 即卸载)</span>
+ps aux | grep yourfs                  <span class="cmt"># 查看在跑的 server / mount</span></code></pre>
+    <div class="note"><b>挂载是前台阻塞式</b>(<code>Session::notifier() + run()</code>);常驻用 <code>nohup ... &amp;</code> 或 systemd。<b>不要</b>用 <code>spawn + BackgroundSession::join()</code> 当阻塞等待——<code>join()</code> 会立即卸载。</div>
+    <h3>回归验证</h3>
+    <pre><code>export PKG_CONFIG=/data/xy/yourfs/.build-bin/pkg-config LC_ALL=C LANG=C
+bash .build-bin/run_all.sh                <span class="cmt"># 全板:build+unit+posix+edge+e2e+remote+errors</span>
+                                          <span class="cmt">#   +resilience+concurrent+metasrv+ha+striping+locks+freshness+bench</span>
+SKIP_BENCH=1 bash .build-bin/run_all.sh   <span class="cmt"># 跳过吞吐基准(纯功能回归)</span></code></pre>
+  </section>
+
+  <!-- 11 -->
+  <section id="ref">
+    <h2 class="title"><span class="num">11</span>命令速查</h2>
+    <table>
+      <tr><th>目的</th><th>命令</th></tr>
+      <tr><td>建视图</td><td><code>yourfs --home H init --user U [--manifest M]</code></td></tr>
+      <tr><td>本地挂载</td><td><code>yourfs --home H mount --user U -m MP [--ro] [--strict] [--threads N]</code></td></tr>
+      <tr><td>远程挂载</td><td><code>yourfs --home H mount --user U -m MP --data A[,A2] --meta M[,M_bak] [--token T]</code></td></tr>
+      <tr><td>卸载</td><td><code>yourfs umount -m MP</code></td></tr>
+      <tr><td>数据服务</td><td><code>yourfs data-server --listen IP:PORT --root DIR [--token T]</code></td></tr>
+      <tr><td>元数据服务</td><td><code>yourfs --home H meta-server --listen IP:PORT [--token T] [--role primary|standby --peer ADDR [--sync-repl] [--witness ADDR[,ADDR...]]]</code></td></tr>
+    </table>
+  </section>
+
+  <!-- 12 -->
+  <section id="honest">
+    <h2 class="title"><span class="num">12</span>诚实标注的边界</h2>
+    <p class="lead">以下为本项目遵循"工程诚信"原则明确标注的限制,而非隐藏假设:</p>
+    <ul>
+      <li><b>传输协议</b>:当前为自定义 TCP 帧,非 gRPC。gRPC(tonic/prost)已做 go/no-go 闸门评估,结论 <b>GO</b>(tonic 0.14 免 protoc),但完整集成<b>有意延后</b>——独立可弃的末位项,现协议已正确且被测。</li>
+      <li><b>HA</b>:RPO ≈ 500ms(async;<code>--sync-repl</code> 可降到 0)。真 fencing 依赖仲裁者:<code>--witness</code>(逗号分隔的 N 个共享 data-server 作 <code>prev</code>-回传 epoch CAS <b>多数派</b>仲裁,需 <code>N/2+1</code> 授予)<b>已落地并 fail-safe</b>——仲裁者<b>多数派</b>不可达时冻结写而非盲升;primary 持不重叠的有界租约(仲裁者拒发重叠租约,多数活租约即独占证明),写由本地租约校验放行、每续租一次向全列表 fan-out,并对内容数据帧按 token 门控,把双写窗口收敛到<b>租约安全余量内</b>(保证收敛单主),各仲裁者独立持久化 token 防重启复活;<b>宕少数仲裁者仍不冻结写、少数盘丢不复活过期主</b>(N=1 退化为单仲裁旧行为)。仅严格两节点<b>不配 witness</b> 时仍无法防脑裂、窗口不封顶(CAP 硬边界,须部署第三方仲裁)。</li>
+      <li><b>条带</b>:单条饱和链路无吞吐增益,价值在多节点聚合容量;真实多机链路须重测后才可声称收益。</li>
+      <li><b>验证环境</b>:全部在 127.0.0.1 回环(模拟 LAN)验证,尚未做真实多机与 fio 级基准。</li>
+    </ul>
+    <div class="ok">凡未实测数字处,文档不做收益声称;凡有限制处,均在代码注释与本节明示。</div>
+  </section>
+
+  <footer>
+    yourfs · 用户视图 FUSE 文件系统使用说明 &nbsp;|&nbsp; 参数以 <code>yourfs &lt;sub&gt; --help</code> 实测输出为准 &nbsp;|&nbsp; 单文件自包含 HTML,可直接浏览器打开或离线分发。
+  </footer>
+</main>
+</div>
+</body>
+</html>
