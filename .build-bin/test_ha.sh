@@ -22,7 +22,7 @@ set -u
 cd /data/xy/yourfs
 export LC_ALL=C LANG=C
 export PKG_CONFIG=/data/xy/yourfs/.build-bin/pkg-config
-Y=./target/release/yourfs
+Y=./target/release/grove
 
 META_A=127.0.0.1:50106   # primary
 META_B=127.0.0.1:50107   # standby

@@ -432,7 +432,7 @@ mod tests {
         (0..n)
             .map(|k| {
                 let mut p = std::env::temp_dir();
-                p.push(format!("yourfs_shard_{tag}_{}_{}", std::process::id(), k));
+                p.push(format!("grovefs_shard_{tag}_{}_{}", std::process::id(), k));
                 let _ = std::fs::remove_dir_all(&p);
                 p
             })

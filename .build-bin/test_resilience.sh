@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Remote data-path RECONNECT resilience for yourfs. Unlike test_remote.sh (which
+# Remote data-path RECONNECT resilience for grovefs. Unlike test_remote.sh (which
 # checks happy-path round trips), this drives a real failure/recovery cycle by
 # killing and restarting the actual `data-server` process at a FIXED address,
 # while the client mount stays up the whole time:
@@ -15,12 +15,12 @@
 set -u
 cd /data/xy/yourfs
 export PKG_CONFIG=/data/xy/yourfs/.build-bin/pkg-config
-Y=./target/release/yourfs
+Y=./target/release/grove
 ADDR=127.0.0.1:50098
 HOST=${ADDR%:*}; PORT=${ADDR#*:}
 
 rm -rf .rtest; mkdir -p .rtest/home .rtest/rsrv .rtest/mnt_a .rtest/mnt_b
-export YOURFS_HOME=$PWD/.rtest/home
+export GROVEFS_HOME=$PWD/.rtest/home
 
 pass=0; fail=0
 ok(){ echo "  OK: $1"; pass=$((pass+1)); }

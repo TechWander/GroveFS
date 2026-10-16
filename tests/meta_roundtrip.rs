@@ -6,13 +6,13 @@
 
 use std::net::TcpListener;
 
-use yourfs::meta::{MetaProvider, NodeKind, ROOT_INO};
-use yourfs::remote::meta::{open_event_stream, serve_on_meta, serve_on_meta_auth, RemoteMeta};
-use yourfs::remote::proto;
+use grovefs::meta::{MetaProvider, NodeKind, ROOT_INO};
+use grovefs::remote::meta::{open_event_stream, serve_on_meta, serve_on_meta_auth, RemoteMeta};
+use grovefs::remote::proto;
 
 fn spawn_meta_server() -> (String, tempfile::TempDir) {
     let dir = tempfile::Builder::new()
-        .prefix("yourfs_msrv_")
+        .prefix("grovefs_msrv_")
         .tempdir()
         .unwrap();
     let base = dir.path().to_path_buf();
@@ -134,7 +134,7 @@ fn meta_per_user_isolation_across_clients() {
 /// different one, so an unauthorized LAN host can't open arbitrary users' trees.
 fn spawn_meta_server_auth(token: &str) -> (String, tempfile::TempDir) {
     let dir = tempfile::Builder::new()
-        .prefix("yourfs_msrv_auth_")
+        .prefix("grovefs_msrv_auth_")
         .tempdir()
         .unwrap();
     let base = dir.path().to_path_buf();

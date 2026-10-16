@@ -16,10 +16,10 @@ cd /data/xy/yourfs
 # locale-independent (this host's default locale is Chinese).
 export LC_ALL=C LANG=C
 export PKG_CONFIG=/data/xy/yourfs/.build-bin/pkg-config
-Y=./target/release/yourfs
+Y=./target/release/grove
 
 rm -rf .ctest; mkdir -p .ctest/home .ctest/m1 .ctest/m2
-export YOURFS_HOME=$PWD/.ctest/home
+export GROVEFS_HOME=$PWD/.ctest/home
 DB=.ctest/home/meta/shared.db
 BLK=.ctest/home/blocks
 

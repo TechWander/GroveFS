@@ -18,12 +18,12 @@
 set -u
 cd /data/xy/yourfs
 export PKG_CONFIG=/data/xy/yourfs/.build-bin/pkg-config
-Y=./target/release/yourfs
+Y=./target/release/grove
 ADDR=127.0.0.1:50098
 SIZE_MB=${SIZE_MB:-512}
 
 rm -rf .br; mkdir -p .br/home .br/srv .br/mnt
-export YOURFS_HOME=$PWD/.br/home
+export GROVEFS_HOME=$PWD/.br/home
 $Y data-server --listen $ADDR --root $PWD/.br/srv > .br/srv.log 2>&1 &
 SP=$!
 $Y init --user perf >/dev/null
@@ -39,7 +39,7 @@ rate(){ awk -v s="$1" -v t="$2" 'BEGIN{ if(t>0) printf "%.1f", s/t; else print "
 
 M=.br/mnt
 echo "=================================================="
-echo " yourfs REMOTE-path throughput (size=${SIZE_MB}MB)"
+echo " grovefs REMOTE-path throughput (size=${SIZE_MB}MB)"
 echo "=================================================="
 w_t=$(secs dd if=/dev/zero of=$M/r.img bs=1M count=$SIZE_MB conv=fsync)
 echo "  remote write  bs=1M: ${w_t}s  ($(rate $SIZE_MB $w_t) MB/s)"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Boundary + concurrency correctness for yourfs, focused on the WRITEBACK_CACHE
+# Boundary + concurrency correctness for grovefs, focused on the WRITEBACK_CACHE
 # path (kernel now coalesces/buffers writes) so data integrity is paramount:
 #   empty file, random-data round-trip md5, positional overwrite, sparse hole,
 #   truncate down/extend, multi-process writers, concurrent O_APPEND to one file,
@@ -7,9 +7,9 @@
 set -u
 cd /data/xy/yourfs
 export PKG_CONFIG=/data/xy/yourfs/.build-bin/pkg-config
-Y=./target/release/yourfs
+Y=./target/release/grove
 rm -rf .etest; mkdir -p .etest/home .etest/mnt
-export YOURFS_HOME=$PWD/.etest/home
+export GROVEFS_HOME=$PWD/.etest/home
 $Y init --user edge >/dev/null
 $Y mount --user edge --mountpoint .etest/mnt > .etest/mnt.log 2>&1 &
 MP=$!

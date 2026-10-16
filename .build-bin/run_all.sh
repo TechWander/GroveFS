@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Unified test entry for yourfs.
+# Unified test entry for grovefs.
 #
 #   bash .build-bin/run_all.sh                 # full board: build + unit + all suites + bench
 #   bash .build-bin/run_all.sh unit e2e        # only the named suites (build auto-prepended)
@@ -109,7 +109,7 @@ run_bench(){
 }
 
 echo "=================================================================="
-echo " yourfs test board   ($(date '+%Y-%m-%d %H:%M:%S'))"
+echo " grovefs test board   ($(date '+%Y-%m-%d %H:%M:%S'))"
 echo " suites: $SEL"
 echo " logs:   $LOGDIR"
 echo "=================================================================="

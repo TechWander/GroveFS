@@ -32,13 +32,13 @@
 set -u
 cd /data/xy/yourfs
 export PKG_CONFIG=/data/xy/yourfs/.build-bin/pkg-config
-Y=./target/release/yourfs
+Y=./target/release/grove
 S1=127.0.0.1:50141
 S2=127.0.0.1:50142
 SIZE_MB=${SIZE_MB:-512}
 
 rm -rf .bs; mkdir -p .bs/home .bs/r1 .bs/r2 .bs/mnt1 .bs/mnt2
-export YOURFS_HOME=$PWD/.bs/home
+export GROVEFS_HOME=$PWD/.bs/home
 
 secs(){ local t0 t1 rc e; t0=$(date +%s.%N); "$@" >/dev/null 2>&1; rc=$?; t1=$(date +%s.%N)
   e=$(awk -v a="$t0" -v b="$t1" 'BEGIN{ printf "%.3f", b-a }'); echo "$e"; return $rc; }
@@ -59,7 +59,7 @@ cleanup(){ fusermount -u .bs/mnt1 .bs/mnt2 2>/dev/null; kill $M1 $M2 $P1 $P2 2>/
 trap cleanup EXIT
 
 echo "=================================================="
-echo " yourfs STRIPING throughput (size=${SIZE_MB}MB, 1 vs 2 servers)"
+echo " grovefs STRIPING throughput (size=${SIZE_MB}MB, 1 vs 2 servers)"
 echo "=================================================="
 w1=$(secs dd if=/dev/zero of=.bs/mnt1/s.img bs=1M count=$SIZE_MB conv=fsync)
 echo "  1-server  write  bs=1M: ${w1}s  ($(rate $SIZE_MB $w1) MB/s)"

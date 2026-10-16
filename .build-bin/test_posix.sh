@@ -5,9 +5,9 @@
 set -u
 cd /data/xy/yourfs
 export PKG_CONFIG=/data/xy/yourfs/.build-bin/pkg-config
-Y=./target/release/yourfs
+Y=./target/release/grove
 rm -rf .ptest; mkdir -p .ptest/home .ptest/mnt
-export YOURFS_HOME=$PWD/.ptest/home
+export GROVEFS_HOME=$PWD/.ptest/home
 
 cat > .ptest/man <<'EOF'
 mkdir docs

@@ -4,11 +4,11 @@
 //! locks left behind by a SIGKILL'd client, and the renewal heartbeat that keeps
 //! a *live* holder from expiring.
 
-use yourfs::meta::{LockType, MetaEngine, ROOT_INO};
+use grovefs::meta::{LockType, MetaEngine, ROOT_INO};
 
 fn tmpdb(tag: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("yourfs_locks_{tag}_{}.db", std::process::id()));
+    p.push(format!("grovefs_locks_{tag}_{}.db", std::process::id()));
     let _ = std::fs::remove_file(&p);
     let _ = std::fs::remove_file(format!("{}-wal", p.display()));
     let _ = std::fs::remove_file(format!("{}-shm", p.display()));
@@ -143,7 +143,7 @@ fn renewal_extends_lease_and_reaps_only_non_renewing() {
     m.renew_locks(9999);
     // Sweep at a real future horizon: without further renewal the lock expires.
     let future = chrono_like_now_plus(std::time::Duration::from_secs(
-        yourfs::meta::LockLease::secs() as u64 * 2,
+        grovefs::meta::LockLease::secs() as u64 * 2,
     ));
     m.sweep_expired_locks(future);
     assert!(

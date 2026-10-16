@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Error-path & errno correctness for yourfs, asserted via *exact errno numbers*
+# Error-path & errno correctness for grovefs, asserted via *exact errno numbers*
 # using python3 (locale-independent, unlike grepping localized tool messages).
 #   RW mount : ENOTDIR / EISDIR / EEXIST / ENOENT / EINVAL / dir-hardlink -> EPERM
 #   RO mount : EROFS on create/write/mkdir/unlink/rename/chmod/truncate/link/
@@ -7,9 +7,9 @@
 set -u
 cd /data/xy/yourfs
 export PKG_CONFIG=/data/xy/yourfs/.build-bin/pkg-config
-Y=./target/release/yourfs
+Y=./target/release/grove
 rm -rf .xtest; mkdir -p .xtest/home .xtest/mnt .xtest/mnt_ro
-export YOURFS_HOME=$PWD/.xtest/home
+export GROVEFS_HOME=$PWD/.xtest/home
 
 cat > .xtest/man <<'EOF'
 mkdir docs

@@ -15,14 +15,14 @@
 set -u
 cd /data/xy/yourfs
 export PKG_CONFIG=/data/xy/yourfs/.build-bin/pkg-config
-Y=./target/release/yourfs
+Y=./target/release/grove
 # two data servers, distinct roots — the striping targets.
 A=127.0.0.1:50121
 B=127.0.0.1:50122
 STRIPE=$((16*1024*1024))   # 16MiB, matches backend::sharded::STRIPE_BYTES
 
 rm -rf .striping; mkdir -p .striping/home .striping/sA .striping/sB .striping/mnt .striping/mnt_legacy
-export YOURFS_HOME=$PWD/.striping/home    # view DBs (data_ref) live client-side
+export GROVEFS_HOME=$PWD/.striping/home    # view DBs (data_ref) live client-side
 
 echo "=== start two data-servers (distinct roots) ==="
 $Y data-server --listen $A --root $PWD/.striping/sA > .striping/sA.log 2>&1 &
@@ -51,8 +51,8 @@ blocks(){ ls "$1"/blocks 2>/dev/null | wc -l; }
 
 echo "===== 1) create tree + roundtrip over the sharded backend ====="
 T mkdir $M/docs
-T sh -c "printf 'striped yourfs works' > $M/docs/hello.txt"
-chk "$(T cat $M/docs/hello.txt)" "striped yourfs works" "sharded write/read roundtrip"
+T sh -c "printf 'striped grovefs works' > $M/docs/hello.txt"
+chk "$(T cat $M/docs/hello.txt)" "striped grovefs works" "sharded write/read roundtrip"
 
 echo "===== 2) small file (<stripe) lives entirely on server 0 ====="
 na0=$(blocks .striping/sA); nb0=$(blocks .striping/sB)

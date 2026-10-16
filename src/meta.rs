@@ -98,11 +98,11 @@ pub struct LockConflict {
 /// partition, SIGKILL before `release`): with renewal in place the lease can be
 /// short — 15s bounds the post-crash dangling window (down from the old 60s)
 /// while a healthy holder is invisible to it. Operators/tests may override via
-/// `YOURFS_LOCK_LEASE_SECS`.
+/// `GROVEFS_LOCK_LEASE_SECS`.
 pub const LOCK_LEASE_SECS: i64 = 15;
 
 /// Runtime lease knob. The default is `LOCK_LEASE_SECS`. Test suites and
-/// operators may lower/raise it by exporting `YOURFS_LOCK_LEASE_SECS=<secs>`
+/// operators may lower/raise it by exporting `GROVEFS_LOCK_LEASE_SECS=<secs>`
 /// before spawning `mount` / `meta-server` — the CLI surface stays unchanged
 /// (an internal knob, not a supported tuning), so e2e tests can exercise the
 /// SIGKILL-then-expire path without sleeping 60s. Cached on first read.
@@ -118,7 +118,7 @@ impl LockLease {
         if cur > 0 {
             return cur;
         }
-        let v = std::env::var("YOURFS_LOCK_LEASE_SECS")
+        let v = std::env::var("GROVEFS_LOCK_LEASE_SECS")
             .ok()
             .and_then(|s| s.parse::<i64>().ok())
             .filter(|n| *n > 0)
@@ -638,7 +638,7 @@ impl MetaEngine {
     pub fn backup_to_bytes(&self) -> rusqlite::Result<Vec<u8>> {
         static SNAP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = SNAP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = std::env::temp_dir().join(format!("yourfs_snap_{}_{}.db", std::process::id(), n));
+        let tmp = std::env::temp_dir().join(format!("grovefs_snap_{}_{}.db", std::process::id(), n));
         let _ = std::fs::remove_file(&tmp);
         let conn = self.conn.lock();
         let r = conn.execute("VACUUM INTO ?1", params![tmp.to_string_lossy().as_ref()]);
@@ -862,7 +862,7 @@ impl MetaEngine {
     }
 }
 
-/// The metadata interface [`crate::fs_impl::YourFS`] actually depends on. It is
+/// The metadata interface [`crate::fs_impl::GroveFS`] actually depends on. It is
 /// implemented locally by [`MetaEngine`] (a direct per-user SQLite file) and
 /// remotely by [`crate::remote::meta::RemoteMeta`] (TCP to a central
 /// `MetaServer`). The same FUSE code therefore drives either a view that lives

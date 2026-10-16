@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Lock-op latency micro-bench for yourfs (L1).
+# Lock-op latency micro-bench for grovefs (L1).
 #
 # Measures the wall-clock cost of a full acquire/release cycle through two
 # different MetaEngine placements:
@@ -23,14 +23,14 @@ set -u
 cd /data/xy/yourfs
 export LC_ALL=C LANG=C
 export PKG_CONFIG=/data/xy/yourfs/.build-bin/pkg-config
-Y=./target/release/yourfs
+Y=./target/release/grove
 
 N=${N:-500}
 META_A=127.0.0.1:50126
 DATA=127.0.0.1:50127
 
 rm -rf .blk; mkdir -p .blk/home .blk/mnt .blk/central/data .blk/centralmeta .blk/chome .blk/mnt_meta
-export YOURFS_HOME=$PWD/.blk/home
+export GROVEFS_HOME=$PWD/.blk/home
 $Y init --user alice --manifest <(echo 'touch bench.lk') >/dev/null
 
 cleanup(){ fusermount -u .blk/mnt 2>/dev/null; fusermount -u .blk/mnt_meta 2>/dev/null
@@ -66,7 +66,7 @@ baseline(){ # $1=mount file path $2=label  (open+close, no flock)
 }
 
 echo "=================================================="
-echo " yourfs LOCK-OP latency bench (N=$N)"
+echo " grovefs LOCK-OP latency bench (N=$N)"
 echo "=================================================="
 echo "-- A) local mount --home (MetaEngine in the FUSE process) --"
 baseline "$F" "open+close only"

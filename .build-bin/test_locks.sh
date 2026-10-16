@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# POSIX advisory-lock e2e for yourfs (L1). Exercises the FUSE `setlk`/`getlk`/
+# POSIX advisory-lock e2e for grovefs (L1). Exercises the FUSE `setlk`/`getlk`/
 # `release` callbacks added in this milestone across the four scenarios that
 # matter:
 #   1. flock -x exclusive across two processes on the SAME mount — second one
@@ -10,7 +10,7 @@
 #      EACCES to match NFS advisory semantics).
 #   4. SIGKILL'd holder — FUSE `release` never runs, but the lease sweep inside
 #      every fresh setlk transaction reaps the stale row. Test overrides the
-#      lease to 3s via `YOURFS_LOCK_LEASE_SECS` (internal knob) so the sleep
+#      lease to 3s via `GROVEFS_LOCK_LEASE_SECS` (internal knob) so the sleep
 #      stays bounded.
 #   5. HA path: a primary meta-server + a standby, client mounts through
 #      `--meta primary,standby`; the `locks` table lives inside the SAME view
@@ -25,12 +25,12 @@ export LC_ALL=C LANG=C
 export PKG_CONFIG=/data/xy/yourfs/.build-bin/pkg-config
 # Short lease so section 4 finishes in seconds, not minutes. Local mounts pick
 # this up through `LockLease::secs()` reading the env at first call.
-export YOURFS_LOCK_LEASE_SECS=3
+export GROVEFS_LOCK_LEASE_SECS=3
 
-Y=./target/release/yourfs
+Y=./target/release/grove
 
 rm -rf .locks; mkdir -p .locks/home .locks/m1 .locks/m2
-export YOURFS_HOME=$PWD/.locks/home
+export GROVEFS_HOME=$PWD/.locks/home
 
 cat > .locks/alice.manifest <<'EOF'
 mkdir seed
@@ -49,7 +49,7 @@ M1=.locks/m1
 M2=.locks/m2
 
 # Two mounts of the *same* user against the same view DB. Both processes carry
-# YOURFS_LOCK_LEASE_SECS=3 through the exported env, so their MetaEngine
+# GROVEFS_LOCK_LEASE_SECS=3 through the exported env, so their MetaEngine
 # instances agree on lease duration and cross-process visibility is guaranteed
 # by the shared `locks` SQLite table (WAL + busy_timeout already proven by the
 # `concurrent` suite).

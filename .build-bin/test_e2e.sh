@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# End-to-end functional test for yourfs: multi-user view isolation + POSIX
+# End-to-end functional test for grovefs: multi-user view isolation + POSIX
 # read/write/mkdir/rename/rm/GC. Now assertion-based (pass/fail counters + a
 # real exit code) so the unified runner (run_all.sh) and CI can trust it, while
 # still printing the human-readable steps.
 set -u
 cd /data/xy/yourfs
 export PKG_CONFIG=/data/xy/yourfs/.build-bin/pkg-config
-Y=./target/release/yourfs
+Y=./target/release/grove
 rm -rf .test; mkdir -p .test/home .test/mnt_alice .test/mnt_bob
-export YOURFS_HOME=$PWD/.test/home
+export GROVEFS_HOME=$PWD/.test/home
 
 cat > .test/alice.manifest <<'EOF'
 mkdir projects
@@ -51,11 +51,11 @@ echo "===== 2) isolation: bob must NOT see alice's files ====="
 [ -e "$B/projects"  ] && bad "leak: bob sees alice's projects" || ok "bob has no projects dir"
 
 echo "===== 3) write+read+append roundtrip in alice view ====="
-T sh -c "printf 'hello yourfs' > $A/readme.md"
-chk "$(T cat $A/readme.md)" "hello yourfs" "write then read readme.md"
+T sh -c "printf 'hello grovefs' > $A/readme.md"
+chk "$(T cat $A/readme.md)" "hello grovefs" "write then read readme.md"
 T sh -c "printf ' MORE' >> $A/readme.md"
-chk "$(T cat $A/readme.md)" "hello yourfs MORE" "O_APPEND round-trip"
-chk "$(T stat -c '%s' $A/readme.md)" "17" "size after append = 17"
+chk "$(T cat $A/readme.md)" "hello grovefs MORE" "O_APPEND round-trip"
+chk "$(T stat -c '%s' $A/readme.md)" "18" "size after append = 18"
 
 echo "===== 4) mkdir / touch / rename / rm ====="
 T mkdir $A/newdir

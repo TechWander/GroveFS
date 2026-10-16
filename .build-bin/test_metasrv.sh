@@ -12,7 +12,7 @@ set -u
 cd /data/xy/yourfs
 export LC_ALL=C LANG=C
 export PKG_CONFIG=/data/xy/yourfs/.build-bin/pkg-config
-Y=./target/release/yourfs
+Y=./target/release/grove
 
 META=127.0.0.1:50094
 DATA=127.0.0.1:50095

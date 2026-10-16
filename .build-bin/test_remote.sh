@@ -5,11 +5,11 @@
 set -u
 cd /data/xy/yourfs
 export PKG_CONFIG=/data/xy/yourfs/.build-bin/pkg-config
-Y=./target/release/yourfs
+Y=./target/release/grove
 ADDR=127.0.0.1:50099
 
 rm -rf .test; mkdir -p .test/rhome .test/rsrv .test/mnt_r
-export YOURFS_HOME=$PWD/.test/rhome      # meta (view DBs) live client-side
+export GROVEFS_HOME=$PWD/.test/rhome      # meta (view DBs) live client-side
                                           # physical objects live server-side (.test/rsrv)
 
 echo "=== start data-server (bg) ==="
@@ -37,8 +37,8 @@ T(){ timeout 10 "$@"; }
 
 echo "===== 1) create tree + roundtrip over remote backend ====="
 T mkdir $M/docs
-T sh -c "printf 'remote yourfs works' > $M/docs/hello.txt"
-chk "$(T cat $M/docs/hello.txt)" "remote yourfs works" "remote write/read roundtrip"
+T sh -c "printf 'remote grovefs works' > $M/docs/hello.txt"
+chk "$(T cat $M/docs/hello.txt)" "remote grovefs works" "remote write/read roundtrip"
 
 echo "===== 2) 4MB write + integrity via network (md5) ====="
 head -c 4194304 /dev/urandom > /tmp/rblob
@@ -55,7 +55,7 @@ if [ "$srv" -ge 1 ]; then ok "server holds object(s) ($srv)"; else bad "server h
 
 echo "===== 4) append + truncate roundtrip over network ====="
 T sh -c "printf ' MORE' >> $M/docs/hello.txt"
-chk "$(T cat $M/docs/hello.txt)" "remote yourfs works MORE" "append over network"
+chk "$(T cat $M/docs/hello.txt)" "remote grovefs works MORE" "append over network"
 T truncate -s 6 $M/docs/hello.txt
 chk "$(T stat -c '%s' $M/docs/hello.txt)" "6" "truncate over network"
 

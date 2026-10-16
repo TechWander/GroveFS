@@ -16,7 +16,7 @@
 set -u
 cd /data/xy/yourfs
 export PKG_CONFIG=/data/xy/yourfs/.build-bin/pkg-config
-Y=./target/release/yourfs
+Y=./target/release/grove
 SIZE_MB=${SIZE_MB:-512}
 BS=${BS:-1M}
 
@@ -34,8 +34,8 @@ rate(){ awk -v s="$1" -v t="$2" 'BEGIN{ if(t>0) printf "%.1f", s/t; else print "
 run_case(){ # $1 = --threads value; echoes 3 lines of results
   local TH=$1 TAG="t$1"
   rm -rf .bt-$TAG; mkdir -p .bt-$TAG/home .bt-$TAG/mnt
-  YOURFS_HOME=$PWD/.bt-$TAG/home $Y init --user perf >/dev/null
-  YOURFS_HOME=$PWD/.bt-$TAG/home $Y mount --user perf --mountpoint .bt-$TAG/mnt --threads $TH > .bt-$TAG/mnt.log 2>&1 &
+  GROVEFS_HOME=$PWD/.bt-$TAG/home $Y init --user perf >/dev/null
+  GROVEFS_HOME=$PWD/.bt-$TAG/home $Y mount --user perf --mountpoint .bt-$TAG/mnt --threads $TH > .bt-$TAG/mnt.log 2>&1 &
   local MP=$!
   sleep 1.0
   local M=.bt-$TAG/mnt
@@ -62,7 +62,7 @@ run_case(){ # $1 = --threads value; echoes 3 lines of results
 }
 
 echo "=================================================="
-echo " yourfs multi-thread dispatch A/B  (size=${SIZE_MB}MB bs=${BS})"
+echo " grovefs multi-thread dispatch A/B  (size=${SIZE_MB}MB bs=${BS})"
 echo "=================================================="
 run_case 1
 run_case 4

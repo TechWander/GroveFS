@@ -1,6 +1,6 @@
 //! Wire-protocol codec round-trip tests. No sockets, pure buffer math.
 
-use yourfs::remote::proto;
+use grovefs::remote::proto;
 
 #[test]
 fn key_and_int_roundtrip() {

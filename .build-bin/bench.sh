@@ -6,9 +6,9 @@
 set -u
 cd /data/xy/yourfs
 export PKG_CONFIG=/data/xy/yourfs/.build-bin/pkg-config
-Y=./target/release/yourfs
+Y=./target/release/grove
 rm -rf .bench; mkdir -p .bench/home .bench/mnt
-export YOURFS_HOME=$PWD/.bench/home
+export GROVEFS_HOME=$PWD/.bench/home
 
 $Y init --user perf >/dev/null
 $Y mount --user perf --mountpoint .bench/mnt > .bench/mnt.log 2>&1 &
@@ -35,7 +35,7 @@ rate(){ # $1=size_mb $2=seconds -> MB/s
 }
 
 echo "=================================================="
-echo " yourfs FUSE throughput  (size=${SIZE_MB}MB bs=${BS})"
+echo " grovefs FUSE throughput  (size=${SIZE_MB}MB bs=${BS})"
 echo "=================================================="
 
 echo "--- [A] direct write to underlying fs (baseline) ---"
@@ -43,17 +43,17 @@ base_t=$(secs dd if=/dev/zero of=.bench/direct.img bs=$BS count=$SIZE_MB conv=fs
 sync
 echo "  baseline write: ${base_t}s  ($(rate $SIZE_MB $base_t) MB/s)"
 
-echo "--- [B] write through yourfs mount ---"
+echo "--- [B] write through grovefs mount ---"
 fuse_t=$(secs dd if=/dev/zero of=$M/fuse.img bs=$BS count=$SIZE_MB conv=fsync 2>/dev/null)
-echo "  yourfs   write: ${fuse_t}s  ($(rate $SIZE_MB $fuse_t) MB/s)"
+echo "  grovefs   write: ${fuse_t}s  ($(rate $SIZE_MB $fuse_t) MB/s)"
 
-echo "--- [C] drop caches-ish: read back through yourfs ---"
+echo "--- [C] drop caches-ish: read back through grovefs ---"
 rd_t=$(secs dd if=$M/fuse.img of=/dev/null bs=$BS 2>/dev/null)
-echo "  yourfs    read: ${rd_t}s  ($(rate $SIZE_MB $rd_t) MB/s)"
+echo "  grovefs    read: ${rd_t}s  ($(rate $SIZE_MB $rd_t) MB/s)"
 
-echo "--- [D] re-read (warm) through yourfs ---"
+echo "--- [D] re-read (warm) through grovefs ---"
 rd2_t=$(secs dd if=$M/fuse.img of=/dev/null bs=$BS 2>/dev/null)
-echo "  yourfs read(warm): ${rd2_t}s  ($(rate $SIZE_MB $rd2_t) MB/s)"
+echo "  grovefs read(warm): ${rd2_t}s  ($(rate $SIZE_MB $rd2_t) MB/s)"
 
 echo "--- [E] small random-ish 4k writes (latency-sensitive path) ---"
 sm_t=$(secs dd if=/dev/zero of=$M/small.img bs=4k count=8192 conv=fsync 2>/dev/null)
@@ -62,9 +62,9 @@ echo "  4k x8192 write: ${sm_t}s  ($(rate 32 $sm_t) MB/s over 32MB)"
 echo "--- [F] 2M-block read (local backend has no connection pool; the"
 echo "     RemoteBackend chunked-read path is measured by bench_remote.sh) ---"
 b2_t=$(secs dd if=$M/fuse.img of=/dev/null bs=2M 2>/dev/null)
-echo "  yourfs read bs=2M: ${b2_t}s  ($(rate $SIZE_MB $b2_t) MB/s)"
+echo "  grovefs read bs=2M: ${b2_t}s  ($(rate $SIZE_MB $b2_t) MB/s)"
 
 echo
-echo "integrity: md5 of source vs yourfs copy"
+echo "integrity: md5 of source vs grovefs copy"
 sha256sum $M/fuse.img | cut -c1-16
 echo "DONE"
