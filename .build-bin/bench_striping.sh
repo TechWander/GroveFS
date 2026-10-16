@@ -30,8 +30,8 @@
 #   2-stripe  write ~200 MB/s   read ~360 MB/s   (mount-level, cache-thrashed;
 #     superseded by the isolated probe above for interpretation)
 set -u
-cd /data/xy/yourfs
-export PKG_CONFIG=/data/xy/yourfs/.build-bin/pkg-config
+cd /data/xy/grovefs
+export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
 Y=./target/release/grove
 S1=127.0.0.1:50141
 S2=127.0.0.1:50142

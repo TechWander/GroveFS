@@ -3,8 +3,8 @@
 #   symlink/readlink, hardlink (shared object + refcount GC), statfs (df),
 #   setattr timestamps (touch -d / -t), chmod, mkfifo (mknod).
 set -u
-cd /data/xy/yourfs
-export PKG_CONFIG=/data/xy/yourfs/.build-bin/pkg-config
+cd /data/xy/grovefs
+export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
 Y=./target/release/grove
 rm -rf .ptest; mkdir -p .ptest/home .ptest/mnt
 export GROVEFS_HOME=$PWD/.ptest/home

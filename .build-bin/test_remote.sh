@@ -3,8 +3,8 @@
 #   client FUSE daemon  --(TCP framing)-->  data-server  -->  server-local disk
 # Assertion-based pass/fail + real exit code so run_all.sh / CI can trust it.
 set -u
-cd /data/xy/yourfs
-export PKG_CONFIG=/data/xy/yourfs/.build-bin/pkg-config
+cd /data/xy/grovefs
+export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
 Y=./target/release/grove
 ADDR=127.0.0.1:50099
 

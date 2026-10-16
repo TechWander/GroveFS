@@ -4,8 +4,8 @@
 # Quantifies the userspace-FUSE overhead so the "high efficiency" claim is measured,
 # not asserted. Uses only coreutils `dd` + `time` (no fio dependency).
 set -u
-cd /data/xy/yourfs
-export PKG_CONFIG=/data/xy/yourfs/.build-bin/pkg-config
+cd /data/xy/grovefs
+export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
 Y=./target/release/grove
 rm -rf .bench; mkdir -p .bench/home .bench/mnt
 export GROVEFS_HOME=$PWD/.bench/home

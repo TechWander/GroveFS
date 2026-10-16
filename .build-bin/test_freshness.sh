@@ -19,9 +19,9 @@
 #
 # Assertion-based (pass/fail counters + real exit code).
 set -u
-cd /data/xy/yourfs
+cd /data/xy/grovefs
 export LC_ALL=C LANG=C
-export PKG_CONFIG=/data/xy/yourfs/.build-bin/pkg-config
+export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
 Y=./target/release/grove
 
 META=127.0.0.1:50156

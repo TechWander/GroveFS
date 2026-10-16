@@ -5,8 +5,8 @@
 #   RO mount : EROFS on create/write/mkdir/unlink/rename/chmod/truncate/link/
 #              symlink, while read/list/stat keep working.
 set -u
-cd /data/xy/yourfs
-export PKG_CONFIG=/data/xy/yourfs/.build-bin/pkg-config
+cd /data/xy/grovefs
+export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
 Y=./target/release/grove
 rm -rf .xtest; mkdir -p .xtest/home .xtest/mnt .xtest/mnt_ro
 export GROVEFS_HOME=$PWD/.xtest/home

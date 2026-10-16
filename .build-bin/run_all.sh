@@ -25,8 +25,8 @@
 # Each suite is time-boxed; every mount-based suite cleans up its own FUSE mount and
 # this script also force-unmounts any leftover mount before starting and on exit.
 set -u
-cd /data/xy/yourfs
-export PKG_CONFIG=/data/xy/yourfs/.build-bin/pkg-config
+cd /data/xy/grovefs
+export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
 SKIP_BENCH=${SKIP_BENCH:-0}
 
 LOGDIR=.build-bin/logs/$(date +%Y%m%d-%H%M%S)

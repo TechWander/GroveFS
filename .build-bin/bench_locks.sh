@@ -20,9 +20,9 @@
 # Baseline = same loop with the `flock` command dropped, so the diff isolates
 # the FUSE_LK cost.
 set -u
-cd /data/xy/yourfs
+cd /data/xy/grovefs
 export LC_ALL=C LANG=C
-export PKG_CONFIG=/data/xy/yourfs/.build-bin/pkg-config
+export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
 Y=./target/release/grove
 
 N=${N:-500}

@@ -21,7 +21,7 @@
 
 ```bash
 # 依赖:Linux + fuse3(fusermount)、pkg-config shim(已内置,无需 libfuse 开发包)
-export PKG_CONFIG=/data/xy/yourfs/.build-bin/pkg-config   # 构建时需要
+export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config   # 构建时需要
 export LC_ALL=C LANG=C
 cargo build --release                                       # 产物:target/release/grove
 ```
@@ -222,7 +222,7 @@ ps aux | grep grove                     # 查看在跑的 server / mount
 ## 10. 验证与回归
 
 ```bash
-export PKG_CONFIG=/data/xy/yourfs/.build-bin/pkg-config LC_ALL=C LANG=C
+export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config LC_ALL=C LANG=C
 bash .build-bin/run_all.sh                # 全板:build+unit+posix+edge+e2e+remote+errors
                                           #       +resilience+concurrent+metasrv+ha+striping+locks+freshness+bench
 SKIP_BENCH=1 bash .build-bin/run_all.sh   # 跳过吞吐基准(纯功能回归)

@@ -4,8 +4,8 @@
 # real exit code) so the unified runner (run_all.sh) and CI can trust it, while
 # still printing the human-readable steps.
 set -u
-cd /data/xy/yourfs
-export PKG_CONFIG=/data/xy/yourfs/.build-bin/pkg-config
+cd /data/xy/grovefs
+export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
 Y=./target/release/grove
 rm -rf .test; mkdir -p .test/home .test/mnt_alice .test/mnt_bob
 export GROVEFS_HOME=$PWD/.test/home
