@@ -9,15 +9,15 @@
 
 | 概念 | 说明 |
 |------|------|
-| **视图(view)** | 每个用户一棵独立的目录树(含自定义层级),存放在一个 SQLite 库里:`<home>/meta/<user>.db`。不同用户互不可见。 |
+| **视图(view)** | 每个用户一棵独立的目录树(含自定义层级),存放在一个 SQLite 库里:`<home>/meta/<view>.db`。不同用户互不可见。 |
 | **数据对象(object)** | 文件的真实字节。一个文件 = `blocks/` 下的一个对象文件,以 UUID 命名(或条带化的多个分块)。视图里的目录项指向对象 key。 |
 | **基目录(base / `--home`)** | 同时容纳 `blocks/`(数据)和 `meta/`(视图)的物理根。默认 `$GROVEFS_HOME` 或 `~/.grovefs`。 |
 
 数据与视图**天然分离**:视图只是"目录树 + 指针",字节永远在 `blocks/`。
 
-### 关于 `--user` 与路径容量
+### 关于 `--view` 与路径容量
 
-- **`--user` 与 Linux 用户名无关**——只是视图命名空间的**任意标签**。二进制不调 `getpwnam`、不校验 uid、也不要求 `useradd`。`alice`、`team-a`、`u42`、`研究组` 都能当作用户名——只要它是目标文件系统的合法文件名。它的作用只有两个:① 确定 `<home>/meta/<user>.db` 库文件名;② 在 FUSE mount 上打 `grovefs:<user>` 标签供 `mount`/`findmnt` 展示。**鉴权来自「能访问 `--home` / `blocks/`」+ 可选 `--token`**,不来自 Linux 用户。
+- **`--view` 与 Linux 用户名无关**——只是视图命名空间的**任意标签**。二进制不调 `getpwnam`、不校验 uid、也不要求 `useradd`。`alice`、`team-a`、`u42`、`研究组` 都能当作用户名——只要它是目标文件系统的合法文件名。它的作用只有两个:① 确定 `<home>/meta/<view>.db` 库文件名;② 在 FUSE mount 上打 `grovefs:<view>` 标签供 `mount`/`findmnt` 展示。**鉴权来自「能访问 `--home` / `blocks/`」+ 可选 `--token`**,不来自 Linux 用户。
 - **一个用户一棵树、树内路径完全自主**——挂载后,在该 mountpoint 下可以 `mkdir`/`touch` **任意多个**文件与目录、**任意深度**、任意层级,与在自己 home 里操作无差异。不同用户隔离的粒度是「整棵视图树」,不是单个路径。manifest 只是预建骨架的便捷入口,不是路径数量的上限;挂载后随时可 `mkdir -p a/b/c/d/...`。
 
 ---
@@ -44,12 +44,12 @@ Y=./target/release/grove
 BASE=/data/myfs                       # 物理基目录
 
 # 1) 初始化两个用户的视图
-$Y --home $BASE init --user alice
-$Y --home $BASE init --user bob
+$Y --home $BASE init --view alice
+$Y --home $BASE init --view bob
 
 # 2) 挂载(前台运行,Ctrl-C 卸载;或加 & 后台)
-$Y --home $BASE mount --user alice --mountpoint /mnt/alice
-$Y --home $BASE mount --user bob   --mountpoint /mnt/bob     # 另一终端
+$Y --home $BASE mount --view alice --mountpoint /mnt/alice
+$Y --home $BASE mount --view bob   --mountpoint /mnt/bob     # 另一终端
 
 # 3) 像普通目录一样读写
 mkdir -p /mnt/alice/projects/2026
@@ -77,7 +77,7 @@ touch projects/2026/README.txt
 ```
 
 ```bash
-$Y --home $BASE init --user alice --manifest ./seed.txt
+$Y --home $BASE init --view alice --manifest ./seed.txt
 # 输出:applied seed manifest ./seed.txt
 ```
 
@@ -100,7 +100,7 @@ $Y --home /data/cluster meta-server --listen 0.0.0.0:50110
 #   注意 meta-server 的 --home/meta/ 下按需为每个新用户建权威库
 
 # ===== 每台客户机(各自有本地 --home,但不存权威数据/视图) =====
-$Y --home /local/home mount --user alice \
+$Y --home /local/home mount --view alice \
      --data 10.0.0.5:50100 --meta 10.0.0.5:50110 /mnt/alice
 ```
 
@@ -134,7 +134,7 @@ $Y --home /local/home mount --user alice \
 
 ```bash
 # 挂载时给逗号分隔的多个 data-server 地址 → 自动启用确定性条带
-$Y --home /local/home mount --user alice \
+$Y --home /local/home mount --view alice \
      --data 10.0.0.5:50100,10.0.0.6:50100 --meta 10.0.0.5:50110 /mnt/alice
 ```
 
@@ -149,7 +149,7 @@ $Y --home /local/home mount --user alice \
 ### 5.4 备份与迁移
 
 - **数据对象**:`blocks/` 就是普通文件目录,可直接 `rsync`/快照备份。
-- **视图库**:走 SQLite(`<home>/meta/<user>.db`)。**勿在对有写活动时裸拷 DB 文件**;HA 模式下由 meta-server 用备份 API 复制(见 5.5),单机可先停写或 checkpoint 后再拷。
+- **视图库**:走 SQLite(`<home>/meta/<view>.db`)。**勿在对有写活动时裸拷 DB 文件**;HA 模式下由 meta-server 用备份 API 复制(见 5.5),单机可先停写或 checkpoint 后再拷。
 
 ### 5.5 HA 主备(meta-server)
 
@@ -185,7 +185,7 @@ $Y data-server --listen 0.0.0.0:50100 --root /data/cluster/blocks --token s3cr3t
 $Y --home /data/cluster meta-server --listen 0.0.0.0:50110 --token s3cr3t
 
 # 客户端挂载带同一 token(同时覆盖数据面 OP_OPEN 与元数据面 M_OPEN)
-$Y --home /local/home mount --user alice \
+$Y --home /local/home mount --view alice \
      --data 10.0.0.5:50100 --meta 10.0.0.5:50110 --token s3cr3t /mnt/alice
 ```
 
@@ -197,7 +197,7 @@ $Y --home /local/home mount --user alice \
 ## 7. 只读挂载
 
 ```bash
-$Y --home $BASE mount --user alice --mountpoint /mnt/alice_ro --ro
+$Y --home $BASE mount --view alice --mountpoint /mnt/alice_ro --ro
 ```
 所有写操作(create/write/mkdir/unlink/rename/chmod/truncate 等)返回 `EROFS`(内核 MS_RDONLY + 文件系统侧守卫双保险)。适合分发/归档视图。
 
@@ -241,9 +241,9 @@ SKIP_BENCH=1 bash .build-bin/run_all.sh   # 跳过吞吐基准(纯功能回归)
 
 | 目的 | 命令 |
 |------|------|
-| 建视图 | `grove --home H init --user U [--manifest M]` |
-| 本地挂载 | `grove --home H mount --user U -m MP [--ro] [--strict] [--threads N]` |
-| 远程挂载 | `grove --home H mount --user U -m MP --data A[,A2] --meta M[,M_bak] [--token T]` |
+| 建视图 | `grove --home H init --view U [--manifest M]` |
+| 本地挂载 | `grove --home H mount --view U -m MP [--ro] [--strict] [--threads N]` |
+| 远程挂载 | `grove --home H mount --view U -m MP --data A[,A2] --meta M[,M_bak] [--token T]` |
 | 卸载 | `grove umount -m MP` |
 | 数据服务 | `grove data-server --listen IP:PORT --root DIR [--token T]` |
 | 元数据服务 | `grove --home H meta-server --listen IP:PORT [--token T] [--role primary\|standby --peer ADDR]` |

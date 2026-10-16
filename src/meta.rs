@@ -1,4 +1,4 @@
-//! Metadata engine: the per-user **view tree** that makes "different users see
+//! Metadata engine: the per-view **view tree** that makes "different users see
 //! different file lists" possible, plus custom folder hierarchy.
 //!
 //! The physical bytes live in the [`crate::backend::StorageBackend`]; this
@@ -163,7 +163,7 @@ pub struct MetaEngine {
     // A single connection, serialized behind a fast parking_lot mutex. The fuser
     // high-level session is already single-threaded, so this lock mainly guards
     // direct/concurrent callers and keeps each logical metadata op atomic.
-    // Cross-process sharing (the *same* user mounted by two processes) is handled
+    // Cross-process sharing (the *same* view mounted by two processes) is handled
     // by SQLite WAL plus the `busy_timeout` set in `open`, so a contending writer
     // waits for the lock instead of failing with SQLITE_BUSY (which would surface
     // to FUSE as EIO).
@@ -175,7 +175,7 @@ const COLS: &str =
     "id,parent_id,name,is_dir,data_ref,link_target,mode,uid,gid,mtime,atime,ctime,ino";
 
 impl MetaEngine {
-    /// Open (and if necessary initialize) the view database for a user.
+    /// Open (and if necessary initialize) the view database for a view.
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
         Self::open_ex(path, false)
     }
@@ -630,11 +630,11 @@ impl MetaEngine {
 
     /// Consistent whole-database snapshot as raw bytes for HA replication.
     /// Uses SQLite's `VACUUM INTO` (single-writer online backup: the output is
-    /// a complete, checkpointed image — a side-copy of `<user>.db` would race
+    /// a complete, checkpointed image — a side-copy of `<view>.db` would race
     /// WAL checkpoints and could ship a torn file). Holds the engine's own
     /// connection lock for the duration, so replication never reads a
     /// half-written page; the step blocks concurrent metadata writes for the
-    /// vacuum time of one user DB (ms for view-sized trees).
+    /// vacuum time of one view DB (ms for view-sized trees).
     pub fn backup_to_bytes(&self) -> rusqlite::Result<Vec<u8>> {
         static SNAP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = SNAP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -863,11 +863,11 @@ impl MetaEngine {
 }
 
 /// The metadata interface [`crate::fs_impl::GroveFS`] actually depends on. It is
-/// implemented locally by [`MetaEngine`] (a direct per-user SQLite file) and
+/// implemented locally by [`MetaEngine`] (a direct per-view SQLite file) and
 /// remotely by [`crate::remote::meta::RemoteMeta`] (TCP to a central
 /// `MetaServer`). The same FUSE code therefore drives either a view that lives
 /// only on one machine or a *single authoritative* view shared by many clients
-/// over the LAN, without knowing which — this is what makes the same user's
+/// over the LAN, without knowing which — this is what makes the same view's
 /// folder tree consistent across machines.
 pub trait MetaProvider: Send + Sync {
     fn lookup(&self, parent: i64, name: &str) -> Option<NodeInfo>;

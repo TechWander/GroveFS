@@ -129,7 +129,7 @@
       <div class="card"><h4>基目录 <code>--home</code></h4><p>同时容纳 <code>blocks/</code>(数据)和 <code>meta/</code>(视图)的物理根。默认 <code>$GROVEFS_HOME</code> 或 <code>~/.grovefs</code>。</p></div>
     </div>
     <div class="note"><b>关键:</b>视图与数据天然分离。视图只是「目录树 + 指针」,字节永远在 <code>blocks/</code>。这正是"不同用户挂载显示不同列表、数据都在硬盘上"的实现基础。</div>
-    <div class="note"><b><code>--user</code> 与路径容量</b>:<code>--user</code> 是视图命名空间的<b>任意标签</b>,与 <b>Linux 用户名无关</b>——不调 <code>getpwnam</code>、不校验 uid、不要求 <code>useradd</code>。<code>alice</code>、<code>team-a</code>、<code>u42</code>、<code>研究组</code> 都可用,只用作 ① <code>&lt;home&gt;/meta/&lt;user&gt;.db</code> 库文件名 ② FUSE mount 上的 <code>grovefs:&lt;user&gt;</code> 标签。<b>鉴权 = 能访问 <code>--home</code>/<code>blocks/</code> + 可选 <code>--token</code></b>,不来自 Linux 用户身份。一个用户一棵树,树内可 <code>mkdir</code>/<code>touch</code> <b>任意多个</b>文件与目录、<b>任意深度</b>,与自家 home 无差异;跨用户隔离的粒度是「整棵视图树」而不是单个路径。<code>--manifest</code> 只是骨架预建入口,不是路径数量上限。</div>
+    <div class="note"><b><code>--view</code> 与路径容量</b>:<code>--view</code> 是视图命名空间的<b>任意标签</b>,与 <b>Linux 用户名无关</b>——不调 <code>getpwnam</code>、不校验 uid、不要求 <code>useradd</code>。<code>alice</code>、<code>team-a</code>、<code>u42</code>、<code>研究组</code> 都可用,只用作 ① <code>&lt;home&gt;/meta/&lt;user&gt;.db</code> 库文件名 ② FUSE mount 上的 <code>grovefs:&lt;user&gt;</code> 标签。<b>鉴权 = 能访问 <code>--home</code>/<code>blocks/</code> + 可选 <code>--token</code></b>,不来自 Linux 用户身份。一个用户一棵树,树内可 <code>mkdir</code>/<code>touch</code> <b>任意多个</b>文件与目录、<b>任意深度</b>,与自家 home 无差异;跨用户隔离的粒度是「整棵视图树」而不是单个路径。<code>--manifest</code> 只是骨架预建入口,不是路径数量上限。</div>
   </section>
 
   <!-- 2 -->
@@ -163,12 +163,12 @@
 BASE=/data/myfs                       <span class="cmt"># 物理基目录</span>
 
 <span class="cmt"># 1) 初始化两个用户的视图</span>
-$Y --home $BASE init --user alice
-$Y --home $BASE init --user bob
+$Y --home $BASE init --view alice
+$Y --home $BASE init --view bob
 
 <span class="cmt"># 2) 挂载(前台运行,Ctrl-C 即卸载;或加 & 后台)</span>
-$Y --home $BASE mount --user alice --mountpoint /mnt/alice
-$Y --home $BASE mount --user bob   --mountpoint /mnt/bob     <span class="cmt"># 另一终端</span>
+$Y --home $BASE mount --view alice --mountpoint /mnt/alice
+$Y --home $BASE mount --view bob   --mountpoint /mnt/bob     <span class="cmt"># 另一终端</span>
 
 <span class="cmt"># 3) 像普通目录一样读写、建自定义层级</span>
 mkdir -p /mnt/alice/projects/2026
@@ -188,7 +188,7 @@ $Y umount --mountpoint /mnt/alice</code></pre>
 mkdir projects
 mkdir projects/2026
 touch projects/2026/README.txt</code></pre>
-    <pre><code>$Y --home $BASE init --user alice --manifest ./seed.txt
+    <pre><code>$Y --home $BASE init --view alice --manifest ./seed.txt
 <span class="cmt"># 输出:applied seed manifest ./seed.txt</span></code></pre>
     <p>挂载后即见预建层级;重复 mkdir/touch 幂等,不报错。</p>
   </section>
@@ -202,7 +202,7 @@ $Y data-server --listen 0.0.0.0:50100 --root /data/cluster/blocks
 $Y --home /data/cluster meta-server --listen 0.0.0.0:50110
 
 <span class="cmt"># ===== 每台客户机(有本地 --home,但不存权威数据/视图) =====</span>
-$Y --home /local/home mount --user alice \
+$Y --home /local/home mount --view alice \
      --data 10.0.0.5:50100 --meta 10.0.0.5:50110 /mnt/alice</code></pre>
     <table>
       <tr><th>选项</th><th>作用</th></tr>
@@ -239,7 +239,7 @@ $Y --home /local/home mount --user alice \
     </ul>
 
     <h3>7.2 多 data-server 条带(聚合容量/带宽)</h3>
-    <pre><code>$Y --home /local/home mount --user alice \
+    <pre><code>$Y --home /local/home mount --view alice \
      --data 10.0.0.5:50100,10.0.0.6:50100 --meta 10.0.0.5:50110 /mnt/alice</code></pre>
     <ul>
       <li>文件 ≥ <b>16 MiB</b> 才分块;小文件自然只落 chunk0(单节点)。</li>
@@ -270,7 +270,7 @@ $Y --home /data/nodeA meta-server --listen 10.0.0.5:50110 --role primary --peer 
 <span class="cmt"># 真 fencing(opt-in):加 --witness &lt;逗号分隔的 data-server 仲裁者列表,推荐奇数 N&gt;,多数派授权把双写窗口收敛为有界(fail-safe)</span>
 $Y --home /data/nodeA meta-server --listen 10.0.0.5:50110 --role primary --peer 10.0.0.6:50111 --witness 10.0.0.7:50100,10.0.0.8:50100,10.0.0.9:50100
 <span class="cmt"># 客户端故障转移列表:主挂自动切备继续读写</span>
-$Y --home /local/home mount --user alice \
+$Y --home /local/home mount --view alice \
      --meta 10.0.0.5:50110,10.0.0.6:50111 --data 10.0.0.5:50100 /mnt/alice</code></pre>
     <ul>
       <li>两节点必须用<b>各自独立的 <code>--home</code></b>(各存一份视图副本,节点间靠快照复制)。</li>
@@ -288,11 +288,11 @@ $Y --home /local/home mount --user alice \
     <p>中心 server 若裸监听 LAN,任何同网段主机都能按 key 读写对象/打开他人视图。加共享口令(同时覆盖数据面 <code>OP_OPEN</code> 与元数据面 <code>M_OPEN</code>):</p>
     <pre><code>$Y data-server     --listen 0.0.0.0:50100 --root /data/cluster/blocks --token s3cr3t
 $Y --home ... meta-server --listen 0.0.0.0:50110 --token s3cr3t
-$Y --home /local/home mount --user alice --data ... --meta ... --token s3cr3t /mnt/alice</code></pre>
+$Y --home /local/home mount --view alice --data ... --meta ... --token s3cr3t /mnt/alice</code></pre>
     <p>token 不匹配 → 连接时直接 <span class="pill">PermissionDenied</span>,不重试。空 token(默认)= LAN-trusted 无鉴权,仅限可信内网。</p>
 
     <h3>只读挂载</h3>
-    <pre><code>$Y --home $BASE mount --user alice --mountpoint /mnt/alice_ro --ro</code></pre>
+    <pre><code>$Y --home $BASE mount --view alice --mountpoint /mnt/alice_ro --ro</code></pre>
     <p>所有写操作返回 <code>EROFS</code>(内核 <code>MS_RDONLY</code> + 文件系统侧守卫双保险)。适合分发/归档视图。</p>
 
     <h3>性能旋钮</h3>
@@ -324,9 +324,9 @@ SKIP_BENCH=1 bash .build-bin/run_all.sh   <span class="cmt"># 跳过吞吐基准
     <h2 class="title"><span class="num">11</span>命令速查</h2>
     <table>
       <tr><th>目的</th><th>命令</th></tr>
-      <tr><td>建视图</td><td><code>grove --home H init --user U [--manifest M]</code></td></tr>
-      <tr><td>本地挂载</td><td><code>grove --home H mount --user U -m MP [--ro] [--strict] [--threads N]</code></td></tr>
-      <tr><td>远程挂载</td><td><code>grove --home H mount --user U -m MP --data A[,A2] --meta M[,M_bak] [--token T]</code></td></tr>
+      <tr><td>建视图</td><td><code>grove --home H init --view U [--manifest M]</code></td></tr>
+      <tr><td>本地挂载</td><td><code>grove --home H mount --view U -m MP [--ro] [--strict] [--threads N]</code></td></tr>
+      <tr><td>远程挂载</td><td><code>grove --home H mount --view U -m MP --data A[,A2] --meta M[,M_bak] [--token T]</code></td></tr>
       <tr><td>卸载</td><td><code>grove umount -m MP</code></td></tr>
       <tr><td>数据服务</td><td><code>grove data-server --listen IP:PORT --root DIR [--token T]</code></td></tr>
       <tr><td>元数据服务</td><td><code>grove --home H meta-server --listen IP:PORT [--token T] [--role primary|standby --peer ADDR [--sync-repl] [--witness ADDR[,ADDR...]]]</code></td></tr>

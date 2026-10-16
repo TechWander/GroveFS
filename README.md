@@ -15,7 +15,7 @@
 
 `GroveFS` 把「谁能看到什么（视图）」与「数据实际存在哪（对象）」彻底分开：
 
-- **视图 view**：每个用户一棵独立目录树，存为一个 SQLite 库 `<home>/meta/<user>.db`。不同用户互不可见。
+- **视图 view**：每个用户一棵独立目录树，存为一个 SQLite 库 `<home>/meta/<view>.db`。不同用户互不可见。
 - **数据对象 object**：文件的真实字节，统一存在 `blocks/` 下、以 UUID 命名的扁平对象里；视图目录项只持有对象 key（指针）。
 - **基目录 `--home`**：同时容纳 `blocks/`（数据）与 `meta/`（视图）的物理根。
 
@@ -39,7 +39,7 @@
 ```
 ┌─ FUSE 挂载进程  (fs_impl.rs: GroveFS，&self 多线程安全)
 │    ├── MetaProvider trait   视图树访问
-│    │     ├── 本地:  MetaEngine  → <home>/meta/<user>.db
+│    │     ├── 本地:  MetaEngine  → <home>/meta/<view>.db
 │    │     └── 远程:  RemoteMeta  → meta-server（中心权威）
 │    └── StorageBackend trait 数据对象 IO
 │          ├── 本地:  LocalBackend  → <home>/blocks/<key>
@@ -76,12 +76,12 @@ Y=./target/release/grove
 BASE=/data/myfs
 
 # 1) 初始化两个用户的视图
-$Y --home $BASE init --user alice
-$Y --home $BASE init --user bob
+$Y --home $BASE init --view alice
+$Y --home $BASE init --view bob
 
 # 2) 挂载（前台运行，Ctrl-C 即卸载；或加 & 后台）
-$Y --home $BASE mount --user alice --mountpoint /mnt/alice
-$Y --home $BASE mount --user bob   --mountpoint /mnt/bob   # 另一终端
+$Y --home $BASE mount --view alice --mountpoint /mnt/alice
+$Y --home $BASE mount --view bob   --mountpoint /mnt/bob   # 另一终端
 
 # 3) 像普通目录一样读写、建自定义层级
 mkdir -p /mnt/alice/projects/2026
@@ -92,11 +92,11 @@ ls /mnt/bob                               # bob 看不到 alice 的文件
 $Y umount --mountpoint /mnt/alice
 ```
 
-用 manifest 预建层级：`init --user alice --manifest seed.txt`（每行 `mkdir <path>` 或 `touch <path>`，`#` 注释，幂等）。
+用 manifest 预建层级：`init --view alice --manifest seed.txt`（每行 `mkdir <path>` 或 `touch <path>`，`#` 注释，幂等）。
 
-## 关于 `--user` 与路径容量
+## 关于 `--view` 与路径容量
 
-- **`--user` 是视图命名空间的标签，与 Linux 用户名无关**：任意合法文件名字符串都可以（如 `alice`、`team-a`、`u42`、`研究组`）——它只用来 ① 生成 `<home>/meta/<user>.db`，② 在 FUSE 挂载上打 `grovefs:<user>` 标签。二进制不调 `getpwnam`、不做 uid 校验、不需要 `useradd`。**权限来自「能访问 `--home` 与 `blocks/`」+ 可选 `--token`**，不来自 Linux 用户身份。同 `--home` 下不同 `--user` = 不同视图，跨用户不可见。
+- **`--view` 是视图命名空间的标签，与 Linux 用户名无关**：任意合法文件名字符串都可以（如 `alice`、`team-a`、`u42`、`研究组`）——它只用来 ① 生成 `<home>/meta/<view>.db`，② 在 FUSE 挂载上打 `grovefs:<view>` 标签。二进制不调 `getpwnam`、不做 uid 校验、不需要 `useradd`。**权限来自「能访问 `--home` 与 `blocks/`」+ 可选 `--token`**，不来自 Linux 用户身份。同 `--home` 下不同 `--view` = 不同视图，跨用户不可见。
 - **一个用户一棵树，树内路径完全自主**：挂载后该 mountpoint 下可 `mkdir`/`touch` **任意多个**文件与目录、**任意深度**、任意自定义层级，与在自己 home 里的操作一致；视图隔离的粒度是「整棵树」而非「单一路径」。`--manifest` 只是预建骨架的便捷入口，不是路径数量的上限。
 
 ## 生产拓扑：中心存储 + 多客户机 LAN 挂载
@@ -107,7 +107,7 @@ $Y data-server --listen 0.0.0.0:50100 --root /data/cluster/blocks
 $Y --home /data/cluster meta-server --listen 0.0.0.0:50110
 
 # ===== 每台客户机（本地 --home 只放临时缓存，不留权威视图副本）=====
-$Y --home /local/home mount --user alice \
+$Y --home /local/home mount --view alice \
      --data 10.0.0.5:50100 --meta 10.0.0.5:50110 /mnt/alice
 ```
 
@@ -150,7 +150,7 @@ $Y --home /data/nodeA meta-server --listen 10.0.0.5:50110 --role primary --peer 
 # 真 fencing（可选）：加 --witness <逗号分隔的主备都可达的 data-server 仲裁者列表，推荐奇数 N>
 $Y --home /data/nodeA meta-server --listen 10.0.0.5:50110 --role primary --peer 10.0.0.6:50111 --witness 10.0.0.7:50100,10.0.0.8:50100,10.0.0.9:50100
 # 客户端故障转移列表
-$Y --home /local/home mount --user alice --meta 10.0.0.5:50110,10.0.0.6:50111 --data 10.0.0.5:50100 /mnt/alice
+$Y --home /local/home mount --view alice --meta 10.0.0.5:50110,10.0.0.6:50111 --data 10.0.0.5:50100 /mnt/alice
 ```
 
 - 两节点必须用**各自独立的 `--home`**（各存一份视图副本，节点间靠快照复制）。
@@ -165,7 +165,7 @@ $Y --home /local/home mount --user alice --meta 10.0.0.5:50110,10.0.0.6:50111 --
 ```bash
 $Y data-server     --listen 0.0.0.0:50100 --root /data/cluster/blocks --token s3cr3t
 $Y --home ...      meta-server --listen 0.0.0.0:50110 --token s3cr3t
-$Y --home /local/home mount --user alice --data ... --meta ... --token s3cr3t /mnt/alice
+$Y --home /local/home mount --view alice --data ... --meta ... --token s3cr3t /mnt/alice
 ```
 
 token 不匹配 → 连接时直接 `PermissionDenied`，不重试。空 token（默认）= LAN-trusted 无鉴权，仅限可信内网。
@@ -184,7 +184,7 @@ token 不匹配 → 连接时直接 `PermissionDenied`，不重试。空 token�
 ## 备份与迁移
 
 - **数据对象**：`blocks/` 是普通文件目录，可直接 `rsync`/快照备份。
-- **视图库**：`<home>/meta/<user>.db`。**勿在有写活动时裸拷 DB**；单机先停写或 checkpoint 后再拷，HA 模式由 meta-server 用备份 API 复制。
+- **视图库**：`<home>/meta/<view>.db`。**勿在有写活动时裸拷 DB**；单机先停写或 checkpoint 后再拷，HA 模式由 meta-server 用备份 API 复制。
 
 ## 测试
 
@@ -201,9 +201,9 @@ SKIP_BENCH=1 bash .build-bin/run_all.sh   # 跳过吞吐基准（纯功能回归
 
 | 目的 | 命令 |
 | --- | --- |
-| 建视图 | `grove --home H init --user U [--manifest M]` |
-| 本地挂载 | `grove --home H mount --user U -m MP [--ro] [--strict] [--threads N]` |
-| 远程挂载 | `grove --home H mount --user U -m MP --data A[,A2] --meta M[,M_bak] [--token T]` |
+| 建视图 | `grove --home H init --view U [--manifest M]` |
+| 本地挂载 | `grove --home H mount --view U -m MP [--ro] [--strict] [--threads N]` |
+| 远程挂载 | `grove --home H mount --view U -m MP --data A[,A2] --meta M[,M_bak] [--token T]` |
 | 卸载 | `grove umount -m MP` |
 | 数据服务 | `grove data-server --listen IP:PORT --root DIR [--token T]` |
 | 元数据服务 | `grove --home H meta-server --listen IP:PORT [--token T] [--role primary\|standby --peer ADDR [--sync-repl] [--witness DATA_ADDR]]` |
@@ -233,7 +233,7 @@ MIT。
 
 `GroveFS` is a **user-view FUSE filesystem**. It cleanly separates *who sees what* (the view) from *where bytes actually live* (the object):
 
-- **View**: each user gets a private directory tree, stored as one SQLite DB `<home>/meta/<user>.db`. Users cannot see each other's files.
+- **View**: each user gets a private directory tree, stored as one SQLite DB `<home>/meta/<view>.db`. Users cannot see each other's files.
 - **Object**: the real bytes of a file, stored flat under `blocks/` as UUID-named objects; the view's directory entries only hold object keys (pointers).
 - **Base dir `--home`**: the physical root holding both `blocks/` (data) and `meta/` (views).
 
@@ -257,7 +257,7 @@ Three layers, all trait-decoupled:
 ```
 ┌─ FUSE mount process  (fs_impl.rs: GroveFS, &self, thread-safe)
 │    ├── MetaProvider trait   view-tree access
-│    │     ├── local:  MetaEngine  → <home>/meta/<user>.db
+│    │     ├── local:  MetaEngine  → <home>/meta/<view>.db
 │    │     └── remote: RemoteMeta  → meta-server (authoritative)
 │    └── StorageBackend trait  object IO
 │          ├── local:  LocalBackend  → <home>/blocks/<key>
@@ -291,11 +291,11 @@ cargo build --release          # artifact: target/release/grove
 Y=./target/release/grove
 BASE=/data/myfs
 
-$Y --home $BASE init --user alice
-$Y --home $BASE init --user bob
+$Y --home $BASE init --view alice
+$Y --home $BASE init --view bob
 
-$Y --home $BASE mount --user alice --mountpoint /mnt/alice
-$Y --home $BASE mount --user bob   --mountpoint /mnt/bob   # another terminal
+$Y --home $BASE mount --view alice --mountpoint /mnt/alice
+$Y --home $BASE mount --view bob   --mountpoint /mnt/bob   # another terminal
 
 mkdir -p /mnt/alice/projects/2026
 echo "report" > /mnt/alice/projects/2026/report.txt
@@ -304,11 +304,11 @@ ls /mnt/bob                                # bob cannot see alice's files
 $Y umount --mountpoint /mnt/alice
 ```
 
-Seed a hierarchy: `init --user alice --manifest seed.txt` (lines of `mkdir <path>` / `touch <path>`, `#` comments, idempotent).
+Seed a hierarchy: `init --view alice --manifest seed.txt` (lines of `mkdir <path>` / `touch <path>`, `#` comments, idempotent).
 
-## About `--user` and per-view path capacity
+## About `--view` and per-view path capacity
 
-- **`--user` is a view-namespace label, unrelated to Linux usernames**: any legal filename works (`alice`, `team-a`, `u42`, `research_group`). It is used only to (1) name `<home>/meta/<user>.db` and (2) tag the FUSE mount as `grovefs:<user>`. The binary does not call `getpwnam`, does not verify uid, does not require `useradd`. **Access authority comes from being able to reach `--home` / `blocks/` (or holding `--token`), not from the Linux user**. Under the same `--home`, distinct `--user` values map to distinct, mutually invisible views.
+- **`--view` is a view-namespace label, unrelated to Linux usernames**: any legal filename works (`alice`, `team-a`, `u42`, `research_group`). It is used only to (1) name `<home>/meta/<view>.db` and (2) tag the FUSE mount as `grovefs:<view>`. The binary does not call `getpwnam`, does not verify uid, does not require `useradd`. **Access authority comes from being able to reach `--home` / `blocks/` (or holding `--token`), not from the Linux user**. Under the same `--home`, distinct `--view` values map to distinct, mutually invisible views.
 - **One user = one tree, unlimited paths inside**: once mounted you may `mkdir`/`touch` any number of files and directories at any depth under that mountpoint, exactly as in your own home. Per-user isolation applies to the whole tree, not to individual paths. `--manifest` is only a convenience for pre-seeding a skeleton, not a cap on path count or depth.
 
 ## Production topology: central storage + LAN mounts
@@ -319,7 +319,7 @@ $Y data-server --listen 0.0.0.0:50100 --root /data/cluster/blocks
 $Y --home /data/cluster meta-server --listen 0.0.0.0:50110
 
 # each client (local --home holds only a cache; no authoritative view copy)
-$Y --home /local/home mount --user alice \
+$Y --home /local/home mount --view alice \
      --data 10.0.0.5:50100 --meta 10.0.0.5:50110 /mnt/alice
 ```
 

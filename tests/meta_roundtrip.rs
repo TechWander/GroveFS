@@ -2,7 +2,7 @@
 //! socket: a [`MetaServer`] rooted in a temp dir, driven by [`RemoteMeta`]
 //! clients. Exercises the framing + `M_OPEN` handshake + dispatch + real SQLite
 //! view operations without mounting FUSE, and proves the key property: two
-//! clients of the same user share ONE authoritative view tree.
+//! clients of the same view share ONE authoritative view tree.
 
 use std::net::TcpListener;
 
@@ -22,15 +22,15 @@ fn spawn_meta_server() -> (String, tempfile::TempDir) {
     (addr, dir)
 }
 
-fn connect(addr: &str, user: &str) -> RemoteMeta {
+fn connect(addr: &str, view: &str) -> RemoteMeta {
     // Retry a moment: the server thread may not be accepting yet.
     for _ in 0..100 {
-        if let Ok(c) = RemoteMeta::new(addr, user) {
+        if let Ok(c) = RemoteMeta::new(addr, view) {
             return c;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    panic!("could not connect to test meta-server at {addr} as {user}");
+    panic!("could not connect to test meta-server at {addr} as {view}");
 }
 
 const UID: u32 = 1000;
@@ -102,7 +102,7 @@ fn meta_core_ops_roundtrip() {
 fn meta_two_clients_share_one_authoritative_view() {
     let (addr, _d) = spawn_meta_server();
     let a = connect(&addr, "shared");
-    let b = connect(&addr, "shared"); // same user, independent client + socket
+    let b = connect(&addr, "shared"); // same view, independent client + socket
 
     // a creates a subtree
     let id = a.create_node(ROOT_INO, "from_a", true, None, 0o755, UID, GID).unwrap();
@@ -125,13 +125,13 @@ fn meta_per_user_isolation_across_clients() {
     let bob = connect(&addr, "bob");
 
     alice.create_node(ROOT_INO, "secret", true, None, 0o700, UID, GID).unwrap();
-    // Different user -> different engine/DB on the same server -> isolated.
+    // Different view -> different engine/DB on the same server -> isolated.
     assert!(bob.lookup(ROOT_INO, "secret").is_none());
     assert!(bob.readdir(ROOT_INO).is_empty());
 }
 
 /// A server started with a token must reject any `M_OPEN` presenting a
-/// different one, so an unauthorized LAN host can't open arbitrary users' trees.
+/// different one, so an unauthorized LAN host can't open arbitrary views' trees.
 fn spawn_meta_server_auth(token: &str) -> (String, tempfile::TempDir) {
     let dir = tempfile::Builder::new()
         .prefix("grovefs_msrv_auth_")
@@ -180,7 +180,7 @@ fn meta_server_token_auth_gates_access() {
 
 /// The invalidation event bus: a dedicated subscriber socket must be pushed an
 /// EV_ENTRY for structural changes and an EV_INODE for content/attr changes,
-/// driven purely by another client's mutations of the same user.
+/// driven purely by another client's mutations of the same view.
 #[test]
 fn meta_event_bus_pushes_invalidations() {
     let (addr, _d) = spawn_meta_server();
@@ -197,7 +197,7 @@ fn meta_event_bus_pushes_invalidations() {
     // surfaces as an assertion error instead of a stalled suite.
     sub.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
 
-    let m = connect(&addr, "carol"); // separate work connection, same user
+    let m = connect(&addr, "carol"); // separate work connection, same view
 
     // create -> EV_ENTRY(ROOT_INO, "docs")
     let dir = m.create_node(ROOT_INO, "docs", true, None, 0o755, UID, GID).unwrap();
