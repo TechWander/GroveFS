@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# Unified test entry for yourfs.
+#
+#   bash .build-bin/run_all.sh                 # full board: build + unit + all suites + bench
+#   bash .build-bin/run_all.sh unit e2e        # only the named suites (build auto-prepended)
+#   SKIP_BENCH=1 bash .build-bin/run_all.sh    # full board but skip the throughput bench
+#
+# Suites (canonical order):
+#   build   cargo build --release              (gates everything; short-circuits on fail)
+#   unit    cargo test --release (meta/proto/remote integration)
+#   posix   symlink/hardlink/statfs/setattr/chmod/mknod completeness
+#   edge    boundary + concurrency correctness (writeback path)
+#   e2e     multi-user view isolation + read/write e2e
+#   remote  remote (no-NFS) TCP data path e2e
+#   errors  errno correctness (ENOTDIR/EISDIR/EEXIST/ENOENT/EINVAL) + read-only EROFS
+#   resilience  remote data-server restart -> transparent client reconnect
+#   concurrent  same-user multi-process metadata consistency (WAL busy_timeout + tx GC)
+#   metasrv     central meta-server: one authoritative view shared across clients
+#   ha          meta-server primary/standby: replication + failover + event relay
+#   striping    deterministic cross-server data striping (multi --data)
+#   locks       POSIX advisory lock e2e: flock/fcntl/lease/HA-replication
+#   freshness   non-strict cross-client push-invalidation visibility e2e
+#   bench   throughput micro-benchmark        (informational; never gates the result)
+#
+# Each suite is time-boxed; every mount-based suite cleans up its own FUSE mount and
+# this script also force-unmounts any leftover mount before starting and on exit.
+set -u
+cd /data/xy/yourfs
+export PKG_CONFIG=/data/xy/yourfs/.build-bin/pkg-config
+SKIP_BENCH=${SKIP_BENCH:-0}
+
+LOGDIR=.build-bin/logs/$(date +%Y%m%d-%H%M%S)
+mkdir -p "$LOGDIR"
+
+CANON="build unit posix edge e2e remote errors resilience concurrent metasrv ha striping locks freshness bench"
+if [ "$#" -gt 0 ]; then SEL="$*"; else SEL="$CANON"; fi
+[ "$SKIP_BENCH" = "1" ] && SEL=${SEL// bench/}
+
+# validate names
+for s in $SEL; do
+  case " $CANON " in *" $s "*) ;; *) echo "unknown suite '$s'; valid: $CANON"; exit 2 ;; esac
+done
+should(){ case " $SEL " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+
+# ensure a fresh binary whenever a code suite is selected
+NEEDS_BUILD=0
+for s in $SEL; do case "$s" in unit|posix|edge|e2e|remote|errors|resilience|concurrent|metasrv|ha|striping|locks|freshness|bench) NEEDS_BUILD=1 ;; esac; done
+if [ "$NEEDS_BUILD" = 1 ] && ! should build; then SEL="build $SEL"; fi
+
+MOUNTS=".test/mnt_alice .test/mnt_bob .test/mnt_r .ptest/mnt .etest/mnt .xtest/mnt .xtest/mnt_ro .rtest/mnt_a .rtest/mnt_b .ctest/m1 .ctest/m2 .msrv/mnt_a .msrv/mnt_b .msrv/mnt_bob .msrv/mnt_s1 .msrv/mnt_s2 .bench/mnt .bt-t1/mnt .bt-t4/mnt .br/mnt .ha/mnt .ha/mnt_sb .striping/mnt .striping/mnt_legacy .sigtest/mnt .locks/m1 .locks/m2 .locks/ha/mnt .fresh/mnt_a .fresh/mnt_b"
+umount_all(){ for d in $MOUNTS; do fusermount -u "$d" 2>/dev/null || true; done; }
+umount_all
+trap umount_all EXIT
+
+overall=0
+declare -A RESULT
+record(){ # $1=suite $2=PASS|FAIL|TIMEOUT|INFO|SKIP
+  RESULT[$1]="$2"
+  if [ "$2" != PASS ] && [ "$2" != INFO ]; then overall=1; fi
+}
+
+run_build(){
+  echo "### build — cargo build --release"
+  if timeout 900 cargo build --release >"$LOGDIR/build.log" 2>&1; then
+    echo "  OK"; record build PASS; return 0
+  else
+    echo "  FAILED (see $LOGDIR/build.log)"; tail -25 "$LOGDIR/build.log"
+    record build FAIL; return 1
+  fi
+}
+
+run_unit(){
+  echo "### unit — cargo test --release"
+  if timeout 900 cargo test --release >"$LOGDIR/unit.log" 2>&1; then
+    grep -E 'test result:' "$LOGDIR/unit.log" | sed 's/^/  /'
+    record unit PASS
+  else
+    echo "  FAILED (see $LOGDIR/unit.log)"
+    grep -E 'test result:|error(\[|:)|panicked|FAILED' "$LOGDIR/unit.log" | tail -25 | sed 's/^/  /'
+    record unit FAIL
+  fi
+}
+
+run_mountsuite(){ # $1=key $2=script $3=timeout
+  local key="$1" script="$2" to="$3" log="$LOGDIR/$1.log" rc sum
+  echo "### $key — bash $script (<= ${to}s)"
+  if timeout "$to" bash "$script" >"$log" 2>&1; then rc=0; else rc=$?; fi
+  sum=$(grep -E 'SUMMARY: pass=' "$log" | tail -1)
+  if [ "$rc" -eq 0 ]; then
+    echo "  OK :: ${sum:-completed}"; record "$key" PASS
+  elif [ "$rc" -eq 124 ]; then
+    echo "  TIMEOUT after ${to}s (see $log)"; tail -12 "$log" | sed 's/^/  /'; record "$key" TIMEOUT
+  else
+    echo "  FAILED rc=$rc :: ${sum:-no-summary} (see $log)"; tail -20 "$log" | sed 's/^/  /'; record "$key" FAIL
+  fi
+}
+
+run_bench(){
+  echo "### bench — throughput micro-benchmark (informational)"
+  local log="$LOGDIR/bench.log" rc
+  timeout 900 bash .build-bin/bench.sh >"$log" 2>&1; rc=$?
+  if [ "$rc" -eq 0 ]; then
+    grep -E 'MB/s' "$log" | sed 's/^/  /'
+    echo "  (full log: $log)"
+  else
+    echo "  bench rc=$rc (see $log)"; tail -10 "$log" | sed 's/^/  /'
+  fi
+  record bench INFO   # never gates
+}
+
+echo "=================================================================="
+echo " yourfs test board   ($(date '+%Y-%m-%d %H:%M:%S'))"
+echo " suites: $SEL"
+echo " logs:   $LOGDIR"
+echo "=================================================================="
+
+stop=0
+for s in $CANON; do
+  should "$s" || { RESULT[$s]=SKIP; continue; }
+  if [ "$stop" = 1 ]; then RESULT[$s]=SKIP; continue; fi
+  case "$s" in
+    build)  run_build  || stop=1 ;;
+    unit)   run_unit ;;
+    posix)  run_mountsuite posix  .build-bin/test_posix.sh  240 ;;
+    edge)   run_mountsuite edge   .build-bin/test_edge.sh   300 ;;
+    e2e)    run_mountsuite e2e    .build-bin/test_e2e.sh    240 ;;
+    remote) run_mountsuite remote .build-bin/test_remote.sh 300 ;;
+    errors) run_mountsuite errors .build-bin/test_errors.sh 180 ;;
+    resilience) run_mountsuite resilience .build-bin/test_resilience.sh 240 ;;
+    concurrent) run_mountsuite concurrent .build-bin/test_concurrent.sh 300 ;;
+    metasrv)  run_mountsuite metasrv .build-bin/test_metasrv.sh 240 ;;
+    ha)       run_mountsuite ha .build-bin/test_ha.sh 240 ;;
+    striping) run_mountsuite striping .build-bin/test_striping.sh 240 ;;
+    locks)    run_mountsuite locks   .build-bin/test_locks.sh   240 ;;
+    freshness) run_mountsuite freshness .build-bin/test_freshness.sh 240 ;;
+    bench)  run_bench ;;
+  esac
+  echo
+done
+
+if [ "$stop" = 1 ]; then
+  echo "!! build failed — downstream suites skipped"; echo
+fi
+
+echo "========================= BOARD =================================="
+for s in $CANON; do
+  should "$s" || continue
+  printf "  %-7s %s\n" "$s" "${RESULT[$s]:-SKIP}"
+done
+echo "================================================================"
+if [ "$overall" -eq 0 ]; then
+  echo "RESULT: GREEN (all gating suites passed)"
+else
+  echo "RESULT: RED (see failures above; logs in $LOGDIR)"
+fi
+umount_all
+exit $overall

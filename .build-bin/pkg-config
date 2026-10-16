@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Build-time pkg-config SHIM (not a system install).
+# Reason: this host has libfuse 2.9.9 headers+libs but no `pkg-config` binary,
+# and fuser's build.rs insists on probing pkg-config. We point PKG_CONFIG at this
+# script so cargo can link the *already-installed* libfuse2. It never runs at
+# runtime and modifies nothing on the system.
+set -u
+
+libs_flags="-L/usr/lib/x86_64-linux-gnu -lfuse -pthread"
+cflags_flags="-I/usr/include/fuse -D_FILE_OFFSET_BITS=64"
+
+want_libs=0
+want_cflags=0
+have_fuse=0
+have_fuse3=0
+do_version=0
+do_modversion=0
+modname=""
+
+for a in "$@"; do
+  case "$a" in
+    --version) do_version=1 ;;
+    --modversion) do_modversion=1 ;;
+    --libs) want_libs=1 ;;
+    --cflags) want_cflags=1 ;;
+    --exists|--atleast-pkgconfig-version*|--print-variables*|--variable*) : ;;
+    fuse3|fuse3\ *) have_fuse3=1; modname=fuse3 ;;
+    fuse|fuse\ *|\'fuse*) have_fuse=1; modname=fuse ;;
+    *) : ;;
+  esac
+done
+
+if [ "$do_version" = 1 ]; then echo "1.8.1 (shim)"; exit 0; fi
+
+# fuser tries fuse3 first; tell it "no" so it falls back to fuse v2.
+if [ "$have_fuse3" = 1 ] && [ "$have_fuse" = 0 ]; then
+  exit 1
+fi
+
+if [ "$have_fuse" = 1 ]; then
+  if [ "$do_modversion" = 1 ]; then echo "2.9.9"; exit 0; fi
+  out=""
+  [ "$want_cflags" = 1 ] && out="$out $cflags_flags"
+  [ "$want_libs" = 1 ] && out="$out $libs_flags"
+  # If neither --libs nor --cflags requested (e.g. --exists), just succeed.
+  if [ "$want_libs" = 0 ] && [ "$want_cflags" = 0 ]; then out=""; fi
+  echo "${out# }"
+  exit 0
+fi
+
+# Unknown module -> behave like real pkg-config: not found.
+exit 1

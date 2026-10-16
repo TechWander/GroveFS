@@ -1,0 +1,48 @@
+[package]
+name = "yourfs"
+version = "0.1.0"
+edition = "2021"
+description = "A user-view FUSE filesystem with pluggable storage backend, no NFS"
+license = "MIT"
+
+[[bin]]
+name = "yourfs"
+path = "src/main.rs"
+
+[lib]
+name = "yourfs"
+path = "src/lib.rs"
+
+[dependencies]
+# FUSE in userspace. 0.18: high-level Filesystem trait is &self + Send/Sync and
+# the session dispatches concurrently across worker threads (Config::n_threads
+# with per-worker cloned /dev/fuse fds via FUSE_DEV_IOC_CLONE, Linux). The old
+# abi-7-* feature flags are gone; capabilities are negotiated at runtime in
+# `init` (KernelConfig::add_capabilities with InitFlags).
+fuser = "0.18"
+# Embedded metadata engine: view tree + inode mapping. bundled = compile SQLite from source, no system dep
+rusqlite = { version = "0.31", features = ["bundled"] }
+# libc for pread/pwrite/fsync (true positional IO, no seek races)
+libc = "0.2"
+# CLI
+clap = { version = "4", features = ["derive"] }
+# Fast in-process locks for the attribute/handle caches
+parking_lot = "0.12"
+# Stable hashes for inode<->key maps (DoS-resistant)
+fnv = "1.0"
+uuid = { version = "1", features = ["v4"] }
+# Errno mapping
+errno = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = "0.4"
+dirs = "5"
+
+[dev-dependencies]
+# Temp dirs for integration tests (metadata DB, remote data-server backing store)
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
