@@ -312,7 +312,7 @@ fusermount -u /mnt/alice              <span class="cmt"># 等价(前台进程 Ct
 ps aux | grep grove                  <span class="cmt"># 查看在跑的 server / mount</span></code></pre>
     <div class="note"><b>挂载是前台阻塞式</b>(<code>Session::notifier() + run()</code>);常驻用 <code>nohup ... &amp;</code> 或 systemd。<b>不要</b>用 <code>spawn + BackgroundSession::join()</code> 当阻塞等待——<code>join()</code> 会立即卸载。</div>
     <h3>回归验证</h3>
-    <pre><code>export PKG_CONFIG=/data/xy/yourfs/.build-bin/pkg-config LC_ALL=C LANG=C
+    <pre><code>export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config LC_ALL=C LANG=C
 bash .build-bin/run_all.sh                <span class="cmt"># 全板:build+unit+posix+edge+e2e+remote+errors</span>
                                           <span class="cmt">#   +resilience+concurrent+metasrv+ha+striping+locks+freshness+bench</span>
 SKIP_BENCH=1 bash .build-bin/run_all.sh   <span class="cmt"># 跳过吞吐基准(纯功能回归)</span></code></pre>
