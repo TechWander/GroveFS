@@ -1,10 +1,10 @@
 //! Unit tests for the metadata / view-tree engine. No mounting required.
 
-use yourfs::meta::{MetaError, MetaEngine, NodeKind, ROOT_INO};
+use grovefs::meta::{MetaError, MetaEngine, NodeKind, ROOT_INO};
 
 fn tmpdb(tag: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("yourfs_meta_{tag}_{}.db", std::process::id()));
+    p.push(format!("grovefs_meta_{tag}_{}.db", std::process::id()));
     let _ = std::fs::remove_file(&p);
     let _ = std::fs::remove_file(format!("{}-wal", p.display()));
     let _ = std::fs::remove_file(format!("{}-shm", p.display()));
@@ -132,7 +132,7 @@ fn backup_to_bytes_is_a_complete_readable_snapshot() {
     assert!(!snap.is_empty());
 
     let mut p = std::env::temp_dir();
-    p.push(format!("yourfs_backup_copy_{}.db", std::process::id()));
+    p.push(format!("grovefs_backup_copy_{}.db", std::process::id()));
     let _ = std::fs::remove_file(&p);
     std::fs::File::create(&p).unwrap().write_all(&snap).unwrap();
 

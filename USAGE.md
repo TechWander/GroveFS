@@ -1,4 +1,4 @@
-# yourfs 使用说明
+# GroveFS 使用说明
 
 > 用户视图 FUSE 文件系统:物理数据集中存放在硬盘,不同用户挂载各自看到独立的文件列表,
 > 列表支持自定义文件夹层级,彻底脱离 NFS。本文件说明**如何使用**与**如何处理数据**。
@@ -11,7 +11,7 @@
 |------|------|
 | **视图(view)** | 每个用户一棵独立的目录树(含自定义层级),存放在一个 SQLite 库里:`<home>/meta/<user>.db`。不同用户互不可见。 |
 | **数据对象(object)** | 文件的真实字节。一个文件 = `blocks/` 下的一个对象文件,以 UUID 命名(或条带化的多个分块)。视图里的目录项指向对象 key。 |
-| **基目录(base / `--home`)** | 同时容纳 `blocks/`(数据)和 `meta/`(视图)的物理根。默认 `$YOURFS_HOME` 或 `~/.yourfs`。 |
+| **基目录(base / `--home`)** | 同时容纳 `blocks/`(数据)和 `meta/`(视图)的物理根。默认 `$GROVEFS_HOME` 或 `~/.grovefs`。 |
 
 数据与视图**天然分离**:视图只是"目录树 + 指针",字节永远在 `blocks/`。
 
@@ -23,7 +23,7 @@
 # 依赖:Linux + fuse3(fusermount)、pkg-config shim(已内置,无需 libfuse 开发包)
 export PKG_CONFIG=/data/xy/yourfs/.build-bin/pkg-config   # 构建时需要
 export LC_ALL=C LANG=C
-cargo build --release                                       # 产物:target/release/yourfs
+cargo build --release                                       # 产物:target/release/grove
 ```
 
 可执行文件子命令:`init` / `mount` / `umount` / `data-server` / `meta-server`。
@@ -35,7 +35,7 @@ cargo build --release                                       # 产物:target/rele
 数据和视图都在本机同一个 `--home`,无需任何 server。适合先体验功能。
 
 ```bash
-Y=./target/release/yourfs
+Y=./target/release/grove
 BASE=/data/myfs                       # 物理基目录
 
 # 1) 初始化两个用户的视图
@@ -211,7 +211,7 @@ $Y --home $BASE mount --user alice --mountpoint /mnt/alice_ro --ro
 ```bash
 $Y umount --mountpoint /mnt/alice        # 卸载
 fusermount -u /mnt/alice                 # 等价(挂载进程前台运行则 Ctrl-C 即卸载)
-ps aux | grep yourfs                     # 查看在跑的 server / mount
+ps aux | grep grove                     # 查看在跑的 server / mount
 ```
 
 > 挂载进程是前台阻塞式(`Session::notifier() + run()`);要常驻用 `nohup ... &` 或 systemd。
@@ -236,9 +236,9 @@ SKIP_BENCH=1 bash .build-bin/run_all.sh   # 跳过吞吐基准(纯功能回归)
 
 | 目的 | 命令 |
 |------|------|
-| 建视图 | `yourfs --home H init --user U [--manifest M]` |
-| 本地挂载 | `yourfs --home H mount --user U -m MP [--ro] [--strict] [--threads N]` |
-| 远程挂载 | `yourfs --home H mount --user U -m MP --data A[,A2] --meta M[,M_bak] [--token T]` |
-| 卸载 | `yourfs umount -m MP` |
-| 数据服务 | `yourfs data-server --listen IP:PORT --root DIR [--token T]` |
-| 元数据服务 | `yourfs --home H meta-server --listen IP:PORT [--token T] [--role primary\|standby --peer ADDR]` |
+| 建视图 | `grove --home H init --user U [--manifest M]` |
+| 本地挂载 | `grove --home H mount --user U -m MP [--ro] [--strict] [--threads N]` |
+| 远程挂载 | `grove --home H mount --user U -m MP --data A[,A2] --meta M[,M_bak] [--token T]` |
+| 卸载 | `grove umount -m MP` |
+| 数据服务 | `grove data-server --listen IP:PORT --root DIR [--token T]` |
+| 元数据服务 | `grove --home H meta-server --listen IP:PORT [--token T] [--role primary\|standby --peer ADDR]` |

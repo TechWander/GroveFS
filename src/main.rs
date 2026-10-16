@@ -1,4 +1,4 @@
-//! yourfs — a user-view FUSE filesystem.
+//! grovefs — a user-view FUSE filesystem.
 //!
 //! One physical store (`<base>/blocks`, shared), one *view* database per user
 //! (`<base>/meta/<user>.db`). Mounting as a given user surfaces only that
@@ -14,17 +14,17 @@ use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
-use yourfs::backend;
-use yourfs::fs_impl::YourFS;
-use yourfs::meta;
-use yourfs::meta::MetaEngine;
-use yourfs::meta::MetaProvider;
-use yourfs::remote;
+use grovefs::backend;
+use grovefs::fs_impl::GroveFS;
+use grovefs::meta;
+use grovefs::meta::MetaEngine;
+use grovefs::meta::MetaProvider;
+use grovefs::remote;
 
 #[derive(Parser)]
-#[command(name = "yourfs", version, about = "User-view FUSE filesystem, no NFS")]
+#[command(name = "grove", version, about = "User-view FUSE filesystem, no NFS")]
 struct Cli {
-    /// Shared base dir holding blocks/ and meta/. Defaults to $YOURFS_HOME or ~/.yourfs
+    /// Shared base dir holding blocks/ and meta/. Defaults to $GROVEFS_HOME or ~/.grovefs
     #[arg(long, global = true)]
     home: Option<PathBuf>,
 
@@ -192,10 +192,10 @@ fn base_dir(home: &Option<PathBuf>) -> PathBuf {
     if let Some(h) = home {
         return h.clone();
     }
-    if let Ok(h) = std::env::var("YOURFS_HOME") {
+    if let Ok(h) = std::env::var("GROVEFS_HOME") {
         return PathBuf::from(h);
     }
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".yourfs")
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".grovefs")
 }
 
 fn meta_path(base: &Path, user: &str) -> PathBuf {
@@ -306,7 +306,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 None => Arc::from(backend::open_local(&base)?),
             };
-            let fs = YourFS::new(
+            let fs = GroveFS::new(
                 meta_provider,
                 backend,
                 ro || o.iter().any(|s| s == "ro"),
@@ -318,7 +318,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // longer MountOption variants but the `acl` field (session-wide request
             // filtering), with All == allow_other and RootAndOwner == allow_root.
             let mut cfg = fuser::Config::default();
-            cfg.mount_options.push(fuser::MountOption::FSName(format!("yourfs:{user}")));
+            cfg.mount_options.push(fuser::MountOption::FSName(format!("grovefs:{user}")));
             for raw in &o {
                 match raw.as_str() {
                     "allow_root" => cfg.acl = fuser::SessionACL::RootAndOwner,
@@ -388,14 +388,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Cmd::MetaServer { listen, token, role, peer, sync_repl, witness } => {
             let role = if role.eq_ignore_ascii_case("standby") {
-                yourfs::remote::meta::Role::Standby
+                grovefs::remote::meta::Role::Standby
             } else {
-                yourfs::remote::meta::Role::Primary
+                grovefs::remote::meta::Role::Primary
             };
             let mut srv = match token.as_deref() {
                 Some(t) if !t.is_empty() =>
-                    yourfs::remote::MetaServer::with_token(&listen, &base, t),
-                _ => yourfs::remote::MetaServer::new(&listen, &base),
+                    grovefs::remote::MetaServer::with_token(&listen, &base, t),
+                _ => grovefs::remote::MetaServer::new(&listen, &base),
             };
             srv = srv.with_ha(role, peer);
             if sync_repl {

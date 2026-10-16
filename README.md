@@ -1,4 +1,4 @@
-# yourfs
+# GroveFS
 
 > **用户视图 FUSE 文件系统** —— 数据集中存放于硬盘，不同用户挂载各自看到**独立的文件树**（支持自定义层级），彻底脱离 NFS。
 >
@@ -13,13 +13,13 @@
 
 ## 是什么
 
-`yourfs` 把「谁能看到什么（视图）」与「数据实际存在哪（对象）」彻底分开：
+`GroveFS` 把「谁能看到什么（视图）」与「数据实际存在哪（对象）」彻底分开：
 
 - **视图 view**：每个用户一棵独立目录树，存为一个 SQLite 库 `<home>/meta/<user>.db`。不同用户互不可见。
 - **数据对象 object**：文件的真实字节，统一存在 `blocks/` 下、以 UUID 命名的扁平对象里；视图目录项只持有对象 key（指针）。
 - **基目录 `--home`**：同时容纳 `blocks/`（数据）与 `meta/`（视图）的物理根。
 
-在此之上，`yourfs` 可把元数据与数据分别服务化（`meta-server` / `data-server`），让**多台客户机经局域网挂载、共享同一份权威视图**——这才是「数据中心存储 + 机房内 LAN 访问」的落地形态，且**不使用 NFS**。
+在此之上，`GroveFS` 可把元数据与数据分别服务化（`meta-server` / `data-server`），让**多台客户机经局域网挂载、共享同一份权威视图**——这才是「数据中心存储 + 机房内 LAN 访问」的落地形态，且**不使用 NFS**。
 
 ## 核心特性
 
@@ -37,7 +37,7 @@
 三层解耦，全走 trait：
 
 ```
-┌─ FUSE 挂载进程  (fs_impl.rs: YourFS，&self 多线程安全)
+┌─ FUSE 挂载进程  (fs_impl.rs: GroveFS，&self 多线程安全)
 │    ├── MetaProvider trait   视图树访问
 │    │     ├── 本地:  MetaEngine  → <home>/meta/<user>.db
 │    │     └── 远程:  RemoteMeta  → meta-server（中心权威）
@@ -58,12 +58,12 @@
 **前置**（Linux）：Rust（edition 2021）、`pkg-config`、libfuse 开发环境、`/dev/fuse`。元数据引擎 `rusqlite` 用 `bundled` 特性从源码编译 SQLite，**无系统依赖**。
 
 ```bash
-cargo build --release          # 产物：target/release/yourfs
+cargo build --release          # 产物：target/release/grove
 ```
 
 > 注：本仓库在**缺少系统 pkg-config** 的环境里开发，构建脚本通过仓库自带的 shim（`.build-bin/pkg-config`）驱动，故跑测试前需：
 > ```bash
-> export PKG_CONFIG=/path/to/yourfs/.build-bin/pkg-config LC_ALL=C LANG=C
+> export PKG_CONFIG=/path/to/grovefs/.build-bin/pkg-config LC_ALL=C LANG=C
 > ```
 > 若你的环境已有正常 `pkg-config` 与 libfuse，直接 `cargo build --release` 即可。
 
@@ -72,7 +72,7 @@ cargo build --release          # 产物：target/release/yourfs
 数据和视图都在同一个 `--home`，无需任何 server：
 
 ```bash
-Y=./target/release/yourfs
+Y=./target/release/grove
 BASE=/data/myfs
 
 # 1) 初始化两个用户的视图
@@ -184,7 +184,7 @@ token 不匹配 → 连接时直接 `PermissionDenied`，不重试。空 token�
 ## 测试
 
 ```bash
-export PKG_CONFIG=/path/to/yourfs/.build-bin/pkg-config LC_ALL=C LANG=C
+export PKG_CONFIG=/path/to/grovefs/.build-bin/pkg-config LC_ALL=C LANG=C
 cargo test --release                 # 单元 + 集成测试
 bash .build-bin/run_all.sh           # 全板 14 套件
 SKIP_BENCH=1 bash .build-bin/run_all.sh   # 跳过吞吐基准（纯功能回归）
@@ -196,12 +196,12 @@ SKIP_BENCH=1 bash .build-bin/run_all.sh   # 跳过吞吐基准（纯功能回归
 
 | 目的 | 命令 |
 | --- | --- |
-| 建视图 | `yourfs --home H init --user U [--manifest M]` |
-| 本地挂载 | `yourfs --home H mount --user U -m MP [--ro] [--strict] [--threads N]` |
-| 远程挂载 | `yourfs --home H mount --user U -m MP --data A[,A2] --meta M[,M_bak] [--token T]` |
-| 卸载 | `yourfs umount -m MP` |
-| 数据服务 | `yourfs data-server --listen IP:PORT --root DIR [--token T]` |
-| 元数据服务 | `yourfs --home H meta-server --listen IP:PORT [--token T] [--role primary\|standby --peer ADDR [--sync-repl] [--witness DATA_ADDR]]` |
+| 建视图 | `grove --home H init --user U [--manifest M]` |
+| 本地挂载 | `grove --home H mount --user U -m MP [--ro] [--strict] [--threads N]` |
+| 远程挂载 | `grove --home H mount --user U -m MP --data A[,A2] --meta M[,M_bak] [--token T]` |
+| 卸载 | `grove umount -m MP` |
+| 数据服务 | `grove data-server --listen IP:PORT --root DIR [--token T]` |
+| 元数据服务 | `grove --home H meta-server --listen IP:PORT [--token T] [--role primary\|standby --peer ADDR [--sync-repl] [--witness DATA_ADDR]]` |
 
 ## 诚实标注的边界
 
@@ -226,7 +226,7 @@ MIT。
 
 ## What it is
 
-`yourfs` is a **user-view FUSE filesystem**. It cleanly separates *who sees what* (the view) from *where bytes actually live* (the object):
+`GroveFS` is a **user-view FUSE filesystem**. It cleanly separates *who sees what* (the view) from *where bytes actually live* (the object):
 
 - **View**: each user gets a private directory tree, stored as one SQLite DB `<home>/meta/<user>.db`. Users cannot see each other's files.
 - **Object**: the real bytes of a file, stored flat under `blocks/` as UUID-named objects; the view's directory entries only hold object keys (pointers).
@@ -250,7 +250,7 @@ On top of that, metadata and data can each be served as a network service (`meta
 Three layers, all trait-decoupled:
 
 ```
-┌─ FUSE mount process  (fs_impl.rs: YourFS, &self, thread-safe)
+┌─ FUSE mount process  (fs_impl.rs: GroveFS, &self, thread-safe)
 │    ├── MetaProvider trait   view-tree access
 │    │     ├── local:  MetaEngine  → <home>/meta/<user>.db
 │    │     └── remote: RemoteMeta  → meta-server (authoritative)
@@ -271,19 +271,19 @@ Three layers, all trait-decoupled:
 **Prerequisites** (Linux): Rust (edition 2021), `pkg-config`, libfuse development environment, `/dev/fuse`. The metadata engine uses `rusqlite` with the `bundled` feature — SQLite is compiled from source, **no system dependency**.
 
 ```bash
-cargo build --release          # artifact: target/release/yourfs
+cargo build --release          # artifact: target/release/grove
 ```
 
 > Note: this project was developed in an environment **without a system `pkg-config`**; the build scripts drive a repo-shipped shim (`.build-bin/pkg-config`), so before running the tests:
 > ```bash
-> export PKG_CONFIG=/path/to/yourfs/.build-bin/pkg-config LC_ALL=C LANG=C
+> export PKG_CONFIG=/path/to/grovefs/.build-bin/pkg-config LC_ALL=C LANG=C
 > ```
 > If your machine already has a working `pkg-config` and libfuse, plain `cargo build --release` is enough.
 
 ## Quick start (single-node, local)
 
 ```bash
-Y=./target/release/yourfs
+Y=./target/release/grove
 BASE=/data/myfs
 
 $Y --home $BASE init --user alice
@@ -368,7 +368,7 @@ $Y --home /data/nodeA meta-server --listen 10.0.0.5:50110 --role primary --peer 
 ## Testing
 
 ```bash
-export PKG_CONFIG=/path/to/yourfs/.build-bin/pkg-config LC_ALL=C LANG=C
+export PKG_CONFIG=/path/to/grovefs/.build-bin/pkg-config LC_ALL=C LANG=C
 cargo test --release
 bash .build-bin/run_all.sh                 # 14 suites
 SKIP_BENCH=1 bash .build-bin/run_all.sh    # skip throughput bench

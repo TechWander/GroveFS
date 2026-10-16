@@ -1,6 +1,6 @@
-//! yourfs library: the reusable pieces of the user-view FUSE filesystem.
+//! grovefs library: the reusable pieces of the user-view FUSE filesystem.
 //!
-//! Split out from the `yourfs` binary so that the metadata engine, the storage
+//! Split out from the `grove` binary so that the metadata engine, the storage
 //! backend abstraction, and the remote wire protocol can be unit-tested without
 //! mounting anything.
 //!

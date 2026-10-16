@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>yourfs 使用说明 · 用户视图 FUSE 文件系统</title>
+<title>GroveFS 使用说明 · 用户视图 FUSE 文件系统</title>
 <style>
   :root{
     --bg:#0f1117; --panel:#161a23; --card:#1b2029; --border:#2a3140;
@@ -108,7 +108,7 @@
 
 <main>
   <div class="hero">
-    <h1>yourfs <span class="pill">使用说明</span></h1>
+    <h1>GroveFS <span class="pill">使用说明</span></h1>
     <p class="lead">一种<strong>用户视图 FUSE 文件系统</strong>:物理数据集中存放在硬盘,不同用户挂载各自看到独立的文件列表,列表支持自定义文件夹层级,彻底脱离 NFS。</p>
     <div class="badges">
       <span class="badge">语言 <b>Rust</b></span>
@@ -126,7 +126,7 @@
     <div class="grid">
       <div class="card"><h4>视图 view</h4><p>每个用户一棵独立目录树(含自定义层级),存在一个 SQLite 库:<code>&lt;home&gt;/meta/&lt;user&gt;.db</code>。不同用户互不可见。</p></div>
       <div class="card"><h4>数据对象 object</h4><p>文件的真实字节。一个文件 = <code>blocks/</code> 下一个以 UUID 命名的对象(或条带化的多个分块)。视图目录项指向对象 key。</p></div>
-      <div class="card"><h4>基目录 <code>--home</code></h4><p>同时容纳 <code>blocks/</code>(数据)和 <code>meta/</code>(视图)的物理根。默认 <code>$YOURFS_HOME</code> 或 <code>~/.yourfs</code>。</p></div>
+      <div class="card"><h4>基目录 <code>--home</code></h4><p>同时容纳 <code>blocks/</code>(数据)和 <code>meta/</code>(视图)的物理根。默认 <code>$GROVEFS_HOME</code> 或 <code>~/.grovefs</code>。</p></div>
     </div>
     <div class="note"><b>关键:</b>视图与数据天然分离。视图只是「目录树 + 指针」,字节永远在 <code>blocks/</code>。这正是"不同用户挂载显示不同列表、数据都在硬盘上"的实现基础。</div>
   </section>
@@ -136,7 +136,7 @@
     <h2 class="title"><span class="num">2</span>架构与原理</h2>
     <p>三层解耦,全走 trait 抽象:</p>
     <pre class="tree">
-┌─ <span class="k">FUSE 挂载进程</span>  <span class="c">fs_impl.rs:YourFS(&self, 多线程安全)</span>
+┌─ <span class="k">FUSE 挂载进程</span>  <span class="c">fs_impl.rs:GroveFS(&self, 多线程安全)</span>
 │    ├── <span class="k">MetaProvider</span> trait  <span class="c">视图树访问(12 方法)</span>
 │    │     ├── 本地:  <span class="c">MetaEngine</span>  → <span class="c">&lt;home&gt;/meta/&lt;user&gt;.db</span>
 │    │     └── 远程:  <span class="c">RemoteMeta</span>  → <span class="c">meta-server(中心权威)</span>
@@ -158,7 +158,7 @@
   <section id="quick">
     <h2 class="title"><span class="num">3</span>快速上手(单机本地模式)</h2>
     <p class="lead">数据和视图都在本机同一个 <code>--home</code>,无需任何 server,先体验功能最快。</p>
-    <pre><code>Y=./target/release/yourfs
+    <pre><code>Y=./target/release/grove
 BASE=/data/myfs                       <span class="cmt"># 物理基目录</span>
 
 <span class="cmt"># 1) 初始化两个用户的视图</span>
@@ -309,7 +309,7 @@ $Y --home /local/home mount --user alice --data ... --meta ... --token s3cr3t /m
     <h2 class="title"><span class="num">10</span>运维与验证</h2>
     <pre><code>$Y umount --mountpoint /mnt/alice     <span class="cmt"># 卸载</span>
 fusermount -u /mnt/alice              <span class="cmt"># 等价(前台进程 Ctrl-C 即卸载)</span>
-ps aux | grep yourfs                  <span class="cmt"># 查看在跑的 server / mount</span></code></pre>
+ps aux | grep grove                  <span class="cmt"># 查看在跑的 server / mount</span></code></pre>
     <div class="note"><b>挂载是前台阻塞式</b>(<code>Session::notifier() + run()</code>);常驻用 <code>nohup ... &amp;</code> 或 systemd。<b>不要</b>用 <code>spawn + BackgroundSession::join()</code> 当阻塞等待——<code>join()</code> 会立即卸载。</div>
     <h3>回归验证</h3>
     <pre><code>export PKG_CONFIG=/data/xy/yourfs/.build-bin/pkg-config LC_ALL=C LANG=C
@@ -323,12 +323,12 @@ SKIP_BENCH=1 bash .build-bin/run_all.sh   <span class="cmt"># 跳过吞吐基准
     <h2 class="title"><span class="num">11</span>命令速查</h2>
     <table>
       <tr><th>目的</th><th>命令</th></tr>
-      <tr><td>建视图</td><td><code>yourfs --home H init --user U [--manifest M]</code></td></tr>
-      <tr><td>本地挂载</td><td><code>yourfs --home H mount --user U -m MP [--ro] [--strict] [--threads N]</code></td></tr>
-      <tr><td>远程挂载</td><td><code>yourfs --home H mount --user U -m MP --data A[,A2] --meta M[,M_bak] [--token T]</code></td></tr>
-      <tr><td>卸载</td><td><code>yourfs umount -m MP</code></td></tr>
-      <tr><td>数据服务</td><td><code>yourfs data-server --listen IP:PORT --root DIR [--token T]</code></td></tr>
-      <tr><td>元数据服务</td><td><code>yourfs --home H meta-server --listen IP:PORT [--token T] [--role primary|standby --peer ADDR [--sync-repl] [--witness ADDR[,ADDR...]]]</code></td></tr>
+      <tr><td>建视图</td><td><code>grove --home H init --user U [--manifest M]</code></td></tr>
+      <tr><td>本地挂载</td><td><code>grove --home H mount --user U -m MP [--ro] [--strict] [--threads N]</code></td></tr>
+      <tr><td>远程挂载</td><td><code>grove --home H mount --user U -m MP --data A[,A2] --meta M[,M_bak] [--token T]</code></td></tr>
+      <tr><td>卸载</td><td><code>grove umount -m MP</code></td></tr>
+      <tr><td>数据服务</td><td><code>grove data-server --listen IP:PORT --root DIR [--token T]</code></td></tr>
+      <tr><td>元数据服务</td><td><code>grove --home H meta-server --listen IP:PORT [--token T] [--role primary|standby --peer ADDR [--sync-repl] [--witness ADDR[,ADDR...]]]</code></td></tr>
     </table>
   </section>
 
@@ -346,7 +346,7 @@ SKIP_BENCH=1 bash .build-bin/run_all.sh   <span class="cmt"># 跳过吞吐基准
   </section>
 
   <footer>
-    yourfs · 用户视图 FUSE 文件系统使用说明 &nbsp;|&nbsp; 参数以 <code>yourfs &lt;sub&gt; --help</code> 实测输出为准 &nbsp;|&nbsp; 单文件自包含 HTML,可直接浏览器打开或离线分发。
+    GroveFS · 用户视图 FUSE 文件系统使用说明 &nbsp;|&nbsp; 参数以 <code>grove &lt;sub&gt; --help</code> 实测输出为准 &nbsp;|&nbsp; 单文件自包含 HTML,可直接浏览器打开或离线分发。
   </footer>
 </main>
 </div>

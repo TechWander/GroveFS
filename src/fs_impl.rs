@@ -37,7 +37,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// The inode->object binding is immutable for the inode's lifetime, so this map
 /// is populated on lookup/create/open and pruned in `forget` (the kernel's
 /// "inode is dead" signal).
-pub struct YourFS {
+pub struct GroveFS {
     meta: Arc<dyn MetaProvider>,
     backend: Arc<dyn StorageBackend>,
     ino_to_key: RwLock<std::collections::HashMap<u64, String>>,
@@ -86,7 +86,7 @@ fn gen_sid() -> u64 {
     }
 }
 
-impl YourFS {
+impl GroveFS {
     pub fn new(
         meta: Arc<dyn MetaProvider>,
         backend: Arc<dyn StorageBackend>,
@@ -234,7 +234,7 @@ fn timeval_from(secs: i64) -> std::time::SystemTime {
     UNIX_EPOCH + Duration::from_secs(secs.max(0) as u64)
 }
 
-impl fuser::Filesystem for YourFS {
+impl fuser::Filesystem for GroveFS {
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> io::Result<()> {
         // Negotiate kernel-side optimizations. With the session now dispatching
         // concurrently across worker threads these stay the biggest throughput
@@ -870,7 +870,7 @@ impl fuser::Filesystem for YourFS {
     }
 }
 
-/// Debounce window for the write-path mtime touch (see `YourFS::write`).
+/// Debounce window for the write-path mtime touch (see `GroveFS::write`).
 const WRITE_TOUCH_DEBOUNCE: Duration = Duration::from_millis(200);
 
 /// True if `ino`'s write-path mtime should be touched now: either never

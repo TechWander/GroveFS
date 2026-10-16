@@ -7,12 +7,12 @@ use std::net::TcpListener;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use yourfs::backend::{self, StorageBackend};
-use yourfs::remote::{proto, server::{serve_on, serve_on_auth}, RemoteBackend};
+use grovefs::backend::{self, StorageBackend};
+use grovefs::remote::{proto, server::{serve_on, serve_on_auth}, RemoteBackend};
 
 fn spawn_server() -> (String, tempfile::TempDir) {
     let dir = tempfile::Builder::new()
-        .prefix("yourfs_rsrv_")
+        .prefix("grovefs_rsrv_")
         .tempdir()
         .unwrap();
     let backend: Arc<dyn StorageBackend> =
@@ -197,7 +197,7 @@ fn remote_chunked_write_roundtrip() {
 /// objects by key.
 fn spawn_server_auth(token: &str) -> (String, tempfile::TempDir) {
     let dir = tempfile::Builder::new()
-        .prefix("yourfs_rsrv_auth_")
+        .prefix("grovefs_rsrv_auth_")
         .tempdir()
         .unwrap();
     let backend: Arc<dyn StorageBackend> =
@@ -206,7 +206,7 @@ fn spawn_server_auth(token: &str) -> (String, tempfile::TempDir) {
     let addr = listener.local_addr().unwrap().to_string();
     let token = token.to_string();
     std::thread::spawn(move || {
-        let fence = Arc::new(yourfs::remote::server::Fence::new_in_memory());
+        let fence = Arc::new(grovefs::remote::server::Fence::new_in_memory());
         serve_on_auth(listener, backend, &token, fence)
     });
     (addr, dir)
@@ -250,16 +250,16 @@ fn data_server_token_auth_gates_access() {
 /// Spin up a data-server whose witness [`Fence`] the test holds a shared handle
 /// to, so it can raise the fencing token out-of-band (simulating a peer node's
 /// promotion) while a client drives the data plane over a real socket.
-fn spawn_fenced_server() -> (String, Arc<yourfs::remote::server::Fence>, tempfile::TempDir) {
+fn spawn_fenced_server() -> (String, Arc<grovefs::remote::server::Fence>, tempfile::TempDir) {
     let dir = tempfile::Builder::new()
-        .prefix("yourfs_fsrv_")
+        .prefix("grovefs_fsrv_")
         .tempdir()
         .unwrap();
     let backend: Arc<dyn StorageBackend> =
         Arc::from(backend::open_local(dir.path()).unwrap());
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
-    let fence = Arc::new(yourfs::remote::server::Fence::new_in_memory());
+    let fence = Arc::new(grovefs::remote::server::Fence::new_in_memory());
     let f = fence.clone();
     std::thread::spawn(move || serve_on_auth(listener, backend, "", f));
     (addr, fence, dir)

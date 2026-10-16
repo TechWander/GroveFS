@@ -1,16 +1,16 @@
 [package]
-name = "yourfs"
+name = "grovefs"
 version = "0.1.0"
 edition = "2021"
 description = "A user-view FUSE filesystem with pluggable storage backend, no NFS"
 license = "MIT"
 
 [[bin]]
-name = "yourfs"
+name = "grove"
 path = "src/main.rs"
 
 [lib]
-name = "yourfs"
+name = "grovefs"
 path = "src/lib.rs"
 
 [dependencies]

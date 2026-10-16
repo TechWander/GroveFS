@@ -520,7 +520,7 @@ mod tests {
         static SEQ: AtomicU32 = AtomicU32::new(0);
         let mut path = std::env::temp_dir();
         path.push(format!(
-            "yourfs_fence_test_{}_{}",
+            "grovefs_fence_test_{}_{}",
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
