@@ -38,9 +38,9 @@ MP=$!
 wait_port $DATA && wait_port $META || { echo "servers failed"; exit 1; }
 
 # ---- two NON-STRICT client mounts of the same user ----
-$Y --home .fresh/m1 mount --user alice --mountpoint .fresh/mnt_a --meta $META --data $DATA > .fresh/a.log 2>&1 &
+$Y --home .fresh/m1 mount --view alice --mountpoint .fresh/mnt_a --meta $META --data $DATA > .fresh/a.log 2>&1 &
 AP=$!
-$Y --home .fresh/m2 mount --user alice --mountpoint .fresh/mnt_b --meta $META --data $DATA > .fresh/b.log 2>&1 &
+$Y --home .fresh/m2 mount --view alice --mountpoint .fresh/mnt_b --meta $META --data $DATA > .fresh/b.log 2>&1 &
 BP=$!
 sleep 2
 

@@ -5,14 +5,14 @@
 //! for the *data* plane.
 //!
 //! Why this exists: with the view database living on each client, two machines
-//! mounting the same user get two independent copies that diverge. Pointing both
+//! mounting the same view get two independent copies that diverge. Pointing both
 //! at one `MetaServer` collapses them onto a single authoritative SQLite tree,
 //! so a folder one client creates is instantly the same view everywhere, while
-//! per-user isolation still holds (the server keeps one engine per user).
+//! per-view isolation still holds (the server keeps one engine per view).
 //!
 //! Wire framing reuses [`super::proto`] (fixed header + variable body, big-endian
 //! integers, one request/response per socket). Metadata adds a connection-level
-//! `M_OPEN` handshake that binds a socket to a user. Responses reuse the
+//! `M_OPEN` handshake that binds a socket to a view. Responses reuse the
 //! `(status, val, data)` triple: for metadata `status` is 0 on success or a small
 //! [`MetaError`] code (1..7) — *not* an errno — and `data` carries serialized
 //! [`NodeInfo`].
@@ -48,12 +48,12 @@ const M_SETTIMES: u8 = 27;
 const M_TOUCH: u8 = 28;
 /// Turn a connection into a pure event sink: after `M_OPEN` the client sends
 /// `M_SUBSCRIBE` and the server pushes invalidation frames for every mutating
-/// op performed by *other* clients of the same user. The connection then issues
+/// op performed by *other* clients of the same view. The connection then issues
 /// no further requests (it only reads events until it disconnects).
 const M_SUBSCRIBE: u8 = 29;
 /// HA replication (primary -> standby), never sent by mount clients. `M_PING`
 /// is a role heartbeat carrying the sender's epoch and elicits the receiver's
-/// epoch back; `M_PUSH` ships one whole `<user>.db` snapshot; `M_FORWARD`
+/// epoch back; `M_PUSH` ships one whole `<view>.db` snapshot; `M_FORWARD`
 /// relays a batch of invalidation events so clients subscribed to the standby
 /// also see writes that happened on the primary (within one replication tick).
 const M_PING: u8 = 30;
@@ -112,7 +112,7 @@ fn is_write_op(op: u8) -> bool {
 }
 
 // --- HA replication timing -------------------------------------------------
-// A primary pushes a fresh snapshot of every user view db to its standby every
+// A primary pushes a fresh snapshot of every view db to its standby every
 // `REPL_INTERVAL`; the standby's watchdog promotes itself if the primary's
 // heartbeats stop for `PROMOTE_TIMEOUT`. RPO ~= REPL_INTERVAL (see the docs on
 // `start_replicator`/`start_promotion_watchdog` for the honest loss window).
@@ -145,7 +145,7 @@ const WITNESS_LEASE_SLACK: Duration = Duration::from_millis(500);
 /// Per-arbiter timeout for the SYNCHRONOUS re-proof on the latency-critical write
 /// path ([`fenced_for_write`], taken only once the local lease has already
 /// expired). Shorter than [`CONTROL_TIMEOUT`] so a blackholed arbiter cannot add a
-/// full background round-trip to a user's write; the fan-out is parallel, hence the
+/// full background round-trip to a view's write; the fan-out is parallel, hence the
 /// whole quorum re-proof is bounded by this single value. A timed-out probe simply
 /// counts as *unreachable* (never as fenced), so safety is unchanged — only the
 /// stall shrinks. Background callers (replicator tick, watchdog promotion, startup
@@ -331,7 +331,7 @@ fn nodes_from(data: &[u8]) -> io::Result<Vec<NodeInfo>> {
 // ======================= client: RemoteMeta ================================
 
 /// A [`MetaProvider`] that ships view-tree operations to a [`MetaServer`]. One
-/// instance is bound to one user; its pooled sockets each carry that user from
+/// instance is bound to one view; its pooled sockets each carry that view from
 /// the `M_OPEN` handshake. Connection pooling and reconnect-on-restart mirror
 /// [`super::client::RemoteBackend`] — see that module for the concurrency caveat
 /// (fuser's high-level session is single-threaded, so one mount drives the pool
@@ -343,7 +343,7 @@ pub struct RemoteMeta {
     /// Index into `addrs` of the currently-preferred node; advanced on failover
     /// when a node's retry budget is exhausted.
     active: AtomicUsize,
-    user: String,
+    view: String,
     token: String,
     pool: Arc<Mutex<Vec<TcpStream>>>,
     max_conns: usize,
@@ -357,11 +357,11 @@ pub struct RemoteMeta {
 }
 
 impl RemoteMeta {
-    /// Connect to `addr` and complete the `M_OPEN` handshake for `user` with no
+    /// Connect to `addr` and complete the `M_OPEN` handshake for `view` with no
     /// token (matches a server started without one), so a bad address or an
-    /// unknown-user failure surfaces at mount time.
-    pub fn new(addr: &str, user: &str) -> io::Result<Self> {
-        Self::new_with_token(addr, user, "")
+    /// unknown-view failure surfaces at mount time.
+    pub fn new(addr: &str, view: &str) -> io::Result<Self> {
+        Self::new_with_token(addr, view, "")
     }
 
     /// Like [`RemoteMeta::new`], but presents `token` in the `M_OPEN` handshake.
@@ -372,11 +372,11 @@ impl RemoteMeta {
     /// `addr` may be a comma-separated failover list (`primary,standby`): the
     /// client sticks to the first reachable address and only falls over to a
     /// later one once an address exhausts its connect-retry budget.
-    pub fn new_with_token(addr: &str, user: &str, token: &str) -> io::Result<Self> {
+    pub fn new_with_token(addr: &str, view: &str, token: &str) -> io::Result<Self> {
         let this = Self {
             addrs: split_addrs(addr),
             active: AtomicUsize::new(0),
-            user: user.to_string(),
+            view: view.to_string(),
             token: token.to_string(),
             pool: Arc::new(Mutex::new(Vec::new())),
             max_conns: 32,
@@ -418,7 +418,7 @@ impl RemoteMeta {
                         let _ = s.set_write_timeout(Some(self.connect_timeout));
                         let _ = s.set_nodelay(true);
                         let mut body = Vec::new();
-                        proto::put_key(&mut body, &self.user);
+                        proto::put_key(&mut body, &self.view);
                         proto::put_key(&mut body, &self.token);
                         let mut s = s;
                         match Self::call(&mut s, M_OPEN, &body) {
@@ -922,10 +922,10 @@ impl MetaRuntime {
     }
 }
 
-/// Central metadata authority. Holds one [`MetaEngine`] per user (lazily opened
-/// against `<base>/meta/<user>.db`), shared across all connection threads, so
-/// every client mounting the same user sees one consistent tree. Serving a whole
-/// user from a single engine means SQLite writes are serialized in-process by
+/// Central metadata authority. Holds one [`MetaEngine`] per view (lazily opened
+/// against `<base>/meta/<view>.db`), shared across all connection threads, so
+/// every client mounting the same view sees one consistent tree. Serving a whole
+/// view from a single engine means SQLite writes are serialized in-process by
 /// the engine's own mutex — no cross-process divergence by construction.
 ///
 /// With `--role`/`--peer` it additionally runs as one half of a two-node
@@ -963,7 +963,7 @@ impl MetaServer {
 
     /// A server that only serves clients presenting `token` on the `M_OPEN`
     /// handshake. With a non-empty token, unknown/unauthorized callers can no
-    /// longer open arbitrary users' view trees over the LAN.
+    /// longer open arbitrary view trees over the LAN.
     pub fn with_token(listen: &str, base: &Path, token: &str) -> Self {
         Self {
             listen: listen.to_string(),
@@ -1192,15 +1192,15 @@ fn serve_runtime(listener: TcpListener, rt: Arc<MetaRuntime>) {
     }
 }
 
-/// Open (or reuse) the authoritative engine for `user`. A HA standby opens its
+/// Open (or reuse) the authoritative engine for `view`. A HA standby opens its
 /// replicated copy strictly read-only (so a stray write is refused at the SQLite
 /// layer, not merely discouraged); a primary opens read-write.
-fn engine_for(rt: &MetaRuntime, user: &str) -> io::Result<Arc<MetaEngine>> {
+fn engine_for(rt: &MetaRuntime, view: &str) -> io::Result<Arc<MetaEngine>> {
     let mut m = rt.cache.lock();
-    if let Some(e) = m.get(user) {
+    if let Some(e) = m.get(view) {
         return Ok(e.clone());
     }
-    let path = rt.base.join("meta").join(format!("{user}.db"));
+    let path = rt.base.join("meta").join(format!("{view}.db"));
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).ok();
     }
@@ -1208,13 +1208,13 @@ fn engine_for(rt: &MetaRuntime, user: &str) -> io::Result<Arc<MetaEngine>> {
     let engine = Arc::new(
         MetaEngine::open_ex(&path, readonly).map_err(|e| io::Error::other(e.to_string()))?,
     );
-    m.insert(user.to_string(), engine.clone());
+    m.insert(view.to_string(), engine.clone());
     Ok(engine)
 }
 
 // --- server-side invalidation event bus ------------------------------------
 
-/// A pending kernel-cache invalidation the server pushes to a user's other
+/// A pending kernel-cache invalidation the server pushes to a view's other
 /// mounts after a successful mutating op, so peers converge without waiting a
 /// TTL and without `--strict`.
 #[derive(Clone)]
@@ -1227,23 +1227,23 @@ enum Event {
     Inode { ino: i64 },
 }
 
-/// Per-user set of event-sink sockets (write halves), keyed by a connection id
+/// Per-view set of event-sink sockets (write halves), keyed by a connection id
 /// so each subscriber thread can unregister exactly its own handle on EOF.
 type Subscribers = Arc<Mutex<HashMap<String, HashMap<u64, TcpStream>>>>;
 
 /// Monotonic id handed to each subscriber connection.
 static NEXT_SUB: AtomicU64 = AtomicU64::new(1);
 
-/// Push `events` to every subscriber of `user`. The registry mutex is held for
+/// Push `events` to every subscriber of `view`. The registry mutex is held for
 /// the whole send so two op threads can never interleave partial frames on the
 /// same socket; events are small and infrequent, so this global serialization
 /// is cheap. Unreachable sinks are pruned opportunistically.
-fn broadcast(subs: &Subscribers, user: &str, events: &[Event]) {
+fn broadcast(subs: &Subscribers, view: &str, events: &[Event]) {
     if events.is_empty() {
         return;
     }
     let mut reg = subs.lock();
-    if let Some(map) = reg.get_mut(user) {
+    if let Some(map) = reg.get_mut(view) {
         let mut dead: Vec<u64> = Vec::new();
         for (id, s) in map.iter_mut() {
             for ev in events {
@@ -1290,7 +1290,7 @@ fn put_events(buf: &mut Vec<u8>, events: &[Event]) {
     }
 }
 
-/// Inverse of [`put_events`]; cursor `i` starts just past the user key.
+/// Inverse of [`put_events`]; cursor `i` starts just past the view key.
 fn events_from(body: &[u8], i: &mut usize) -> io::Result<Vec<Event>> {
     let count = proto::read_u32(body, i)? as usize;
     let mut out = Vec::with_capacity(count.min(4096));
@@ -1340,12 +1340,12 @@ fn inode_change_events(engine: &MetaEngine, ino: i64) -> Vec<Event> {
 fn serve_subscriber(
     mut reader: BufReader<TcpStream>,
     mut writer: TcpStream,
-    user: &str,
+    view: &str,
     subs: &Subscribers,
 ) -> io::Result<()> {
     let id = NEXT_SUB.fetch_add(1, Ordering::Relaxed);
     let handle = writer.try_clone()?;
-    subs.lock().entry(user.to_string()).or_default().insert(id, handle);
+    subs.lock().entry(view.to_string()).or_default().insert(id, handle);
     proto::send_response(&mut writer, 0, 0, &[])?; // subscribe ack
     // The client sends no further requests here; drain until it hangs up.
     let result = loop {
@@ -1360,7 +1360,7 @@ fn serve_subscriber(
             }
         }
     };
-    if let Some(map) = subs.lock().get_mut(user) {
+    if let Some(map) = subs.lock().get_mut(view) {
         map.remove(&id);
     }
     result
@@ -1372,8 +1372,8 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
     let mut writer = stream;
 
     // First frame distinguishes a client from a peer's replication control
-    // connection: clients always open with `M_OPEN { user, token }`; the peer
-    // opens directly with `M_PING`/`M_PUSH` (never bound to a user).
+    // connection: clients always open with `M_OPEN { view, token }`; the peer
+    // opens directly with `M_PING`/`M_PUSH` (never bound to a view).
     let (op, body) = proto::recv_request(&mut reader)?;
     if op == M_PING || op == M_PUSH {
         return handle_control_conn(&mut reader, &mut writer, rt, op, body);
@@ -1383,7 +1383,7 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
         return Ok(());
     }
     let mut i = 0usize;
-    let user = proto::get_key(&body, &mut i).unwrap_or_default();
+    let view = proto::get_key(&body, &mut i).unwrap_or_default();
     let presented = proto::get_key(&body, &mut i).unwrap_or_default();
     // Enforce the shared secret when one is configured; an empty server token
     // accepts any client (backward-compatible, LAN-trusted).
@@ -1391,11 +1391,11 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
         proto::send_response(&mut writer, E_AUTH, 0, &[])?;
         return Ok(());
     }
-    // Validate the user's view db opens before acking. We deliberately do NOT
+    // Validate the view db opens before acking. We deliberately do NOT
     // cache this engine for the whole connection: under HA a fresh replicated
     // snapshot evicts the cached engine, so live connections must re-resolve it
     // per op to observe the swap (see the loop below).
-    if engine_for(&rt, &user).is_err() {
+    if engine_for(&rt, &view).is_err() {
         proto::send_response(&mut writer, E_DB, 0, &[])?;
         return Ok(());
     }
@@ -1416,7 +1416,7 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
     // work connection (metadata ops) by peeking the next frame.
     let (op, body) = proto::recv_request(&mut reader)?;
     if op == M_SUBSCRIBE {
-        return serve_subscriber(reader, writer, &user, &rt.subs);
+        return serve_subscriber(reader, writer, &view, &rt.subs);
     }
     let mut pending = Some((op, body));
 
@@ -1450,7 +1450,7 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
         }
         // Re-resolve the engine each op: cheap while cached, and picks up a
         // freshly installed snapshot after a replication push evicted the old one.
-        let engine = match engine_for(&rt, &user) {
+        let engine = match engine_for(&rt, &view) {
             Ok(e) => e,
             Err(_) => {
                 proto::send_response(&mut writer, E_DB, 0, &[])?;
@@ -1463,16 +1463,16 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
         // and emit a warn so operators see the degraded RPO honestly. Non-HA
         // or standby roles skip this entirely (their `rt.sync_repl` is false).
         if rt.sync_repl && status == 0 && is_write_op(op) && rt.role() == Role::Primary {
-            push_snapshot_now(&rt, &user, &engine);
+            push_snapshot_now(&rt, &view, &engine);
         }
         proto::send_response(&mut writer, status, val, &data)?;
         if status == 0 && !events.is_empty() {
-            broadcast(&rt.subs, &user, &events);
+            broadcast(&rt.subs, &view, &events);
             // Under HA, also queue the batch for relay to the standby's own
             // subscribers so a client mounted to the standby converges too. The
             // replicator drains this each cycle (<= one REPL_INTERVAL lag).
             if rt.peer.is_some() && rt.role() == Role::Primary {
-                rt.forward.lock().push((user.clone(), events));
+                rt.forward.lock().push((view.clone(), events));
             }
         }
     }
@@ -1481,7 +1481,7 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
 /// Serve a replication / heartbeat control connection initiated by the peer.
 /// Frames are handled request/response on one socket: `M_PING { sender_epoch }`
 /// refreshes the standby's heartbeat and returns our epoch (or [`E_EPOCH`] if
-/// the sender is a stale ex-primary that must stand down); `M_PUSH { user,
+/// the sender is a stale ex-primary that must stand down); `M_PUSH { view,
 /// snapshot }` installs a replicated view db atomically (standby only).
 fn handle_control_conn(
     reader: &mut BufReader<TcpStream>,
@@ -1522,12 +1522,12 @@ fn handle_control_conn(
             }
             M_PUSH => {
                 let mut i = 0usize;
-                let user = proto::get_key(&body, &mut i).unwrap_or_default();
+                let view = proto::get_key(&body, &mut i).unwrap_or_default();
                 let snap = body[i..].to_vec();
                 // Only a standby installs pushes; a node that has promoted (or a
                 // plain primary) is authoritative and rejects the stale copy.
                 if ha.role() == Role::Standby
-                    && install_snapshot(&rt.base, &rt.cache, &user, &snap).is_ok()
+                    && install_snapshot(&rt.base, &rt.cache, &view, &snap).is_ok()
                 {
                     proto::send_response(writer, 0, 0, &[])?;
                 } else {
@@ -1538,9 +1538,9 @@ fn handle_control_conn(
                 // Relay from the primary: deliver to this node's own subscribers
                 // so standby-mounted clients converge (batched, <= one tick).
                 let mut i = 0usize;
-                let user = proto::get_key(&body, &mut i).unwrap_or_default();
+                let view = proto::get_key(&body, &mut i).unwrap_or_default();
                 if let Ok(evs) = events_from(&body, &mut i) {
-                    broadcast(&rt.subs, &user, &evs);
+                    broadcast(&rt.subs, &view, &evs);
                 }
                 proto::send_response(writer, 0, 0, &[])?;
             }
@@ -1565,32 +1565,32 @@ fn handle_control_conn(
     }
 }
 
-/// Atomically replace `<base>/meta/<user>.db` with a replicated snapshot and
+/// Atomically replace `<base>/meta/<view>.db` with a replicated snapshot and
 /// drop the cached engine so the next read opens the fresh copy. The snapshot is
 /// a complete `VACUUM INTO` image (self-contained, rollback-journal), so the old
-/// WAL/shm side files are removed rather than left to shadow it. `user` is
+/// WAL/shm side files are removed rather than left to shadow it. `view` is
 /// validated to keep the peer from steering writes outside the meta dir.
 fn install_snapshot(
     base: &Path,
     cache: &Mutex<HashMap<String, Arc<MetaEngine>>>,
-    user: &str,
+    view: &str,
     snap: &[u8],
 ) -> io::Result<()> {
-    if user.is_empty() || user.contains('/') || user.contains('\\') || user.contains("..") {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "bad user name"));
+    if view.is_empty() || view.contains('/') || view.contains('\\') || view.contains("..") {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "bad view name"));
     }
     let dir = base.join("meta");
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{user}.db"));
-    let tmp = dir.join(format!("{user}.db.push.tmp"));
+    let path = dir.join(format!("{view}.db"));
+    let tmp = dir.join(format!("{view}.db.push.tmp"));
     let mut f = std::fs::File::create(&tmp)?;
     f.write_all(snap)?;
     f.sync_all()?;
     drop(f);
     std::fs::rename(&tmp, &path)?; // same-fs rename is atomic
-    cache.lock().remove(user); // force a reopen of the fresh copy on next access
-    let _ = std::fs::remove_file(dir.join(format!("{user}.db-wal")));
-    let _ = std::fs::remove_file(dir.join(format!("{user}.db-shm")));
+    cache.lock().remove(view); // force a reopen of the fresh copy on next access
+    let _ = std::fs::remove_file(dir.join(format!("{view}.db-wal")));
+    let _ = std::fs::remove_file(dir.join(format!("{view}.db-shm")));
     Ok(())
 }
 
@@ -1640,7 +1640,7 @@ fn max_epoch_on_disk(rt: &MetaRuntime) -> i64 {
 ///
 /// The client's write still succeeded locally; the warn is the honest signal
 /// that RPO for this op has fallen back to `REPL_INTERVAL`.
-fn push_snapshot_now(rt: &MetaRuntime, user: &str, engine: &MetaEngine) {
+fn push_snapshot_now(rt: &MetaRuntime, view: &str, engine: &MetaEngine) {
     let peer = match &rt.peer {
         Some(p) => p.clone(),
         None => return,
@@ -1665,8 +1665,8 @@ fn push_snapshot_now(rt: &MetaRuntime, user: &str, engine: &MetaEngine) {
     };
     let _ = conn.set_read_timeout(Some(SYNC_REPL_ACK_TIMEOUT));
     let _ = conn.set_write_timeout(Some(SYNC_REPL_ACK_TIMEOUT));
-    let mut body = Vec::with_capacity(user.len() + 2 + snap.len());
-    proto::put_key(&mut body, user);
+    let mut body = Vec::with_capacity(view.len() + 2 + snap.len());
+    proto::put_key(&mut body, view);
     body.extend_from_slice(&snap);
     if proto::send_request(&mut conn, M_PUSH, &body).is_err() {
         eprintln!("meta sync-repl: M_PUSH send to {peer} failed; degraded to async for this op");
@@ -1866,7 +1866,7 @@ fn witness_quorum(addrs: &[String], token: &str, epoch: i64, ttl: Duration, time
 }
 
 /// Primary-side replication sender. Every [`REPL_INTERVAL`] it heartbeats its
-/// epoch to the peer and ships a consistent snapshot of every user view db.
+/// epoch to the peer and ships a consistent snapshot of every view db.
 ///
 /// Honest limits: this is an ASYNC archival copy, so `RPO ~= REPL_INTERVAL` —
 /// writes committed just before a crash may not have been pushed and are lost on
@@ -1979,8 +1979,8 @@ fn start_replicator(rt: Arc<MetaRuntime>) {
             // standby's install path. Skip the M_PUSH loop but keep heartbeat
             // (M_PING) and event relay (M_FORWARD) running.
             if !rt.sync_repl {
-                for user in list_users(&rt.base) {
-                    let engine = match engine_for(&rt, &user) {
+                for view in list_users(&rt.base) {
+                    let engine = match engine_for(&rt, &view) {
                         Ok(e) => e,
                         Err(_) => continue,
                     };
@@ -1988,8 +1988,8 @@ fn start_replicator(rt: Arc<MetaRuntime>) {
                         Ok(s) => s,
                         Err(_) => continue,
                     };
-                    let mut body = Vec::with_capacity(user.len() + 2 + snap.len());
-                    proto::put_key(&mut body, &user);
+                    let mut body = Vec::with_capacity(view.len() + 2 + snap.len());
+                    proto::put_key(&mut body, &view);
                     body.extend_from_slice(&snap);
                     if proto::send_request(&mut conn, M_PUSH, &body).is_err() {
                         break;
@@ -2003,9 +2003,9 @@ fn start_replicator(rt: Arc<MetaRuntime>) {
             // standby-mounted subscribers converge too (best-effort: dropped if
             // the peer link is already broken this cycle).
             let pending: Vec<(String, Vec<Event>)> = std::mem::take(&mut *rt.forward.lock());
-            for (user, events) in pending {
+            for (view, events) in pending {
                 let mut body = Vec::new();
-                proto::put_key(&mut body, &user);
+                proto::put_key(&mut body, &view);
                 put_events(&mut body, &events);
                 if proto::send_request(&mut conn, M_FORWARD, &body).is_err() {
                     break;
@@ -2102,8 +2102,8 @@ fn start_promotion_watchdog(rt: Arc<MetaRuntime>, ha: Arc<HaState>) {
         let new_epoch = candidate;
         ha.set_role(Role::Primary);
         rt.cache.lock().clear(); // reopen views read-write on next access
-        for user in list_users(&rt.base) {
-            if let Ok(eng) = engine_for(&rt, &user) {
+        for view in list_users(&rt.base) {
+            if let Ok(eng) = engine_for(&rt, &view) {
                 let _ = eng.set_epoch(new_epoch);
             }
         }
@@ -2112,7 +2112,7 @@ fn start_promotion_watchdog(rt: Arc<MetaRuntime>, ha: Arc<HaState>) {
     });
 }
 
-/// Execute one metadata operation against the user's engine.
+/// Execute one metadata operation against the view's engine.
 fn dispatch_meta(engine: &MetaEngine, op: u8, body: &[u8]) -> (i32, u64, Vec<u8>, Vec<Event>) {
     let mut i = 0usize;
     macro_rules! bail {
@@ -2294,17 +2294,17 @@ fn dispatch_meta(engine: &MetaEngine, op: u8, body: &[u8]) -> (i32, u64, Vec<u8>
 
 /// Open a dedicated event-subscription connection: run `M_OPEN` + `M_SUBSCRIBE`
 /// and return a socket the caller only *reads* — the server pushes invalidation
-/// frames for every mutating op another client of this user performs. Public so
+/// frames for every mutating op another client of this view performs. Public so
 /// a test can attach a raw subscriber without a FUSE session.
 ///
 /// `addr` may be a comma-separated failover list; each address is tried in order
 /// and the first successful subscription is returned (a token rejection is fatal
 /// and not retried against a backup). Used by the mount's listener thread so
 /// invalidation pushes keep flowing after a failover.
-pub fn open_event_stream(addr: &str, user: &str, token: &str) -> io::Result<TcpStream> {
+pub fn open_event_stream(addr: &str, view: &str, token: &str) -> io::Result<TcpStream> {
     let mut last = io::Error::new(io::ErrorKind::ConnectionRefused, "no meta addr");
     for a in split_addrs(addr) {
-        match try_open_event_stream(&a, user, token) {
+        match try_open_event_stream(&a, view, token) {
             Ok(s) => return Ok(s),
             // A rejected token is a config error on every node; don't rotate.
             Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return Err(e),
@@ -2314,13 +2314,13 @@ pub fn open_event_stream(addr: &str, user: &str, token: &str) -> io::Result<TcpS
     Err(last)
 }
 
-fn try_open_event_stream(addr: &str, user: &str, token: &str) -> io::Result<TcpStream> {
+fn try_open_event_stream(addr: &str, view: &str, token: &str) -> io::Result<TcpStream> {
     let mut s = TcpStream::connect(addr)?;
     s.set_read_timeout(None)?; // block waiting for pushed events
     s.set_write_timeout(Some(Duration::from_secs(5)))?;
     s.set_nodelay(true)?;
     let mut body = Vec::new();
-    proto::put_key(&mut body, user);
+    proto::put_key(&mut body, view);
     proto::put_key(&mut body, token);
     proto::send_request(&mut s, M_OPEN, &body)?;
     let (st, _, _) = proto::recv_response(&mut s)?;
@@ -2365,15 +2365,15 @@ fn split_addrs(s: &str) -> Vec<String> {
 /// `--meta` mounts; abandoned harmlessly when the process exits at unmount.
 pub fn spawn_invalidation_listener(
     addr: &str,
-    user: &str,
+    view: &str,
     token: &str,
     notifier: Notifier,
 ) -> thread::JoinHandle<()> {
     let addr = addr.to_string();
-    let user = user.to_string();
+    let view = view.to_string();
     let token = token.to_string();
     thread::spawn(move || loop {
-        match run_event_stream(&addr, &user, &token, &notifier) {
+        match run_event_stream(&addr, &view, &token, &notifier) {
             // A rejected token is a config error; retrying can't fix it.
             Err(ref e) if e.kind() == io::ErrorKind::PermissionDenied => {
                 eprintln!("invalidation listener stopped: token rejected");
@@ -2385,8 +2385,8 @@ pub fn spawn_invalidation_listener(
     })
 }
 
-fn run_event_stream(addr: &str, user: &str, token: &str, notifier: &Notifier) -> io::Result<()> {
-    let mut s = open_event_stream(addr, user, token)?;
+fn run_event_stream(addr: &str, view: &str, token: &str, notifier: &Notifier) -> io::Result<()> {
+    let mut s = open_event_stream(addr, view, token)?;
     loop {
         let (kind, val, data) = proto::recv_response(&mut s)?;
         match kind {
@@ -2436,9 +2436,9 @@ mod ha_tests {
         proto::put_key(&mut body, "alice");
         put_events(&mut body, &events);
         let mut i = 0usize;
-        let user = proto::get_key(&body, &mut i).unwrap();
+        let view = proto::get_key(&body, &mut i).unwrap();
         let back = events_from(&body, &mut i).unwrap();
-        assert_eq!(user, "alice");
+        assert_eq!(view, "alice");
         assert_eq!(back.len(), 3);
         match (&back[0], &back[2]) {
             (Event::Entry { parent: p1, name: n1 }, Event::Entry { parent: p2, name: n2 }) => {

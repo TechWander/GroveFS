@@ -44,7 +44,7 @@ wait_port $META_B || true
 
 # ---- client mounts ----
 # main client: failover list primary,standby
-$Y --home .ha/chome mount --user alice --mountpoint .ha/mnt --meta "$META_A,$META_B" --data $DATA > .ha/c.log 2>&1 &
+$Y --home .ha/chome mount --view alice --mountpoint .ha/mnt --meta "$META_A,$META_B" --data $DATA > .ha/c.log 2>&1 &
 CP=$!
 sleep 2
 
@@ -71,7 +71,7 @@ echo "===== 2) replication: standby received a snapshot of alice.db ====="
 [ -f .ha/b/meta/alice.db ] && ok "standby replicated alice.db exists" || bad "standby alice.db missing (no replication)"
 # a client pointed ONLY at the standby reads the replicated view (proves the
 # snapshot is complete + readable, not a torn file copy)
-$Y --home .ha/sbhome mount --user alice --mountpoint .ha/mnt_sb --meta $META_B --data $DATA > .ha/sb.log 2>&1 &
+$Y --home .ha/sbhome mount --view alice --mountpoint .ha/mnt_sb --meta $META_B --data $DATA > .ha/sb.log 2>&1 &
 SP=$!
 sleep 2
 chk "$(T cat .ha/mnt_sb/p1.txt)" "p1-bytes" "standby-only client reads a primary-written file (replicated view)"
@@ -136,7 +136,7 @@ wait_port $SYNC_D; wait_port $SYNC_A; wait_port $SYNC_B
 grep -q 'synchronous replication ON' .ha/sync_a.log \
   && ok "--sync-repl logged activation" || bad "--sync-repl not activated"
 
-$Y --home .ha/sync_chome mount --user alice --mountpoint .ha/sync_mnt --meta "$SYNC_A,$SYNC_B" --data $SYNC_D > .ha/sync_mnt.log 2>&1 &
+$Y --home .ha/sync_chome mount --view alice --mountpoint .ha/sync_mnt --meta "$SYNC_A,$SYNC_B" --data $SYNC_D > .ha/sync_mnt.log 2>&1 &
 SCP=$!
 sleep 2
 SM=.ha/sync_mnt
@@ -157,7 +157,7 @@ sleep 4
 
 # Mount a fresh client pointing ONLY at the (now-promoted) standby.
 rm -rf .ha/sync_mnt2; mkdir -p .ha/sync_mnt2
-$Y --home .ha/sync_chome mount --user alice --mountpoint .ha/sync_mnt2 --meta $SYNC_B --data $SYNC_D > .ha/sync_mnt2.log 2>&1 &
+$Y --home .ha/sync_chome mount --view alice --mountpoint .ha/sync_mnt2 --meta $SYNC_B --data $SYNC_D > .ha/sync_mnt2.log 2>&1 &
 SCP2=$!
 sleep 2
 
@@ -191,7 +191,7 @@ $Y --home .ha/part_b meta-server --listen $PART_B --role standby --peer $PART_A 
 PBP=$!
 wait_port $PART_D; wait_port $PART_A; wait_port $PART_B
 
-$Y --home .ha/part_chome mount --user alice --mountpoint .ha/part_mnt --meta $PART_A --data $PART_D > .ha/part_mnt.log 2>&1 &
+$Y --home .ha/part_chome mount --view alice --mountpoint .ha/part_mnt --meta $PART_A --data $PART_D > .ha/part_mnt.log 2>&1 &
 PCP=$!
 sleep 2
 # Kill the standby so the next sync push cannot get an ACK.
@@ -374,7 +374,7 @@ grep -q 'registered fencing epoch' .ha/q_a.log && grep -q 'quorum (2/3' .ha/q_a.
 $Y data-server --listen $Q_DC --root .ha/q_dc > .ha/q_dc.log 2>&1 & QDC=$!
 wait_port $Q_DC || true
 rm -rf .ha/qmnt; mkdir -p .ha/qmnt
-$Y --home .ha/qhome mount --user alice --mountpoint .ha/qmnt --meta "$Q_A,$Q_B" --data $Q_DC > .ha/qc.log 2>&1 & QC=$!
+$Y --home .ha/qhome mount --view alice --mountpoint .ha/qmnt --meta "$Q_A,$Q_B" --data $Q_DC > .ha/qc.log 2>&1 & QC=$!
 sleep 2
 T sh -c "printf hi > .ha/qmnt/probe.txt" && [ "$(T cat .ha/qmnt/probe.txt)" = hi ] \
   && ok "client write succeeds under a healthy 3-arbiter quorum" \

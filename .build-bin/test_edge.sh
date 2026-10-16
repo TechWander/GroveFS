@@ -10,8 +10,8 @@ export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
 Y=./target/release/grove
 rm -rf .etest; mkdir -p .etest/home .etest/mnt
 export GROVEFS_HOME=$PWD/.etest/home
-$Y init --user edge >/dev/null
-$Y mount --user edge --mountpoint .etest/mnt > .etest/mnt.log 2>&1 &
+$Y init --view edge >/dev/null
+$Y mount --view edge --mountpoint .etest/mnt > .etest/mnt.log 2>&1 &
 MP=$!
 sleep 1.0
 cleanup(){ fusermount -u .etest/mnt 2>/dev/null; kill $MP 2>/dev/null; }

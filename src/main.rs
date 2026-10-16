@@ -1,13 +1,13 @@
-//! grovefs — a user-view FUSE filesystem.
+//! grovefs — a view-view FUSE filesystem.
 //!
-//! One physical store (`<base>/blocks`, shared), one *view* database per user
-//! (`<base>/meta/<user>.db`). Mounting as a given user surfaces only that
-//! user's view tree. Data IO is fully decoupled from NFS: it goes through the
+//! One physical store (`<base>/blocks`, shared), one *view* database per view
+//! (`<base>/meta/<view>.db`). Mounting as a given view surfaces only that
+//! view tree. Data IO is fully decoupled from NFS: it goes through the
 //! pluggable `StorageBackend` trait (local disk today, gRPC to a cluster later).
 //!
 //! Subcommands:
-//!   init   — create a user's view DB + seed some folders/files from a manifest
-//!   mount  — mount a user's view at a mountpoint (foreground)
+//!   init   — create a view DB + seed some folders/files from a manifest
+//!   mount  — mount a view at a mountpoint (foreground)
 //!   umount — unmount
 
 use clap::{Parser, Subcommand};
@@ -34,19 +34,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Initialize a user's view (creates meta DB, optional seed manifest)
+    /// Initialize a view (creates meta DB, optional seed manifest)
     Init {
         #[arg(long)]
-        user: String,
+        view: String,
         /// Optional manifest file: lines of "mkdir <path>" or "touch <path>"
         /// to pre-build a custom folder hierarchy.
         #[arg(long)]
         manifest: Option<PathBuf>,
     },
-    /// Mount a user's view at a mountpoint (runs in foreground)
+    /// Mount a view at a mountpoint (runs in foreground)
     Mount {
         #[arg(long)]
-        user: String,
+        view: String,
         #[arg(short, long)]
         mountpoint: PathBuf,
         /// Remote data service address (host:port). If set, object IO is shipped
@@ -57,14 +57,14 @@ enum Cmd {
         data: Option<String>,
         /// Remote metadata service address (host:port). If set, the view tree is
         /// served by a central `meta-server` instead of a local `<home>/meta` DB,
-        /// so multiple clients mounting the same user share ONE authoritative view
+        /// so multiple clients mounting the same view share ONE authoritative view
         /// (consistent across machines) rather than diverging local copies.
         /// May be a comma-separated failover list (`primary,standby`): the mount
         /// stays on the first reachable node and falls over to a backup when the
         /// primary dies (pairs with HA `meta-server --role/--peer`).
         #[arg(long)]
         meta: Option<String>,
-        /// Mount the user's view read-only: every mutating operation (create,
+        /// Mount the view read-only: every mutating operation (create,
         /// write, mkdir, unlink, rename, symlink/link, chmod, truncate) returns
         /// EROFS. Enforced by the kernel `MS_RDONLY` flag plus a filesystem-side
         /// guard.
@@ -108,7 +108,7 @@ enum Cmd {
         #[arg(long)]
         token: Option<String>,
     },
-    /// Run the central metadata service: the authoritative per-user view DB that
+    /// Run the central metadata service: the authoritative per-view DB that
     /// many `mount --meta` clients share (no NFS; pairs with `data-server`).
     MetaServer {
         /// Listen address, e.g. 0.0.0.0:50053
@@ -116,7 +116,7 @@ enum Cmd {
         listen: String,
         /// Shared secret clients must present (`mount --token`). When set, the
         /// server refuses any `M_OPEN` whose token differs, so an unauthorized
-        /// host on the LAN can no longer open arbitrary users' view trees. Empty
+        /// host on the LAN can no longer open arbitrary view trees. Empty
         /// (default) keeps the original LAN-trusted, no-auth behavior.
         #[arg(long)]
         token: Option<String>,
@@ -198,8 +198,8 @@ fn base_dir(home: &Option<PathBuf>) -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".grovefs")
 }
 
-fn meta_path(base: &Path, user: &str) -> PathBuf {
-    base.join("meta").join(format!("{user}.db"))
+fn meta_path(base: &Path, view: &str) -> PathBuf {
+    base.join("meta").join(format!("{view}.db"))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -215,10 +215,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(base.join("meta"))?;
 
     match cli.command {
-        Cmd::Init { user, manifest } => {
-            let mp = meta_path(&base, &user);
+        Cmd::Init { view, manifest } => {
+            let mp = meta_path(&base, &view);
             let meta = MetaEngine::open(&mp)?;
-            println!("initialized view db for user '{user}' at {}", mp.display());
+            println!("initialized view '{view}' at {}", mp.display());
             if let Some(mf) = manifest {
                 let backend = backend::open_local(&base)?;
                 seed_manifest(&meta, backend.as_ref(), &mf)?;
@@ -226,7 +226,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Cmd::Mount {
-            user,
+            view,
             mountpoint,
             data,
             meta,
@@ -239,19 +239,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::fs::create_dir_all(&mountpoint)?;
             // Metadata source: a central `meta-server` when --meta is given (a
             // single authoritative view shared across clients), else this machine's
-            // local `<home>/meta/<user>.db`. Both satisfy `MetaProvider`, so the
+            // local `<home>/meta/<view>.db`. Both satisfy `MetaProvider`, so the
             // FUSE layer below is identical either way.
             let meta_provider: Arc<dyn MetaProvider> = match &meta {
                 Some(addr) => {
                     println!("using remote metadata service at {addr}");
                     Arc::new(remote::RemoteMeta::new_with_token(
                         addr,
-                        &user,
+                        &view,
                         token.as_deref().unwrap_or(""),
                     )?)
                 }
                 None => {
-                    let mp = meta_path(&base, &user);
+                    let mp = meta_path(&base, &view);
                     Arc::new(MetaEngine::open(&mp)?)
                 }
             };
@@ -318,7 +318,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // longer MountOption variants but the `acl` field (session-wide request
             // filtering), with All == allow_other and RootAndOwner == allow_root.
             let mut cfg = fuser::Config::default();
-            cfg.mount_options.push(fuser::MountOption::FSName(format!("grovefs:{user}")));
+            cfg.mount_options.push(fuser::MountOption::FSName(format!("grovefs:{view}")));
             for raw in &o {
                 match raw.as_str() {
                     "allow_root" => cfg.acl = fuser::SessionACL::RootAndOwner,
@@ -341,7 +341,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cfg.n_threads = if threads > 1 { Some(threads) } else { None };
             cfg.clone_fd = threads > 1;
             println!(
-                "mounting user '{user}' view at {} (base {}{})",
+                "mounting view '{view}' at {} (base {}{})",
                 mountpoint.display(),
                 base.display(),
                 if want_ro { ", read-only" } else { "" }
@@ -368,11 +368,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(addr) = &meta {
                 let notifier = session.notifier();
                 let tok = token.clone().unwrap_or_default();
-                let _listener = remote::spawn_invalidation_listener(addr, &user, &tok, notifier);
+                let _listener = remote::spawn_invalidation_listener(addr, &view, &tok, notifier);
             }
             spawn_term_unmounter(mountpoint.clone());
             session.run()?;
-            println!("unmounted user '{user}' view at {}", mountpoint.display());
+            println!("unmounted view '{view}' at {}", mountpoint.display());
         }
         Cmd::DataServer { listen, root, token } => {
             std::fs::create_dir_all(&root)?;
@@ -413,7 +413,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Seed a custom folder hierarchy from a simple manifest. Demonstrates that the
-/// view tree is entirely user-defined and decoupled from physical layout.
+/// view tree is entirely view-defined and decoupled from physical layout.
 fn seed_manifest(
     meta: &MetaEngine,
     backend: &dyn backend::StorageBackend,

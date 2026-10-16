@@ -37,7 +37,7 @@ mkdir seed
 touch seed/f1.bin
 touch seed/f2.bin
 EOF
-$Y init --user alice --manifest .locks/alice.manifest >/dev/null
+$Y init --view alice --manifest .locks/alice.manifest >/dev/null
 
 pass=0; fail=0
 ok(){ echo "  OK: $1"; pass=$((pass+1)); }
@@ -53,9 +53,9 @@ M2=.locks/m2
 # instances agree on lease duration and cross-process visibility is guaranteed
 # by the shared `locks` SQLite table (WAL + busy_timeout already proven by the
 # `concurrent` suite).
-$Y mount --user alice --mountpoint $M1 > .locks/m1.log 2>&1 &
+$Y mount --view alice --mountpoint $M1 > .locks/m1.log 2>&1 &
 P1=$!
-$Y mount --user alice --mountpoint $M2 > .locks/m2.log 2>&1 &
+$Y mount --view alice --mountpoint $M2 > .locks/m2.log 2>&1 &
 P2=$!
 sleep 1.5
 
@@ -234,7 +234,7 @@ BP=$!
 wait_port $DATA && wait_port $META_A && wait_port $META_B || bad "HA ports did not come up"
 
 # Client mounts via failover list against the HA pair.
-$Y --home .locks/ha/chome mount --user alice --mountpoint .locks/ha/mnt --meta "$META_A,$META_B" --data $DATA > .locks/ha/mnt.log 2>&1 &
+$Y --home .locks/ha/chome mount --view alice --mountpoint .locks/ha/mnt --meta "$META_A,$META_B" --data $DATA > .locks/ha/mnt.log 2>&1 &
 CP=$!
 sleep 2
 # HA client's alice view is created on-demand server-side, so it only has /

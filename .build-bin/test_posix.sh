@@ -13,9 +13,9 @@ cat > .ptest/man <<'EOF'
 mkdir docs
 touch docs/orig.txt
 EOF
-$Y init --user carol --manifest .ptest/man >/dev/null
+$Y init --view carol --manifest .ptest/man >/dev/null
 
-$Y mount --user carol --mountpoint .ptest/mnt > .ptest/mount.log 2>&1 &
+$Y mount --view carol --mountpoint .ptest/mnt > .ptest/mount.log 2>&1 &
 MP=$!
 sleep 1.2
 cleanup(){ fusermount -u .ptest/mnt 2>/dev/null; kill $MP 2>/dev/null; }

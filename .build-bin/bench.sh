@@ -10,8 +10,8 @@ Y=./target/release/grove
 rm -rf .bench; mkdir -p .bench/home .bench/mnt
 export GROVEFS_HOME=$PWD/.bench/home
 
-$Y init --user perf >/dev/null
-$Y mount --user perf --mountpoint .bench/mnt > .bench/mnt.log 2>&1 &
+$Y init --view perf >/dev/null
+$Y mount --view perf --mountpoint .bench/mnt > .bench/mnt.log 2>&1 &
 MP=$!
 sleep 1.0
 cleanup(){ fusermount -u .bench/mnt 2>/dev/null; kill $MP 2>/dev/null; rm -f .bench/direct.img; }

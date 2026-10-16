@@ -18,10 +18,10 @@ SP=$!
 sleep 0.8
 
 echo "=== init alice view (empty tree) ==="
-$Y init --user alice > /dev/null
+$Y init --view alice > /dev/null
 
 echo "=== mount alice against REMOTE backend ==="
-$Y mount --user alice --mountpoint .test/mnt_r --data $ADDR > .test/mnt_r.log 2>&1 &
+$Y mount --view alice --mountpoint .test/mnt_r --data $ADDR > .test/mnt_r.log 2>&1 &
 MP=$!
 sleep 1.0
 

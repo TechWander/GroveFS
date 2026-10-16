@@ -3,11 +3,11 @@
 #
 # Measures the wall-clock cost of a full acquire/release cycle through two
 # different MetaEngine placements:
-#   A) local mount (`mount --user alice`): MetaEngine lives in the mount
+#   A) local mount (`mount --view alice`): MetaEngine lives in the mount
 #      process, `locks` table sits on the same SQLite WAL as the node tree,
 #      FUSE_LK lands in-process. Expected: dominated by SQLite BEGIN
 #      IMMEDIATE + INSERT + DELETE. Should be well under a network RTT.
-#   B) meta-server (`mount --user alice --meta 127.0.0.1:...`): MetaEngine
+#   B) meta-server (`mount --view alice --meta 127.0.0.1:...`): MetaEngine
 #      lives in the meta-server process, FUSE_LK goes kernel->mount->loopback
 #      TCP->meta-server->SQLite and back. Expected: adds ~2 loopback RTTs.
 #
@@ -31,7 +31,7 @@ DATA=127.0.0.1:50127
 
 rm -rf .blk; mkdir -p .blk/home .blk/mnt .blk/central/data .blk/centralmeta .blk/chome .blk/mnt_meta
 export GROVEFS_HOME=$PWD/.blk/home
-$Y init --user alice --manifest <(echo 'touch bench.lk') >/dev/null
+$Y init --view alice --manifest <(echo 'touch bench.lk') >/dev/null
 
 cleanup(){ fusermount -u .blk/mnt 2>/dev/null; fusermount -u .blk/mnt_meta 2>/dev/null
   kill $MP $DP $AMP 2>/dev/null || true; }
@@ -40,7 +40,7 @@ trap cleanup EXIT
 wait_port(){ local a=$1; for _ in $(seq 1 100); do (echo >/dev/tcp/${a%%:*}/${a##*:}) 2>/dev/null && return 0; sleep 0.05; done; return 1; }
 
 # ---- A) local mount ----
-$Y mount --user alice --mountpoint .blk/mnt > .blk/mnt.log 2>&1 &
+$Y mount --view alice --mountpoint .blk/mnt > .blk/mnt.log 2>&1 &
 MP=$!
 sleep 1.2
 F=.blk/mnt/bench.lk
@@ -78,7 +78,7 @@ DP=$!
 $Y --home .blk/centralmeta meta-server --listen $META_A > .blk/meta.log 2>&1 &
 AMP=$!
 wait_port $DATA; wait_port $META_A
-$Y --home .blk/chome mount --user alice --mountpoint .blk/mnt_meta --meta "$META_A" --data $DATA > .blk/mnt_meta.log 2>&1 &
+$Y --home .blk/chome mount --view alice --mountpoint .blk/mnt_meta --meta "$META_A" --data $DATA > .blk/mnt_meta.log 2>&1 &
 MPM=$!
 sleep 2
 MF=.blk/mnt_meta/bench.lk

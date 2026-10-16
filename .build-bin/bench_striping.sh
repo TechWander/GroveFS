@@ -46,13 +46,13 @@ rate(){ awk -v s="$1" -v t="$2" 'BEGIN{ if(t>0) printf "%.1f", s/t; else print "
 
 # ---- single-server mount ----
 $Y data-server --listen $S1 --root $PWD/.bs/r1 > .bs/s1.log 2>&1 & P1=$!
-$Y init --user perf1 >/dev/null
-$Y mount --user perf1 --mountpoint .bs/mnt1 --data $S1 > .bs/mnt1.log 2>&1 & M1=$!
+$Y init --view perf1 >/dev/null
+$Y mount --view perf1 --mountpoint .bs/mnt1 --data $S1 > .bs/mnt1.log 2>&1 & M1=$!
 sleep 1.0
 # ---- two-server striped mount ----
 $Y data-server --listen $S2 --root $PWD/.bs/r2 > .bs/s2.log 2>&1 & P2=$!
-$Y init --user perf2 >/dev/null
-$Y mount --user perf2 --mountpoint .bs/mnt2 --data "$S1,$S2" > .bs/mnt2.log 2>&1 & M2=$!
+$Y init --view perf2 >/dev/null
+$Y mount --view perf2 --mountpoint .bs/mnt2 --data "$S1,$S2" > .bs/mnt2.log 2>&1 & M2=$!
 sleep 1.0
 
 cleanup(){ fusermount -u .bs/mnt1 .bs/mnt2 2>/dev/null; kill $M1 $M2 $P1 $P2 2>/dev/null; }

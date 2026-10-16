@@ -32,8 +32,8 @@ PB=$!
 sleep 0.8
 
 echo "=== init alice view + mount across BOTH servers ==="
-$Y init --user alice > /dev/null
-$Y mount --user alice --mountpoint .striping/mnt --data "$A,$B" > .striping/mnt.log 2>&1 &
+$Y init --view alice > /dev/null
+$Y mount --view alice --mountpoint .striping/mnt --data "$A,$B" > .striping/mnt.log 2>&1 &
 PM=$!
 sleep 1.2
 
@@ -104,8 +104,8 @@ if [ "$afterA" -lt "$beforeA" ]; then ok "rm freed server A chunk ($beforeA -> $
 echo "===== 7) backward compat: single --data mount uses bare-uuid keys ====="
 # a single address must NOT emit the s-prefix layout (old objects keep working).
 # use a distinct user so its local view DB never contends with the sharded mount.
-$Y init --user bob > /dev/null
-$Y mount --user bob --mountpoint .striping/mnt_legacy --data $A > .striping/mnt_legacy.log 2>&1 &
+$Y init --view bob > /dev/null
+$Y mount --view bob --mountpoint .striping/mnt_legacy --data $A > .striping/mnt_legacy.log 2>&1 &
 PL=$!
 sleep 1.2
 T sh -c "printf 'legacy-single' > .striping/mnt_legacy/leg.txt"

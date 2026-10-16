@@ -27,11 +27,11 @@ BLK=.ctest/home/blocks
 cat > .ctest/shared.manifest <<'EOF'
 mkdir seed
 EOF
-$Y init --user shared --manifest .ctest/shared.manifest >/dev/null
+$Y init --view shared --manifest .ctest/shared.manifest >/dev/null
 
-$Y mount --user shared --mountpoint .ctest/m1 > .ctest/m1.log 2>&1 &
+$Y mount --view shared --mountpoint .ctest/m1 > .ctest/m1.log 2>&1 &
 P1=$!
-$Y mount --user shared --mountpoint .ctest/m2 > .ctest/m2.log 2>&1 &
+$Y mount --view shared --mountpoint .ctest/m2 > .ctest/m2.log 2>&1 &
 P2=$!
 sleep 1.2
 

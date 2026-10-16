@@ -48,9 +48,9 @@ B=.rtest/mnt_b
 
 echo "===== A) server up: mount alice + seed ====="
 start_server 1
-$Y init --user alice >/dev/null
-$Y init --user bob   >/dev/null
-$Y mount --user alice --mountpoint $A --data $ADDR > .rtest/a.log 2>&1 & MA=$!
+$Y init --view alice >/dev/null
+$Y init --view bob   >/dev/null
+$Y mount --view alice --mountpoint $A --data $ADDR > .rtest/a.log 2>&1 & MA=$!
 sleep 1.2
 timeout 10 sh -c "printf 'persistent payload\n' > $A/seed.txt" && sync
 chk "$(timeout 5 cat $A/seed.txt)" "persistent payload" "seed written+read on live server"
@@ -79,7 +79,7 @@ chk "$rc" "0" "op over a stale pooled socket recovers with NO error surfaced"
 chk "$(timeout 5 cat $A/transparent.txt)" "transparent" "transparently-recovered write is readable"
 
 echo "===== E) two client mounts vs one server: concurrent + isolated ====="
-$Y mount --user bob --mountpoint $B --data $ADDR > .rtest/b.log 2>&1 & MB=$!
+$Y mount --view bob --mountpoint $B --data $ADDR > .rtest/b.log 2>&1 & MB=$!
 sleep 1.2
 p1=""; p2=""
 timeout 30 sh -c "for n in \$(seq 1 200); do echo a-\$n > $A/mc.txt; done" & p1=$!

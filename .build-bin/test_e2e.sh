@@ -22,12 +22,12 @@ mkdir private
 touch shared/data.bin
 EOF
 
-$Y init --user alice --manifest .test/alice.manifest >/dev/null
-$Y init --user bob   --manifest .test/bob.manifest   >/dev/null
+$Y init --view alice --manifest .test/alice.manifest >/dev/null
+$Y init --view bob   --manifest .test/bob.manifest   >/dev/null
 
-$Y mount --user alice --mountpoint .test/mnt_alice > .test/alice.log 2>&1 &
+$Y mount --view alice --mountpoint .test/mnt_alice > .test/alice.log 2>&1 &
 AP=$!
-$Y mount --user bob   --mountpoint .test/mnt_bob   > .test/bob.log   2>&1 &
+$Y mount --view bob   --mountpoint .test/mnt_bob   > .test/bob.log   2>&1 &
 BP=$!
 sleep 1.2
 
