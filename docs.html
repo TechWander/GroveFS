@@ -129,6 +129,7 @@
       <div class="card"><h4>基目录 <code>--home</code></h4><p>同时容纳 <code>blocks/</code>(数据)和 <code>meta/</code>(视图)的物理根。默认 <code>$GROVEFS_HOME</code> 或 <code>~/.grovefs</code>。</p></div>
     </div>
     <div class="note"><b>关键:</b>视图与数据天然分离。视图只是「目录树 + 指针」,字节永远在 <code>blocks/</code>。这正是"不同用户挂载显示不同列表、数据都在硬盘上"的实现基础。</div>
+    <div class="note"><b><code>--user</code> 与路径容量</b>:<code>--user</code> 是视图命名空间的<b>任意标签</b>,与 <b>Linux 用户名无关</b>——不调 <code>getpwnam</code>、不校验 uid、不要求 <code>useradd</code>。<code>alice</code>、<code>team-a</code>、<code>u42</code>、<code>研究组</code> 都可用,只用作 ① <code>&lt;home&gt;/meta/&lt;user&gt;.db</code> 库文件名 ② FUSE mount 上的 <code>grovefs:&lt;user&gt;</code> 标签。<b>鉴权 = 能访问 <code>--home</code>/<code>blocks/</code> + 可选 <code>--token</code></b>,不来自 Linux 用户身份。一个用户一棵树,树内可 <code>mkdir</code>/<code>touch</code> <b>任意多个</b>文件与目录、<b>任意深度</b>,与自家 home 无差异;跨用户隔离的粒度是「整棵视图树」而不是单个路径。<code>--manifest</code> 只是骨架预建入口,不是路径数量上限。</div>
   </section>
 
   <!-- 2 -->

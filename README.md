@@ -94,6 +94,11 @@ $Y umount --mountpoint /mnt/alice
 
 用 manifest 预建层级：`init --user alice --manifest seed.txt`（每行 `mkdir <path>` 或 `touch <path>`，`#` 注释，幂等）。
 
+## 关于 `--user` 与路径容量
+
+- **`--user` 是视图命名空间的标签，与 Linux 用户名无关**：任意合法文件名字符串都可以（如 `alice`、`team-a`、`u42`、`研究组`）——它只用来 ① 生成 `<home>/meta/<user>.db`，② 在 FUSE 挂载上打 `grovefs:<user>` 标签。二进制不调 `getpwnam`、不做 uid 校验、不需要 `useradd`。**权限来自「能访问 `--home` 与 `blocks/`」+ 可选 `--token`**，不来自 Linux 用户身份。同 `--home` 下不同 `--user` = 不同视图，跨用户不可见。
+- **一个用户一棵树，树内路径完全自主**：挂载后该 mountpoint 下可 `mkdir`/`touch` **任意多个**文件与目录、**任意深度**、任意自定义层级，与在自己 home 里的操作一致；视图隔离的粒度是「整棵树」而非「单一路径」。`--manifest` 只是预建骨架的便捷入口，不是路径数量的上限。
+
 ## 生产拓扑：中心存储 + 多客户机 LAN 挂载
 
 ```bash
@@ -300,6 +305,11 @@ $Y umount --mountpoint /mnt/alice
 ```
 
 Seed a hierarchy: `init --user alice --manifest seed.txt` (lines of `mkdir <path>` / `touch <path>`, `#` comments, idempotent).
+
+## About `--user` and per-view path capacity
+
+- **`--user` is a view-namespace label, unrelated to Linux usernames**: any legal filename works (`alice`, `team-a`, `u42`, `research_group`). It is used only to (1) name `<home>/meta/<user>.db` and (2) tag the FUSE mount as `grovefs:<user>`. The binary does not call `getpwnam`, does not verify uid, does not require `useradd`. **Access authority comes from being able to reach `--home` / `blocks/` (or holding `--token`), not from the Linux user**. Under the same `--home`, distinct `--user` values map to distinct, mutually invisible views.
+- **One user = one tree, unlimited paths inside**: once mounted you may `mkdir`/`touch` any number of files and directories at any depth under that mountpoint, exactly as in your own home. Per-user isolation applies to the whole tree, not to individual paths. `--manifest` is only a convenience for pre-seeding a skeleton, not a cap on path count or depth.
 
 ## Production topology: central storage + LAN mounts
 
