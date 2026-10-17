@@ -108,6 +108,22 @@ $Y --home /local/home mount --view alice \
 - `--meta <host:port>`:视图树由中心 meta-server 提供,**多台客户机挂同一用户 = 共享同一棵权威树**。
 - 客户机本地**不留视图副本**(`--home` 只放临时缓存)。
 
+### 4.1 多机共享到底需要 PG 吗？——上手选型
+
+> **直接回答：不需要。** 多机 LAN 共享一棵树的能力来自「同一个 `meta-server` + 同一个 `--view`」，与后端存的是 SQLite 还是 PG **无关**。默认 embedded SQLite(`rusqlite bundled` 编译进二进制、零外部依赖)已经足够支撑多客户端挂载、写串行化、实时失效推送。PG 只是 meta-server 的**可选后端**,纯服务端配置(`--store postgres://…` 在 meta-server 启动时给,客户端无此选项、不感知)。仅当你想把权威树的持久化/HA/运维**交给成熟数据库**时才上 PG。
+
+| 拓扑 | 后端 | 适用场景 | 命令 |
+| --- | --- | --- | --- |
+| 单机本地 | SQLite (embedded) | 开发、测试、单用户 | `mount --view alice --mountpoint /mnt/alice` |
+| **中心节点 + 多客户端 LAN** | **SQLite (默认)** | **小/中型团队共享、零外部服务依赖** | `meta-server --listen 0.0.0.0:50110` + 客户端 `mount --meta ip:port --view alice` |
+| 中心 + 多客户端 LAN | SQLite + HA (`--role`+`--peer`+`--witness`) | 单 meta-server 挂后自动 failover、双写防护 | 加 `--role primary --peer …` 等 |
+| 中心 + 多客户端 LAN | **PostgreSQL** (`--store postgres://…`) | 想把 HA/备份/PITR/百万节点索引调优**交给 PG**,且已有 PG 运维能力 | `meta-server --store postgres://user:pw@host:5432/db`(不能同时加 `--peer`/`--witness`) |
+
+> **常见误解纠正**：
+> - 「PG 是客户端跟服务端都要装」→ 错,**只在服务端**(meta-server 进程连 PG),客户端只装 `grove` 二进制、只说 GroveFS 的 TCP 帧协议。
+> - 「上了 PG 写并发会更高」→ 错,meta-server 仍是单一串行写者,PG 模式内部也是单连接串行。PG 的价值是复制/备份/DBA 工具链,不是并行写吞吐。
+> - 「共享一棵树必须先有 PG」→ 错,默认 SQLite 就支持,`metasrv`/`freshness`/`locks` 三个套件全部纯 SQLite。
+
 ### 跨客户端一致性:两种模式
 
 | 模式 | 命令 | 行为 |
@@ -209,7 +225,7 @@ $Y --home /data/cluster acl revoke --view alice --uid 2000   # 撤销行
 
 语义：
 - **无行 = 无约束**(向后兼容,任何 uid 挂同一 view 都放行)；
-- **有任意行 = 白名单**(无匹配行→ `M_OPEN` `E_AUTH` 拒挂载、挂载 fail-fast；仅 read 授权→ 写意图 op 逐条 `E_ROFS`、读仍放行)。
+- **有任意行 = 白名单**(无匹配行→ `M_OPEN` `E_AUTH` 拒挂载、挂载 fail-fast；仅 read 授权→ 写意图 op 前动态重查、回 `E_NOTPERM`（客户端 FUSE 侧落 `EPERM`，区别于 HA 备机 `E_ROFS` 切换信号）、读仍放行；写门不缓存故 `revoke` 对已挂载连接即时生效)。
 - 客户端上报的 uid 默认 `geteuid()`,可 `mount --as-uid N` 显式覆盖,用于共享 meta-server 上不同角色的挂载。
 
 **诚实边界**：TCP 客户端自报 uid 属 advisory,真正确定性靠 `--token`；白名单适合「已通过 token 准入的集群内部职责分离」,不适合防内鬼。本地模式（无 `--meta`）仅写读门可拦截挂载；写操作落本地 SQLite 文件,同 uid 无法强制隔离,依赖 OS 文件权限。存储层为 `<home>/meta/acl.db`（单表 `view_acl(view,uid,can_read,can_write,PRIMARY KEY(view,uid))`）。
@@ -280,8 +296,12 @@ SKIP_BENCH=1 bash .build-bin/run_all.sh   # 跳过吞吐基准(纯功能回归)
 | 目的 | 命令 |
 |------|------|
 | 建视图 | `grove --home H init --view U [--manifest M]` |
-| 本地挂载 | `grove --home H mount --view U -m MP [--ro] [--strict] [--threads N]` |
-| 远程挂载 | `grove --home H mount --view U -m MP --data A[,A2] --meta M[,M_bak] [--token T]` |
+| 本地挂载 | `grove --home H mount --view U -m MP [--ro] [--strict] [--threads N] [--as-uid N]` |
+| 远程挂载 | `grove --home H mount --view U -m MP --data A[,A2] --meta M[,M_bak] [--token T] [--as-uid N]` |
 | 卸载 | `grove umount -m MP` |
 | 数据服务 | `grove data-server --listen IP:PORT --root DIR [--token T]` |
-| 元数据服务 | `grove --home H meta-server --listen IP:PORT [--token T] [--role primary\|standby --peer ADDR]` |
+| 元数据服务（默认 SQLite） | `grove --home H meta-server --listen IP:PORT [--token T] [--role primary\|standby --peer ADDR [--sync-repl] [--witness ADDR]]` |
+| 元数据服务（PostgreSQL 后端） | `grove --home H meta-server --listen IP:PORT --store postgres://user:pw@host:5432/db` |
+| 视图白名单授权 | `grove --home H acl allow --view V --uid N [--read] [--write]` |
+| 视图白名单撤销 | `grove --home H acl revoke --view V --uid N` |
+| 视图白名单查询 | `grove --home H acl list --view V` |
