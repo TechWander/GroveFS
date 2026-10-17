@@ -25,7 +25,7 @@
 
 - **多用户视图隔离**：一用户一棵树，跨用户不可见；完整的 `mkdir`/`mknod`/`rename`/`rmdir` 自定义层级。
 - **可插拔存储/元数据后端**（trait 抽象）：本地 `LocalBackend`/`MetaEngine`、远程 `RemoteBackend`/`RemoteMeta`、跨多节点条带 `ShardedBackend`，对上层透明。元数据权威存储亦可切换为 **PostgreSQL**（`meta-server --store postgres://…`）：服务端 schema-per-view、事务化 rename/unlink/lock；此模式下自研 HA 有意关闭，交给 PG 自己的流复制/PITR。
-- **视图级 uid 白名单（可选）**：`grove acl allow/revoke/list` 管理 `<home>/meta/acl.db` 的 `view_acl(view,uid,can_read,can_write)`。未列入 = 无约束（14 套件历史行为不变）；一旦有行 → 读门在 `M_OPEN` 处 `E_AUTH` 拒挂载、写门逐 op `E_ROFS`。同一 view 即多人共享同一棵权威树，per-uid 读写分别放行。
+- **视图级 uid 白名单（可选）**：`grove acl allow/revoke/list` 管理 `<home>/meta/acl.db` 的 `view_acl(view,uid,can_read,can_write)`。未列入 = 无约束（历史行为不变）；一旦有行 → 读门在 `M_OPEN` 处 `E_AUTH` 拒挂载、写门每次写意图 op 前动态重查并回 `E_NOTPERM`（客户端 FUSE 侧落 `EPERM`；有意区别于 HA 备机 `E_ROFS` 故障转移信号），故 `acl revoke` 对已建立的挂载连接**即时生效**、无需重挂。同一 view 即多人共享同一棵权威树，per-uid 读写分别放行。
 - **自定义二进制帧 over TCP**（非 NFS/gRPC）：定长头 + 变长体，连接池并发。
 - **跨客户端实时失效推送**（默认）：一端写成功，中心经事件总线向同用户其它订阅者广播 `inval_entry`+`inval_inode`，对端下次访问**即时可见**，无需轮询；`--strict` 提供零缓存兜底。
 - **分布式 advisory 锁**：`flock` / `fcntl F_SETLK/F_GETLK` 经中心 `locks` 表集中仲裁，跨进程、跨机生效；崩溃即时回收（FUSE `release`）+ 短 lease（默认 15s）+ 续约心跳。
@@ -53,6 +53,50 @@
 - **中心 MetaServer**：同一用户在多客户机共享**一份权威视图**，不再各存副本导致分叉。
 - **事件总线 + Notifier**：写成功后向订阅者推送失效，保证内容新鲜度。
 - **fuser 0.18 多线程**：每线程独立 `/dev/fuse` fd（`clone_fd`，Linux 4.5+），请求并发派发不串行。
+
+## 多机共享与存储选型（原理与常见疑问）
+
+> 这一节回答最容易混淆的两个问题：① 「多台服务器经局域网共享同一棵目录树」**要不要 PostgreSQL**？② PG 到底**跑在哪一侧**？
+
+### 一次写请求的完整路径（数据面 / 元数据面各走一半）
+
+GroveFS 把「文件的字节」与「目录树」拆成两条独立通道，这也是它能脱离 NFS 的根本：
+
+```
+应用 write()/close()
+   │
+   ├─ 数据面 ─→ RemoteBackend ─TCP帧→ data-server ─→ blocks/<key>（UUID 命名、扁平存）
+   │            （≥4MiB 自动分片并发；大文件可跨多台 data-server 条带）
+   │
+   └─ 元数据面 ─→ RemoteMeta ─TCP帧→ meta-server ─→ 权威视图树（默认 SQLite，或 PostgreSQL）
+                │  （create / rename / setattr / touch_mtime …）
+                └─ 写成功后经事件总线向同 view 的其它订阅者推 inval_entry + inval_inode
+                                          → 对端下次 getattr/lookup 命中失效、向中心重取 → 即时可见
+```
+
+- **谁持有权威**：`meta-server` 是**单一权威串行点**——同一 view 的一棵树只由这一个进程落到存储引擎（SQLite 一 view 一 `.db`，PG 一 view 一 schema），所有客户端经 TCP 帧汇聚到它。这是**有意的设计**（杜绝各存副本导致的视图分叉），不是疏漏。
+- **客户端从不直接碰存储**：客户机既不开 `.db` 文件、也不持 PG 连接串，只会说 GroveFS 的线协议。后端是 SQLite 还是 PG，对客户端**完全透明**、命令一字不变。
+
+### 常见疑问
+
+**Q：多台服务器经局域网挂载同一棵目录树，数据库是不是必须上 PG？**
+**不需要。**「多机共享一棵树」的能力来自 **`meta-server` + 相同 `--view`**，与底层是 SQLite 还是 PG **无关**。默认的 embedded SQLite（`rusqlite bundled` 编译进二进制、零外部依赖）本来就是为这个拓扑设计的——把 `data-server` + `meta-server` 部署在中心节点，多台客户机 `mount --view alice --meta <中心>:50110 --data <中心>:50100` 即共享同一棵权威树、跨端实时可见。这一整套由 `metasrv` / `freshness` / `locks` 套件在纯 SQLite 后端上证明,**不需要先装 PostgreSQL**。
+
+**Q：那 PG 到底跑在哪一侧？**
+**只在服务端**（`meta-server` 那一侧），是它的**可插拔权威存储后端**：
+
+```
+客户端(仅 grove 二进制)      服务端                    数据层
+mount --view alice   ─TCP→   meta-server   ─postgres://→  PostgreSQL 服务器
+  · 无 PG 库/凭据/感知        · --store 是它的启动参数     (与 meta-server 同机或独立 DB 机)
+```
+
+`--store postgres://…` 只出现在 `meta-server` 子命令上，客户端没有这个选项、也拿不到连接串。PG 服务器进程物理上跑在中心（可与 meta-server 同机走 loopback，或独立一台 DB 机经局域网连），但**始终在服务端**。
+
+**Q：那什么时候才值得上 PG？**
+当你想把权威树的**持久化 / 高可用 / 备份 / 集中运维**交给一个成熟数据库时:PG 自带流复制 / logical replication / PITR、`pg_basebackup`、监控与 DBA 工具链,海量元数据(百万级节点)也可借 PG 的索引/VACUUM 调优。注意**自研 HA(快照复制)与 PG 互斥**(见「共享视图与权限模型」),上了 PG 就用 PG 自己的复制、不再用 GroveFS 的文件级快照。
+
+> **诚实边界**：上 PG **不会**把元数据写并行化——`meta-server` 作为单一写者,PG 模式下内部仍是单连接串行。PG 的价值在**持久化/复制/运维成熟度**,不在写吞吐扩展;真正的元数据写并发扩展是更大的架构命题,当前未做。默认场景请继续用零依赖的 SQLite。
 
 ## 构建
 
@@ -114,7 +158,7 @@ GroveFS 的权限栈只有两层——**令牌 = 集群准入，view 名 = 树�
   $Y --home /data/cluster acl revoke --view alice --uid 2000                 # 撤销单条
   ```
 
-  `view_acl(view, uid, can_read, can_write)` 语义：**无行 = 无约束**（任何 uid 挂同一个 view 都放行，向后兼容旧行为）；**有任意行 = 白名单**（该 uid 无匹配行则 `M_OPEN` 直接被拒 `E_AUTH`，挂载 fail-fast；只读授权的 uid 在 op 循环里对写意图 op 逐条拒 `E_ROFS`）。本地模式（无 `--meta`）也走读门校验，写门由 OS 文件权限兜底（view 本地 SQLite 文件属主即最后一道防线）。客户端上报的 uid 默认取 `geteuid()`，也允许 `mount --as-uid N` 显式覆盖，用于共享 `meta-server` 上按角色挂载。
+  `view_acl(view, uid, can_read, can_write)` 语义：**无行 = 无约束**（任何 uid 挂同一个 view 都放行，向后兼容旧行为）；**有任意行 = 白名单**（该 uid 无匹配行则 `M_OPEN` 直接被拒 `E_AUTH`，挂载 fail-fast；只读授权的 uid 在 op 循环里对写意图 op 逐条拒 `E_NOTPERM`——客户端 FUSE 侧落 `EPERM`，有意区别于 HA 备机的 `E_ROFS` 故障转移信号，以免一次权限拒绝触发伪切换）。写门**每个 op 前动态重查**（不在 `M_OPEN` 缓存），故 `acl revoke`/降级对已建立的连接即时生效。本地模式（无 `--meta`）也走读门校验，写门由 OS 文件权限兜底（view 本地 SQLite 文件属主即最后一道防线）。客户端上报的 uid 默认取 `geteuid()`，也允许 `mount --as-uid N` 显式覆盖，用于共享 `meta-server` 上按角色挂载。
 
   > **诚实边界**：TCP 客户端自报 uid 属**advisory**（客户端可伪造），真正的准入仍由 `--token` 把关；白名单是给一个已通过 token 的集群内部做**分工/职责**用的，不是防内鬼。本地模式（无 `--meta`）的写门只能靠 OS 权限（同 uid 无法强制隔离）。
 
@@ -284,7 +328,7 @@ On top of that, metadata and data can each be served as a network service (`meta
 
 - **Per-user view isolation** with full custom nesting (`mkdir`/`mknod`/`rename`/`rmdir`).
 - **Pluggable storage/metadata backends** via traits: local, remote, and cross-server striped (`ShardedBackend`). The authoritative metadata store can additionally be swapped to **PostgreSQL** (`meta-server --store postgres://…`): one PG schema per view, transactions around rename/unlink/lock; under PG the in-tree HA (snapshot shipping) is intentionally off — use PG's own streaming replication / PITR instead.
-- **Optional per-view uid whitelist**: `grove acl allow/revoke/list` manages `view_acl(view,uid,can_read,can_write)` in `<home>/meta/acl.db`. No rows for a view = unrestricted (back-compat, all 14 legacy suites unchanged); any row = whitelist → `M_OPEN` fails with `E_AUTH` if the uid has no read grant, and every write-intent op is refused with `E_ROFS` if it lacks a write grant. Multiple clients can therefore share one authoritative tree at differing privilege levels.
+- **Optional per-view uid whitelist**: `grove acl allow/revoke/list` manages `view_acl(view,uid,can_read,can_write)` in `<home>/meta/acl.db`. No rows for a view = unrestricted (back-compat, the legacy suites unchanged); any row = whitelist → `M_OPEN` fails with `E_AUTH` if the uid has no read grant, and every write-intent op is refused with `E_NOTPERM` (surfacing as `EPERM` at the client's FUSE layer, deliberately distinct from an HA standby's `E_ROFS` failover signal) if it lacks a write grant. The write gate is re-evaluated per-op (not cached at open), so `acl revoke` takes effect on already-mounted connections immediately. Multiple clients can therefore share one authoritative tree at differing privilege levels.
 - **Custom binary framing over TCP** (not NFS, not gRPC) with a connection pool.
 - **Real-time cross-client invalidation push** (default): after a write, the center broadcasts `inval_entry`+`inval_inode` so peers see changes immediately, no polling; `--strict` gives a zero-caching fallback.
 - **Distributed advisory locks**: `flock` / `fcntl F_SETLK/F_GETLK` arbitrated centrally, effective across processes and machines; crash reclaim via FUSE `release`, plus a short lease (default 15s) and renewal heartbeats.
@@ -312,6 +356,50 @@ Three layers, all trait-decoupled:
 - **Central MetaServer**: one authoritative view per user shared across machines, so no diverging local copies.
 - **Event bus + Notifier**: pushes invalidations after writes for content freshness.
 - **fuser 0.18 multi-threading**: each worker gets its own `/dev/fuse` fd (`clone_fd`, Linux 4.5+), requests dispatch concurrently.
+
+## Sharing across machines & storage backends (how it works, common questions)
+
+> This section answers the two most-confused questions: (1) does "many servers sharing one directory tree over the LAN" **require PostgreSQL**, and (2) which side does PG actually run on?
+
+### The full path of one write (data plane and metadata plane, half each)
+
+GroveFS splits a file's *bytes* from its *directory tree* into two independent channels — this is precisely why it needs no NFS:
+
+```
+app write()/close()
+   │
+   ├─ data plane ─→ RemoteBackend ─TCP frame→ data-server ─→ blocks/<key>  (UUID-named, flat)
+   │                (≥4MiB auto-sharded concurrently; large files can stripe across data-servers)
+   │
+   └─ metadata plane ─→ RemoteMeta ─TCP frame→ meta-server ─→ authoritative tree (SQLite by default, or PostgreSQL)
+                      │  (create / rename / setattr / touch_mtime …)
+                      └─ on success, the event bus pushes inval_entry + inval_inode to the view's other subscribers
+                                → peer's next getattr/lookup sees the invalidation, re-fetches → visible immediately
+```
+
+- **Who holds authority**: `meta-server` is a **single authoritative serialization point** — one view's tree is written to the storage engine by that one process alone (SQLite: one `.db` per view; PG: one schema per view); every client's TCP frames converge on it. This is **deliberate** (it eliminates the view divergence you'd get from per-client copies), not an oversight.
+- **Clients never touch storage directly**: a client opens neither the `.db` file nor a PG connection — it only speaks the GroveFS wire protocol. Whether the backend is SQLite or PG is **completely transparent** to clients; the mount command is byte-for-byte identical.
+
+### Common questions
+
+**Q: To mount one directory tree from many servers over the LAN, is PostgreSQL mandatory?**
+**No.** The "many machines share one tree" capability comes from **`meta-server` + the same `--view`**, independent of whether the backend is SQLite or PG. The default embedded SQLite (`rusqlite bundled`, compiled into the binary, zero external deps) was built for exactly this topology — deploy `data-server` + `meta-server` on a central node and have clients `mount --view alice --meta <center>:50110 --data <center>:50100`; they share one authoritative tree with real-time cross-client visibility. This whole path is proven on a pure-SQLite backend by the `metasrv` / `freshness` / `locks` suites — **you do not need to install PostgreSQL first**.
+
+**Q: Which side does PG run on?**
+**Server-side only** (on the `meta-server`), as its **pluggable authoritative storage backend**:
+
+```
+client (just the grove binary)   server-side                 data tier
+mount --view alice   ─TCP→        meta-server   ─postgres://→  PostgreSQL server
+  · no PG lib / creds / awareness  · --store is ITS flag       (same host as meta-server, or a dedicated DB box)
+```
+
+`--store postgres://…` appears only on the `meta-server` subcommand; clients have no such option and never see the connection string. The PostgreSQL server process runs physically in the center (co-located with `meta-server` over loopback, or a dedicated DB machine reached over the LAN) but is **always server-side**.
+
+**Q: So when is PG actually worth it?**
+When you want to hand the authoritative tree's **durability / HA / backup / centralized operations** to a mature database: PG brings streaming / logical replication, PITR, `pg_basebackup`, monitoring and DBA tooling, and can tune very large metadata (millions of nodes) with indexes/VACUUM. Note **the in-tree HA (snapshot shipping) is mutually exclusive with PG** (see "Shared views & the permission model") — once on PG, use PG's own replication, not GroveFS's file-level snapshots.
+
+> **Honest boundary**: adding PG does **not** parallelize metadata writes — as a single writer, `meta-server` still serializes internally (one connection) even in PG mode. PG's value is in **durability / replication / operational maturity**, not write-throughput scaling; genuine metadata write-concurrency scaling is a larger architectural problem and is not done here. For default deployments, keep the zero-dependency SQLite.
 
 ## Build
 
@@ -366,7 +454,7 @@ GroveFS has exactly two authorization layers — **token = cluster admission, vi
   $Y --home /data/cluster acl revoke --view alice --uid 2000                  # drop one row
   ```
 
-  Semantics: **zero rows for a view = unrestricted** (every uid passes, matches historical behavior); **any row = whitelist** (a uid without a matching row is refused at `M_OPEN` with `E_AUTH` so mount fails fast; a read-only grant sees every write-intent op rejected with `E_ROFS` while reads continue). In single-node local mounts the same read gate runs, but the write path lands on the underlying SQLite file directly — OS file permissions are the last line of defense there. The uid presented to the server is `geteuid()` by default and can be overridden with `mount --as-uid N` for role-based mounts against a shared `meta-server`.
+  Semantics: **zero rows for a view = unrestricted** (every uid passes, matches historical behavior); **any row = whitelist** (a uid without a matching row is refused at `M_OPEN` with `E_AUTH` so mount fails fast; a read-only grant sees every write-intent op rejected with `E_NOTPERM` — `EPERM` at the client FUSE layer, deliberately distinct from an HA standby's `E_ROFS` failover signal — while reads continue). The write gate is re-checked before every op rather than cached at open, so `acl revoke` / a rw→ro downgrade takes effect on live connections immediately. In single-node local mounts the same read gate runs, but the write path lands on the underlying SQLite file directly — OS file permissions are the last line of defense there. The uid presented to the server is `geteuid()` by default and can be overridden with `mount --as-uid N` for role-based mounts against a shared `meta-server`.
 
   > **Honest boundary**: the client-reported uid is **advisory** — a TCP client can forge it. Real admission is still the `--token` gate; the whitelist is for **role separation inside an already-trusted cluster**, not for hostile-tenant isolation.
 
