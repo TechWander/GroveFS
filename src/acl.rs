@@ -70,60 +70,54 @@ impl AclStore {
 
     /// A view is "restricted" once it has any whitelist rows; unrestricted views
     /// are open to everyone (backward-compatible default).
+    ///
+    /// Fail-closed: any query error returns true (treat as restricted) so a
+    /// busy / corrupted acl.db never silently opens a whitelisted view. Under
+    /// the single `parking_lot::Mutex<Connection>` held by `AclStore` and the
+    /// 5 s `busy_timeout` set at open, this branch is practically unreachable
+    /// in normal operation — it exists for the pathological case.
     pub fn is_restricted(&self, view: &str) -> bool {
         let conn = self.conn.lock();
         conn.query_row(
-            "SELECT COUNT(*) FROM view_acl WHERE view=?1",
+            "SELECT EXISTS(SELECT 1 FROM view_acl WHERE view=?1)",
             params![view],
-            |r| r.get::<_, i64>(0),
+            |r| r.get::<_, bool>(0),
         )
-        .unwrap_or(0)
-            > 0
+        .unwrap_or(true)
     }
 
-    /// Whether `uid` may open (mount/read) `view`. Unrestricted → always true.
+    /// Whether `uid` may open (mount/read) `view`. Semantics:
+    /// - Unrestricted (no rows for the view) → true for any uid.
+    /// - Whitelisted (any row for the view)   → true only if a `(view, uid)`
+    ///   row exists with `can_read = 1`.
+    ///
+    /// Any DB error fails closed (returns `false`) — during a transient
+    /// SQLite lock / corruption we must not silently open a whitelisted view.
     pub fn check_read(&self, view: &str, uid: u32) -> bool {
         let conn = self.conn.lock();
-        let restricted: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM view_acl WHERE view=?1",
-                params![view],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-        if restricted == 0 {
-            return true;
-        }
         conn.query_row(
-            "SELECT can_read FROM view_acl WHERE view=?1 AND uid=?2",
-            params![view, uid as i64],
-            |r| r.get::<_, i64>(0),
+            "SELECT (NOT EXISTS (SELECT 1 FROM view_acl WHERE view=?1))
+                    OR EXISTS (SELECT 1 FROM view_acl
+                               WHERE view=?2 AND uid=?3 AND can_read=1)",
+            params![view, view, uid as i64],
+            |r| r.get::<_, bool>(0),
         )
-        .unwrap_or(0)
-            == 1
+        .unwrap_or(false)
     }
 
     /// Whether `uid` may mutate `view`. Unrestricted → true (no write policy).
-    /// Restricted → requires an explicit `can_write` row.
+    /// Restricted → requires an explicit `can_write=1` row for this uid.
+    /// Fail-closed on any DB error (mirrors [`Self::check_read`]).
     pub fn check_write(&self, view: &str, uid: u32) -> bool {
         let conn = self.conn.lock();
-        let restricted: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM view_acl WHERE view=?1",
-                params![view],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-        if restricted == 0 {
-            return true;
-        }
         conn.query_row(
-            "SELECT can_write FROM view_acl WHERE view=?1 AND uid=?2",
-            params![view, uid as i64],
-            |r| r.get::<_, i64>(0),
+            "SELECT (NOT EXISTS (SELECT 1 FROM view_acl WHERE view=?1))
+                    OR EXISTS (SELECT 1 FROM view_acl
+                               WHERE view=?2 AND uid=?3 AND can_write=1)",
+            params![view, view, uid as i64],
+            |r| r.get::<_, bool>(0),
         )
-        .unwrap_or(0)
-            == 1
+        .unwrap_or(false)
     }
 
     /// Grant (or replace) `uid`'s read/write access to `view`. At least one of

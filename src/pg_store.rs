@@ -106,6 +106,10 @@ fn parse_node(r: &postgres::Row) -> RawNode {
 pub struct PgEngine {
     view: String,
     schema: String,
+    /// Kept so we can transparently re-establish the connection after a
+    /// server-side close / network blip; without this the view becomes
+    /// permanently unusable until the meta-server process restarts.
+    conn_uri: String,
     client: parking_lot::Mutex<Client>,
 }
 
@@ -128,6 +132,7 @@ impl PgEngine {
         let this = Self {
             view: view.to_string(),
             schema,
+            conn_uri: conn_uri.to_string(),
             client: parking_lot::Mutex::new(client),
         };
         this.ensure_schema()?;
@@ -165,8 +170,36 @@ impl PgEngine {
         format!("{}.{}", self.schema, table)
     }
 
+    /// Acquire the mutex-guarded [`Client`], transparently reconnecting if the
+    /// server closed the socket (idle-timeout, network blip, PG restart).
+    /// Without this the view becomes permanently unusable after a disconnect,
+    /// because `engine_for` in `remote/meta.rs` never evicts a cached engine.
+    /// Held under the same mutex as every op, so reconnect cannot race with a
+    /// concurrent op.
+    fn conn(&self) -> parking_lot::MutexGuard<'_, Client> {
+        let mut g = self.client.lock();
+        if g.is_closed() {
+            match Client::connect(&self.conn_uri, NoTls) {
+                Ok(fresh) => {
+                    *g = fresh;
+                }
+                Err(e) => {
+                    // Log the reconnect failure and return the still-closed
+                    // client: the caller's op will fail with the mapped db
+                    // error, which is the correct behavior (surfacing the
+                    // outage) rather than silently succeeding on stale state.
+                    eprintln!(
+                        "pg: reconnect for view='{}' failed: {e}",
+                        self.view
+                    );
+                }
+            }
+        }
+        g
+    }
+
     fn ensure_schema(&self) -> std::io::Result<()> {
-        let mut c = self.client.lock();
+        let mut c = self.conn();
         // CREATE SCHEMA takes the raw identifier (no dots).
         c.batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS {}", self.schema))
             .map_err(io_e)?;
@@ -291,7 +324,7 @@ impl PgEngine {
     }
 
     fn query_one(&self, sql: &str, params: &[&(dyn postgres::types::ToSql + Sync)]) -> Option<RawNode> {
-        let mut c = self.client.lock();
+        let mut c = self.conn();
         c.query(sql, params).ok().and_then(|rows| {
             rows.into_iter().next().map(|r| parse_node(&r))
         })
@@ -301,7 +334,7 @@ impl PgEngine {
         let node = self.t("node");
         let sql = format!("SELECT {COLS} FROM {node} WHERE parent_id=$1 AND name=$2");
         let raw = self.query_one(&sql, &[&parent, &name])?;
-        let mut c = self.client.lock();
+        let mut c = self.conn();
         Some(self.finalize(&mut c, raw))
     }
 
@@ -309,14 +342,14 @@ impl PgEngine {
         let node = self.t("node");
         let sql = format!("SELECT {COLS} FROM {node} WHERE ino=$1 LIMIT 1");
         let raw = self.query_one(&sql, &[&ino])?;
-        let mut c = self.client.lock();
+        let mut c = self.conn();
         Some(self.finalize(&mut c, raw))
     }
 
     pub fn readdir(&self, parent: i64) -> Vec<NodeInfo> {
         let node = self.t("node");
         let sql = format!("SELECT {COLS} FROM {node} WHERE parent_id=$1 ORDER BY name");
-        let mut c = self.client.lock();
+        let mut c = self.conn();
         let rows = match c.query(&sql, &[&parent]) {
             Ok(r) => r,
             Err(_) => return Vec::new(),
@@ -341,14 +374,20 @@ impl PgEngine {
     ) -> Result<i64, MetaError> {
         let t = now();
         let node = self.t("node");
-        let sql = format!(
-            "INSERT INTO {node} (parent_id,name,is_dir,data_ref,link_target,mode,uid,gid,mtime,atime,ctime)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9,$9) RETURNING id"
-        );
-        let mut c = self.client.lock();
-        let id: i64 = c
+        // Insert + set `ino = id` must be atomic: otherwise a mid-op PG
+        // disconnect or crash would leave the row with `ino IS NULL`, which
+        // `parse_node` reads as 0 and breaks every FUSE lookup on that name.
+        // SQLite's version gets this for free because INSERT writes ino in
+        // one statement (`INSERT ... VALUES(..., ino=id)` requires a
+        // two-step there too, so it also lives inside a `Transaction`).
+        let mut c = self.conn();
+        let mut tx = c.transaction().map_err(|e| map_db_err(&e))?;
+        let id: i64 = tx
             .query(
-                &sql,
+                &format!(
+                    "INSERT INTO {node} (parent_id,name,is_dir,data_ref,link_target,mode,uid,gid,mtime,atime,ctime)
+                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9,$9) RETURNING id"
+                ),
                 &[
                     &parent,
                     &name,
@@ -367,10 +406,12 @@ impl PgEngine {
             .map(|r| r.get(0))
             .ok_or_else(|| MetaError::Db("no RETURNING row".to_string()))?;
         // Brand-new name owns a fresh inode: ino == id.
-        let _ = c.execute(
+        tx.execute(
             &format!("UPDATE {node} SET ino=$1 WHERE id=$1"),
             &[&id],
-        );
+        )
+        .map_err(|e| map_db_err(&e))?;
+        tx.commit().map_err(|e| map_db_err(&e))?;
         Ok(id)
     }
 
@@ -401,7 +442,7 @@ impl PgEngine {
 
     pub fn link_node(&self, src_ino: i64, new_parent: i64, new_name: &str) -> Result<i64, MetaError> {
         let node = self.t("node");
-        let mut c = self.client.lock();
+        let mut c = self.conn();
         let row = c
             .query(
                 &format!("SELECT is_dir, data_ref, mode, uid, gid FROM {node} WHERE ino=$1 LIMIT 1"),
@@ -450,7 +491,7 @@ impl PgEngine {
     ) -> Result<Option<String>, MetaError> {
         let node = self.t("node");
         let t = now();
-        let mut c = self.client.lock();
+        let mut c = self.conn();
         let mut tx = c.transaction().map_err(|e| MetaError::Db(e.to_string()))?;
         let src_id: i64 = tx
             .query(
@@ -539,7 +580,7 @@ impl PgEngine {
 
     pub fn unlink(&self, parent: i64, name: &str) -> Result<Option<String>, MetaError> {
         let node = self.t("node");
-        let mut c = self.client.lock();
+        let mut c = self.conn();
         let mut tx = c.transaction().map_err(|e| MetaError::Db(e.to_string()))?;
         let row = tx
             .query(
@@ -594,7 +635,7 @@ impl PgEngine {
     pub fn touch_mtime(&self, ino: i64) {
         let t = now();
         let node = self.t("node");
-        let mut c = self.client.lock();
+        let mut c = self.conn();
         let _ = c.execute(
             &format!("UPDATE {node} SET mtime=$1, ctime=$1 WHERE ino=$2"),
             &[&t, &ino],
@@ -604,7 +645,7 @@ impl PgEngine {
     pub fn set_times(&self, ino: i64, atime: Option<i64>, mtime: Option<i64>) {
         let t = now();
         let node = self.t("node");
-        let mut c = self.client.lock();
+        let mut c = self.conn();
         if let Some(a) = atime {
             let _ = c.execute(
                 &format!("UPDATE {node} SET atime=$1, ctime=$2 WHERE ino=$3"),
@@ -622,7 +663,7 @@ impl PgEngine {
     pub fn set_mode(&self, ino: i64, mode: u32) {
         let t = now();
         let node = self.t("node");
-        let mut c = self.client.lock();
+        let mut c = self.conn();
         let _ = c.execute(
             &format!("UPDATE {node} SET mode=$1, ctime=$2 WHERE ino=$3"),
             &[&(mode as i64), &t, &ino],
@@ -632,7 +673,7 @@ impl PgEngine {
     pub fn set_uid_gid(&self, ino: i64, uid: u32, gid: u32) {
         let t = now();
         let node = self.t("node");
-        let mut c = self.client.lock();
+        let mut c = self.conn();
         let _ = c.execute(
             &format!("UPDATE {node} SET uid=$1, gid=$2, ctime=$3 WHERE ino=$4"),
             &[&(uid as i64), &(gid as i64), &t, &ino],
@@ -643,7 +684,7 @@ impl PgEngine {
 
     pub fn get_epoch(&self) -> i64 {
         let ctrl = self.t("ctrl");
-        let mut c = self.client.lock();
+        let mut c = self.conn();
         c.query(&format!("SELECT v FROM {ctrl} WHERE k='epoch'"), &[])
             .ok()
             .and_then(|rows| rows.first().map(|r| r.get::<_, i64>(0)))
@@ -652,7 +693,7 @@ impl PgEngine {
 
     pub fn set_epoch(&self, e: i64) -> std::io::Result<()> {
         let ctrl = self.t("ctrl");
-        let mut c = self.client.lock();
+        let mut c = self.conn();
         c.execute(
             &format!(
                 "INSERT INTO {ctrl} (k,v) VALUES ('epoch',$1) ON CONFLICT(k) DO UPDATE SET v=excluded.v"
@@ -691,7 +732,7 @@ impl PgEngine {
     ) -> Result<Option<LockConflict>, MetaError> {
         let locks = self.t("locks");
         let now = now();
-        let mut c = self.client.lock();
+        let mut c = self.conn();
         let mut tx = c.transaction().map_err(|e| MetaError::Db(e.to_string()))?;
         tx.execute(
             &format!("DELETE FROM {locks} WHERE expires_at < $1"),
@@ -773,7 +814,7 @@ impl PgEngine {
         let now = now();
         let s = start.min(i64::MAX as u64) as i64;
         let e = end.min(i64::MAX as u64) as i64;
-        let mut c = self.client.lock();
+        let mut c = self.conn();
         let want_write = ty.to_u8() as i64 == 1;
         c.query(
             &format!(
@@ -802,7 +843,7 @@ impl PgEngine {
 
     pub fn release_locks_of_owner(&self, owner: u64) {
         let locks = self.t("locks");
-        let mut c = self.client.lock();
+        let mut c = self.conn();
         let _ = c.execute(
             &format!("DELETE FROM {locks} WHERE owner=$1"),
             &[&(owner as i64)],
@@ -812,7 +853,7 @@ impl PgEngine {
     pub fn renew_locks(&self, sid: u64) {
         let locks = self.t("locks");
         let now = now();
-        let mut c = self.client.lock();
+        let mut c = self.conn();
         let _ = c.execute(
             &format!("UPDATE {locks} SET expires_at=$1 WHERE sid=$2"),
             &[&(now + lease_secs()), &(sid as i64)],
@@ -821,7 +862,7 @@ impl PgEngine {
 
     pub fn release_locks_of_session(&self, sid: u64) {
         let locks = self.t("locks");
-        let mut c = self.client.lock();
+        let mut c = self.conn();
         let _ = c.execute(
             &format!("DELETE FROM {locks} WHERE sid=$1"),
             &[&(sid as i64)],
@@ -830,7 +871,7 @@ impl PgEngine {
 
     pub fn sweep_expired_locks(&self, now_secs: i64) {
         let locks = self.t("locks");
-        let mut c = self.client.lock();
+        let mut c = self.conn();
         let _ = c.execute(
             &format!("DELETE FROM {locks} WHERE expires_at < $1"),
             &[&now_secs],

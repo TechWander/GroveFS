@@ -4,7 +4,9 @@
 #   - an UNRESTRICTED view (no acl rows) mounts for any uid  -> no regression;
 #   - a RESTRICTED view refuses the M_OPEN (E_AUTH) for a uid with no read grant
 #     (mount fails fast), admits one with a read grant;
-#   - a read-only grant can list/read but every write-intent op returns EROFS;
+#   - a read-only grant can list/read but every write-intent op returns EPERM
+#     (server sends E_NOTPERM, distinct from an HA-standby's E_ROFS failover
+#     signal, so an ACL denial never triggers a spurious failover);
 #   - revoking the last row reopens the view (back to UNRESTRICTED).
 # Assertion-based (pass/fail counters + real exit code), like the other suites.
 set -u
@@ -83,6 +85,21 @@ RC=$?
 # and the file must NOT have appeared for the rw client
 sleep 1.0
 [ ! -f "$A/forbidden.txt" ] && ok "denied write left no trace" || bad "denied write leaked a file"
+
+echo "===== 5b) TOCTOU: downgrade the LIVE rw mount's uid in-place, no remount ====="
+# The rw mount from step 4 is STILL connected; its M_OPEN handshake passed while
+# uid 1000 had write=true. Downgrade that grant to read-only in place. Because
+# the server re-evaluates the write-gate per-op (not cached at open), a fresh
+# write over the *existing* pooled connection must now be refused immediately.
+$Y --home .acl/central acl allow --view alice --uid 1000 --read >/dev/null 2>&1 \
+    && ok "downgraded uid1000 rw->ro (in place)" || bad "acl downgrade failed"
+T sh -c "printf 'late' > $A/late.txt"
+RC2=$?
+[ "$RC2" != 0 ] && ok "write refused on LIVE mount after downgrade (rc=$RC2)" || bad "live mount still writable after revoke -> TOCTOU regression"
+[ ! -f "$A/late.txt" ] && ok "downgraded live write left no file" || bad "downgraded write leaked a file"
+chk "$(T cat $A/notes.txt)" "secret" "downgraded uid can still read (ro grant)"
+# restore rw so the following unrestricted-revoke section starts from a known state
+$Y --home .acl/central acl allow --view alice --uid 1000 --read --write >/dev/null 2>&1
 
 echo "===== 6) revoke all rows -> view is UNRESTRICTED again ====="
 $Y --home .acl/central acl revoke --view alice --uid 1000 >/dev/null 2>&1
