@@ -1511,9 +1511,11 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
         proto::send_response(&mut writer, E_AUTH, 0, &[])?;
         return Ok(());
     }
-    // Whether this uid may mutate the view (checked per write-intent op below);
-    // an unrestricted view grants writes too.
-    let write_ok = rt.acl.check_write(&view, uid);
+    // Note: the write-gate is re-evaluated per-op inside the loop below (not
+    // cached here), so `grove acl revoke --view V --uid U` immediately closes
+    // established connections against further writes rather than only on the
+    // next M_OPEN handshake (closes a TOCTOU where revoke had no effect on
+    // any already-mounted client).
     // Validate the view db opens before acking. We deliberately do NOT
     // cache this engine for the whole connection: under HA a fresh replicated
     // snapshot evicts the cached engine, so live connections must re-resolve it
@@ -1559,8 +1561,14 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
         };
         // View write-whitelist: a restricted view refuses mutating ops from a uid
         // without a write grant (reads still served). Unrestricted views grant all.
-        if is_write_op(op) && !write_ok {
-            proto::send_response(&mut writer, E_ROFS, 0, &[])?;
+        // Re-evaluated per-op so `grove acl revoke` immediately closes established
+        // connections (see the M_OPEN note above for the TOCTOU rationale).
+        //
+        // Uses E_NOTPERM (not E_ROFS) so the client's `err_from_code` maps to
+        // `MetaError::OpNotPermitted` → `EPERM` at the FUSE reply, distinct
+        // from an HA-standby's E_ROFS failover signal.
+        if is_write_op(op) && !rt.acl.check_write(&view, uid) {
+            proto::send_response(&mut writer, E_NOTPERM, 0, &[])?;
             continue;
         }
         // Read-only gate: a HA standby (or a demoted ex-primary) refuses
