@@ -37,6 +37,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = "0.4"
 dirs = "5"
+# Optional PostgreSQL metadata backend (`meta-server --store postgres://...`).
+# Pure-Rust (tokio-postgres under the hood, no libpq needed); TLS features off
+# because the backend is reached over a trusted LAN via plain NoTls connections.
+postgres = { version = "0.19", default-features = false }
 
 [dev-dependencies]
 # Temp dirs for integration tests (metadata DB, remote data-server backing store)

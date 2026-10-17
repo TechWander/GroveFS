@@ -14,6 +14,7 @@ use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
+use grovefs::acl::AclStore;
 use grovefs::backend;
 use grovefs::fs_impl::GroveFS;
 use grovefs::meta;
@@ -92,6 +93,13 @@ enum Cmd {
         /// behind one channel lock.
         #[arg(long, default_value_t = 4)]
         threads: usize,
+        /// Report a specific uid on the `M_OPEN` handshake (remote meta only),
+        /// instead of the process's real euid, so a shared `meta-server` with a
+        /// view whitelist can admit this mount under a chosen slot. Also drives
+        /// the local mount's read-gate check. Advisory: the client self-reports
+        /// its uid, and the token is the real gate against a malicious peer.
+        #[arg(long)]
+        as_uid: Option<u32>,
     },
     /// Run the remote data service (central cluster node) backed by local disk
     DataServer {
@@ -180,11 +188,61 @@ enum Cmd {
         /// deploy a witness (an ODD number, 3 is the robust default) for safety.
         #[arg(long)]
         witness: Option<String>,
+        /// Metadata backend URI. Default (unset or `"sqlite"`) is the embedded
+        /// SQLite path: one db file per view under `<home>/meta/`, HA snapshot
+        /// shipping available. Set to `postgres://user:pw@host:port/db`
+        /// (`postgresql://…` also accepted) to place the authoritative view
+        /// tree in PostgreSQL: one `grovefs_v_<hex(view)>` schema per view,
+        /// transactions for rename/unlink/lock. Note that this mode is
+        /// **incompatible** with `--role standby` / `--peer` / `--witness`:
+        /// GroveFS-native HA snapshot shipping is `VACUUM INTO`-based and only
+        /// makes sense on the embedded SQLite backend; under PG, run
+        /// PostgreSQL's own streaming/logical replication for HA instead.
+        /// The per-view uid whitelist (`acl.db`) stays local SQLite regardless
+        /// of this choice.
+        #[arg(long)]
+        store: Option<String>,
     },
     /// Unmount a mountpoint
     Umount {
         #[arg(short, long)]
         mountpoint: PathBuf,
+    },
+    /// Manage the optional per-view uid whitelist (`<home>/meta/acl.db`).
+    /// A view with no rows is unrestricted (any uid, once past the token gate,
+    /// may mount); adding any row for a view switches it to whitelist mode.
+    Acl {
+        #[command(subcommand)]
+        action: AclAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum AclAction {
+    /// Grant `--uid` access to `--view`. At least one of `--read`/`--write`
+    /// is normally set; both-false reserves the row without granting.
+    Allow {
+        #[arg(long)]
+        view: String,
+        #[arg(long)]
+        uid: u32,
+        #[arg(long)]
+        read: bool,
+        #[arg(long)]
+        write: bool,
+    },
+    /// Revoke `--uid`'s grant on `--view`. Removing the last row reopens the
+    /// view to everyone.
+    Revoke {
+        #[arg(long)]
+        view: String,
+        #[arg(long)]
+        uid: u32,
+    },
+    /// List grants on `--view` (empty output = unrestricted).
+    List {
+        #[arg(long)]
+        view: String,
     },
 }
 
@@ -235,8 +293,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             token,
             o,
             threads,
+            as_uid,
         } => {
             std::fs::create_dir_all(&mountpoint)?;
+            // Effective uid reported to the server / used for local ACL check:
+            // `--as-uid` overrides the process euid (advisory).
+            let uid = as_uid.unwrap_or_else(|| unsafe { libc::geteuid() });
             // Metadata source: a central `meta-server` when --meta is given (a
             // single authoritative view shared across clients), else this machine's
             // local `<home>/meta/<view>.db`. Both satisfy `MetaProvider`, so the
@@ -244,13 +306,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let meta_provider: Arc<dyn MetaProvider> = match &meta {
                 Some(addr) => {
                     println!("using remote metadata service at {addr}");
-                    Arc::new(remote::RemoteMeta::new_with_token(
+                    Arc::new(remote::RemoteMeta::new_with_token_uid(
                         addr,
                         &view,
                         token.as_deref().unwrap_or(""),
+                        uid,
                     )?)
                 }
                 None => {
+                    // Local mount: enforce the view whitelist's read-gate before
+                    // opening the sqlite file. Write-gating is a meta-server-only
+                    // feature (writes here hit the file directly, behind OS fs
+                    // perms); document this honestly.
+                    let acl = AclStore::open(&base)?;
+                    if !acl.check_read(&view, uid) {
+                        return Err(format!(
+                            "local view '{view}' is whitelisted; uid {uid} has no read grant (see `grove acl list --view {view}`)"
+                        )
+                        .into());
+                    }
                     let mp = meta_path(&base, &view);
                     Arc::new(MetaEngine::open(&mp)?)
                 }
@@ -368,7 +442,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(addr) = &meta {
                 let notifier = session.notifier();
                 let tok = token.clone().unwrap_or_default();
-                let _listener = remote::spawn_invalidation_listener(addr, &view, &tok, notifier);
+                let _listener = remote::spawn_invalidation_listener(addr, &view, &tok, uid, notifier);
             }
             spawn_term_unmounter(mountpoint.clone());
             session.run()?;
@@ -386,7 +460,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let srv = srv.with_fence_store(root.join(".fence_token"));
             srv.serve()?;
         }
-        Cmd::MetaServer { listen, token, role, peer, sync_repl, witness } => {
+        Cmd::MetaServer { listen, token, role, peer, sync_repl, witness, store } => {
             let role = if role.eq_ignore_ascii_case("standby") {
                 grovefs::remote::meta::Role::Standby
             } else {
@@ -402,11 +476,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 srv = srv.with_sync_repl(true);
             }
             srv = srv.with_witness(witness);
+            srv = srv.with_store(store);
             srv.serve()?;
         }
         Cmd::Umount { mountpoint } => {
             run_fusermount(&["-u", &mountpoint.to_string_lossy()])?;
             println!("unmounted {}", mountpoint.display());
+        }
+        Cmd::Acl { action } => {
+            let acl = AclStore::open(&base)?;
+            match action {
+                AclAction::Allow { view, uid, read, write } => {
+                    acl.allow(&view, uid, read, write)?;
+                    println!("acl: granted view='{view}' uid={uid} read={read} write={write}");
+                }
+                AclAction::Revoke { view, uid } => {
+                    acl.revoke(&view, uid)?;
+                    println!("acl: revoked view='{view}' uid={uid}");
+                }
+                AclAction::List { view } => {
+                    let rows = acl.list(&view);
+                    if rows.is_empty() {
+                        println!(
+                            "view '{view}': UNRESTRICTED (no ACL rows — anyone who passes the token gate may mount)"
+                        );
+                    } else {
+                        println!("view '{view}' is whitelisted:");
+                        for r in rows {
+                            println!(
+                                "  uid {} read={} write={}",
+                                r.uid, r.can_read, r.can_write
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
     Ok(())

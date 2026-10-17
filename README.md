@@ -24,13 +24,14 @@
 ## 核心特性
 
 - **多用户视图隔离**：一用户一棵树，跨用户不可见；完整的 `mkdir`/`mknod`/`rename`/`rmdir` 自定义层级。
-- **可插拔存储/元数据后端**（trait 抽象）：本地 `LocalBackend`/`MetaEngine`、远程 `RemoteBackend`/`RemoteMeta`、跨多节点条带 `ShardedBackend`，对上层透明。
+- **可插拔存储/元数据后端**（trait 抽象）：本地 `LocalBackend`/`MetaEngine`、远程 `RemoteBackend`/`RemoteMeta`、跨多节点条带 `ShardedBackend`，对上层透明。元数据权威存储亦可切换为 **PostgreSQL**（`meta-server --store postgres://…`）：服务端 schema-per-view、事务化 rename/unlink/lock；此模式下自研 HA 有意关闭，交给 PG 自己的流复制/PITR。
+- **视图级 uid 白名单（可选）**：`grove acl allow/revoke/list` 管理 `<home>/meta/acl.db` 的 `view_acl(view,uid,can_read,can_write)`。未列入 = 无约束（14 套件历史行为不变）；一旦有行 → 读门在 `M_OPEN` 处 `E_AUTH` 拒挂载、写门逐 op `E_ROFS`。同一 view 即多人共享同一棵权威树，per-uid 读写分别放行。
 - **自定义二进制帧 over TCP**（非 NFS/gRPC）：定长头 + 变长体，连接池并发。
 - **跨客户端实时失效推送**（默认）：一端写成功，中心经事件总线向同用户其它订阅者广播 `inval_entry`+`inval_inode`，对端下次访问**即时可见**，无需轮询；`--strict` 提供零缓存兜底。
 - **分布式 advisory 锁**：`flock` / `fcntl F_SETLK/F_GETLK` 经中心 `locks` 表集中仲裁，跨进程、跨机生效；崩溃即时回收（FUSE `release`）+ 短 lease（默认 15s）+ 续约心跳。
 - **高可用主备**：`meta-server --role primary|standby --peer` 心跳/epoch 提升/自动降级；`--sync-repl` 把写 RPO 降到 0；`--witness` 取逗号分隔的 N 个共享 `data-server` 作**独立仲裁者集合**（推荐奇数），**fail-safe、持不重叠的有界多数派租约（需 `N/2+1` 授予；多数活租约即独占证明，写由本地租约校验放行）并对内容数据帧按 token 门控，把双写窗口收敛到租约安全余量内**；宕少数仲裁者仍不冻结写（N=1 退化为单仲裁旧行为）。
 - **Token 双面鉴权**、**只读挂载**（`--ro`）、多线程 `fuser 0.18`（`clone_fd` 并发派发）、**分块并行 IO** 与 **跨 server 条带**。
-- **完整回归**：`run_all.sh` **14 套件全板 GREEN**。
+- **完整回归**：`run_all.sh` **16 套件全板 GREEN**（新增 `acl` view 白名单 e2e、`pg` PostgreSQL 后端 e2e；`pg` 会在无 PG 主机上自动 SKIP）。
 
 ## 架构与原理
 
@@ -98,6 +99,42 @@ $Y umount --mountpoint /mnt/alice
 
 - **`--view` 是视图命名空间的标签，与 Linux 用户名无关**：任意合法文件名字符串都可以（如 `alice`、`team-a`、`u42`、`研究组`）——它只用来 ① 生成 `<home>/meta/<view>.db`，② 在 FUSE 挂载上打 `grovefs:<view>` 标签。二进制不调 `getpwnam`、不做 uid 校验、不需要 `useradd`。**权限来自「能访问 `--home` 与 `blocks/`」+ 可选 `--token`**，不来自 Linux 用户身份。同 `--home` 下不同 `--view` = 不同视图，跨用户不可见。
 - **一个用户一棵树，树内路径完全自主**：挂载后该 mountpoint 下可 `mkdir`/`touch` **任意多个**文件与目录、**任意深度**、任意自定义层级，与在自己 home 里的操作一致；视图隔离的粒度是「整棵树」而非「单一路径」。`--manifest` 只是预建骨架的便捷入口，不是路径数量的上限。
+
+## 共享视图与权限模型
+
+GroveFS 的权限栈只有两层——**令牌 = 集群准入，view 名 = 树选择**。`--view` 字符串本身不是身份：任何 uid 只要挂同一个 `--meta <addr>` + `--view alice` 都会落到 alice 的同一棵权威树上，看到彼此写入。这是有意的，也让「多人共享一个视图」开箱即用：
+
+- **多人共享同一 view**：多台机器、不同 OS 用户，都 `mount --view alice --meta ... --data ...` → 元数据经 `meta-server` 集中（一棵 SQLite/PG 树，串行化写）、内容经 `data-server` 集中（一份 `blocks/`）；`ls` 或 `cat` 立刻跨端可见，实时失效推送保证收敛。若希望**不同 uid 有不同权限**（例如只读旁观者），加白名单：
+
+  ```bash
+  # 中心节点上：给 alice 视图开白名单
+  $Y --home /data/cluster acl allow --view alice --uid 1000 --read --write   # rw 协作者
+  $Y --home /data/cluster acl allow --view alice --uid 2000 --read           # 只读订阅者
+  $Y --home /data/cluster acl list --view alice                              # 查看已授权的 uid
+  $Y --home /data/cluster acl revoke --view alice --uid 2000                 # 撤销单条
+  ```
+
+  `view_acl(view, uid, can_read, can_write)` 语义：**无行 = 无约束**（任何 uid 挂同一个 view 都放行，向后兼容旧行为）；**有任意行 = 白名单**（该 uid 无匹配行则 `M_OPEN` 直接被拒 `E_AUTH`，挂载 fail-fast；只读授权的 uid 在 op 循环里对写意图 op 逐条拒 `E_ROFS`）。本地模式（无 `--meta`）也走读门校验，写门由 OS 文件权限兜底（view 本地 SQLite 文件属主即最后一道防线）。客户端上报的 uid 默认取 `geteuid()`，也允许 `mount --as-uid N` 显式覆盖，用于共享 `meta-server` 上按角色挂载。
+
+  > **诚实边界**：TCP 客户端自报 uid 属**advisory**（客户端可伪造），真正的准入仍由 `--token` 把关；白名单是给一个已通过 token 的集群内部做**分工/职责**用的，不是防内鬼。本地模式（无 `--meta`）的写门只能靠 OS 权限（同 uid 无法强制隔离）。
+
+- **元数据后端可切换：SQLite ↔ PostgreSQL**（仅指 `meta-server` 权威存储）：
+
+  ```bash
+  # 默认（embedded SQLite，一 view 一 `<home>/meta/<view>.db`）
+  $Y --home /data/cluster meta-server --listen 0.0.0.0:50110
+
+  # PostgreSQL：一 view 一个 schema `grovefs_v_<hex(view)>`，事务化 rename/unlink/lock
+  $Y --home /data/cluster meta-server --listen 0.0.0.0:50110 \
+       --store postgres://user:pw@10.0.0.9:5432/grovefs
+  ```
+
+  客户端挂载命令**完全一致**（仍 `--meta host:port --view alice`）——线协议不变。注意：
+  - **PG 模式与自研 HA 互斥**：`--store postgres://…` + 任一 `--role standby / --peer / --witness` 在启动时直接 fail-fast（`VACUUM INTO` 快照复制是 SQLite 特性）；PG 上 HA 请交给 PostgreSQL 自己的**流复制/logical replication/PITR**——那本来就是比文件级快照更强的机制。
+  - `acl.db` 白名单在 PG 模式下**依然落本地 SQLite**（`<home>/meta/acl.db`）：它是控制面准入状态，不是 view 树的一部分，不应跟 view 一起进入 PG 复制域。
+  - 建表由服务端在 view 首次 `M_OPEN` 时幂等 `CREATE SCHEMA IF NOT EXISTS` + `CREATE TABLE IF NOT EXISTS` 完成，不需要预迁移脚本；根节点固定 id=1，`setval(pg_get_serial_sequence(...), MAX(id))` 对齐序列，`ROOT_INO` 语义与 SQLite 完全一致。
+
+  为什么没做 Redis：Redis 的 K/V+TTL 模型与视图树（rename/unlink/hardlink/refcount GC 需事务、锁需要行级仲裁）不同构——把 relational 语义硬塞到 Redis 里等于在应用层重做一个 PG，收益为负。**GroveFS 只加 PG，不加 Redis**。
 
 ## 生产拓扑：中心存储 + 多客户机 LAN 挂载
 
@@ -191,22 +228,26 @@ token 不匹配 → 连接时直接 `PermissionDenied`，不重试。空 token�
 ```bash
 export PKG_CONFIG=/path/to/grovefs/.build-bin/pkg-config LC_ALL=C LANG=C
 cargo test --release                 # 单元 + 集成测试
-bash .build-bin/run_all.sh           # 全板 14 套件
+bash .build-bin/run_all.sh           # 全板 16 套件
 SKIP_BENCH=1 bash .build-bin/run_all.sh   # 跳过吞吐基准（纯功能回归）
 ```
 
-套件：`build`、`unit`、`posix`、`edge`、`e2e`、`remote`、`errors`、`resilience`、`concurrent`、`metasrv`、`ha`（含 `--witness` fencing / fail-safe 场景）、`striping`、`locks`（含崩溃即时回收 / 续约跨过 lease）、`freshness`。
+套件：`build`、`unit`、`posix`、`edge`、`e2e`、`remote`、`errors`、`resilience`、`concurrent`、`metasrv`、`ha`（含 `--witness` fencing / fail-safe 场景）、`striping`、`locks`（含崩溃即时回收 / 续约跨过 lease）、`freshness`、`acl`（view 白名单 e2e）、`pg`（PostgreSQL 后端 e2e；无 PG 主机自动 SKIP、不拉低 GREEN）。
 
 ## 命令速查
 
 | 目的 | 命令 |
 | --- | --- |
 | 建视图 | `grove --home H init --view U [--manifest M]` |
-| 本地挂载 | `grove --home H mount --view U -m MP [--ro] [--strict] [--threads N]` |
-| 远程挂载 | `grove --home H mount --view U -m MP --data A[,A2] --meta M[,M_bak] [--token T]` |
+| 本地挂载 | `grove --home H mount --view U -m MP [--ro] [--strict] [--threads N] [--as-uid N]` |
+| 远程挂载 | `grove --home H mount --view U -m MP --data A[,A2] --meta M[,M_bak] [--token T] [--as-uid N]` |
 | 卸载 | `grove umount -m MP` |
 | 数据服务 | `grove data-server --listen IP:PORT --root DIR [--token T]` |
-| 元数据服务 | `grove --home H meta-server --listen IP:PORT [--token T] [--role primary\|standby --peer ADDR [--sync-repl] [--witness DATA_ADDR]]` |
+| 元数据服务（默认 SQLite） | `grove --home H meta-server --listen IP:PORT [--token T] [--role primary\|standby --peer ADDR [--sync-repl] [--witness DATA_ADDR]]` |
+| 元数据服务（PostgreSQL 后端） | `grove --home H meta-server --listen IP:PORT --store postgres://user:pw@host:5432/dbname` |
+| 视图白名单授权 | `grove --home H acl allow --view V --uid N [--read] [--write]` |
+| 视图白名单撤销 | `grove --home H acl revoke --view V --uid N` |
+| 视图白名单查询 | `grove --home H acl list --view V` |
 
 ## 诚实标注的边界
 
@@ -242,13 +283,14 @@ On top of that, metadata and data can each be served as a network service (`meta
 ## Key features
 
 - **Per-user view isolation** with full custom nesting (`mkdir`/`mknod`/`rename`/`rmdir`).
-- **Pluggable storage/metadata backends** via traits: local, remote, and cross-server striped (`ShardedBackend`).
+- **Pluggable storage/metadata backends** via traits: local, remote, and cross-server striped (`ShardedBackend`). The authoritative metadata store can additionally be swapped to **PostgreSQL** (`meta-server --store postgres://…`): one PG schema per view, transactions around rename/unlink/lock; under PG the in-tree HA (snapshot shipping) is intentionally off — use PG's own streaming replication / PITR instead.
+- **Optional per-view uid whitelist**: `grove acl allow/revoke/list` manages `view_acl(view,uid,can_read,can_write)` in `<home>/meta/acl.db`. No rows for a view = unrestricted (back-compat, all 14 legacy suites unchanged); any row = whitelist → `M_OPEN` fails with `E_AUTH` if the uid has no read grant, and every write-intent op is refused with `E_ROFS` if it lacks a write grant. Multiple clients can therefore share one authoritative tree at differing privilege levels.
 - **Custom binary framing over TCP** (not NFS, not gRPC) with a connection pool.
 - **Real-time cross-client invalidation push** (default): after a write, the center broadcasts `inval_entry`+`inval_inode` so peers see changes immediately, no polling; `--strict` gives a zero-caching fallback.
 - **Distributed advisory locks**: `flock` / `fcntl F_SETLK/F_GETLK` arbitrated centrally, effective across processes and machines; crash reclaim via FUSE `release`, plus a short lease (default 15s) and renewal heartbeats.
 - **High availability**: primary/standby `meta-server` with heartbeat/epoch promotion and automatic demotion; `--sync-repl` drops write RPO to 0; `--witness` takes a comma-separated list of shared `data-server` arbiters (odd `N`) and arbitrates by **majority** (`quorum_size = N/2+1`), **fail-safe**, holding a non-overlapping lease at a majority (renewed every tick; each arbiter refuses overlapping leases, so a majority live lease is itself proof of exclusive authority and a write is admitted from a local lease check) and stamping content frames so the arbiters can fence a stale writer, bounding the double-write window to the lease safety margin; losing a minority of arbiters no longer freezes writes (`N=1` degrades to a lone witness).
 - **Token authentication**, **read-only mounts** (`--ro`), **multi-threaded `fuser 0.18`** (`clone_fd`), **chunked parallel IO**, and **cross-server striping**.
-- **Full regression**: `run_all.sh` — **14 suites, all GREEN**.
+- **Full regression**: `run_all.sh` — **16 suites, all GREEN** (new `acl` per-view whitelist e2e + `pg` PostgreSQL backend e2e; the PG suite self-skips on hosts without a reachable PostgreSQL, so GREEN is preserved either way).
 
 ## Architecture
 
@@ -310,6 +352,41 @@ Seed a hierarchy: `init --view alice --manifest seed.txt` (lines of `mkdir <path
 
 - **`--view` is a view-namespace label, unrelated to Linux usernames**: any legal filename works (`alice`, `team-a`, `u42`, `research_group`). It is used only to (1) name `<home>/meta/<view>.db` and (2) tag the FUSE mount as `grovefs:<view>`. The binary does not call `getpwnam`, does not verify uid, does not require `useradd`. **Access authority comes from being able to reach `--home` / `blocks/` (or holding `--token`), not from the Linux user**. Under the same `--home`, distinct `--view` values map to distinct, mutually invisible views.
 - **One user = one tree, unlimited paths inside**: once mounted you may `mkdir`/`touch` any number of files and directories at any depth under that mountpoint, exactly as in your own home. Per-user isolation applies to the whole tree, not to individual paths. `--manifest` is only a convenience for pre-seeding a skeleton, not a cap on path count or depth.
+
+## Shared views & the permission model
+
+GroveFS has exactly two authorization layers — **token = cluster admission, view name = tree choice**. `--view` is not an identity: any uid that mounts the same `--meta <addr>` with the same `--view alice` lands on alice's single authoritative tree and sees the other writers. That is intentional and makes "one view, many users" work out of the box.
+
+- **Many OS users sharing one view**: point every client at the same `mount --view alice --meta ... --data ...` and both metadata (single SQLite/PG tree, writes serialized through the central engine) and content (single `blocks/`) converge in-place. If you need **differentiated rights per uid** inside that shared tree (e.g. an auditor mount that can list but never mutate), add a whitelist entry on the central node:
+
+  ```bash
+  $Y --home /data/cluster acl allow  --view alice --uid 1000 --read --write   # rw peer
+  $Y --home /data/cluster acl allow  --view alice --uid 2000 --read          # read-only subscriber
+  $Y --home /data/cluster acl list   --view alice                             # show grants
+  $Y --home /data/cluster acl revoke --view alice --uid 2000                  # drop one row
+  ```
+
+  Semantics: **zero rows for a view = unrestricted** (every uid passes, matches historical behavior); **any row = whitelist** (a uid without a matching row is refused at `M_OPEN` with `E_AUTH` so mount fails fast; a read-only grant sees every write-intent op rejected with `E_ROFS` while reads continue). In single-node local mounts the same read gate runs, but the write path lands on the underlying SQLite file directly — OS file permissions are the last line of defense there. The uid presented to the server is `geteuid()` by default and can be overridden with `mount --as-uid N` for role-based mounts against a shared `meta-server`.
+
+  > **Honest boundary**: the client-reported uid is **advisory** — a TCP client can forge it. Real admission is still the `--token` gate; the whitelist is for **role separation inside an already-trusted cluster**, not for hostile-tenant isolation.
+
+- **Metadata backend is swappable: SQLite ↔ PostgreSQL** (this is the `meta-server`'s *authoritative* store only; the wire protocol clients see does not change):
+
+  ```bash
+  # default: embedded SQLite, one `<home>/meta/<view>.db` per view
+  $Y --home /data/cluster meta-server --listen 0.0.0.0:50110
+
+  # PostgreSQL: one `grovefs_v_<hex(view)>` schema per view, tx-guarded rename/unlink/lock
+  $Y --home /data/cluster meta-server --listen 0.0.0.0:50110 \
+       --store postgres://user:pw@10.0.0.9:5432/grovefs
+  ```
+
+  Clients mount exactly the same way (`--meta host:port --view alice`). Notes that matter:
+  - **PG is mutually exclusive with the in-tree HA flags**: `--store postgres://…` combined with any of `--role standby` / `--peer` / `--witness` fails fast at startup — GroveFS-native HA ships snapshots via SQLite `VACUUM INTO`, which has no PG analogue. On PG, use PostgreSQL's own streaming / logical replication / PITR, which is strictly stronger than the file-snapshot mechanism anyway.
+  - `acl.db` remains a **local SQLite file** in PG mode as well: it is control-plane admission state, not part of any view tree, and should not travel with the view into PG's replication domain.
+  - Tables are created idempotently on the view's first `M_OPEN` (`CREATE SCHEMA IF NOT EXISTS` + `CREATE TABLE IF NOT EXISTS`), so no pre-migration script is needed; the root row is pinned at `id=1` and `setval(pg_get_serial_sequence(...), MAX(id))` aligns the sequence, matching SQLite's `ROOT_INO` semantics exactly.
+
+  Why Redis was *not* added: Redis's K/V+TTL model is not isomorphic to a view tree (rename/unlink/hardlink/refcount GC want transactions, lock arbitration wants row-level state). Emulating relational semantics on Redis would rebuild a worse PG at the application layer. **GroveFS ships PG, not Redis.**
 
 ## Production topology: central storage + LAN mounts
 
@@ -380,7 +457,7 @@ $Y --home /data/nodeA meta-server --listen 10.0.0.5:50110 --role primary --peer 
 ```bash
 export PKG_CONFIG=/path/to/grovefs/.build-bin/pkg-config LC_ALL=C LANG=C
 cargo test --release
-bash .build-bin/run_all.sh                 # 14 suites
+bash .build-bin/run_all.sh                 # 16 suites
 SKIP_BENCH=1 bash .build-bin/run_all.sh    # skip throughput bench
 ```
 

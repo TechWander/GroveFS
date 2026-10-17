@@ -192,6 +192,44 @@ $Y --home /local/home mount --view alice \
 - token 不匹配 → 连接时直接 permission denied,不重试。
 - 空 token(默认)= LAN-trusted 无鉴权,向后兼容,仅限可信内网。
 
+### 6.1 共享 view + 视图级 uid 白名单
+
+**默认行为下 `--view` 不隔离 uid**：任何 uid 只要 `mount --meta <addr> --view alice` 都落到 alice 同一棵权威树上,看到彼此写入。这就是「多人共享一个 view」开箱可用的形态——元数据集中、内容集中、实时失效推送保证收敛。
+
+如需在同一棵共享 tree 里区分职责(例如只读审阅者),可在中心 `--home` 上开白名单：
+
+```bash
+# rw 协作者 uid=1000
+$Y --home /data/cluster acl allow --view alice --uid 1000 --read --write
+# 只读订阅者 uid=2000
+$Y --home /data/cluster acl allow --view alice --uid 2000 --read
+$Y --home /data/cluster acl list --view alice         # 查看已授权 uid
+$Y --home /data/cluster acl revoke --view alice --uid 2000   # 撤销行
+```
+
+语义：
+- **无行 = 无约束**(向后兼容,任何 uid 挂同一 view 都放行)；
+- **有任意行 = 白名单**(无匹配行→ `M_OPEN` `E_AUTH` 拒挂载、挂载 fail-fast；仅 read 授权→ 写意图 op 逐条 `E_ROFS`、读仍放行)。
+- 客户端上报的 uid 默认 `geteuid()`,可 `mount --as-uid N` 显式覆盖,用于共享 meta-server 上不同角色的挂载。
+
+**诚实边界**：TCP 客户端自报 uid 属 advisory,真正确定性靠 `--token`；白名单适合「已通过 token 准入的集群内部职责分离」,不适合防内鬼。本地模式（无 `--meta`）仅写读门可拦截挂载；写操作落本地 SQLite 文件,同 uid 无法强制隔离,依赖 OS 文件权限。存储层为 `<home>/meta/acl.db`（单表 `view_acl(view,uid,can_read,can_write,PRIMARY KEY(view,uid))`）。
+
+### 6.2 PostgreSQL 元数据后端（可选）
+
+`meta-server` 默认将权威 view 树存在 embedded SQLite（一 view 一 `<home>/meta/<view>.db`）；可将它切为 PostgreSQL：
+
+```bash
+$Y --home /data/cluster meta-server --listen 0.0.0.0:50110 \
+     --store postgres://user:pw@10.0.0.9:5432/grovefs
+```
+
+客户端挂载命令完全一致(`--meta host:port --view alice`),线协议不变。服务端内部将每个 view 映射到一个 `grovefs_v_<hex(view)>` schema（hex 保证 identifier 安全、注入无关）,根节点固定 id=1,`ROOT_INO` 与 SQLite 行为一致。建表为幂等 `CREATE ... IF NOT EXISTS`,无需预迁移脚本。rename/unlink/lock 等需多语句原子性的 op 走显式事务。
+
+**注意**：
+- **与自研 HA 不兼容**：`--store postgres://…` + 任一 `--role standby` / `--peer` / `--witness` 会在启动时 fail-fast（`VACUUM INTO` 快照机制仅适用于 SQLite）。PG 高可用请交给 **PostgreSQL 自身的流复制 / logical replication / PITR**——本来就比文件快照更强。
+- `acl.db` 在 PG 模式下**仍属本地 SQLite**（控制面准入状态,不随 view 进 PG 复制域）。
+- 为什么不提供 Redis：K/V+TTL 与视图树不同构（事务/行锁/多列索引都是自然需要,硬塞只会同实例重建一个更弱的 PG）。
+
 ---
 
 ## 7. 只读挂载
