@@ -1005,6 +1005,118 @@ impl MetaProvider for MetaEngine {
     }
 }
 
+// ===================== pluggable metadata store (SQLite | PostgreSQL) ======
+
+/// A concrete metadata store the central `meta-server` (or a direct mount) can
+/// drive: the embedded SQLite [`MetaEngine`] or the [`crate::pg_store::PgEngine`]
+/// PostgreSQL backend. Both implement [`MetaProvider`], and this enum exposes
+/// the *same* inherent surface (`get_epoch`/`set_epoch`/`backup_to_bytes`) that
+/// the server's HA/replication code calls on the engine, so swapping backends is
+/// a construction-time choice in `engine_for` — the dispatch and event code never
+/// branch on the store.
+///
+/// GroveFS-native HA (`VACUUM INTO` snapshot shipping) is SQLite-only; under the
+/// PG variant `backup_to_bytes` reports unsupported and a `--store postgres://…`
+/// meta-server rejects the `--role/--peer/--witness` flags at CLI time.
+pub enum MetaStore {
+    Sqlite(MetaEngine),
+    Pg(Box<crate::pg_store::PgEngine>),
+}
+
+impl MetaStore {
+    /// Open a SQLite store for `<base>/meta/<view>.db` (`readonly` for a standby).
+    pub fn open_sqlite(base: &std::path::Path, view: &str, readonly: bool) -> rusqlite::Result<Self> {
+        let path = base.join("meta").join(format!("{view}.db"));
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        MetaEngine::open_ex(&path, readonly).map(MetaStore::Sqlite)
+    }
+
+    /// Open a PostgreSQL store for `view` in the database at `conn_uri`.
+    pub fn open_pg(conn_uri: &str, view: &str, readonly: bool) -> std::io::Result<Self> {
+        crate::pg_store::PgEngine::open(conn_uri, view, readonly).map(|p| MetaStore::Pg(Box::new(p)))
+    }
+
+    pub fn get_epoch(&self) -> i64 {
+        match self {
+            MetaStore::Sqlite(m) => m.get_epoch(),
+            MetaStore::Pg(p) => p.get_epoch(),
+        }
+    }
+
+    pub fn set_epoch(&self, e: i64) -> std::io::Result<()> {
+        match self {
+            MetaStore::Sqlite(m) => m.set_epoch(e).map_err(|err| std::io::Error::other(err.to_string())),
+            MetaStore::Pg(p) => p.set_epoch(e),
+        }
+    }
+
+    pub fn backup_to_bytes(&self) -> std::io::Result<Vec<u8>> {
+        match self {
+            MetaStore::Sqlite(m) => m.backup_to_bytes().map_err(|err| std::io::Error::other(err.to_string())),
+            MetaStore::Pg(p) => p.backup_to_bytes(),
+        }
+    }
+}
+
+impl MetaProvider for MetaStore {
+    fn lookup(&self, parent: i64, name: &str) -> Option<NodeInfo> {
+        match self { MetaStore::Sqlite(m) => m.lookup(parent, name), MetaStore::Pg(p) => p.lookup(parent, name) }
+    }
+    fn getattr(&self, ino: i64) -> Option<NodeInfo> {
+        match self { MetaStore::Sqlite(m) => m.getattr(ino), MetaStore::Pg(p) => p.getattr(ino) }
+    }
+    fn readdir(&self, parent: i64) -> Vec<NodeInfo> {
+        match self { MetaStore::Sqlite(m) => m.readdir(parent), MetaStore::Pg(p) => p.readdir(parent) }
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn create_node(&self, parent: i64, name: &str, is_dir: bool, data_ref: Option<&str>, mode: u32, uid: u32, gid: u32) -> Result<i64, MetaError> {
+        match self { MetaStore::Sqlite(m) => m.create_node(parent, name, is_dir, data_ref, mode, uid, gid), MetaStore::Pg(p) => p.create_node(parent, name, is_dir, data_ref, mode, uid, gid) }
+    }
+    fn create_symlink(&self, parent: i64, name: &str, target: &str, uid: u32, gid: u32) -> Result<i64, MetaError> {
+        match self { MetaStore::Sqlite(m) => m.create_symlink(parent, name, target, uid, gid), MetaStore::Pg(p) => p.create_symlink(parent, name, target, uid, gid) }
+    }
+    fn link_node(&self, src_ino: i64, new_parent: i64, new_name: &str) -> Result<i64, MetaError> {
+        match self { MetaStore::Sqlite(m) => m.link_node(src_ino, new_parent, new_name), MetaStore::Pg(p) => p.link_node(src_ino, new_parent, new_name) }
+    }
+    fn unlink(&self, parent: i64, name: &str) -> Result<Option<String>, MetaError> {
+        match self { MetaStore::Sqlite(m) => m.unlink(parent, name), MetaStore::Pg(p) => p.unlink(parent, name) }
+    }
+    fn rename(&self, parent: i64, name: &str, new_parent: i64, new_name: &str, noreplace: bool) -> Result<Option<String>, MetaError> {
+        match self { MetaStore::Sqlite(m) => m.rename(parent, name, new_parent, new_name, noreplace), MetaStore::Pg(p) => p.rename(parent, name, new_parent, new_name, noreplace) }
+    }
+    fn set_mode(&self, ino: i64, mode: u32) {
+        match self { MetaStore::Sqlite(m) => m.set_mode(ino, mode), MetaStore::Pg(p) => p.set_mode(ino, mode) }
+    }
+    fn set_uid_gid(&self, ino: i64, uid: u32, gid: u32) {
+        match self { MetaStore::Sqlite(m) => m.set_uid_gid(ino, uid, gid), MetaStore::Pg(p) => p.set_uid_gid(ino, uid, gid) }
+    }
+    fn set_times(&self, ino: i64, atime: Option<i64>, mtime: Option<i64>) {
+        match self { MetaStore::Sqlite(m) => m.set_times(ino, atime, mtime), MetaStore::Pg(p) => p.set_times(ino, atime, mtime) }
+    }
+    fn touch_mtime(&self, ino: i64) {
+        match self { MetaStore::Sqlite(m) => m.touch_mtime(ino), MetaStore::Pg(p) => p.touch_mtime(ino) }
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn lock_op(&self, ino: i64, owner: u64, start: u64, end: u64, ty: LockType, pid: u32, sid: u64) -> Result<Option<LockConflict>, MetaError> {
+        match self { MetaStore::Sqlite(m) => m.lock_op(ino, owner, start, end, ty, pid, sid), MetaStore::Pg(p) => p.lock_op(ino, owner, start, end, ty, pid, sid) }
+    }
+    fn get_lock(&self, ino: i64, owner: u64, start: u64, end: u64, ty: LockType) -> Option<LockConflict> {
+        match self { MetaStore::Sqlite(m) => m.get_lock(ino, owner, start, end, ty), MetaStore::Pg(p) => p.get_lock(ino, owner, start, end, ty) }
+    }
+    fn release_locks_of_owner(&self, owner: u64) {
+        match self { MetaStore::Sqlite(m) => m.release_locks_of_owner(owner), MetaStore::Pg(p) => p.release_locks_of_owner(owner) }
+    }
+    fn renew_locks(&self, sid: u64) {
+        match self { MetaStore::Sqlite(m) => m.renew_locks(sid), MetaStore::Pg(p) => p.renew_locks(sid) }
+    }
+    fn fence_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        match self { MetaStore::Sqlite(m) => m.fence_handle(), MetaStore::Pg(p) => p.fence_handle() }
+    }
+}
+
+
 struct RawNode {
     id: i64,
     parent_id: Option<i64>,

@@ -18,7 +18,7 @@
 //! [`NodeInfo`].
 
 use super::proto;
-use crate::meta::{LockConflict, LockType, MetaEngine, MetaError, MetaProvider, NodeInfo, NodeKind};
+use crate::meta::{LockConflict, LockType, MetaEngine, MetaError, MetaProvider, MetaStore, NodeInfo, NodeKind};
 use fuser::{INodeNo, Notifier};
 use libc::EIO;
 use parking_lot::Mutex;
@@ -345,6 +345,10 @@ pub struct RemoteMeta {
     active: AtomicUsize,
     view: String,
     token: String,
+    /// Mount process uid presented on the `M_OPEN` handshake so the central
+    /// `meta-server` can apply the optional per-view uid whitelist
+    /// ([`crate::acl::AclStore']). Self-reported (advisory), not a hard identity.
+    uid: u32,
     pool: Arc<Mutex<Vec<TcpStream>>>,
     max_conns: usize,
     connect_timeout: Duration,
@@ -364,6 +368,12 @@ impl RemoteMeta {
         Self::new_with_token(addr, view, "")
     }
 
+    /// The presenting uid: the mount process's real euid, reported to the
+    /// server's optional view whitelist.
+    fn self_uid() -> u32 {
+        unsafe { libc::geteuid() }
+    }
+
     /// Like [`RemoteMeta::new`], but presents `token` in the `M_OPEN` handshake.
     /// A server configured with a different token rejects the connection with
     /// `PermissionDenied`, so mount fails fast rather than silently running
@@ -373,11 +383,24 @@ impl RemoteMeta {
     /// client sticks to the first reachable address and only falls over to a
     /// later one once an address exhausts its connect-retry budget.
     pub fn new_with_token(addr: &str, view: &str, token: &str) -> io::Result<Self> {
+        Self::new_with_token_uid(addr, view, token, Self::self_uid())
+    }
+
+    /// Like [`RemoteMeta::new_with_token`], but presents an explicit `uid` on the
+    /// handshake (the `mount --as-uid` override) instead of the process euid, so
+    /// a shared meta-server can be exercised/used under a chosen whitelist slot.
+    pub fn new_with_token_uid(
+        addr: &str,
+        view: &str,
+        token: &str,
+        uid: u32,
+    ) -> io::Result<Self> {
         let this = Self {
             addrs: split_addrs(addr),
             active: AtomicUsize::new(0),
             view: view.to_string(),
             token: token.to_string(),
+            uid,
             pool: Arc::new(Mutex::new(Vec::new())),
             max_conns: 32,
             connect_timeout: Duration::from_secs(5),
@@ -420,6 +443,7 @@ impl RemoteMeta {
                         let mut body = Vec::new();
                         proto::put_key(&mut body, &self.view);
                         proto::put_key(&mut body, &self.token);
+                        proto::put_u32(&mut body, self.uid);
                         let mut s = s;
                         match Self::call(&mut s, M_OPEN, &body) {
                             Ok((0, epoch, _)) => {
@@ -810,13 +834,29 @@ impl HaState {
     }
 }
 
+/// Which metadata backend a [`MetaServer`] should drive. The default
+/// ([`StoreKind::Sqlite`]) keeps the historical embedded-SQLite path (one db per
+/// view under `<base>/meta/`, HA snapshot shipping via `VACUUM INTO`).
+/// [`StoreKind::Pg`] routes every view through
+/// [`MetaStore::Pg`]/[`crate::pg_store::PgEngine`] against the given libpq-style
+/// connection URI; per-view isolation is via a PG schema (`grovefs_v_<hex>`)
+/// instead of a separate db. PG deployments rely on PostgreSQL's own
+/// replication/logical decoding for durability, so GroveFS-native HA
+/// (`--role standby`/`--peer`/`--witness`) is rejected at `serve()` time and
+/// [`MetaStore::backup_to_bytes`] reports unsupported for this variant.
+#[derive(Clone, Debug)]
+pub enum StoreKind {
+    Sqlite,
+    Pg(String),
+}
+
 /// Everything a connection thread needs to serve a node. Wrapped in `Arc` so the
 /// accept loop hands one to each spawned thread and the HA background threads
 /// share the same cache / role / peer view.
 struct MetaRuntime {
     base: PathBuf,
     token: String,
-    cache: Arc<Mutex<HashMap<String, Arc<MetaEngine>>>>,
+    cache: Arc<Mutex<HashMap<String, Arc<MetaStore>>>>,
     subs: Subscribers,
     ha: Option<Arc<HaState>>,
     peer: Option<String>,
@@ -860,6 +900,15 @@ struct MetaRuntime {
     /// arbiter node, not merely bounded (see [`super::server`]'s data-plane gate
     /// and [`super::client::RemoteBackend`]).
     witness: Option<String>,
+    /// Optional per-view uid whitelist (`<base>/meta/acl.db`). Unrestricted views
+    /// (no rows) are served to everyone; restricted views gate the `M_OPEN` read
+    /// (else `E_AUTH`) and each write-intent op (else `E_ROFS`). See [`crate::acl`].
+    acl: Arc<crate::acl::AclStore>,
+    /// Which metadata backend `engine_for` should open against (see
+    /// [`StoreKind`]). `Pg(_)` disables the GroveFS-native HA paths by
+    /// construction: `serve()` rejects the `--role standby`/`--peer`/`--witness`
+    /// flags for a PG store, and sync-repl / replicator ticks never fire.
+    store: StoreKind,
 }
 
 impl MetaRuntime {
@@ -938,6 +987,7 @@ pub struct MetaServer {
     peer: Option<String>,
     sync_repl: bool,
     witness: Option<String>,
+    store: StoreKind,
 }
 
 /// Upper bound on the primary's wait for a standby ACK under `--sync-repl`.
@@ -958,6 +1008,7 @@ impl MetaServer {
             peer: None,
             sync_repl: false,
             witness: None,
+            store: StoreKind::Sqlite,
         }
     }
 
@@ -973,6 +1024,7 @@ impl MetaServer {
             peer: None,
             sync_repl: false,
             witness: None,
+            store: StoreKind::Sqlite,
         }
     }
 
@@ -1042,8 +1094,52 @@ impl MetaServer {
         self
     }
 
+    /// Choose the metadata backend. `uri` accepts:
+    /// * `None` or `"sqlite"` (or anything not a `postgres[ql]://` URI) — the
+    ///   default embedded-SQLite backend, one db per view under `<base>/meta/`.
+    /// * `postgres://user:pw@host:port/db` (or `postgresql://...`) — the
+    ///   PostgreSQL backend, one PG schema per view. Combined with
+    ///   `--role/--peer/--witness` at `serve()` time this returns an
+    ///   [`io::ErrorKind::InvalidInput`] because GroveFS-native HA snapshot
+    ///   shipping (`VACUUM INTO`) is a SQLite-specific mechanism; run PG with
+    ///   PostgreSQL's own streaming/logical replication instead.
+    ///
+    /// The `acl.db` whitelist store remains local SQLite regardless of this
+    /// choice — ACL rows are per-`meta-server` control-plane state, not part of
+    /// the shared view tree.
+    pub fn with_store(mut self, uri: Option<String>) -> Self {
+        match uri {
+            Some(u) if u.starts_with("postgres://") || u.starts_with("postgresql://") => {
+                self.store = StoreKind::Pg(u);
+            }
+            _ => self.store = StoreKind::Sqlite,
+        }
+        self
+    }
+
     pub fn serve(&self) -> io::Result<()> {
+        // PG mode never exercises the GroveFS-native HA pipeline: the
+        // `VACUUM INTO` snapshot mechanism and the fencing-witness lease are
+        // SQLite-specific. Refuse the combination at startup instead of letting
+        // a caller assume `--peer` still replicates (it silently wouldn't).
+        if matches!(self.store, StoreKind::Pg(_))
+            && (self.peer.is_some() || self.witness.is_some() || self.role == Role::Standby)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--store postgres://… cannot be combined with --role standby / --peer / --witness: \n                     GroveFS-native HA snapshot shipping is SQLite-only.\n                     Run PostgreSQL's own streaming / logical replication for HA,\n                     or keep the meta-server single-instance under PG.",
+            ));
+        }
         std::fs::create_dir_all(self.base.join("meta"))?;
+        // Open the optional view whitelist BEFORE binding so a client (or the
+        // test board's `wait_port` + log grep) never sees the listen port
+        // reachable while the SQLite ACL setup is still running — otherwise
+        // the port becomes connectable before the `synchronous replication ON`
+        // / `registered fencing epoch` log lines have flushed, and readiness
+        // probes race startup I/O.
+        let acl = Arc::new(
+            crate::acl::AclStore::open(&self.base).expect("open acl.db"),
+        );
         let listener = TcpListener::bind(&self.listen)?;
         println!(
             "meta-server listening on {} (base {}, role {:?}{})",
@@ -1073,6 +1169,8 @@ impl MetaServer {
             sync_repl: self.sync_repl && self.peer.is_some(),
             standby_push: Mutex::new(()),
             witness: self.witness.clone(),
+            acl,
+            store: self.store.clone(),
         });
         if rt.sync_repl {
             println!("meta-server: synchronous replication ON (RPO=0 for mutating ops, ACK timeout {SYNC_REPL_ACK_TIMEOUT:?})");
@@ -1159,6 +1257,7 @@ pub fn serve_on_meta(listener: TcpListener, base: PathBuf) {
 /// Accept loop with an access token (`""` disables the check). Single-node (no
 /// HA), matching the historical behavior all existing tests rely on.
 pub fn serve_on_meta_auth(listener: TcpListener, base: PathBuf, token: &str) {
+    let acl_base = base.clone();
     let rt = Arc::new(MetaRuntime {
         base,
         token: token.to_string(),
@@ -1170,6 +1269,10 @@ pub fn serve_on_meta_auth(listener: TcpListener, base: PathBuf, token: &str) {
         sync_repl: false,
         standby_push: Mutex::new(()),
         witness: None,
+        acl: Arc::new(
+            crate::acl::AclStore::open(&acl_base).expect("open acl.db"),
+        ),
+        store: StoreKind::Sqlite,
     });
     serve_runtime(listener, rt);
 }
@@ -1194,20 +1297,28 @@ fn serve_runtime(listener: TcpListener, rt: Arc<MetaRuntime>) {
 
 /// Open (or reuse) the authoritative engine for `view`. A HA standby opens its
 /// replicated copy strictly read-only (so a stray write is refused at the SQLite
-/// layer, not merely discouraged); a primary opens read-write.
-fn engine_for(rt: &MetaRuntime, view: &str) -> io::Result<Arc<MetaEngine>> {
+/// layer, not merely discouraged); a primary opens read-write. Under
+/// [`StoreKind::Pg`] the standby/readonly path never fires (`serve()` refuses
+/// the combination), so `readonly` is passed through as `false`.
+fn engine_for(rt: &MetaRuntime, view: &str) -> io::Result<Arc<MetaStore>> {
     let mut m = rt.cache.lock();
     if let Some(e) = m.get(view) {
         return Ok(e.clone());
     }
-    let path = rt.base.join("meta").join(format!("{view}.db"));
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).ok();
-    }
-    let readonly = rt.role() == Role::Standby;
-    let engine = Arc::new(
-        MetaEngine::open_ex(&path, readonly).map_err(|e| io::Error::other(e.to_string()))?,
-    );
+    let store = match &rt.store {
+        StoreKind::Sqlite => {
+            let path = rt.base.join("meta").join(format!("{view}.db"));
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir).ok();
+            }
+            let readonly = rt.role() == Role::Standby;
+            MetaStore::open_sqlite(&rt.base, view, readonly)
+                .map_err(|e| io::Error::other(e.to_string()))?
+        }
+        StoreKind::Pg(uri) => MetaStore::open_pg(uri, view, false)
+            .map_err(|e| io::Error::other(format!("pg open for view='{view}' uri='{uri}': {e}")))?,
+    };
+    let engine = Arc::new(store);
     m.insert(view.to_string(), engine.clone());
     Ok(engine)
 }
@@ -1324,7 +1435,7 @@ fn events_from(body: &[u8], i: &mut usize) -> io::Result<Vec<Event>> {
 ///
 /// The parent/name are resolved server-side from the authoritative engine, so
 /// the writer's `touch_mtime(ino)` call site needs no extra context.
-fn inode_change_events(engine: &MetaEngine, ino: i64) -> Vec<Event> {
+fn inode_change_events(engine: &MetaStore, ino: i64) -> Vec<Event> {
     let mut evs = vec![Event::Inode { ino }];
     if let Some(n) = engine.getattr(ino) {
         if !n.name.is_empty() {
@@ -1385,17 +1496,30 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
     let mut i = 0usize;
     let view = proto::get_key(&body, &mut i).unwrap_or_default();
     let presented = proto::get_key(&body, &mut i).unwrap_or_default();
+    // Optional presenting uid appended by the client handshake (older clients
+    // omit it -> uid 0, which is simply denied on a whitelisted view).
+    let uid = proto::read_u32(&body, &mut i).unwrap_or(0);
     // Enforce the shared secret when one is configured; an empty server token
     // accepts any client (backward-compatible, LAN-trusted).
     if !rt.token.is_empty() && presented != rt.token {
         proto::send_response(&mut writer, E_AUTH, 0, &[])?;
         return Ok(());
     }
+    // View whitelist: an unrestricted view (no ACL rows) admits any uid; a
+    // restricted one refuses the open outright unless `uid` holds a read grant.
+    if !rt.acl.check_read(&view, uid) {
+        proto::send_response(&mut writer, E_AUTH, 0, &[])?;
+        return Ok(());
+    }
+    // Whether this uid may mutate the view (checked per write-intent op below);
+    // an unrestricted view grants writes too.
+    let write_ok = rt.acl.check_write(&view, uid);
     // Validate the view db opens before acking. We deliberately do NOT
     // cache this engine for the whole connection: under HA a fresh replicated
     // snapshot evicts the cached engine, so live connections must re-resolve it
     // per op to observe the swap (see the loop below).
-    if engine_for(&rt, &view).is_err() {
+    if let Err(e) = engine_for(&rt, &view) {
+        eprintln!("meta: M_OPEN view='{view}' engine open failed: {e}");
         proto::send_response(&mut writer, E_DB, 0, &[])?;
         return Ok(());
     }
@@ -1433,6 +1557,12 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
                 }
             },
         };
+        // View write-whitelist: a restricted view refuses mutating ops from a uid
+        // without a write grant (reads still served). Unrestricted views grant all.
+        if is_write_op(op) && !write_ok {
+            proto::send_response(&mut writer, E_ROFS, 0, &[])?;
+            continue;
+        }
         // Read-only gate: a HA standby (or a demoted ex-primary) refuses
         // write-intent ops. Reads + subscriptions are still served from the
         // replicated snapshot; the client treats E_ROFS as a failover signal.
@@ -1572,7 +1702,7 @@ fn handle_control_conn(
 /// validated to keep the peer from steering writes outside the meta dir.
 fn install_snapshot(
     base: &Path,
-    cache: &Mutex<HashMap<String, Arc<MetaEngine>>>,
+    cache: &Mutex<HashMap<String, Arc<MetaStore>>>,
     view: &str,
     snap: &[u8],
 ) -> io::Result<()> {
@@ -1640,7 +1770,7 @@ fn max_epoch_on_disk(rt: &MetaRuntime) -> i64 {
 ///
 /// The client's write still succeeded locally; the warn is the honest signal
 /// that RPO for this op has fallen back to `REPL_INTERVAL`.
-fn push_snapshot_now(rt: &MetaRuntime, view: &str, engine: &MetaEngine) {
+fn push_snapshot_now(rt: &MetaRuntime, view: &str, engine: &MetaStore) {
     let peer = match &rt.peer {
         Some(p) => p.clone(),
         None => return,
@@ -2113,7 +2243,7 @@ fn start_promotion_watchdog(rt: Arc<MetaRuntime>, ha: Arc<HaState>) {
 }
 
 /// Execute one metadata operation against the view's engine.
-fn dispatch_meta(engine: &MetaEngine, op: u8, body: &[u8]) -> (i32, u64, Vec<u8>, Vec<Event>) {
+fn dispatch_meta(engine: &MetaStore, op: u8, body: &[u8]) -> (i32, u64, Vec<u8>, Vec<Event>) {
     let mut i = 0usize;
     macro_rules! bail {
         ($e:expr) => {
@@ -2301,10 +2431,10 @@ fn dispatch_meta(engine: &MetaEngine, op: u8, body: &[u8]) -> (i32, u64, Vec<u8>
 /// and the first successful subscription is returned (a token rejection is fatal
 /// and not retried against a backup). Used by the mount's listener thread so
 /// invalidation pushes keep flowing after a failover.
-pub fn open_event_stream(addr: &str, view: &str, token: &str) -> io::Result<TcpStream> {
+pub fn open_event_stream(addr: &str, view: &str, token: &str, uid: u32) -> io::Result<TcpStream> {
     let mut last = io::Error::new(io::ErrorKind::ConnectionRefused, "no meta addr");
     for a in split_addrs(addr) {
-        match try_open_event_stream(&a, view, token) {
+        match try_open_event_stream(&a, view, token, uid) {
             Ok(s) => return Ok(s),
             // A rejected token is a config error on every node; don't rotate.
             Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return Err(e),
@@ -2314,7 +2444,7 @@ pub fn open_event_stream(addr: &str, view: &str, token: &str) -> io::Result<TcpS
     Err(last)
 }
 
-fn try_open_event_stream(addr: &str, view: &str, token: &str) -> io::Result<TcpStream> {
+fn try_open_event_stream(addr: &str, view: &str, token: &str, uid: u32) -> io::Result<TcpStream> {
     let mut s = TcpStream::connect(addr)?;
     s.set_read_timeout(None)?; // block waiting for pushed events
     s.set_write_timeout(Some(Duration::from_secs(5)))?;
@@ -2322,6 +2452,7 @@ fn try_open_event_stream(addr: &str, view: &str, token: &str) -> io::Result<TcpS
     let mut body = Vec::new();
     proto::put_key(&mut body, view);
     proto::put_key(&mut body, token);
+    proto::put_u32(&mut body, uid);
     proto::send_request(&mut s, M_OPEN, &body)?;
     let (st, _, _) = proto::recv_response(&mut s)?;
     if st == E_AUTH {
@@ -2367,13 +2498,14 @@ pub fn spawn_invalidation_listener(
     addr: &str,
     view: &str,
     token: &str,
+    uid: u32,
     notifier: Notifier,
 ) -> thread::JoinHandle<()> {
     let addr = addr.to_string();
     let view = view.to_string();
     let token = token.to_string();
     thread::spawn(move || loop {
-        match run_event_stream(&addr, &view, &token, &notifier) {
+        match run_event_stream(&addr, &view, &token, uid, &notifier) {
             // A rejected token is a config error; retrying can't fix it.
             Err(ref e) if e.kind() == io::ErrorKind::PermissionDenied => {
                 eprintln!("invalidation listener stopped: token rejected");
@@ -2385,8 +2517,8 @@ pub fn spawn_invalidation_listener(
     })
 }
 
-fn run_event_stream(addr: &str, view: &str, token: &str, notifier: &Notifier) -> io::Result<()> {
-    let mut s = open_event_stream(addr, view, token)?;
+fn run_event_stream(addr: &str, view: &str, token: &str, uid: u32, notifier: &Notifier) -> io::Result<()> {
+    let mut s = open_event_stream(addr, view, token, uid)?;
     loop {
         let (kind, val, data) = proto::recv_response(&mut s)?;
         match kind {
@@ -2500,6 +2632,8 @@ mod ha_tests {
             sync_repl: false,
             standby_push: Mutex::new(()),
             witness: Some(waddr),
+            acl: Arc::new(crate::acl::AclStore::open(dir.path()).unwrap()),
+            store: StoreKind::Sqlite,
         });
 
         // Witness holds nothing above our epoch: the first proof grants a lease

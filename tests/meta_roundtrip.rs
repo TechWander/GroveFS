@@ -185,7 +185,7 @@ fn meta_server_token_auth_gates_access() {
 fn meta_event_bus_pushes_invalidations() {
     let (addr, _d) = spawn_meta_server();
     let mut sub = (0..100)
-        .find_map(|_| match open_event_stream(&addr, "carol", "") {
+        .find_map(|_| match open_event_stream(&addr, "carol", "", 0) {
             Ok(s) => Some(s),
             Err(_) => {
                 std::thread::sleep(std::time::Duration::from_millis(20));
