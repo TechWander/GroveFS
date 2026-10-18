@@ -21,6 +21,7 @@
 #   locks       POSIX advisory lock e2e: flock/fcntl/lease/HA-replication
 #   freshness   non-strict cross-client push-invalidation visibility e2e
 #   acl         optional per-view uid whitelist e2e (read gate + write gate)
+#   layout      presentation overlay e2e: one stored view, per-client lens
 #   pg          PostgreSQL metadata backend e2e (self-skips if PG unreachable)
 #   bench   throughput micro-benchmark        (informational; never gates the result)
 #
@@ -34,7 +35,7 @@ SKIP_BENCH=${SKIP_BENCH:-0}
 LOGDIR=.build-bin/logs/$(date +%Y%m%d-%H%M%S)
 mkdir -p "$LOGDIR"
 
-CANON="build unit posix edge e2e remote errors resilience concurrent metasrv ha striping locks freshness acl pg bench"
+CANON="build unit posix edge e2e remote errors resilience concurrent metasrv ha striping locks freshness acl layout import pg bench"
 if [ "$#" -gt 0 ]; then SEL="$*"; else SEL="$CANON"; fi
 [ "$SKIP_BENCH" = "1" ] && SEL=${SEL// bench/}
 
@@ -46,10 +47,10 @@ should(){ case " $SEL " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
 # ensure a fresh binary whenever a code suite is selected
 NEEDS_BUILD=0
-for s in $SEL; do case "$s" in unit|posix|edge|e2e|remote|errors|resilience|concurrent|metasrv|ha|striping|locks|freshness|acl|pg|bench) NEEDS_BUILD=1 ;; esac; done
+for s in $SEL; do case "$s" in unit|posix|edge|e2e|remote|errors|resilience|concurrent|metasrv|ha|striping|locks|freshness|acl|layout|import|pg|bench) NEEDS_BUILD=1 ;; esac; done
 if [ "$NEEDS_BUILD" = 1 ] && ! should build; then SEL="build $SEL"; fi
 
-MOUNTS=".test/mnt_alice .test/mnt_bob .test/mnt_r .ptest/mnt .etest/mnt .xtest/mnt .xtest/mnt_ro .rtest/mnt_a .rtest/mnt_b .ctest/m1 .ctest/m2 .msrv/mnt_a .msrv/mnt_b .msrv/mnt_bob .msrv/mnt_s1 .msrv/mnt_s2 .bench/mnt .bt-t1/mnt .bt-t4/mnt .br/mnt .ha/mnt .ha/mnt_sb .striping/mnt .striping/mnt_legacy .sigtest/mnt .locks/m1 .locks/m2 .locks/ha/mnt .fresh/mnt_a .fresh/mnt_b .acl/mnt_rw .acl/mnt_ro .acl/mnt_denied .pgtest/mnt_a .pgtest/mnt_b"
+MOUNTS=".test/mnt_alice .test/mnt_bob .test/mnt_r .ptest/mnt .etest/mnt .xtest/mnt .xtest/mnt_ro .rtest/mnt_a .rtest/mnt_b .ctest/m1 .ctest/m2 .msrv/mnt_a .msrv/mnt_b .msrv/mnt_bob .msrv/mnt_s1 .msrv/mnt_s2 .ltest/mnt_base .ltest/mnt_a .ltest/mnt_b .ltest/mnt_c .ltest/mnt_d .ltest/mnt_srv .ltest/mnt_srvbase .ltest/mnt_ld .itest/mnt .itest/mnt_r .itest/mnt_v .bench/mnt .bt-t1/mnt .bt-t4/mnt .br/mnt .ha/mnt .ha/mnt_sb .striping/mnt .striping/mnt_legacy .sigtest/mnt .locks/m1 .locks/m2 .locks/ha/mnt .fresh/mnt_a .fresh/mnt_b .acl/mnt_rw .acl/mnt_ro .acl/mnt_denied .pgtest/mnt_a .pgtest/mnt_b"
 umount_all(){ for d in $MOUNTS; do fusermount -u "$d" 2>/dev/null || true; done; }
 umount_all
 trap umount_all EXIT
@@ -136,6 +137,8 @@ for s in $CANON; do
     locks)    run_mountsuite locks   .build-bin/test_locks.sh   240 ;;
     freshness) run_mountsuite freshness .build-bin/test_freshness.sh 240 ;;
     acl)      run_mountsuite acl .build-bin/test_acl.sh 240 ;;
+    layout)   run_mountsuite layout .build-bin/test_layout.sh 240 ;;
+    import)   run_mountsuite import .build-bin/test_import.sh 240 ;;
     pg)       run_mountsuite pg .build-bin/test_pg.sh 240 ;;
     bench)  run_bench ;;
   esac

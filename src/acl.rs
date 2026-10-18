@@ -9,8 +9,8 @@
 //!
 //! Semantics (kept minimal and backward-compatible):
 //! - A view with **no ACL rows is unrestricted** — anyone who passes the token
-//!   gate may mount it, exactly as before. The 14 regression suites never write
-//!   ACL rows, so they are unaffected.
+//!   gate may mount it, exactly as before. The other regression suites never
+//!   write ACL rows, so they are unaffected.
 //! - A view with **one or more ACL rows is whitelisted**: only uids listed with
 //!   `can_read` may open it at all; only uids listed with `can_write` may mutate
 //!   it (create/unlink/rename/write/chmod/...).

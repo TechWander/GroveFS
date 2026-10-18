@@ -1,6 +1,9 @@
 # Rust build artifacts
 /target/
 
+# Preserved standalone release binary (copied out of target/ so it survives `cargo clean`)
+/bin/
+
 # Runtime / test scratch mounts and data dirs created by the suites
 /.bench/
 /.blk/
@@ -22,6 +25,8 @@
 /.acl/
 /.pgtest/
 /.pgtest2/
+/.ltest/
+/.itest/
 
 # .build-bin tracks the test/bench scripts and the pkg-config wrapper,
 # but never its run output or captured logs.

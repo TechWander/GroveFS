@@ -10,10 +10,12 @@
 //! - [`fs_impl`]      : the fuser `Filesystem` bridging POSIX calls to the above
 //! - [`remote`]       : TCP data transport (client backend + server), no NFS
 //! - [`acl`]          : optional per-view uid whitelist (advisory access control)
+//! - [`layout`]       : per-mount presentation overlay (same tree, different lens)
 
 pub mod acl;
 pub mod backend;
 pub mod fs_impl;
+pub mod layout;
 pub mod meta;
 pub mod pg_store;
 pub mod remote;

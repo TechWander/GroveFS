@@ -25,7 +25,7 @@ wait_port(){ local a=$1; for _ in $(seq 1 100); do (echo >/dev/tcp/${a%%:*}/${a#
 # ---- central services ----
 $Y data-server --listen $DATA --root .msrv/central/data > .msrv/data.log 2>&1 &
 DP=$!
-$Y --home .msrv/central meta-server --listen $META > .msrv/meta.log 2>&1 &
+$Y meta-server --db-path .msrv/central --listen $META > .msrv/meta.log 2>&1 &
 MP=$!
 wait_port $DATA || true
 if wait_port $META; then MP_OK=1; else MP_OK=0; fi

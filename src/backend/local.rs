@@ -10,7 +10,7 @@
 //!   on the same fd are safe and race-free.
 //! - `fsync` uses `fdatasync` semantics via `fsync` on the fd.
 
-use super::{FsStat, StorageBackend};
+use super::{FsStat, Imported, StorageBackend};
 use libc::{close, fstat, fsync, ftruncate, pread, pwrite, statvfs};
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -170,6 +170,31 @@ impl StorageBackend for LocalBackend {
             fs::remove_file(path)?;
         }
         Ok(())
+    }
+
+    fn import_at(&self, key: &str, src: &Path) -> io::Result<Imported> {
+        let dst = self.block_path(key);
+        // Zero-copy fast path: a hard link shares the source's inode, so the
+        // object costs no extra bytes and reads/writes through EITHER path see
+        // the same live data. `remove()` (GC) then only unlinks the blocks/
+        // path — the source path survives until its own last link goes, which
+        // is exactly the "importing must not destroy the dataset" guarantee.
+        if fs::hard_link(src, &dst).is_ok() {
+            return Ok(Imported::Hardlinked);
+        }
+        // Cross-device, filesystems forbidding links, or source already being
+        // a link we may not duplicate: fall back to streaming a copy.
+        let mut file = fs::File::open(src)?;
+        let mut out = fs::File::create(&dst)?;
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let n = std::io::Read::read(&mut file, &mut buf)?;
+            if n == 0 {
+                break;
+            }
+            std::io::Write::write_all(&mut out, &buf[..n])?;
+        }
+        Ok(Imported::Copied)
     }
 
     fn statvfs(&self) -> io::Result<FsStat> {

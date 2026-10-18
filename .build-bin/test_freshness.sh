@@ -33,7 +33,7 @@ wait_port(){ local a=$1; for _ in $(seq 1 100); do (echo >/dev/tcp/${a%%:*}/${a#
 # ---- central services ----
 $Y data-server --listen $DATA --root .fresh/central/data > .fresh/data.log 2>&1 &
 DP=$!
-$Y --home .fresh/central meta-server --listen $META > .fresh/meta.log 2>&1 &
+$Y meta-server --db-path .fresh/central --listen $META > .fresh/meta.log 2>&1 &
 MP=$!
 wait_port $DATA && wait_port $META || { echo "servers failed"; exit 1; }
 

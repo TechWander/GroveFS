@@ -72,6 +72,27 @@ impl ShardedBackend {
         (idx, format!("{}#{}", l.base, i))
     }
 
+    /// Outcome of asking a member whether a chunk exists: `Absent` is a
+    /// *definitive* ENOENT, while `Unknown` means the probe kept failing with
+    /// transient errors (already retried). Conflating `Unknown` with `Absent`
+    /// once let the GC fan-out silently skip live chunks when two consecutive
+    /// probes hit a transient error, leaving permanent orphans (striping GC
+    /// flake); callers must treat the two distinctly.
+    fn probe(&self, s: usize, ck: &str) -> Probe {
+        for attempt in 0..3u32 {
+            match self.servers[s].len(ck) {
+                Ok(n) => return Probe::Present(n),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Probe::Absent,
+                Err(_) => {
+                    if attempt + 1 < 3 {
+                        thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                }
+            }
+        }
+        Probe::Unknown
+    }
+
     /// Enumerate the (chunk_index, sub_offset, sub_len) tuples covering the
     /// logical range `[off, off+len)`, clamping the first/last partial chunks.
     fn chunks_for(&self, l: &Layout, off: u64, len: usize) -> Vec<(u64, u64, usize)> {
@@ -126,6 +147,13 @@ impl ShardedBackend {
         }
         Ok(())
     }
+}
+
+/// See [`ShardedBackend::probe`].
+enum Probe {
+    Present(u64),
+    Absent,
+    Unknown,
 }
 
 impl StorageBackend for ShardedBackend {
@@ -295,14 +323,16 @@ impl StorageBackend for ShardedBackend {
         let mut i = 0u64;
         loop {
             let (s, ck) = self.chunk(&l, i);
-            match self.servers[s].len(&ck) {
-                Ok(c) => {
+            match self.probe(s, &ck) {
+                Probe::Present(c) => {
                     total = i * l.stripe + c;
                     if c < l.stripe {
                         return Ok(total);
                     }
                 }
-                Err(_) => return Ok(total),
+                Probe::Absent => return Ok(total),
+                // Unknown: fail honestly rather than report a too-short size.
+                Probe::Unknown => return Err(io::Error::from_raw_os_error(libc::EIO)),
             }
             i += 1;
             if i > u32::MAX as u64 {
@@ -335,16 +365,18 @@ impl StorageBackend for ShardedBackend {
             let mut i = 0u64;
             loop {
                 let (s, ck) = self.chunk(&l, i);
-                let existed = self.servers[s].len(&ck).is_ok();
-                if !existed && i > 0 {
-                    break;
+                match self.probe(s, &ck) {
+                    Probe::Present(_) => {
+                        let _ = self.servers[s].remove(&ck);
+                    }
+                    Probe::Absent => break,
+                    Probe::Unknown => {
+                        let _ = self.servers[s].remove(&ck);
+                        break; // can't tell more; don't scan blindly
+                    }
                 }
-                let _ = self.servers[s].remove(&ck);
                 i += 1;
                 if i > u32::MAX as u64 {
-                    break;
-                }
-                if !existed {
                     break;
                 }
             }
@@ -378,10 +410,16 @@ impl StorageBackend for ShardedBackend {
         let mut i = last_chunk + 1;
         loop {
             let (s, ck) = self.chunk(&l, i);
-            if self.servers[s].len(&ck).is_err() {
-                break;
+            match self.probe(s, &ck) {
+                Probe::Present(_) => {
+                    let _ = self.servers[s].remove(&ck);
+                }
+                Probe::Absent => break,
+                Probe::Unknown => {
+                    let _ = self.servers[s].remove(&ck);
+                    break; // can't tell more; don't scan blindly
+                }
             }
-            let _ = self.servers[s].remove(&ck);
             i += 1;
             if i > u32::MAX as u64 {
                 break;
@@ -401,11 +439,21 @@ impl StorageBackend for ShardedBackend {
         let mut missing_run = 0;
         while missing_run < 2 {
             let (s, ck) = self.chunk(&l, i);
-            if self.servers[s].len(&ck).is_ok() {
-                missing_run = 0;
-                let _ = self.servers[s].remove(&ck);
-            } else {
-                missing_run += 1;
+            match self.probe(s, &ck) {
+                Probe::Present(_) => {
+                    missing_run = 0;
+                    // GC stays best-effort, but a failed chunk delete means a
+                    // permanent orphan (nothing sweeps later) — say so loudly.
+                    if let Err(e) = self.servers[s].remove(&ck) {
+                        eprintln!("striped GC: remove chunk #{i} of {} on server {s} failed: {e}", l.base);
+                    }
+                }
+                Probe::Absent => missing_run += 1,
+                Probe::Unknown => {
+                    // Try the (idempotent) delete anyway, but do NOT reset the
+                    // run: a stretch of unknown probes must still terminate.
+                    let _ = self.servers[s].remove(&ck);
+                }
             }
             i += 1;
             if i > u32::MAX as u64 {

@@ -57,7 +57,7 @@ chk "$(T cat $M/docs/hello.txt)" "striped grovefs works" "sharded write/read rou
 echo "===== 2) small file (<stripe) lives entirely on server 0 ====="
 na0=$(blocks .striping/sA); nb0=$(blocks .striping/sB)
 T dd if=/dev/zero of=$M/small.bin bs=4096 count=1 2>/dev/null   # 4KiB << 16MiB
-sync "$M" 2>/dev/null
+sync "$M/small.bin" 2>/dev/null   # sync the FILE: dirty pages land before counting
 nb1=$(blocks .striping/sB)
 chk "$nb1" "$nb0" "sub-stripe file adds no object on server B (single-chunk path)"
 if [ "$(blocks .striping/sA)" -gt "$na0" ]; then ok "sub-stripe file placed on server 0 only"; else bad "small file not on server 0"; fi
@@ -66,7 +66,8 @@ echo "===== 3) >stripe file (40MiB) physically spans BOTH server roots ====="
 # 40MiB > 2*16MiB => chunks 0,1,2 => servers A,B,A. Both roots must gain objects.
 head -c 41943040 /dev/urandom > /tmp/sblob        # 40MiB
 T cp /tmp/sblob $M/big.bin
-sync "$M" 2>/dev/null
+sync "$M/big.bin" 2>/dev/null   # file fsync forces every chunk WRITE over FUSE NOW
+                                # (sync on the DIRECTORY would not flush the file's dirty pages)
 if [ "$(blocks .striping/sA)" -ge 2 ]; then ok "server A holds >=2 striped chunks"; else bad "server A chunks=$(blocks .striping/sA)"; fi
 if [ "$(blocks .striping/sB)" -ge 1 ]; then ok "server B holds >=1 striped chunk (real striping)"; else bad "server B has no striped chunk"; fi
 src=$(md5sum /tmp/sblob | awk '{print $1}')
@@ -83,7 +84,7 @@ chk "$part" "$want" "unaligned cross-chunk dd slice matches source"
 echo "===== 5) truncate shrinks owned chunks and trims trailing (cross-server) ones ====="
 bB=$(blocks .striping/sB)               # big.bin currently owns a chunk on server B
 T truncate -s $STRIPE $M/big.bin        # back to exactly one chunk (16MiB, server A)
-sync "$M" 2>/dev/null
+sync "$M/big.bin" 2>/dev/null
 chk "$(T stat -c '%s' $M/big.bin)" "$STRIPE" "truncate to 16MiB size"
 head -c $STRIPE /tmp/sblob > /tmp/sblob16
 chk "$(T md5sum $M/big.bin | awk '{print $1}')" "$(md5sum /tmp/sblob16 | awk '{print $1}')" "truncated prefix still byte-identical readback"
@@ -92,12 +93,21 @@ if [ "$(blocks .striping/sB)" -lt "$bB" ]; then ok "truncate trimmed the trailin
 echo "===== 6) GC over striping: rm clears chunks on BOTH roots ====="
 # fresh >stripe file so it owns a chunk on each server again.
 head -c 41943040 /dev/urandom > /tmp/sblob2
-T cp /tmp/sblob2 $M/big2.bin; sync "$M" 2>/dev/null
+T cp /tmp/sblob2 $M/big2.bin; sync "$M/big2.bin" 2>/dev/null
 beforeA=$(blocks .striping/sA); beforeB=$(blocks .striping/sB)
 if [ "$beforeB" -ge 1 ]; then ok "re-striped file put a chunk back on server B"; else bad "big2.bin did not stripe onto server B"; fi
 T rm $M/big2.bin
-sleep 0.5
-afterA=$(blocks .striping/sA); afterB=$(blocks .striping/sB)
+# rm's GC delete is synchronous, but WITHOUT the file fsync above a lagging
+# kernel writeback could re-create a chunk AFTER its delete (a delayed WRITE
+# materializes the object again) — that race once flaked the whole suite RED
+# on `(1 -> 1)`. The file is fsynced before rm; poll a short deadline anyway
+# so a transient transport hiccup can't fail the assertion outright.
+afterA=$beforeA; afterB=$beforeB
+for _i in $(seq 1 100); do
+  afterA=$(blocks .striping/sA); afterB=$(blocks .striping/sB)
+  [ "$afterA" -lt "$beforeA" ] && [ "$afterB" -lt "$beforeB" ] && break
+  sleep 0.1
+done
 if [ "$afterB" -lt "$beforeB" ]; then ok "rm freed server B chunk ($beforeB -> $afterB)"; else bad "server B not GC'd ($beforeB -> $afterB)"; fi
 if [ "$afterA" -lt "$beforeA" ]; then ok "rm freed server A chunk ($beforeA -> $afterA)"; else bad "server A not GC'd ($beforeA -> $afterA)"; fi
 

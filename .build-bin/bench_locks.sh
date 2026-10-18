@@ -75,7 +75,7 @@ bench    "$F" "flock -x cycle"
 # ---- B) meta-server path ----
 $Y data-server --listen $DATA --root .blk/central/data > .blk/data.log 2>&1 &
 DP=$!
-$Y --home .blk/centralmeta meta-server --listen $META_A > .blk/meta.log 2>&1 &
+$Y meta-server --db-path .blk/centralmeta --listen $META_A > .blk/meta.log 2>&1 &
 AMP=$!
 wait_port $DATA; wait_port $META_A
 $Y --home .blk/chome mount --view alice --mountpoint .blk/mnt_meta --meta "$META_A" --data $DATA > .blk/mnt_meta.log 2>&1 &

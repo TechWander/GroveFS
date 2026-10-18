@@ -227,9 +227,9 @@ wait_port(){ local a=$1; for _ in $(seq 1 100); do (echo >/dev/tcp/${a%%:*}/${a#
 
 $Y data-server --listen $DATA --root .locks/ha/data > .locks/ha/data.log 2>&1 &
 DP=$!
-$Y --home .locks/ha/a meta-server --listen $META_A --peer $META_B > .locks/ha/a.log 2>&1 &
+$Y meta-server --db-path .locks/ha/a --listen $META_A --peer $META_B > .locks/ha/a.log 2>&1 &
 AP=$!
-$Y --home .locks/ha/b meta-server --listen $META_B --role standby --peer $META_A > .locks/ha/b.log 2>&1 &
+$Y meta-server --db-path .locks/ha/b --listen $META_B --role standby --peer $META_A > .locks/ha/b.log 2>&1 &
 BP=$!
 wait_port $DATA && wait_port $META_A && wait_port $META_B || bad "HA ports did not come up"
 

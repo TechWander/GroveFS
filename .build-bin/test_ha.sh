@@ -34,9 +34,9 @@ wait_port(){ local a=$1; for _ in $(seq 1 100); do (echo >/dev/tcp/${a%%:*}/${a#
 # ---- data server + the HA meta pair ----
 $Y data-server --listen $DATA --root .ha/data > .ha/data.log 2>&1 &
 DP=$!
-$Y --home .ha/a meta-server --listen $META_A --peer $META_B > .ha/a.log 2>&1 &
+$Y meta-server --db-path .ha/a --listen $META_A --peer $META_B > .ha/a.log 2>&1 &
 AP=$!
-$Y --home .ha/b meta-server --listen $META_B --role standby --peer $META_A > .ha/b.log 2>&1 &
+$Y meta-server --db-path .ha/b --listen $META_B --role standby --peer $META_A > .ha/b.log 2>&1 &
 BP=$!
 wait_port $DATA || true
 wait_port $META_A || true
@@ -107,7 +107,7 @@ awk "BEGIN{exit !($FT < 12)}" && ok "failover+recovery completed in ${FT}s (<12s
 echo "===== 6) recovered old primary demotes itself (no double-primary) ====="
 # bring the old primary back; its replicator sees the peer's higher epoch and
 # must step down to standby rather than resume writing.
-$Y --home .ha/a meta-server --listen $META_A --peer $META_B > .ha/a2.log 2>&1 &
+$Y meta-server --db-path .ha/a --listen $META_A --peer $META_B > .ha/a2.log 2>&1 &
 AP2=$!
 # reassign cleanup to also reap the restarted node
 trap 'for d in .ha/mnt .ha/mnt_sb; do fusermount -u "$d" 2>/dev/null; done; kill $CP $SP $DP $AP2 $BP 2>/dev/null' EXIT
@@ -127,9 +127,9 @@ mkdir -p .ha/sync_a .ha/sync_b .ha/sync_data .ha/sync_chome .ha/sync_mnt
 
 $Y data-server --listen $SYNC_D --root .ha/sync_data > .ha/sync_data.log 2>&1 &
 SDP=$!
-$Y --home .ha/sync_a meta-server --listen $SYNC_A --peer $SYNC_B --sync-repl > .ha/sync_a.log 2>&1 &
+$Y meta-server --db-path .ha/sync_a --listen $SYNC_A --peer $SYNC_B --sync-repl > .ha/sync_a.log 2>&1 &
 SAP=$!
-$Y --home .ha/sync_b meta-server --listen $SYNC_B --role standby --peer $SYNC_A > .ha/sync_b.log 2>&1 &
+$Y meta-server --db-path .ha/sync_b --listen $SYNC_B --role standby --peer $SYNC_A > .ha/sync_b.log 2>&1 &
 SBP=$!
 wait_port $SYNC_D; wait_port $SYNC_A; wait_port $SYNC_B
 # Confirm the server logged sync-repl activation.
@@ -185,9 +185,9 @@ mkdir -p .ha/part_a .ha/part_b .ha/part_data .ha/part_chome .ha/part_mnt
 
 $Y data-server --listen $PART_D --root .ha/part_data > .ha/part_data.log 2>&1 &
 PDP=$!
-$Y --home .ha/part_a meta-server --listen $PART_A --peer $PART_B --sync-repl > .ha/part_a.log 2>&1 &
+$Y meta-server --db-path .ha/part_a --listen $PART_A --peer $PART_B --sync-repl > .ha/part_a.log 2>&1 &
 PAP=$!
-$Y --home .ha/part_b meta-server --listen $PART_B --role standby --peer $PART_A > .ha/part_b.log 2>&1 &
+$Y meta-server --db-path .ha/part_b --listen $PART_B --role standby --peer $PART_A > .ha/part_b.log 2>&1 &
 PBP=$!
 wait_port $PART_D; wait_port $PART_A; wait_port $PART_B
 
@@ -230,9 +230,9 @@ rm -rf .ha/w_a .ha/w_b .ha/w_data; mkdir -p .ha/w_a .ha/w_b .ha/w_data
 $Y data-server --listen $W_D --root .ha/w_data > .ha/w_data.log 2>&1 &
 WD=$!
 wait_port $W_D   # arbiter must be up BEFORE the primary registers, or it fail-safe-boots as standby
-$Y --home .ha/w_a meta-server --listen $W_A --peer $W_B --witness $W_D > .ha/w_a.log 2>&1 &
+$Y meta-server --db-path .ha/w_a --listen $W_A --peer $W_B --witness $W_D > .ha/w_a.log 2>&1 &
 WA=$!
-$Y --home .ha/w_b meta-server --listen $W_B --role standby --peer $W_A --witness $W_D > .ha/w_b.log 2>&1 &
+$Y meta-server --db-path .ha/w_b --listen $W_B --role standby --peer $W_A --witness $W_D > .ha/w_b.log 2>&1 &
 WB=$!
 wait_port $W_A; wait_port $W_B
 
@@ -258,7 +258,7 @@ grep -qx '1' .ha/w_data/.fence_token 2>/dev/null \
 
 # Restart the OLD primary (same --home, still stale on-disk epoch). The witness
 # now carries the promoted node's higher epoch, so it must refuse primary.
-$Y --home .ha/w_a meta-server --listen $W_A --peer $W_B --witness $W_D > .ha/w_a2.log 2>&1 &
+$Y meta-server --db-path .ha/w_a --listen $W_A --peer $W_B --witness $W_D > .ha/w_a2.log 2>&1 &
 WA2=$!
 wait_port $W_A || true
 sleep 2
@@ -288,9 +288,9 @@ rm -rf .ha/f_a .ha/f_b .ha/f_data; mkdir -p .ha/f_a .ha/f_b .ha/f_data
 $Y data-server --listen $F_D --root .ha/f_data > .ha/f_data.log 2>&1 &
 FD=$!
 wait_port $F_D   # arbiter up before the primary registers (else it fail-safe-boots standby)
-$Y --home .ha/f_a meta-server --listen $F_A --peer $F_B --witness $F_D > .ha/f_a.log 2>&1 &
+$Y meta-server --db-path .ha/f_a --listen $F_A --peer $F_B --witness $F_D > .ha/f_a.log 2>&1 &
 FA=$!
-$Y --home .ha/f_b meta-server --listen $F_B --role standby --peer $F_A --witness $F_D > .ha/f_b.log 2>&1 &
+$Y meta-server --db-path .ha/f_b --listen $F_B --role standby --peer $F_A --witness $F_D > .ha/f_b.log 2>&1 &
 FB=$!
 wait_port $F_A; wait_port $F_B
 sleep 1
@@ -358,8 +358,8 @@ $Y data-server --listen $Q_D1 --root .ha/q_d1 > .ha/q_d1.log 2>&1 & QD1=$!
 $Y data-server --listen $Q_D2 --root .ha/q_d2 > .ha/q_d2.log 2>&1 & QD2=$!
 $Y data-server --listen $Q_D3 --root .ha/q_d3 > .ha/q_d3.log 2>&1 & QD3=$!
 wait_port $Q_D1; wait_port $Q_D2; wait_port $Q_D3
-$Y --home .ha/q_a meta-server --listen $Q_A --peer $Q_B --witness "$Q_D1,$Q_D2,$Q_D3" > .ha/q_a.log 2>&1 & QA=$!
-$Y --home .ha/q_b meta-server --listen $Q_B --role standby --peer $Q_A --witness "$Q_D1,$Q_D2,$Q_D3" > .ha/q_b.log 2>&1 & QB=$!
+$Y meta-server --db-path .ha/q_a --listen $Q_A --peer $Q_B --witness "$Q_D1,$Q_D2,$Q_D3" > .ha/q_a.log 2>&1 & QA=$!
+$Y meta-server --db-path .ha/q_b --listen $Q_B --role standby --peer $Q_A --witness "$Q_D1,$Q_D2,$Q_D3" > .ha/q_b.log 2>&1 & QB=$!
 wait_port $Q_A; wait_port $Q_B
 sleep 1
 
@@ -411,17 +411,17 @@ kill $QC $QA $QB $QD3 $QDC 2>/dev/null || true
 # indistinguishable from a real partition. serve() must warn at startup, and a
 # well-formed ODD list must stay quiet (no false alarms).
 mkdir -p .ha/vm
-$Y --home .ha/vm meta-server --listen 127.0.0.1:50190 --witness "127.0.0.1" > .ha/v_bad.log 2>&1 & VM1=$!
+$Y meta-server --db-path .ha/vm --listen 127.0.0.1:50190 --witness "127.0.0.1" > .ha/v_bad.log 2>&1 & VM1=$!
 sleep 0.6; kill $VM1 2>/dev/null; wait $VM1 2>/dev/null || true
 grep -q 'are not host:port' .ha/v_bad.log \
   && ok "malformed --witness entry warned fail-loud (not mistaken for a partition)" \
   || bad "malformed --witness entry produced no warning (log: $(tr '\n' ' ' < .ha/v_bad.log))"
-$Y --home .ha/vm meta-server --listen 127.0.0.1:50191 --witness "127.0.0.1:50192,127.0.0.1:50193" > .ha/v_even.log 2>&1 & VM2=$!
+$Y meta-server --db-path .ha/vm --listen 127.0.0.1:50191 --witness "127.0.0.1:50192,127.0.0.1:50193" > .ha/v_even.log 2>&1 & VM2=$!
 sleep 0.6; kill $VM2 2>/dev/null; wait $VM2 2>/dev/null || true
 grep -q '(even) arbiters' .ha/v_even.log \
   && ok "even-N --witness list warned with an odd-count recommendation" \
   || bad "even-N --witness list produced no warning (log: $(tr '\n' ' ' < .ha/v_even.log))"
-$Y --home .ha/vm meta-server --listen 127.0.0.1:50194 --witness "127.0.0.1:50195,127.0.0.1:50196,127.0.0.1:50197" > .ha/v_ok.log 2>&1 & VM3=$!
+$Y meta-server --db-path .ha/vm --listen 127.0.0.1:50194 --witness "127.0.0.1:50195,127.0.0.1:50196,127.0.0.1:50197" > .ha/v_ok.log 2>&1 & VM3=$!
 sleep 0.6; kill $VM3 2>/dev/null; wait $VM3 2>/dev/null || true
 { grep -q 'are not host:port' .ha/v_ok.log || grep -q '(even) arbiters' .ha/v_ok.log; } \
   && bad "healthy odd-N witness list emitted a spurious warning" \

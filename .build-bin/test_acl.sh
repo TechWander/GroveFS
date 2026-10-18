@@ -27,25 +27,25 @@ bad(){ echo "  FAIL: $1"; fail=$((fail+1)); }
 chk(){ if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got '$1' want '$2')"; fi; }
 T(){ timeout 8 "$@"; }
 
-echo "===== 1) seed the ACL on the server's home (before start) ====="
-$Y --home .acl/central acl allow --view alice --uid 1000 --read --write >/dev/null 2>&1 \
+echo "===== 1) seed the ACL on the server's --db-path root (before start) ====="
+$Y acl --db-path .acl/central allow --view alice --uid 1000 --read --write >/dev/null 2>&1 \
     && ok "granted uid1000 rw on alice" || bad "acl allow (rw) failed"
-$Y --home .acl/central acl allow --view alice --uid 2000 --read >/dev/null 2>&1 \
+$Y acl --db-path .acl/central allow --view alice --uid 2000 --read >/dev/null 2>&1 \
     && ok "granted uid2000 ro on alice" || bad "acl allow (ro) failed"
-[ -f .acl/central/meta/acl.db ] && ok "server home has acl.db" || bad "acl.db missing"
-LIST=$($Y --home .acl/central acl list --view alice 2>&1)
+[ -f .acl/central/meta/acl.db ] && ok "server db-path has acl.db" || bad "acl.db missing"
+LIST=$($Y acl --db-path .acl/central list --view alice 2>&1)
 echo "$LIST" | grep -q "whitelisted" && ok "alice reports whitelisted" || bad "alice should be whitelisted ($LIST)"
 echo "$LIST" | grep -q "uid 1000 read=true write=true" && ok "list shows 1000 rw" || bad "list missing 1000 rw ($LIST)"
 echo "$LIST" | grep -q "uid 2000 read=true write=false" && ok "list shows 2000 ro" || bad "list missing 2000 ro ($LIST)"
 
 echo "===== 2) an unrestricted view (bob) reports UNRESTRICTED ====="
-$Y --home .acl/central acl list --view bob 2>&1 | grep -q "UNRESTRICTED" \
+$Y acl --db-path .acl/central list --view bob 2>&1 | grep -q "UNRESTRICTED" \
     && ok "bob unrestricted" || bad "bob should be unrestricted"
 
 # ---- central services ----
 $Y data-server --listen $DATA --root .acl/central/data > .acl/data.log 2>&1 &
 DP=$!
-$Y --home .acl/central meta-server --listen $META > .acl/meta.log 2>&1 &
+$Y meta-server --db-path .acl/central --listen $META > .acl/meta.log 2>&1 &
 MP=$!
 wait_port $DATA || true
 if wait_port $META; then MP_OK=1; else MP_OK=0; fi
@@ -91,7 +91,7 @@ echo "===== 5b) TOCTOU: downgrade the LIVE rw mount's uid in-place, no remount =
 # uid 1000 had write=true. Downgrade that grant to read-only in place. Because
 # the server re-evaluates the write-gate per-op (not cached at open), a fresh
 # write over the *existing* pooled connection must now be refused immediately.
-$Y --home .acl/central acl allow --view alice --uid 1000 --read >/dev/null 2>&1 \
+$Y acl --db-path .acl/central allow --view alice --uid 1000 --read >/dev/null 2>&1 \
     && ok "downgraded uid1000 rw->ro (in place)" || bad "acl downgrade failed"
 T sh -c "printf 'late' > $A/late.txt"
 RC2=$?
@@ -99,12 +99,12 @@ RC2=$?
 [ ! -f "$A/late.txt" ] && ok "downgraded live write left no file" || bad "downgraded write leaked a file"
 chk "$(T cat $A/notes.txt)" "secret" "downgraded uid can still read (ro grant)"
 # restore rw so the following unrestricted-revoke section starts from a known state
-$Y --home .acl/central acl allow --view alice --uid 1000 --read --write >/dev/null 2>&1
+$Y acl --db-path .acl/central allow --view alice --uid 1000 --read --write >/dev/null 2>&1
 
 echo "===== 6) revoke all rows -> view is UNRESTRICTED again ====="
-$Y --home .acl/central acl revoke --view alice --uid 1000 >/dev/null 2>&1
-$Y --home .acl/central acl revoke --view alice --uid 2000 >/dev/null 2>&1
-$Y --home .acl/central acl list --view alice 2>&1 | grep -q "UNRESTRICTED" \
+$Y acl --db-path .acl/central revoke --view alice --uid 1000 >/dev/null 2>&1
+$Y acl --db-path .acl/central revoke --view alice --uid 2000 >/dev/null 2>&1
+$Y acl --db-path .acl/central list --view alice 2>&1 | grep -q "UNRESTRICTED" \
     && ok "alice unrestricted after revoking last row" || bad "alice should reopen after revoke"
 
 # ---- summary ----

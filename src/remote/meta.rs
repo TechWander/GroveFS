@@ -18,6 +18,7 @@
 //! [`NodeInfo`].
 
 use super::proto;
+use crate::layout::{LayoutMeta, LayoutRules, ViewDef};
 use crate::meta::{LockConflict, LockType, MetaEngine, MetaError, MetaProvider, MetaStore, NodeInfo, NodeKind};
 use fuser::{INodeNo, Notifier};
 use libc::EIO;
@@ -358,6 +359,11 @@ pub struct RemoteMeta {
     /// updated to the meta-server's fencing epoch on every `M_OPEN` handshake,
     /// so the client's stamped writes track the live token even across failover.
     fence: Arc<AtomicU64>,
+    /// Set from the `M_OPEN` handshake ack when the mounted view name resolves
+    /// to a server-side DERIVED view: virtual views are presentation-only and
+    /// mount read-only. Refreshed on every (re)handshake so a failover re-reads
+    /// the flag from the node actually serving us.
+    readonly: AtomicU8,
 }
 
 impl RemoteMeta {
@@ -407,11 +413,21 @@ impl RemoteMeta {
             connect_retries: 6,
             reconnect_backoff: Duration::from_millis(150),
             fence: Arc::new(AtomicU64::new(0)),
+            readonly: AtomicU8::new(0),
         };
         // Probe once (connect + handshake) so mount fails fast on a dead server.
         let (s, _) = this.connect_fresh()?;
         this.put_conn(s);
         Ok(this)
+    }
+
+    /// True when the bound view name resolved to a server-side DERIVED view on
+    /// the last `M_OPEN` handshake — the mount must be read-only (virtual views
+    /// render a shape over the base tree but refuse every mutation; writes go
+    /// to the original/physical view). False for physical views and against
+    /// servers old enough to omit the handshake flag.
+    pub fn is_readonly_view(&self) -> bool {
+        self.readonly.load(Ordering::SeqCst) != 0
     }
 
     fn get_conn(&self) -> io::Result<(TcpStream, bool)> {
@@ -446,11 +462,17 @@ impl RemoteMeta {
                         proto::put_u32(&mut body, self.uid);
                         let mut s = s;
                         match Self::call(&mut s, M_OPEN, &body) {
-                            Ok((0, epoch, _)) => {
+                            Ok((0, epoch, data)) => {
                                 // Cache the authoritative fencing epoch so the
                                 // data-plane client stamps writes with the live
                                 // token (advances automatically on failover).
                                 self.fence.store(epoch, Ordering::SeqCst);
+                                // Handshake ack carries a 1-byte flag: nonzero
+                                // when the view is a DERIVED (virtual) view the
+                                // server mounts read-only. An empty body is an
+                                // old server without the flag -> stays writable.
+                                self.readonly
+                                    .store(data.first().copied().unwrap_or(0), Ordering::SeqCst);
                                 self.active.store(idx, Ordering::Relaxed);
                                 return Ok((s, false));
                             }
@@ -902,19 +924,64 @@ struct MetaRuntime {
     witness: Option<String>,
     /// Optional per-view uid whitelist (`<base>/meta/acl.db`). Unrestricted views
     /// (no rows) are served to everyone; restricted views gate the `M_OPEN` read
-    /// (else `E_AUTH`) and each write-intent op (else `E_ROFS`). See [`crate::acl`].
+    /// (else `E_AUTH`) and each write-intent op per-op (else `E_NOTPERM`, so an
+    /// active writer loses privileges the instant a grant is revoked — no
+    /// TOCTOU cache). See [`crate::acl`].
     acl: Arc<crate::acl::AclStore>,
     /// Which metadata backend `engine_for` should open against (see
     /// [`StoreKind`]). `Pg(_)` disables the GroveFS-native HA paths by
     /// construction: `serve()` rejects the `--role standby`/`--peer`/`--witness`
     /// flags for a PG store, and sync-repl / replicator ticks never fire.
     store: StoreKind,
+    /// Server-side **derived views**: client-visible name → resolved provider
+    /// (the physical `MetaStore` itself, or a [`LayoutMeta`] lens over another
+    /// store's tree, defined by `<base>/meta/views/<name>.layout`). The cache
+    /// the wire loop dispatches against.
+    views: Arc<Mutex<HashMap<String, Arc<dyn MetaProvider>>>>,
+    /// Derived view name → physical base view name. Physical views map to
+    /// themselves, so subscribers and snapshot pushes can always resolve the
+    /// tree a name actually reads. Populated by [`view_provider`].
+    bases: Arc<Mutex<HashMap<String, String>>>,
+    /// Derived view name → mtime of the `meta/views/<name>.layout` the cached
+    /// provider was built from. Presence marks a cache entry as DERIVED, which
+    /// lets `view_provider` hot-reload it: an edited definition (different
+    /// mtime) evicts the cached lens so live mounts converge on the new shape
+    /// without a remount. Physical entries are absent here and never re-checked.
+    defs: Arc<Mutex<HashMap<String, std::time::SystemTime>>>,
 }
 
 impl MetaRuntime {
     /// Effective role: always Primary for a plain (non-HA) node.
     fn role(&self) -> Role {
         self.ha.as_ref().map(|h| h.role()).unwrap_or(Role::Primary)
+    }
+
+    /// Drop every cached engine: physical stores, derived-view providers and
+    /// the name→base map. Called whenever the on-disk trees or the role change
+    /// underneath the cache (HA promote/demote, witness fence, replicated
+    /// snapshot install) so the next op re-opens against fresh state.
+    fn evict(&self) {
+        self.cache.lock().clear();
+        self.views.lock().clear();
+        self.bases.lock().clear();
+        self.defs.lock().clear();
+    }
+
+    /// Physical tree a client-visible view name resolves to. Derived views
+    /// return their `base`; plain/physical names return themselves. Only
+    /// meaningful after [`view_provider`] has resolved the name once.
+    fn physical_base(&self, view: &str) -> String {
+        self.bases.lock().get(view).cloned().unwrap_or_else(|| view.to_string())
+    }
+
+    /// Is `view` a DERIVED (virtual) view name — i.e. served through a
+    /// `meta/views/<view>.layout` definition rather than its own physical db?
+    /// Such views mount read-only: they are a centrally defined presentation,
+    /// every write belongs to the original (base) view. Fresh per op because
+    /// the wire loop re-resolves [`view_provider`] (which repopulates `bases`)
+    /// before consulting this.
+    fn is_derived(&self, view: &str) -> bool {
+        self.defs.lock().contains_key(view)
     }
 
     /// Synchronous data-plane fencing re-proof, run before a mutating op is
@@ -956,7 +1023,7 @@ impl MetaRuntime {
             ha.set_role(Role::Standby);
             ha.epoch.store(res.prev_max, Ordering::SeqCst);
             ha.lease_clear();
-            self.cache.lock().clear();
+            self.evict();
             eprintln!("meta HA: fenced at write time (a quorum of {q}/{} arbiters holds {} > our {mine}); demoted to standby, op refused", addrs.len(), res.prev_max);
             true
         } else {
@@ -1171,6 +1238,9 @@ impl MetaServer {
             witness: self.witness.clone(),
             acl,
             store: self.store.clone(),
+            views: Arc::new(Mutex::new(HashMap::new())),
+            bases: Arc::new(Mutex::new(HashMap::new())),
+            defs: Arc::new(Mutex::new(HashMap::new())),
         });
         if rt.sync_repl {
             println!("meta-server: synchronous replication ON (RPO=0 for mutating ops, ACK timeout {SYNC_REPL_ACK_TIMEOUT:?})");
@@ -1215,7 +1285,7 @@ impl MetaServer {
                     if res.fenced(q) {
                         ha.set_role(Role::Standby);
                         ha.epoch.store(res.prev_max, Ordering::SeqCst);
-                        rt.cache.lock().clear();
+                        rt.evict();
                         println!("meta HA: starting as standby (a quorum of {q}/{} arbiters holds {} > our on-disk {mine}; peer already promoted)", addrs.len(), res.prev_max);
                     } else if res.leased(q) {
                         // Majority granted our lease: establish the initial lease so
@@ -1231,7 +1301,7 @@ impl MetaServer {
                         // node (no peer) has no double-write risk, so serve.
                         if rt.peer.is_some() {
                             ha.set_role(Role::Standby);
-                            rt.cache.lock().clear();
+                            rt.evict();
                             eprintln!("meta HA: only {}/{} arbiters reachable at startup (need quorum {q}); fail-safe starting as standby (cannot prove exclusive authority against a configured peer)", res.reachable, addrs.len());
                         } else {
                             eprintln!("meta HA: cannot obtain a lease quorum ({q}/{}) at startup; no peer configured, serving as primary (fencing not applicable to a lone node)", addrs.len());
@@ -1273,6 +1343,9 @@ pub fn serve_on_meta_auth(listener: TcpListener, base: PathBuf, token: &str) {
             crate::acl::AclStore::open(&acl_base).expect("open acl.db"),
         ),
         store: StoreKind::Sqlite,
+        views: Arc::new(Mutex::new(HashMap::new())),
+        bases: Arc::new(Mutex::new(HashMap::new())),
+        defs: Arc::new(Mutex::new(HashMap::new())),
     });
     serve_runtime(listener, rt);
 }
@@ -1295,12 +1368,14 @@ fn serve_runtime(listener: TcpListener, rt: Arc<MetaRuntime>) {
     }
 }
 
-/// Open (or reuse) the authoritative engine for `view`. A HA standby opens its
-/// replicated copy strictly read-only (so a stray write is refused at the SQLite
-/// layer, not merely discouraged); a primary opens read-write. Under
-/// [`StoreKind::Pg`] the standby/readonly path never fires (`serve()` refuses
-/// the combination), so `readonly` is passed through as `false`.
-fn engine_for(rt: &MetaRuntime, view: &str) -> io::Result<Arc<MetaStore>> {
+/// Open (or reuse) the authoritative PHYSICAL engine for a base view name.
+/// A HA standby opens its replicated copy strictly read-only (so a stray
+/// write is refused at the SQLite layer, not merely discouraged); a primary
+/// opens read-write. Under [`StoreKind::Pg`] the standby/readonly path never
+/// fires (`serve()` refuses the combination), so `readonly` is passed through
+/// as `false`. Keyed by the on-disk tree name — derived display views live in
+/// [`MetaRuntime::views`] and are resolved by [`view_provider`].
+fn store_for(rt: &MetaRuntime, view: &str) -> io::Result<Arc<MetaStore>> {
     let mut m = rt.cache.lock();
     if let Some(e) = m.get(view) {
         return Ok(e.clone());
@@ -1321,6 +1396,127 @@ fn engine_for(rt: &MetaRuntime, view: &str) -> io::Result<Arc<MetaStore>> {
     let engine = Arc::new(store);
     m.insert(view.to_string(), engine.clone());
     Ok(engine)
+}
+
+/// Scan `meta/views/*.layout` once for PURE ALIAS definitions, returning
+/// alias-name → real-view-name. Malformed and non-alias entries are ignored
+/// here — derived/physical resolution goes through [`view_provider`], which
+/// parses each definition it needs. Called on every M_OPEN: mounts are rare
+/// and the directory is small control-plane config, so a full read is
+/// cheaper than maintaining an invalidation protocol for it.
+fn load_aliases(base: &Path) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    if let Ok(rd) = std::fs::read_dir(base.join("meta").join("views")) {
+        for ent in rd.flatten() {
+            let p = ent.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("layout") {
+                continue;
+            }
+            let name = match p.file_stem().and_then(|s| s.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            if let Ok(text) = std::fs::read_to_string(&p) {
+                if let Ok(ViewDef::Alias(real)) = LayoutRules::parse_def(&text) {
+                    out.insert(name, real);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Resolve the provider a client-visible `view` name is served from. Two
+/// shapes:
+/// - **physical view** (`<base>/meta/views/<view>.layout` absent): the
+///   authoritative store itself, exactly as before — one db, one tree.
+/// - **derived view** (definition file present): `LayoutRules::parse_view`
+///   yields `(base, rules)`; the provider is a server-side [`LayoutMeta`] lens
+///   over the base tree's store. One copy of bytes and metadata, a different
+///   presentation per view name — clients mount `--view <name>` with no local
+///   rules file, and the SAME derived name from any machine shows the SAME
+///   shape (the lens is one shared server-side instance, so virtual inodes and
+///   display paths are consistent across its subscribers).
+///
+/// Deliberate limits (documented honestly): no nesting — a derived view's
+/// `base` must name a physical tree, and a derived name cannot shadow a
+/// physical db (checked at define time and here). Derived views are display
+/// customization, NOT a security boundary; hard isolation stays view+ACL+token.
+/// They are, however, READ-ONLY by contract: the M_OPEN ack flags them so the
+/// client mounts kernel read-only, and the per-op gate above refuses every
+/// write-intent op for a derived name — mutations belong to the original
+/// (physical) view, so a virtual shape can never be half-edited through.
+fn view_provider(rt: &MetaRuntime, view: &str) -> io::Result<Arc<dyn MetaProvider>> {
+    let def = rt.base.join("meta").join("views").join(format!("{view}.layout"));
+    // Bind the cached clone FIRST: an `if let Some(p) = rt.views.lock()...`
+    // would keep the guard alive through the whole block (temporary lifetime
+    // rules), and the eviction path below locks `views` again — a non-reentrant
+    // mutex would self-deadlock the connection.
+    let cached = rt.views.lock().get(view).cloned();
+    if let Some(p) = cached {
+        // Hot reload: a cached DERIVED entry is only served while its
+        // definition file is unchanged (mtime probe; a local stat per op is
+        // negligible next to a FUSE round trip). An edited definition evicts
+        // the lens and every live mount of the name converges on the next op
+        // — bounded by the client's attr/dentry TTL (≤2s), no remount needed.
+        // A *removed* definition intentionally does NOT yank the shape out
+        // from under established mounts: they keep the lens they opened with
+        // (names only change meaning at M_OPEN for deletes). Physical
+        // entries (no `defs` row) are never re-checked — a definition
+        // appearing out-of-band for an already-resolved physical name would
+        // ambiguously shadow its db, so it is deliberately ignored.
+        let stale = rt
+            .defs
+            .lock()
+            .get(view)
+            .copied()
+            .map_or(false, |seen| {
+                std::fs::metadata(&def)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .map_or(false, |now| now != seen)
+            });
+        if !stale {
+            return Ok(p);
+        }
+        rt.views.lock().remove(view);
+        rt.defs.lock().remove(view);
+    }
+    if !crate::layout::valid_view_name(view) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "bad view name"));
+    }
+    let (provider, base): (Arc<dyn MetaProvider>, String) = if def.is_file() {
+        let (b, rules) =
+            LayoutRules::parse_view_file(&def).map_err(io::Error::other)?;
+        if b == view {
+            return Err(io::Error::other("view definition base equals its own name"));
+        }
+        // The base must be a physical tree: no lens over a lens, which would
+        // also make eviction/subscription resolution ambiguous.
+        if rt.base.join("meta").join("views").join(format!("{b}.layout")).is_file() {
+            return Err(io::Error::other("derived view cannot build on another derived view"));
+        }
+        if rt.base.join("meta").join(format!("{view}.db")).is_file() {
+            // a physical <view>.db exists — the name would be ambiguous
+            return Err(io::Error::other("view name shadows a physical db"));
+        }
+        let store = store_for(rt, &b)?;
+        // Record the exact mtime the lens was built from AFTER parsing, so a
+        // concurrent edit shows up as stale on the next check (eventually
+        // convergent, never serves a shape newer than its recorded mtime).
+        if let Ok(md) = std::fs::metadata(&def) {
+            if let Ok(mtime) = md.modified() {
+                rt.defs.lock().insert(view.to_string(), mtime);
+            }
+        }
+        (Arc::new(LayoutMeta::new(store, rules)), b)
+    } else {
+        let store = store_for(rt, view)?;
+        (Arc::clone(&store) as Arc<dyn MetaProvider>, view.to_string())
+    };
+    rt.bases.lock().insert(view.to_string(), base);
+    rt.views.lock().insert(view.to_string(), provider.clone());
+    Ok(provider)
 }
 
 // --- server-side invalidation event bus ------------------------------------
@@ -1435,7 +1631,7 @@ fn events_from(body: &[u8], i: &mut usize) -> io::Result<Vec<Event>> {
 ///
 /// The parent/name are resolved server-side from the authoritative engine, so
 /// the writer's `touch_mtime(ino)` call site needs no extra context.
-fn inode_change_events(engine: &MetaStore, ino: i64) -> Vec<Event> {
+fn inode_change_events(engine: &dyn MetaProvider, ino: i64) -> Vec<Event> {
     let mut evs = vec![Event::Inode { ino }];
     if let Some(n) = engine.getattr(ino) {
         if !n.name.is_empty() {
@@ -1445,18 +1641,21 @@ fn inode_change_events(engine: &MetaStore, ino: i64) -> Vec<Event> {
     evs
 }
 
-/// Turn a connection into a pure event sink: register its write half, ack, then
-/// block on reads until the client disconnects and unregister. Other threads
-/// deliver events to the registered handle via [`broadcast`].
+/// Serve a subscriber connection: register its write half under every bucket
+/// name (`view` itself plus, for derived views, its physical base), ack, then
+/// block on reads until the client disconnects and unregister from all of
+/// them. Other threads deliver events to the registered handle via [`broadcast`].
 fn serve_subscriber(
     mut reader: BufReader<TcpStream>,
     mut writer: TcpStream,
-    view: &str,
+    buckets: &[String],
     subs: &Subscribers,
 ) -> io::Result<()> {
     let id = NEXT_SUB.fetch_add(1, Ordering::Relaxed);
     let handle = writer.try_clone()?;
-    subs.lock().entry(view.to_string()).or_default().insert(id, handle);
+    for b in buckets {
+        subs.lock().entry(b.clone()).or_default().insert(id, handle.try_clone()?);
+    }
     proto::send_response(&mut writer, 0, 0, &[])?; // subscribe ack
     // The client sends no further requests here; drain until it hangs up.
     let result = loop {
@@ -1471,8 +1670,10 @@ fn serve_subscriber(
             }
         }
     };
-    if let Some(map) = subs.lock().get_mut(view) {
-        map.remove(&id);
+    for b in buckets {
+        if let Some(map) = subs.lock().get_mut(b) {
+            map.remove(&id);
+        }
     }
     result
 }
@@ -1494,7 +1695,7 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
         return Ok(());
     }
     let mut i = 0usize;
-    let view = proto::get_key(&body, &mut i).unwrap_or_default();
+    let mut view = proto::get_key(&body, &mut i).unwrap_or_default();
     let presented = proto::get_key(&body, &mut i).unwrap_or_default();
     // Optional presenting uid appended by the client handshake (older clients
     // omit it -> uid 0, which is simply denied on a whitelisted view).
@@ -1502,6 +1703,26 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
     // Enforce the shared secret when one is configured; an empty server token
     // accepts any client (backward-compatible, LAN-trusted).
     if !rt.token.is_empty() && presented != rt.token {
+        proto::send_response(&mut writer, E_AUTH, 0, &[])?;
+        return Ok(());
+    }
+    // PURE ALIAS resolution (name governance): an `alias <real>` definition
+    // in meta/views/ makes the alias the public mount surface for a physical
+    // view. The swap happens BEFORE the ACL read gate and every downstream
+    // engine/bucket decision, so the alias simply IS the real view — grants
+    // written against the real name keep holding through it, and the full
+    // tree stays writable (no rules, so no read-only flag). Conversely, once
+    // a real name is governed by ANY alias, mounting it directly is refused:
+    // the mapping is the entry point — which is the whole point, letting an
+    // operator rotate public names freely while the storage identity stays
+    // unexposed. Rescanned per M_OPEN (a small control-plane dir scan; mount
+    // establishment is rare); established connections are untouched, exactly
+    // like the read gate — deleting an alias reopens the real name only for
+    // new mounts.
+    let aliases = load_aliases(&rt.base);
+    if let Some(real) = aliases.get(&view) {
+        view = real.clone();
+    } else if aliases.values().any(|r| r == &view) {
         proto::send_response(&mut writer, E_AUTH, 0, &[])?;
         return Ok(());
     }
@@ -1516,12 +1737,13 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
     // established connections against further writes rather than only on the
     // next M_OPEN handshake (closes a TOCTOU where revoke had no effect on
     // any already-mounted client).
-    // Validate the view db opens before acking. We deliberately do NOT
-    // cache this engine for the whole connection: under HA a fresh replicated
-    // snapshot evicts the cached engine, so live connections must re-resolve it
-    // per op to observe the swap (see the loop below).
-    if let Err(e) = engine_for(&rt, &view) {
-        eprintln!("meta: M_OPEN view='{view}' engine open failed: {e}");
+    // Validate the view resolves (physical db or a parseable derived-view
+    // definition) before acking. We deliberately do NOT cache this provider
+    // for the whole connection: under HA a fresh replicated snapshot evicts
+    // the cached engine, so live connections must re-resolve it per op to
+    // observe the swap (see the loop below).
+    if let Err(e) = view_provider(&rt, &view) {
+        eprintln!("meta: M_OPEN view='{view}' resolve failed: {e}");
         proto::send_response(&mut writer, E_DB, 0, &[])?;
         return Ok(());
     }
@@ -1536,13 +1758,28 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
         .as_ref()
         .map(|h| h.epoch.load(Ordering::SeqCst) as u64)
         .unwrap_or(0);
-    proto::send_response(&mut writer, 0, open_epoch, &[])?;
+    // The ack body carries one flag byte: nonzero when `view` is a DERIVED
+    // (virtual) view. Mount clients turn that into a kernel read-only mount so
+    // writes fail locally with EROFS instead of round-tripping to a gate; the
+    // per-op gate below stays authoritative regardless of what a client claims.
+    let derived_flag = [rt.is_derived(&view) as u8];
+    proto::send_response(&mut writer, 0, open_epoch, &derived_flag)?;
 
     // Distinguish a subscriber (becomes an event sink, sends no requests) from a
     // work connection (metadata ops) by peeking the next frame.
     let (op, body) = proto::recv_request(&mut reader)?;
     if op == M_SUBSCRIBE {
-        return serve_subscriber(reader, writer, &view, &rt.subs);
+        // A derived-view subscriber registers BOTH under its own name (to get
+        // display-coordinate events from lens writes) and under its physical
+        // base (to see plain writes other clients make to the same tree; those
+        // events may name coordinates the lens does not show — a no-op miss at
+        // the kernel, never a stale hit).
+        let base = rt.physical_base(&view);
+        let mut buckets = vec![view.clone()];
+        if base != view {
+            buckets.push(base);
+        }
+        return serve_subscriber(reader, writer, &buckets, &rt.subs);
     }
     let mut pending = Some((op, body));
 
@@ -1586,26 +1823,46 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
             proto::send_response(&mut writer, E_ROFS, 0, &[])?;
             continue;
         }
-        // Re-resolve the engine each op: cheap while cached, and picks up a
+        // Re-resolve the provider each op: cheap while cached, and picks up a
         // freshly installed snapshot after a replication push evicted the old one.
-        let engine = match engine_for(&rt, &view) {
+        let engine = match view_provider(&rt, &view) {
             Ok(e) => e,
             Err(_) => {
                 proto::send_response(&mut writer, E_DB, 0, &[])?;
                 continue;
             }
         };
-        let (status, val, data, events) = dispatch_meta(&engine, op, &body);
+        // Derived-view read-only gate: a virtual view is a server-defined
+        // PRESENTATION over the base tree — writes belong to the original
+        // (physical) view only. Evaluated after the per-op re-resolve so the
+        // name→base map is fresh (a `view define`/`rm` in flight converges
+        // within this same ≤TTL window as the shape itself). Current clients
+        // never reach it (the mount is kernel read-only from the handshake
+        // flag); it stands as the authoritative gate for old or rogue clients.
+        // Deliberately E_NOTPERM (→ EPERM at FUSE), never E_ROFS, which the
+        // client reads as an HA failover signal.
+        if is_write_op(op) && rt.is_derived(&view) {
+            proto::send_response(&mut writer, E_NOTPERM, 0, &[])?;
+            continue;
+        }
+        let (status, val, data, events) = dispatch_meta(&*engine, op, &body);
         // Synchronous replication (L2): commit the op to the standby BEFORE
         // acking the client. If the push/ACK window is exceeded we fall through
         // and emit a warn so operators see the degraded RPO honestly. Non-HA
         // or standby roles skip this entirely (their `rt.sync_repl` is false).
         if rt.sync_repl && status == 0 && is_write_op(op) && rt.role() == Role::Primary {
-            push_snapshot_now(&rt, &view, &engine);
+            push_snapshot_now(&rt, &view);
         }
         proto::send_response(&mut writer, status, val, &data)?;
         if status == 0 && !events.is_empty() {
             broadcast(&rt.subs, &view, &events);
+            // A lens write changed the PHYSICAL tree too; plain subscribers of
+            // the base view converge on the same push (coordinate mismatches
+            // in relocated spots simply miss, which is harmless).
+            let base = rt.physical_base(&view);
+            if base != view {
+                broadcast(&rt.subs, &base, &events);
+            }
             // Under HA, also queue the batch for relay to the standby's own
             // subscribers so a client mounted to the standby converges too. The
             // replicator drains this each cycle (<= one REPL_INTERVAL lag).
@@ -1665,7 +1922,7 @@ fn handle_control_conn(
                 // Only a standby installs pushes; a node that has promoted (or a
                 // plain primary) is authoritative and rejects the stale copy.
                 if ha.role() == Role::Standby
-                    && install_snapshot(&rt.base, &rt.cache, &view, &snap).is_ok()
+                    && install_snapshot(&rt, &view, &snap).is_ok()
                 {
                     proto::send_response(writer, 0, 0, &[])?;
                 } else {
@@ -1704,19 +1961,17 @@ fn handle_control_conn(
 }
 
 /// Atomically replace `<base>/meta/<view>.db` with a replicated snapshot and
-/// drop the cached engine so the next read opens the fresh copy. The snapshot is
+/// drop every cached engine so the next read opens the fresh copy (derived
+/// views built on any base are re-resolved too — a snapshot swap is rare and
+/// a full evict is the cheap, correct hammer). The snapshot is
 /// a complete `VACUUM INTO` image (self-contained, rollback-journal), so the old
 /// WAL/shm side files are removed rather than left to shadow it. `view` is
 /// validated to keep the peer from steering writes outside the meta dir.
-fn install_snapshot(
-    base: &Path,
-    cache: &Mutex<HashMap<String, Arc<MetaStore>>>,
-    view: &str,
-    snap: &[u8],
-) -> io::Result<()> {
+fn install_snapshot(rt: &MetaRuntime, view: &str, snap: &[u8]) -> io::Result<()> {
     if view.is_empty() || view.contains('/') || view.contains('\\') || view.contains("..") {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "bad view name"));
     }
+    let base = &rt.base;
     let dir = base.join("meta");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{view}.db"));
@@ -1726,7 +1981,7 @@ fn install_snapshot(
     f.sync_all()?;
     drop(f);
     std::fs::rename(&tmp, &path)?; // same-fs rename is atomic
-    cache.lock().remove(view); // force a reopen of the fresh copy on next access
+    rt.evict(); // force a reopen of the fresh copy (and any derived lens) on next access
     let _ = std::fs::remove_file(dir.join(format!("{view}.db-wal")));
     let _ = std::fs::remove_file(dir.join(format!("{view}.db-shm")));
     Ok(())
@@ -1778,7 +2033,7 @@ fn max_epoch_on_disk(rt: &MetaRuntime) -> i64 {
 ///
 /// The client's write still succeeded locally; the warn is the honest signal
 /// that RPO for this op has fallen back to `REPL_INTERVAL`.
-fn push_snapshot_now(rt: &MetaRuntime, view: &str, engine: &MetaStore) {
+fn push_snapshot_now(rt: &MetaRuntime, view: &str) {
     let peer = match &rt.peer {
         Some(p) => p.clone(),
         None => return,
@@ -1787,7 +2042,13 @@ fn push_snapshot_now(rt: &MetaRuntime, view: &str, engine: &MetaStore) {
         Some(h) => h.clone(),
         None => return,
     };
-    let snap = match engine.backup_to_bytes() {
+    // A mutating op on a DERIVED view must ship the snapshot of the PHYSICAL
+    // tree it reads — and be named as such, or the standby would install a db
+    // file under the derived label.
+    let base = rt.physical_base(view);
+    let snap = match store_for(rt, &base).and_then(|s| {
+        s.backup_to_bytes().map_err(io::Error::other)
+    }) {
         Ok(s) => s,
         Err(_) => return,
     };
@@ -1803,8 +2064,8 @@ fn push_snapshot_now(rt: &MetaRuntime, view: &str, engine: &MetaStore) {
     };
     let _ = conn.set_read_timeout(Some(SYNC_REPL_ACK_TIMEOUT));
     let _ = conn.set_write_timeout(Some(SYNC_REPL_ACK_TIMEOUT));
-    let mut body = Vec::with_capacity(view.len() + 2 + snap.len());
-    proto::put_key(&mut body, view);
+    let mut body = Vec::with_capacity(base.len() + 2 + snap.len());
+    proto::put_key(&mut body, &base);
     body.extend_from_slice(&snap);
     if proto::send_request(&mut conn, M_PUSH, &body).is_err() {
         eprintln!("meta sync-repl: M_PUSH send to {peer} failed; degraded to async for this op");
@@ -1817,7 +2078,7 @@ fn push_snapshot_now(rt: &MetaRuntime, view: &str, engine: &MetaStore) {
             // the periodic replicator's heartbeat handling).
             ha.set_role(Role::Standby);
             ha.epoch.store((peer_epoch as i64).max(ha.epoch.load(Ordering::SeqCst)), Ordering::SeqCst);
-            rt.cache.lock().clear();
+            rt.evict();
             *ha.last_peer.lock() = Instant::now();
             eprintln!("meta sync-repl: demoted to standby (peer epoch {peer_epoch})");
         }
@@ -2054,7 +2315,7 @@ fn start_replicator(rt: Arc<MetaRuntime>) {
                     ha.set_role(Role::Standby);
                     ha.epoch.store(res.prev_max, Ordering::SeqCst);
                     ha.lease_clear();
-                    rt.cache.lock().clear();
+                    rt.evict();
                     *ha.last_peer.lock() = Instant::now();
                     eprintln!("meta HA: demoted to standby (a quorum of {q}/{} arbiters holds {} > our {mine})", addrs.len(), res.prev_max);
                     continue;
@@ -2080,7 +2341,7 @@ fn start_replicator(rt: Arc<MetaRuntime>) {
                     if fenced {
                         ha.set_role(Role::Standby);
                         ha.lease_clear();
-                        rt.cache.lock().clear();
+                        rt.evict();
                         *ha.last_peer.lock() = now;
                         eprintln!("meta HA: cannot form lease quorum ({}/{} reachable, need {q}) >{WITNESS_FENCE_GRACE:?}; fail-safe self-demote to standby (cannot prove exclusive authority; refusing to keep writing)", res.reachable, addrs.len());
                         continue;
@@ -2107,7 +2368,7 @@ fn start_replicator(rt: Arc<MetaRuntime>) {
                 // Peer is authoritative at a higher epoch: stand down to standby.
                 ha.set_role(Role::Standby);
                 ha.epoch.store((peer_epoch as i64).max(ha.epoch.load(Ordering::SeqCst)), Ordering::SeqCst);
-                rt.cache.lock().clear(); // reopen views read-only for serving
+                rt.evict(); // reopen views read-only for serving
                 *ha.last_peer.lock() = Instant::now(); // don't instantly re-promote
                 eprintln!("meta HA: demoted to standby (peer epoch {peer_epoch})");
                 continue;
@@ -2118,7 +2379,7 @@ fn start_replicator(rt: Arc<MetaRuntime>) {
             // (M_PING) and event relay (M_FORWARD) running.
             if !rt.sync_repl {
                 for view in list_users(&rt.base) {
-                    let engine = match engine_for(&rt, &view) {
+                    let engine = match store_for(&rt, &view) {
                         Ok(e) => e,
                         Err(_) => continue,
                     };
@@ -2239,9 +2500,9 @@ fn start_promotion_watchdog(rt: Arc<MetaRuntime>, ha: Arc<HaState>) {
         }
         let new_epoch = candidate;
         ha.set_role(Role::Primary);
-        rt.cache.lock().clear(); // reopen views read-write on next access
+        rt.evict(); // reopen views read-write on next access
         for view in list_users(&rt.base) {
-            if let Ok(eng) = engine_for(&rt, &view) {
+            if let Ok(eng) = store_for(&rt, &view) {
                 let _ = eng.set_epoch(new_epoch);
             }
         }
@@ -2251,7 +2512,7 @@ fn start_promotion_watchdog(rt: Arc<MetaRuntime>, ha: Arc<HaState>) {
 }
 
 /// Execute one metadata operation against the view's engine.
-fn dispatch_meta(engine: &MetaStore, op: u8, body: &[u8]) -> (i32, u64, Vec<u8>, Vec<Event>) {
+fn dispatch_meta(engine: &dyn MetaProvider, op: u8, body: &[u8]) -> (i32, u64, Vec<u8>, Vec<Event>) {
     let mut i = 0usize;
     macro_rules! bail {
         ($e:expr) => {
@@ -2633,6 +2894,9 @@ mod ha_tests {
             base: dir.path().to_path_buf(),
             token: String::new(),
             cache: Arc::new(Mutex::new(HashMap::new())),
+            views: Arc::new(Mutex::new(HashMap::new())),
+            bases: Arc::new(Mutex::new(HashMap::new())),
+            defs: Arc::new(Mutex::new(HashMap::new())),
             subs: Arc::new(Mutex::new(HashMap::new())),
             ha: Some(ha.clone()),
             peer: Some("127.0.0.1:1".to_string()),
