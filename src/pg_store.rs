@@ -493,30 +493,34 @@ impl PgEngine {
         let t = now();
         let mut c = self.conn();
         let mut tx = c.transaction().map_err(|e| MetaError::Db(e.to_string()))?;
-        let src_id: i64 = tx
+        let (src_id, src_ino): (i64, Option<i64>) = tx
             .query(
-                &format!("SELECT id FROM {node} WHERE parent_id=$1 AND name=$2"),
+                &format!("SELECT id, ino FROM {node} WHERE parent_id=$1 AND name=$2"),
                 &[&parent, &name],
             )
             .map_err(|e| map_db_err(&e))?
             .into_iter()
             .next()
-            .map(|r| r.get(0))
+            .map(|r| (r.get(0), r.get(1)))
             .ok_or(MetaError::NotFound)?;
         if is_descendant_tx(&mut tx, &node, new_parent, src_id)? {
             return Err(MetaError::BadParentCycle);
         }
-        let tgt: Option<(i64, i64, Option<String>)> = tx
+        let tgt: Option<(i64, i64, Option<String>, Option<i64>)> = tx
             .query(
-                &format!("SELECT id, is_dir, data_ref FROM {node} WHERE parent_id=$1 AND name=$2"),
+                &format!("SELECT id, is_dir, data_ref, ino FROM {node} WHERE parent_id=$1 AND name=$2"),
                 &[&new_parent, &new_name],
             )
             .map_err(|e| map_db_err(&e))?
             .into_iter()
             .next()
-            .map(|r| (r.get(0), r.get(1), r.get(2)));
-        if let Some((tid, _, _)) = &tgt {
-            if *tid == src_id {
+            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)));
+        // Same-inode renames (rename(a,a) AND a rename between two hard link
+        // names of one file) are POSIX no-ops: without the ino comparison the
+        // DELETE below would drop the target link and shrink nlink. Mirrors
+        // the SQLite engine's guard in [`crate::meta::MetaEngine::rename`].
+        if let Some((tid, _, _, tino)) = &tgt {
+            if *tid == src_id || (tino.is_some() && *tino == src_ino) {
                 tx.commit().map_err(|e| MetaError::Db(e.to_string()))?;
                 return Ok(None);
             }
@@ -525,7 +529,7 @@ impl PgEngine {
             return Err(MetaError::Exists);
         }
         let mut gc: Option<String> = None;
-        if let Some((tid, is_dir, tgt_ref)) = tgt {
+        if let Some((tid, is_dir, tgt_ref, _)) = tgt {
             let src_is_dir: i64 = tx
                 .query(
                     &format!("SELECT is_dir FROM {node} WHERE id=$1"),

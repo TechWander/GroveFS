@@ -101,6 +101,37 @@ fn rename_moves_and_rejects_cycle() {
 }
 
 #[test]
+fn rename_between_hardlinks_is_noop() {
+    // POSIX (man 2 rename): oldpath and newpath as two hard link names of the
+    // SAME file -> rename() does nothing and succeeds. A row-id-only no-op
+    // guard used to miss this and delete the target name, silently shrinking
+    // nlink — the guard must compare inodes, not rows.
+    let m = MetaEngine::open(&tmpdb("renhl")).unwrap();
+    let f = m.create_node(ROOT_INO, "a", false, Some("key-r"), 0o644, 0, 0).unwrap();
+    m.link_node(f, ROOT_INO, "b").unwrap();
+    assert_eq!(m.getattr(f).unwrap().nlink, 2);
+
+    // Both directions between the two links are no-ops that free no object.
+    assert_eq!(m.rename(ROOT_INO, "a", ROOT_INO, "b", false).unwrap(), None);
+    assert_eq!(m.rename(ROOT_INO, "b", ROOT_INO, "a", false).unwrap(), None);
+    assert_eq!(m.getattr(f).unwrap().nlink, 2, "nlink must stay 2");
+    let names: Vec<String> = m.readdir(ROOT_INO).into_iter().map(|n| n.name).collect();
+    assert!(
+        names.contains(&"a".to_string()) && names.contains(&"b".to_string()),
+        "both links survive, got {names:?}"
+    );
+
+    // A rename over a DIFFERENT file still replaces normally: the old "a"
+    // link of the hardlinked pair loses one name ("b" survives), and its
+    // object is NOT GC'd because that last remaining name still refs it.
+    let other = m.create_node(ROOT_INO, "c", false, Some("key-c"), 0o644, 0, 0).unwrap();
+    assert_eq!(m.rename(ROOT_INO, "c", ROOT_INO, "a", false).unwrap(), None);
+    assert!(m.lookup(ROOT_INO, "c").is_none());
+    assert_eq!(m.getattr(other).unwrap().nlink, 1);
+    assert_eq!(m.getattr(f).unwrap().nlink, 1);
+}
+
+#[test]
 fn unlink_nonempty_dir_rejected() {
     let m = MetaEngine::open(&tmpdb("notempty")).unwrap();
     let d = m.create_node(ROOT_INO, "d", true, None, 0o755, 0, 0).unwrap();

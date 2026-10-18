@@ -7,10 +7,20 @@
 //!
 //! Subcommands:
 //!   init   — create a view DB + seed some folders/files from a manifest
-//!   mount  — mount a view at a mountpoint (foreground)
+//!   mount  — mount a view at a mountpoint (foreground; `--layout` lens, or a
+//!            server-side derived view name resolved from `meta/views/`)
 //!   umount — unmount
+//!   view   — manage server-side view definitions (define/alias/list/rm):
+//!            derived lenses (shape governance, mounted read-only) and pure
+//!            aliases (name governance: the alias is the writable public
+//!            face of a physical view, whose real name stops being mountable)
+//!   import — mirror an EXISTING local directory tree into a view, zero-copy
+//!            (hard link into blocks/) where the filesystem allows it
+//!   acl    — per-view uid whitelist
+//!   data-server / meta-server — centralized storage/metadata services
 
 use clap::{Parser, Subcommand};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
@@ -25,7 +35,12 @@ use grovefs::remote;
 #[derive(Parser)]
 #[command(name = "grove", version, about = "User-view FUSE filesystem, no NFS")]
 struct Cli {
-    /// Shared base dir holding blocks/ and meta/. Defaults to $GROVEFS_HOME or ~/.grovefs
+    /// Base directory holding `blocks/` (data) and `meta/` (view DBs) for LOCAL
+    /// mode (`init`, a mount without `--meta`/`--data`). Commands that talk to
+    /// one specific store name their own path instead (`meta-server --db-path`,
+    /// `acl --db-path`, `data-server --root`), with `--home` kept as their
+    /// fallback. A fully remote mount (`--data` + `--meta`) needs neither and
+    /// writes nothing here. Defaults to $GROVEFS_HOME or ~/.grovefs.
     #[arg(long, global = true)]
     home: Option<PathBuf>,
 
@@ -100,6 +115,16 @@ enum Cmd {
         /// its uid, and the token is the real gate against a malicious peer.
         #[arg(long)]
         as_uid: Option<u32>,
+        /// Presentation overlay: a rules file that reshapes how THIS mount
+        /// displays the view without touching the stored tree. Verbs: `hide
+        /// <src>`, `only <src>`, `map <src> <dst>`, `link <src> <dst>` (see
+        /// `grovefs::layout`). Client-side and per-mount: two clients mounting
+        /// the same view with different files see different cuts of the same
+        /// authoritative data. Writes through the lens land on the real
+        /// entries; creating directly inside a synthesized (lens-only) dir is
+        /// refused with EPERM.
+        #[arg(long)]
+        layout: Option<PathBuf>,
     },
     /// Run the remote data service (central cluster node) backed by local disk
     DataServer {
@@ -122,6 +147,14 @@ enum Cmd {
         /// Listen address, e.g. 0.0.0.0:50053
         #[arg(short, long, default_value = "127.0.0.1:50053")]
         listen: String,
+        /// Authoritative metadata root for this server: every view DB is
+        /// created under `<db-path>/meta/<view>.db` (lazily, on first open) and
+        /// the per-view ACL lives at `<db-path>/meta/acl.db` (this local SQLite
+        /// store is deliberate — admission state stays outside any PG/replica
+        /// timeline). Takes precedence over the global `--home`, which is kept
+        /// for backward compatibility.
+        #[arg(long)]
+        db_path: Option<PathBuf>,
         /// Shared secret clients must present (`mount --token`). When set, the
         /// server refuses any `M_OPEN` whose token differs, so an unauthorized
         /// host on the LAN can no longer open arbitrary view trees. Empty
@@ -135,7 +168,8 @@ enum Cmd {
         role: String,
         /// The other HA node's `host:port`. A primary pushes every ~500ms and
         /// heartbeats its epoch here; a standby promotes after missing heartbeats.
-        /// Requires a *separate* `--home` from the peer (each node keeps its own
+        /// Requires a *separate* metadata root (`--db-path`, or the legacy
+        /// global `--home`) from the peer (each node keeps its own
         /// copy of the view dbs; replication ships whole snapshots between them).
         #[arg(long)]
         peer: Option<String>,
@@ -189,7 +223,7 @@ enum Cmd {
         #[arg(long)]
         witness: Option<String>,
         /// Metadata backend URI. Default (unset or `"sqlite"`) is the embedded
-        /// SQLite path: one db file per view under `<home>/meta/`, HA snapshot
+        /// SQLite path: one db file per view under `<db-path>/meta/`, HA snapshot
         /// shipping available. Set to `postgres://user:pw@host:port/db`
         /// (`postgresql://…` also accepted) to place the authoritative view
         /// tree in PostgreSQL: one `grovefs_v_<hex(view)>` schema per view,
@@ -208,12 +242,143 @@ enum Cmd {
         #[arg(short, long)]
         mountpoint: PathBuf,
     },
-    /// Manage the optional per-view uid whitelist (`<home>/meta/acl.db`).
+    /// Manage the optional per-view uid whitelist (the metadata root's
+    /// `meta/acl.db`, same root as a `meta-server`'s `--db-path`).
     /// A view with no rows is unrestricted (any uid, once past the token gate,
     /// may mount); adding any row for a view switches it to whitelist mode.
     Acl {
+        /// The metadata root holding `meta/acl.db` — deliberately the SAME
+        /// option name (and the same directory) as `meta-server --db-path`,
+        /// so that both commands take one shared path, spelled identically.
+        /// Falls back to the global `--home` when omitted.
+        #[arg(long, global = true)]
+        db_path: Option<PathBuf>,
         #[command(subcommand)]
         action: AclAction,
+    },
+    /// Manage SERVER-SIDE view definitions — the two governance shapes:
+    /// DERIVED views (named presentation lenses over ONE physical view tree,
+    /// mounted read-only) and pure ALIASES (public-name ↔ real-name mapping,
+    /// writable, real name not mountable). Definitions live in the meta root
+    /// (`<db-path>/meta/views/<name>.layout`), clients simply mount
+    /// `--view <name>` and need no local rules file. A `meta-server` resolves
+    /// them at `M_OPEN`; a local mount resolves them from `--home`. Rules are
+    /// display customization, NOT a security boundary — hard isolation stays
+    /// view + ACL + token (mounting the base name directly shows the full
+    /// tree to whoever is allowed past its gates). Derived (virtual) views
+    /// mount READ-ONLY: the shape is centrally governed, so every write goes
+    /// to the original (base) view — a mount of a derived name refuses all
+    /// mutations with EROFS (kernel read-only flag negotiated at `M_OPEN`,
+    /// plus an authoritative per-op gate on the meta-server).
+    View {
+        /// The metadata root holding `meta/views/*.layout` — same option name
+        /// and directory as `meta-server --db-path` / `grove acl --db-path`;
+        /// falls back to the global `--home` when omitted.
+        #[arg(long)]
+        db_path: Option<PathBuf>,
+        #[command(subcommand)]
+        action: ViewAction,
+    },
+    /// Import an EXISTING local directory tree into a view WITHOUT moving or
+    /// duplicating bytes: every regular file is registered as an object —
+    /// hard-linked into `blocks/` when source and store share a filesystem
+    /// (zero extra bytes; edits through either path stay visible in the
+    /// other), streamed as a copy otherwise — and the directory structure is
+    /// mirrored into the view tree under `--prefix`. Run it where the store
+    /// lives (local `--home`, or the meta/data servers' root — same
+    /// operational envelope as `grove acl`/`grove view`). Re-running is an
+    /// INCREMENTAL import: names already in the view are skipped. Symlinks
+    /// and special files are skipped (counted, never followed). Timestamps,
+    /// mode and owner are preserved from the source. The target must be a
+    /// PHYSICAL view — importing into a derived (virtual) name is refused,
+    /// since virtual views mount read-only. Live `meta-server`
+    /// mounts converge within their attr/dentry TTL (≤2s, no remount); a PG
+    /// backend instead goes through a mounted path (rsync) since the
+    /// authoritative tree lives in Postgres, not in a local db file.
+    Import {
+        /// Metadata root holding `meta/<view>.db` — same option name and
+        /// directory as `meta-server --db-path`; falls back to `--home`.
+        #[arg(long)]
+        db_path: Option<PathBuf>,
+        /// Data root holding `blocks/` — same option name as
+        /// `data-server --root` style paths; defaults to `--db-path` (the
+        /// colocated topology used by every deployment example).
+        #[arg(long)]
+        data_root: Option<PathBuf>,
+        /// Target view (its meta DB is created if absent, like `init`).
+        #[arg(long)]
+        view: String,
+        /// Existing directory to mirror in.
+        #[arg(long)]
+        source: PathBuf,
+        /// In-view destination directory; defaults to the source dir's name
+        /// at the view root.
+        #[arg(long)]
+        prefix: Option<String>,
+        /// Only report what would be imported; touch nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ViewAction {
+    /// Create/replace derived view `--name` on physical `--base`, rules read
+    /// from `--rules FILE` (same verbs as `mount --layout`: hide/only/map/link).
+    /// Against a `meta-server`, live mounts of that name pick the new shape up
+    /// automatically (the server re-checks the definition's mtime per op; the
+    /// client converges within its attr/dentry TTL, ≤2s — no remount). A local
+    /// (`--home`) mount resolves the definition once at mount time. Mounts of
+    /// the derived name are READ-ONLY (writes belong to the base view).
+    Define {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        base: String,
+        /// Layout rules file (one verb per line; a `base` line inside it is
+        /// rejected here — the base is given by `--base`).
+        #[arg(long)]
+        rules: PathBuf,
+    },
+    /// List every view definition: derived views (name, base tree, rule
+    /// counts, read-only) and pure aliases (name → real view, writable).
+    List,
+    /// Remove a view DEFINITION `--name` (derived or alias — the file slot is
+    /// shared). Underlying data untouched;
+    /// already-mounted clients keep their resolved lens until they remount
+    /// (or the server's cache is evicted by an HA/snapshot event). Removing an
+    /// alias also makes the real name mountable again for NEW mounts.
+    Rm {
+        #[arg(long)]
+        name: String,
+    },
+    /// Create/replace a PURE ALIAS `--name` for physical `--real`: name
+    /// governance (vs `define`'s shape governance). No rules, so the alias
+    /// shows the FULL tree and stays WRITABLE — it simply is the real view
+    /// under a public name. A `meta-server` then refuses mounts of the real
+    /// name itself (and a local `--home` mount honors the same contract):
+    /// while the alias exists the real name is not a mount entry point, so
+    /// public names can rotate freely without exposing the storage identity.
+    /// ACL grants are checked against the REAL name (resolution precedes the
+    /// read gate), so `grove acl allow --view <real> ...` authorizes both
+    /// doors. Chained aliases, aliases over derived views, and aliasing an
+    /// already-governed real name are rejected at this command.
+    ///
+    /// To ROTATE a leaked public name in one gapless step, add `--retire
+    /// <old-alias>`: the new alias is written before the old one is removed,
+    /// so the real name stays governed throughout (never briefly mountable by
+    /// its own name), and the ACL grants keyed to the real view carry over
+    /// untouched — the leaker's old name stops resolving, legitimate users
+    /// just remount under the new name.
+    Alias {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        real: String,
+        /// Atomically retire a previous alias of the same real view (name
+        /// rotation without a governance gap).
+        #[arg(long)]
+        retire: Option<String>,
     },
 }
 
@@ -260,6 +425,34 @@ fn meta_path(base: &Path, view: &str) -> PathBuf {
     base.join("meta").join(format!("{view}.db"))
 }
 
+/// Scan `<base>/meta/views/*.layout` once for PURE ALIAS definitions
+/// (alias-name → real-view-name). Mirrors the meta-server's own resolver so a
+/// local `--home` mount honors the same name-governance contract: mounting a
+/// governed real name by its real name is refused locally, exactly as
+/// remotely. Malformed entries are ignored here; the branches that actually
+/// need a definition re-parse it and surface the error.
+fn load_view_aliases(base: &Path) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    if let Ok(rd) = std::fs::read_dir(base.join("meta").join("views")) {
+        for ent in rd.flatten() {
+            let p = ent.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("layout") {
+                continue;
+            }
+            let name = match p.file_stem().and_then(|s| s.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            if let Ok(grovefs::layout::ViewDef::Alias(real)) =
+                grovefs::layout::LayoutRules::parse_def_file(&p)
+            {
+                out.insert(name, real);
+            }
+        }
+    }
+    out
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -270,11 +463,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
     let base = base_dir(&cli.home);
-    std::fs::create_dir_all(base.join("meta"))?;
+    // NOTE: deliberately no unconditional `create_dir_all(base/meta)` here.
+    // Only two paths actually touch `<home>/meta`: `init` and a *local* mount
+    // (no `--meta`). Those create it in their own branches below. A fully
+    // remote mount (`--data` + `--meta`) writes nothing under `--home` — no
+    // authoritative data, no cache, no ACL (the read/write gates are enforced
+    // server-side at M_OPEN / per-op) — so `--home` is not needed at all there
+    // and leaves no footprint. The servers self-provision too: `meta-server`
+    // creates `<base>/meta` in `serve()`, and `AclStore`/`MetaStore`/the
+    // on-push view path all `create_dir_all` before opening their files.
 
     match cli.command {
         Cmd::Init { view, manifest } => {
             let mp = meta_path(&base, &view);
+            if let Some(dir) = mp.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
             let meta = MetaEngine::open(&mp)?;
             println!("initialized view '{view}' at {}", mp.display());
             if let Some(mf) = manifest {
@@ -294,11 +498,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             o,
             threads,
             as_uid,
+            layout,
         } => {
             std::fs::create_dir_all(&mountpoint)?;
             // Effective uid reported to the server / used for local ACL check:
             // `--as-uid` overrides the process euid (advisory).
             let uid = as_uid.unwrap_or_else(|| unsafe { libc::geteuid() });
+            // A DERIVED (virtual) view — server-defined shape or local
+            // `meta/views/<view>.layout` — mounts read-only by contract: the
+            // shape is centrally governed, writes belong to the original
+            // (base) view. Set by whichever metadata source resolves below;
+            // folded into the FUSE readonly flag AND the kernel RO mount.
+            let mut view_ro = false;
             // Metadata source: a central `meta-server` when --meta is given (a
             // single authoritative view shared across clients), else this machine's
             // local `<home>/meta/<view>.db`. Both satisfy `MetaProvider`, so the
@@ -306,28 +517,139 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let meta_provider: Arc<dyn MetaProvider> = match &meta {
                 Some(addr) => {
                     println!("using remote metadata service at {addr}");
-                    Arc::new(remote::RemoteMeta::new_with_token_uid(
+                    let rm = remote::RemoteMeta::new_with_token_uid(
                         addr,
                         &view,
                         token.as_deref().unwrap_or(""),
                         uid,
-                    )?)
+                    )?;
+                    // The M_OPEN ack flagged derived names (absent = old server
+                    // or physical view → stays writable, behavior-compatible).
+                    view_ro = rm.is_readonly_view();
+                    Arc::new(rm)
                 }
                 None => {
                     // Local mount: enforce the view whitelist's read-gate before
                     // opening the sqlite file. Write-gating is a meta-server-only
                     // feature (writes here hit the file directly, behind OS fs
                     // perms); document this honestly.
-                    let acl = AclStore::open(&base)?;
-                    if !acl.check_read(&view, uid) {
+                    std::fs::create_dir_all(base.join("meta"))?;
+                    // PURE ALIAS resolution mirrors the meta-server's M_OPEN
+                    // gate (see `load_view_aliases`): a governed real name is
+                    // not a local mount entry point either, and the public
+                    // alias name resolves to the real tree — full shape,
+                    // writable, grants written against the REAL name hold.
+                    // Remote mounts deliberately do NOT swap here: the client
+                    // sends the alias name and the SERVER resolves (and
+                    // refuses) it.
+                    let mut effective = view.clone();
+                    let mut local_def: Option<grovefs::layout::ViewDef> = None;
+                    let local_aliases = load_view_aliases(&base);
+                    if let Some(real) = local_aliases.get(&view) {
+                        println!(
+                            "alias view '{view}' resolves to real view '{real}' (full tree, writable)"
+                        );
+                        effective = real.clone();
+                    } else if local_aliases.values().any(|r| r == &view) {
+                        // Mounting the real name while it is governed: the
+                        // alias is the entry point, not this one (same shape
+                        // as the server's M_OPEN refusal).
                         return Err(format!(
-                            "local view '{view}' is whitelisted; uid {uid} has no read grant (see `grove acl list --view {view}`)"
+                            "view '{view}' is governed by an alias — mount the alias name instead (`grove view list` shows it)"
                         )
                         .into());
                     }
-                    let mp = meta_path(&base, &view);
-                    Arc::new(MetaEngine::open(&mp)?)
+                    if layout.is_none() {
+                        if let Ok(rd) =
+                            std::fs::read_dir(base.join("meta").join("views"))
+                        {
+                            for ent in rd.flatten() {
+                                let p = ent.path();
+                                if p.file_stem().and_then(|s| s.to_str())
+                                    == Some(view.as_str())
+                                    && p.extension().and_then(|s| s.to_str())
+                                        == Some("layout")
+                                {
+                                    let d =
+                                        grovefs::layout::LayoutRules::parse_def_file(
+                                            &p,
+                                        )
+                                        .map_err(|e| {
+                                            format!("bad view definition '{view}': {e}")
+                                        })?;
+                                    local_def = Some(d);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let acl = AclStore::open(&base)?;
+                    if !acl.check_read(&effective, uid) {
+                        return Err(format!(
+                            "local view '{effective}' is whitelisted; uid {uid} has no read grant (see `grove acl list --view {effective}`)"
+                        )
+                        .into());
+                    }
+                    // A local mount resolves the SAME derived-view definition a
+                    // meta-server would (`<home>/meta/views/<view>.layout`): the
+                    // lens wraps the base tree's engine, so one server-side
+                    // definition serves every mount of this home. An explicit
+                    // `--layout FILE` takes precedence (no lens stacking).
+                    let def = base.join("meta").join("views").join(format!("{effective}.layout"));
+                    let derived = match &local_def {
+                        Some(grovefs::layout::ViewDef::Derived(b, r))
+                            if layout.is_none() =>
+                        {
+                            Some((b.clone(), r.clone()))
+                        }
+                        _ if def.is_file() && layout.is_none() => {
+                            let (b, r) =
+                                grovefs::layout::LayoutRules::parse_view_file(&def)
+                                    .map_err(|e| format!("bad derived view '{effective}': {e}"))?;
+                            Some((b, r))
+                        }
+                        _ => None,
+                    };
+                    if let Some((b, rules)) = derived {
+                        println!(
+                            "derived view '{view}' over base '{b}': {} hide, {} only, {} reloc rule(s)",
+                            rules.hide.len(),
+                            rules.only.len(),
+                            rules.reloc.len()
+                        );
+                        // Same read-only contract the meta-server enforces for
+                        // derived names; a local mount honors it without a wire.
+                        view_ro = true;
+                        println!(
+                            "note: derived (virtual) views mount read-only — write to base view '{b}'"
+                        );
+                        let engine = MetaEngine::open(&meta_path(&base, &b))?;
+                        Arc::new(grovefs::layout::LayoutMeta::new(Arc::new(engine), rules))
+                    } else {
+                        let mp = meta_path(&base, &effective);
+                        Arc::new(MetaEngine::open(&mp)?)
+                    }
                 }
+            };
+            // Presentation overlay: wrap the provider in a per-mount lens so
+            // different clients render the SAME stored tree with different
+            // cuts/reorganization. Purely client-side: the server and every
+            // other mount are unaffected; data IO is untouched (entries keep
+            // their real inodes, so read/write/lock/GC pass straight through).
+            let meta_provider: Arc<dyn MetaProvider> = match &layout {
+                Some(f) => {
+                    let rules = grovefs::layout::LayoutRules::parse_file(f)
+                        .map_err(|e| format!("bad layout file: {e}"))?;
+                    println!(
+                        "layout overlay {}: {} hide, {} only, {} reloc rule(s)",
+                        f.display(),
+                        rules.hide.len(),
+                        rules.only.len(),
+                        rules.reloc.len()
+                    );
+                    Arc::new(grovefs::layout::LayoutMeta::new(meta_provider, rules))
+                }
+                None => meta_provider,
             };
             // Fencing wiring: the meta client owns the live epoch handle (kept
             // current on every M_OPEN handshake/failover); the data client shares
@@ -383,7 +705,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let fs = GroveFS::new(
                 meta_provider,
                 backend,
-                ro || o.iter().any(|s| s == "ro"),
+                ro || view_ro || o.iter().any(|s| s == "ro"),
                 strict || o.iter().any(|s| s == "strict"),
             );
 
@@ -405,8 +727,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     other => cfg.mount_options.push(fuser::MountOption::CUSTOM(other.to_string())),
                 }
             }
-            // `--ro` (or `-o ro`) mounts the view read-only at the kernel level.
-            let want_ro = ro || o.iter().any(|s| s == "ro");
+            // `--ro` (or `-o ro`) mounts the view read-only at the kernel level;
+            // a derived (virtual) view is forced RO regardless of the flag.
+            let want_ro = ro || view_ro || o.iter().any(|s| s == "ro");
             if want_ro && !o.iter().any(|s| s == "ro") {
                 cfg.mount_options.push(fuser::MountOption::RO);
             }
@@ -414,10 +737,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // cloned /dev/fuse fd. `threads = 0` maps to single-threaded legacy mode.
             cfg.n_threads = if threads > 1 { Some(threads) } else { None };
             cfg.clone_fd = threads > 1;
+            // Only print `base` when the mount actually reads/writes under it:
+            // a fully remote mount (`--data` + `--meta`) touches no local store
+            // at all, so naming a base there would mislead (mirrors the
+            // removed unconditional create_dir_all side effect).
+            let locality = if data.is_some() && meta.is_some() {
+                String::from("fully remote: no local store")
+            } else {
+                format!("base {}", base.display())
+            };
             println!(
-                "mounting view '{view}' at {} (base {}{})",
+                "mounting view '{view}' at {} ({}{})",
                 mountpoint.display(),
-                base.display(),
+                locality,
                 if want_ro { ", read-only" } else { "" }
             );
             // Graceful shutdown: the FUSE session returns whenever the mount goes
@@ -460,16 +792,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let srv = srv.with_fence_store(root.join(".fence_token"));
             srv.serve()?;
         }
-        Cmd::MetaServer { listen, token, role, peer, sync_repl, witness, store } => {
+        Cmd::MetaServer {
+            listen,
+            db_path,
+            token,
+            role,
+            peer,
+            sync_repl,
+            witness,
+            store,
+        } => {
             let role = if role.eq_ignore_ascii_case("standby") {
                 grovefs::remote::meta::Role::Standby
             } else {
                 grovefs::remote::meta::Role::Primary
             };
+            // `--db-path` is the explicit, self-describing form of the metadata
+            // root; the global `--home` still works (back-compat) but loses if
+            // both are given.
+            let meta_base = db_path.unwrap_or_else(|| base.clone());
             let mut srv = match token.as_deref() {
                 Some(t) if !t.is_empty() =>
-                    grovefs::remote::MetaServer::with_token(&listen, &base, t),
-                _ => grovefs::remote::MetaServer::new(&listen, &base),
+                    grovefs::remote::MetaServer::with_token(&listen, &meta_base, t),
+                _ => grovefs::remote::MetaServer::new(&listen, &meta_base),
             };
             srv = srv.with_ha(role, peer);
             if sync_repl {
@@ -483,8 +828,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_fusermount(&["-u", &mountpoint.to_string_lossy()])?;
             println!("unmounted {}", mountpoint.display());
         }
-        Cmd::Acl { action } => {
-            let acl = AclStore::open(&base)?;
+        Cmd::Acl { db_path, action } => {
+            // `--db-path` (same name/same dir as `meta-server --db-path`) wins;
+            // the global `--home` stays as the backward-compatible fallback.
+            let acl_base = db_path.unwrap_or_else(|| base.clone());
+            let acl = AclStore::open(&acl_base)?;
             match action {
                 AclAction::Allow { view, uid, read, write } => {
                     acl.allow(&view, uid, read, write)?;
@@ -511,6 +859,531 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
+        }
+        Cmd::View { db_path, action } => {
+            // Derived-view definitions live with the authoritative meta root,
+            // exactly like acl.db: control-plane state, read by the meta-server
+            // at M_OPEN (or by a local mount from --home) — never replicated
+            // with the view trees themselves (copy the `views/` dir to a HA
+            // standby like any other config).
+            let vbase = db_path.unwrap_or_else(|| base.clone());
+            let dir = vbase.join("meta").join("views");
+            match action {
+                ViewAction::Define {
+                    name,
+                    base: src_base,
+                    rules,
+                } => {
+                    use grovefs::layout::{valid_view_name, LayoutRules};
+                    if !valid_view_name(&name) {
+                        return Err(format!(
+                            "invalid view name '{name}' (must be one safe path element)"
+                        )
+                        .into());
+                    }
+                    if !valid_view_name(&src_base) {
+                        return Err(format!("invalid base view name '{src_base}'").into());
+                    }
+                    if name == src_base {
+                        return Err("derived view name must differ from its base".into());
+                    }
+                    if vbase.join("meta").join(format!("{name}.db")).is_file() {
+                        return Err(format!(
+                            "'{name}' already names a physical view db — pick another name"
+                        )
+                        .into());
+                    }
+                    // One file slot per name: an existing ALIAS may be replaced
+                    // (a deliberate governance change) but silently turning a
+                    // public alias into a read-only shaped view is not `define`
+                    // 's business.
+                    let self_def_path = dir.join(format!("{name}.layout"));
+                    if let Ok(d) = grovefs::layout::LayoutRules::parse_def_file(&self_def_path) {
+                        if matches!(d, grovefs::layout::ViewDef::Alias(_)) {
+                            return Err(format!(
+                                "'{name}' is a pure alias — remove it first (`grove view rm --name {name}`) before defining a derived view over it"
+                            )
+                            .into());
+                        }
+                    }
+                    // `base` is supplied by --base, so a base line inside the
+                    // rules file is rejected here (LayoutRules::parse has no
+                    // such verb) — one unambiguous source of truth per file.
+                    let text = std::fs::read_to_string(&rules)
+                        .map_err(|e| format!("cannot read rules file {}: {e}", rules.display()))?;
+                    let r = LayoutRules::parse(&text).map_err(|e| format!("bad layout rules: {e}"))?;
+                    if dir.join(format!("{name}.layout")).is_file() {
+                        println!("view '{name}' already defined — replacing it (live meta-server mounts hot-reload it within their cache TTL)");
+                    }
+                    std::fs::create_dir_all(&dir)?;
+                    std::fs::write(
+                        dir.join(format!("{name}.layout")),
+                        format!("base {src_base}\n{text}"),
+                    )?;
+                    println!(
+                        "defined derived view '{name}' over base '{src_base}': {} hide, {} only, {} reloc rule(s)",
+                        r.hide.len(),
+                        r.only.len(),
+                        r.reloc.len()
+                    );
+                    println!(
+                        "note: mounts of '{name}' are read-only (virtual shape) — write to base view '{src_base}'"
+                    );
+                    if !vbase.join("meta").join(format!("{src_base}.db")).is_file() {
+                        eprintln!(
+                            "note: no local <db-path>/meta/{src_base}.db yet — fine under PG or lazy creation, otherwise run `grove --home ... init --view {src_base}` first"
+                        );
+                    }
+                }
+                ViewAction::List => {
+                    let mut names: Vec<String> = Vec::new();
+                    if let Ok(rd) = std::fs::read_dir(&dir) {
+                        for ent in rd.flatten() {
+                            let p = ent.path();
+                            if p.extension().and_then(|e| e.to_str()) == Some("layout") {
+                                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                                    names.push(stem.to_string());
+                                }
+                            }
+                        }
+                    }
+                    names.sort();
+                    if names.is_empty() {
+                        println!(
+                            "no view definitions under {} (every view name maps to its own tree)",
+                            dir.display()
+                        );
+                    }
+                    for n in names {
+                        let d = grovefs::layout::LayoutRules::parse_def_file(
+                            &dir.join(format!("{n}.layout")),
+                        )
+                        .map_err(|e| format!("bad view definition for '{n}': {e}"))?;
+                        match d {
+                            grovefs::layout::ViewDef::Alias(real) => println!(
+                                "alias '{n}' -> real view '{real}' (full tree, writable; '{real}' not mountable by its own name)"
+                            ),
+                            grovefs::layout::ViewDef::Derived(b, r) => println!(
+                                "view '{n}' -> base '{b}': {} hide, {} only, {} reloc rule(s) (read-only)"
+                            ,
+                                r.hide.len(),
+                                r.only.len(),
+                                r.reloc.len()
+                            ),
+                        }
+                    }
+                }
+                ViewAction::Alias { name, real, retire } => {
+                    use grovefs::layout::{LayoutRules, ViewDef};
+                    if !grovefs::layout::valid_view_name(&name) {
+                        return Err(format!(
+                            "invalid alias name '{name}' (must be one safe path element)"
+                        )
+                        .into());
+                    }
+                    if !grovefs::layout::valid_view_name(&real) {
+                        return Err(format!("invalid real view name '{real}'").into());
+                    }
+                    if name == real {
+                        return Err("alias name must differ from the real view name".into());
+                    }
+                    if let Some(old) = &retire {
+                        if !grovefs::layout::valid_view_name(old) {
+                            return Err(format!("invalid --retire alias name '{old}'").into());
+                        }
+                        if old == &name {
+                            return Err(
+                                "--retire must name a DIFFERENT (previous) alias, not the one being created"
+                                    .into(),
+                            );
+                        }
+                    }
+                    if vbase.join("meta").join(format!("{name}.db")).is_file() {
+                        return Err(format!(
+                            "'{name}' already names a physical view db — pick another name"
+                        )
+                        .into());
+                    }
+                    // The alias target must be a PHYSICAL view (the storage
+                    // identity the alias maps onto), and must not itself be
+                    // governed: chaining aliases or aliasing a derived view
+                    // would create resolution ambiguity the server does not
+                    // model (M_OPEN resolution is single-hop by design).
+                    let mut alias_to: HashMap<String, String> = HashMap::new();
+                    let mut derived_names: Vec<String> = Vec::new();
+                    if let Ok(rd) = std::fs::read_dir(&dir) {
+                        for ent in rd.flatten() {
+                            let p = ent.path();
+                            if p.extension().and_then(|e| e.to_str()) != Some("layout") {
+                                continue;
+                            }
+                            let stem = match p.file_stem().and_then(|s| s.to_str()) {
+                                Some(s) => s.to_string(),
+                                None => continue,
+                            };
+                            if let Ok(d) = LayoutRules::parse_def_file(&p) {
+                                match d {
+                                    ViewDef::Alias(r) => {
+                                        alias_to.insert(stem, r);
+                                    }
+                                    ViewDef::Derived(..) => derived_names.push(stem),
+                                }
+                            }
+                        }
+                    }
+                    // A requested atomic retirement: verify the old name is
+                    // in fact an alias of THIS real view (never silently drop
+                    // a derived definition or a different view's alias), then
+                    // drop it from the working map so the steady-state check
+                    // below reflects the post-rotation state (one name per
+                    // real view) instead of tripping on the alias we retire
+                    // in this very command.
+                    if let Some(old) = &retire {
+                        match alias_to.get(old) {
+                            Some(r) if r == &real => {
+                                alias_to.remove(old);
+                            }
+                            Some(r) => {
+                                return Err(format!(
+                                    "--retire '{old}' currently aliases a different real view ('{r}'), not '{real}' — rotation must retire the previous name of the same view"
+                                )
+                                .into());
+                            }
+                            None => {
+                                return Err(format!(
+                                    "--retire '{old}' is not a pure alias here (a derived view is separate — `grove view list` shows what '{old}' actually is)"
+                                )
+                                .into());
+                            }
+                        }
+                    }
+                    if alias_to.contains_key(&real) {
+                        return Err(format!(
+                            "alias target '{real}' is itself an alias (-> '{}') — chains are not supported; alias the physical view instead",
+                            alias_to[&real]
+                        )
+                        .into());
+                    }
+                    if derived_names.iter().any(|d| d == &real) {
+                        return Err(format!(
+                            "alias target '{real}' is a derived (virtual) view — aliases map onto a physical view only"
+                        )
+                        .into());
+                    }
+                    if let Some(existing) = alias_to.iter().find(|(_, r)| **r == real) {
+                        if existing.0 != &name {
+                            return Err(format!(
+                                "real view '{real}' is already governed by alias '{}' — one public name per real view; to rotate it gaplessly use `grove view alias --name {name} --real {real} --retire {}`",
+                                existing.0, existing.0
+                            )
+                            .into());
+                        }
+                    }
+                    if dir.join(format!("{name}.layout")).is_file() {
+                        println!(
+                            "view '{name}' already defined — replacing it with the alias (live mounts re-resolve at their next M_OPEN)"
+                        );
+                    }
+                    std::fs::create_dir_all(&dir)?;
+                    // Write the new alias BEFORE removing the retired one: the
+                    // real view is governed by at least one name at every
+                    // instant, so a leaked old name never opens a window where
+                    // the real name becomes mountable by itself.
+                    std::fs::write(dir.join(format!("{name}.layout")), format!("alias {real}\n"))?;
+                    if let Some(old) = &retire {
+                        let _ = std::fs::remove_file(dir.join(format!("{old}.layout")));
+                        println!(
+                            "rotated public name for real view '{real}': '{old}' -> '{name}' (gapless — '{real}' stayed governed throughout, '{old}' no longer resolves)"
+                        );
+                        println!(
+                            "note: ACL grants are keyed to '{real}', so they carried over untouched — legitimate users just remount under '{name}'"
+                        );
+                    } else {
+                        println!("defined pure alias '{name}' -> real view '{real}'");
+                    }
+                    println!(
+                        "note: '{real}' is no longer a mount entry point while this definition exists (mounts by its real name are refused, locally and via meta-server); alias mounts show the FULL tree and are WRITABLE"
+                    );
+                    if !vbase.join("meta").join(format!("{real}.db")).is_file() {
+                        eprintln!(
+                            "note: no local <db-path>/meta/{real}.db yet — fine under PG or lazy creation, otherwise run `grove --home ... init --view {real}` first"
+                        );
+                    }
+                }
+                ViewAction::Rm { name } => {
+                    if !grovefs::layout::valid_view_name(&name) {
+                        return Err(format!("invalid view name '{name}'").into());
+                    }
+                    let p = dir.join(format!("{name}.layout"));
+                    if !p.is_file() {
+                        return Err(
+                            format!("no view definition '{name}' under {}", dir.display()).into()
+                        );
+                    }
+                    std::fs::remove_file(&p)?;
+                    println!("removed view definition '{name}' (underlying data untouched)");
+                }
+            }
+        }
+        Cmd::Import {
+            db_path,
+            data_root,
+            view,
+            source,
+            prefix,
+            dry_run,
+        } => {
+            let md = std::fs::metadata(&source)
+                .map_err(|e| format!("import source {}: {e}", source.display()))?;
+            if !md.is_dir() {
+                return Err("import --source must be a directory".into());
+            }
+            let mbase = db_path.unwrap_or_else(|| base.clone());
+            // Import writes the authoritative tree directly — that is only
+            // sound for a PHYSICAL view. A derived name is served through its
+            // base's db; writing a separate `<view>.db` under the virtual name
+            // would create a shadow tree nothing ever reads.
+            if mbase
+                .join("meta")
+                .join("views")
+                .join(format!("{view}.layout"))
+                .is_file()
+            {
+                // Resolve the slot so BOTH governance shapes are covered: a
+                // derived name would write a shadow `<view>.db` nothing reads,
+                // and an alias name is not a storage identity at all — the
+                // server resolves it to the real view, whose db import would
+                // bypass here lives under a different name.
+                let slot = mbase.join("meta").join("views").join(format!("{view}.layout"));
+                let target = grovefs::layout::LayoutRules::parse_def_file(&slot)
+                    .map(|d| match d {
+                        grovefs::layout::ViewDef::Alias(real) => format!(
+                            "'{view}' is a pure alias of real view '{real}' — import into '{real}' directly (an alias is not a storage identity)"
+                        ),
+                        grovefs::layout::ViewDef::Derived(..) => format!(
+                            "import target '{view}' is a derived (virtual) view — import into its physical base view instead (derived views mount read-only)"
+                        ),
+                    })
+                    .unwrap_or_else(|_| {
+                        format!(
+                            "import target '{view}' has a view definition — import into its physical base view instead"
+                        )
+                    });
+                return Err(target.into());
+            }
+            let droot = data_root.unwrap_or_else(|| mbase.clone());
+            let prefix = prefix.unwrap_or_else(|| {
+                source
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "imported".to_string())
+            });
+            let prefix = format!("/{}", prefix.trim_matches('/'));
+            if dry_run {
+                // Literally touch nothing: not even the view DB is opened.
+                let mut st = ImportStats::default();
+                count_walk(&source, &mut st)?;
+                println!(
+                    "dry run: view '{view}' under {} would mirror {} dir(s) and {} file(s) \
+                     (symlinks/special files and names already in the view are skipped \
+                     on the real run)",
+                    prefix, st.dirs, st.files
+                );
+                return Ok(());
+            }
+            let mp = meta_path(&mbase, &view);
+            if let Some(dir) = mp.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let meta = MetaEngine::open(&mp)?;
+            let backend = backend::open_local(&droot)?;
+            let mut dirs: std::collections::HashMap<String, i64> =
+                std::collections::HashMap::new();
+            dirs.insert("/".to_string(), meta::ROOT_INO);
+            ensure_dir_soft(&meta, &prefix, &mut dirs)?;
+            let mut st = ImportStats::default();
+            import_walk(&meta, backend.as_ref(), &source, &prefix, &mut dirs, &mut st)?;
+            println!(
+                "imported into view '{view}' under {}: {} dir(s), {} object(s) \
+                 ({} hardlinked zero-copy, {} copied), {} skipped, {} failed",
+                prefix,
+                st.dirs,
+                st.linked + st.copied,
+                st.linked,
+                st.copied,
+                st.skipped,
+                st.failed
+            );
+            if st.failed > 0 {
+                return Err(format!("{} entry(ies) failed to import", st.failed).into());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Tallies for `grove import`.
+#[derive(Default)]
+struct ImportStats {
+    dirs: usize,
+    files: usize,
+    linked: usize,
+    copied: usize,
+    skipped: usize,
+    failed: usize,
+}
+
+/// ensure_dir variant that REUSES pre-existing nodes instead of failing —
+/// what makes a re-run of `grove import` an incremental no-op over the
+/// already-mirrored parts of the tree.
+fn ensure_dir_soft(
+    meta: &MetaEngine,
+    path: &str,
+    dirs: &mut std::collections::HashMap<String, i64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut cur_ino = meta::ROOT_INO;
+    let mut cur_path = String::from("/");
+    for comp in path.trim_matches('/').split('/').filter(|c| !c.is_empty()) {
+        let next_path = if cur_path == "/" {
+            format!("/{comp}")
+        } else {
+            format!("{cur_path}/{comp}")
+        };
+        if let Some(&ino) = dirs.get(&next_path) {
+            cur_ino = ino;
+            cur_path = next_path;
+            continue;
+        }
+        let ino = match meta.lookup(cur_ino, comp) {
+            Some(node) => node.id,
+            None => meta.create_node(cur_ino, comp, true, None, 0o0755,
+                unsafe { libc::getuid() }, unsafe { libc::getgid() })?,
+        };
+        dirs.insert(next_path.clone(), ino);
+        cur_ino = ino;
+        cur_path = next_path;
+    }
+    Ok(())
+}
+
+/// Pure source-side tally for `import --dry_run`: counts what WOULD be
+/// mirrored, without opening the store at all — "touch nothing", literally.
+fn count_walk(src: &Path, st: &mut ImportStats) -> Result<(), Box<dyn std::error::Error>> {
+    for e in std::fs::read_dir(src)? {
+        let e = e?;
+        let ty = e.file_type()?;
+        if ty.is_dir() {
+            st.dirs += 1;
+            count_walk(&e.path(), st)?;
+        } else if ty.is_file() {
+            st.files += 1;
+        } else {
+            st.skipped += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Recursively mirror the existing tree at `src` into view path `in_view`
+/// (the data half of `Cmd::Import`). Dirs become nodes; regular files become
+/// objects via `StorageBackend::import_at` (hard link first, copy fallback),
+/// keeping their timestamps/mode/owner. Names that already exist are skipped;
+/// symlinks/special files are skipped too (and never followed, which also
+/// rules out symlink loops). Per-entry failures are counted and reported, not
+/// fatal — one unreadable file must not abort a bulk import.
+fn import_walk(
+    meta: &MetaEngine,
+    backend: &dyn backend::StorageBackend,
+    src: &Path,
+    in_view: &str,
+    dirs: &mut std::collections::HashMap<String, i64>,
+    st: &mut ImportStats,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::MetadataExt;
+    let mut entries: Vec<_> = std::fs::read_dir(src)?
+        .filter_map(|e| match e {
+            Ok(e) => Some(e),
+            Err(err) => {
+                eprintln!("import: cannot read an entry under {}: {err}", src.display());
+                st.failed += 1;
+                None
+            }
+        })
+        .collect();
+    entries.sort_by_key(|e| e.file_name()); // stable order across re-runs
+    for e in entries {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.is_empty() || name == "." || name == ".." {
+            continue;
+        }
+        let child = if in_view == "/" {
+            format!("/{name}")
+        } else {
+            format!("{in_view}/{name}")
+        };
+        let ty = e.file_type()?;
+        if ty.is_dir() {
+            st.dirs += 1;
+            ensure_dir_soft(meta, &child, dirs)?;
+            import_walk(meta, backend, &e.path(), &child, dirs, st)?;
+        } else if ty.is_file() {
+            let parent_ino = *dirs
+                .get(in_view)
+                .ok_or_else(|| format!("import: missing dir node for {in_view}"))?;
+            if meta.lookup(parent_ino, &name).is_some() {
+                st.skipped += 1; // incremental re-run: keep whatever is there
+                continue;
+            }
+            let fm = match std::fs::metadata(&e.path()) {
+                Ok(fm) => fm,
+                Err(err) => {
+                    eprintln!("import: {}: {err}", e.path().display());
+                    st.failed += 1;
+                    continue;
+                }
+            };
+            let key = backend.new_key(&uuid::Uuid::new_v4().to_string());
+            let imported = match backend.import_at(&key, &e.path()) {
+                Ok(v) => v,
+                Err(err) => {
+                    eprintln!("import: {}: {err}", e.path().display());
+                    st.failed += 1;
+                    continue;
+                }
+            };
+            match meta.create_node(
+                parent_ino,
+                &name,
+                false,
+                Some(&key),
+                (fm.mode() & 0o7777) as u32,
+                fm.uid(),
+                fm.gid(),
+            ) {
+                Ok(ino) => {
+                    // Keep the file's own clock, not "import happened now".
+                    meta.set_times(ino, Some(fm.atime() as i64), Some(fm.mtime() as i64));
+                    match imported {
+                        backend::Imported::Hardlinked => st.linked += 1,
+                        backend::Imported::Copied => st.copied += 1,
+                    }
+                }
+                Err(meta::MetaError::Exists) => {
+                    // Lost a race against a concurrent writer: drop the object
+                    // we just materialized so nothing dangles, count as skipped.
+                    let _ = backend.remove(&key);
+                    st.skipped += 1;
+                }
+                Err(err) => {
+                    let _ = backend.remove(&key);
+                    eprintln!("import: {child}: {err}");
+                    st.failed += 1;
+                }
+            }
+        } else {
+            // symlink / fifo / socket / device: not representable as a plain
+            // object today — counted, never followed.
+            st.skipped += 1;
         }
     }
     Ok(())

@@ -420,29 +420,33 @@ impl MetaEngine {
         let t = now();
         let mut conn = self.conn.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let src_id: i64 = tx
+        let (src_id, src_ino): (i64, Option<i64>) = tx
             .query_row(
-                "SELECT id FROM node WHERE parent_id=?1 AND name=?2",
+                "SELECT id,ino FROM node WHERE parent_id=?1 AND name=?2",
                 params![parent, name],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .map_err(|_| MetaError::NotFound)?;
         // Refuse to move a directory into its own subtree (would corrupt the tree).
         if self.is_descendant_locked(&tx, new_parent, src_id) {
             return Err(MetaError::BadParentCycle);
         }
-        let tgt: Option<(i64, i64, Option<String>)> = tx
+        let tgt: Option<(i64, i64, Option<String>, Option<i64>)> = tx
             .query_row(
-                "SELECT id,is_dir,data_ref FROM node WHERE parent_id=?1 AND name=?2",
+                "SELECT id,is_dir,data_ref,ino FROM node WHERE parent_id=?1 AND name=?2",
                 params![new_parent, new_name],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<String>>(2)?)),
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Option<i64>>(3)?)),
             )
             .ok();
         // rename(a, a): the target row IS the source row — a successful no-op.
         // Without this guard the DELETE below would remove the source and the
         // later UPDATE would match nothing, silently destroying the entry.
-        if let Some((tid, _, _)) = &tgt {
-            if *tid == src_id {
+        // The same-inode case covers two *different* hard link names of one
+        // file: POSIX (man 2 rename) also mandates a silent no-op there, but
+        // the row-id guard alone would miss it and delete the target name,
+        // shrinking nlink (a link vanishes). Compare ino, not just row id.
+        if let Some((tid, _, _, tino)) = &tgt {
+            if *tid == src_id || (*tino).is_some() && *tino == src_ino {
                 tx.commit()?;
                 return Ok(None);
             }
@@ -455,7 +459,7 @@ impl MetaEngine {
         // Blob freed by overwriting a target that held the last name to its data;
         // the caller GCs it in the storage backend (mirrors unlink's refcount rule).
         let mut gc: Option<String> = None;
-        if let Some((tid, is_dir, tgt_ref)) = tgt {
+        if let Some((tid, is_dir, tgt_ref, _)) = tgt {
             let src_is_dir: i64 = tx
                 .query_row("SELECT is_dir FROM node WHERE id=?1", params![src_id], |r| r.get(0))
                 .unwrap_or(0);

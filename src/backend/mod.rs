@@ -15,7 +15,18 @@
 pub mod local;
 pub mod sharded;
 
-use std::io;
+use std::io::{self, Read};
+use std::path::Path;
+
+/// How [`StorageBackend::import_at`] materialized an external file as an object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Imported {
+    /// The object shares the source file's inode (same filesystem): zero
+    /// extra bytes, and edits through either path are visible in the other.
+    Hardlinked,
+    /// The bytes were streamed into a fresh, independent object.
+    Copied,
+}
 
 /// Filesystem-level capacity stats surfaced through FUSE `statfs` (i.e. `df`).
 #[derive(Debug, Clone, Copy)]
@@ -67,6 +78,27 @@ pub trait StorageBackend: Send + Sync {
 
     /// Delete the object. Called by GC when the last reference goes away.
     fn remove(&self, key: &str) -> io::Result<()>;
+
+    /// Register an EXISTING local file as the object under `key` — the data
+    /// plane's half of `grove import`. Implementations should avoid copying
+    /// bytes when storage can be shared with the source (a hard link on the
+    /// same filesystem); the default streams the file into a fresh object.
+    /// The metadata side (`node.data_ref = key`) is the caller's job.
+    fn import_at(&self, key: &str, src: &Path) -> io::Result<Imported> {
+        let mut file = std::fs::File::open(src)?;
+        self.create(key)?;
+        let mut buf = vec![0u8; 1 << 20];
+        let mut off = 0u64;
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            self.write(key, off, &buf[..n])?;
+            off += n as u64;
+        }
+        Ok(Imported::Copied)
+    }
 
     /// Capacity of the underlying store, surfaced by `df`/`statvfs`.
     fn statvfs(&self) -> io::Result<FsStat>;
