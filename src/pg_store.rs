@@ -110,8 +110,19 @@ pub struct PgEngine {
     /// server-side close / network blip; without this the view becomes
     /// permanently unusable until the meta-server process restarts.
     conn_uri: String,
+    /// The single authoritative *writer* connection. Every mutation runs under
+    /// this mutex, exactly mirroring the SQLite engine's write serialization.
     client: parking_lot::Mutex<Client>,
+    /// Pooled read connections so concurrent metadata reads (lookup/getattr/
+    /// readdir) fan out instead of queueing behind the writer. A fresh
+    /// PostgreSQL backend started by `Client::connect` sees committed writes
+    /// from `client` in its own read transaction, so read-your-writes holds.
+    read_pool: parking_lot::Mutex<Vec<Client>>,
 }
+
+/// Number of pooled read connections opened per PG view engine, matching the
+/// SQLite engine's [`crate::meta::READ_POOL_SIZE`].
+const PG_READ_POOL_SIZE: usize = 4;
 
 impl PgEngine {
     /// Connect to a PostgreSQL server (from a `postgres://user:pw@host/db`
@@ -129,11 +140,21 @@ impl PgEngine {
         })?;
         let client = Client::connect(conn_uri, NoTls)
             .map_err(|e| std::io::Error::other(format!("postgres connect: {e}")))?;
+        // Pre-fill the read pool so the first big-directory scan doesn't pay
+        // connect latency per page. A failed extra connection just shrinks the
+        // pool (reads fall back to fresh-connect or the writer), never open().
+        let mut read_pool = Vec::new();
+        for _ in 0..PG_READ_POOL_SIZE {
+            if let Ok(rc) = Client::connect(conn_uri, NoTls) {
+                read_pool.push(rc);
+            }
+        }
         let this = Self {
             view: view.to_string(),
             schema,
             conn_uri: conn_uri.to_string(),
             client: parking_lot::Mutex::new(client),
+            read_pool: parking_lot::Mutex::new(read_pool),
         };
         this.ensure_schema()?;
         Ok(this)
@@ -196,6 +217,57 @@ impl PgEngine {
             }
         }
         g
+    }
+
+    /// Borrow a pooled read connection if one is free (skipping any closed ones
+    /// left by a server restart), else open a fresh one. Returns `None` only
+    /// when connecting also fails — the caller then falls back to the writer
+    /// connection, whose reconnect path surfaces the outage as a mapped db error.
+    fn try_read_conn(&self) -> Option<Client> {
+        let pooled = {
+            let mut p = self.read_pool.lock();
+            loop {
+                match p.pop() {
+                    Some(c) if c.is_closed() => continue, // discard stale, try next
+                    Some(c) => break Some(c),
+                    None => break None,
+                }
+            }
+        };
+        match pooled {
+            Some(c) => Some(c),
+            None => Client::connect(&self.conn_uri, NoTls).ok(),
+        }
+    }
+
+    /// Return a used read connection to the pool (bounded); drop it if the
+    /// server closed it so a stale socket never gets handed out again.
+    fn requeue_read(&self, c: Client) {
+        if c.is_closed() {
+            return;
+        }
+        let mut p = self.read_pool.lock();
+        if p.len() < PG_READ_POOL_SIZE {
+            p.push(c);
+        }
+    }
+
+    /// Run one SELECT-only op on a read-pool connection, fanning concurrent
+    /// reads out across the pool. Falls back to the serialized writer only when
+    /// no read connection can be obtained (server down), so behaviour degrades
+    /// to the pre-pool path rather than failing reads that would otherwise work.
+    fn with_read<T>(&self, f: impl FnOnce(&mut Client) -> T) -> T {
+        match self.try_read_conn() {
+            Some(mut c) => {
+                let r = f(&mut c);
+                self.requeue_read(c);
+                r
+            }
+            None => {
+                let mut g = self.conn();
+                f(&mut g)
+            }
+        }
     }
 
     fn ensure_schema(&self) -> std::io::Result<()> {
@@ -323,39 +395,61 @@ impl PgEngine {
         }
     }
 
-    fn query_one(&self, sql: &str, params: &[&(dyn postgres::types::ToSql + Sync)]) -> Option<RawNode> {
-        let mut c = self.conn();
-        c.query(sql, params).ok().and_then(|rows| {
-            rows.into_iter().next().map(|r| parse_node(&r))
-        })
-    }
-
     pub fn lookup(&self, parent: i64, name: &str) -> Option<NodeInfo> {
         let node = self.t("node");
         let sql = format!("SELECT {COLS} FROM {node} WHERE parent_id=$1 AND name=$2");
-        let raw = self.query_one(&sql, &[&parent, &name])?;
-        let mut c = self.conn();
-        Some(self.finalize(&mut c, raw))
+        self.with_read(|c| {
+            let raw = c
+                .query(&sql, &[&parent, &name])
+                .ok()
+                .and_then(|rows| rows.into_iter().next())
+                .map(|r| parse_node(&r))?;
+            Some(self.finalize(c, raw))
+        })
     }
 
     pub fn getattr(&self, ino: i64) -> Option<NodeInfo> {
         let node = self.t("node");
         let sql = format!("SELECT {COLS} FROM {node} WHERE ino=$1 LIMIT 1");
-        let raw = self.query_one(&sql, &[&ino])?;
-        let mut c = self.conn();
-        Some(self.finalize(&mut c, raw))
+        self.with_read(|c| {
+            let raw = c
+                .query(&sql, &[&ino])
+                .ok()
+                .and_then(|rows| rows.into_iter().next())
+                .map(|r| parse_node(&r))?;
+            Some(self.finalize(c, raw))
+        })
     }
 
     pub fn readdir(&self, parent: i64) -> Vec<NodeInfo> {
         let node = self.t("node");
         let sql = format!("SELECT {COLS} FROM {node} WHERE parent_id=$1 ORDER BY name");
-        let mut c = self.conn();
-        let rows = match c.query(&sql, &[&parent]) {
-            Ok(r) => r,
-            Err(_) => return Vec::new(),
-        };
-        let raws: Vec<RawNode> = rows.iter().map(parse_node).collect();
-        raws.into_iter().map(|r| self.finalize(&mut c, r)).collect()
+        self.with_read(|c| {
+            let rows = match c.query(&sql, &[&parent]) {
+                Ok(r) => r,
+                Err(_) => return Vec::new(),
+            };
+            let raws: Vec<RawNode> = rows.iter().map(parse_node).collect();
+            raws.into_iter().map(|r| self.finalize(c, r)).collect()
+        })
+    }
+
+    /// Page `offset..offset+limit` of the `ORDER BY name` listing, pushed into
+    /// SQL with `LIMIT/OFFSET`. Same O(buffer) win as the SQLite engine: one
+    /// small query and one `finalize` per entry per kernel READDIR buffer, not a
+    /// full re-scan + re-`COUNT` of the whole directory each time.
+    pub fn readdir_page(&self, parent: i64, offset: usize, limit: usize) -> Vec<NodeInfo> {
+        let node = self.t("node");
+        let sql =
+            format!("SELECT {COLS} FROM {node} WHERE parent_id=$1 ORDER BY name LIMIT $2 OFFSET $3");
+        self.with_read(|c| {
+            let rows = match c.query(&sql, &[&parent, &(limit as i64), &(offset as i64)]) {
+                Ok(r) => r,
+                Err(_) => return Vec::new(),
+            };
+            let raws: Vec<RawNode> = rows.iter().map(parse_node).collect();
+            raws.into_iter().map(|r| self.finalize(c, r)).collect()
+        })
     }
 
     // ---- write paths ------------------------------------------------------
@@ -948,10 +1042,11 @@ fn map_db_err(e: &postgres::Error) -> MetaError {
     }
 }
 
-// The MetaStore enum in meta.rs implements MetaProvider by delegating to either
-// MetaEngine or PgEngine; provide the same trait surface here too so callers
-// holding an `Arc<PgEngine>` directly (unit tests) can also use it as a
-// MetaProvider.
+// The MetaStore enum in meta.rs drives PgEngine through its *inherent* methods
+// (`readdir_page`/`readdir`/...), not this trait impl. This impl exists so a
+// caller holding an `Arc<PgEngine>` directly (unit tests) can also use it as a
+// MetaProvider, and so `supports_paged_readdir` reports PG's store-level paging
+// capability to anything that asks through the trait.
 impl MetaProvider for PgEngine {
     fn lookup(&self, parent: i64, name: &str) -> Option<NodeInfo> {
         PgEngine::lookup(self, parent, name)
@@ -961,6 +1056,12 @@ impl MetaProvider for PgEngine {
     }
     fn readdir(&self, parent: i64) -> Vec<NodeInfo> {
         PgEngine::readdir(self, parent)
+    }
+    fn readdir_page(&self, parent: i64, offset: usize, limit: usize) -> Vec<NodeInfo> {
+        PgEngine::readdir_page(self, parent, offset, limit)
+    }
+    fn supports_paged_readdir(&self) -> bool {
+        true
     }
     #[allow(clippy::too_many_arguments)]
     fn create_node(

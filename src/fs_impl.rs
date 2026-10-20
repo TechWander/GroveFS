@@ -17,8 +17,8 @@ use crate::meta::{LockType, MetaError, MetaProvider, NodeInfo, NodeKind};
 use fuser::{
     BsdFileFlags, Errno, FileAttr, FileHandle, FileType, FopenFlags, Generation, InitFlags,
     INodeNo, KernelConfig, LockOwner, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen, ReplyStatfs, ReplyWrite, Request,
-    TimeOrNow, WriteFlags,
+    ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen, ReplyStatfs,
+    ReplyWrite, Request, TimeOrNow, WriteFlags,
 };
 use parking_lot::RwLock;
 use std::ffi::OsStr;
@@ -54,6 +54,13 @@ pub struct GroveFS {
     /// one client's write must be visible to another immediately rather than
     /// after the default cache TTL. Costs the caching benefit; opt-in via `--strict`.
     strict: bool,
+    /// Negotiate FUSE_READDIRPLUS (kernel >= 4.6): READDIR replies then carry
+    /// per-entry dentry+attr, so `ls -l` on a big dir costs one metadata
+    /// round-trip instead of N LOOKUP+GETATTR. On by default; `--no-readdirplus`
+    /// turns it off for A/B benchmarks and compatibility debugging. `init` only
+    /// ever offers it if the provider also pages in its own store — see
+    /// `MetaProvider::supports_paged_readdir`.
+    readdirplus: bool,
     /// Per-mount session id stamped on every lock this daemon grants, so a
     /// background heartbeat can renew exactly its own leases (`renew_locks`)
     /// and the authority can reap them on disconnect without touching peers.
@@ -92,6 +99,7 @@ impl GroveFS {
         backend: Arc<dyn StorageBackend>,
         readonly: bool,
         strict: bool,
+        readdirplus: bool,
     ) -> Self {
         Self {
             meta,
@@ -100,6 +108,7 @@ impl GroveFS {
             last_write_touch: RwLock::new(std::collections::HashMap::new()),
             readonly,
             strict,
+            readdirplus,
             lock_sid: gen_sid(),
             lock_renew_started: std::sync::atomic::AtomicBool::new(false),
         }
@@ -158,6 +167,23 @@ impl GroveFS {
             FopenFlags::FOPEN_DIRECT_IO
         } else {
             FopenFlags::empty()
+        }
+    }
+
+    /// Page-size policy for the directory callbacks, as (first page, cap).
+    /// An engine that pages inside its own store is asked for geometrically
+    /// growing SQL pages — a buffer that fills after ~20 entries costs 32 rows,
+    /// not the whole directory. This covers the SQLite and PostgreSQL engines,
+    /// and a remote client whose `meta-server` advertised the `M_READDIRP` cap.
+    /// Providers that cannot page in their store (a derived/layout lens, or a
+    /// remote client against a server too old to page) would re-materialise the
+    /// entire listing for every page, so they are asked for one full listing per
+    /// kernel buffer: their behaviour before paging existed, no extra round trips.
+    fn fetch_policy(&self) -> (usize, usize) {
+        if self.meta.supports_paged_readdir() {
+            (READDIR_FETCH_MIN, READDIR_FETCH_MAX)
+        } else {
+            (usize::MAX, usize::MAX)
         }
     }
 
@@ -268,6 +294,20 @@ impl fuser::Filesystem for GroveFS {
             | InitFlags::FUSE_FLOCK_LOCKS;
         // Ignore which exact bits the kernel rejected; use whatever it supports.
         let _ = config.add_capabilities(caps);
+        // READDIRPLUS (kernel >= 4.6): reply a directory listing with per-entry
+        // dentry+attr already filled in, so `ls -l` on a big dir costs one metadata
+        // round-trip instead of N LOOKUP+GETATTR. Negotiated as its own
+        // all-or-nothing group (add_capabilities is per-group): on a kernel without
+        // it we simply keep plain READDIR — the other caps above stay applied.
+        // Only offered when the provider can page in its own store: PLUS records are
+        // ~4x fatter, so they split the same listing into ~4x more kernel buffers,
+        // and a provider that re-fetches the whole listing per buffer would pay that
+        // multiplier in full round trips instead of saving the per-entry LOOKUPs.
+        if self.readdirplus && self.meta.supports_paged_readdir() {
+            let _ = config.add_capabilities(
+                InitFlags::FUSE_DO_READDIRPLUS | InitFlags::FUSE_READDIRPLUS_AUTO,
+            );
+        }
         // Advertise a 1 MiB max write; matches the kernel/FUSE page limit.
         let _ = config.set_max_write(1 << 20);
         let _ = config.set_max_readahead(1 << 20);
@@ -811,33 +851,140 @@ impl fuser::Filesystem for GroveFS {
         }
     }
 
+    /// READDIR_PLUS: same deterministic listing as `readdir`, but each entry
+    /// carries its full attributes (taken straight from the `NodeInfo` the
+    /// engine already returned — zero extra metadata queries), so the kernel
+    /// inserts dentry+attr in one shot and `ls -l` skips the per-name
+    /// LOOKUP/GETATTR storm.
+    fn readdirplus(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        mut reply: ReplyDirectoryPlus,
+    ) {
+        let node = match self.meta.getattr(ino.0 as i64) {
+            Some(n) if n.is_dir() => n,
+            Some(_) => {
+                reply.error(Errno::ENOTDIR);
+                return;
+            }
+            None => {
+                reply.error(Errno::ENOENT);
+                return;
+            }
+        };
+        // "." / ".." first, then children in ORDER BY name (same resume semantics
+        // as `readdir`; the two share the kernel-side offset indexing).
+        let ttl = self.ttl();
+        let self_attr = self.build_attr(&node);
+        let skip = offset as usize;
+        if skip == 0 && reply.add(ino, 1, ".", &ttl, &self_attr, Generation(0)) {
+            reply.ok();
+            return;
+        }
+        let parent_ino = if ino == INodeNo::ROOT { ino.0 } else { node.parent_id as u64 };
+        let parent_attr = match self.meta.getattr(parent_ino as i64) {
+            Some(p) => self.build_attr(&p),
+            None => self_attr,
+        };
+        if skip <= 1
+            && reply.add(
+                INodeNo(parent_ino),
+                2,
+                "..",
+                &ttl,
+                &parent_attr,
+                Generation(0),
+            )
+        {
+            reply.ok();
+            return;
+        }
+        // Children are streamed a SQL page at a time until the reply buffer
+        // fills or the listing ends, so one kernel READDIRPLUS request costs
+        // O(what it can hold) instead of O(whole directory). `child_i` indexes
+        // the ORDER BY name sequence, so the reported offset (`child_i + 2`, the
+        // two slots taken by "." and "..") is exactly the offset the previous
+        // full-scan implementation reported for the same entry.
+        let mut child_i = skip.saturating_sub(2);
+        let (mut want, want_max) = self.fetch_policy();
+        loop {
+            let page = self.meta.readdir_page(ino.0 as i64, child_i, want);
+            let got = page.len();
+            for c in page {
+                if let Some(k) = &c.data_ref {
+                    self.cache_key(c.id as u64, k);
+                }
+                let attr = self.build_attr(&c);
+                let idx = (child_i + 2) as u64;
+                if reply.add(
+                    INodeNo(c.id as u64),
+                    idx + 1,
+                    OsStr::new(&c.name),
+                    &ttl,
+                    &attr,
+                    Generation(0),
+                ) {
+                    reply.ok();
+                    return; // buffer full; kernel resumes at offset = idx + 1
+                }
+                child_i += 1;
+            }
+            if got < want {
+                break; // short page: the directory is exhausted
+            }
+            want = want.saturating_mul(2).min(want_max);
+        }
+        reply.ok();
+    }
+
     fn readdir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
         let node = match self.meta.getattr(ino.0 as i64) {
             Some(n) if n.is_dir() => n,
             Some(_) => { reply.error(Errno::ENOTDIR); return; }
             None => { reply.error(Errno::ENOENT); return; }
         };
-        // Deterministic listing: ".", ".." then children (SQL already ORDER BY name),
-        // so index-based resume stays stable across calls.
-        let mut entries: Vec<(INodeNo, FileType, String)> = Vec::new();
-        entries.push((ino, FileType::Directory, ".".to_string()));
+        // Deterministic listing: ".", ".." then children (SQL already ORDER BY
+        // name), so index-based resume stays stable across calls. Children are
+        // streamed through `readdir_page` in chunks (see `readdirplus`), and the
+        // offsets match the READDIRPLUS ones, which the kernel may interleave
+        // with these on the same directory handle.
+        let skip = offset as usize;
         let parent_ino = if ino == INodeNo::ROOT { ino.0 } else { node.parent_id as u64 };
-        entries.push((INodeNo(parent_ino), FileType::Directory, "..".to_string()));
-        for c in self.meta.readdir(ino.0 as i64) {
-            let kind = match c.kind {
-                NodeKind::Dir => FileType::Directory,
-                NodeKind::Symlink => FileType::Symlink,
-                NodeKind::Regular => FileType::RegularFile,
-            };
-            entries.push((INodeNo(c.id as u64), kind, c.name));
-        }
-        // `offset` is the index to resume from; each add() reports the index of the
-        // NEXT entry so the kernel can continue after the reply buffer fills. When
-        // there is nothing left (i >= len) we add nothing and ok() signals EOF.
-        for (i, (eino, kind, name)) in entries.iter().enumerate().skip(offset as usize) {
-            if reply.add(*eino, (i + 1) as u64, *kind, OsStr::new(name)) {
-                break; // buffer full; kernel re-requests at offset = i + 1
+        if skip <= 1 {
+            if skip == 0 && reply.add(ino, 1, FileType::Directory, OsStr::new(".")) {
+                reply.ok();
+                return;
             }
+            if reply.add(INodeNo(parent_ino), 2, FileType::Directory, OsStr::new("..")) {
+                reply.ok();
+                return;
+            }
+        }
+        let mut child_i = skip.saturating_sub(2);
+        let (mut want, want_max) = self.fetch_policy();
+        loop {
+            let page = self.meta.readdir_page(ino.0 as i64, child_i, want);
+            let got = page.len();
+            for c in page {
+                let kind = match c.kind {
+                    NodeKind::Dir => FileType::Directory,
+                    NodeKind::Symlink => FileType::Symlink,
+                    NodeKind::Regular => FileType::RegularFile,
+                };
+                let idx = (child_i + 2) as u64;
+                if reply.add(INodeNo(c.id as u64), idx + 1, kind, OsStr::new(&c.name)) {
+                    reply.ok();
+                    return; // buffer full; kernel re-requests at offset = idx + 1
+                }
+                child_i += 1;
+            }
+            if got < want {
+                break;
+            }
+            want = want.saturating_mul(2).min(want_max);
         }
         reply.ok();
     }
@@ -872,6 +1019,16 @@ impl fuser::Filesystem for GroveFS {
 
 /// Debounce window for the write-path mtime touch (see `GroveFS::write`).
 const WRITE_TOUCH_DEBOUNCE: Duration = Duration::from_millis(200);
+
+/// First (smallest) page of children fetched per metadata query while
+/// streaming a READDIR/READDIRPLUS reply, and the cap it grows to. fuser does
+/// not expose how much room is left in the reply buffer, so the fetch size
+/// doubles on each refill: the kernel asks for 4 KiB READDIRPLUS buffers (~23
+/// fat records), where a fixed large chunk would waste most of every query,
+/// while a geometric run costs at most about one extra chunk per buffer — and
+/// still adapts when the kernel does ask for a big one.
+const READDIR_FETCH_MIN: usize = 32;
+const READDIR_FETCH_MAX: usize = 1024;
 
 /// True if `ino`'s write-path mtime should be touched now: either never
 /// touched since the last prune, or the debounce window has elapsed. Updates
