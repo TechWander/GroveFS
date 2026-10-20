@@ -168,6 +168,40 @@ pub struct MetaEngine {
     // waits for the lock instead of failing with SQLITE_BUSY (which would surface
     // to FUSE as EIO).
     conn: parking_lot::Mutex<Connection>,
+    /// Pooled read-only connections (opened read-write to sidestep WAL `-shm`
+    /// restrictions on strictly read-only handles, but only ever used for
+    /// SELECT) so concurrent metadata reads fan out instead of serializing
+    /// behind the single writer's `conn` mutex.
+    read_pool: parking_lot::Mutex<Vec<Connection>>,
+    /// DB path, kept so the pool can open extra read connections when drained.
+    path: std::path::PathBuf,
+}
+
+/// Number of pooled read connections opened per view engine for concurrent
+/// metadata reads.
+pub const READ_POOL_SIZE: usize = 4;
+
+/// Borrows one read-pool connection; returns it on drop (bounded). Derefs to
+/// `Connection` so callers use it exactly like the writer guard.
+struct ReadGuard<'a> {
+    conn: Option<Connection>,
+    eng: &'a MetaEngine,
+}
+impl std::ops::Deref for ReadGuard<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.conn.as_ref().expect("read conn alive until drop")
+    }
+}
+impl Drop for ReadGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(c) = self.conn.take() {
+            let mut pool = self.eng.read_pool.lock();
+            if pool.len() < READ_POOL_SIZE {
+                pool.push(c);
+            }
+        }
+    }
 }
 
 /// The columns returned by every node SELECT, in order.
@@ -196,6 +230,8 @@ impl MetaEngine {
             let _ = conn.execute_batch("PRAGMA busy_timeout=5000;");
             return Ok(Self {
                 conn: parking_lot::Mutex::new(conn),
+                read_pool: parking_lot::Mutex::new(Vec::new()),
+                path: path.to_path_buf(),
             });
         }
         conn.execute_batch(
@@ -261,9 +297,29 @@ impl MetaEngine {
                 params![ROOT_INO, 0o0755u32, unsafe { libc::getuid() }, unsafe { libc::getgid() }, t],
             )?;
         }
+        let mut pool = Vec::new();
+        for _ in 0..READ_POOL_SIZE {
+            if let Ok(rc) = Connection::open(path) {
+                let _ = rc.execute_batch("PRAGMA busy_timeout=5000;");
+                pool.push(rc);
+            }
+        }
         Ok(Self {
             conn: parking_lot::Mutex::new(conn),
+            read_pool: parking_lot::Mutex::new(pool),
+            path: path.to_path_buf(),
         })
+    }
+
+    /// Borrow a pooled read connection for one SELECT-only op; falls back to a
+    /// lazily-opened connection when the pool is drained (returned on drop).
+    fn read_conn(&self) -> ReadGuard<'_> {
+        let c = self.read_pool.lock().pop().unwrap_or_else(|| {
+            let rc = Connection::open(&self.path).expect("open read connection");
+            let _ = rc.execute_batch("PRAGMA busy_timeout=5000;");
+            rc
+        });
+        ReadGuard { conn: Some(c), eng: self }
     }
 
     /// Resolve (parent, name) -> node. This is the FUSE `lookup` hot path.
@@ -272,7 +328,7 @@ impl MetaEngine {
     pub fn lookup(&self, parent: i64, name: &str) -> Option<NodeInfo> {
         let sql = format!("SELECT {COLS} FROM node WHERE parent_id=?1 AND name=?2");
         let raw = {
-            let conn = self.conn.lock();
+            let conn = self.read_conn();
             let mut stmt = conn.prepare(&sql).ok()?;
             stmt.query_row(params![parent, name], row_to_raw).ok()
         };
@@ -284,7 +340,7 @@ impl MetaEngine {
     pub fn getattr(&self, ino: i64) -> Option<NodeInfo> {
         let sql = format!("SELECT {COLS} FROM node WHERE ino=?1 LIMIT 1");
         let raw = {
-            let conn = self.conn.lock();
+            let conn = self.read_conn();
             let mut stmt = conn.prepare(&sql).ok()?;
             stmt.query_row(params![ino], row_to_raw).ok()
         };
@@ -295,12 +351,40 @@ impl MetaEngine {
     pub fn readdir(&self, parent: i64) -> Vec<NodeInfo> {
         let sql = format!("SELECT {COLS} FROM node WHERE parent_id=?1 ORDER BY name");
         let raws = {
-            let conn = self.conn.lock();
+            let conn = self.read_conn();
             let mut stmt = match conn.prepare(&sql) {
                 Ok(s) => s,
                 Err(_) => return Vec::new(),
             };
             let rows = match stmt.query_map(params![parent], row_to_raw) {
+                Ok(r) => r,
+                Err(_) => return Vec::new(),
+            };
+            rows.filter_map(|r| r.ok()).collect::<Vec<_>>()
+        };
+        raws.into_iter().map(|r| self.finalize(r)).collect()
+    }
+
+    /// One slice of the deterministic listing: children in the same
+    /// `ORDER BY name` sequence `readdir` uses, starting at `offset` and at most
+    /// `limit` rows. Paging is pushed into SQL so replying to one kernel
+    /// READDIR/READDIRPLUS buffer costs O(buffer) instead of re-scanning *and*
+    /// re-finalizing the whole directory (one `COUNT` query per entry) once per
+    /// buffer — the difference between a large directory feeling instant and
+    /// taking minutes.
+    pub fn readdir_page(&self, parent: i64, offset: usize, limit: usize) -> Vec<NodeInfo> {
+        let sql =
+            format!("SELECT {COLS} FROM node WHERE parent_id=?1 ORDER BY name LIMIT ?2 OFFSET ?3");
+        let raws = {
+            let conn = self.read_conn();
+            let mut stmt = match conn.prepare(&sql) {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            let rows = match stmt.query_map(
+                params![parent, limit as i64, offset as i64],
+                row_to_raw,
+            ) {
                 Ok(r) => r,
                 Err(_) => return Vec::new(),
             };
@@ -820,7 +904,7 @@ impl MetaEngine {
         } else {
             NodeKind::Regular
         };
-        let conn = self.conn.lock();
+        let conn = self.read_conn();
         let (nlink, size) = match kind {
             NodeKind::Dir => {
                 let subdirs: i64 = conn
@@ -877,6 +961,25 @@ pub trait MetaProvider: Send + Sync {
     fn lookup(&self, parent: i64, name: &str) -> Option<NodeInfo>;
     fn getattr(&self, ino: i64) -> Option<NodeInfo>;
     fn readdir(&self, parent: i64) -> Vec<NodeInfo>;
+    /// Page `offset..offset+limit` of the same deterministic listing `readdir`
+    /// returns. `GroveFS` streams directory replies through this so a big
+    /// directory costs one small query per kernel buffer. Engines that page
+    /// inside their store (SQLite, PostgreSQL, and a `RemoteMeta` client whose
+    /// server advertised `M_READDIRP`) override this; providers that cannot (a
+    /// derived/layout lens, or a remote client against a server too old to page)
+    /// keep working through the default below, just without the O(page) win.
+    fn readdir_page(&self, parent: i64, offset: usize, limit: usize) -> Vec<NodeInfo> {
+        self.readdir(parent).into_iter().skip(offset).take(limit).collect()
+    }
+    /// Whether [`Self::readdir_page`] is a real sub-query or just a slice of a
+    /// full listing. Only engines that can page *inside their store* answer
+    /// true. `GroveFS` uses this to keep the cheap behaviour for the others:
+    /// a provider with no store-level paging is asked for one whole listing per
+    /// kernel buffer (exactly what it did before paging existed), and it is not
+    /// offered READDIRPLUS, whose fatter records would multiply that full fetch.
+    fn supports_paged_readdir(&self) -> bool {
+        false
+    }
     #[allow(clippy::too_many_arguments)]
     fn create_node(
         &self,
@@ -947,6 +1050,12 @@ impl MetaProvider for MetaEngine {
     }
     fn readdir(&self, parent: i64) -> Vec<NodeInfo> {
         MetaEngine::readdir(self, parent)
+    }
+    fn readdir_page(&self, parent: i64, offset: usize, limit: usize) -> Vec<NodeInfo> {
+        MetaEngine::readdir_page(self, parent, offset, limit)
+    }
+    fn supports_paged_readdir(&self) -> bool {
+        true
     }
     #[allow(clippy::too_many_arguments)]
     fn create_node(
@@ -1073,6 +1182,22 @@ impl MetaProvider for MetaStore {
     }
     fn readdir(&self, parent: i64) -> Vec<NodeInfo> {
         match self { MetaStore::Sqlite(m) => m.readdir(parent), MetaStore::Pg(p) => p.readdir(parent) }
+    }
+    fn readdir_page(&self, parent: i64, offset: usize, limit: usize) -> Vec<NodeInfo> {
+        match self { MetaStore::Sqlite(m) => m.readdir_page(parent, offset, limit), MetaStore::Pg(p) => p.readdir_page(parent, offset, limit) }
+    }
+    fn supports_paged_readdir(&self) -> bool {
+        // Both concrete stores page inside their own store (SQLite via
+        // LIMIT/OFFSET on the read pool, PG via LIMIT/OFFSET on its read pool),
+        // so a meta-server backed by either can serve M_READDIRP and offer
+        // READDIRPLUS to its clients. A derived view served through a
+        // [`crate::layout::LayoutMeta`] lens does NOT reach here — the lens keeps
+        // the trait default (false) because its hidden/mapped shape cannot be
+        // expressed as a single SQL page.
+        match self {
+            MetaStore::Sqlite(m) => MetaProvider::supports_paged_readdir(m),
+            MetaStore::Pg(p) => MetaProvider::supports_paged_readdir(&**p),
+        }
     }
     #[allow(clippy::too_many_arguments)]
     fn create_node(&self, parent: i64, name: &str, is_dir: bool, data_ref: Option<&str>, mode: u32, uid: u32, gid: u32) -> Result<i64, MetaError> {
@@ -1296,5 +1421,113 @@ mod tests {
         assert_eq!(gc, None, "move to a free name frees nothing");
         assert!(e.lookup(ROOT_INO, "src").is_none());
         assert!(e.lookup(ROOT_INO, "fresh").is_some());
+    }
+
+    /// `readdir_page` must stitch back into exactly the same `ORDER BY name`
+    /// sequence as the full `readdir`, whatever chunk sizes are used: the FUSE
+    /// directory callbacks stream pages to the kernel and resume from a
+    /// caller-supplied index, so a boundary mismatch here would drop or
+    /// duplicate entries in `ls`.
+    #[test]
+    fn readdir_page_stitches_into_the_full_sorted_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = MetaEngine::open(&dir.path().join("view.db")).unwrap();
+        for i in 0..100 {
+            e.create_node(ROOT_INO, &format!("f{i:03}"), false, Some(&format!("k{i}")), 0o644, 1000, 1000)
+                .unwrap();
+        }
+        e.create_node(ROOT_INO, "sub", true, None, 0o755, 1000, 1000).unwrap();
+        let full: Vec<String> = e.readdir(ROOT_INO).into_iter().map(|n| n.name).collect();
+        assert_eq!(full.len(), 101, "100 files + 1 subdir");
+        for chunk in [1usize, 7, 32, 100, 1024] {
+            let mut paged: Vec<String> = Vec::new();
+            let mut off = 0usize;
+            loop {
+                let page = e.readdir_page(ROOT_INO, off, chunk);
+                if page.is_empty() {
+                    break;
+                }
+                paged.extend(page.into_iter().map(|n| n.name));
+                off += chunk;
+            }
+            assert_eq!(paged, full, "chunk size {chunk} must reassemble the listing");
+        }
+        // An offset past the end and a zero limit are empty pages, not panics.
+        assert!(e.readdir_page(ROOT_INO, full.len(), 10).is_empty());
+        assert!(e.readdir_page(ROOT_INO, 0, 0).is_empty());
+    }
+
+    /// Metadata reads are served from pooled side connections, so they must
+    /// still observe this engine's own committed writes immediately — `create`
+    /// followed by `ls` from another FUSE worker thread is exactly this path.
+    #[test]
+    fn reads_through_the_pool_observe_committed_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = MetaEngine::open(&dir.path().join("view.db")).unwrap();
+        let id = e.create_node(ROOT_INO, "fresh", false, Some("kfresh"), 0o644, 1000, 1000).unwrap();
+        assert_eq!(
+            e.lookup(ROOT_INO, "fresh").map(|n| n.id),
+            Some(id),
+            "lookup must see the insert"
+        );
+        assert_eq!(
+            e.readdir_page(ROOT_INO, 0, 8).into_iter().map(|n| n.name).collect::<Vec<_>>(),
+            vec!["fresh".to_string()],
+            "paged readdir must see the insert"
+        );
+        e.unlink(ROOT_INO, "fresh").unwrap();
+        assert!(e.lookup(ROOT_INO, "fresh").is_none(), "lookup must see the delete");
+        assert!(e.readdir_page(ROOT_INO, 0, 8).is_empty(), "paged readdir must see the delete");
+    }
+
+    /// `GroveFS` keys both the READDIRPLUS negotiation and its fetch chunking off
+    /// `supports_paged_readdir`, so that flag is a contract, not a hint: an
+    /// engine that pages *inside its own store* must advertise it, and one that
+    /// cannot must keep the safe default (one full listing per kernel buffer, no
+    /// READDIRPLUS) instead of silently multiplying full fetches. The SQLite
+    /// engine pages; the server-side `MetaStore` wrapper forwards that so its
+    /// `M_READDIRP` RPC handler answers a real page; a derived [`LayoutMeta`]
+    /// lens cannot express its hidden/mapped shape as one SQL page, so it stays
+    /// on the default.
+    #[test]
+    fn store_level_paging_is_advertised_only_by_providers_that_page_in_sql() {
+        let dir = tempfile::tempdir().unwrap();
+        let eng: std::sync::Arc<dyn MetaProvider> = std::sync::Arc::new(
+            MetaEngine::open(&dir.path().join("view.db")).unwrap(),
+        );
+        assert!(eng.supports_paged_readdir(), "SQLite pages with LIMIT/OFFSET");
+
+        // The server-side wrapper now forwards paging method-by-method, so the
+        // meta-server can serve M_READDIRP as a real sub-query — and, gated on
+        // this flag, offer READDIRPLUS to its clients.
+        let store: std::sync::Arc<dyn MetaProvider> = std::sync::Arc::new(MetaStore::Sqlite(
+            MetaEngine::open(&dir.path().join("other.db")).unwrap(),
+        ));
+        assert!(store.supports_paged_readdir(), "wrapper forwards the SQLite engine's paging");
+        // Forwarding is not just the flag: the pages must stitch back into the
+        // exact full listing `readdir` returns.
+        for _ in 0..5 {
+            store.create_node(ROOT_INO, "n", false, None, 0o644, 0, 0).ok();
+        }
+        let full: Vec<String> = store.readdir(ROOT_INO).into_iter().map(|n| n.name).collect();
+        let mut stitched = Vec::new();
+        let mut off = 0usize;
+        loop {
+            let page = store.readdir_page(ROOT_INO, off, 2);
+            if page.is_empty() {
+                break;
+            }
+            stitched.extend(page.into_iter().map(|n| n.name));
+            off += 2;
+        }
+        assert_eq!(stitched, full, "forwarded readdir_page stitches into readdir");
+
+        // A derived lens over the same engine keeps the trait default (false):
+        // its shaped view has no single SQL page equivalent, so it is not
+        // offered READDIRPLUS and answers each buffer with one whole listing.
+        let lens: std::sync::Arc<dyn MetaProvider> = std::sync::Arc::new(
+            crate::layout::LayoutMeta::new(eng.clone(), crate::layout::LayoutRules::default()),
+        );
+        assert!(!lens.supports_paged_readdir(), "a derived lens cannot page in SQL");
     }
 }

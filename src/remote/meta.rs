@@ -71,6 +71,11 @@ const M_RELEASE_LOCKS: u8 = 35;
 /// row tagged with its session id, so a live holder never expires while a dead
 /// one (which stops renewing) ages out inside one lease.
 const M_RENEW: u8 = 36;
+/// Paged variant of `M_READDIR`: `{parent, offset, limit}` -> one page of the
+/// `ORDER BY name` listing. Sent only when the `M_OPEN` ack advertised that the
+/// server pages in its own store; an unknown-op (old server) falls through to
+/// `E_DB`, which the client treats as "fall back to a full readdir". Read op.
+const M_READDIRP: u8 = 37;
 
 // --- pushed invalidation event kinds (carried in a response frame's status) --
 // EV_ENTRY: val = parent inode, data = length-prefixed name -> kernel
@@ -364,6 +369,14 @@ pub struct RemoteMeta {
     /// mount read-only. Refreshed on every (re)handshake so a failover re-reads
     /// the flag from the node actually serving us.
     readonly: AtomicU8,
+    /// Nonzero when the `M_OPEN` handshake ack reported that the server's store
+    /// can page a directory listing itself (SQLite or PostgreSQL backend). Only
+    /// then does [`RemoteMeta::readdir_page`] issue the small `M_READDIRP` RPC
+    /// and only then is READDIRPLUS offered; an empty/short ack body (an old
+    /// server) leaves this 0 and the client keeps the pre-paging behaviour: one
+    /// full `M_READDIR` per kernel buffer, no READDIRPLUS. Refreshed on every
+    /// (re)handshake so a failover re-reads the cap from the live node.
+    paged: AtomicU8,
 }
 
 impl RemoteMeta {
@@ -414,6 +427,7 @@ impl RemoteMeta {
             reconnect_backoff: Duration::from_millis(150),
             fence: Arc::new(AtomicU64::new(0)),
             readonly: AtomicU8::new(0),
+            paged: AtomicU8::new(0),
         };
         // Probe once (connect + handshake) so mount fails fast on a dead server.
         let (s, _) = this.connect_fresh()?;
@@ -473,6 +487,13 @@ impl RemoteMeta {
                                 // old server without the flag -> stays writable.
                                 self.readonly
                                     .store(data.first().copied().unwrap_or(0), Ordering::SeqCst);
+                                // Second ack byte (if present) = server can page a
+                                // directory listing (M_READDIRP). Absent on an old
+                                // server or one whose store cannot page -> the client
+                                // keeps fetching one full listing per buffer and is
+                                // not offered READDIRPLUS.
+                                self.paged
+                                    .store(data.get(1).copied().unwrap_or(0), Ordering::SeqCst);
                                 self.active.store(idx, Ordering::Relaxed);
                                 return Ok((s, false));
                             }
@@ -586,6 +607,31 @@ impl MetaProvider for RemoteMeta {
             Ok((0, _, data)) => nodes_from(&data).unwrap_or_default(),
             _ => Vec::new(),
         }
+    }
+
+    fn readdir_page(&self, parent: i64, offset: usize, limit: usize) -> Vec<NodeInfo> {
+        // Only page over the wire when the handshake said the server's store can
+        // page. Otherwise slice a single full listing (the pre-paging behaviour).
+        if self.paged.load(Ordering::SeqCst) == 0 {
+            return self.readdir(parent).into_iter().skip(offset).take(limit).collect();
+        }
+        let mut b = Vec::new();
+        put_i64(&mut b, parent);
+        proto::put_u64(&mut b, offset as u64);
+        proto::put_u64(&mut b, limit as u64);
+        match self.round_trip(M_READDIRP, &b) {
+            Ok((0, _, data)) => nodes_from(&data).unwrap_or_default(),
+            // A failed page RPC (we raced a reconnect to a node too old to know
+            // M_READDIRP, or a transient transport error) must not truncate the
+            // directory: fall back to slicing one full listing. `round_trip`
+            // already re-handshakes on a stale socket, so `paged` reflects the
+            // live node before the next page call.
+            _ => self.readdir(parent).into_iter().skip(offset).take(limit).collect(),
+        }
+    }
+
+    fn supports_paged_readdir(&self) -> bool {
+        self.paged.load(Ordering::SeqCst) != 0
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1738,15 +1784,24 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
     // next M_OPEN handshake (closes a TOCTOU where revoke had no effect on
     // any already-mounted client).
     // Validate the view resolves (physical db or a parseable derived-view
-    // definition) before acking. We deliberately do NOT cache this provider
-    // for the whole connection: under HA a fresh replicated snapshot evicts
-    // the cached engine, so live connections must re-resolve it per op to
-    // observe the swap (see the loop below).
-    if let Err(e) = view_provider(&rt, &view) {
-        eprintln!("meta: M_OPEN view='{view}' resolve failed: {e}");
-        proto::send_response(&mut writer, E_DB, 0, &[])?;
-        return Ok(());
-    }
+    // definition) before acking. We deliberately do NOT hold this provider for
+    // the whole connection: under HA a fresh replicated snapshot evicts the
+    // cached engine, so live connections must re-resolve it per op to observe
+    // the swap (see the loop below). We only keep the paging capability it
+    // reports (a stable property of the store kind — SQLite/PG page, a derived
+    // lens does not) as one ack byte, dropping the provider Arc immediately.
+    let paged_cap = match view_provider(&rt, &view) {
+        Ok(e) => {
+            let c = e.supports_paged_readdir() as u8;
+            drop(e);
+            c
+        }
+        Err(e) => {
+            eprintln!("meta: M_OPEN view='{view}' resolve failed: {e}");
+            proto::send_response(&mut writer, E_DB, 0, &[])?;
+            return Ok(());
+        }
+    };
     // Handshake ack. Echo this node's current fencing epoch in `val` (0 when HA
     // is not configured) so the client can stamp its data-plane writes with the
     // token its (primary) meta-server holds — the arbiter then accepts writes that
@@ -1758,12 +1813,16 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
         .as_ref()
         .map(|h| h.epoch.load(Ordering::SeqCst) as u64)
         .unwrap_or(0);
-    // The ack body carries one flag byte: nonzero when `view` is a DERIVED
-    // (virtual) view. Mount clients turn that into a kernel read-only mount so
-    // writes fail locally with EROFS instead of round-tripping to a gate; the
-    // per-op gate below stays authoritative regardless of what a client claims.
-    let derived_flag = [rt.is_derived(&view) as u8];
-    proto::send_response(&mut writer, 0, open_epoch, &derived_flag)?;
+    // The ack body carries two flag bytes:
+    //   [0] nonzero when `view` is a DERIVED (virtual) view — the client mounts
+    //       read-only so writes fail locally with EROFS instead of round-tripping
+    //       to a gate (the per-op gate below stays authoritative regardless);
+    //   [1] nonzero when the server pages directory listings in its own store,
+    //       unlocking the small M_READDIRP RPC + READDIRPLUS on the client.
+    // An old client reads only byte [0] and ignores byte [1]; an old server
+    // sends just [0], so a new client sees no [1] and stays on full readdirs.
+    let ack_flags = [rt.is_derived(&view) as u8, paged_cap];
+    proto::send_response(&mut writer, 0, open_epoch, &ack_flags)?;
 
     // Distinguish a subscriber (becomes an event sink, sends no requests) from a
     // work connection (metadata ops) by peeking the next frame.
@@ -2542,6 +2601,19 @@ fn dispatch_meta(engine: &dyn MetaProvider, op: u8, body: &[u8]) -> (i32, u64, V
             put_nodes(&mut d, &nodes);
             (0, 0, d, Vec::new())
         }
+        M_READDIRP => {
+            let parent = match get_i64(body, &mut i) { Ok(v) => v, Err(_) => return (E_DB, 0, Vec::new(), Vec::new()) };
+            let offset = match proto::read_u64(body, &mut i) { Ok(v) => v, Err(_) => return (E_DB, 0, Vec::new(), Vec::new()) };
+            let limit = match proto::read_u64(body, &mut i) { Ok(v) => v, Err(_) => return (E_DB, 0, Vec::new(), Vec::new()) };
+            // Page inside the store (LIMIT/OFFSET) rather than shipping the whole
+            // directory per kernel buffer. Reached only for a server whose store
+            // advertises paging (the M_READDIRP cap), so `engine` is a physical
+            // MetaStore, never a non-paging derived lens.
+            let nodes = engine.readdir_page(parent, offset as usize, limit as usize);
+            let mut d = Vec::new();
+            put_nodes(&mut d, &nodes);
+            (0, 0, d, Vec::new())
+        }
         M_CREATE => {
             let parent = match get_i64(body, &mut i) { Ok(v) => v, Err(_) => return (E_DB, 0, Vec::new(), Vec::new()) };
             let is_dir = get_u8(body, &mut i).unwrap_or(0) != 0;
@@ -2860,9 +2932,48 @@ mod ha_tests {
         for op in [M_CREATE, M_SYMLINK, M_LINK, M_UNLINK, M_RENAME, M_SETMODE, M_SETUIDGID, M_SETTIMES, M_TOUCH] {
             assert!(is_write_op(op), "op {op} must be write-intent");
         }
-        for op in [M_OPEN, M_LOOKUP, M_GETATTR, M_READDIR, M_SUBSCRIBE, M_PING, M_PUSH, M_FORWARD] {
+        for op in [M_OPEN, M_LOOKUP, M_GETATTR, M_READDIR, M_READDIRP, M_SUBSCRIBE, M_PING, M_PUSH, M_FORWARD] {
             assert!(!is_write_op(op), "op {op} must not be write-intent");
         }
+    }
+
+    #[test]
+    fn remote_client_pages_through_m_readdirp_when_the_server_supports_it() {
+        // End-to-end proof of the RPC paging path: a client mounting a
+        // SQLite-backed server sees the M_READDIRP capability in the M_OPEN ack
+        // (`supports_paged_readdir()` -> READDIRPLUS is then offered), and its
+        // paged readdir stitches back into the exact full listing.
+        use crate::meta::ROOT_INO;
+
+        let dir = tempfile::Builder::new().prefix("yf_pagedir_").tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        std::fs::create_dir_all(base.join("meta")).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || serve_on_meta_auth(listener, base, ""));
+
+        let meta = RemoteMeta::new(&addr, "alice").expect("handshake with a live server");
+        assert!(meta.supports_paged_readdir(), "a SQLite-backed server advertises store-level paging");
+
+        let n = 7;
+        for i in 0..n {
+            meta.create_node(ROOT_INO, &format!("f{i}"), false, None, 0o644, 0, 0)
+                .expect("create through the RPC path");
+        }
+        let full: Vec<String> = meta.readdir(ROOT_INO).into_iter().map(|x| x.name).collect();
+        assert_eq!(full.len(), n as usize, "all entries listed");
+
+        let mut stitched = Vec::new();
+        let mut off = 0usize;
+        loop {
+            let page = meta.readdir_page(ROOT_INO, off, 3);
+            if page.is_empty() {
+                break;
+            }
+            stitched.extend(page.into_iter().map(|x| x.name));
+            off += 3;
+        }
+        assert_eq!(stitched, full, "M_READDIRP pages must equal the full readdir");
     }
 
     #[test]

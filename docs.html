@@ -154,6 +154,7 @@
         <tr><td><b>接入凭证</b> — 进入服务端的 token（数据面与元数据面可分别设）</td><td><code>--token &lt;串&gt;</code></td></tr>
         <tr><td><b>以指定身份挂载</b> — ACL 按此 uid 判定读写</td><td><code>--as-uid &lt;uid&gt;</code></td></tr>
         <tr><td><b>只读 / 零缓存强一致</b> — 挂载为只读 / 关闭客户端缓存</td><td><code>--ro</code> / <code>--strict</code></td></tr>
+        <tr><td><b>目录列举提速的回退开关</b> — 关掉 READDIRPLUS（随目录项一并带回属性），退回普通 READDIR + 逐条 <code>LOOKUP</code>，仅供 A/B 与兼容排障（provider 自身不能分页的挂载本来就不协商 READDIRPLUS，此开关对它们为空操作）</td><td><code>--no-readdirplus</code></td></tr>
       </tbody>
     </table>
   </section>
@@ -178,6 +179,7 @@
       <li><b>中心 MetaServer</b>:同一用户在多客户机共享<b>一份权威视图</b>,不再各存各的副本导致分叉。</li>
       <li><b>事件总线 + Notifier</b>:写成功后向订阅者推送失效,解决"默认缓存下内容新鲜度"。</li>
       <li><b>fuser 0.18 多线程</b>:每线程独立 <code>/dev/fuse</code> fd(<code>clone_fd</code>),请求并发派发不串行。</li>
+      <li><b>元数据读并行 + 目录分页 + READDIRPLUS</b>:每个视图的存储引擎除单条写连接外再开 4 条只读连接(SQL <code>READ_POOL_SIZE</code>、PG <code>PG_READ_POOL_SIZE</code>)服务 <code>lookup</code>/<code>getattr</code>/<code>readdir</code>,读不再排在写锁后面(<b>写仍串行在同一权威连接上</b>),服务端引擎同样吃各自后端的池;目录列举按 <code>readdir_page</code> 下推成 SQL <code>LIMIT/OFFSET</code>、回复缓冲按 32→1024 几何块填充,一个内核请求付 <code>O(缓冲)</code> 而非 <code>O(整棵目录)</code>;默认协商 <code>FUSE_DO_READDIRPLUS</code>(内核 ≥4.6)让属性随目录项一次带回。同一份 5001 条目录、同一挂载点、每趟新挂载实测 <code>ls -l</code>:<b>2.56s</b>(只留分页 5.22s;改造前基线 55.34s,三份输出排序后逐字节相同)。分页与 PLUS 在所有能自身分页的 provider 上启用——本地 SQLite/PG,以及对接 SQLite/PG <code>meta-server</code> 的<b>远端挂载</b>(新 <code>M_READDIRP</code> 帧把 <code>offset/limit</code> 下推到服务端):同一 5001 条目录经 <code>meta-server</code>+<code>data-server</code> 实测由改造前 ~54s → <b>2.29s</b>(只关 PLUS 保留分页 4.22s,两份输出逐字节相同)。仅派生/透镜视图与不含该能力位的老服务端仍走每缓冲一次全量列表、不协商 PLUS。</li>
     </ul>
     <h3>一次写请求的完整路径（数据面 / 元数据面各走一半）</h3>
     <pre class="tree">
@@ -401,6 +403,8 @@ $Y mount --view alice --data ... --meta ... --token s3cr3t -m /mnt/alice</code><
       <tr><td>分块并行 IO</td><td>客户端读 ≥1MiB 按 1MiB 切片并发;写 ≥4MiB 分片并发(零协议改动)。</td></tr>
       <tr><td><code>--o allow_other</code></td><td>额外 fuser 挂载选项透传。</td></tr>
       <tr><td>touch 去抖</td><td><code>write()</code> 对同 inode 200ms 窗口去抖 <code>touch_mtime</code>,减少元数据面 RPC 与 HA 日志量(<code>setattr-size</code> 不去抖,语义要求即时)。</td></tr>
+      <tr><td>元数据读连接池</td><td>每视图 SQLite 引擎 <code>READ_POOL_SIZE = 4</code> 条附加连接服务 <code>lookup</code>/<code>getattr</code>/<code>readdir</code> 与 nlink 解析,读不再排写锁;写仍走单一权威连接,服务端引擎同享此池。池连接按 WAL 读事务读已提交数据,自己的写立刻可见(<code>reads_through_the_pool_observe_committed_writes</code> 断言);HA 备机/只读打开的引擎不预开池,首次读按需懒建并归还。<code>PgEngine</code> 现也持一条对等的 <code>PG_READ_POOL_SIZE = 4</code> 只读池(取不到只读连接时回退写连接以如实暴露故障),写仍串行在单 <code>client</code>。</td></tr>
+      <tr><td>目录分页 + READDIRPLUS</td><td><code>readdir_page(parent, offset, limit)</code> 在 SQLite 与 PG 引擎都下推成 SQL <code>LIMIT/OFFSET</code>,FUSE 回调按 32→1024 几何块流式填回复缓冲;默认协商 <code>FUSE_DO_READDIRPLUS</code>(与普通能力位分属不同的 all-or-nothing 组,内核不支持则自然回退),<code>--no-readdirplus</code> 可关做 A/B。两者由 <code>supports_paged_readdir()</code> 门控:本地 SQLite/PG 与对接能分页的 <code>meta-server</code> 的远端挂载(新 <code>M_READDIRP</code> 帧把分页下推到服务端)都吃两者;仍不能自身分页的 provider(<code>LayoutMeta</code> 派生/透镜、不含该能力位的老服务端)每内核缓冲取一次全量列表且不协商 PLUS,以免 PLUS 的胖记录把全量重取次数乘 ~4 倍。</td></tr>
     </table>
   </section>
 
@@ -1038,7 +1042,7 @@ $ ls /mnt/leak   <span class="cmt"># (命名空间按需新建，数据不外泄
     <table>
       <tr><th>目的</th><th>命令</th></tr>
       <tr><td>建视图</td><td><code>grove --home H init --view U [--manifest M]</code></td></tr>
-      <tr><td>本地挂载</td><td><code>grove --home H mount --view U -m MP [--ro] [--strict] [--threads N] [--as-uid N] [--layout F]</code></td></tr>
+      <tr><td>本地挂载</td><td><code>grove --home H mount --view U -m MP [--ro] [--strict] [--threads N] [--as-uid N] [--layout F] [--no-readdirplus]</code></td></tr>
       <tr><td>远程挂载</td><td><code>grove --home H mount --view U -m MP --data A[,A2] --meta M[,M_bak] [--token T] [--as-uid N] [--layout F]</code></td></tr>
       <tr><td>显示规则文件</td><td>每行 <code>hide &lt;src&gt;</code> / <code>only &lt;src&gt;</code> / <code>map &lt;src&gt; &lt;dst&gt;</code> / <code>link &lt;src&gt; &lt;dst&gt;</code>(<code>#</code> 注释，绝对路径，见 §15.5)</td></tr>
       <tr><td>定义派生视图</td><td><code>grove view --db-path D define --name V --base B --rules F</code>(存于 <code>D/meta/views/V.layout</code>，<code>mount --view V</code> 即得形状，虚拟视图挂载只读、写走基名 <code>B</code>，见 §15.6)</td></tr>
@@ -1071,6 +1075,7 @@ $ ls /mnt/leak   <span class="cmt"># (命名空间按需新建，数据不外泄
       <li><b>服务端纯别名 <code>grove view alias</code></b>：与派生视图的正反面——别名挂载全树<b>可写</b>、真实名被治理后<b>不可直挂</b>(本地与服务端均拒)；单跳解析、每 <code>M_OPEN</code> 重扫 <code>views/</code>(挂载是罕见事件)；拒别名链/派生目标/一真实名多别名；<code>import</code> 拒别名目标；删别名仅影响<b>新</b>挂载(已建立连接不受影响，同 <code>view rm</code> 语义)；远端拒挂真实名时客户端回显复用 token 拒因文案(<code>E_AUTH</code> 共用码，行为正确、提示不精确)，本地拒挂文案精确；改名不是安全机制(公开名终究要分发)，真实名隐藏属名字治理，硬边界仍是 token+ACL。</li>
       <li><b>零拷贝导入 <code>grove import</code></b>:硬链接要求源与 <code>blocks/</code> 同文件系统(跨盘自动退化为独立拷贝并如实计数);外部工具以 <b>rename/替换写</b>更新源文件(vim 默认行为)时,视图侧保持旧 inode 的最后内容,需对新内容重跑 import(已有名字跳过,可换 <code>--prefix</code> 强制重登记);symlink/特殊文件有意跳过;导入对象为单文件,不走 ≥16MiB 跨 server 条带;meta-server 部署下 import 直写权威 db 文件,需在存储机执行、已挂载靠 TTL(≤2s)收敛而非即时推送;PG 后端不支持(权威树在 Postgres,走挂载点 rsync 灌入);<code>--source</code> 建议与存储根同盘并保留——删源仅失去「源路径」别名(数据在 <code>blocks/</code> 链接里不丢),但外部改名/迁移后视图与字节实体的关联只剩 <code>blocks/</code> 一条路径。</li>
       <li><b>PostgreSQL 后端与 HA 互斥</b>:<code>--store postgres://…</code> 下自研 HA(<code>--role standby / --peer / --witness</code>)在启动时 fail-fast;<code>backup_to_bytes</code> 返回错误——高可用请交给 PG 自带的<b>流复制 / logical replication / PITR</b>,不在 GroveFS 里重一个共识。<code>acl.db</code> 仍落本地 SQLite,不随 view 进 PG 复制域。</li>
+      <li><b>元数据读并行 / 目录分页的作用范围</b>:只读连接池与 <code>LIMIT/OFFSET</code> 分页现在长在<b>两个存储引擎</b>(SQLite <code>MetaEngine</code> 与 PG <code>PgEngine</code>)里,各自 4 连接只读池。本地 <code>--home</code>(SQLite 或 PG)吃满分页与 PLUS;<code>meta-server</code> 的并发处理器吃各自后端的池,且新增的 <code>M_READDIRP</code> 帧带 <code>offset/limit</code> 把分页下推到服务端,远端客户端每缓冲只取一页并协商 <code>FUSE_READDIRPLUS</code>(同一 5001 条目录远端实测由改造前 ~54s → 2.29s,只关 PLUS 保留分页 4.22s)。仍走 trait 默认实现(每缓冲一次全量列表、不协商 PLUS)的只有 <code>LayoutMeta</code> 派生/透镜(隐藏/映射形状无法表示为单条 SQL 页)与对接<b>不含该能力位的老 <code>meta-server</code></b> 的挂载(<code>M_OPEN</code> ack 无第二字节则回退)。元数据<b>写</b>并行(多权威)仍未做。判据 <code>MetaProvider::supports_paged_readdir()</code> 由单测 <code>store_level_paging_is_advertised_only_by_providers_that_page_in_sql</code> 钉住。</li>
     </ul>
     <div class="ok">凡未实测数字处,文档不做收益声称;凡有限制处,均在代码注释与本节明示。</div>
   </section>

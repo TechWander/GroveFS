@@ -125,6 +125,16 @@ enum Cmd {
         /// refused with EPERM.
         #[arg(long)]
         layout: Option<PathBuf>,
+        /// Disable FUSE READDIRPLUS negotiation (kernel >= 4.6). With it off,
+        /// directory listings fall back to plain READDIR + per-entry LOOKUP —
+        /// useful as an A/B benchmark knob and for compatibility debugging.
+        /// READDIRPLUS is only ever offered on mounts whose metadata provider
+        /// pages inside its own store: local `--home` SQLite, and remote mounts
+        /// against a SQLite/PG meta-server (which serve the paged M_READDIRP
+        /// RPC). Derived/lens mounts answer a whole listing per buffer, so this
+        /// flag changes nothing for them.
+        #[arg(long)]
+        no_readdirplus: bool,
     },
     /// Run the remote data service (central cluster node) backed by local disk
     DataServer {
@@ -499,6 +509,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             threads,
             as_uid,
             layout,
+            no_readdirplus,
         } => {
             std::fs::create_dir_all(&mountpoint)?;
             // Effective uid reported to the server / used for local ACL check:
@@ -707,6 +718,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 backend,
                 ro || view_ro || o.iter().any(|s| s == "ro"),
                 strict || o.iter().any(|s| s == "strict"),
+                !no_readdirplus,
             );
 
             // Build the fuser 0.18 session Config. The old `--o` string surface is

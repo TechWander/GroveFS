@@ -31,6 +31,7 @@
 | **接入凭证** — 进入服务端的 token(数据面与元数据面可分别设) | `--token <串>` |
 | **以指定身份挂载** — ACL 按此 uid 判定读写 | `--as-uid <uid>` |
 | **只读 / 零缓存强一致** — 挂载为只读 / 关闭客户端缓存 | `--ro` / `--strict` |
+| **目录列举提速的回退开关** — 关掉 READDIRPLUS（随目录项一并带回属性），退回普通 READDIR + 逐条 `LOOKUP`，仅供 A/B 与兼容排障（只有 provider 能在自己存储里分页的挂载才协商 READDIRPLUS：本地 `--home` 的 SQLite/PG，以及对接能分页的 `meta-server` 的远端挂载；派生/透镜视图与老服务端本来就不协商） | `--no-readdirplus` |
 
 ### 关于 `--view` 与路径容量
 
@@ -437,6 +438,10 @@ $Y --home $BASE mount --view alice --mountpoint /mnt/alice_ro --ro
 
 - `--threads N`(默认 4):FUSE 并发派发工作线程,每线程独立 `/dev/fuse` fd(`clone_fd`,Linux 4.5+)。`0` = 单线程(遗留行为,可作 A/B 对照)。
 - 客户端大 IO 自动分块并行:读 ≥1MiB 按 1MiB 切片并发,写 ≥4MiB 分片并发(零协议改动)。
+- **元数据读并行**(写不并行):每个视图的 `MetaEngine` 除单条写连接外开 `READ_POOL_SIZE = 4` 条附加连接,`lookup`/`getattr`/`readdir` 与 nlink 解析走池,因此同视图并发读不再排在写锁后面;**写仍串行在同一权威连接上**(单写者语义不变)。池连接按 WAL 读事务读已提交数据,自己的写立刻可见(`cargo test` 内 `reads_through_the_pool_observe_committed_writes` 钉住这一点)。HA 备机/只读打开的引擎不预开池,首次读按需懒建并归还,同样有界。PG 引擎(`PgEngine`)现也持一条对等的 `PG_READ_POOL_SIZE = 4` 只读连接池(按 PG 事务读已提交数据,取不到只读连接时回退写连接以如实暴露故障),但写仍串行在单 `client` 上。
+- **目录列举分页 + READDIRPLUS**(不带开关即生效):`MetaProvider::readdir_page(parent, offset, limit)` 在 SQLite 与 PG 引擎里都下推成 SQL `LIMIT/OFFSET`,FUSE 回调按 32→1024 几何块流式填回复缓冲,因此一个内核 READDIR/READDIRPLUS 请求付 `O(缓冲)` 而不是 `O(整棵目录)`(改造前每个分页都重扫整棵目录并为每条重算 nlink);属性随目录项一次带回(内核 ≥4.6 的 `FUSE_DO_READDIRPLUS`,与上面能力位分属不同的 all-or-nothing 协商组,内核不支持则自然回退普通 READDIR)。同一份 5001 条目录、同一挂载点、每趟新挂载(内核 dentry 空)实测 `ls -l`:**2.56s**;`--no-readdirplus` 只留分页:**5.22s**;改造前基线(HEAD,无分页无 PLUS):**55.34s** —— 三份输出排序后逐字节相同。远端同样已接分页——新 `M_READDIRP` 帧带 `offset/limit` 下推到服务端,同一 5001 条目录经 `meta-server`+`data-server` 实测由改造前 ~54s 降到 **2.29s**(只关 PLUS 保留分页 4.22s,两份输出逐字节相同)。注意作这个改动时先把 READDIRPLUS 接在了不能分页的 provider 上,反而把全量重取次数乘了 ~4 倍,因此现在两者都由 `supports_paged_readdir()` 门控(见下条)。
+- **作用范围**(与上条同口径):只读连接池与 SQL 分页现在两个存储引擎上都——SQLite `MetaEngine` 与 PG `PgEngine`(各 4 连接只读池)。本地 `--home`(SQLite 或 PG)吃满分页与 PLUS;`meta-server` 侧并发 RPC 处理器吃各自后端读池,且 `M_READDIRP` 帧把分页下推到服务端,远端客户端每缓冲只取一页并协商 PLUS(同数据集远端实测 ~54s → 2.29s)。仍走 trait 默认实现(每缓冲一次全量列表、不协商 PLUS)的只有 `--layout`/派生视图的 `LayoutMeta`(隐藏/映射形状无法表示为单条 SQL 页)与对接不含该能力位的老 `meta-server`(`M_OPEN` ack 无第二字节则回退)。元数据**写**并行(多权威)仍未做。判据由 `cargo test` 内 `store_level_paging_is_advertised_only_by_providers_that_page_in_sql` 钉住。
+- `--no-readdirplus`:关闭 READDIRPLUS 协商,回退普通 READDIR+逐条 `LOOKUP`,供 A/B 基准与兼容性排障(不认该能力的老内核自然就是此行为;provider 不能自身分页的挂载——派生/透镜视图与老服务端——本来也不协商,此开关对它们为空操作)。
 - `--o allow_other` 等额外 fuser 选项透传给挂载。
 
 ---
