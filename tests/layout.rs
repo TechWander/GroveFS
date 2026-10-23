@@ -196,3 +196,56 @@ fn no_rules_is_transparent_passthrough() {
     let docs = eng.lookup(ROOT_INO, "docs").unwrap().id;
     assert_eq!(names(&l.readdir(docs)), vec!["2025".to_string(), "2026".to_string()]);
 }
+
+/// A `map` rule renders an entry under a SYNTHESIZED parent: `display_targets`
+/// must return the display coordinate so the invalidation push can close the
+/// staleness window that would otherwise last until the attribute TTL (~2s).
+#[test]
+fn display_targets_fires_for_relocated_entry() {
+    let eng = seed_tree("dt1");
+    let rules = "map /data/raw /team/raw";
+    let l = lens_over(eng.clone(), rules);
+    let data_ino = eng.lookup(ROOT_INO, "data").unwrap().id;
+    // display_targets(data_ino, "raw") must return the synthesized /team coord.
+    let targets = l.display_targets(data_ino, "raw");
+    assert!(!targets.is_empty(), "expected at least one display coord");
+    // The returned parent must match what the lens traversal allocates.
+    let team_node = l.lookup(ROOT_INO, "team").expect("/team must exist");
+    let (tp, tn) = &targets[0];
+    assert_eq!(*tp, team_node.id, "display parent = traversal-allocated ino");
+    assert_eq!(tn.as_str(), "raw", "display name = basename(dst)");
+    // Non-relocated: empty.
+    let docs_ino = eng.lookup(ROOT_INO, "docs").unwrap().id;
+    assert!(
+        l.display_targets(docs_ino, "2026").is_empty(),
+        "no reloc for /docs/2026"
+    );
+}
+
+/// A `link` alias renders under a synthesized parent too.
+#[test]
+fn display_targets_covers_link_alias() {
+    let eng = seed_tree("dt2");
+    let rules = "link /shared/lib /team/lib";
+    let l = lens_over(eng.clone(), rules);
+    let shared_ino = eng.lookup(ROOT_INO, "shared").unwrap().id;
+    let targets = l.display_targets(shared_ino, "lib");
+    assert!(!targets.is_empty(), "link alias must produce display coord");
+    let team_node = l.lookup(ROOT_INO, "team").expect("/team dir");
+    let (tp, tn) = &targets[0];
+    assert_eq!(*tp, team_node.id);
+    assert_eq!(tn.as_str(), "lib");
+}
+
+/// With only `hide`/`only` rules (no reloc), display_targets stays empty.
+#[test]
+fn display_targets_empty_without_reloc() {
+    let eng = seed_tree("dt3");
+    let rules = "hide /photos/private";
+    let l = lens_over(eng.clone(), rules);
+    let data_ino = eng.lookup(ROOT_INO, "data").unwrap().id;
+    assert!(
+        l.display_targets(data_ino, "raw").is_empty(),
+        "hide doesn't relocate"
+    );
+}

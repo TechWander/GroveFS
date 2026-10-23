@@ -72,6 +72,25 @@ impl ShardedBackend {
         (idx, format!("{}#{}", l.base, i))
     }
 
+    /// A striped key encodes the server count it was created with (`l.n`). If
+    /// this mount was brought up with a DIFFERENT number of data servers, the
+    /// `i % n` mapping in [`Self::chunk`] would silently route logical chunks to
+    /// the wrong member — reading or overwriting a different object. Fail loudly
+    /// at every dispatch entry instead of corrupting data on a misconfigured
+    /// shrink/grow of the `--data` list.
+    fn check_layout(&self, l: &Layout) -> io::Result<()> {
+        if l.n != self.servers.len() {
+            return Err(io::Error::other(format!(
+                "striped object {} was laid out across {} servers but this mount has {}; \
+                 refusing to remap (would read/write wrong chunks)",
+                l.base,
+                l.n,
+                self.servers.len()
+            )));
+        }
+        Ok(())
+    }
+
     /// Outcome of asking a member whether a chunk exists: `Absent` is a
     /// *definitive* ENOENT, while `Unknown` means the probe kept failing with
     /// transient errors (already retried). Conflating `Unknown` with `Absent`
@@ -91,6 +110,19 @@ impl ShardedBackend {
             }
         }
         Probe::Unknown
+    }
+
+    /// Length of logical chunk `i`, as a tri-state suited to the monotone search
+    /// in [`Self::len`]: `Ok(Some(n))` present, `Ok(None)` definitively absent
+    /// (ENOENT), `Err(EIO)` when the probe kept failing transiently (Unknown) —
+    /// never silently folded into "absent", which would understate the size.
+    fn chunk_len(&self, l: &Layout, i: u64) -> io::Result<Option<u64>> {
+        let (s, ck) = self.chunk(l, i);
+        match self.probe(s, &ck) {
+            Probe::Present(n) => Ok(Some(n)),
+            Probe::Absent => Ok(None),
+            Probe::Unknown => Err(io::Error::from_raw_os_error(libc::EIO)),
+        }
     }
 
     /// Enumerate the (chunk_index, sub_offset, sub_len) tuples covering the
@@ -166,6 +198,7 @@ impl StorageBackend for ShardedBackend {
             // Materialize chunk 0 so the object exists with length 0; the rest
             // are created lazily by write/truncate.
             Some(l) => {
+                self.check_layout(&l)?;
                 let (s, ck) = self.chunk(&l, 0);
                 self.servers[s].create(&ck)
             }
@@ -178,6 +211,7 @@ impl StorageBackend for ShardedBackend {
             Some(l) => l,
             None => return self.servers[0].read(key, offset, len),
         };
+        self.check_layout(&l)?;
         let ranges = self.chunks_for(&l, offset, len);
         // A chunk whose object is absent reads as EOF: for a contiguously
         // written striped file the only chunks that can be missing are the
@@ -251,6 +285,7 @@ impl StorageBackend for ShardedBackend {
             Some(l) => l,
             None => return self.servers[0].write(key, offset, data),
         };
+        self.check_layout(&l)?;
         let ranges = self.chunks_for(&l, offset, data.len());
         // A write that jumps past the current end must first make every chunk
         // below its target contiguous, or `len` would stop at the old short tail
@@ -314,31 +349,52 @@ impl StorageBackend for ShardedBackend {
             Some(l) => l,
             None => return self.servers[0].len(key),
         };
-        // Walk chunks from 0; the file ends at the first chunk shorter than the
-        // stripe (partial tail) or absent (not yet written). This is exact because
-        // `write` keeps chunks contiguous below any new write (see `pad_below`):
-        // sparse writes materialize the gap rather than leaving interior chunks
-        // missing, so there are never holes the walk could stop at prematurely.
-        let mut total = 0u64;
-        let mut i = 0u64;
-        loop {
-            let (s, ck) = self.chunk(&l, i);
-            match self.probe(s, &ck) {
-                Probe::Present(c) => {
-                    total = i * l.stripe + c;
-                    if c < l.stripe {
-                        return Ok(total);
-                    }
-                }
-                Probe::Absent => return Ok(total),
-                // Unknown: fail honestly rather than report a too-short size.
-                Probe::Unknown => return Err(io::Error::from_raw_os_error(libc::EIO)),
-            }
-            i += 1;
-            if i > u32::MAX as u64 {
-                return Ok(total); // runaway guard
+        self.check_layout(&l)?;
+        // Chunks are CONTIGUOUS: `write` keeps every chunk below a new write full
+        // (see `pad_below`), so exactly the range [0, A) is present and every
+        // chunk at/after A is absent, with only the trailing chunk A-1 allowed to
+        // be short. "chunk i is absent" is therefore a monotone predicate with a
+        // single boundary — we find A with exponential bounding + binary search
+        // in O(log A) probes instead of the old O(A) linear walk. That walk made
+        // getattr (and READDIRPLUS over a directory of large striped files) fan
+        // out one probe per chunk — e.g. ~6400 round-trips for a 100 GiB file at
+        // a 16 MiB stripe — the `backend.len` hot-spot `read` itself refuses to
+        // pay (see the comment there). A `Probe::Unknown` still fails honestly
+        // (EIO) rather than reporting a too-short size.
+        //
+        // Chunk 0 first: absent => empty object; present-and-short => it is the
+        // only (trailing) chunk, size == its length.
+        let len0 = match self.chunk_len(&l, 0)? {
+            None => return Ok(0),
+            Some(c) => c,
+        };
+        if len0 < l.stripe {
+            return Ok(len0);
+        }
+        // Chunk 0 is a full stripe, so A >= 1. Exponential search for a present
+        // low bound `lo` and an absent high bound `hi` (present(lo), absent(hi)).
+        let mut lo = 0u64;
+        let mut hi = 1u64;
+        while self.chunk_len(&l, hi)?.is_some() {
+            lo = hi;
+            match hi.checked_mul(2) {
+                Some(next) if next <= u32::MAX as u64 => hi = next,
+                // Beyond 2^32 chunks (>~68 YiB at a 16 MiB stripe) the old
+                // walk bailed with the confirmed-full total; mirror that.
+                _ => return Ok((lo + 1) * l.stripe),
             }
         }
+        // Binary search the boundary in (lo, hi]: lo present, hi absent.
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            match self.chunk_len(&l, mid)? {
+                Some(_) => lo = mid,
+                None => hi = mid,
+            }
+        }
+        // `hi` is the first absent chunk; `hi-1` is the trailing (present) chunk.
+        let last = self.chunk_len(&l, hi - 1)?.ok_or_else(|| io::Error::from_raw_os_error(libc::EIO))?;
+        Ok((hi - 1) * l.stripe + last)
     }
 
     fn fsync(&self, key: &str) -> io::Result<()> {
@@ -360,6 +416,7 @@ impl StorageBackend for ShardedBackend {
             Some(l) => l,
             None => return self.servers[0].truncate(key, new_len),
         };
+        self.check_layout(&l)?;
         if new_len == 0 {
             // Drop every chunk (GC is idempotent; ignore absent ones).
             let mut i = 0u64;
@@ -433,6 +490,7 @@ impl StorageBackend for ShardedBackend {
             Some(l) => l,
             None => return self.servers[0].remove(key),
         };
+        self.check_layout(&l)?;
         // Best-effort delete of every chunk the object could own. GC is
         // idempotent, so errors on already-gone chunks are ignored.
         let mut i = 0u64;
@@ -464,10 +522,45 @@ impl StorageBackend for ShardedBackend {
     }
 
     fn statvfs(&self) -> io::Result<FsStat> {
-        // Report the first member's capacity; striping distributes bytes across
-        // all of them, so this is a per-node view (a full aggregate is a later
-        // refinement and only cosmetic for `df`).
-        self.servers[0].statvfs()
+        // Striping spreads bytes round-robin across EVERY member, so `df` must
+        // report the aggregate capacity, not one node's slice: a single-member
+        // view understates total space by Nx and would make a 1/N-full volume
+        // look nearly full (or a full volume look roomy if server 0 happened to
+        // be the least-loaded). Sum the block/inode counts over members.
+        //
+        // `bsize` is the FUSE-reported optimal transfer size; members share a
+        // block size in practice, so keep the first one observed. `namemax` is
+        // taken as the minimum across members — a name must fit every backing
+        // store, so the most conservative one is the honest answer.
+        //
+        // Availability: a striped object needs all its member servers reachable
+        // to read/write every chunk, so a member that fails to report is a real
+        // outage. We skip failed members and aggregate those that respond (this
+        // UNDERSTATES usable capacity, which is the safe direction for `df`);
+        // only if NO member reports do we propagate an error so statfs reflects
+        // the outage instead of fabricating a healthy volume.
+        let mut acc: Option<FsStat> = None;
+        let mut last_err: Option<io::Error> = None;
+        for s in &self.servers {
+            match s.statvfs() {
+                Ok(st) => {
+                    acc = Some(match acc {
+                        None => st,
+                        Some(a) => FsStat {
+                            tblocks: a.tblocks.saturating_add(st.tblocks),
+                            bfree: a.bfree.saturating_add(st.bfree),
+                            bavail: a.bavail.saturating_add(st.bavail),
+                            files: a.files.saturating_add(st.files),
+                            ffree: a.ffree.saturating_add(st.ffree),
+                            bsize: a.bsize,
+                            namemax: a.namemax.min(st.namemax),
+                        },
+                    });
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        acc.ok_or_else(|| last_err.unwrap_or_else(|| io::Error::from_raw_os_error(libc::EIO)))
     }
 }
 
@@ -585,6 +678,30 @@ mod tests {
     }
 
     #[test]
+    fn layout_server_count_mismatch_fails_not_silent_remap() {
+        // A key laid out across 3 servers must NOT be silently remapped when this
+        // mount only has 2 members — that would read/write the wrong chunk. It
+        // must fail loudly instead.
+        let roots = tmp_root("mismatch", 2);
+        let sb = ShardedBackend::new(members(&roots), 4096);
+        // Forge a 3-server layout key while the backend holds only 2 members.
+        let key = "s3:4096:deadbeef".to_string();
+        assert!(sb.create(&key).is_err());
+        assert!(sb.write(&key, 0, &[1, 2, 3]).is_err());
+        assert!(sb.read(&key, 0, 4096).is_err());
+        assert!(sb.len(&key).is_err());
+        assert!(sb.truncate(&key, 10).is_err());
+        assert!(sb.remove(&key).is_err());
+        // The matching-arity path is unaffected.
+        let ok = sb.new_key("ok");
+        assert_eq!(sb.create(&ok).unwrap(), ());
+        assert_eq!(sb.len(&ok).unwrap(), 0);
+        for r in roots {
+            let _ = std::fs::remove_dir_all(r);
+        }
+    }
+
+    #[test]
     fn sparse_write_past_eof_is_not_hidden() {
         // Regression for the striping hole bug: a write that jumps past the
         // current end (lseek + write, e.g. `dd seek=`) used to leave the old short
@@ -622,6 +739,128 @@ mod tests {
         assert_eq!(sb.read(&key, off, 50).unwrap(), tail);
         assert_eq!(sb.read(&key, 5000, 10).unwrap(), vec![0u8; 10]); // inside the hole
         sb.remove(&key).unwrap();
+        for r in roots {
+            let _ = std::fs::remove_dir_all(r);
+        }
+    }
+
+    /// A backend whose only role is to report a fixed [`FsStat`] (and optionally
+    /// fail), so statvfs aggregation can be asserted deterministically without
+    /// depending on the real free-block count of a shared temp device (which
+    /// drifts between calls and would make a `xN` assertion flaky).
+    struct MockStat {
+        stat: FsStat,
+        fail: bool,
+    }
+
+    impl StorageBackend for MockStat {
+        fn create(&self, _key: &str) -> io::Result<()> {
+            Ok(())
+        }
+        fn read(&self, _key: &str, _offset: u64, len: usize) -> io::Result<Vec<u8>> {
+            Ok(vec![0u8; len])
+        }
+        fn write(&self, _key: &str, _offset: u64, data: &[u8]) -> io::Result<usize> {
+            Ok(data.len())
+        }
+        fn len(&self, _key: &str) -> io::Result<u64> {
+            Ok(0)
+        }
+        fn fsync(&self, _key: &str) -> io::Result<()> {
+            Ok(())
+        }
+        fn truncate(&self, _key: &str, _new_len: u64) -> io::Result<()> {
+            Ok(())
+        }
+        fn remove(&self, _key: &str) -> io::Result<()> {
+            Ok(())
+        }
+        fn statvfs(&self) -> io::Result<FsStat> {
+            if self.fail {
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            } else {
+                Ok(self.stat)
+            }
+        }
+    }
+
+    fn mock(tblocks: u64, bfree: u64, namemax: u32, fail: bool) -> Arc<dyn StorageBackend> {
+        Arc::new(MockStat {
+            stat: FsStat {
+                tblocks,
+                bfree,
+                bavail: bfree,
+                files: tblocks / 2,
+                ffree: bfree / 2,
+                bsize: 4096,
+                namemax,
+            },
+            fail,
+        })
+    }
+
+    #[test]
+    fn statvfs_aggregates_every_member_not_just_first() {
+        // Three members with distinct capacities must sum, not report server 0.
+        let sb = ShardedBackend::new(
+            vec![mock(100, 40, 255, false), mock(200, 60, 255, false), mock(300, 80, 255, false)],
+            4096,
+        );
+        let agg = sb.statvfs().unwrap();
+        assert_eq!(agg.tblocks, 600, "total blocks must sum across members");
+        assert_eq!(agg.bfree, 180, "free blocks must sum across members");
+        assert_eq!(agg.files, 50 + 100 + 150);
+        assert_eq!(agg.ffree, 20 + 30 + 40);
+        assert_eq!(agg.bsize, 4096, "block size preserved");
+        assert_eq!(agg.namemax, 255, "namemax preserved when equal");
+    }
+
+    #[test]
+    fn statvfs_takes_min_namemax_and_skips_unreachable_members() {
+        // A conservative namemax (min) and skipping a failed member while still
+        // aggregating the reachable ones (understating capacity = safe).
+        let sb = ShardedBackend::new(
+            vec![mock(100, 40, 255, false), mock(100, 40, 64, true), mock(100, 40, 128, false)],
+            4096,
+        );
+        let agg = sb.statvfs().unwrap();
+        // member[1] failed and is skipped: only 0 and 2 count.
+        assert_eq!(agg.tblocks, 200, "failed member excluded");
+        assert_eq!(agg.bfree, 80);
+        assert_eq!(agg.namemax, 128, "min namemax over reachable members");
+    }
+
+    #[test]
+    fn statvfs_errors_only_when_no_member_reports() {
+        let sb = ShardedBackend::new(vec![mock(100, 40, 255, true), mock(100, 40, 255, true)], 4096);
+        assert!(sb.statvfs().is_err(), "all members down must surface an error, not fake stats");
+    }
+
+    #[test]
+    fn len_binary_search_matches_exact_sizes_across_chunk_boundaries() {
+        // The exponential+binary rewrite of `len` must reproduce the old linear
+        // walk's exact size for every boundary shape: empty, single short chunk,
+        // exact multiples (trailing chunk full, next absent), and partial tails.
+        // Each size lands on a different first-absent index, so the binary search
+        // is exercised at many pivots rather than one lucky case.
+        let roots = tmp_root("lenb", 2);
+        let stripe = 1024u64;
+        let sb = ShardedBackend::new(members(&roots), stripe);
+        for &size in &[
+            0u64, 1, 1023, 1024, 1025, 2048, 3071, 4096, 5000, 8192, 8193, 12288, 13000,
+        ] {
+            let key = sb.new_key(&format!("f{size}"));
+            sb.create(&key).unwrap();
+            if size > 0 {
+                let data: Vec<u8> = (0..size as u32).map(|i| (i % 251) as u8).collect();
+                sb.write(&key, 0, &data).unwrap();
+            }
+            assert_eq!(sb.len(&key).unwrap(), size, "len mismatch at size {size}");
+            // read clamps to the same EOF the search computed
+            let back = sb.read(&key, 0, size as usize + 4096).unwrap();
+            assert_eq!(back.len() as u64, size, "read must clamp at size {size}");
+            sb.remove(&key).unwrap();
+        }
         for r in roots {
             let _ = std::fs::remove_dir_all(r);
         }

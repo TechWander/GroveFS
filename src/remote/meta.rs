@@ -1217,9 +1217,9 @@ impl MetaServer {
     ///   shipping (`VACUUM INTO`) is a SQLite-specific mechanism; run PG with
     ///   PostgreSQL's own streaming/logical replication instead.
     ///
-    /// The `acl.db` whitelist store remains local SQLite regardless of this
-    /// choice — ACL rows are per-`meta-server` control-plane state, not part of
-    /// the shared view tree.
+    /// Under PG the ACL whitelist also lives in a shared `grovefs_acl.view_acl`
+    /// table (one `pg_dump` covers the entire metadata plane); under SQLite it
+    /// stays at `<base>/meta/acl.db`.
     pub fn with_store(mut self, uri: Option<String>) -> Self {
         match uri {
             Some(u) if u.starts_with("postgres://") || u.starts_with("postgresql://") => {
@@ -1244,15 +1244,22 @@ impl MetaServer {
             ));
         }
         std::fs::create_dir_all(self.base.join("meta"))?;
-        // Open the optional view whitelist BEFORE binding so a client (or the
+        // Open the ACL store BEFORE binding so a client (or the
         // test board's `wait_port` + log grep) never sees the listen port
-        // reachable while the SQLite ACL setup is still running — otherwise
+        // reachable while the ACL setup is still running — otherwise
         // the port becomes connectable before the `synchronous replication ON`
         // / `registered fencing epoch` log lines have flushed, and readiness
         // probes race startup I/O.
-        let acl = Arc::new(
-            crate::acl::AclStore::open(&self.base).expect("open acl.db"),
-        );
+        //
+        // Under PG the ACL lives in a shared `grovefs_acl.view_acl` table
+        // (single `pg_dump` covers everything); under SQLite it stays at
+        // `<base>/meta/acl.db`.
+        let acl = Arc::new(match &self.store {
+            StoreKind::Pg(uri) => crate::acl::AclStore::open_pg(uri)
+                .unwrap_or_else(|e| panic!("open PG acl: {e}")),
+            StoreKind::Sqlite => crate::acl::AclStore::open(&self.base)
+                .expect("open acl.db"),
+        });
         let listener = TcpListener::bind(&self.listen)?;
         println!(
             "meta-server listening on {} (base {}, role {:?}{})",
@@ -1582,33 +1589,100 @@ enum Event {
 
 /// Per-view set of event-sink sockets (write halves), keyed by a connection id
 /// so each subscriber thread can unregister exactly its own handle on EOF.
-type Subscribers = Arc<Mutex<HashMap<String, HashMap<u64, TcpStream>>>>;
+/// Each sink is a per-subscriber `Arc<Mutex<TcpStream>>` shared across every
+/// bucket it registered under (its own view + physical base), so concurrent
+/// broadcasts serialize only against the SAME socket (preserving frame
+/// atomicity), never against the whole registry.
+type Subscribers = Arc<Mutex<HashMap<String, HashMap<u64, Arc<Mutex<TcpStream>>>>>>;
 
 /// Monotonic id handed to each subscriber connection.
 static NEXT_SUB: AtomicU64 = AtomicU64::new(1);
 
-/// Push `events` to every subscriber of `view`. The registry mutex is held for
-/// the whole send so two op threads can never interleave partial frames on the
-/// same socket; events are small and infrequent, so this global serialization
-/// is cheap. Unreachable sinks are pruned opportunistically.
+/// Upper bound on how long a push to one subscriber may block the broadcasting
+/// op thread. A client that stops draining its subscribe socket is dropped
+/// (pruned) after this rather than stalling event delivery — it then converges
+/// via its attribute TTL. Bounded so a single laggy peer can't wedge a writer.
+const BROADCAST_SEND_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Push `events` to every subscriber of `view`.
+///
+/// The registry lock is held ONLY to snapshot the current sinks (cheap map
+/// clone of `Arc` handles); the actual socket writes happen outside it, each
+/// under that subscriber's own mutex. So a slow or wedged subscriber can no
+/// longer block broadcasts to other views, new subscribe/unsubscribe, or the
+/// whole event bus — the failure mode the previous single global lock-across-
+/// send created. Dead/timed-out sinks are pruned opportunistically.
 fn broadcast(subs: &Subscribers, view: &str, events: &[Event]) {
     if events.is_empty() {
         return;
     }
-    let mut reg = subs.lock();
-    if let Some(map) = reg.get_mut(view) {
-        let mut dead: Vec<u64> = Vec::new();
-        for (id, s) in map.iter_mut() {
-            for ev in events {
-                if send_event(s, ev).is_err() {
-                    dead.push(*id);
-                    break;
+    let sinks: Vec<(u64, Arc<Mutex<TcpStream>>)> = {
+        let reg = subs.lock();
+        match reg.get(view) {
+            Some(map) => map.iter().map(|(id, s)| (*id, Arc::clone(s))).collect(),
+            None => return,
+        }
+    };
+    let mut dead: Vec<u64> = Vec::new();
+    for (id, sink) in sinks {
+        let mut s = sink.lock();
+        for ev in events {
+            if send_event(&mut s, ev).is_err() {
+                dead.push(id);
+                break;
+            }
+        }
+    }
+    if !dead.is_empty() {
+        let mut reg = subs.lock();
+        if let Some(map) = reg.get_mut(view) {
+            for id in dead {
+                map.remove(&id);
+            }
+        }
+    }
+}
+
+/// Enrich source-coordinate entry events into display-coordinate events for
+/// every derived view that uses `phys` as its base. A derived subscriber
+/// registers under BOTH its own name and the base, so the existing broadcast
+/// to `phys` hits it; however the event's `(parent, name)` is a SOURCE
+/// coordinate. For a relocated entry rendered under a SYNTHESIZED dir the
+/// source coordinate addresses no dentry, leaving a ≤2s stale window. This
+/// helper calls `display_targets` on each derived lens and pushes the extra
+/// display-coordinate events (Entry + Inode) into the derived bucket.
+fn broadcast_derived_display(rt: &MetaRuntime, phys: &str, events: &[Event]) {
+    let derived: Vec<String> = rt
+        .bases
+        .lock()
+        .iter()
+        .filter(|(_, b)| b.as_str() == phys)
+        .map(|(n, _)| n.clone())
+        .filter(|n| n.as_str() != phys)
+        .collect();
+    for dname in derived {
+        // Only enrich if this bucket has actual subscribers.
+        let has_subs = rt.subs.lock().get(&dname).map_or(false, |m| !m.is_empty());
+        if !has_subs {
+            continue;
+        }
+        let prov = rt.views.lock().get(&dname).cloned();
+        let Some(prov) = prov else { continue };
+        let mut extra: Vec<Event> = Vec::new();
+        for ev in events {
+            if let Event::Entry { parent, name } = ev {
+                for (p, dn) in prov.display_targets(*parent, name) {
+                    extra.push(Event::Entry {
+                        parent: p,
+                        name: dn,
+                    });
+                    // Flush the display parent's cached listing (synthesized
+                    // dirs have fixed mtime → pages never self-invalidate).
+                    extra.push(Event::Inode { ino: p });
                 }
             }
         }
-        for id in dead {
-            map.remove(&id);
-        }
+        broadcast(&rt.subs, &dname, &extra);
     }
 }
 
@@ -1699,8 +1773,16 @@ fn serve_subscriber(
 ) -> io::Result<()> {
     let id = NEXT_SUB.fetch_add(1, Ordering::Relaxed);
     let handle = writer.try_clone()?;
+    // Bound the push so a subscriber that stops draining can't wedge the
+    // broadcasting thread (see BROADCAST_SEND_TIMEOUT); a past-timeout send
+    // errors and the sink is pruned by broadcast().
+    handle.set_write_timeout(Some(BROADCAST_SEND_TIMEOUT))?;
+    // One shared per-subscriber sink across every bucket it registers under, so
+    // concurrent broadcasts to THIS socket serialize (frame atomicity) while
+    // other views' delivery stays independent of the global registry lock.
+    let sink = Arc::new(Mutex::new(handle));
     for b in buckets {
-        subs.lock().entry(b.clone()).or_default().insert(id, handle.try_clone()?);
+        subs.lock().entry(b.clone()).or_default().insert(id, Arc::clone(&sink));
     }
     proto::send_response(&mut writer, 0, 0, &[])?; // subscribe ack
     // The client sends no further requests here; drain until it hangs up.
@@ -1922,6 +2004,9 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
             if base != view {
                 broadcast(&rt.subs, &base, &events);
             }
+            // Push display-coordinate invalidations to derived subscribers
+            // whose lens renders relocated entries under synthesized dirs.
+            broadcast_derived_display(&rt, &base, &events);
             // Under HA, also queue the batch for relay to the standby's own
             // subscribers so a client mounted to the standby converges too. The
             // replicator drains this each cycle (<= one REPL_INTERVAL lag).
@@ -1995,6 +2080,7 @@ fn handle_control_conn(
                 let view = proto::get_key(&body, &mut i).unwrap_or_default();
                 if let Ok(evs) = events_from(&body, &mut i) {
                     broadcast(&rt.subs, &view, &evs);
+                    broadcast_derived_display(&rt, &view, &evs);
                 }
                 proto::send_response(writer, 0, 0, &[])?;
             }
@@ -2835,18 +2921,25 @@ fn split_addrs(s: &str) -> Vec<String> {
 /// away. Reconnects with a small bounded backoff across a server restart; stops
 /// permanently only on a fatal token rejection. Spawned by the mount process for
 /// `--meta` mounts; abandoned harmlessly when the process exits at unmount.
+///
+/// `display`: when the client wraps its provider in a local `LayoutMeta` lens
+/// (`--layout FILE`), passing it here lets the listener ALSO translate
+/// source-coordinate events into display coordinates (inval_entry + inval_inode
+/// at the synthesized parent), narrowing the staleness window for relocated
+/// entries from the attr-TTL (~2s) to sub-ms.
 pub fn spawn_invalidation_listener(
     addr: &str,
     view: &str,
     token: &str,
     uid: u32,
     notifier: Notifier,
+    display: Option<Arc<dyn MetaProvider>>,
 ) -> thread::JoinHandle<()> {
     let addr = addr.to_string();
     let view = view.to_string();
     let token = token.to_string();
     thread::spawn(move || loop {
-        match run_event_stream(&addr, &view, &token, uid, &notifier) {
+        match run_event_stream(&addr, &view, &token, uid, &notifier, display.as_ref()) {
             // A rejected token is a config error; retrying can't fix it.
             Err(ref e) if e.kind() == io::ErrorKind::PermissionDenied => {
                 eprintln!("invalidation listener stopped: token rejected");
@@ -2858,7 +2951,14 @@ pub fn spawn_invalidation_listener(
     })
 }
 
-fn run_event_stream(addr: &str, view: &str, token: &str, uid: u32, notifier: &Notifier) -> io::Result<()> {
+fn run_event_stream(
+    addr: &str,
+    view: &str,
+    token: &str,
+    uid: u32,
+    notifier: &Notifier,
+    display: Option<&Arc<dyn MetaProvider>>,
+) -> io::Result<()> {
     let mut s = open_event_stream(addr, view, token, uid)?;
     loop {
         let (kind, val, data) = proto::recv_response(&mut s)?;
@@ -2868,6 +2968,13 @@ fn run_event_stream(addr: &str, view: &str, token: &str, uid: u32, notifier: &No
                 if let Ok(name) = proto::get_key(&data, &mut i) {
                     // A missing/already-evicted entry is harmless; ignore errors.
                     let _ = notifier.inval_entry(INodeNo(val), OsStr::new(&name));
+                    // Display-coordinate enrichment for local-lens mounts:
+                    if let Some(prov) = display {
+                        for (p, dn) in prov.display_targets(val as i64, &name) {
+                            let _ = notifier.inval_entry(INodeNo(p as u64), OsStr::new(&dn));
+                            let _ = notifier.inval_inode(INodeNo(p as u64), 0, -1);
+                        }
+                    }
                 }
             }
             EV_INODE => {

@@ -15,6 +15,14 @@
 //!   `can_read` may open it at all; only uids listed with `can_write` may mutate
 //!   it (create/unlink/rename/write/chmod/...).
 //!
+//! Storage backend follows the metadata store choice:
+//! - Under SQLite (default/embedded): `<base>/meta/acl.db`, one local file.
+//! - Under PostgreSQL (`--store postgres://…`): a shared table
+//!   `grovefs_acl.view_acl` inside the same PG instance that holds the view
+//!   trees. This keeps the entire metadata plane (trees + locks + ACL) in one
+//!   database, simplifying backup, migration and replication: a single
+//!   `pg_dump` captures everything.
+//!
 //! Honest security boundary: the presenting uid is self-reported by the mount
 //! process (`geteuid()`, or an explicit `--as-uid`). Over a trusted LAN this is a
 //! *courtesy* fence against honest-but-different users, not a hard wall — a
@@ -36,15 +44,23 @@ pub struct AclEntry {
     pub can_write: bool,
 }
 
-/// The per-base ACL table, stored in a dedicated `<base>/meta/acl.db` so it is
-/// resolved *before* any individual view db is opened (authorization precedes
-/// selecting the view's storage). Serialized behind a fast mutex like the
-/// metadata engine; a meta-server shares one instance across all connections.
-pub struct AclStore {
-    conn: parking_lot::Mutex<Connection>,
+/// The PG table name for the ACL when stored in PostgreSQL.
+const ACL_PG_TABLE: &str = "grovefs_acl.view_acl";
+
+/// The per-base ACL table. Dispatches to either a local SQLite file or a
+/// PostgreSQL table depending on the metadata backend in use.
+pub enum AclStore {
+    Sqlite {
+        conn: parking_lot::Mutex<Connection>,
+    },
+    Pg {
+        client: parking_lot::Mutex<postgres::Client>,
+    },
 }
 
 impl AclStore {
+    // ---------------------------------------------------------------- SQLite
+
     /// Open (and if necessary initialize) `<base>/meta/acl.db`. Creating the
     /// table is idempotent; an empty table means "no view is restricted".
     pub fn open(base: &Path) -> rusqlite::Result<Self> {
@@ -63,108 +79,232 @@ impl AclStore {
                  PRIMARY KEY (view, uid)
              );",
         )?;
-        Ok(Self {
+        Ok(Self::Sqlite {
             conn: parking_lot::Mutex::new(conn),
         })
     }
 
-    /// A view is "restricted" once it has any whitelist rows; unrestricted views
-    /// are open to everyone (backward-compatible default).
-    ///
-    /// Fail-closed: any query error returns true (treat as restricted) so a
-    /// busy / corrupted acl.db never silently opens a whitelisted view. Under
-    /// the single `parking_lot::Mutex<Connection>` held by `AclStore` and the
-    /// 5 s `busy_timeout` set at open, this branch is practically unreachable
-    /// in normal operation — it exists for the pathological case.
+    // ------------------------------------------------------------- PostgreSQL
+
+    /// Open (and if necessary initialize) the ACL table inside PG.
+    /// Creates schema `grovefs_acl` and table `view_acl` idempotently.
+    pub fn open_pg(conn_uri: &str) -> Result<Self, String> {
+        let client = postgres::Client::connect(conn_uri, postgres::NoTls)
+            .map_err(|e| format!("AclStore::open_pg connect: {e}"))?;
+        let me = Self::Pg {
+            client: parking_lot::Mutex::new(client),
+        };
+        // Idempotent DDL — safe to call on every startup.
+        {
+            let mut c = me.pg_lock();
+            c.batch_execute(
+                "CREATE SCHEMA IF NOT EXISTS grovefs_acl;\n\
+                 CREATE TABLE IF NOT EXISTS grovefs_acl.view_acl (\n\
+                     view       TEXT    NOT NULL,\n\
+                     uid        BIGINT  NOT NULL,\n\
+                     can_read   BOOLEAN NOT NULL,\n\
+                     can_write  BOOLEAN NOT NULL,\n\
+                     PRIMARY KEY (view, uid)\n\
+                 );"
+            ).map_err(|e| format!("AclStore::open_pg DDL: {e}"))?;
+        }
+        Ok(me)
+    }
+
+    fn pg_lock(&self) -> parking_lot::MutexGuard<'_, postgres::Client> {
+        match self {
+            Self::Pg { client } => client.lock(),
+            Self::Sqlite { .. } => panic!("pg_lock called on SQLite AclStore"),
+        }
+    }
+
+    // ---------------------------------------------------------- Dispatch API
+
+    /// Whether `view` has any whitelist rows (i.e. is restricted).
     pub fn is_restricted(&self, view: &str) -> bool {
-        let conn = self.conn.lock();
-        conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM view_acl WHERE view=?1)",
-            params![view],
-            |r| r.get::<_, bool>(0),
-        )
-        .unwrap_or(true)
+        match self {
+            Self::Sqlite { conn } => {
+                let c = conn.lock();
+                c.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM view_acl WHERE view=?1)",
+                    params![view],
+                    |r| r.get::<_, bool>(0),
+                )
+                .unwrap_or(true)
+            }
+            Self::Pg { .. } => {
+                let mut c = self.pg_lock();
+                c.query(
+                    &format!("SELECT EXISTS(SELECT 1 FROM {ACL_PG_TABLE} WHERE view=$1)"),
+                    &[&view],
+                )
+                .map(|rows| rows.first().map(|r| r.get::<_, bool>(0)).unwrap_or(true))
+                .unwrap_or(true)
+            }
+        }
     }
 
-    /// Whether `uid` may open (mount/read) `view`. Semantics:
-    /// - Unrestricted (no rows for the view) → true for any uid.
-    /// - Whitelisted (any row for the view)   → true only if a `(view, uid)`
-    ///   row exists with `can_read = 1`.
-    ///
-    /// Any DB error fails closed (returns `false`) — during a transient
-    /// SQLite lock / corruption we must not silently open a whitelisted view.
+    /// Whether `uid` may open (mount/read) `view`.
     pub fn check_read(&self, view: &str, uid: u32) -> bool {
-        let conn = self.conn.lock();
-        conn.query_row(
-            "SELECT (NOT EXISTS (SELECT 1 FROM view_acl WHERE view=?1))
-                    OR EXISTS (SELECT 1 FROM view_acl
-                               WHERE view=?2 AND uid=?3 AND can_read=1)",
-            params![view, view, uid as i64],
-            |r| r.get::<_, bool>(0),
-        )
-        .unwrap_or(false)
+        let uid_i = uid as i64;
+        match self {
+            Self::Sqlite { conn } => {
+                let c = conn.lock();
+                c.query_row(
+                    "SELECT (NOT EXISTS (SELECT 1 FROM view_acl WHERE view=?1))\n             \n                    OR EXISTS (SELECT 1 FROM view_acl\n             \n                               WHERE view=?2 AND uid=?3 AND can_read=1)",
+                    params![view, view, uid_i],
+                    |r| r.get::<_, bool>(0),
+                )
+                .unwrap_or(false)
+            }
+            Self::Pg { .. } => {
+                let mut c = self.pg_lock();
+                c.query(
+                    &format!(
+                        "SELECT (NOT EXISTS (SELECT 1 FROM {ACL_PG_TABLE} WHERE view=$1))\n             \n                            OR EXISTS (SELECT 1 FROM {ACL_PG_TABLE}\n             \n                                      WHERE view=$2 AND uid=$3 AND can_read)"
+                    ),
+                    &[&view, &view, &uid_i],
+                )
+                .map(|rows| rows.first().map(|r| r.get::<_, bool>(0)).unwrap_or(false))
+                .unwrap_or(false)
+            }
+        }
     }
 
-    /// Whether `uid` may mutate `view`. Unrestricted → true (no write policy).
-    /// Restricted → requires an explicit `can_write=1` row for this uid.
-    /// Fail-closed on any DB error (mirrors [`Self::check_read`]).
+    /// Whether `uid` may mutate `view`.
     pub fn check_write(&self, view: &str, uid: u32) -> bool {
-        let conn = self.conn.lock();
-        conn.query_row(
-            "SELECT (NOT EXISTS (SELECT 1 FROM view_acl WHERE view=?1))
-                    OR EXISTS (SELECT 1 FROM view_acl
-                               WHERE view=?2 AND uid=?3 AND can_write=1)",
-            params![view, view, uid as i64],
-            |r| r.get::<_, bool>(0),
-        )
-        .unwrap_or(false)
+        let uid_i = uid as i64;
+        match self {
+            Self::Sqlite { conn } => {
+                let c = conn.lock();
+                c.query_row(
+                    "SELECT (NOT EXISTS (SELECT 1 FROM view_acl WHERE view=?1))\n             \n                    OR EXISTS (SELECT 1 FROM view_acl\n             \n                               WHERE view=?2 AND uid=?3 AND can_write=1)",
+                    params![view, view, uid_i],
+                    |r| r.get::<_, bool>(0),
+                )
+                .unwrap_or(false)
+            }
+            Self::Pg { .. } => {
+                let mut c = self.pg_lock();
+                c.query(
+                    &format!(
+                        "SELECT (NOT EXISTS (SELECT 1 FROM {ACL_PG_TABLE} WHERE view=$1))\n             \n                            OR EXISTS (SELECT 1 FROM {ACL_PG_TABLE}\n             \n                                      WHERE view=$2 AND uid=$3 AND can_write)"
+                    ),
+                    &[&view, &view, &uid_i],
+                )
+                .map(|rows| rows.first().map(|r| r.get::<_, bool>(0)).unwrap_or(false))
+                .unwrap_or(false)
+            }
+        }
     }
 
-    /// Grant (or replace) `uid`'s read/write access to `view`. At least one of
-    /// read/write should be set for the row to be meaningful, but a row with both
-    /// false is legal: it reserves the whitelist slot (view becomes restricted,
-    /// and this uid is denied) so later `revoke` of others does not reopen it.
-    pub fn allow(&self, view: &str, uid: u32, read: bool, write: bool) -> rusqlite::Result<()> {
-        let conn = self.conn.lock();
-        conn.execute(
-            "INSERT INTO view_acl (view,uid,can_read,can_write) VALUES (?1,?2,?3,?4)
-             ON CONFLICT(view,uid) DO UPDATE SET can_read=excluded.can_read, can_write=excluded.can_write",
-            params![view, uid as i64, read as i64, write as i64],
-        )?;
-        Ok(())
+    /// Grant (or replace) `uid`'s read/write access to `view`.
+    pub fn allow(&self, view: &str, uid: u32, read: bool, write: bool) -> Result<(), AclError> {
+        let uid_i = uid as i64;
+        match self {
+            Self::Sqlite { conn } => {
+                let c = conn.lock();
+                c.execute(
+                    "INSERT INTO view_acl (view,uid,can_read,can_write) VALUES (?1,?2,?3,?4)\n             \n                     ON CONFLICT(view,uid) DO UPDATE SET can_read=excluded.can_read, can_write=excluded.can_write",
+                    params![view, uid_i, read as i64, write as i64],
+                )?;
+                Ok(())
+            }
+            Self::Pg { .. } => {
+                let mut c = self.pg_lock();
+                c.execute(
+                    &format!(
+                        "INSERT INTO {ACL_PG_TABLE} (view,uid,can_read,can_write) VALUES ($1,$2,$3,$4)\n             \n                         ON CONFLICT(view,uid) DO UPDATE SET can_read=EXCLUDED.can_read, can_write=EXCLUDED.can_write"
+                    ),
+                    &[&view, &uid_i, &read, &write],
+                )
+                .map_err(|e| AclError(e.to_string()))?;
+                Ok(())
+            }
+        }
     }
 
-    /// Remove `uid`'s grant from `view`. When the last row for a view is removed
-    /// the view returns to unrestricted (the whitelist is defined by its rows).
-    pub fn revoke(&self, view: &str, uid: u32) -> rusqlite::Result<()> {
-        let conn = self.conn.lock();
-        conn.execute(
-            "DELETE FROM view_acl WHERE view=?1 AND uid=?2",
-            params![view, uid as i64],
-        )?;
-        Ok(())
+    /// Remove `uid`'s grant from `view`.
+    pub fn revoke(&self, view: &str, uid: u32) -> Result<(), AclError> {
+        let uid_i = uid as i64;
+        match self {
+            Self::Sqlite { conn } => {
+                let c = conn.lock();
+                c.execute(
+                    "DELETE FROM view_acl WHERE view=?1 AND uid=?2",
+                    params![view, uid_i],
+                )?;
+                Ok(())
+            }
+            Self::Pg { .. } => {
+                let mut c = self.pg_lock();
+                c.execute(
+                    &format!("DELETE FROM {ACL_PG_TABLE} WHERE view=$1 AND uid=$2"),
+                    &[&view, &uid_i],
+                )
+                .map_err(|e| AclError(e.to_string()))?;
+                Ok(())
+            }
+        }
     }
 
     /// List grants for one view (empty = unrestricted).
     pub fn list(&self, view: &str) -> Vec<AclEntry> {
-        let conn = self.conn.lock();
-        let mut stmt = match conn.prepare(
-            "SELECT uid,can_read,can_write FROM view_acl WHERE view=?1 ORDER BY uid",
-        ) {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-        let rows = match stmt.query_map(params![view], |r| {
-            Ok(AclEntry {
-                uid: r.get::<_, i64>(0)? as u32,
-                can_read: r.get::<_, i64>(1)? == 1,
-                can_write: r.get::<_, i64>(2)? == 1,
-            })
-        }) {
-            Ok(it) => it,
-            Err(_) => return Vec::new(),
-        };
-        rows.filter_map(|x| x.ok()).collect()
+        match self {
+            Self::Sqlite { conn } => {
+                let c = conn.lock();
+                let mut stmt = match c.prepare(
+                    "SELECT uid,can_read,can_write FROM view_acl WHERE view=?1 ORDER BY uid",
+                ) {
+                    Ok(s) => s,
+                    Err(_) => return Vec::new(),
+                };
+                let rows = match stmt.query_map(params![view], |r| {
+                    Ok(AclEntry {
+                        uid: r.get::<_, i64>(0)? as u32,
+                        can_read: r.get::<_, i64>(1)? == 1,
+                        can_write: r.get::<_, i64>(2)? == 1,
+                    })
+                }) {
+                    Ok(it) => it,
+                    Err(_) => return Vec::new(),
+                };
+                rows.filter_map(|x| x.ok()).collect()
+            }
+            Self::Pg { .. } => {
+                let mut c = self.pg_lock();
+                match c.query(
+                    &format!("SELECT uid,can_read,can_write FROM {ACL_PG_TABLE} WHERE view=$1 ORDER BY uid"),
+                    &[&view],
+                ) {
+                    Ok(rows) => rows
+                        .iter()
+                        .map(|r| AclEntry {
+                            uid: r.get::<_, i64>(0) as u32,
+                            can_read: r.get::<_, bool>(1),
+                            can_write: r.get::<_, bool>(2),
+                        })
+                        .collect(),
+                    Err(_) => Vec::new(),
+                }
+            }
+        }
+    }
+}
+
+/// Thin error wrapper so `allow`/`revoke` can be uniform across backends.
+#[derive(Debug)]
+pub struct AclError(pub String);
+
+impl std::fmt::Display for AclError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+impl std::error::Error for AclError {}
+impl From<rusqlite::Error> for AclError {
+    fn from(e: rusqlite::Error) -> Self {
+        AclError(e.to_string())
     }
 }
 

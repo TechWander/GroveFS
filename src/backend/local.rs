@@ -91,17 +91,13 @@ impl StorageBackend for LocalBackend {
 
     fn read(&self, key: &str, offset: u64, len: usize) -> io::Result<Vec<u8>> {
         let fd = self.fd(key, false)?;
-        let cur_len = Self::stat_len(fd)?;
-        if offset >= cur_len {
-            return Ok(Vec::new());
-        }
-        let want = len.min((cur_len - offset) as usize);
-        let mut buf = vec![0u8; want];
+        // pread naturally returns fewer bytes at EOF, so no fstat needed.
+        let mut buf = vec![0u8; len];
         let n = unsafe {
             pread(
                 fd,
                 buf.as_mut_ptr() as *mut c_void,
-                want,
+                len,
                 offset as libc::off_t,
             )
         };
@@ -194,6 +190,11 @@ impl StorageBackend for LocalBackend {
             }
             std::io::Write::write_all(&mut out, &buf[..n])?;
         }
+        // Durably land the bytes before the object is registered as imported:
+        // an interrupted copy otherwise leaves a short object that the metadata
+        // side would still point `data_ref` at (the hard-link path shares the
+        // source inode and needs no flush).
+        out.sync_all()?;
         Ok(Imported::Copied)
     }
 
