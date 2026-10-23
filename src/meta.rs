@@ -281,6 +281,11 @@ impl MetaEngine {
         let _ = conn.execute("ALTER TABLE node ADD COLUMN ino INTEGER", []);
         // Backfill ino for rows inserted before the column existed: one inode per name.
         let _ = conn.execute("UPDATE node SET ino=id WHERE ino IS NULL", []);
+        // Index the inode column AFTER the migration above (so the column is
+        // guaranteed to exist even on a pre-upgrade DB). FUSE `getattr` and every
+        // setattr-path UPDATE key on `ino`, not the rowid `id`; without this index
+        // each is a full table scan. This is the single hottest metadata read.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_node_ino ON node(ino)", [])?;
 
         let has_root: i64 = conn
             .query_row(
@@ -434,8 +439,16 @@ impl MetaEngine {
         gid: u32,
     ) -> Result<i64, MetaError> {
         let t = now();
-        let conn = self.conn.lock();
-        conn.execute(
+        let mut conn = self.conn.lock();
+        // Atomic, exactly like rename/unlink/lock_op: one IMMEDIATE tx wraps the
+        // INSERT *and* the `ino = rowid` back-fill. Two autocommit statements
+        // would let a concurrent reader on a separate WAL connection observe the
+        // row between them with `ino IS NULL` (invisible to `WHERE ino=?`), and a
+        // crash in that window would leave a dangling NULL-ino row until the next
+        // open's back-fill. A failed INSERT (constraint) rolls the tx back and
+        // still surfaces as Exists; the UPDATE's error is propagated, not swallowed.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
             "INSERT INTO node (parent_id,name,is_dir,data_ref,link_target,mode,uid,gid,mtime,atime,ctime)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?9)",
             params![parent, name, is_dir as i64, data_ref, link_target, mode, uid, gid, t],
@@ -448,9 +461,10 @@ impl MetaEngine {
             }
             other => MetaError::Db(other.to_string()),
         })?;
-        let rowid = conn.last_insert_rowid();
+        let rowid = tx.last_insert_rowid();
         // A brand-new name owns a fresh inode: ino == its own row id.
-        let _ = conn.execute("UPDATE node SET ino=?1 WHERE id=?1", params![rowid]);
+        tx.execute("UPDATE node SET ino=?1 WHERE id=?1", params![rowid])?;
+        tx.commit()?;
         Ok(rowid)
     }
 
@@ -961,6 +975,25 @@ pub trait MetaProvider: Send + Sync {
     fn lookup(&self, parent: i64, name: &str) -> Option<NodeInfo>;
     fn getattr(&self, ino: i64) -> Option<NodeInfo>;
     fn readdir(&self, parent: i64) -> Vec<NodeInfo>;
+    /// Extra KERNEL-cache coordinates a change at the SOURCE coordinate
+    /// `(src_parent, name)` implies for this provider's display namespace.
+    ///
+    /// A push invalidation from a `meta-server` always names the real source
+    /// `(parent inode, name)` of a mutated entry, and the kernel only ever
+    /// remembers a dentry by `(display parent inode, display name)`. For a
+    /// pass-through provider those are the same pair, so the default (empty)
+    /// is correct. A presentation lens can render an entry SOMEWHERE ELSE —
+    /// and the one coordinate a source event provably cannot reach is a leaf
+    /// hanging under a *synthesized* scaffolding dir, whose inode exists only
+    /// in the lens. Each returned `(parent, name)` is such an additional
+    /// display coordinate for the given source entry, i.e. one the caller
+    /// should ALSO invalidate (plus, for a synthesized parent, flush its
+    /// cached listing: a virtual dir's mtime never moves, so its directory
+    /// pages cannot self-invalidate and would otherwise hold the stale name
+    /// until the attribute TTL).
+    fn display_targets(&self, _src_parent: i64, _name: &str) -> Vec<(i64, String)> {
+        Vec::new()
+    }
     /// Page `offset..offset+limit` of the same deterministic listing `readdir`
     /// returns. `GroveFS` streams directory replies through this so a big
     /// directory costs one small query per kernel buffer. Engines that page

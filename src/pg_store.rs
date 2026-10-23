@@ -5,7 +5,8 @@
 //! and the central `meta-server` consume, so switching a `meta-server` to PG (or
 //! a local `mount` to PG) is invisible to clients. The view tree, hard links,
 //! refcount GC and POSIX advisory locks behave exactly as on SQLite; only the
-//! storage engine differs.
+//! storage engine differs — and, on this backend, the **write concurrency
+//! model**.
 //!
 //! Mapping from the SQLite schema:
 //! - one `<home>/meta/<view>.db` file  ->  one schema `grovefs_v_<hex(view)>`
@@ -14,10 +15,26 @@
 //!   pinned at id 1 so [`crate::meta::ROOT_INO`] stays valid);
 //! - `INTEGER PRIMARY KEY` (rowid)      ->  `BIGSERIAL PRIMARY KEY`;
 //! - `INSERT OR IGNORE`                 ->  `ON CONFLICT DO NOTHING`;
-//! - `TransactionBehavior::Immediate`   ->  an explicit `BEGIN`/`COMMIT` (the
-//!   engine holds one connection behind a mutex, so a whole logical op is
-//!   serialized the way SQLite's single-writer model already serializes it);
-//! - `busy_timeout` cross-process wait  ->  the mutex + PG's own lock waits.
+//! - `TransactionBehavior::Immediate` + single-writer mutex
+//!   ->  per-op `SERIALIZABLE` transaction on a pooled writer connection,
+//!       with automatic retry on `SQLSTATE 40001 serialization_failure` /
+//!       `40P01 deadlock_detected`. This is the HopsFS route (Sharma et al.,
+//!       FAST'18) implemented on top of PostgreSQL's own SSI (Ports & O'Neil,
+//!       OSDI'12), adapted to a single-cluster deployment: no namespace
+//!       partitioning, no cross-server 2PC.
+//! - `busy_timeout` cross-process wait  ->  SSI retry with bounded exponential
+//!       backoff (200us..25ms, up to 12 attempts).
+//!
+//! Why SERIALIZABLE and not READ COMMITTED: GroveFS's governance invariants
+//! I1–I4 (see §5 of the TOS manuscript) are safety properties about the final
+//! name-space shape — one object per identity, no orphan data_ref, atomically
+//! applied renames, and post-commit visibility. Under a serialisable schedule
+//! every such invariant follows from its truth in *some* serial order — the
+//! standard proof pattern that lets HopsFS/Spanner drop the single-writer
+//! assumption without giving up correctness. Concurrent `create_node` calls on
+//! different parents touch disjoint `(parent_id, name)` rows and never abort;
+//! `rename` walks the source/target rows plus the ancestor chain in one tx and
+//! loses one side of a cycle against a concurrent `rename`, which then retries.
 //!
 //! Honest boundary: the GroveFS-native HA (`--role/--peer/--witness` snapshot
 //! shipping, built on SQLite `VACUUM INTO`) is NOT offered on the PG path —
@@ -97,32 +114,64 @@ fn parse_node(r: &postgres::Row) -> RawNode {
     }
 }
 
-/// A [`MetaProvider`] backed by PostgreSQL. Serialized behind one connection
-/// (`parking_lot::Mutex<Client>`) — a whole metadata op runs under that lock,
-/// exactly as the SQLite engine serializes on its single connection. For
-/// cross-node concurrency the central `meta-server` is the single writer; a
-/// direct `mount` to a shared PG database gets the same behavior as two SQLite
-/// processes sharing a file.
+/// A [`MetaProvider`] backed by PostgreSQL, with **per-op SERIALIZABLE
+/// transactions** checked out from a bounded writer pool. Two writers on
+/// disjoint `(parent_id, name)` rows never block each other; two writers whose
+/// reads/writes overlap get an SSI abort on one side and transparently retry
+/// (see [`PgEngine::with_serial_retry`]). This is the professional scalable-
+/// metadata route pioneered by HopsFS (Sharma et al., FAST'18) and made
+/// practical here by delegating the transactional substrate to PostgreSQL's
+/// own SSI (Ports & O'Neil, OSDI'12) instead of a bespoke FoundationDB stack.
+///
+/// The SQLite [`crate::meta::MetaEngine`] keeps its single-writer mutex
+/// unchanged: a `meta-server` running without `--store` still serialises all
+/// writes for its one view's `.db`, so this change is strictly opt-in and
+/// never regress the embedded path.
 pub struct PgEngine {
     view: String,
     schema: String,
-    /// Kept so we can transparently re-establish the connection after a
+    /// Kept so we can transparently re-establish a connection after a
     /// server-side close / network blip; without this the view becomes
     /// permanently unusable until the meta-server process restarts.
     conn_uri: String,
-    /// The single authoritative *writer* connection. Every mutation runs under
-    /// this mutex, exactly mirroring the SQLite engine's write serialization.
-    client: parking_lot::Mutex<Client>,
+    /// Pool of writer connections, each carrying
+    /// `default_transaction_isolation = 'serializable'` at the session level.
+    /// A [`Self::checkout_writer`] hands one to the calling thread; every
+    /// mutation runs its per-op `Transaction` on that borrowed client, so
+    /// concurrent mutators on disjoint rows genuinely run in parallel PG
+    /// backends. Bounded so a busy meta-server does not exhaust `max_connections`.
+    write_pool: parking_lot::Mutex<Vec<Client>>,
     /// Pooled read connections so concurrent metadata reads (lookup/getattr/
-    /// readdir) fan out instead of queueing behind the writer. A fresh
-    /// PostgreSQL backend started by `Client::connect` sees committed writes
-    /// from `client` in its own read transaction, so read-your-writes holds.
+    /// readdir) fan out at READ COMMITTED (cheaper — no SSI predicate locks)
+    /// instead of queueing behind an SSI writer. A fresh PostgreSQL backend
+    /// started by `Client::connect` sees committed writes in its own read
+    /// transaction, so read-your-writes holds.
     read_pool: parking_lot::Mutex<Vec<Client>>,
 }
+
+/// Number of pooled writer connections per PG view engine. Bounded by
+/// `max_connections` on the server (default 100); a small per-view pool keeps
+/// total backend pressure predictable when the meta-server hosts many views.
+const PG_WRITE_POOL_SIZE: usize = 8;
 
 /// Number of pooled read connections opened per PG view engine, matching the
 /// SQLite engine's [`crate::meta::READ_POOL_SIZE`].
 const PG_READ_POOL_SIZE: usize = 4;
+
+/// Upper bound on SSI retries per write op. Chosen so that a hot rename
+/// contention across 8 writers still terminates within ~1 second while
+/// allowing genuinely-conflicting schedules (usually 2–3 rounds suffice).
+const SERIALIZATION_MAX_ATTEMPTS: u32 = 12;
+
+/// Initial SSI-retry backoff, doubling up to [`SERIALIZATION_BACKOFF_MAX`].
+/// Starting at 200us keeps uncontended retries sub-millisecond; the cap at
+/// 25ms prevents the tail latency from blowing up under sustained contention.
+const SERIALIZATION_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_micros(200);
+const SERIALIZATION_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Session-level pragma applied to every writer connection so PG's default
+/// `BEGIN` (implicit or via `Client::transaction()`) opens under SSI.
+const WRITER_ISOLATION_SQL: &str = "SET default_transaction_isolation = 'serializable'";
 
 impl PgEngine {
     /// Connect to a PostgreSQL server (from a `postgres://user:pw@host/db`
@@ -138,11 +187,21 @@ impl PgEngine {
                 "view name '{view}' incompatible with PG schema naming (empty, or longer than 25 bytes)"
             ))
         })?;
-        let client = Client::connect(conn_uri, NoTls)
-            .map_err(|e| std::io::Error::other(format!("postgres connect: {e}")))?;
+        // Pre-fill the writer pool: every entry carries the session-level
+        // SERIALIZABLE pragma so any `Client::transaction()` inherits SSI.
+        // A failed extra connection just shrinks the pool (writes fall back to
+        // a fresh connect in `checkout_writer`), never fails open().
+        let mut write_pool = Vec::new();
+        for _ in 0..PG_WRITE_POOL_SIZE {
+            if let Ok(mut wc) = Client::connect(conn_uri, NoTls) {
+                if wc.batch_execute(WRITER_ISOLATION_SQL).is_ok() {
+                    write_pool.push(wc);
+                }
+            }
+        }
         // Pre-fill the read pool so the first big-directory scan doesn't pay
-        // connect latency per page. A failed extra connection just shrinks the
-        // pool (reads fall back to fresh-connect or the writer), never open().
+        // connect latency per page. Reads stay at READ COMMITTED (the PG
+        // default) — cheaper and no SSI predicate-lock overhead.
         let mut read_pool = Vec::new();
         for _ in 0..PG_READ_POOL_SIZE {
             if let Ok(rc) = Client::connect(conn_uri, NoTls) {
@@ -153,9 +212,13 @@ impl PgEngine {
             view: view.to_string(),
             schema,
             conn_uri: conn_uri.to_string(),
-            client: parking_lot::Mutex::new(client),
+            write_pool: parking_lot::Mutex::new(write_pool),
             read_pool: parking_lot::Mutex::new(read_pool),
         };
+        // Ensure the schema exists through the normal writer checkout: if
+        // every pool connect above failed, `checkout_writer` opens a fresh
+        // one; a real outage then surfaces as the mapped io_error the caller
+        // already expects.
         this.ensure_schema()?;
         Ok(this)
     }
@@ -191,38 +254,55 @@ impl PgEngine {
         format!("{}.{}", self.schema, table)
     }
 
-    /// Acquire the mutex-guarded [`Client`], transparently reconnecting if the
-    /// server closed the socket (idle-timeout, network blip, PG restart).
-    /// Without this the view becomes permanently unusable after a disconnect,
-    /// because `engine_for` in `remote/meta.rs` never evicts a cached engine.
-    /// Held under the same mutex as every op, so reconnect cannot race with a
-    /// concurrent op.
-    fn conn(&self) -> parking_lot::MutexGuard<'_, Client> {
-        let mut g = self.client.lock();
-        if g.is_closed() {
-            match Client::connect(&self.conn_uri, NoTls) {
-                Ok(fresh) => {
-                    *g = fresh;
-                }
-                Err(e) => {
-                    // Log the reconnect failure and return the still-closed
-                    // client: the caller's op will fail with the mapped db
-                    // error, which is the correct behavior (surfacing the
-                    // outage) rather than silently succeeding on stale state.
-                    eprintln!(
-                        "pg: reconnect for view='{}' failed: {e}",
-                        self.view
-                    );
+    /// Check out a writer connection: prefer one from the pool (transparently
+    /// reconnecting if the pooled client got closed by an idle timeout / PG
+    /// restart), else open a fresh session with the SERIALIZABLE pragma. On
+    /// total outage returns a mapped MetaError so the caller surfaces it.
+    ///
+    /// The returned `Client` is *owned* by the caller and must be handed back
+    /// via [`Self::requeue_writer`] to keep the pool bounded. Not doing so
+    /// leaks one backend per dropped checkout until PG's `max_connections`
+    /// trips — bounded usage makes that pattern visible at review time.
+    fn checkout_writer(&self) -> Result<Client, MetaError> {
+        let pooled = {
+            let mut p = self.write_pool.lock();
+            loop {
+                match p.pop() {
+                    Some(c) if c.is_closed() => continue, // discard stale, try next
+                    Some(c) => break Some(c),
+                    None => break None,
                 }
             }
+        };
+        match pooled {
+            Some(c) => Ok(c),
+            None => {
+                let mut c = Client::connect(&self.conn_uri, NoTls).map_err(|e| map_db_err(&e))?;
+                // Fresh connect may bypass the pooled PRAGMA path; re-arm so
+                // every writer session is guaranteed SERIALIZABLE regardless
+                // of how it entered the pool.
+                let _ = c.batch_execute(WRITER_ISOLATION_SQL);
+                Ok(c)
+            }
         }
-        g
+    }
+
+    /// Return a writer connection to the pool (bounded); drop it if the
+    /// server closed the socket so a stale handle never gets handed out again.
+    fn requeue_writer(&self, c: Client) {
+        if c.is_closed() {
+            return;
+        }
+        let mut p = self.write_pool.lock();
+        if p.len() < PG_WRITE_POOL_SIZE {
+            p.push(c);
+        }
     }
 
     /// Borrow a pooled read connection if one is free (skipping any closed ones
     /// left by a server restart), else open a fresh one. Returns `None` only
-    /// when connecting also fails — the caller then falls back to the writer
-    /// connection, whose reconnect path surfaces the outage as a mapped db error.
+    /// when connecting also fails — the caller then falls back to a checked-out
+    /// writer (see [`Self::with_read`]).
     fn try_read_conn(&self) -> Option<Client> {
         let pooled = {
             let mut p = self.read_pool.lock();
@@ -253,25 +333,32 @@ impl PgEngine {
     }
 
     /// Run one SELECT-only op on a read-pool connection, fanning concurrent
-    /// reads out across the pool. Falls back to the serialized writer only when
-    /// no read connection can be obtained (server down), so behaviour degrades
-    /// to the pre-pool path rather than failing reads that would otherwise work.
-    fn with_read<T>(&self, f: impl FnOnce(&mut Client) -> T) -> T {
-        match self.try_read_conn() {
-            Some(mut c) => {
+    /// reads out across the pool. Falls back to a checked-out writer when no
+    /// read connection can be obtained (server down on the read path), so
+    /// behaviour degrades to the pre-pool path rather than failing reads that
+    /// would otherwise work. `T: Default` lets the total-outage branch return
+    /// an empty/None result rather than propagating an error type that would
+    /// need threading through every read helper.
+    fn with_read<T: Default>(&self, f: impl FnOnce(&mut Client) -> T) -> T {
+        if let Some(mut c) = self.try_read_conn() {
+            let r = f(&mut c);
+            self.requeue_read(c);
+            return r;
+        }
+        match self.checkout_writer() {
+            Ok(mut c) => {
                 let r = f(&mut c);
-                self.requeue_read(c);
+                self.requeue_writer(c);
                 r
             }
-            None => {
-                let mut g = self.conn();
-                f(&mut g)
-            }
+            Err(_) => T::default(),
         }
     }
 
     fn ensure_schema(&self) -> std::io::Result<()> {
-        let mut c = self.conn();
+        let mut c = self
+            .checkout_writer()
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         // CREATE SCHEMA takes the raw identifier (no dots).
         c.batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS {}", self.schema))
             .map_err(io_e)?;
@@ -297,6 +384,7 @@ impl PgEngine {
              );
              CREATE INDEX IF NOT EXISTS node_parent  ON {node}(parent_id);
              CREATE INDEX IF NOT EXISTS node_dataref ON {node}(data_ref);
+             CREATE INDEX IF NOT EXISTS node_ino     ON {node}(ino);
              CREATE TABLE IF NOT EXISTS {ctrl} (k TEXT PRIMARY KEY, v BIGINT NOT NULL);
              CREATE TABLE IF NOT EXISTS {locks} (
                  id          BIGSERIAL PRIMARY KEY,
@@ -335,7 +423,81 @@ impl PgEngine {
             &[],
         )
         .map_err(io_e)?;
+        self.requeue_writer(c);
         Ok(())
+    }
+
+    /// Classify a `postgres::Error` as an SSI retry trigger. Only the two
+    /// server signalled codes are retried transparently: 40001
+    /// `serialization_failure` (SSI abort) and 40P01 `deadlock_detected`
+    /// (traditional deadlock, PG picks one side). Everything else (unique
+    /// violation, foreign key, syntax, connection loss) propagates so callers
+    /// see POSIX-visible errors like `EEXIST` unchanged.
+    fn is_serialization_failure(e: &postgres::Error) -> bool {
+        matches!(
+            e.code(),
+            Some(&postgres::error::SqlState::T_R_SERIALIZATION_FAILURE)
+                | Some(&postgres::error::SqlState::T_R_DEADLOCK_DETECTED)
+        )
+    }
+
+    /// Run one write op as a per-attempt `SERIALIZABLE` transaction on a
+    /// pooled writer, with bounded exponential-backoff retry on SSI abort.
+    ///
+    /// `body` receives a `&mut Transaction` (already opened under the
+    /// session-level SERIALIZABLE pragma applied at pool-entry creation time)
+    /// and returns either:
+    /// - `Ok(v)`             — the helper `commit()`s and returns `Ok(v)`;
+    ///   if commit itself hits 40001 the whole op is retried;
+    /// - `Err(WriteErr::Serialization)` — the tx is dropped (auto-rollback) and
+    ///   the whole body is retried;
+    /// - `Err(WriteErr::Hard(me))`      — the tx is dropped and `me` is
+    ///   propagated unchanged (POSIX-visible failures like `EEXIST`/`ENOTEMPTY`).
+    ///
+    /// Retry budget is [`SERIALIZATION_MAX_ATTEMPTS`] with 200us..25ms
+    /// doubling backoff; on exhaustion a `MetaError::Db` describes the last
+    /// serialization state so operators see a real outage rather than a
+    /// silent stall.
+    fn with_serial_retry<T, F>(&self, mut body: F) -> Result<T, MetaError>
+    where
+        F: FnMut(&mut postgres::Transaction<'_>) -> Result<T, WriteErr>,
+    {
+        let mut delay = SERIALIZATION_BACKOFF_MIN;
+        for attempt in 0..SERIALIZATION_MAX_ATTEMPTS {
+            let mut c = self.checkout_writer()?;
+            let out: Result<T, WriteErr> = (|| {
+                let mut tx = c.transaction().map_err(|e| {
+                    if Self::is_serialization_failure(&e) {
+                        WriteErr::Serialization
+                    } else {
+                        WriteErr::Hard(map_db_err(&e))
+                    }
+                })?;
+                let v = body(&mut tx)?;
+                tx.commit().map_err(|e| {
+                    if Self::is_serialization_failure(&e) {
+                        WriteErr::Serialization
+                    } else {
+                        WriteErr::Hard(map_db_err(&e))
+                    }
+                })?;
+                Ok(v)
+            })();
+            self.requeue_writer(c);
+            match out {
+                Ok(v) => return Ok(v),
+                Err(WriteErr::Hard(me)) => return Err(me),
+                Err(WriteErr::Serialization) => {
+                    std::thread::sleep(delay);
+                    delay = (delay * 2).min(SERIALIZATION_BACKOFF_MAX);
+                    let _ = attempt; // kept for future telemetry hooks
+                }
+            }
+        }
+        Err(MetaError::Db(format!(
+            "serialization retry exhausted after {SERIALIZATION_MAX_ATTEMPTS} attempts (view '{}')",
+            self.view
+        )))
     }
 
     // ---- read paths -------------------------------------------------------
@@ -453,6 +615,14 @@ impl PgEngine {
     }
 
     // ---- write paths ------------------------------------------------------
+    //
+    // Every mutation below runs through [`Self::with_serial_retry`]: one
+    // `SERIALIZABLE` transaction per op, checked out from the writer pool,
+    // retried transparently on `SQLSTATE 40001/40P01`. Two concurrent
+    // `create_node` calls on DIFFERENT parents commit in parallel because
+    // they touch disjoint `(parent_id, name)` rows and PG's SSI does not
+    // consider non-overlapping write sets in conflict; two `rename` calls
+    // whose source/target sets intersect abort one side and re-run it.
 
     #[allow(clippy::too_many_arguments)]
     fn insert(
@@ -469,44 +639,42 @@ impl PgEngine {
         let t = now();
         let node = self.t("node");
         // Insert + set `ino = id` must be atomic: otherwise a mid-op PG
-        // disconnect or crash would leave the row with `ino IS NULL`, which
-        // `parse_node` reads as 0 and breaks every FUSE lookup on that name.
-        // SQLite's version gets this for free because INSERT writes ino in
-        // one statement (`INSERT ... VALUES(..., ino=id)` requires a
-        // two-step there too, so it also lives inside a `Transaction`).
-        let mut c = self.conn();
-        let mut tx = c.transaction().map_err(|e| map_db_err(&e))?;
-        let id: i64 = tx
-            .query(
-                &format!(
-                    "INSERT INTO {node} (parent_id,name,is_dir,data_ref,link_target,mode,uid,gid,mtime,atime,ctime)
-                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9,$9) RETURNING id"
-                ),
-                &[
-                    &parent,
-                    &name,
-                    &(is_dir as i64),
-                    &data_ref,
-                    &link_target,
-                    &(mode as i64),
-                    &(uid as i64),
-                    &(gid as i64),
-                    &t,
-                ],
-            )
-            .map_err(|e| map_db_err(&e))?
-            .into_iter()
-            .next()
-            .map(|r| r.get(0))
-            .ok_or_else(|| MetaError::Db("no RETURNING row".to_string()))?;
-        // Brand-new name owns a fresh inode: ino == id.
-        tx.execute(
-            &format!("UPDATE {node} SET ino=$1 WHERE id=$1"),
-            &[&id],
-        )
-        .map_err(|e| map_db_err(&e))?;
-        tx.commit().map_err(|e| map_db_err(&e))?;
-        Ok(id)
+        // disconnect or SSI abort would leave the row with `ino IS NULL`,
+        // which `parse_node` reads as 0 and breaks every FUSE lookup on
+        // that name. Two simultaneous INSERTs on the same (parent, name) get
+        // either the UNIQUE-violation path (hard `EEXIST`, propagated) or an
+        // SSI abort on the loser (retried — it will then see the row and
+        // hit `EEXIST` on the second attempt).
+        self.with_serial_retry(|tx| {
+            let id: i64 = tx
+                .query(
+                    &format!(
+                        "INSERT INTO {node} (parent_id,name,is_dir,data_ref,link_target,mode,uid,gid,mtime,atime,ctime)
+                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9,$9) RETURNING id"
+                    ),
+                    &[
+                        &parent,
+                        &name,
+                        &(is_dir as i64),
+                        &data_ref,
+                        &link_target,
+                        &(mode as i64),
+                        &(uid as i64),
+                        &(gid as i64),
+                        &t,
+                    ],
+                )?
+                .into_iter()
+                .next()
+                .map(|r| r.get(0))
+                .ok_or_else(|| WriteErr::Hard(MetaError::Db("no RETURNING row".to_string())))?;
+            // Brand-new name owns a fresh inode: ino == id.
+            tx.execute(
+                &format!("UPDATE {node} SET ino=$1 WHERE id=$1"),
+                &[&id],
+            )?;
+            Ok(id)
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -536,43 +704,49 @@ impl PgEngine {
 
     pub fn link_node(&self, src_ino: i64, new_parent: i64, new_name: &str) -> Result<i64, MetaError> {
         let node = self.t("node");
-        let mut c = self.conn();
-        let row = c
-            .query(
-                &format!("SELECT is_dir, data_ref, mode, uid, gid FROM {node} WHERE ino=$1 LIMIT 1"),
-                &[&src_ino],
-            )
-            .map_err(|e| map_db_err(&e))?
-            .into_iter()
-            .next()
-            .ok_or(MetaError::NotFound)?;
-        let is_dir: i64 = row.get::<_, i64>(0);
-        let data_ref: Option<String> = row.get(1);
-        let mode: i64 = row.get(2);
-        let uid: i64 = row.get(3);
-        let gid: i64 = row.get(4);
-        if is_dir == 1 || data_ref.is_none() {
-            return Err(MetaError::OpNotPermitted);
-        }
         let t = now();
-        c.execute(
-            &format!(
-                "INSERT INTO {node} (parent_id,name,is_dir,data_ref,link_target,mode,uid,gid,mtime,atime,ctime,ino)
-                 VALUES ($1,$2,0,$3,NULL,$4,$5,$6,$7,$7,$7,$8)"
-            ),
-            &[
-                &new_parent,
-                &new_name,
-                &data_ref,
-                &mode,
-                &uid,
-                &gid,
-                &t,
-                &src_ino,
-            ],
-        )
-        .map_err(|e| map_db_err(&e))?;
-        Ok(src_ino)
+        // Read-of-source + INSERT of new name now share one SERIALIZABLE tx
+        // (the pre-SSI impl ran them as two autocommit statements on the
+        // mutex-guarded writer, which was safe only because of the mutex).
+        // Under SSI a concurrent `unlink` of the last other name for the same
+        // `src_ino` that commits between our SELECT and our INSERT would be
+        // seen as a rw-dependency and abort one side — the retry then observes
+        // the (now-different) state and correctly reports `ENOENT` or succeeds.
+        self.with_serial_retry(|tx| {
+            let row = tx
+                .query(
+                    &format!("SELECT is_dir, data_ref, mode, uid, gid FROM {node} WHERE ino=$1 LIMIT 1"),
+                    &[&src_ino],
+                )?
+                .into_iter()
+                .next()
+                .ok_or(WriteErr::Hard(MetaError::NotFound))?;
+            let is_dir: i64 = row.get::<_, i64>(0);
+            let data_ref: Option<String> = row.get(1);
+            let mode: i64 = row.get(2);
+            let uid: i64 = row.get(3);
+            let gid: i64 = row.get(4);
+            if is_dir == 1 || data_ref.is_none() {
+                return Err(WriteErr::Hard(MetaError::OpNotPermitted));
+            }
+            tx.execute(
+                &format!(
+                    "INSERT INTO {node} (parent_id,name,is_dir,data_ref,link_target,mode,uid,gid,mtime,atime,ctime,ino)
+                     VALUES ($1,$2,0,$3,NULL,$4,$5,$6,$7,$7,$7,$8)"
+                ),
+                &[
+                    &new_parent,
+                    &new_name,
+                    &data_ref,
+                    &mode,
+                    &uid,
+                    &gid,
+                    &t,
+                    &src_ino,
+                ],
+            )?;
+            Ok(src_ino)
+        })
     }
 
     pub fn rename(
@@ -585,221 +759,251 @@ impl PgEngine {
     ) -> Result<Option<String>, MetaError> {
         let node = self.t("node");
         let t = now();
-        let mut c = self.conn();
-        let mut tx = c.transaction().map_err(|e| MetaError::Db(e.to_string()))?;
-        let (src_id, src_ino): (i64, Option<i64>) = tx
-            .query(
-                &format!("SELECT id, ino FROM {node} WHERE parent_id=$1 AND name=$2"),
-                &[&parent, &name],
-            )
-            .map_err(|e| map_db_err(&e))?
-            .into_iter()
-            .next()
-            .map(|r| (r.get(0), r.get(1)))
-            .ok_or(MetaError::NotFound)?;
-        if is_descendant_tx(&mut tx, &node, new_parent, src_id)? {
-            return Err(MetaError::BadParentCycle);
-        }
-        let tgt: Option<(i64, i64, Option<String>, Option<i64>)> = tx
-            .query(
-                &format!("SELECT id, is_dir, data_ref, ino FROM {node} WHERE parent_id=$1 AND name=$2"),
-                &[&new_parent, &new_name],
-            )
-            .map_err(|e| map_db_err(&e))?
-            .into_iter()
-            .next()
-            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)));
-        // Same-inode renames (rename(a,a) AND a rename between two hard link
-        // names of one file) are POSIX no-ops: without the ino comparison the
-        // DELETE below would drop the target link and shrink nlink. Mirrors
-        // the SQLite engine's guard in [`crate::meta::MetaEngine::rename`].
-        if let Some((tid, _, _, tino)) = &tgt {
-            if *tid == src_id || (tino.is_some() && *tino == src_ino) {
-                tx.commit().map_err(|e| MetaError::Db(e.to_string()))?;
-                return Ok(None);
-            }
-        }
-        if tgt.is_some() && noreplace {
-            return Err(MetaError::Exists);
-        }
-        let mut gc: Option<String> = None;
-        if let Some((tid, is_dir, tgt_ref, _)) = tgt {
-            let src_is_dir: i64 = tx
+        // Full rename stays one transaction end-to-end: SELECT src -> cycle
+        // check -> SELECT tgt -> same-inode no-op -> optional overwrite
+        // DELETE -> UPDATE parent/name. A concurrent rename whose source or
+        // target rows intersect ours will get an SSI abort on one side and
+        // retry, at which point the second attempt sees the committed shape
+        // and returns the correct POSIX outcome (ENOENT / ENOTEMPTY /
+        // EEXIST / success). I1 (single identity) and I2 (visible atomicity)
+        // follow from the schedule being serialisable — no per-op global
+        // writer needed.
+        self.with_serial_retry(|tx| {
+            let (src_id, src_ino): (i64, Option<i64>) = tx
                 .query(
-                    &format!("SELECT is_dir FROM {node} WHERE id=$1"),
-                    &[&src_id],
-                )
-                .map_err(|e| map_db_err(&e))?
+                    &format!("SELECT id, ino FROM {node} WHERE parent_id=$1 AND name=$2"),
+                    &[&parent, &name],
+                )?
                 .into_iter()
                 .next()
-                .map(|r| r.get(0))
-                .unwrap_or(0);
-            if src_is_dir != is_dir {
-                return Err(MetaError::TypeMismatch);
+                .map(|r| (r.get(0), r.get(1)))
+                .ok_or(WriteErr::Hard(MetaError::NotFound))?;
+            if is_descendant_tx(tx, &node, new_parent, src_id)? {
+                return Err(WriteErr::Hard(MetaError::BadParentCycle));
             }
-            if is_dir == 1 {
-                let kids: i64 = tx
+            let tgt: Option<(i64, i64, Option<String>, Option<i64>)> = tx
+                .query(
+                    &format!("SELECT id, is_dir, data_ref, ino FROM {node} WHERE parent_id=$1 AND name=$2"),
+                    &[&new_parent, &new_name],
+                )?
+                .into_iter()
+                .next()
+                .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)));
+            // Same-inode renames (rename(a,a) AND a rename between two hard
+            // link names of one file) are POSIX no-ops: without the ino
+            // comparison the DELETE below would drop the target link and
+            // shrink nlink. Mirrors the SQLite engine's guard in
+            // [`crate::meta::MetaEngine::rename`].
+            if let Some((tid, _, _, tino)) = &tgt {
+                if *tid == src_id || (tino.is_some() && *tino == src_ino) {
+                    return Ok(None);
+                }
+            }
+            if tgt.is_some() && noreplace {
+                return Err(WriteErr::Hard(MetaError::Exists));
+            }
+            let mut gc: Option<String> = None;
+            if let Some((tid, is_dir, tgt_ref, _)) = tgt {
+                let src_is_dir: i64 = tx
                     .query(
-                        &format!("SELECT COUNT(*) FROM {node} WHERE parent_id=$1"),
-                        &[&tid],
-                    )
-                    .map(|rows| rows.first().map(|r| r.get::<_, i64>(0)).unwrap_or(0))
+                        &format!("SELECT is_dir FROM {node} WHERE id=$1"),
+                        &[&src_id],
+                    )?
+                    .into_iter()
+                    .next()
+                    .map(|r| r.get(0))
                     .unwrap_or(0);
-                if kids > 0 {
-                    return Err(MetaError::NotEmpty);
+                if src_is_dir != is_dir {
+                    return Err(WriteErr::Hard(MetaError::TypeMismatch));
+                }
+                if is_dir == 1 {
+                    let kids: i64 = tx
+                        .query(
+                            &format!("SELECT COUNT(*) FROM {node} WHERE parent_id=$1"),
+                            &[&tid],
+                        )?
+                        .first()
+                        .map(|r| r.get::<_, i64>(0))
+                        .unwrap_or(0);
+                    if kids > 0 {
+                        return Err(WriteErr::Hard(MetaError::NotEmpty));
+                    }
+                }
+                tx.execute(
+                    &format!("DELETE FROM {node} WHERE id=$1"),
+                    &[&tid],
+                )?;
+                if let Some(dr) = tgt_ref {
+                    let refs: i64 = tx
+                        .query(
+                            &format!("SELECT COUNT(*) FROM {node} WHERE data_ref=$1"),
+                            &[&dr],
+                        )?
+                        .first()
+                        .map(|r| r.get::<_, i64>(0))
+                        .unwrap_or(0);
+                    if refs == 0 {
+                        gc = Some(dr);
+                    }
                 }
             }
             tx.execute(
-                &format!("DELETE FROM {node} WHERE id=$1"),
-                &[&tid],
-            )
-            .map_err(|e| map_db_err(&e))?;
-            if let Some(dr) = tgt_ref {
-                let refs: i64 = tx
-                    .query(
-                        &format!("SELECT COUNT(*) FROM {node} WHERE data_ref=$1"),
-                        &[&dr],
-                    )
-                    .map(|rows| rows.first().map(|r| r.get::<_, i64>(0)).unwrap_or(0))
-                    .unwrap_or(0);
-                if refs == 0 {
-                    gc = Some(dr);
-                }
-            }
-        }
-        tx.execute(
-            &format!("UPDATE {node} SET parent_id=$1, name=$2, ctime=$3 WHERE id=$4"),
-            &[&new_parent, &new_name, &t, &src_id],
-        )
-        .map_err(|e| map_db_err(&e))?;
-        tx.commit().map_err(|e| MetaError::Db(e.to_string()))?;
-        Ok(gc)
+                &format!("UPDATE {node} SET parent_id=$1, name=$2, ctime=$3 WHERE id=$4"),
+                &[&new_parent, &new_name, &t, &src_id],
+            )?;
+            Ok(gc)
+        })
     }
 
     pub fn unlink(&self, parent: i64, name: &str) -> Result<Option<String>, MetaError> {
         let node = self.t("node");
-        let mut c = self.conn();
-        let mut tx = c.transaction().map_err(|e| MetaError::Db(e.to_string()))?;
-        let row = tx
-            .query(
-                &format!("SELECT id, is_dir, data_ref FROM {node} WHERE parent_id=$1 AND name=$2"),
-                &[&parent, &name],
-            )
-            .map_err(|e| map_db_err(&e))?
-            .into_iter()
-            .next()
-            .ok_or(MetaError::NotFound)?;
-        let id: i64 = row.get(0);
-        let is_dir: i64 = row.get(1);
-        let data_ref: Option<String> = row.get(2);
-        if is_dir == 1 {
-            let kids: i64 = tx
+        // Find -> emptiness check (dirs) -> DELETE -> refcount read is one
+        // tx, so two hardlink names being removed concurrently can never
+        // interleave and either GC a still-referenced object or miss GC of
+        // the last name. The final `refs == 0` read is inside the same
+        // snapshot as the DELETE, so SSI sees the full write set as one
+        // atomic transition.
+        self.with_serial_retry(|tx| {
+            let row = tx
                 .query(
-                    &format!("SELECT COUNT(*) FROM {node} WHERE parent_id=$1"),
-                    &[&id],
-                )
-                .map(|rows| rows.first().map(|r| r.get::<_, i64>(0)).unwrap_or(0))
-                .unwrap_or(0);
-            if kids > 0 {
-                return Err(MetaError::NotEmpty);
-            }
-        }
-        tx.execute(
-            &format!("DELETE FROM {node} WHERE id=$1"),
-            &[&id],
-        )
-        .map_err(|e| map_db_err(&e))?;
-        let gc = match &data_ref {
-            Some(dr) => {
-                let refs: i64 = tx
+                    &format!("SELECT id, is_dir, data_ref FROM {node} WHERE parent_id=$1 AND name=$2"),
+                    &[&parent, &name],
+                )?
+                .into_iter()
+                .next()
+                .ok_or(WriteErr::Hard(MetaError::NotFound))?;
+            let id: i64 = row.get(0);
+            let is_dir: i64 = row.get(1);
+            let data_ref: Option<String> = row.get(2);
+            if is_dir == 1 {
+                let kids: i64 = tx
                     .query(
-                        &format!("SELECT COUNT(*) FROM {node} WHERE data_ref=$1"),
-                        &[&dr],
-                    )
-                    .map(|rows| rows.first().map(|r| r.get::<_, i64>(0)).unwrap_or(0))
+                        &format!("SELECT COUNT(*) FROM {node} WHERE parent_id=$1"),
+                        &[&id],
+                    )?
+                    .first()
+                    .map(|r| r.get::<_, i64>(0))
                     .unwrap_or(0);
-                if refs == 0 {
-                    Some(dr.clone())
-                } else {
-                    None
+                if kids > 0 {
+                    return Err(WriteErr::Hard(MetaError::NotEmpty));
                 }
             }
-            None => None,
-        };
-        tx.commit().map_err(|e| MetaError::Db(e.to_string()))?;
-        Ok(gc)
+            tx.execute(
+                &format!("DELETE FROM {node} WHERE id=$1"),
+                &[&id],
+            )?;
+            let gc = match &data_ref {
+                Some(dr) => {
+                    let refs: i64 = tx
+                        .query(
+                            &format!("SELECT COUNT(*) FROM {node} WHERE data_ref=$1"),
+                            &[&dr],
+                        )?
+                        .first()
+                        .map(|r| r.get::<_, i64>(0))
+                        .unwrap_or(0);
+                    if refs == 0 {
+                        Some(dr.clone())
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            };
+            Ok(gc)
+        })
     }
 
     pub fn touch_mtime(&self, ino: i64) {
         let t = now();
         let node = self.t("node");
-        let mut c = self.conn();
-        let _ = c.execute(
-            &format!("UPDATE {node} SET mtime=$1, ctime=$1 WHERE ino=$2"),
-            &[&t, &ino],
-        );
+        // Single-statement UPDATE. SSI can still abort one side of a
+        // concurrent touch on the same row while a reader holds a
+        // conflicting predicate window, so run it through the retry helper
+        // and drop the mapped error (mirrors the pre-SSI `let _ = ...`
+        // tolerance: a stale mtime is a soft failure, not a POSIX error).
+        let _ = self.with_serial_retry(|tx| {
+            tx.execute(
+                &format!("UPDATE {node} SET mtime=$1, ctime=$1 WHERE ino=$2"),
+                &[&t, &ino],
+            )?;
+            Ok(())
+        });
     }
 
     pub fn set_times(&self, ino: i64, atime: Option<i64>, mtime: Option<i64>) {
         let t = now();
         let node = self.t("node");
-        let mut c = self.conn();
-        if let Some(a) = atime {
-            let _ = c.execute(
-                &format!("UPDATE {node} SET atime=$1, ctime=$2 WHERE ino=$3"),
-                &[&a, &t, &ino],
-            );
-        }
-        if let Some(m) = mtime {
-            let _ = c.execute(
-                &format!("UPDATE {node} SET mtime=$1, ctime=$2 WHERE ino=$3"),
-                &[&m, &t, &ino],
-            );
-        }
+        let _ = self.with_serial_retry(|tx| {
+            if let Some(a) = atime {
+                tx.execute(
+                    &format!("UPDATE {node} SET atime=$1, ctime=$2 WHERE ino=$3"),
+                    &[&a, &t, &ino],
+                )?;
+            }
+            if let Some(m) = mtime {
+                tx.execute(
+                    &format!("UPDATE {node} SET mtime=$1, ctime=$2 WHERE ino=$3"),
+                    &[&m, &t, &ino],
+                )?;
+            }
+            Ok(())
+        });
     }
 
     pub fn set_mode(&self, ino: i64, mode: u32) {
         let t = now();
         let node = self.t("node");
-        let mut c = self.conn();
-        let _ = c.execute(
-            &format!("UPDATE {node} SET mode=$1, ctime=$2 WHERE ino=$3"),
-            &[&(mode as i64), &t, &ino],
-        );
+        let _ = self.with_serial_retry(|tx| {
+            tx.execute(
+                &format!("UPDATE {node} SET mode=$1, ctime=$2 WHERE ino=$3"),
+                &[&(mode as i64), &t, &ino],
+            )?;
+            Ok(())
+        });
     }
 
     pub fn set_uid_gid(&self, ino: i64, uid: u32, gid: u32) {
         let t = now();
         let node = self.t("node");
-        let mut c = self.conn();
-        let _ = c.execute(
-            &format!("UPDATE {node} SET uid=$1, gid=$2, ctime=$3 WHERE ino=$4"),
-            &[&(uid as i64), &(gid as i64), &t, &ino],
-        );
+        let _ = self.with_serial_retry(|tx| {
+            tx.execute(
+                &format!("UPDATE {node} SET uid=$1, gid=$2, ctime=$3 WHERE ino=$4"),
+                &[&(uid as i64), &(gid as i64), &t, &ino],
+            )?;
+            Ok(())
+        });
     }
 
     // ---- HA epoch (present for API parity; GroveFS HA runs SQLite-only) ----
 
     pub fn get_epoch(&self) -> i64 {
         let ctrl = self.t("ctrl");
-        let mut c = self.conn();
-        c.query(&format!("SELECT v FROM {ctrl} WHERE k='epoch'"), &[])
-            .ok()
-            .and_then(|rows| rows.first().map(|r| r.get::<_, i64>(0)))
-            .unwrap_or(0)
+        // Read path: fan out on the read pool (READ COMMITTED is fine here —
+        // the value is only consulted by the SQLite-only HA code and never
+        // gates a governance decision on the PG path).
+        self.with_read(|c| {
+            c.query(&format!("SELECT v FROM {ctrl} WHERE k='epoch'"), &[])
+                .ok()
+                .and_then(|rows| rows.first().map(|r| r.get::<_, i64>(0)))
+                .unwrap_or(0)
+        })
     }
 
     pub fn set_epoch(&self, e: i64) -> std::io::Result<()> {
         let ctrl = self.t("ctrl");
-        let mut c = self.conn();
-        c.execute(
+        // Admin path (only reachable from SQLite-HA code that PG rejects at
+        // startup, so it is effectively dead here): checkout/requeue directly,
+        // no need to build an SSI tx for a one-shot UPSERT.
+        let mut c = self.checkout_writer().map_err(|me| std::io::Error::other(me.to_string()))?;
+        let r = c.execute(
             &format!(
                 "INSERT INTO {ctrl} (k,v) VALUES ('epoch',$1) ON CONFLICT(k) DO UPDATE SET v=excluded.v"
             ),
             &[&e],
-        )
-        .map(|_| ())
-        .map_err(io_e)
+        );
+        self.requeue_writer(c);
+        r.map(|_| ()).map_err(io_e)
     }
 
     /// GroveFS-native HA snapshot is not offered on PG — Postgres replicates
@@ -830,74 +1034,74 @@ impl PgEngine {
     ) -> Result<Option<LockConflict>, MetaError> {
         let locks = self.t("locks");
         let now = now();
-        let mut c = self.conn();
-        let mut tx = c.transaction().map_err(|e| MetaError::Db(e.to_string()))?;
-        tx.execute(
-            &format!("DELETE FROM {locks} WHERE expires_at < $1"),
-            &[&now],
-        )
-        .map_err(|e| map_db_err(&e))?;
-        let s = start.min(i64::MAX as u64) as i64;
-        let e = end.min(i64::MAX as u64) as i64;
-        let owner_i = owner as i64;
-        match ty {
-            LockType::Unlock => {
-                tx.execute(
-                    &format!("DELETE FROM {locks} WHERE ino=$1 AND owner=$2 AND l_start<=$3 AND l_end>=$4"),
-                    &[&ino, &owner_i, &e, &s],
-                )
-                .map_err(|er| map_db_err(&er))?;
-            }
-            LockType::Read | LockType::Write => {
-                let want_write = ty.to_u8() as i64 == 1;
-                let conflict_sql = format!(
-                    "SELECT l_start, l_end, ltype, pid FROM {locks}
-                     WHERE ino=$1 AND owner<>$2 AND l_start<=$3 AND l_end>=$4
-                       AND ($5::bigint = 1 OR ltype = 1) LIMIT 1"
-                );
-                let conflict: Option<(i64, i64, i64, i64)> = tx
-                    .query(
-                        &conflict_sql,
-                        &[&ino, &owner_i, &e, &s, &(want_write as i64)],
-                    )
-                    .map_err(|er| map_db_err(&er))?
-                    .into_iter()
-                    .next()
-                    .map(|r| (r.get(0), r.get(1), r.get::<_, i64>(2), r.get::<_, i64>(3)));
-                if let Some((cs, ce, ct, cp)) = conflict {
-                    return Ok(Some(LockConflict {
-                        start: cs.max(0) as u64,
-                        end: ce.max(0) as u64,
-                        ty: LockType::from_u8(ct as u8).unwrap_or(LockType::Read),
-                        pid: cp as u32,
-                    }));
+        // Lease sweep + conflict SELECT + own-range DELETE + INSERT run in
+        // one SSI tx. Two clients racing for the same (ino, range) get one
+        // side aborted and re-run: the retry then sees the winner's INSERT
+        // and correctly returns the LockConflict (or succeeds if the winner
+        // was for a disjoint range). Locks across DIFFERENT inodes never
+        // conflict because their rows are disjoint.
+        self.with_serial_retry(|tx| {
+            tx.execute(
+                &format!("DELETE FROM {locks} WHERE expires_at < $1"),
+                &[&now],
+            )?;
+            let s = start.min(i64::MAX as u64) as i64;
+            let e = end.min(i64::MAX as u64) as i64;
+            let owner_i = owner as i64;
+            match ty {
+                LockType::Unlock => {
+                    tx.execute(
+                        &format!("DELETE FROM {locks} WHERE ino=$1 AND owner=$2 AND l_start<=$3 AND l_end>=$4"),
+                        &[&ino, &owner_i, &e, &s],
+                    )?;
                 }
-                tx.execute(
-                    &format!("DELETE FROM {locks} WHERE ino=$1 AND owner=$2 AND l_start<=$3 AND l_end>=$4"),
-                    &[&ino, &owner_i, &e, &s],
-                )
-                .map_err(|er| map_db_err(&er))?;
-                tx.execute(
-                    &format!(
-                        "INSERT INTO {locks} (ino,owner,sid,l_start,l_end,pid,ltype,expires_at)
-                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)"
-                    ),
-                    &[
-                        &ino,
-                        &owner_i,
-                        &(sid as i64),
-                        &s,
-                        &e,
-                        &(pid as i64),
-                        &(ty.to_u8() as i64),
-                        &(now + lease_secs()),
-                    ],
-                )
-                .map_err(|er| map_db_err(&er))?;
+                LockType::Read | LockType::Write => {
+                    let want_write = ty.to_u8() as i64 == 1;
+                    let conflict_sql = format!(
+                        "SELECT l_start, l_end, ltype, pid FROM {locks}
+                         WHERE ino=$1 AND owner<>$2 AND l_start<=$3 AND l_end>=$4
+                           AND ($5::bigint = 1 OR ltype = 1) LIMIT 1"
+                    );
+                    let conflict: Option<(i64, i64, i64, i64)> = tx
+                        .query(
+                            &conflict_sql,
+                            &[&ino, &owner_i, &e, &s, &(want_write as i64)],
+                        )?
+                        .into_iter()
+                        .next()
+                        .map(|r| (r.get(0), r.get(1), r.get::<_, i64>(2), r.get::<_, i64>(3)));
+                    if let Some((cs, ce, ct, cp)) = conflict {
+                        return Ok(Some(LockConflict {
+                            start: cs.max(0) as u64,
+                            end: ce.max(0) as u64,
+                            ty: LockType::from_u8(ct as u8).unwrap_or(LockType::Read),
+                            pid: cp as u32,
+                        }));
+                    }
+                    tx.execute(
+                        &format!("DELETE FROM {locks} WHERE ino=$1 AND owner=$2 AND l_start<=$3 AND l_end>=$4"),
+                        &[&ino, &owner_i, &e, &s],
+                    )?;
+                    tx.execute(
+                        &format!(
+                            "INSERT INTO {locks} (ino,owner,sid,l_start,l_end,pid,ltype,expires_at)
+                             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)"
+                        ),
+                        &[
+                            &ino,
+                            &owner_i,
+                            &(sid as i64),
+                            &s,
+                            &e,
+                            &(pid as i64),
+                            &(ty.to_u8() as i64),
+                            &(now + lease_secs()),
+                        ],
+                    )?;
+                }
             }
-        }
-        tx.commit().map_err(|e| MetaError::Db(e.to_string()))?;
-        Ok(None)
+            Ok(None)
+        })
     }
 
     pub fn get_lock(
@@ -912,79 +1116,93 @@ impl PgEngine {
         let now = now();
         let s = start.min(i64::MAX as u64) as i64;
         let e = end.min(i64::MAX as u64) as i64;
-        let mut c = self.conn();
         let want_write = ty.to_u8() as i64 == 1;
-        c.query(
-            &format!(
-                "SELECT l_start, l_end, ltype, pid FROM {locks}
-                 WHERE ino=$1 AND owner<>$2 AND expires_at>=$3 AND l_start<=$4 AND l_end>=$5
-                   AND ($6::bigint = 1 OR ltype = 1) LIMIT 1"
-            ),
-            &[&ino, &(owner as i64), &now, &e, &s, &want_write],
-        )
-        .ok()
-        .and_then(|rows| {
-            rows.into_iter().next().map(|r| {
-                let cs: i64 = r.get(0);
-                let ce: i64 = r.get(1);
-                let ct: i64 = r.get(2);
-                let cp: i64 = r.get(3);
-                LockConflict {
-                    start: cs.max(0) as u64,
-                    end: ce.max(0) as u64,
-                    ty: LockType::from_u8(ct as u8).unwrap_or(LockType::Read),
-                    pid: cp as u32,
-                }
+        // Pure read: fan out on the read pool at READ COMMITTED.
+        self.with_read(|c| {
+            c.query(
+                &format!(
+                    "SELECT l_start, l_end, ltype, pid FROM {locks}
+                     WHERE ino=$1 AND owner<>$2 AND expires_at>=$3 AND l_start<=$4 AND l_end>=$5
+                       AND ($6::bigint = 1 OR ltype = 1) LIMIT 1"
+                ),
+                &[&ino, &(owner as i64), &now, &e, &s, &want_write],
+            )
+            .ok()
+            .and_then(|rows| {
+                rows.into_iter().next().map(|r| {
+                    let cs: i64 = r.get(0);
+                    let ce: i64 = r.get(1);
+                    let ct: i64 = r.get(2);
+                    let cp: i64 = r.get(3);
+                    LockConflict {
+                        start: cs.max(0) as u64,
+                        end: ce.max(0) as u64,
+                        ty: LockType::from_u8(ct as u8).unwrap_or(LockType::Read),
+                        pid: cp as u32,
+                    }
+                })
             })
         })
     }
 
     pub fn release_locks_of_owner(&self, owner: u64) {
         let locks = self.t("locks");
-        let mut c = self.conn();
-        let _ = c.execute(
-            &format!("DELETE FROM {locks} WHERE owner=$1"),
-            &[&(owner as i64)],
-        );
+        let _ = self.with_serial_retry(|tx| {
+            tx.execute(
+                &format!("DELETE FROM {locks} WHERE owner=$1"),
+                &[&(owner as i64)],
+            )?;
+            Ok(())
+        });
     }
 
     pub fn renew_locks(&self, sid: u64) {
         let locks = self.t("locks");
         let now = now();
-        let mut c = self.conn();
-        let _ = c.execute(
-            &format!("UPDATE {locks} SET expires_at=$1 WHERE sid=$2"),
-            &[&(now + lease_secs()), &(sid as i64)],
-        );
+        let _ = self.with_serial_retry(|tx| {
+            tx.execute(
+                &format!("UPDATE {locks} SET expires_at=$1 WHERE sid=$2"),
+                &[&(now + lease_secs()), &(sid as i64)],
+            )?;
+            Ok(())
+        });
     }
 
     pub fn release_locks_of_session(&self, sid: u64) {
         let locks = self.t("locks");
-        let mut c = self.conn();
-        let _ = c.execute(
-            &format!("DELETE FROM {locks} WHERE sid=$1"),
-            &[&(sid as i64)],
-        );
+        let _ = self.with_serial_retry(|tx| {
+            tx.execute(
+                &format!("DELETE FROM {locks} WHERE sid=$1"),
+                &[&(sid as i64)],
+            )?;
+            Ok(())
+        });
     }
 
     pub fn sweep_expired_locks(&self, now_secs: i64) {
         let locks = self.t("locks");
-        let mut c = self.conn();
-        let _ = c.execute(
-            &format!("DELETE FROM {locks} WHERE expires_at < $1"),
-            &[&now_secs],
-        );
+        let _ = self.with_serial_retry(|tx| {
+            tx.execute(
+                &format!("DELETE FROM {locks} WHERE expires_at < $1"),
+                &[&now_secs],
+            )?;
+            Ok(())
+        });
     }
 }
 
 /// Walk ancestors of `new_parent` looking for `src_id`; if we reach it, moving
 /// would create a cycle. Runs inside the rename transaction.
+///
+/// Errors are typed as [`WriteErr`] so the caller's `with_serial_retry` body
+/// can distinguish an SSI abort on the ancestor walk (retry the whole rename)
+/// from a genuine `BadParentCycle` / db failure (propagate to the client).
 fn is_descendant_tx(
-    tx: &mut postgres::Transaction,
+    tx: &mut postgres::Transaction<'_>,
     node: &str,
     new_parent: i64,
     src_id: i64,
-) -> Result<bool, MetaError> {
+) -> Result<bool, WriteErr> {
     let mut cur = new_parent;
     for _ in 0..4096 {
         if cur == src_id {
@@ -994,8 +1212,7 @@ fn is_descendant_tx(
             .query(
                 &format!("SELECT parent_id FROM {node} WHERE id=$1"),
                 &[&cur],
-            )
-            .map_err(|e| map_db_err(&e))?
+            )?
             .into_iter()
             .next()
             .and_then(|r| r.get(0));
@@ -1005,6 +1222,33 @@ fn is_descendant_tx(
         }
     }
     Ok(false)
+}
+
+/// Internal marker returned by [`PgEngine::with_serial_retry`] bodies so the
+/// driver can decide between "retry the whole body with backoff" (SSI abort)
+/// and "propagate to the caller" (POSIX-visible failures such as `EEXIST`,
+/// `ENOTEMPTY`, `EXDEV`, db outage). Not exposed outside this module.
+enum WriteErr {
+    /// SQLSTATE 40001 `serialization_failure` or 40P01 `deadlock_detected`.
+    Serialization,
+    /// Any other error, already mapped to the caller-facing [`MetaError`].
+    Hard(MetaError),
+}
+
+impl From<postgres::Error> for WriteErr {
+    fn from(e: postgres::Error) -> Self {
+        if PgEngine::is_serialization_failure(&e) {
+            WriteErr::Serialization
+        } else {
+            WriteErr::Hard(map_db_err(&e))
+        }
+    }
+}
+
+impl From<MetaError> for WriteErr {
+    fn from(me: MetaError) -> Self {
+        WriteErr::Hard(me)
+    }
 }
 
 fn io_e(e: postgres::Error) -> std::io::Error {

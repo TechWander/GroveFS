@@ -20,9 +20,20 @@
 #   striping    deterministic cross-server data striping (multi --data)
 #   locks       POSIX advisory lock e2e: flock/fcntl/lease/HA-replication
 #   freshness   non-strict cross-client push-invalidation visibility e2e
+#   disp_fresh  display-coordinate freshness e2e: relocated entry under synth parent
+#               converges via enriched push (not TTL); exercises display_targets
 #   acl         optional per-view uid whitelist e2e (read gate + write gate)
-#   layout      presentation overlay e2e: one stored view, per-client lens
+#   import      zero-copy legacy onboarding e2e (hardlink + incremental)
+#   govcheck    governance counterexample study (paper Sec. 7.3): overlay/symlink
+#               vs GroveFS identity-preservation assertions I1-I4 (overlay self-skips if unmountable)
+#   govtime     governance convergence timing (paper Sec. 7.4): hot-reload / push-inval / --retire latencies
+#   grovesci    astronomy "non-landing data" end-to-end case (paper Sec. 7): zero-copy
+#               import + read-only derived data-release + revocable public alias
 #   pg          PostgreSQL metadata backend e2e (self-skips if PG unreachable)
+#   pg_parallel PostgreSQL SERIALIZABLE/SSI parallel-write e2e (self-skips if
+#               PG unreachable); drives three concurrent FUSE clients against
+#               one PG-backed meta-server and asserts parallelism + contention
+#               correctness (paper Sec. 5 I3 + Sec. 9 scalability boundary)
 #   bench   throughput micro-benchmark        (informational; never gates the result)
 #
 # Each suite is time-boxed; every mount-based suite cleans up its own FUSE mount and
@@ -35,7 +46,7 @@ SKIP_BENCH=${SKIP_BENCH:-0}
 LOGDIR=.build-bin/logs/$(date +%Y%m%d-%H%M%S)
 mkdir -p "$LOGDIR"
 
-CANON="build unit posix edge e2e remote errors resilience concurrent metasrv ha striping locks freshness acl layout import pg bench"
+CANON="build unit posix edge e2e remote errors resilience concurrent metasrv ha striping locks freshness disp_fresh acl layout import govcheck govtime grovesci pg pg_parallel bench"
 if [ "$#" -gt 0 ]; then SEL="$*"; else SEL="$CANON"; fi
 [ "$SKIP_BENCH" = "1" ] && SEL=${SEL// bench/}
 
@@ -47,10 +58,10 @@ should(){ case " $SEL " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
 # ensure a fresh binary whenever a code suite is selected
 NEEDS_BUILD=0
-for s in $SEL; do case "$s" in unit|posix|edge|e2e|remote|errors|resilience|concurrent|metasrv|ha|striping|locks|freshness|acl|layout|import|pg|bench) NEEDS_BUILD=1 ;; esac; done
+for s in $SEL; do case "$s" in unit|posix|edge|e2e|remote|errors|resilience|concurrent|metasrv|ha|striping|locks|freshness|disp_fresh|acl|layout|import|govcheck|govtime|grovesci|pg|pg_parallel|bench) NEEDS_BUILD=1 ;; esac; done
 if [ "$NEEDS_BUILD" = 1 ] && ! should build; then SEL="build $SEL"; fi
 
-MOUNTS=".test/mnt_alice .test/mnt_bob .test/mnt_r .ptest/mnt .etest/mnt .xtest/mnt .xtest/mnt_ro .rtest/mnt_a .rtest/mnt_b .ctest/m1 .ctest/m2 .msrv/mnt_a .msrv/mnt_b .msrv/mnt_bob .msrv/mnt_s1 .msrv/mnt_s2 .ltest/mnt_base .ltest/mnt_a .ltest/mnt_b .ltest/mnt_c .ltest/mnt_d .ltest/mnt_srv .ltest/mnt_srvbase .ltest/mnt_ld .itest/mnt .itest/mnt_r .itest/mnt_v .bench/mnt .bt-t1/mnt .bt-t4/mnt .br/mnt .ha/mnt .ha/mnt_sb .striping/mnt .striping/mnt_legacy .sigtest/mnt .locks/m1 .locks/m2 .locks/ha/mnt .fresh/mnt_a .fresh/mnt_b .acl/mnt_rw .acl/mnt_ro .acl/mnt_denied .pgtest/mnt_a .pgtest/mnt_b"
+MOUNTS=".test/mnt_alice .test/mnt_bob .test/mnt_r .ptest/mnt .etest/mnt .xtest/mnt .xtest/mnt_ro .rtest/mnt_a .rtest/mnt_b .ctest/m1 .ctest/m2 .msrv/mnt_a .msrv/mnt_b .msrv/mnt_bob .msrv/mnt_s1 .msrv/mnt_s2 .ltest/mnt_base .ltest/mnt_a .ltest/mnt_b .ltest/mnt_c .ltest/mnt_d .ltest/mnt_srv .ltest/mnt_srvbase .ltest/mnt_ld .govcheck/mnt_base .govcheck/mnt_lens .govcheck/mnt_map .govtime/mnt_base .govtime/mnt_dv .govtime/mnt_al .grovesci/mnt_dr .grovesci/mnt_al .grovesci/mnt_refused .itest/mnt .itest/mnt_r .itest/mnt_v .bench/mnt .bt-t1/mnt .bt-t4/mnt .br/mnt .ha/mnt .ha/mnt_sb .striping/mnt .striping/mnt_legacy .sigtest/mnt .locks/m1 .locks/m2 .locks/ha/mnt .fresh/mnt_a .fresh/mnt_b .dfresh/mntA .dfresh/mntB .acl/mnt_rw .acl/mnt_ro .acl/mnt_denied .pgtest/mnt_a .pgtest/mnt_b .pgpar/mnt_a .pgpar/mnt_b .pgpar/mnt_c"
 umount_all(){ for d in $MOUNTS; do fusermount -u "$d" 2>/dev/null || true; done; }
 umount_all
 trap umount_all EXIT
@@ -136,10 +147,15 @@ for s in $CANON; do
     striping) run_mountsuite striping .build-bin/test_striping.sh 240 ;;
     locks)    run_mountsuite locks   .build-bin/test_locks.sh   240 ;;
     freshness) run_mountsuite freshness .build-bin/test_freshness.sh 240 ;;
+    disp_fresh) run_mountsuite disp_fresh .build-bin/test_disp_fresh.sh 240 ;;
     acl)      run_mountsuite acl .build-bin/test_acl.sh 240 ;;
     layout)   run_mountsuite layout .build-bin/test_layout.sh 240 ;;
-    import)   run_mountsuite import .build-bin/test_import.sh 240 ;;
+    import)   run_mountsuite import   .build-bin/test_import.sh   240 ;;
+    govcheck) run_mountsuite govcheck .build-bin/test_govcheck.sh 240 ;;
+    govtime)  run_mountsuite govtime  .build-bin/test_govtime.sh  240 ;;
+    grovesci) run_mountsuite grovesci .build-bin/test_grovesci.sh 240 ;;
     pg)       run_mountsuite pg .build-bin/test_pg.sh 240 ;;
+    pg_parallel) run_mountsuite pg_parallel .build-bin/test_pg_parallel.sh 300 ;;
     bench)  run_bench ;;
   esac
   echo

@@ -40,7 +40,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub struct GroveFS {
     meta: Arc<dyn MetaProvider>,
     backend: Arc<dyn StorageBackend>,
-    ino_to_key: RwLock<std::collections::HashMap<u64, String>>,
+    ino_to_key: RwLock<std::collections::HashMap<u64, Arc<str>>>,
     /// Last write-path mtime touch per inode, for the `write()` debounce below.
     last_write_touch: RwLock<std::collections::HashMap<u64, SystemTime>>,
     /// When set, every mutating operation is refused with EROFS. This is a
@@ -189,19 +189,20 @@ impl GroveFS {
 
     /// Remember the object key backing an inode.
     fn cache_key(&self, ino: u64, key: &str) {
-        self.ino_to_key.write().insert(ino, key.to_string());
+        self.ino_to_key.write().insert(ino, Arc::from(key));
     }
 
     /// Resolve the object key for an inode: fast in-memory map, falling back to
     /// the metadata engine (then caching it) so a request that races ahead of
     /// `open` — e.g. a writeback flush — still resolves.
-    fn key_for_ino(&self, ino: u64) -> Option<String> {
+    /// Returns `Arc<str>` so the hot path costs a refcount bump, not a heap alloc.
+    fn key_for_ino(&self, ino: u64) -> Option<Arc<str>> {
         if let Some(k) = self.ino_to_key.read().get(&ino) {
-            return Some(k.clone());
+            return Some(Arc::clone(k));
         }
         let k = self.meta.getattr(ino as i64)?.data_ref?;
         self.cache_key(ino, &k);
-        Some(k)
+        Some(Arc::from(k.as_str()))
     }
 
     /// Debounce gate for the write-path mtime touch: takes the timestamp lock
@@ -308,9 +309,10 @@ impl fuser::Filesystem for GroveFS {
                 InitFlags::FUSE_DO_READDIRPLUS | InitFlags::FUSE_READDIRPLUS_AUTO,
             );
         }
-        // Advertise a 1 MiB max write; matches the kernel/FUSE page limit.
-        let _ = config.set_max_write(1 << 20);
-        let _ = config.set_max_readahead(1 << 20);
+        // Advertise a 4 MiB max write/readahead; effective ceiling is bounded by
+        // kernel FUSE_MAX_MAX_PAGES (1 MiB on 5.4, 4 MiB on 6.x+).
+        let _ = config.set_max_write(4 << 20);
+        let _ = config.set_max_readahead(4 << 20);
         Ok(())
     }
 

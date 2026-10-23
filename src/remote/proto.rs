@@ -78,8 +78,17 @@ pub fn is_data_write(op: u8) -> bool {
 }
 
 /// Append a u16-length-prefixed UTF-8 key to `buf`.
+///
+/// The length prefix is a `u16`, so a key longer than 65535 bytes would wrap
+/// and produce a frame the receiver mis-parses. Every legitimate key here is
+/// well under that (a v4 uuid, or a `s<n>:<stripe>:<uuid>` striping key), and
+/// the sole externally-supplied one — the handshake token — is validated at the
+/// connect boundary. The debug_assert pins the invariant for tests/debug builds
+/// so a future caller that violates it fails loudly rather than silently
+/// corrupting a frame; the on-wire format is intentionally left at u16.
 pub fn put_key(buf: &mut Vec<u8>, key: &str) {
     let k = key.as_bytes();
+    debug_assert!(k.len() <= u16::MAX as usize, "put_key: key exceeds u16 length prefix");
     buf.extend_from_slice(&(k.len() as u16).to_be_bytes());
     buf.extend_from_slice(k);
 }

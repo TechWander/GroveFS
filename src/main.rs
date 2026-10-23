@@ -157,12 +157,13 @@ enum Cmd {
         /// Listen address, e.g. 0.0.0.0:50053
         #[arg(short, long, default_value = "127.0.0.1:50053")]
         listen: String,
-        /// Authoritative metadata root for this server: every view DB is
-        /// created under `<db-path>/meta/<view>.db` (lazily, on first open) and
-        /// the per-view ACL lives at `<db-path>/meta/acl.db` (this local SQLite
-        /// store is deliberate — admission state stays outside any PG/replica
-        /// timeline). Takes precedence over the global `--home`, which is kept
-        /// for backward compatibility.
+        /// Authoritative metadata root for this server: under SQLite every
+        /// view DB is created under `<db-path>/meta/<view>.db` (lazily, on
+        /// first open) and the ACL lives at `<db-path>/meta/acl.db`; under
+        /// PostgreSQL (`--store postgres://…`) both the view trees and the
+        /// ACL whitelist live in PG, making `<db-path>` a config-only
+        /// directory (derived-view definitions, logs). Takes precedence over
+        /// the global `--home`, which is kept for backward compatibility.
         #[arg(long)]
         db_path: Option<PathBuf>,
         /// Shared secret clients must present (`mount --token`). When set, the
@@ -242,8 +243,8 @@ enum Cmd {
         /// GroveFS-native HA snapshot shipping is `VACUUM INTO`-based and only
         /// makes sense on the embedded SQLite backend; under PG, run
         /// PostgreSQL's own streaming/logical replication for HA instead.
-        /// The per-view uid whitelist (`acl.db`) stays local SQLite regardless
-        /// of this choice.
+        /// The per-view uid whitelist also migrates to a shared PG table
+        /// (`grovefs_acl.view_acl`), so one `pg_dump` covers everything.
         #[arg(long)]
         store: Option<String>,
     },
@@ -252,8 +253,9 @@ enum Cmd {
         #[arg(short, long)]
         mountpoint: PathBuf,
     },
-    /// Manage the optional per-view uid whitelist (the metadata root's
-    /// `meta/acl.db`, same root as a `meta-server`'s `--db-path`).
+    /// Manage the per-view uid whitelist. Under SQLite the store lives at
+    /// `<db-path>/meta/acl.db`; under PostgreSQL (`--store postgres://…`)
+    /// it lives in the shared table `grovefs_acl.view_acl`.
     /// A view with no rows is unrestricted (any uid, once past the token gate,
     /// may mount); adding any row for a view switches it to whitelist mode.
     Acl {
@@ -263,6 +265,10 @@ enum Cmd {
         /// Falls back to the global `--home` when omitted.
         #[arg(long, global = true)]
         db_path: Option<PathBuf>,
+        /// Connect to a PostgreSQL-backed ACL store instead of local SQLite.
+        /// Must match the `meta-server --store` URI.
+        #[arg(long)]
+        store: Option<String>,
         #[command(subcommand)]
         action: AclAction,
     },
@@ -669,6 +675,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // For a local meta this is a detached 0, so the data gate stays inert.
             let fence_epoch = meta_provider.fence_handle();
             let meta_for_fence = meta_provider.clone();
+            // Keep a display-capable handle for the invalidation listener:
+            // for `--layout` + `--meta`, the lens translates source-coordinate
+            // events into display coordinates at the kernel notifier.
+            let provider_for_events: Option<Arc<dyn MetaProvider>> =
+                if meta.is_some() { Some(meta_provider.clone()) } else { None };
             let fence_refresh: Arc<dyn Fn() -> u64 + Send + Sync> =
                 Arc::new(move || meta_for_fence.fetch_fence_epoch());
             // Pick the data path: remote over our TCP transport (no NFS) when
@@ -786,7 +797,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(addr) = &meta {
                 let notifier = session.notifier();
                 let tok = token.clone().unwrap_or_default();
-                let _listener = remote::spawn_invalidation_listener(addr, &view, &tok, uid, notifier);
+                let _listener = remote::spawn_invalidation_listener(addr, &view, &tok, uid, notifier, provider_for_events);
             }
             spawn_term_unmounter(mountpoint.clone());
             session.run()?;
@@ -840,11 +851,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_fusermount(&["-u", &mountpoint.to_string_lossy()])?;
             println!("unmounted {}", mountpoint.display());
         }
-        Cmd::Acl { db_path, action } => {
+        Cmd::Acl { db_path, store, action } => {
             // `--db-path` (same name/same dir as `meta-server --db-path`) wins;
             // the global `--home` stays as the backward-compatible fallback.
             let acl_base = db_path.unwrap_or_else(|| base.clone());
-            let acl = AclStore::open(&acl_base)?;
+            let acl = match store.as_deref() {
+                Some(uri) if uri.starts_with("postgres://") || uri.starts_with("postgresql://") => {
+                    AclStore::open_pg(uri).map_err(|e| Box::<dyn std::error::Error>::from(e))?
+                }
+                _ => AclStore::open(&acl_base)?,
+            };
             match action {
                 AclAction::Allow { view, uid, read, write } => {
                     acl.allow(&view, uid, read, write)?;

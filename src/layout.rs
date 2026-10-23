@@ -36,9 +36,12 @@
 //! - Path→inode caches expire after a short TTL so out-of-band renames are
 //!   picked up; a local mutation on this mount flushes the resolution caches.
 //! - With a shared `meta-server`, push invalidation events reference SOURCE
-//!   inodes; entries hanging under a synthesized dir can therefore lag up to
-//!   the kernel attr TTL. Combine `--layout` with `--strict` when peers write
-//!   concurrently through different lenses.
+//!   inodes; the lens translates each source entry change into the display
+//!   coordinates it renders at (see [`LayoutMeta::display_targets`]), so even
+//!   a leaf hanging under a synthesized dir converges on the push instead of
+//!   the attribute TTL. The residual TTL-bounded case is a RULE-SET change:
+//!   scaffolding dirs appear/disappear only with the rules, and a rule edit
+//!   converges by server-side hot-reload, not by an entry event.
 
 use crate::meta::{LockConflict, LockType, MetaError, MetaProvider, NodeInfo, ROOT_INO};
 use parking_lot::Mutex;
@@ -50,6 +53,46 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// Resolution-cache lifetime. Matches the FUSE attr/dentry TTL, so the lens is
 /// never staler than what the kernel already caches underneath it.
 const CACHE_TTL: Duration = Duration::from_secs(2);
+
+/// Hard ceilings on the path/inode resolution caches (see [`bound_map`]). TTL
+/// expiry is the normal bound, but an entry is only reclaimed when the SAME
+/// path is looked up again after expiring — a mount that walks a very large,
+/// churning namespace would otherwise keep every distinct path forever. These
+/// caps bound that growth; eviction prefers the stalest entries so the working
+/// set is retained.
+const RESOLVE_CAP: usize = 65_536;
+const SRC_PATH_CAP: usize = 65_536;
+
+/// Enforce a hard ceiling on a `(Instant, _)`-valued TTL map. First drop every
+/// entry already past [`CACHE_TTL`] — the steady-state bound, since a still-used
+/// path is refreshed in place on its next resolve — and only if the map is
+/// STILL over `cap` (extreme churn inside one TTL window) keep the `cap`
+/// freshest entries by their stored resolve timestamp, dropping the rest.
+///
+/// NOTE: this is deliberately eviction-by-RESOLVE-time, not by last-ACCESS.
+/// Bumping the timestamp on a cache hit would make a continuously-read entry
+/// never expire, silently breaking the mandatory freshness contract (an
+/// out-of-band rename must become visible after CACHE_TTL even under sustained
+/// traffic). So we keep the two roles separate: TTL governs staleness, `cap`
+/// governs memory, and stalest-first eviction only kicks in under memory
+/// pressure. O(len) work happens only when already over `cap`, amortizing to a
+/// `len()` check in the common case.
+fn bound_map<K, V>(map: &mut HashMap<K, (Instant, V)>, cap: usize)
+where
+    K: Eq + std::hash::Hash,
+{
+    if map.len() <= cap {
+        return;
+    }
+    map.retain(|_, (at, _)| at.elapsed() < CACHE_TTL);
+    if map.len() <= cap {
+        return;
+    }
+    let mut times: Vec<Instant> = map.values().map(|(at, _)| *at).collect();
+    times.sort();
+    let cutoff = times[times.len() - cap];
+    map.retain(|_, (at, _)| *at >= cutoff);
+}
 
 /// One relocation rule: source path displayed at a destination path.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -459,7 +502,9 @@ impl LayoutMeta {
                     chain.push((cur, acc.clone()));
                 }
                 None => {
-                    self.st.lock().resolve.insert(path.to_string(), (Instant::now(), None));
+                    let mut st = self.st.lock();
+                    st.resolve.insert(path.to_string(), (Instant::now(), None));
+                    bound_map(&mut st.resolve, RESOLVE_CAP);
                     return None;
                 }
             }
@@ -470,6 +515,8 @@ impl LayoutMeta {
             for (ino, p) in chain {
                 st.src_path.insert(ino, (Instant::now(), p));
             }
+            bound_map(&mut st.resolve, RESOLVE_CAP);
+            bound_map(&mut st.src_path, SRC_PATH_CAP);
         }
         Some(cur)
     }
@@ -501,7 +548,11 @@ impl LayoutMeta {
             return None;
         }
         let p = format!("/{}", parts.into_iter().rev().collect::<Vec<_>>().join("/"));
-        self.st.lock().src_path.insert(ino, (Instant::now(), p.clone()));
+        {
+            let mut st = self.st.lock();
+            st.src_path.insert(ino, (Instant::now(), p.clone()));
+            bound_map(&mut st.src_path, SRC_PATH_CAP);
+        }
         Some(p)
     }
 
@@ -513,6 +564,39 @@ impl LayoutMeta {
             return Some(d);
         }
         self.src_path_of(ino)
+    }
+
+    /// The inode this lens would hand the kernel for display path `dp`,
+    /// walking its own `lookup` so synthesized scaffolding is allocated
+    /// exactly as a real traversal would allocate it (the same virtual inode
+    /// number, from the same shared map). `None` when the current rules
+    /// render nothing at that path (filtered away, or not yet resolvable).
+    fn disp_ino_of(&self, dp: &str) -> Option<i64> {
+        let mut cur = ROOT_INO;
+        for c in dp.split('/').filter(|s| !s.is_empty()) {
+            cur = self.lookup(cur, c)?.id;
+        }
+        Some(cur)
+    }
+
+    /// Display coordinates of the entry whose SOURCE path is `src`: one pair
+    /// per relocation rule that renders exactly this entry elsewhere. A leaf
+    /// under a synthesized scaffolding dir is the coordinate a source-event
+    /// invalidation provably cannot reach, which is what this recovers.
+    fn display_spots(&self, src: &str) -> Vec<(i64, String)> {
+        let mut out: Vec<(i64, String)> = Vec::new();
+        for r in &self.rules.reloc {
+            if r.from != src {
+                continue;
+            }
+            let dn = basename(&r.to).to_string();
+            if let Some(p) = self.disp_ino_of(&dirname(&r.to)) {
+                if !out.iter().any(|(i, n)| *i == p && *n == dn) {
+                    out.push((p, dn));
+                }
+            }
+        }
+        out
     }
 
     /// Node for a relocated display leaf: the raw source node rendered with
@@ -709,6 +793,30 @@ impl MetaProvider for LayoutMeta {
             n.parent_id = o.parent_id;
         }
         Some(n)
+    }
+
+    /// See [`MetaProvider::display_targets`]. A relocated entry (`map` moves
+    /// it, `link` mirrors it) renders at `basename(dst)` under `dirname(dst)`;
+    /// when that display parent is a synthesized scaffolding dir, its inode
+    /// appears in NO source event, so a peer's create/remove/rename of the
+    /// source entry leaves the display dentry (and the parent's cached
+    /// listing) stale until the attribute TTL. Reporting the display
+    /// coordinate lets the invalidation push close that window.
+    ///
+    /// Complete by construction: an entry under a REAL display parent keeps
+    /// its source inode identity, so the source `(parent, name)` coordinate
+    /// already addresses its dentry, and scaffolding dirs themselves only
+    /// appear/disappear with the rule set (a rule edit hot-reloads the lens
+    /// server-side and flushes on the next op, not via an entry event).
+    fn display_targets(&self, src_parent: i64, name: &str) -> Vec<(i64, String)> {
+        if self.rules.reloc.is_empty() {
+            return Vec::new();
+        }
+        let sp = match self.src_path_of(src_parent) {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
+        self.display_spots(&jjoin(&sp, name))
     }
 
     fn getattr(&self, ino: i64) -> Option<NodeInfo> {
@@ -1033,5 +1141,42 @@ mod tests {
             LayoutRules::parse_def("base alice\nonly /docs\n"),
             Ok(ViewDef::Derived(b, _)) if b == "alice"
         ));
+    }
+
+    #[test]
+    fn bound_map_drops_expired_before_stalest() {
+        let base = Instant::now();
+        let aged = |ms: u64| base - Duration::from_millis(ms);
+        let expired = || base - CACHE_TTL - Duration::from_secs(1);
+
+        // (1) Under cap is a pure no-op even with an expired entry present.
+        let mut m: HashMap<String, (Instant, i64)> = HashMap::new();
+        m.insert("keep".into(), (expired(), 1));
+        bound_map(&mut m, 8);
+        assert_eq!(m.len(), 1, "under cap must not evict");
+
+        // (2) Over cap: expired entries are reclaimed first; the surviving
+        //     fresh set is within TTL so the stalest-drop step never fires.
+        let mut m: HashMap<String, (Instant, i64)> = HashMap::new();
+        for k in 0..4 {
+            m.insert(format!("e{k}"), (expired(), k));
+        }
+        m.insert("f1".into(), (aged(500), 10));
+        m.insert("f2".into(), (aged(100), 11));
+        bound_map(&mut m, 3);
+        assert_eq!(m.len(), 2, "expired dropped, still under cap after");
+        assert!(m.contains_key("f1") && m.contains_key("f2"));
+
+        // (3) Over cap with everything fresh: keep only the cap freshest by
+        //     resolve timestamp, dropping the stalest.
+        let mut m: HashMap<String, (Instant, i64)> = HashMap::new();
+        m.insert("oldest".into(), (aged(900), 1));
+        m.insert("middle".into(), (aged(500), 2));
+        m.insert("newer".into(), (aged(300), 3));
+        m.insert("newest".into(), (base, 4));
+        bound_map(&mut m, 2);
+        assert_eq!(m.len(), 2);
+        assert!(m.contains_key("newest") && m.contains_key("newer"));
+        assert!(!m.contains_key("oldest") && !m.contains_key("middle"));
     }
 }

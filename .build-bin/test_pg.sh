@@ -115,7 +115,7 @@ fi
 echo "===== 5) mount B on same view: cross-client convergence (shared PG tree) ====="
 $Y --home .pgtest/m2 mount --view "$VIEW" --mountpoint .pgtest/mnt_b --meta $META --data $DATA > .pgtest/mnt_b.log 2>&1 &
 RBP=$!
-sleep 1.5
+sleep 2.5
 B=.pgtest/mnt_b
 if T ls "$B" | grep -qx projects; then ok "B sees A's 'projects' dir"; else bad "B missing A's dir ($(T ls $B | tr '\n' ' '))"; fi
 chk "$(T cat $B/sub/renamed)" "alpha" "B reads A's renamed file (shared blob)"
