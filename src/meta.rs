@@ -19,6 +19,7 @@
 //! size and the same timestamps. Fresh files/dirs get `ino == row id`.
 
 use rusqlite::{params, Connection, OpenFlags, TransactionBehavior};
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -208,6 +209,37 @@ impl Drop for ReadGuard<'_> {
 const COLS: &str =
     "id,parent_id,name,is_dir,data_ref,link_target,mode,uid,gid,mtime,atime,ctime,ino";
 
+/// Run `SELECT <keycol>, COUNT(*) FROM node WHERE <keycol> IN (<keys>) <tail>
+/// GROUP BY <keycol>` over `keys`, folding each `key -> count` into `out`. The
+/// key list is chunked so a statement never exceeds SQLite's bound-variable
+/// limit (a full-directory `readdir` can carry far more ids than that). `tail`
+/// is a fixed, trusted SQL fragment (e.g. `AND is_dir=1`), never user input.
+/// Keys with no matching rows are absent from `out`; the caller applies the
+/// per-field default (0 sub-dirs, or a floor of 1 hard link).
+fn grouped_counts(conn: &Connection, keycol: &str, tail: &str, keys: &[i64], out: &mut HashMap<i64, i64>) {
+    const CHUNK: usize = 500;
+    for chunk in keys.chunks(CHUNK) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!(
+            "SELECT {keycol}, COUNT(*) FROM node WHERE {keycol} IN ({placeholders}) {tail} GROUP BY {keycol}"
+        );
+        let args: Vec<&dyn rusqlite::types::ToSql> =
+            chunk.iter().map(|v| v as &dyn rusqlite::types::ToSql).collect();
+        if let Ok(mut stmt) = conn.prepare_cached(&sql) {
+            if let Ok(rows) = stmt.query_map(args.as_slice(), |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            }) {
+                for row in rows.flatten() {
+                    out.insert(row.0, row.1);
+                }
+            }
+        }
+    }
+}
+
 impl MetaEngine {
     /// Open (and if necessary initialize) the view database for a view.
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
@@ -367,15 +399,16 @@ impl MetaEngine {
             };
             rows.filter_map(|r| r.ok()).collect::<Vec<_>>()
         };
-        raws.into_iter().map(|r| self.finalize(r)).collect()
+        self.finalize_batch(&raws)
     }
 
     /// One slice of the deterministic listing: children in the same
     /// `ORDER BY name` sequence `readdir` uses, starting at `offset` and at most
     /// `limit` rows. Paging is pushed into SQL so replying to one kernel
-    /// READDIR/READDIRPLUS buffer costs O(buffer) instead of re-scanning *and*
-    /// re-finalizing the whole directory (one `COUNT` query per entry) once per
-    /// buffer — the difference between a large directory feeling instant and
+    /// READDIR/READDIRPLUS buffer costs O(buffer) instead of re-scanning the
+    /// whole directory once per buffer; the entries are then finalized together
+    /// by [`Self::finalize_batch`] (a couple of grouped `COUNT`s, not one per
+    /// entry) — the difference between a large directory feeling instant and
     /// taking minutes.
     pub fn readdir_page(&self, parent: i64, offset: usize, limit: usize) -> Vec<NodeInfo> {
         let sql =
@@ -395,7 +428,7 @@ impl MetaEngine {
             };
             rows.filter_map(|r| r.ok()).collect::<Vec<_>>()
         };
-        raws.into_iter().map(|r| self.finalize(r)).collect()
+        self.finalize_batch(&raws)
     }
 
     /// Create a new file/dir node. `data_ref` is Some for files, None for dirs.
@@ -911,13 +944,7 @@ impl MetaEngine {
     /// Compute nlink/size and resolve the node kind. Re-locks the connection,
     /// so callers MUST have already released their own guard.
     fn finalize(&self, raw: RawNode) -> NodeInfo {
-        let kind = if raw.is_dir == 1 {
-            NodeKind::Dir
-        } else if raw.link_target.is_some() {
-            NodeKind::Symlink
-        } else {
-            NodeKind::Regular
-        };
+        let kind = Self::node_kind(&raw);
         let conn = self.read_conn();
         let (nlink, size) = match kind {
             NodeKind::Dir => {
@@ -945,13 +972,32 @@ impl MetaEngine {
                 (links.max(1) as u64, 0u64)
             }
         };
+        Self::build_info(&raw, kind, nlink, size)
+    }
+
+    /// Classify a raw row into a node kind. Shared by the scalar and batched
+    /// finalize paths so the two can never diverge.
+    fn node_kind(raw: &RawNode) -> NodeKind {
+        if raw.is_dir == 1 {
+            NodeKind::Dir
+        } else if raw.link_target.is_some() {
+            NodeKind::Symlink
+        } else {
+            NodeKind::Regular
+        }
+    }
+
+    /// Assemble a `NodeInfo` from a raw row plus the already-computed nlink and
+    /// size. Pure (no store access); the single source of truth for the field
+    /// mapping, used by both finalize paths.
+    fn build_info(raw: &RawNode, kind: NodeKind, nlink: u64, size: u64) -> NodeInfo {
         NodeInfo {
             id: raw.ino,
             parent_id: raw.parent_id.unwrap_or(0),
-            name: raw.name,
+            name: raw.name.clone(),
             kind,
-            data_ref: raw.data_ref,
-            link_target: raw.link_target,
+            data_ref: raw.data_ref.clone(),
+            link_target: raw.link_target.clone(),
             mode: raw.mode as u32,
             uid: raw.uid as u32,
             gid: raw.gid as u32,
@@ -961,6 +1007,53 @@ impl MetaEngine {
             nlink,
             size,
         }
+    }
+
+    /// Finalize a whole directory listing with at most two grouped `COUNT`
+    /// queries — one for every regular file's hard-link count, one for every
+    /// directory's sub-directory count — instead of one `COUNT` per entry.
+    ///
+    /// `readdir`/`readdir_page` map this over the raw rows they already
+    /// fetched, so a listing of N entries used to pay N separate `read_conn()`
+    /// pool borrows and N `COUNT` round-trips (the READDIRPLUS hot spot); now it
+    /// pays a single pool borrow and a constant number of chunked queries.
+    /// Symlinks need no query. Output is identical to mapping the scalar
+    /// [`Self::finalize`] over the same rows: an inode's hard-link count is
+    /// global (`WHERE ino IN (...)`), and a directory's nlink is `2 +` its count
+    /// of directory children.
+    fn finalize_batch(&self, raws: &[RawNode]) -> Vec<NodeInfo> {
+        let mut dir_ids: Vec<i64> = Vec::new();
+        let mut reg_inos: Vec<i64> = Vec::new();
+        for r in raws {
+            match Self::node_kind(r) {
+                NodeKind::Dir => dir_ids.push(r.id),
+                NodeKind::Regular => reg_inos.push(r.ino),
+                NodeKind::Symlink => {}
+            }
+        }
+        let mut nlink_map: HashMap<i64, i64> = HashMap::new();
+        let mut subdir_map: HashMap<i64, i64> = HashMap::new();
+        if !dir_ids.is_empty() || !reg_inos.is_empty() {
+            let conn = self.read_conn();
+            grouped_counts(&conn, "ino", "", &reg_inos, &mut nlink_map);
+            grouped_counts(&conn, "parent_id", "AND is_dir=1", &dir_ids, &mut subdir_map);
+        }
+        raws.iter()
+            .map(|r| {
+                let kind = Self::node_kind(r);
+                let (nlink, size) = match kind {
+                    NodeKind::Dir => (2 + *subdir_map.get(&r.id).unwrap_or(&0) as u64, 4096u64),
+                    NodeKind::Symlink => {
+                        (1, r.link_target.as_ref().map(|s| s.len() as u64).unwrap_or(0))
+                    }
+                    NodeKind::Regular => {
+                        let links = *nlink_map.get(&r.ino).unwrap_or(&1);
+                        (links.max(1) as u64, 0u64)
+                    }
+                };
+                Self::build_info(r, kind, nlink, size)
+            })
+            .collect()
     }
 }
 
@@ -1511,6 +1604,83 @@ mod tests {
         e.unlink(ROOT_INO, "fresh").unwrap();
         assert!(e.lookup(ROOT_INO, "fresh").is_none(), "lookup must see the delete");
         assert!(e.readdir_page(ROOT_INO, 0, 8).is_empty(), "paged readdir must see the delete");
+    }
+
+    /// The batched directory finalize must agree with the scalar one entry-for-
+    /// entry, including the fields it derives by aggregation: hard-linked files
+    /// (a *global* link count keyed on `ino`), directories (nlink = 2 + number
+    /// of directory children), and symlinks (size = target length). `readdir`/
+    /// `readdir_page` take the grouped-query path; `lookup` takes the per-node
+    /// path — comparing the two over one mixed directory is the regression guard
+    /// for collapsing the readdir N+1.
+    #[test]
+    fn finalize_batch_matches_scalar_finalize() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = MetaEngine::open(&dir.path().join("view.db")).unwrap();
+
+        // A directory with three directory children: nlink = 2 + 3 = 5.
+        let d2 = e.create_node(ROOT_INO, "d2", true, None, 0o755, 1000, 1000).unwrap();
+        for n in ["a", "b", "c"] {
+            e.create_node(d2, n, true, None, 0o755, 1000, 1000).unwrap();
+        }
+        // A directory with no directory children: nlink = 2.
+        e.create_node(ROOT_INO, "d0", true, None, 0o755, 1000, 1000).unwrap();
+        // A lone regular file: nlink = 1.
+        e.create_node(ROOT_INO, "solo", false, Some("ksolo"), 0o644, 1000, 1000).unwrap();
+        // A hard-linked pair (same inode, two names): nlink = 2 for both.
+        let hl = e
+            .create_node(ROOT_INO, "hl", false, Some("khl"), 0o644, 1000, 1000)
+            .unwrap();
+        e.link_node(hl, ROOT_INO, "hl2").unwrap();
+        // A symlink: nlink = 1, size = target length.
+        e.create_symlink(ROOT_INO, "sl", "/some/target", 1000, 1000).unwrap();
+
+        // Ground truth for the aggregate fields of the root listing.
+        let expect: HashMap<&str, (u64, u64)> = HashMap::from([
+            ("d2", (5u64, 4096u64)),
+            ("d0", (2, 4096)),
+            ("solo", (1, 0)),
+            ("hl", (2, 0)),
+            ("hl2", (2, 0)),
+            ("sl", (1, "/some/target".len() as u64)),
+        ]);
+
+        let batch = e.readdir(ROOT_INO); // grouped path
+        for n in &batch {
+            if let Some(&(nlink, size)) = expect.get(n.name.as_str()) {
+                assert_eq!(n.nlink, nlink, "batched nlink for {}", n.name);
+                assert_eq!(n.size, size, "batched size for {}", n.name);
+            }
+        }
+        // Grouped (readdir) must equal scalar (lookup) field-for-field.
+        for name in expect.keys() {
+            let b = batch
+                .iter()
+                .find(|n| n.name == *name)
+                .unwrap_or_else(|| panic!("batched missing {name}"));
+            let s = e
+                .lookup(ROOT_INO, name)
+                .unwrap_or_else(|| panic!("scalar missing {name}"));
+            assert_eq!(b.id, s.id, "id {name}");
+            assert_eq!(b.kind, s.kind, "kind {name}");
+            assert_eq!(b.nlink, s.nlink, "nlink {name}");
+            assert_eq!(b.size, s.size, "size {name}");
+        }
+
+        // A hard link in another directory is still counted *globally*: add a
+        // cross-directory alias of `hl` and read the d2 page (grouped path).
+        e.link_node(hl, d2, "hl_elsewhere").unwrap();
+        let paged = e.readdir_page(d2, 0, 16);
+        let alias = paged
+            .iter()
+            .find(|n| n.name == "hl_elsewhere")
+            .expect("cross-directory alias present in the d2 page");
+        assert_eq!(alias.nlink, 3, "global hard-link count (hl + hl2 + hl_elsewhere)");
+        assert_eq!(
+            e.lookup(ROOT_INO, "hl").map(|n| n.nlink),
+            Some(3),
+            "scalar path must agree on the global count"
+        );
     }
 
     /// `GroveFS` keys both the READDIRPLUS negotiation and its fetch chunking off

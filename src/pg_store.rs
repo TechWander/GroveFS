@@ -45,6 +45,7 @@
 
 use crate::meta::{LockConflict, LockType, MetaError, MetaProvider, NodeInfo, NodeKind, ROOT_INO};
 use postgres::{Client, NoTls};
+use std::collections::HashMap;
 use std::path::Path;
 
 /// Default lease for a lock row (seconds), matching [`crate::meta::LockLease`].
@@ -502,16 +503,46 @@ impl PgEngine {
 
     // ---- read paths -------------------------------------------------------
 
-    /// Compute nlink/size for a raw row and produce the NodeInfo. Runs on the
-    /// caller's already-held connection to avoid re-locking.
-    fn finalize(&self, c: &mut Client, raw: RawNode) -> NodeInfo {
-        let kind = if raw.is_dir == 1 {
+    /// Classify a raw row into a node kind. Shared by the scalar and batched
+    /// finalize paths so the two can never diverge.
+    fn node_kind(raw: &RawNode) -> NodeKind {
+        if raw.is_dir == 1 {
             NodeKind::Dir
         } else if raw.link_target.is_some() {
             NodeKind::Symlink
         } else {
             NodeKind::Regular
-        };
+        }
+    }
+
+    /// Assemble a `NodeInfo` from a raw row plus the already-computed nlink and
+    /// size. Pure (no store access); the single source of truth for the field
+    /// mapping, used by both finalize paths.
+    fn build_info(raw: &RawNode, kind: NodeKind, nlink: u64, size: u64) -> NodeInfo {
+        NodeInfo {
+            id: raw.ino,
+            parent_id: raw.parent_id.unwrap_or(0),
+            name: raw.name.clone(),
+            kind,
+            data_ref: raw.data_ref.clone(),
+            link_target: raw.link_target.clone(),
+            mode: raw.mode as u32,
+            uid: raw.uid as u32,
+            gid: raw.gid as u32,
+            mtime: raw.mtime,
+            atime: raw.atime,
+            ctime: raw.ctime,
+            nlink,
+            size,
+        }
+    }
+
+    /// Compute nlink/size for ONE raw row and produce the NodeInfo. Runs on the
+    /// caller's already-held connection to avoid re-locking. The directory-
+    /// listing path uses [`Self::finalize_batch`] instead, which collapses the
+    /// per-row `COUNT` this issues into a single grouped query.
+    fn finalize(&self, c: &mut Client, raw: RawNode) -> NodeInfo {
+        let kind = Self::node_kind(&raw);
         let node = self.t("node");
         let (nlink, size) = match kind {
             NodeKind::Dir => {
@@ -539,22 +570,69 @@ impl PgEngine {
                 (links.max(1) as u64, 0u64)
             }
         };
-        NodeInfo {
-            id: raw.ino,
-            parent_id: raw.parent_id.unwrap_or(0),
-            name: raw.name,
-            kind,
-            data_ref: raw.data_ref,
-            link_target: raw.link_target,
-            mode: raw.mode as u32,
-            uid: raw.uid as u32,
-            gid: raw.gid as u32,
-            mtime: raw.mtime,
-            atime: raw.atime,
-            ctime: raw.ctime,
-            nlink,
-            size,
+        Self::build_info(&raw, kind, nlink, size)
+    }
+
+    /// Finalize a whole directory listing with at most two grouped `COUNT`
+    /// queries — one for every regular file's hard-link count, one for every
+    /// directory's sub-directory count — instead of one `COUNT` per entry. Runs
+    /// on the caller's already-held connection. The key sets are passed as
+    /// arrays via `= ANY($1)`, so a large directory needs no client-side chunking
+    /// (unlike the SQLite engine's `IN (...)`). Symlinks need no query. Output
+    /// is identical to mapping the scalar [`Self::finalize`] over the same rows:
+    /// an inode's hard-link count is global, a directory's nlink is `2 +` its
+    /// count of directory children.
+    fn finalize_batch(&self, c: &mut Client, raws: &[RawNode]) -> Vec<NodeInfo> {
+        let node = self.t("node");
+        let mut dir_ids: Vec<i64> = Vec::new();
+        let mut reg_inos: Vec<i64> = Vec::new();
+        for r in raws {
+            match Self::node_kind(r) {
+                NodeKind::Dir => dir_ids.push(r.id),
+                NodeKind::Regular => reg_inos.push(r.ino),
+                NodeKind::Symlink => {}
+            }
         }
+        let mut nlink_map: HashMap<i64, i64> = HashMap::new();
+        let mut subdir_map: HashMap<i64, i64> = HashMap::new();
+        if !reg_inos.is_empty() {
+            if let Ok(rows) = c.query(
+                &format!("SELECT ino, COUNT(*) FROM {node} WHERE ino = ANY($1) GROUP BY ino"),
+                &[&reg_inos],
+            ) {
+                for r in &rows {
+                    nlink_map.insert(r.get::<_, i64>(0), r.get::<_, i64>(1));
+                }
+            }
+        }
+        if !dir_ids.is_empty() {
+            if let Ok(rows) = c.query(
+                &format!(
+                    "SELECT parent_id, COUNT(*) FROM {node} WHERE parent_id = ANY($1) AND is_dir=1 GROUP BY parent_id"
+                ),
+                &[&dir_ids],
+            ) {
+                for r in &rows {
+                    subdir_map.insert(r.get::<_, i64>(0), r.get::<_, i64>(1));
+                }
+            }
+        }
+        raws.iter()
+            .map(|r| {
+                let kind = Self::node_kind(r);
+                let (nlink, size) = match kind {
+                    NodeKind::Dir => (2 + *subdir_map.get(&r.id).unwrap_or(&0) as u64, 4096u64),
+                    NodeKind::Symlink => {
+                        (1, r.link_target.as_ref().map(|s| s.len() as u64).unwrap_or(0))
+                    }
+                    NodeKind::Regular => {
+                        let links = *nlink_map.get(&r.ino).unwrap_or(&1);
+                        (links.max(1) as u64, 0u64)
+                    }
+                };
+                Self::build_info(r, kind, nlink, size)
+            })
+            .collect()
     }
 
     pub fn lookup(&self, parent: i64, name: &str) -> Option<NodeInfo> {
@@ -592,14 +670,16 @@ impl PgEngine {
                 Err(_) => return Vec::new(),
             };
             let raws: Vec<RawNode> = rows.iter().map(parse_node).collect();
-            raws.into_iter().map(|r| self.finalize(c, r)).collect()
+            self.finalize_batch(c, &raws)
         })
     }
 
     /// Page `offset..offset+limit` of the `ORDER BY name` listing, pushed into
     /// SQL with `LIMIT/OFFSET`. Same O(buffer) win as the SQLite engine: one
-    /// small query and one `finalize` per entry per kernel READDIR buffer, not a
-    /// full re-scan + re-`COUNT` of the whole directory each time.
+    /// small query per kernel READDIR buffer (not a full re-scan of the whole
+    /// directory), with the page's entries finalized together by
+    /// [`Self::finalize_batch`] — a couple of grouped `COUNT`s, not one per
+    /// entry.
     pub fn readdir_page(&self, parent: i64, offset: usize, limit: usize) -> Vec<NodeInfo> {
         let node = self.t("node");
         let sql =
@@ -610,7 +690,7 @@ impl PgEngine {
                 Err(_) => return Vec::new(),
             };
             let raws: Vec<RawNode> = rows.iter().map(parse_node).collect();
-            raws.into_iter().map(|r| self.finalize(c, r)).collect()
+            self.finalize_batch(c, &raws)
         })
     }
 

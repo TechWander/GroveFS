@@ -709,7 +709,7 @@ Sec.~\ref{sec:eval}.
 %% ================================================================== 6-10 stub
 \section{Implementation}
 \label{sec:impl}
-GroveFS is \textasciitilde14k lines of Rust. The lens, remote service and
+GroveFS is \textasciitilde13k lines of Rust. The lens, remote service and
 storage backends are each a module behind the two trait seams
 (Figure~\ref{fig:arch}, sizes in Table~\ref{tab:loc}); we summarise the parts
 that matter to the correctness claims. A governed write resolves the display
@@ -722,14 +722,21 @@ clone\_fd), sound because the filesystem is \texttt{\&self}-safe with all
 per-inode state behind locks. \texttt{init} best-effort negotiates
 \texttt{ASYNC\_READ}, \texttt{BIG\_WRITES}, \texttt{WRITEBACK\_CACHE},
 \texttt{PARALLEL\_DIROPS} and \texttt{POSIX\_LOCKS}/\texttt{FLOCK\_LOCKS}, and
-advertises a 1\,MiB max write and readahead. Under \texttt{WRITEBACK\_CACHE} the
+advertises a 4\,MiB max write and readahead, though the effective ceiling
+remains bounded by the kernel's \texttt{FUSE\_MAX\_MAX\_PAGES} (1\,MiB on the
+5.4 line, 4\,MiB on 6.x and later). Under \texttt{WRITEBACK\_CACHE} the
 kernel flushes dirty pages asynchronously, sometimes after the writer has closed
 the file, so the inode-to-object binding is keyed by the inode rather than the
 transient handle and resolved under a lock, letting late writebacks land
 correctly. \texttt{READDIRPLUS} is offered only when the metadata provider
 supports paged \texttt{readdir} (Sec.~\ref{sec:impl}, SQLite and server
 backends); the derived-view lens does not, and therefore keeps the safe fallback
-of one listing per kernel buffer rather than multiplying full fetches.
+of one listing per kernel buffer rather than multiplying full fetches. Paging
+alone would still resolve each entry's hard-link and sub-directory counts with
+one aggregate query per listing entry; both paged backends instead finalize a
+whole page together, folding those counts into a small constant number of
+grouped queries (an \texttt{IN}/{\texttt{ANY}} \texttt{GROUP BY}) rather than one
+per entry.
 
 \paragraph{Metadata engine.} The local engine is one embedded \texttt{rusqlite}
 database per view (bundled SQLite, no system dependency) with a
@@ -810,12 +817,12 @@ pushed to peers (I3--I4).}
 \toprule
 Module & Responsibility & Lines \\
 \midrule
-\texttt{fs\_impl.rs}   & FUSE callbacks, init negotiation & $\sim$0.96k \\
-\texttt{meta.rs}       & local view tree, hardlinks, GC, locks & $\sim$1.5k \\
-\texttt{layout.rs}     & lens / derived / alias rendering & $\sim$1.0k \\
-\texttt{remote/meta.rs}& authoritative service, notify, HA & $\sim$3.0k \\
-\texttt{pg\_store.rs}   & PostgreSQL provider, SSI write pool & $\sim$1.4k \\
-\texttt{backend/*}     & local / remote / sharded objects & $\sim$0.9k \\
+\texttt{fs\_impl.rs}   & FUSE callbacks, init negotiation & $\sim$1.1k \\
+\texttt{meta.rs}       & local view tree, hardlinks, GC, locks & $\sim$1.7k \\
+\texttt{layout.rs}     & lens / derived / alias rendering & $\sim$1.2k \\
+\texttt{remote/meta.rs}& authoritative service, notify, HA & $\sim$3.2k \\
+\texttt{pg\_store.rs}   & PostgreSQL provider, SSI write pool & $\sim$1.5k \\
+\texttt{backend/*}     & local / remote / sharded objects & $\sim$1.2k \\
 \bottomrule
 \end{tabular}
 \end{table}
