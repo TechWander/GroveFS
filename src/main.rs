@@ -135,6 +135,24 @@ enum Cmd {
         /// flag changes nothing for them.
         #[arg(long)]
         no_readdirplus: bool,
+        /// Opt-in per-stage latency telemetry. When set, the mount records how
+        /// long each phase of a read/write/metadata op takes (key resolve, data
+        /// backend, remote RTT, striping fan-out, SQLite/PG query, SSI retry …)
+        /// into HDR histograms and prints an aggregate p50/p90/p99/max report on
+        /// unmount. Off by default and cheap when off (one relaxed load per site,
+        /// no clock/lock/allocation on the hot path). Diagnostic only — not a
+        /// throughput claim. Also enabled by env `GROVEFS_STATS=1`.
+        #[arg(long)]
+        stats: bool,
+        /// With `--stats`: also append the report to this file periodically and
+        /// on exit (a stable, diff-friendly sink for A/B runs and CI capture).
+        #[arg(long)]
+        stats_file: Option<PathBuf>,
+        /// With `--stats`: rewrite `--stats-file` (or stderr if no file) every
+        /// N seconds while mounted, so a long-running mount can be sampled
+        /// offline without unmounting. 0/unset disables periodic dumping.
+        #[arg(long, default_value_t = 0)]
+        stats_interval: u64,
     },
     /// Run the remote data service (central cluster node) backed by local disk
     DataServer {
@@ -516,8 +534,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             as_uid,
             layout,
             no_readdirplus,
+            stats: stats_on,
+            stats_file,
+            stats_interval,
         } => {
             std::fs::create_dir_all(&mountpoint)?;
+            // ---- opt-in per-stage latency telemetry ----
+            // Enabled by `--stats` OR env `GROVEFS_STATS=1|true`. Off by default,
+            // where every instrument site is a single relaxed load that skips all
+            // work (no clock, lock, or allocation on the hot path). The returned
+            // `ExitDump` guard prints + flushes the aggregate report when the mount
+            // arm returns — including when `session.run()?` bails — so even a
+            // failed mount leaves a triage artifact.
+            let stats_env = std::env::var("GROVEFS_STATS")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            let _stats_dump = if stats_on || stats_env {
+                let interval = if stats_interval > 0 {
+                    Some(std::time::Duration::from_secs(stats_interval))
+                } else {
+                    None
+                };
+                grovefs::stats::enable(stats_file.clone(), interval);
+                if let Some(p) = &stats_file {
+                    println!("telemetry: --stats on, periodic report -> {}", p.display());
+                } else {
+                    println!("telemetry: --stats on, report printed at unmount");
+                }
+                Some(grovefs::stats::ExitDump)
+            } else {
+                None
+            };
             // Effective uid reported to the server / used for local ACL check:
             // `--as-uid` overrides the process euid (advisory).
             let uid = as_uid.unwrap_or_else(|| unsafe { libc::geteuid() });

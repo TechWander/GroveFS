@@ -19,3 +19,4 @@ pub mod layout;
 pub mod meta;
 pub mod pg_store;
 pub mod remote;
+pub mod stats;

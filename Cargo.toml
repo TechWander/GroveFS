@@ -41,6 +41,10 @@ dirs = "5"
 # Pure-Rust (tokio-postgres under the hood, no libpq needed); TLS features off
 # because the backend is reached over a trusted LAN via plain NoTls connections.
 postgres = { version = "0.19", default-features = false }
+# Opt-in per-stage latency telemetry (src/stats.rs): high-dynamic-range histograms
+# for offline bottleneck diagnosis. Pure-Rust, zero deps. Only touched when
+# `--stats` / `GROVEFS_STATS=1` is on; the disabled path costs one atomic load.
+hdrhistogram = "7"
 
 [dev-dependencies]
 # Temp dirs for integration tests (metadata DB, remote data-server backing store)

@@ -11,6 +11,7 @@
 //! - `fsync` uses `fdatasync` semantics via `fsync` on the fd.
 
 use super::{FsStat, Imported, StorageBackend};
+use crate::stats;
 use libc::{close, fstat, fsync, ftruncate, pread, pwrite, statvfs};
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -90,6 +91,7 @@ impl StorageBackend for LocalBackend {
     }
 
     fn read(&self, key: &str, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        let _t = stats::start(stats::Stage::IoLocalRead);
         let fd = self.fd(key, false)?;
         // pread naturally returns fewer bytes at EOF, so no fstat needed.
         let mut buf = vec![0u8; len];
@@ -109,6 +111,7 @@ impl StorageBackend for LocalBackend {
     }
 
     fn write(&self, key: &str, offset: u64, data: &[u8]) -> io::Result<usize> {
+        let _t = stats::start(stats::Stage::IoLocalWrite);
         let fd = self.fd(key, true)?;
         let mut done = 0usize;
         while done < data.len() {
@@ -134,6 +137,7 @@ impl StorageBackend for LocalBackend {
     }
 
     fn len(&self, key: &str) -> io::Result<u64> {
+        let _t = stats::start(stats::Stage::IoLocalLen);
         let fd = self.fd(key, false)?;
         Self::stat_len(fd)
     }

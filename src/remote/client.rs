@@ -31,6 +31,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use crate::stats;
+
 /// Reads at or above this size are split into [`READ_CHUNK`] slices and fetched
 /// concurrently over separate pooled sockets, stitched back in offset order.
 pub const CHUNKED_READ_MIN: usize = 1 << 20;
@@ -210,8 +212,20 @@ impl RemoteBackend {
     /// transparently. A failure on a socket we just opened is propagated (there
     /// is nothing left to retry against).
     fn round_trip(&self, op: u8, body: &[u8]) -> io::Result<(i32, u64, Vec<u8>)> {
-        let (mut s, reused) = self.get_conn()?;
-        match Self::call(&mut s, op, body) {
+        let (mut s, reused) = {
+            let _t = stats::start(stats::Stage::IoRemotePoolWait);
+            self.get_conn()?
+        };
+        let rtt = match op {
+            proto::OP_WRITE => stats::Stage::IoRemoteWrite,
+            proto::OP_LEN => stats::Stage::IoRemoteLen,
+            _ => stats::Stage::IoRemoteRead,
+        };
+        let first = {
+            let _t = stats::start(rtt);
+            Self::call(&mut s, op, body)
+        };
+        match first {
             Ok(r) => {
                 self.put_conn(s);
                 Ok(r)
@@ -264,6 +278,7 @@ impl RemoteBackend {
     /// (each slice already enjoyed its own one-shot stale-pool retry inside
     /// `round_trip`).
     fn read_chunked(&self, key: &str, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        let _t = stats::start(stats::Stage::IoRemoteChunked);
         let slices: Vec<(u64, usize)> = (0..len)
             .step_by(READ_CHUNK)
             .map(|i| (offset + i as u64, (len - i).min(READ_CHUNK)))
@@ -333,6 +348,7 @@ impl RemoteBackend {
     /// concurrently to independent offsets (positional `pwrite` on the server
     /// makes same-file parallel writes safe). Returns the total accepted bytes.
     fn write_chunked(&self, key: &str, offset: u64, data: &[u8]) -> io::Result<usize> {
+        let _t = stats::start(stats::Stage::IoRemoteChunked);
         let slices: Vec<(u64, &[u8])> = data
             .chunks(WRITE_CHUNK)
             .enumerate()

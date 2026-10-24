@@ -20,6 +20,7 @@
 use super::proto;
 use crate::layout::{LayoutMeta, LayoutRules, ViewDef};
 use crate::meta::{LockConflict, LockType, MetaEngine, MetaError, MetaProvider, MetaStore, NodeInfo, NodeKind};
+use crate::stats;
 use fuser::{INodeNo, Notifier};
 use libc::EIO;
 use parking_lot::Mutex;
@@ -532,6 +533,10 @@ impl RemoteMeta {
     /// Send + recv with the same stale-pool recovery as the data client: a
     /// failure on a *reused* socket clears the pool and retries once fresh.
     fn round_trip(&self, op: u8, body: &[u8]) -> io::Result<(i32, u64, Vec<u8>)> {
+        // One metadata RPC end-to-end (checkout + send + recv + any stale-pool
+        // reconnect). Pairs with the data-plane io.remote.* RTTs so an operator
+        // can separate meta-server round-trip cost from data-server cost.
+        let _rpc = stats::start(stats::Stage::RemoteMetaRpc);
         let (mut s, reused) = self.get_conn()?;
         match Self::call(&mut s, op, body) {
             Ok(r) => {
@@ -543,6 +548,10 @@ impl RemoteMeta {
                 if !reused {
                     return Err(first_err);
                 }
+                // A failure on a *reused* socket means the peer died between
+                // handshake and this op — count it as a reconnect (the HA /
+                // restart signal) before re-establishing.
+                stats::count(stats::Counter::RemoteReconnect, 1);
                 self.pool.lock().clear();
                 let (mut s2, _) = self.connect_fresh()?;
                 match Self::call(&mut s2, op, body) {
@@ -1070,6 +1079,7 @@ impl MetaRuntime {
             ha.epoch.store(res.prev_max, Ordering::SeqCst);
             ha.lease_clear();
             self.evict();
+            stats::count(stats::Counter::HaFencing, 1);
             eprintln!("meta HA: fenced at write time (a quorum of {q}/{} arbiters holds {} > our {mine}); demoted to standby, op refused", addrs.len(), res.prev_max);
             true
         } else {
@@ -1628,6 +1638,10 @@ fn broadcast(subs: &Subscribers, view: &str, events: &[Event]) {
         let mut s = sink.lock();
         for ev in events {
             if send_event(&mut s, ev).is_err() {
+                // A sink that can't be drained (write-timeout on a subscriber
+                // that stopped reading, or a dropped socket) is pruned; count it
+                // so a slow/leaky subscriber shows up as a growing signal.
+                stats::count(stats::Counter::BroadcastTimeout, 1);
                 dead.push(id);
                 break;
             }
@@ -2462,6 +2476,7 @@ fn start_replicator(rt: Arc<MetaRuntime>) {
                     ha.lease_clear();
                     rt.evict();
                     *ha.last_peer.lock() = Instant::now();
+                    stats::count(stats::Counter::HaFencing, 1);
                     eprintln!("meta HA: demoted to standby (a quorum of {q}/{} arbiters holds {} > our {mine})", addrs.len(), res.prev_max);
                     continue;
                 }
@@ -2488,6 +2503,7 @@ fn start_replicator(rt: Arc<MetaRuntime>) {
                         ha.lease_clear();
                         rt.evict();
                         *ha.last_peer.lock() = now;
+                        stats::count(stats::Counter::HaQuorumRefuse, 1);
                         eprintln!("meta HA: cannot form lease quorum ({}/{} reachable, need {q}) >{WITNESS_FENCE_GRACE:?}; fail-safe self-demote to standby (cannot prove exclusive authority; refusing to keep writing)", res.reachable, addrs.len());
                         continue;
                     }

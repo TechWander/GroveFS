@@ -44,6 +44,7 @@
 //! flags. Everything else is a drop-in.
 
 use crate::meta::{LockConflict, LockType, MetaError, MetaProvider, NodeInfo, NodeKind, ROOT_INO};
+use crate::stats;
 use postgres::{Client, NoTls};
 use std::collections::HashMap;
 use std::path::Path;
@@ -265,6 +266,11 @@ impl PgEngine {
     /// leaks one backend per dropped checkout until PG's `max_connections`
     /// trips — bounded usage makes that pattern visible at review time.
     fn checkout_writer(&self) -> Result<Client, MetaError> {
+        // Pool-wait window: covers popping a warm writer AND the cold path
+        // where the pool is drained and we pay a full `Client::connect` — that
+        // fresh-connect latency shows up as the PgPoolWait tail, telling an
+        // operator the writer pool is too small for the current concurrency.
+        let _pw = stats::start(stats::Stage::PgPoolWait);
         let pooled = {
             let mut p = self.write_pool.lock();
             loop {
@@ -305,6 +311,7 @@ impl PgEngine {
     /// when connecting also fails — the caller then falls back to a checked-out
     /// writer (see [`Self::with_read`]).
     fn try_read_conn(&self) -> Option<Client> {
+        let _pw = stats::start(stats::Stage::PgPoolWait);
         let pooled = {
             let mut p = self.read_pool.lock();
             loop {
@@ -342,12 +349,14 @@ impl PgEngine {
     /// need threading through every read helper.
     fn with_read<T: Default>(&self, f: impl FnOnce(&mut Client) -> T) -> T {
         if let Some(mut c) = self.try_read_conn() {
+            let _q = stats::start(stats::Stage::PgQuery);
             let r = f(&mut c);
             self.requeue_read(c);
             return r;
         }
         match self.checkout_writer() {
             Ok(mut c) => {
+                let _q = stats::start(stats::Stage::PgQuery);
                 let r = f(&mut c);
                 self.requeue_writer(c);
                 r
@@ -464,6 +473,10 @@ impl PgEngine {
         F: FnMut(&mut postgres::Transaction<'_>) -> Result<T, WriteErr>,
     {
         let mut delay = SERIALIZATION_BACKOFF_MIN;
+        // Total write-transaction latency, retries included: the number that
+        // actually lands on the caller's tail. SSI aborts inflate this well
+        // above PgQuery/PgPoolWait, so comparing the two pinpoints contention.
+        let _txn = stats::start(stats::Stage::PgWriteTxn);
         for attempt in 0..SERIALIZATION_MAX_ATTEMPTS {
             let mut c = self.checkout_writer()?;
             let out: Result<T, WriteErr> = (|| {
@@ -489,9 +502,14 @@ impl PgEngine {
                 Ok(v) => return Ok(v),
                 Err(WriteErr::Hard(me)) => return Err(me),
                 Err(WriteErr::Serialization) => {
+                    // Each SSI/deadlock abort is both a count (how often
+                    // optimistic concurrency is contending) and a timed backoff
+                    // window (how much retry stall that contention costs).
+                    stats::count(stats::Counter::PgSsiRetry, 1);
+                    let _rt = stats::start(stats::Stage::PgSsiRetry);
                     std::thread::sleep(delay);
                     delay = (delay * 2).min(SERIALIZATION_BACKOFF_MAX);
-                    let _ = attempt; // kept for future telemetry hooks
+                    let _ = attempt; // attempts exhausted -> terminal MetaError below
                 }
             }
         }
@@ -636,6 +654,7 @@ impl PgEngine {
     }
 
     pub fn lookup(&self, parent: i64, name: &str) -> Option<NodeInfo> {
+        let _t = stats::start(stats::Stage::MetaLookup);
         let node = self.t("node");
         let sql = format!("SELECT {COLS} FROM {node} WHERE parent_id=$1 AND name=$2");
         self.with_read(|c| {
@@ -649,6 +668,7 @@ impl PgEngine {
     }
 
     pub fn getattr(&self, ino: i64) -> Option<NodeInfo> {
+        let _t = stats::start(stats::Stage::MetaGetattr);
         let node = self.t("node");
         let sql = format!("SELECT {COLS} FROM {node} WHERE ino=$1 LIMIT 1");
         self.with_read(|c| {
@@ -662,6 +682,7 @@ impl PgEngine {
     }
 
     pub fn readdir(&self, parent: i64) -> Vec<NodeInfo> {
+        let _t = stats::start(stats::Stage::MetaReaddir);
         let node = self.t("node");
         let sql = format!("SELECT {COLS} FROM {node} WHERE parent_id=$1 ORDER BY name");
         self.with_read(|c| {
@@ -681,6 +702,7 @@ impl PgEngine {
     /// [`Self::finalize_batch`] — a couple of grouped `COUNT`s, not one per
     /// entry.
     pub fn readdir_page(&self, parent: i64, offset: usize, limit: usize) -> Vec<NodeInfo> {
+        let _t = stats::start(stats::Stage::MetaReaddirPage);
         let node = self.t("node");
         let sql =
             format!("SELECT {COLS} FROM {node} WHERE parent_id=$1 ORDER BY name LIMIT $2 OFFSET $3");
@@ -768,6 +790,7 @@ impl PgEngine {
         uid: u32,
         gid: u32,
     ) -> Result<i64, MetaError> {
+        let _t = stats::start(stats::Stage::MetaCreate);
         self.insert(parent, name, is_dir, data_ref, None, mode, uid, gid)
     }
 
@@ -779,10 +802,12 @@ impl PgEngine {
         uid: u32,
         gid: u32,
     ) -> Result<i64, MetaError> {
+        let _t = stats::start(stats::Stage::MetaCreate);
         self.insert(parent, name, false, None, Some(target), 0o0777, uid, gid)
     }
 
     pub fn link_node(&self, src_ino: i64, new_parent: i64, new_name: &str) -> Result<i64, MetaError> {
+        let _t = stats::start(stats::Stage::MetaCreate);
         let node = self.t("node");
         let t = now();
         // Read-of-source + INSERT of new name now share one SERIALIZABLE tx
@@ -837,6 +862,7 @@ impl PgEngine {
         new_name: &str,
         noreplace: bool,
     ) -> Result<Option<String>, MetaError> {
+        let _t = stats::start(stats::Stage::MetaRename);
         let node = self.t("node");
         let t = now();
         // Full rename stays one transaction end-to-end: SELECT src -> cycle
@@ -936,6 +962,7 @@ impl PgEngine {
     }
 
     pub fn unlink(&self, parent: i64, name: &str) -> Result<Option<String>, MetaError> {
+        let _t = stats::start(stats::Stage::MetaUnlink);
         let node = self.t("node");
         // Find -> emptiness check (dirs) -> DELETE -> refcount read is one
         // tx, so two hardlink names being removed concurrently can never

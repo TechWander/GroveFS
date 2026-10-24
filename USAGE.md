@@ -32,6 +32,7 @@
 | **以指定身份挂载** — ACL 按此 uid 判定读写 | `--as-uid <uid>` |
 | **只读 / 零缓存强一致** — 挂载为只读 / 关闭客户端缓存 | `--ro` / `--strict` |
 | **目录列举提速的回退开关** — 关掉 READDIRPLUS（随目录项一并带回属性），退回普通 READDIR + 逐条 `LOOKUP`，仅供 A/B 与兼容排障（只有 provider 能在自己存储里分页的挂载才协商 READDIRPLUS：本地 `--home` 的 SQLite/PG，以及对接能分页的 `meta-server` 的远端挂载；派生/透镜视图与老服务端本来就不协商） | `--no-readdirplus` |
+| **分阶段延迟遥测** — opt-in 记录读/写/元数据各阶段耗时(离线聚合 p50/p90/p99/max 排障定位瓶颈；退出打印 + 周期落盘 + 隐藏节点 `.grove-stats`；非吞吐声明) | `--stats` / `--stats-file <路径>` / `--stats-interval <秒>` / `GROVEFS_STATS=1`(详见 §8.1) |
 
 ### 关于 `--view` 与路径容量
 
@@ -443,6 +444,28 @@ $Y --home $BASE mount --view alice --mountpoint /mnt/alice_ro --ro
 - **作用范围**(与上条同口径):只读连接池与 SQL 分页现在两个存储引擎上都——SQLite `MetaEngine` 与 PG `PgEngine`(各 4 连接只读池)。本地 `--home`(SQLite 或 PG)吃满分页与 PLUS;`meta-server` 侧并发 RPC 处理器吃各自后端读池,且 `M_READDIRP` 帧把分页下推到服务端,远端客户端每缓冲只取一页并协商 PLUS(同数据集远端实测 ~54s → 2.29s)。仍走 trait 默认实现(每缓冲一次全量列表、不协商 PLUS)的只有 `--layout`/派生视图的 `LayoutMeta`(隐藏/映射形状无法表示为单条 SQL 页)与对接不含该能力位的老 `meta-server`(`M_OPEN` ack 无第二字节则回退)。元数据**写**并行(多权威)仍未做。判据由 `cargo test` 内 `store_level_paging_is_advertised_only_by_providers_that_page_in_sql` 钉住。
 - `--no-readdirplus`:关闭 READDIRPLUS 协商,回退普通 READDIR+逐条 `LOOKUP`,供 A/B 基准与兼容性排障(不认该能力的老内核自然就是此行为;provider 不能自身分页的挂载——派生/透镜视图与老服务端——本来也不协商,此开关对它们为空操作)。
 - `--o allow_other` 等额外 fuser 选项透传给挂载。
+
+### 8.1 分阶段延迟遥测(opt-in,排查瓶颈用)
+
+挂载时加 `--stats` 可开启**分阶段延迟遥测**:它把一次读/写/元数据操作在各阶段的耗时分别记录进 HDR 直方图,离线聚合出 p50/p90/p99/max,用来**定位瓶颈到底在哪一段**(键解析 vs 数据后端 vs 远端 TCP 往返 vs 条带扇出 vs SQLite/PG 查询 vs SSI 重试…),而不是只看一个总墙钟。这是**白盒诊断设施,不是吞吐/可扩展性声明**——关掉时每个埋点仅一次 relaxed 原子读即跳过(不取时钟、不加锁、不分配),对热路径无可测影响。
+
+```bash
+# 卸载时把汇总报告打到 stderr(挂载进程 stderr)
+$Y mount --view alice -m /mnt/alice --stats
+# 额外周期性 + 退出时原子落盘到文件(CI/长时间采样)
+$Y mount --view alice -m /mnt/alice --stats --stats-file /var/log/grove.stats --stats-interval 10
+# 或不改命令行,用环境开关(GROVEFS_STATS=1)
+GROVEFS_STATS=1 $Y mount --view alice -m /mnt/alice
+```
+
+- `--stats`:开启遥测(退出时打印报告;若同时给 `--stats-file` 再落盘一份)。
+- `--stats-file PATH`:报告写入该文件(先写临时文件再 `rename`,并发 `cat` 不会读到半截);退出时也会刷新。
+- `--stats-interval SECS`:>0 时起一个守护线程,每 SECS 秒重写一次 `--stats-file`(未给文件则跳过周期),便于不卸载也能采样。
+- 隐藏控制节点 **`.grove-stats`**:仅在 `--stats` 打开时,根目录下出现这个只读合成文件,`cat` 它就是当前快照;卸载或未开启时**完全不出现**——它是纯客户端合成节点,从不写进元数据存储,因此不触碰单身份/无孤儿 `data_ref`/原子改名等治理不变量,也不给默认挂载增加可见项。
+
+覆盖的阶段(`group` 分类):`op`(read/write 的 op_total——内核看到的端到端单 op 延迟,减去下面子阶段即 FUSE 回包/派发开销、key_resolve、backend_total、write.touch_mtime)、`data-io`(local/remote 的 read/write/len 往返、remote.pool_wait、remote.chunked、shard 的 read_total/write_total/server_op/split/concat)、`meta`(lookup/getattr/readdir/readdir_page/create/unlink/rename/setattr/statfs、db.sqlite_read/write_txn/finalize_count、db.pg_query/write_txn/pool_wait/ssi_retry、remeta.rpc)。非计时计数器:`sqlite read-pool lazy-opens`、`pg ssi-retries`、`remote reconnects`、`broadcast send timeouts`、`ha fencing demotions`、`ha quorum refusals`、`lock lease renewals`、`lock expired reclaims`、`gc objects freed`、`bytes read`、`bytes written`——用来给上面的耗时曲线**提供解释信号**(例如 pool_wait 尾部抬高→池太小;ssi_retry 计数上升→并发写冲突;remote reconnects 增长→后端在重启/漂移)。报告同时提供文本表与 CSV(`--stats-file` 内两段都写),便于离线绘图或 A/B 对拍。
+
+> 注意口径:遥测数字是**单次挂载进程内**各阶段的实测分布,用于排障;它不等于、也不应用于论文里的吞吐/规模结论(本系统对吞吐/可扩展性刻意不作声明)。`errno 计数` 暂未纳入固定注册表(需扩 `Counter` 集与报告 schema),作为后续项。
 
 ---
 
