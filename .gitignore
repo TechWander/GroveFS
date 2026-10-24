@@ -27,6 +27,11 @@
 /.pgtest2/
 /.ltest/
 /.itest/
+/.dfresh/
+/.govcheck/
+/.govtime/
+/.grovesci/
+/.pgpar/
 
 # .build-bin tracks the test/bench scripts and the pkg-config wrapper,
 # but never its run output or captured logs.
@@ -35,3 +40,17 @@
 
 # Stray ad-hoc run logs
 /edge_run.txt
+
+# LaTeX build artifacts under paper/ (only the .tex source is tracked; the
+# rest are regenerable by latexmk/pdflatex).
+/paper/*.aux
+/paper/*.log
+/paper/*.out
+/paper/*.toc
+/paper/*.fls
+/paper/*.fdb_latexmk
+/paper/*.bbl
+/paper/*.blg
+/paper/*.synctex.gz
+/paper/comment.cut
+/paper/*.pdf
