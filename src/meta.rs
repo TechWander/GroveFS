@@ -23,6 +23,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::stats;
+
 pub const ROOT_INO: i64 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -352,6 +354,7 @@ impl MetaEngine {
     /// lazily-opened connection when the pool is drained (returned on drop).
     fn read_conn(&self) -> ReadGuard<'_> {
         let c = self.read_pool.lock().pop().unwrap_or_else(|| {
+            stats::count(stats::Counter::PoolLazyOpen, 1);
             let rc = Connection::open(&self.path).expect("open read connection");
             let _ = rc.execute_batch("PRAGMA busy_timeout=5000;");
             rc
@@ -363,8 +366,10 @@ impl MetaEngine {
     /// NOTE: DROP the lock before `finalize` (which re-locks) — parking_lot's
     /// Mutex is not reentrant, so holding it across the call would deadlock.
     pub fn lookup(&self, parent: i64, name: &str) -> Option<NodeInfo> {
+        let _t = stats::start(stats::Stage::MetaLookup);
         let sql = format!("SELECT {COLS} FROM node WHERE parent_id=?1 AND name=?2");
         let raw = {
+            let _r = stats::start(stats::Stage::SqliteRead);
             let conn = self.read_conn();
             let mut stmt = conn.prepare(&sql).ok()?;
             stmt.query_row(params![parent, name], row_to_raw).ok()
@@ -375,8 +380,10 @@ impl MetaEngine {
     /// Fetch a node by inode number (FUSE `getattr`). Any name sharing the
     /// inode resolves to the same attributes.
     pub fn getattr(&self, ino: i64) -> Option<NodeInfo> {
+        let _t = stats::start(stats::Stage::MetaGetattr);
         let sql = format!("SELECT {COLS} FROM node WHERE ino=?1 LIMIT 1");
         let raw = {
+            let _r = stats::start(stats::Stage::SqliteRead);
             let conn = self.read_conn();
             let mut stmt = conn.prepare(&sql).ok()?;
             stmt.query_row(params![ino], row_to_raw).ok()
@@ -386,8 +393,10 @@ impl MetaEngine {
 
     /// Raw parent_id lookup without nlink/size computation (cheap, for fs_impl).
     pub fn readdir(&self, parent: i64) -> Vec<NodeInfo> {
+        let _t = stats::start(stats::Stage::MetaReaddir);
         let sql = format!("SELECT {COLS} FROM node WHERE parent_id=?1 ORDER BY name");
         let raws = {
+            let _r = stats::start(stats::Stage::SqliteRead);
             let conn = self.read_conn();
             let mut stmt = match conn.prepare(&sql) {
                 Ok(s) => s,
@@ -411,9 +420,11 @@ impl MetaEngine {
     /// entry) — the difference between a large directory feeling instant and
     /// taking minutes.
     pub fn readdir_page(&self, parent: i64, offset: usize, limit: usize) -> Vec<NodeInfo> {
+        let _t = stats::start(stats::Stage::MetaReaddirPage);
         let sql =
             format!("SELECT {COLS} FROM node WHERE parent_id=?1 ORDER BY name LIMIT ?2 OFFSET ?3");
         let raws = {
+            let _r = stats::start(stats::Stage::SqliteRead);
             let conn = self.read_conn();
             let mut stmt = match conn.prepare(&sql) {
                 Ok(s) => s,
@@ -471,6 +482,7 @@ impl MetaEngine {
         uid: u32,
         gid: u32,
     ) -> Result<i64, MetaError> {
+        let _t = stats::start(stats::Stage::MetaCreate);
         let t = now();
         let mut conn = self.conn.lock();
         // Atomic, exactly like rename/unlink/lock_op: one IMMEDIATE tx wraps the
@@ -505,6 +517,7 @@ impl MetaEngine {
     /// (same data object, same size, same timestamps). Only regular files may be
     /// hard-linked (POSIX forbids linking dirs). Returns the shared inode number.
     pub fn link_node(&self, src_ino: i64, new_parent: i64, new_name: &str) -> Result<i64, MetaError> {
+        let _t = stats::start(stats::Stage::MetaCreate);
         let conn = self.conn.lock();
         let row = conn
             .query_row(
@@ -548,6 +561,7 @@ impl MetaEngine {
     /// lock up front, so two concurrent mounts can never observe a half-applied
     /// rename.
     pub fn rename(&self, parent: i64, name: &str, new_parent: i64, new_name: &str, noreplace: bool) -> Result<Option<String>, MetaError> {
+        let _t = stats::start(stats::Stage::MetaRename);
         let t = now();
         let mut conn = self.conn.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -667,6 +681,7 @@ impl MetaEngine {
     /// GC a still-referenced object or miss GC of the last name; `busy_timeout`
     /// makes the loser of a lock race wait rather than error.
     pub fn unlink(&self, parent: i64, name: &str) -> Result<Option<String>, MetaError> {
+        let _t = stats::start(stats::Stage::MetaUnlink);
         let mut conn = self.conn.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (id, is_dir, data_ref) = tx
@@ -918,10 +933,15 @@ impl MetaEngine {
     pub fn renew_locks(&self, sid: u64) {
         let conn = self.conn.lock();
         let now = now();
-        let _ = conn.execute(
-            "UPDATE locks SET expires_at = ?1 WHERE sid = ?2",
-            params![now + LockLease::secs(), sid as i64],
-        );
+        let n = conn
+            .execute(
+                "UPDATE locks SET expires_at = ?1 WHERE sid = ?2",
+                params![now + LockLease::secs(), sid as i64],
+            )
+            .unwrap_or(0);
+        if n > 0 {
+            stats::count(stats::Counter::LockRenew, n as u64);
+        }
     }
 
     /// Reap every lock held by session `sid`. Called on the meta-server when a
@@ -938,7 +958,12 @@ impl MetaEngine {
     /// write txn; exposed so tests (and future lease-renew RPCs) can drive it.
     pub fn sweep_expired_locks(&self, now_secs: i64) {
         let conn = self.conn.lock();
-        let _ = conn.execute("DELETE FROM locks WHERE expires_at < ?1", params![now_secs]);
+        let n = conn
+            .execute("DELETE FROM locks WHERE expires_at < ?1", params![now_secs])
+            .unwrap_or(0);
+        if n > 0 {
+            stats::count(stats::Counter::LockExpireReclaim, n as u64);
+        }
     }
 
     /// Compute nlink/size and resolve the node kind. Re-locks the connection,
@@ -1034,6 +1059,7 @@ impl MetaEngine {
         let mut nlink_map: HashMap<i64, i64> = HashMap::new();
         let mut subdir_map: HashMap<i64, i64> = HashMap::new();
         if !dir_ids.is_empty() || !reg_inos.is_empty() {
+            let _f = stats::start(stats::Stage::SqliteFinalizeCount);
             let conn = self.read_conn();
             grouped_counts(&conn, "ino", "", &reg_inos, &mut nlink_map);
             grouped_counts(&conn, "parent_id", "AND is_dir=1", &dir_ids, &mut subdir_map);

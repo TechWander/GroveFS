@@ -27,6 +27,20 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::stats;
+
+/// Name of the synthetic, read-only control node exposing the live telemetry
+/// snapshot. It materializes ONLY while `--stats` is active, so a default mount
+/// never sees it and the real namespace / governance invariants are untouched.
+pub const STATS_NAME: &str = ".grove-stats";
+/// Sentinel inode for the control node, far above any DB-generated id (real ids
+/// come from a small 1-based sequence), so it can never collide with a node.
+pub const STATS_INO: u64 = u64::MAX - 1;
+/// Opaque readdir cookie handed to the control-node row. `off_t` is signed, so
+/// it stays inside `i64::MAX`; real per-entry offsets are tiny directory ranks
+/// and never reach it. A resume at this exact offset means "listing done" -> EOF.
+const STATS_COOKIE: u64 = i64::MAX as u64;
+
 /// Handle table: maps an inode number to its object key so read/write don't
 /// re-query metadata each call.
 ///
@@ -244,6 +258,44 @@ impl GroveFS {
         }
     }
 
+    /// Attribute for the synthetic control node. It is a small, read-only,
+    /// regular file owned by root with 0444; its size is the current snapshot
+    /// length (informational — `read` is authoritative and returns a short/empty
+    /// slice at EOF, which is the portable way to size a dynamic virtual file).
+    fn stats_attr() -> FileAttr {
+        let size = stats::snapshot_text().len() as u64;
+        FileAttr {
+            ino: INodeNo(STATS_INO),
+            size,
+            blocks: size.div_ceil(512),
+            atime: UNIX_EPOCH,
+            mtime: UNIX_EPOCH,
+            ctime: UNIX_EPOCH,
+            crtime: UNIX_EPOCH,
+            kind: FileType::RegularFile,
+            perm: 0o444,
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            blksize: 4096,
+            flags: 0,
+        }
+    }
+
+    /// Slice the live snapshot for a `read` at `offset..offset+size`. Returns
+    /// empty past EOF so the kernel sees end-of-file after the last chunk.
+    fn stats_slice(offset: u64, size: usize) -> Vec<u8> {
+        let body = stats::snapshot_text();
+        let b = body.as_bytes();
+        let off = offset as usize;
+        if off >= b.len() {
+            return Vec::new();
+        }
+        let end = off.saturating_add(size).min(b.len());
+        b[off..end].to_vec()
+    }
+
     fn err_to_errno(e: MetaError) -> Errno {
         match e {
             MetaError::Exists => Errno::EEXIST,
@@ -318,6 +370,12 @@ impl fuser::Filesystem for GroveFS {
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let name_str = name.to_string_lossy().to_string();
+        // Synthetic telemetry control node: resolves only under the root and
+        // only while `--stats` is active; zero-cost otherwise (one relaxed load).
+        if stats::enabled() && parent == INodeNo::ROOT && name_str == STATS_NAME {
+            reply.entry(&Duration::from_secs(0), &Self::stats_attr(), Generation(0));
+            return;
+        }
         match self.meta.lookup(parent.0 as i64, &name_str) {
             Some(node) => {
                 if let Some(k) = &node.data_ref {
@@ -331,6 +389,10 @@ impl fuser::Filesystem for GroveFS {
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        if stats::enabled() && ino.0 == STATS_INO {
+            reply.attr(&Duration::from_secs(0), &Self::stats_attr());
+            return;
+        }
         match self.meta.getattr(ino.0 as i64) {
             Some(node) => {
                 let attr = self.build_attr(&node);
@@ -362,6 +424,7 @@ impl fuser::Filesystem for GroveFS {
             reply.error(Errno::EROFS);
             return;
         }
+        let _t = stats::start(stats::Stage::MetaSetattr);
         if let Some(m) = mode {
             self.meta.set_mode(ino.0 as i64, m);
         }
@@ -576,6 +639,11 @@ impl fuser::Filesystem for GroveFS {
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        if stats::enabled() && ino.0 == STATS_INO {
+            // Read-only virtual handle; no backend object is bound to it.
+            reply.opened(FileHandle(STATS_INO), FopenFlags::empty());
+            return;
+        }
         match self.meta.getattr(ino.0 as i64) {
             Some(node) if !node.is_dir() => {
                 if let Some(k) = &node.data_ref {
@@ -590,17 +658,43 @@ impl fuser::Filesystem for GroveFS {
     }
 
     fn read(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, size: u32, _flags: OpenFlags, _lock_owner: Option<LockOwner>, reply: ReplyData) {
-        let key = match self.key_for_ino(ino.0) {
-            Some(k) => k,
-            None => {
-                reply.error(Errno::ENOENT);
-                return;
+        if stats::enabled() && ino.0 == STATS_INO {
+            reply.data(&Self::stats_slice(offset, size as usize));
+            return;
+        }
+        // Outermost per-op wall clock: the real end-to-end "read speed" the
+        // kernel sees, so `read.op_total` minus (key_resolve + backend_total)
+        // exposes the FUSE reply-serialization / dispatch overhead the sub-stages
+        // deliberately leave out. Placed after the control-node branch so reading
+        // `.grove-stats` itself does not pollute the data-read distribution.
+        let _op = stats::start(stats::Stage::OpRead);
+        let key = {
+            let _t = stats::start(stats::Stage::ReadKeyResolve);
+            match self.key_for_ino(ino.0) {
+                Some(k) => k,
+                None => {
+                    reply.error(Errno::ENOENT);
+                    return;
+                }
             }
         };
-        match self.backend.read(&key, offset, size as usize) {
-            Ok(data) => reply.data(&data),
-            Err(e) => reply.error(errno_of(&e)),
-        }
+        // Time the backend fetch on its own so the `reply.data` serialization
+        // back into the FUSE buffer (a different cost) is not folded in.
+        let data = {
+            let _t = stats::start(stats::Stage::ReadBackendTotal);
+            match self.backend.read(&key, offset, size as usize) {
+                Ok(d) => {
+                    stats::add_bytes(stats::Stage::ReadBackendTotal, d.len() as u64);
+                    stats::count(stats::Counter::BytesRead, d.len() as u64);
+                    d
+                }
+                Err(e) => {
+                    reply.error(errno_of(&e));
+                    return;
+                }
+            }
+        };
+        reply.data(&data);
     }
 
     fn write(
@@ -619,31 +713,49 @@ impl fuser::Filesystem for GroveFS {
             reply.error(Errno::EROFS);
             return;
         }
-        let key = match self.key_for_ino(ino.0) {
-            Some(k) => k,
-            None => {
-                reply.error(Errno::ENOENT);
-                return;
+        // Outermost per-op write latency (kernel-visible "write speed"); the gap
+        // to (key_resolve + backend_total + touch_mtime) is unmeasured glue.
+        let _op = stats::start(stats::Stage::OpWrite);
+        let key = {
+            let _t = stats::start(stats::Stage::WriteKeyResolve);
+            match self.key_for_ino(ino.0) {
+                Some(k) => k,
+                None => {
+                    reply.error(Errno::ENOENT);
+                    return;
+                }
             }
         };
-        match self.backend.write(&key, offset, data) {
-            Ok(n) => {
-                // Debounced mtime touch: a streaming writer fires one write
-                // callback per 1MiB chunk, and each unhedged touch is a full
-                // metadata write (a local tx, or — with --meta — a synchronous
-                // RPC round-trip and one row in the HA replication stream).
-                // One touch per WRITE_TOUCH_DEBOUNCE window per inode bounds
-                // that amplification. Honest cost: mtime granularity degrades
-                // to ~the window (200ms); the setattr path (truncate, explicit
-                // utimes/touch) is NOT debounced because those semantics require
-                // immediacy.
-                if self.should_touch_write(ino.0) {
-                    self.meta.touch_mtime(ino.0 as i64);
+        let n = {
+            let _t = stats::start(stats::Stage::WriteBackendTotal);
+            match self.backend.write(&key, offset, data) {
+                Ok(n) => {
+                    stats::add_bytes(stats::Stage::WriteBackendTotal, n as u64);
+                    stats::count(stats::Counter::BytesWritten, n as u64);
+                    n
                 }
-                reply.written(n as u32);
+                Err(e) => {
+                    reply.error(errno_of(&e));
+                    return;
+                }
             }
-            Err(e) => reply.error(errno_of(&e)),
+        };
+        // Debounced mtime touch: a streaming writer fires one write
+        // callback per 1MiB chunk, and each unhedged touch is a full
+        // metadata write (a local tx, or — with --meta — a synchronous
+        // RPC round-trip and one row in the HA replication stream).
+        // One touch per WRITE_TOUCH_DEBOUNCE window per inode bounds
+        // that amplification. Honest cost: mtime granularity degrades
+        // to ~the window (200ms); the setattr path (truncate, explicit
+        // utimes/touch) is NOT debounced because those semantics require
+        // immediacy.
+        {
+            let _t = stats::start(stats::Stage::WriteTouchMtime);
+            if self.should_touch_write(ino.0) {
+                self.meta.touch_mtime(ino.0 as i64);
+            }
         }
+        reply.written(n as u32);
     }
 
     fn fsync(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
@@ -803,6 +915,7 @@ impl fuser::Filesystem for GroveFS {
         match self.meta.unlink(parent.0 as i64, &name_str) {
             Ok(gced_key) => {
                 if let Some(k) = gced_key {
+                    stats::count(stats::Counter::GcFreed, 1);
                     let _ = self.backend.remove(&k);
                 }
                 reply.ok();
@@ -845,6 +958,7 @@ impl fuser::Filesystem for GroveFS {
                 // Renaming over an existing file drops that file's last name; free
                 // its storage blob so the space does not leak (mirrors unlink).
                 if let Some(k) = gc {
+                    stats::count(stats::Counter::GcFreed, 1);
                     let _ = self.backend.remove(&k);
                 }
                 reply.ok();
@@ -866,6 +980,11 @@ impl fuser::Filesystem for GroveFS {
         offset: u64,
         mut reply: ReplyDirectoryPlus,
     ) {
+        // Resume at the control node's cookie -> the listing already ended -> EOF.
+        if stats::enabled() && ino == INodeNo::ROOT && offset == STATS_COOKIE {
+            reply.ok();
+            return;
+        }
         let node = match self.meta.getattr(ino.0 as i64) {
             Some(n) if n.is_dir() => n,
             Some(_) => {
@@ -939,10 +1058,33 @@ impl fuser::Filesystem for GroveFS {
             }
             want = want.saturating_mul(2).min(want_max);
         }
+        // Append the synthetic telemetry row once at the end of the root
+        // listing (see `readdir`), leaving the real-children path unchanged.
+        if stats::enabled() && ino == INodeNo::ROOT {
+            let sattr = Self::stats_attr();
+            let sttl = Duration::from_secs(0);
+            if reply.add(
+                INodeNo(STATS_INO),
+                STATS_COOKIE,
+                OsStr::new(STATS_NAME),
+                &sttl,
+                &sattr,
+                Generation(0),
+            ) {
+                reply.ok();
+                return;
+            }
+        }
         reply.ok();
     }
 
     fn readdir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
+        // A resume at the control node's cookie means the listing (including the
+        // synthetic row) already ended -> EOF. Guards against re-emitting it.
+        if stats::enabled() && ino == INodeNo::ROOT && offset == STATS_COOKIE {
+            reply.ok();
+            return;
+        }
         let node = match self.meta.getattr(ino.0 as i64) {
             Some(n) if n.is_dir() => n,
             Some(_) => { reply.error(Errno::ENOTDIR); return; }
@@ -988,6 +1130,14 @@ impl fuser::Filesystem for GroveFS {
             }
             want = want.saturating_mul(2).min(want_max);
         }
+        // Root gets the synthetic telemetry row appended once, after the real
+        // children are exhausted, occupying one trailing slot with its own
+        // opaque cookie. This leaves the real-children enumeration byte-for-byte
+        // unchanged and never runs when `--stats` is off.
+        if stats::enabled() && ino == INodeNo::ROOT && reply.add(INodeNo(STATS_INO), STATS_COOKIE, FileType::RegularFile, OsStr::new(STATS_NAME)) {
+            reply.ok();
+            return;
+        }
         reply.ok();
     }
 
@@ -1000,6 +1150,7 @@ impl fuser::Filesystem for GroveFS {
     }
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
+        let _t = stats::start(stats::Stage::MetaStatfs);
         match self.backend.statvfs() {
             Ok(s) => {
                 let bsize = s.bsize.max(512) as u32;

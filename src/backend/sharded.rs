@@ -12,6 +12,7 @@
 //! the number of servers rather than being capped by one node's socket.
 
 use super::{FsStat, StorageBackend};
+use crate::stats;
 use std::io;
 use std::sync::Arc;
 use std::thread;
@@ -211,8 +212,12 @@ impl StorageBackend for ShardedBackend {
             Some(l) => l,
             None => return self.servers[0].read(key, offset, len),
         };
+        let _total = stats::start(stats::Stage::IoShardRead);
         self.check_layout(&l)?;
-        let ranges = self.chunks_for(&l, offset, len);
+        let ranges = {
+            let _t = stats::start(stats::Stage::IoShardSplit);
+            self.chunks_for(&l, offset, len)
+        };
         // A chunk whose object is absent reads as EOF: for a contiguously
         // written striped file the only chunks that can be missing are the
         // trailing ones (past i_size) — the kernel issues readahead reads that
@@ -229,7 +234,11 @@ impl StorageBackend for ShardedBackend {
         if ranges.len() <= 1 {
             for (i, sub_off, sub_len) in ranges {
                 let (s, ck) = self.chunk(&l, i);
-                match self.servers[s].read(&ck, sub_off, sub_len) {
+                let rd = {
+                    let _t = stats::start(stats::Stage::IoShardServerOp);
+                    self.servers[s].read(&ck, sub_off, sub_len)
+                };
+                match rd {
                     Ok(buf) => results.push((i, buf)),
                     Err(e) if is_eof(&e) => {}
                     Err(e) => return Err(e),
@@ -248,7 +257,11 @@ impl StorageBackend for ShardedBackend {
                         scope.spawn(move || -> (u64, Vec<u8>) {
                             let idx = i as usize % n;
                             let ck = format!("{}#{}", base, i);
-                            match servers[idx].read(&ck, sub_off, sub_len) {
+                            let rd = {
+                                let _t = stats::start(stats::Stage::IoShardServerOp);
+                                servers[idx].read(&ck, sub_off, sub_len)
+                            };
+                            match rd {
                                 Ok(buf) => (i, buf),
                                 Err(e) if e.kind() == io::ErrorKind::NotFound => (i, Vec::new()),
                                 Err(e) => {
@@ -273,10 +286,14 @@ impl StorageBackend for ShardedBackend {
             }
         }
         results.sort_by_key(|(i, _)| *i);
-        let mut out = Vec::with_capacity(len);
-        for (_, buf) in results {
-            out.extend_from_slice(&buf);
-        }
+        let out = {
+            let _t = stats::start(stats::Stage::IoShardConcat);
+            let mut out = Vec::with_capacity(len);
+            for (_, buf) in results {
+                out.extend_from_slice(&buf);
+            }
+            out
+        };
         Ok(out)
     }
 
@@ -285,8 +302,12 @@ impl StorageBackend for ShardedBackend {
             Some(l) => l,
             None => return self.servers[0].write(key, offset, data),
         };
+        let _total = stats::start(stats::Stage::IoShardWrite);
         self.check_layout(&l)?;
-        let ranges = self.chunks_for(&l, offset, data.len());
+        let ranges = {
+            let _t = stats::start(stats::Stage::IoShardSplit);
+            self.chunks_for(&l, offset, data.len())
+        };
         // A write that jumps past the current end must first make every chunk
         // below its target contiguous, or `len` would stop at the old short tail
         // / a missing interior chunk and hide the data beyond the gap. No-op for
@@ -298,7 +319,11 @@ impl StorageBackend for ShardedBackend {
         if ranges.len() <= 1 {
             for (i, sub_off, sub_len) in ranges {
                 let (s, ck) = self.chunk(&l, i);
-                written += self.servers[s].write(&ck, sub_off, &data[(i * l.stripe + sub_off - offset) as usize..][..sub_len])?;
+                let w = {
+                    let _t = stats::start(stats::Stage::IoShardServerOp);
+                    self.servers[s].write(&ck, sub_off, &data[(i * l.stripe + sub_off - offset) as usize..][..sub_len])
+                };
+                written += w?;
             }
             return Ok(written);
         }
@@ -320,7 +345,11 @@ impl StorageBackend for ShardedBackend {
                     // the overall write offset.
                     let dstart = (i * l.stripe + sub_off - offset) as usize;
                     let sub = &data[dstart..dstart + sub_len];
-                    match servers[idx].write(&ck, sub_off, sub) {
+                    let r = {
+                        let _t = stats::start(stats::Stage::IoShardServerOp);
+                        servers[idx].write(&ck, sub_off, sub)
+                    };
+                    match r {
                         Ok(w) => {
                             total.fetch_add(w, std::sync::atomic::Ordering::Relaxed);
                         }
