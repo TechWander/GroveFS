@@ -36,6 +36,7 @@
 - **高可用主备**：`meta-server --role primary|standby --peer` 心跳/epoch 提升/自动降级；`--sync-repl` 把写 RPO 降到 0；`--witness` 取逗号分隔的 N 个共享 `data-server` 作**独立仲裁者集合**（推荐奇数），**fail-safe、持不重叠的有界多数派租约（需 `N/2+1` 授予；多数活租约即独占证明，写由本地租约校验放行）并对内容数据帧按 token 门控，把双写窗口收敛到租约安全余量内**；宕少数仲裁者仍不冻结写（N=1 退化为单仲裁旧行为）。
 - **Token 双面鉴权**、**只读挂载**（`--ro`）、多线程 `fuser 0.18`（`clone_fd` 并发派发）、**分块并行 IO** 与 **跨 server 条带**。
 - **元数据读并行 + 目录列举分页 + `FUSE_READDIRPLUS`**：每个视图的 `MetaEngine` 在单条写连接之外再开 4 条附加连接（`READ_POOL_SIZE`），`lookup`/`getattr`/`readdir` 及 nlink 解析都走这条只读池，元数据**读**不再排队等写锁（**写仍串行在同一权威连接上**，单写者语义不动）；服务端 `MetaEngine` 同样吃这条池，故 `meta-server` 的并发 RPC 处理器也不再互等。目录列举新增 `readdir_page(parent, offset, limit)`，SQLite 引擎把它下推成 SQL `LIMIT/OFFSET`，FUSE 回调按 32→1024 几何块流式填回复缓冲，一个内核请求付 `O(缓冲)` 而非 `O(整棵目录)`（改造前每个内核分页都要重扫整棵目录并为每条重算 nlink）；并默认协商 `FUSE_DO_READDIRPLUS`（内核 ≥4.6），目录项连同属性一次带回，`ls -l` 不再退化成逐条 `LOOKUP`+`GETATTR`。同一份 5001 条目录、同一挂载点、逐个新挂载（内核 dentry 缓存为空）实测 `ls -l`：**2.56s**（改造前基线 55.34s；关掉 PLUS 只留分页为 5.22s，三份输出逐字节相同）。分页与 PLUS 只在「能自己分页的存储引擎」上启用——本地 `--home` 的 SQLite、PG 后端（各配一条独立的 4 连接只读池并同样下推 `LIMIT/OFFSET`），以及对接 SQLite/PG `meta-server` 的**远端挂载**：新增 `M_READDIRP` 帧把 `offset/limit` 下推到服务端，客户端每个内核缓冲只取一页并协商 PLUS。同一 5001 条目录经 `meta-server`+`data-server` 实测 `ls -l`：改造前二进制 ~54s → **2.29s**（只留分页、关 PLUS 为 4.22s，两份输出排序后逐字节相同）。唯有派生/透镜视图（`LayoutMeta`）及其对接的老服务端仍走 trait 默认实现（每内核缓冲一次全量列表、不协商 PLUS），详见「诚实边界」。`--no-readdirplus` 保留作 A/B 与兼容排障开关。
+- **分阶段延迟遥测（`--stats`，opt-in、默认关闭零成本）**：给一次读/写/元数据 op 内部各阶段（端到端 `op_total`、key 解析、后端 IO、分片扇出、元数据 DB、远程 RPC）打时间戳，用 hdrhistogram 汇成 p50/p90/p99/max 离线定位瓶颈。**默认关闭时每个埋点仅一次 relaxed 原子读即短路**（连 `Instant::now()` 都不调用），读写热路径不受影响；仅显式开启才采样，直方图按 worker 线程分片不串行化到全局锁。开关 `--stats` / `--stats-file <路径>`（周期覆盖写）/ `--stats-interval <秒>` / `GROVEFS_STATS=1`；退出时经 `stderr` 打印报告，只读控制节点 `<mnt>/.grove-stats` 仅在开启时出现（保留 inode、不落盘，治理不变量不受影响）。是排障工具而非吞吐测量，详见 `USAGE.md` §8.1。
 - **完整回归**：`run_all.sh` **18 套件全板 GREEN**（新增 `acl` view 白名单 e2e、`layout` 显示透镜与服务端派生视图 e2e、`import` 零拷贝导入 e2e、`pg` PostgreSQL 后端 e2e；`pg` 会在无 PG 主机上自动 SKIP）。
 
 ## 架构与原理
@@ -439,6 +440,7 @@ token 不匹配 → 连接时直接 `PermissionDenied`，不重试。空 token�
 | touch 去抖 | 同 inode 200ms 窗口去抖 `touch_mtime`，减少元数据 RPC 与 HA 日志量 |
 | 元数据读连接池 | 每视图 SQLite 引擎 4 条附加连接（`READ_POOL_SIZE`）服务 `lookup`/`getattr`/`readdir`，读不再排写锁；PG 引擎另持一条对等的 4 连接只读池（`PG_READ_POOL_SIZE`）。写仍各走单一权威连接（SQLite `conn` / PG `client`）串行 |
 | 目录分页 + READDIRPLUS | `readdir_page` 下推 `LIMIT/OFFSET`，回复缓冲按 32→1024 几何块填充；默认协商 `FUSE_DO_READDIRPLUS`，`--no-readdirplus` 可关。SQLite/PG 本地挂载与对接 SQLite/PG `meta-server` 的远端挂载（`M_READDIRP` 帧下推分页）都吃到两者；只有派生/透镜视图与不含该能力位的老服务端每内核缓冲取一次全量列表、不协商 PLUS |
+| 分阶段延迟遥测 `--stats` | 把读/写/元数据 op 各阶段延迟汇成分位数离线排瓶颈；**默认关闭、零成本**（埋点仅一次原子读短路），仅 `--stats` 才采样，直方图按线程分片；退出 `stderr` + 可选周期文件 + 只读节点 `.grove-stats`。详见 §8.1（USAGE.md） |
 
 ## 备份与迁移
 
