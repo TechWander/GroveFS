@@ -155,6 +155,7 @@
         <tr><td><b>以指定身份挂载</b> — ACL 按此 uid 判定读写</td><td><code>--as-uid &lt;uid&gt;</code></td></tr>
         <tr><td><b>只读 / 零缓存强一致</b> — 挂载为只读 / 关闭客户端缓存</td><td><code>--ro</code> / <code>--strict</code></td></tr>
         <tr><td><b>目录列举提速的回退开关</b> — 关掉 READDIRPLUS（随目录项一并带回属性），退回普通 READDIR + 逐条 <code>LOOKUP</code>，仅供 A/B 与兼容排障（provider 自身不能分页的挂载本来就不协商 READDIRPLUS，此开关对它们为空操作）</td><td><code>--no-readdirplus</code></td></tr>
+        <tr><td><b>读写瓶颈排查</b> — 开启分阶段延迟遥测，把一次读/写/元数据 op 内部各阶段的分段墙钟延迟汇成 p50/p90/p99/max 离线看（默认关闭、零成本，仅显式开启才采样）</td><td><code>--stats</code> / <code>--stats-file</code> / <code>--stats-interval</code></td></tr>
       </tbody>
     </table>
   </section>
@@ -405,7 +406,22 @@ $Y mount --view alice --data ... --meta ... --token s3cr3t -m /mnt/alice</code><
       <tr><td>touch 去抖</td><td><code>write()</code> 对同 inode 200ms 窗口去抖 <code>touch_mtime</code>,减少元数据面 RPC 与 HA 日志量(<code>setattr-size</code> 不去抖,语义要求即时)。</td></tr>
       <tr><td>元数据读连接池</td><td>每视图 SQLite 引擎 <code>READ_POOL_SIZE = 4</code> 条附加连接服务 <code>lookup</code>/<code>getattr</code>/<code>readdir</code> 与 nlink 解析,读不再排写锁;写仍走单一权威连接,服务端引擎同享此池。池连接按 WAL 读事务读已提交数据,自己的写立刻可见(<code>reads_through_the_pool_observe_committed_writes</code> 断言);HA 备机/只读打开的引擎不预开池,首次读按需懒建并归还。<code>PgEngine</code> 现也持一条对等的 <code>PG_READ_POOL_SIZE = 4</code> 只读池(取不到只读连接时回退写连接以如实暴露故障),写仍串行在单 <code>client</code>。</td></tr>
       <tr><td>目录分页 + READDIRPLUS</td><td><code>readdir_page(parent, offset, limit)</code> 在 SQLite 与 PG 引擎都下推成 SQL <code>LIMIT/OFFSET</code>,FUSE 回调按 32→1024 几何块流式填回复缓冲;默认协商 <code>FUSE_DO_READDIRPLUS</code>(与普通能力位分属不同的 all-or-nothing 组,内核不支持则自然回退),<code>--no-readdirplus</code> 可关做 A/B。两者由 <code>supports_paged_readdir()</code> 门控:本地 SQLite/PG 与对接能分页的 <code>meta-server</code> 的远端挂载(新 <code>M_READDIRP</code> 帧把分页下推到服务端)都吃两者;仍不能自身分页的 provider(<code>LayoutMeta</code> 派生/透镜、不含该能力位的老服务端)每内核缓冲取一次全量列表且不协商 PLUS,以免 PLUS 的胖记录把全量重取次数乘 ~4 倍。</td></tr>
+      <tr><td>分阶段延迟遥测 <code>--stats</code></td><td>把一次读/写/元数据 op 内部各阶段(端到端 <code>op_total</code>、key 解析、后端 IO、分片扇出、元数据 DB、远程 RPC)的分段<b>墙钟延迟</b>汇成 p50/p90/p99/max,离线定位瓶颈——是排障工具而非吞吐测量,不构成任何吞吐/可扩展性声明。<b>默认关闭、零成本</b>:每个埋点仅一次 relaxed 原子读即短路(关闭态连 <code>Instant::now()</code> 都不调用、不加锁、不分配),<code>.grove-stats</code> 节点检查同样短路,故默认挂载的读写热路径不受影响;仅显式开启才付采样代价。直方图按 worker 线程分片,记录不串行化到一把全局锁。开关 <code>--stats</code> / <code>--stats-file &lt;路径&gt;</code>(周期覆盖写)/ <code>--stats-interval &lt;秒&gt;</code> / 环境变量 <code>GROVEFS_STATS=1</code>;挂载退出时经 <code>stderr</code> 打印最终报告。只读控制节点 <code>&lt;mnt&gt;/.grove-stats</code> 仅在开启时出现(保留 inode、不落盘、不进任何视图定义,治理不变量 I1–I4 不受影响),<code>cat</code> 即当前报告。端到端见 <code>.build-bin/test_stats.sh</code>。<b>已知延后项</b>:errno(失败 op)计数因需扩固定 counter 注册表 schema,本轮有意未做。</td></tr>
     </table>
+    <div class="note"><b>真实回显</b>(本地 SQLite 挂载加 <code>--stats</code>,做了若干读写 / mkdir / readdir 后 <code>cat &lt;mnt&gt;/.grove-stats</code> 的 <code>[op]</code> 节选,单位 µs;<code>[data-io]</code>/<code>[meta]</code>/<code>[counters]</code> 同形,完整清单见 <code>USAGE.md</code> §8.1):
+      <pre>GroveFS per-stage latency telemetry  (durations in µs)
+  diagnostic tooling only — not a throughput/scalability claim
+  snapshot @ 2026-10-25 01:48:05
+
+[op]
+  read.op_total              ops=17       p50=164      p90=439      p99=445       max=445       mean=206      total_s=0.00    bytes=0
+  write.op_total             ops=6        p50=1263     p90=3535     p99=3535      max=3535      mean=1599     total_s=0.01    bytes=0
+  read.key_resolve           ops=17       p50=0        p90=1        p99=1         max=1         mean=0        total_s=0.00    bytes=0
+  read.backend_total         ops=17       p50=80       p90=341      p99=343       max=343       mean=128      total_s=0.00    bytes=4000003
+  write.key_resolve          ops=6        p50=1        p90=1        p99=1         max=1         mean=1        total_s=0.00    bytes=0
+  write.backend_total        ops=6        p50=1175     p90=3359     p99=3359      max=3359      mean=1465     total_s=0.01    bytes=4000003
+  write.touch_mtime          ops=6        p50=1        p90=148      p99=148       max=148       mean=40       total_s=0.00    bytes=0</pre>
+    </div>
   </section>
 
   <!-- 11 -->
@@ -1042,8 +1058,8 @@ $ ls /mnt/leak   <span class="cmt"># (命名空间按需新建，数据不外泄
     <table>
       <tr><th>目的</th><th>命令</th></tr>
       <tr><td>建视图</td><td><code>grove --home H init --view U [--manifest M]</code></td></tr>
-      <tr><td>本地挂载</td><td><code>grove --home H mount --view U -m MP [--ro] [--strict] [--threads N] [--as-uid N] [--layout F] [--no-readdirplus]</code></td></tr>
-      <tr><td>远程挂载</td><td><code>grove --home H mount --view U -m MP --data A[,A2] --meta M[,M_bak] [--token T] [--as-uid N] [--layout F]</code></td></tr>
+      <tr><td>本地挂载</td><td><code>grove --home H mount --view U -m MP [--ro] [--strict] [--threads N] [--as-uid N] [--layout F] [--no-readdirplus] [--stats [--stats-file F] [--stats-interval S]]</code></td></tr>
+      <tr><td>远程挂载</td><td><code>grove --home H mount --view U -m MP --data A[,A2] --meta M[,M_bak] [--token T] [--as-uid N] [--layout F] [--stats [--stats-file F] [--stats-interval S]]</code></td></tr>
       <tr><td>显示规则文件</td><td>每行 <code>hide &lt;src&gt;</code> / <code>only &lt;src&gt;</code> / <code>map &lt;src&gt; &lt;dst&gt;</code> / <code>link &lt;src&gt; &lt;dst&gt;</code>(<code>#</code> 注释，绝对路径，见 §15.5)</td></tr>
       <tr><td>定义派生视图</td><td><code>grove view --db-path D define --name V --base B --rules F</code>(存于 <code>D/meta/views/V.layout</code>，<code>mount --view V</code> 即得形状，虚拟视图挂载只读、写走基名 <code>B</code>，见 §15.6)</td></tr>
       <tr><td>定义纯别名</td><td><code>grove view --db-path D alias --name A --real R</code>(公开名 1:1 映射真实视图：<code>A</code> 全树可写，<code>R</code> 不可直挂，见 §15.8)</td></tr>
