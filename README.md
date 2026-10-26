@@ -441,6 +441,8 @@ token 不匹配 → 连接时直接 `PermissionDenied`，不重试。空 token�
 | 元数据读连接池 | 每视图 SQLite 引擎 4 条附加连接（`READ_POOL_SIZE`）服务 `lookup`/`getattr`/`readdir`，读不再排写锁；PG 引擎另持一条对等的 4 连接只读池（`PG_READ_POOL_SIZE`）。写仍各走单一权威连接（SQLite `conn` / PG `client`）串行 |
 | 目录分页 + READDIRPLUS | `readdir_page` 下推 `LIMIT/OFFSET`，回复缓冲按 32→1024 几何块填充；默认协商 `FUSE_DO_READDIRPLUS`，`--no-readdirplus` 可关。SQLite/PG 本地挂载与对接 SQLite/PG `meta-server` 的远端挂载（`M_READDIRP` 帧下推分页）都吃到两者；只有派生/透镜视图与不含该能力位的老服务端每内核缓冲取一次全量列表、不协商 PLUS |
 | 分阶段延迟遥测 `--stats` | 把读/写/元数据 op 各阶段延迟汇成分位数离线排瓶颈；**默认关闭、零成本**（埋点仅一次原子读短路），仅 `--stats` 才采样，直方图按线程分片；退出 `stderr` + 可选周期文件 + 只读节点 `.grove-stats`。详见 §8.1（USAGE.md） |
+| 后台 WAL checkpoint | 每个可写视图引擎一条后台 `wal_checkpoint(PASSIVE)` 线程（每 1s，~30s 一次 TRUNCATE）+ 写连接 `wal_autocheckpoint=0`，把内联同步 checkpoint 停顿（曾使 `create` 单次 125ms 尾刺）移出写热路径；经 `Arc<StopSignal>` 随引擎 `Drop` 关停，只读/备机不启动。热读路径另 `prepare_cached` 复用语句。实测同 3000 文件创建 `meta.create` total 1.64s→0.38s、max 125ms→33ms |
+| 读缓存 TTL `--tune-cache` | 把内核 attr/dentry 缓存 TTL 从默认 2s 放大，削减读多/不可变树的重复 LOOKUP/GETATTR；跨端新鲜度仍靠默认 `notify` 失效推送，新内核（≥3.15）协商 `AUTO_INVAL_DATA`（size/mtime 变则丢陈旧页）保证安全，`--strict` 恒钉 0。与 `max_write`/`readahead` 按 `FUSE_MAX_MAX_PAGES` 自动截断、`PARALLEL_DIROPS`/`WRITEBACK` 能力协商同属“新内核快、老内核降级”（详见 §8.2 USAGE.md） |
 
 ## 备份与迁移
 

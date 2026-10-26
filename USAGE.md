@@ -33,6 +33,7 @@
 | **只读 / 零缓存强一致** — 挂载为只读 / 关闭客户端缓存 | `--ro` / `--strict` |
 | **目录列举提速的回退开关** — 关掉 READDIRPLUS（随目录项一并带回属性），退回普通 READDIR + 逐条 `LOOKUP`，仅供 A/B 与兼容排障（只有 provider 能在自己存储里分页的挂载才协商 READDIRPLUS：本地 `--home` 的 SQLite/PG，以及对接能分页的 `meta-server` 的远端挂载；派生/透镜视图与老服务端本来就不协商） | `--no-readdirplus` |
 | **分阶段延迟遥测** — opt-in 记录读/写/元数据各阶段耗时(离线聚合 p50/p90/p99/max 排障定位瓶颈；退出打印 + 周期落盘 + 隐藏节点 `.grove-stats`；非吞吐声明) | `--stats` / `--stats-file <路径>` / `--stats-interval <秒>` / `GROVEFS_STATS=1`(详见 §8.1) |
+| **读缓存 TTL 调优** — 放大内核 attr/dentry 缓存 TTL(默认 2s),对读多/不可变树削减重复 LOOKUP/GETATTR;跨端新鲜度仍靠默认失效推送 + 新内核 `AUTO_INVAL_DATA` 兜底,`--strict` 强制归 0 | `--tune-cache <秒>`(详见 §8.2) |
 
 ### 关于 `--view` 与路径容量
 
@@ -466,6 +467,26 @@ GROVEFS_STATS=1 $Y mount --view alice -m /mnt/alice
 覆盖的阶段(`group` 分类):`op`(read/write 的 op_total——内核看到的端到端单 op 延迟,减去下面子阶段即 FUSE 回包/派发开销、key_resolve、backend_total、write.touch_mtime)、`data-io`(local/remote 的 read/write/len 往返、remote.pool_wait、remote.chunked、shard 的 read_total/write_total/server_op/split/concat)、`meta`(lookup/getattr/readdir/readdir_page/create/unlink/rename/setattr/statfs、db.sqlite_read/write_txn/finalize_count、db.pg_query/write_txn/pool_wait/ssi_retry、remeta.rpc)。非计时计数器:`sqlite read-pool lazy-opens`、`pg ssi-retries`、`remote reconnects`、`broadcast send timeouts`、`ha fencing demotions`、`ha quorum refusals`、`lock lease renewals`、`lock expired reclaims`、`gc objects freed`、`bytes read`、`bytes written`——用来给上面的耗时曲线**提供解释信号**(例如 pool_wait 尾部抬高→池太小;ssi_retry 计数上升→并发写冲突;remote reconnects 增长→后端在重启/漂移)。报告同时提供文本表与 CSV(`--stats-file` 内两段都写),便于离线绘图或 A/B 对拍。
 
 > 注意口径:遥测数字是**单次挂载进程内**各阶段的实测分布,用于排障;它不等于、也不应用于论文里的吞吐/规模结论(本系统对吞吐/可扩展性刻意不作声明)。`errno 计数` 暂未纳入固定注册表(需扩 `Counter` 集与报告 schema),作为后续项。
+
+### 8.2 读写/元数据加速(内核自适应 + 自动降级)
+
+系统的加速改动都遵循**新内核走快路、老内核自动降级**的能力协商原则:FUSE 能力位由 `INIT` 阶段内核授予,不支持的位只是不生效,绝不影响其余路径;SQLite/PG 侧优化与内核版本无关。本机(5.4)实测 `--stats` 下会打印 `grovefs negotiated caps: PARALLEL_DIROPS=true AUTO_INVAL_DATA=true WRITEBACK=true MAX_PAGES=true`,即本机全部命中。
+
+**元数据写尾延迟(P0)**:每个可写视图引擎起一条**后台 `wal_checkpoint(PASSIVE)` 线程**(每 1s 一次,每 ~30s 一次 `TRUNCATE` 收缩 `-wal` 文件),并把写连接的 `wal_autocheckpoint` 置 0——把原本内联在提交里的同步 checkpoint 停顿(实测曾贡献 `create` 单次 **125ms** 尾刺)移出写热路径。线程经 `Arc<StopSignal>` 随引擎 `Drop` 关停(不 join、不阻塞卸载),只读/备机引擎不启动。配合热读路径 `prepare_cached` 复用语句(避免每次重编译 SQL)。同一 3000 文件建目录负载 `--stats` 前后对比:
+
+| 指标(µs) | 优化前 | 优化后 |
+| --- | --- | --- |
+| `meta.create` total | 1.64 s | **0.38 s**(↓4.3×) |
+| `meta.create` p99 / max | 1151 / **125439** | **230 / 33535**(尾刺消除) |
+| `meta.lookup` p50 | 39 | **17** |
+| `meta.getattr` p50 | 66 | **36** |
+| `db.sqlite_read` p50 | 44 | **21** |
+
+**读缓存 TTL(P1)**:`--tune-cache <秒>` 把内核 attr/dentry 缓存 TTL 从默认 2s 放大,削减对同一目录/文件的重复 `LOOKUP`/`GETATTR` 往返——适合读多或不可变树(如天文“数据不落地”的一次性流读)。安全边界:跨端新鲜度**仍由默认 `notify` 实时失效推送保证**,且新内核(≥3.15)协商到 `AUTO_INVAL_DATA` 后,size/mtime 变化会顺带丢弃对端陈旧页数据;`--strict` 恒把 TTL 钉为 0(完全旁路)。`run_all.sh` 的 `freshness`/`disp_fresh` 套件默认 TTL 未变下持续证明 <500ms 对端可见。
+
+**大块 IO(P2,内核自适应)**:`max_write`/`max_readahead` 申请 4MiB,由 fuser 与内核按 `FUSE_MAX_MAX_PAGES` 各自截断——老内核(如 5.4)自动降到页上限,6.x+ 给到更大块=更少往返;`PARALLEL_DIROPS`(并发目录 op)与 `WRITEBACK_CACHE`(批量合并写)早已协商。大块读写已逼近底层文件系统地板,实测 FUSE 每 op 仅加 ~50–70µs。
+
+> 诚实边界:上表是本机单进程 `--stats` 实测分布(存在 run-to-run 抖动,但 4.3× 的 create total 与 125ms→33ms 的尾刺收敛远超噪声,且机制可归因);这些是排障/调优观测,**不构成吞吐或可扩展性声明**。远程/PG 后端瓶颈是网络 RTT,须另用 `bench_remote.sh` 量测。
 
 ---
 
