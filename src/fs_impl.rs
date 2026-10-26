@@ -75,6 +75,13 @@ pub struct GroveFS {
     /// ever offers it if the provider also pages in its own store — see
     /// `MetaProvider::supports_paged_readdir`.
     readdirplus: bool,
+    /// Base kernel attr/dentry cache TTL used when *not* `--strict`. Defaults to
+    /// 2 s (unchanged behavior). `--tune-cache <secs>` raises it for read-heavy /
+    /// immutable trees (e.g. the astronomy "data never lands" read-once pattern):
+    /// fewer LOOKUP/GETATTR round-trips. Cross-client freshness is still
+    /// preserved by the default notify-invalidation push, and `--strict` pins
+    /// this to 0, so this knob only ever widens caching for callers who opt in.
+    cache_ttl: Duration,
     /// Per-mount session id stamped on every lock this daemon grants, so a
     /// background heartbeat can renew exactly its own leases (`renew_locks`)
     /// and the authority can reap them on disconnect without touching peers.
@@ -114,6 +121,7 @@ impl GroveFS {
         readonly: bool,
         strict: bool,
         readdirplus: bool,
+        cache_ttl_secs: u64,
     ) -> Self {
         Self {
             meta,
@@ -123,6 +131,7 @@ impl GroveFS {
             readonly,
             strict,
             readdirplus,
+            cache_ttl: Duration::from_secs(cache_ttl_secs),
             lock_sid: gen_sid(),
             lock_renew_started: std::sync::atomic::AtomicBool::new(false),
         }
@@ -161,7 +170,7 @@ impl GroveFS {
         if self.strict {
             Duration::ZERO
         } else {
-            Duration::from_secs(2)
+            self.cache_ttl
         }
     }
 
@@ -170,7 +179,9 @@ impl GroveFS {
         if self.strict {
             Duration::ZERO
         } else {
-            Duration::from_secs(1)
+            // Half the base TTL (floored at 1 s when the base is >=2 s), matching
+            // the historical 2 s / 1 s pairing under the default cache_ttl.
+            (self.cache_ttl / 2).max(Duration::from_secs(1))
         }
     }
 
@@ -347,6 +358,15 @@ impl fuser::Filesystem for GroveFS {
             | InitFlags::FUSE_FLOCK_LOCKS;
         // Ignore which exact bits the kernel rejected; use whatever it supports.
         let _ = config.add_capabilities(caps);
+        // AUTO_INVAL_DATA (kernel >= 3.15): when a cached attr is refreshed and
+        // mtime/size changed, the kernel also drops the file's cached page data.
+        // This is what makes a raised `--tune-cache` TTL safe: a remote write that
+        // bumps size/mtime still invalidates a peer's stale pages on next access,
+        // complementing our notify-invalidation push. Negotiated as its OWN
+        // all-or-nothing group so an older kernel that lacks it drops only this
+        // bit (the core caps above stay applied) — behavior degrades to the
+        // pre-existing notify-only path, never regressing the rest.
+        let _ = config.add_capabilities(InitFlags::FUSE_AUTO_INVAL_DATA);
         // READDIRPLUS (kernel >= 4.6): reply a directory listing with per-entry
         // dentry+attr already filled in, so `ls -l` on a big dir costs one metadata
         // round-trip instead of N LOOKUP+GETATTR. Negotiated as its own
@@ -361,10 +381,24 @@ impl fuser::Filesystem for GroveFS {
                 InitFlags::FUSE_DO_READDIRPLUS | InitFlags::FUSE_READDIRPLUS_AUTO,
             );
         }
-        // Advertise a 4 MiB max write/readahead; effective ceiling is bounded by
-        // kernel FUSE_MAX_MAX_PAGES (1 MiB on 5.4, 4 MiB on 6.x+).
+        // Advertise a 4 MiB max write/readahead; fuser clamps each to its own
+        // MAX_WRITE_SIZE ceiling and the kernel further clamps to FUSE_MAX_MAX_PAGES,
+        // so this is the auto-degrade point (5.4 -> 1 MiB/page-capped, 6.x+ -> more).
         let _ = config.set_max_write(4 << 20);
         let _ = config.set_max_readahead(4 << 20);
+        // Report the bits the kernel actually granted (config.capabilities() is the
+        // kernel-supported mask) so `--stats` operators can see which new-kernel
+        // accelerations are live vs silently degraded on this host.
+        if crate::stats::enabled() {
+            let g = config.capabilities();
+            eprintln!(
+                "grovefs negotiated caps: PARALLEL_DIROPS={} AUTO_INVAL_DATA={} WRITEBACK={} MAX_PAGES={} (max_write req 4 MiB)",
+                g.contains(InitFlags::FUSE_PARALLEL_DIROPS),
+                g.contains(InitFlags::FUSE_AUTO_INVAL_DATA),
+                g.contains(InitFlags::FUSE_WRITEBACK_CACHE),
+                g.contains(InitFlags::FUSE_MAX_PAGES),
+            );
+        }
         Ok(())
     }
 

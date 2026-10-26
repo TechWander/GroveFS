@@ -135,6 +135,15 @@ enum Cmd {
         /// flag changes nothing for them.
         #[arg(long)]
         no_readdirplus: bool,
+        /// Raise the kernel attribute/dentry cache TTL to this many seconds
+        /// (default 2). For read-heavy or immutable trees (e.g. streaming the
+        /// same large files, or an astronomy "data never lands" read-once
+        /// workload) a larger TTL cuts repeated LOOKUP/GETATTR round-trips.
+        /// Cross-client freshness is still kept by the default notify-invalidation
+        /// push, and on kernels >= 3.15 AUTO_INVAL_DATA drops stale page data when
+        /// size/mtime change; `--strict` overrides this to 0 (full bypass).
+        #[arg(long, default_value_t = 2)]
+        tune_cache: u64,
         /// Opt-in per-stage latency telemetry. When set, the mount records how
         /// long each phase of a read/write/metadata op takes (key resolve, data
         /// backend, remote RTT, striping fan-out, SQLite/PG query, SSI retry …)
@@ -534,6 +543,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             as_uid,
             layout,
             no_readdirplus,
+            tune_cache,
             stats: stats_on,
             stats_file,
             stats_interval,
@@ -777,6 +787,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ro || view_ro || o.iter().any(|s| s == "ro"),
                 strict || o.iter().any(|s| s == "strict"),
                 !no_readdirplus,
+                tune_cache,
             );
 
             // Build the fuser 0.18 session Config. The old `--o` string surface is

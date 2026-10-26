@@ -21,7 +21,8 @@
 use rusqlite::{params, Connection, OpenFlags, TransactionBehavior};
 use std::collections::HashMap;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Condvar, Mutex as StdMutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::stats;
 
@@ -178,7 +179,38 @@ pub struct MetaEngine {
     read_pool: parking_lot::Mutex<Vec<Connection>>,
     /// DB path, kept so the pool can open extra read connections when drained.
     path: std::path::PathBuf,
+    /// Present only on a *writable* engine: the shutdown handle for this view's
+    /// background WAL-checkpoint thread. `None` for a read-only/standby open
+    /// (which never commits and must not spawn a thread). Dropped in
+    /// [`MetaEngine::drop`], which flips the flag and wakes the thread so it
+    /// exits within one interval. The thread holds only an `Arc` clone of this
+    /// controller — never of `MetaEngine` — so there is no reference cycle.
+    ckpt: Option<Arc<CheckpointCtl>>,
 }
+
+/// Shutdown signal for the per-view WAL-checkpoint background thread: a boolean
+/// guarded by a std mutex with a condvar so `Drop` can wake it immediately
+/// rather than waiting out the sleep interval. Kept separate from the engine's
+/// `parking_lot` writer lock; this lock is cold-path only (thread start/stop).
+struct CheckpointCtl {
+    stopped: StdMutex<bool>,
+    wake: Condvar,
+}
+
+impl CheckpointCtl {
+    /// Tell the checkpoint thread to exit at its next wake-up and nudge it now.
+    fn shutdown(&self) {
+        *self.stopped.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.wake.notify_all();
+    }
+}
+
+/// How often a writable view engine runs a background `wal_checkpoint(PASSIVE)`.
+/// A PASSIVE checkpoint never blocks the writer or readers; doing it here keeps
+/// the WAL short so the writer's *inline* auto-checkpoint (a synchronous WAL
+/// flush that showed up as a ~125 ms outlier on `create`) essentially never
+/// fires on the hot path — the stall moves off the user's metadata write.
+const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Number of pooled read connections opened per view engine for concurrent
 /// metadata reads.
@@ -242,6 +274,18 @@ fn grouped_counts(conn: &Connection, keycol: &str, tail: &str, keys: &[i64], out
     }
 }
 
+/// Stop the background WAL-checkpoint thread when the engine goes away (view
+/// unmounted / hot-reloaded / test teardown). Detached: we signal stop and
+/// wake it rather than join, so no metadata path ever blocks on shutdown; the
+/// thread exits within one [`CHECKPOINT_INTERVAL`] (or immediately on the wake).
+impl Drop for MetaEngine {
+    fn drop(&mut self) {
+        if let Some(ctl) = self.ckpt.take() {
+            ctl.shutdown();
+        }
+    }
+}
+
 impl MetaEngine {
     /// Open (and if necessary initialize) the view database for a view.
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
@@ -266,6 +310,7 @@ impl MetaEngine {
                 conn: parking_lot::Mutex::new(conn),
                 read_pool: parking_lot::Mutex::new(Vec::new()),
                 path: path.to_path_buf(),
+                ckpt: None,
             });
         }
         conn.execute_batch(
@@ -273,6 +318,7 @@ impl MetaEngine {
              PRAGMA synchronous=NORMAL;
              PRAGMA foreign_keys=ON;
              PRAGMA busy_timeout=5000;
+             PRAGMA wal_autocheckpoint=1000;
              CREATE TABLE IF NOT EXISTS node (
                  id           INTEGER PRIMARY KEY,
                  parent_id    INTEGER,
@@ -343,11 +389,73 @@ impl MetaEngine {
                 pool.push(rc);
             }
         }
+        // Background WAL checkpoint (see CHECKPOINT_INTERVAL). Only when the
+        // dedicated thread actually starts do we disable the writer's inline
+        // auto-checkpoint; if spawning fails we leave the default in place so
+        // the WAL still gets bounded by opportunistic inline passes.
+        let ckpt = Self::spawn_checkpoint_thread(path, &conn);
         Ok(Self {
             conn: parking_lot::Mutex::new(conn),
             read_pool: parking_lot::Mutex::new(pool),
             path: path.to_path_buf(),
+            ckpt,
         })
+    }
+
+    /// Spawn this view's WAL-checkpoint thread. On success it opens its own
+    /// connection, drives `wal_checkpoint(PASSIVE)` every [`CHECKPOINT_INTERVAL`]
+    /// (and a `TRUNCATE` every ~30 intervals to shrink the `-wal` file), and
+    /// returns the shutdown handle while disabling the writer's inline
+    /// auto-checkpoint (the ~125 ms `create` tail this removes). On any failure
+    /// it returns `None` and the writer keeps its default auto-checkpoint.
+    fn spawn_checkpoint_thread(path: &Path, writer: &Connection) -> Option<Arc<CheckpointCtl>> {
+        let ctl = Arc::new(CheckpointCtl {
+            stopped: StdMutex::new(false),
+            wake: Condvar::new(),
+        });
+        let db_path = path.to_path_buf();
+        let thread_ctl = Arc::clone(&ctl);
+        let started = std::thread::Builder::new()
+            .name("grove-wal-ckpt".to_string())
+            .spawn(move || {
+                let cc = match Connection::open(&db_path) {
+                    Ok(c) => c,
+                    Err(_) => return, // cannot open: leave inline checkpoint active
+                };
+                let _ = cc.execute_batch("PRAGMA busy_timeout=5000;");
+                let mut pass: u32 = 0;
+                loop {
+                    // Park for up to one interval, but wake immediately when the
+                    // engine is dropped (stop flag set) so shutdown is prompt.
+                    let guard = thread_ctl.stopped.lock().unwrap_or_else(|e| e.into_inner());
+                    let (guard, _) = thread_ctl
+                        .wake
+                        .wait_timeout_while(guard, CHECKPOINT_INTERVAL, |stopped| !*stopped)
+                        .unwrap_or_else(|e| e.into_inner());
+                    if *guard {
+                        break; // engine dropped -> exit
+                    }
+                    drop(guard);
+                    pass += 1;
+                    // TRUNCATE (reclaims disk) every ~30s, PASSIVE (non-blocking)
+                    // otherwise. Both are safe under WAL and never block readers.
+                    let sql = if pass.is_multiple_of(30) {
+                        "PRAGMA wal_checkpoint(TRUNCATE);"
+                    } else {
+                        "PRAGMA wal_checkpoint(PASSIVE);"
+                    };
+                    let _ = cc.execute_batch(sql);
+                }
+            });
+        match started {
+            Ok(_) => {
+                // The thread is alive and will keep the WAL small: disable the
+                // writer's inline auto-checkpoint so it never stalls a commit.
+                let _ = writer.execute_batch("PRAGMA wal_autocheckpoint=0;");
+                Some(ctl)
+            }
+            Err(_) => None,
+        }
     }
 
     /// Borrow a pooled read connection for one SELECT-only op; falls back to a
@@ -371,7 +479,7 @@ impl MetaEngine {
         let raw = {
             let _r = stats::start(stats::Stage::SqliteRead);
             let conn = self.read_conn();
-            let mut stmt = conn.prepare(&sql).ok()?;
+            let mut stmt = conn.prepare_cached(&sql).ok()?;
             stmt.query_row(params![parent, name], row_to_raw).ok()
         };
         raw.map(|r| self.finalize(r))
@@ -385,7 +493,7 @@ impl MetaEngine {
         let raw = {
             let _r = stats::start(stats::Stage::SqliteRead);
             let conn = self.read_conn();
-            let mut stmt = conn.prepare(&sql).ok()?;
+            let mut stmt = conn.prepare_cached(&sql).ok()?;
             stmt.query_row(params![ino], row_to_raw).ok()
         };
         raw.map(|r| self.finalize(r))
@@ -398,7 +506,7 @@ impl MetaEngine {
         let raws = {
             let _r = stats::start(stats::Stage::SqliteRead);
             let conn = self.read_conn();
-            let mut stmt = match conn.prepare(&sql) {
+            let mut stmt = match conn.prepare_cached(&sql) {
                 Ok(s) => s,
                 Err(_) => return Vec::new(),
             };
@@ -426,7 +534,7 @@ impl MetaEngine {
         let raws = {
             let _r = stats::start(stats::Stage::SqliteRead);
             let conn = self.read_conn();
-            let mut stmt = match conn.prepare(&sql) {
+            let mut stmt = match conn.prepare_cached(&sql) {
                 Ok(s) => s,
                 Err(_) => return Vec::new(),
             };
@@ -974,11 +1082,8 @@ impl MetaEngine {
         let (nlink, size) = match kind {
             NodeKind::Dir => {
                 let subdirs: i64 = conn
-                    .query_row(
-                        "SELECT COUNT(*) FROM node WHERE parent_id=?1 AND is_dir=1",
-                        params![raw.id],
-                        |r| r.get(0),
-                    )
+                    .prepare_cached("SELECT COUNT(*) FROM node WHERE parent_id=?1 AND is_dir=1")
+                    .and_then(|mut s| s.query_row(params![raw.id], |r| r.get(0)))
                     .unwrap_or(0);
                 (2 + subdirs as u64, 4096u64)
             }
@@ -988,11 +1093,8 @@ impl MetaEngine {
             }
             NodeKind::Regular => {
                 let links: i64 = conn
-                    .query_row(
-                        "SELECT COUNT(*) FROM node WHERE ino=?1",
-                        params![raw.ino],
-                        |r| r.get(0),
-                    )
+                    .prepare_cached("SELECT COUNT(*) FROM node WHERE ino=?1")
+                    .and_then(|mut s| s.query_row(params![raw.ino], |r| r.get(0)))
                     .unwrap_or(1);
                 (links.max(1) as u64, 0u64)
             }
