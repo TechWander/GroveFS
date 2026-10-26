@@ -415,13 +415,29 @@ impl MetaEngine {
         });
         let db_path = path.to_path_buf();
         let thread_ctl = Arc::clone(&ctl);
+        // Handshake: the thread reports whether it managed to open its own
+        // connection. `thread::spawn` returning Ok only proves the OS thread
+        // started, NOT that `Connection::open` inside it will succeed — and a
+        // failed open would leave the thread exiting without ever checkpointing
+        // while we had already disabled the writer's inline auto-checkpoint (an
+        // unbounded-growth gap, the opposite of the comment's promise). So we
+        // only disable inline checkpointing once the thread confirms readiness.
+        let (tx, rx) = std::sync::mpsc::channel::<bool>();
         let started = std::thread::Builder::new()
             .name("grove-wal-ckpt".to_string())
             .spawn(move || {
                 let cc = match Connection::open(&db_path) {
                     Ok(c) => c,
-                    Err(_) => return, // cannot open: leave inline checkpoint active
+                    // Cannot open: tell the parent to keep inline checkpointing,
+                    // then bow out. The WAL stays bounded by opportunistic passes.
+                    Err(_) => {
+                        let _ = tx.send(false);
+                        return;
+                    }
                 };
+                // Connection is live and this thread will now own the checkpoint
+                // cadence — green-light the parent to disable inline checkpointing.
+                let _ = tx.send(true);
                 let _ = cc.execute_batch("PRAGMA busy_timeout=5000;");
                 let mut pass: u32 = 0;
                 loop {
@@ -448,11 +464,25 @@ impl MetaEngine {
                 }
             });
         match started {
+            // Wait (bounded) for the thread's open result. On the normal path it
+            // opens in microseconds, so this returns immediately; we only stall
+            // toward the timeout when the open genuinely fails/hangs, in which
+            // case keeping the writer's inline auto-checkpoint is the safe choice
+            // (a late-starting thread would merely run idempotent PASSIVE passes
+            // alongside inline ones — never a gap).
             Ok(_) => {
-                // The thread is alive and will keep the WAL small: disable the
-                // writer's inline auto-checkpoint so it never stalls a commit.
-                let _ = writer.execute_batch("PRAGMA wal_autocheckpoint=0;");
-                Some(ctl)
+                if rx.recv_timeout(CHECKPOINT_INTERVAL).unwrap_or(false) {
+                    // The thread is alive and will keep the WAL small: disable
+                    // the writer's inline auto-checkpoint so it never stalls a
+                    // commit (this is what removes the ~125 ms `create` tail).
+                    let _ = writer.execute_batch("PRAGMA wal_autocheckpoint=0;");
+                    Some(ctl)
+                } else {
+                    // Thread couldn't open its connection (or panicked before
+                    // reporting): keep the writer's default auto-checkpoint so
+                    // the WAL is still bounded inline. No orphan-thread gap.
+                    None
+                }
             }
             Err(_) => None,
         }
