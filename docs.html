@@ -156,6 +156,7 @@
         <tr><td><b>只读 / 零缓存强一致</b> — 挂载为只读 / 关闭客户端缓存</td><td><code>--ro</code> / <code>--strict</code></td></tr>
         <tr><td><b>目录列举提速的回退开关</b> — 关掉 READDIRPLUS（随目录项一并带回属性），退回普通 READDIR + 逐条 <code>LOOKUP</code>，仅供 A/B 与兼容排障（provider 自身不能分页的挂载本来就不协商 READDIRPLUS，此开关对它们为空操作）</td><td><code>--no-readdirplus</code></td></tr>
         <tr><td><b>读写瓶颈排查</b> — 开启分阶段延迟遥测，把一次读/写/元数据 op 内部各阶段的分段墙钟延迟汇成 p50/p90/p99/max 离线看（默认关闭、零成本，仅显式开启才采样）</td><td><code>--stats</code> / <code>--stats-file</code> / <code>--stats-interval</code></td></tr>
+        <tr><td><b>读缓存 TTL 调优</b> — 放大内核 attr/dentry 缓存 TTL(默认 2s)，对读多/不可变树削减重复 LOOKUP/GETATTR；跨端新鲜度仍靠默认失效推送 + 新内核 AUTO_INVAL_DATA 兜底，<code>--strict</code> 强制归 0</td><td><code>--tune-cache &lt;秒&gt;</code></td></tr>
       </tbody>
     </table>
   </section>
@@ -408,6 +409,14 @@ $Y mount --view alice --data ... --meta ... --token s3cr3t -m /mnt/alice</code><
       <tr><td>目录分页 + READDIRPLUS</td><td><code>readdir_page(parent, offset, limit)</code> 在 SQLite 与 PG 引擎都下推成 SQL <code>LIMIT/OFFSET</code>,FUSE 回调按 32→1024 几何块流式填回复缓冲;默认协商 <code>FUSE_DO_READDIRPLUS</code>(与普通能力位分属不同的 all-or-nothing 组,内核不支持则自然回退),<code>--no-readdirplus</code> 可关做 A/B。两者由 <code>supports_paged_readdir()</code> 门控:本地 SQLite/PG 与对接能分页的 <code>meta-server</code> 的远端挂载(新 <code>M_READDIRP</code> 帧把分页下推到服务端)都吃两者;仍不能自身分页的 provider(<code>LayoutMeta</code> 派生/透镜、不含该能力位的老服务端)每内核缓冲取一次全量列表且不协商 PLUS,以免 PLUS 的胖记录把全量重取次数乘 ~4 倍。</td></tr>
       <tr><td>分阶段延迟遥测 <code>--stats</code></td><td>把一次读/写/元数据 op 内部各阶段(端到端 <code>op_total</code>、key 解析、后端 IO、分片扇出、元数据 DB、远程 RPC)的分段<b>墙钟延迟</b>汇成 p50/p90/p99/max,离线定位瓶颈——是排障工具而非吞吐测量,不构成任何吞吐/可扩展性声明。<b>默认关闭、零成本</b>:每个埋点仅一次 relaxed 原子读即短路(关闭态连 <code>Instant::now()</code> 都不调用、不加锁、不分配),<code>.grove-stats</code> 节点检查同样短路,故默认挂载的读写热路径不受影响;仅显式开启才付采样代价。直方图按 worker 线程分片,记录不串行化到一把全局锁。开关 <code>--stats</code> / <code>--stats-file &lt;路径&gt;</code>(周期覆盖写)/ <code>--stats-interval &lt;秒&gt;</code> / 环境变量 <code>GROVEFS_STATS=1</code>;挂载退出时经 <code>stderr</code> 打印最终报告。只读控制节点 <code>&lt;mnt&gt;/.grove-stats</code> 仅在开启时出现(保留 inode、不落盘、不进任何视图定义,治理不变量 I1–I4 不受影响),<code>cat</code> 即当前报告。端到端见 <code>.build-bin/test_stats.sh</code>。<b>已知延后项</b>:errno(失败 op)计数因需扩固定 counter 注册表 schema,本轮有意未做。</td></tr>
     </table>
+    <h3>加速与内核自适应（新内核走快路、老内核自动降级）</h3>
+    <table>
+      <tr><th>项</th><th>说明</th></tr>
+      <tr><td>后台 WAL checkpoint</td><td>每个可写视图引擎起一条后台 <code>wal_checkpoint(PASSIVE)</code> 线程（每 1s，~30s 一次 <code>TRUNCATE</code>），并把写连接 <code>wal_autocheckpoint=0</code>——把原本内联在提交里的同步 checkpoint 停顿（实测曾使 <code>create</code> 单次 125ms 尾刺）移出写热路径。线程经 <code>Arc&lt;StopSignal&gt;</code> 随引擎 <code>Drop</code> 关停（不 join、不阻塞卸载），只读/备机引擎不启动。配合热读路径 <code>prepare_cached</code> 复用语句。同一 3000 文件建目录实测：<code>meta.create</code> total 1.64s→<b>0.38s</b>、max 125ms→<b>33ms</b>；<code>lookup</code> p50 39→17µs、<code>getattr</code> p50 66→36µs。</td></tr>
+      <tr><td><code>--tune-cache &lt;秒&gt;</code> 读缓存 TTL</td><td>把内核 attr/dentry 缓存 TTL 从默认 2s 放大，适合读多/不可变树（天文“数据不落地”一次性流读）。安全边界：跨端新鲜度仍由默认 <code>notify</code> 实时失效推送保证，且新内核（≥ 3.15）协商到 <code>FUSE_AUTO_INVAL_DATA</code>（size/mtime 变则丢陈旧页数据）；<code>--strict</code> 恒把 TTL 钉为 0。能力位按各自组协商，<code>AUTO_INVAL_DATA</code> 单独成组→老内核只丢此位不伤其余。见 <code>run_all.sh</code> <code>freshness</code>/<code>disp_fresh</code>。</td></tr>
+      <tr><td>内核自适应大块 IO</td><td><code>max_write</code>/<code>max_readahead</code> 申请 4MiB，由 fuser 与内核按 <code>FUSE_MAX_MAX_PAGES</code> 各自截断：老内核（5.4）自动降到页上限，6.x+ 更大块=更少往返；<code>PARALLEL_DIROPS</code>、<code>WRITEBACK_CACHE</code>、<code>MAX_PAGES</code> 均能力协商。<code>--stats</code> 下会打印 <code>grovefs negotiated caps: …</code> 显示本机实际授予位。大块读写已贴近底层地板，实测 FUSE 每 op 仅加 ~50–70µs。</td></tr>
+    </table>
+    <div class="note">这些加速均为排障/调优观测，<b>不构成吞吐或可扩展性声明</b>（与论文边界一致）；上表数字是本机单进程 <code>--stats</code> 实测分布，存在 run-to-run 抖动但机制可归因。远程/PG 后端瓶颈是网络 RTT，须另用 <code>bench_remote.sh</code> 量测。</div>
     <div class="note"><b>真实回显</b>(本地 SQLite 挂载加 <code>--stats</code>,做了若干读写 / mkdir / readdir 后 <code>cat &lt;mnt&gt;/.grove-stats</code> 的 <code>[op]</code> 节选,单位 µs;<code>[data-io]</code>/<code>[meta]</code>/<code>[counters]</code> 同形,完整清单见 <code>USAGE.md</code> §8.1):
       <pre>GroveFS per-stage latency telemetry  (durations in µs)
   diagnostic tooling only — not a throughput/scalability claim
