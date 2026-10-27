@@ -14,6 +14,8 @@
 //!            derived lenses (shape governance, mounted read-only) and pure
 //!            aliases (name governance: the alias is the writable public
 //!            face of a physical view, whose real name stops being mountable)
+//!   mcp    — serve the view-governance tools over MCP (stdio) so an AI agent
+//!            can customize data listings through the same validated API
 //!   import — mirror an EXISTING local directory tree into a view, zero-copy
 //!            (hard link into blocks/) where the filesystem allows it
 //!   acl    — per-view uid whitelist
@@ -322,6 +324,50 @@ enum Cmd {
         #[command(subcommand)]
         action: ViewAction,
     },
+    /// Serve view governance over MCP (Model Context Protocol) on stdio, for
+    /// AI agents. An MCP client (agent runtime) spawns this as a subprocess
+    /// and the agent drives the same validated operations as `grove view`:
+    /// list_views / define_derived_view / alias_view / remove_view /
+    /// preview_rules — rules travel as inline text (hide/only/map/link), so
+    /// an agent customizes a data listing's shape without touching files.
+    /// Implements the initialize / ping / tools/list / tools/call core of the
+    /// 2025-06-18 protocol revision with newline-delimited JSON-RPC 2.0
+    /// framing. Control plane only: it writes `<db-path>/meta/views/*.layout`
+    /// definitions (live meta-server mounts hot-reload them) but never mounts
+    /// or touches data. `--db-path` sets the default metadata root (falls
+    /// back to `--home`); a per-call `db_path` argument overrides it.
+    Mcp {
+        /// Metadata root holding `meta/views/` — same option name and
+        /// directory as `grove view` / `meta-server --db-path`.
+        #[arg(long)]
+        db_path: Option<PathBuf>,
+        /// Require an API key before the tool surface is usable. With it, an
+        /// MCP client must present a `grove apikey create` key as `apiKey` in
+        /// the `initialize` params (or the operator exports
+        /// `GROVEFS_MCP_API_KEY` to pre-authenticate the whole server); until a
+        /// key authenticates, `tools/list` and `tools/call` are refused with a
+        /// JSON-RPC error. `initialize`/`ping` stay open so a client can always
+        /// handshake. Off by default: a plain `grove mcp` trusts whoever can
+        /// spawn it (the same OS boundary as a local mount). Either way, every
+        /// tool call is appended to `<db-path>/meta/api_keys.db`'s audit log.
+        #[arg(long)]
+        require_api_key: bool,
+    },
+    /// Manage the MCP server's API keys and read its call-audit log. Keys
+    /// authenticate callers of `grove mcp --require-api-key`; they are stored
+    /// as SHA-256 hashes (only the minting `create` shows the plaintext once),
+    /// so a leaked `api_keys.db` hands out nothing usable. Revoking keeps the
+    /// row (so past calls stay attributed) but fails authentication. The audit
+    /// log records every tool call (timestamp, key, tool, success, detail).
+    Apikey {
+        /// The metadata root holding `meta/api_keys.db` — same option name and
+        /// directory as `grove mcp --db-path` / `meta-server --db-path`; falls
+        /// back to the global `--home`.
+        #[arg(long)]
+        db_path: Option<PathBuf>,
+        #[command(subcommand)]
+        action: ApikeyAction,
+    },
     /// Import an EXISTING local directory tree into a view WITHOUT moving or
     /// duplicating bytes: every regular file is registered as an object —
     /// hard-linked into `blocks/` when source and store share a filesystem
@@ -451,6 +497,32 @@ enum AclAction {
     List {
         #[arg(long)]
         view: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ApikeyAction {
+    /// Mint a new key labeled `--label` and print the full plaintext
+    /// `<id>:<secret>` ONCE (it is not recoverable afterward — only its
+    /// SHA-256 is stored). Give this to the agent/client; it presents it as
+    /// `apiKey` in the MCP `initialize` params.
+    Create {
+        #[arg(long)]
+        label: String,
+    },
+    /// List every key (id, label, created/last-used/revoked) — never any
+    /// secret material.
+    List,
+    /// Revoke the key with id `--id` (short id prefix accepted). Revoked keys
+    /// fail authentication but stay listed so past audit rows keep attribution.
+    Revoke {
+        #[arg(long)]
+        id: String,
+    },
+    /// Show the most recent `--limit` (default 20) MCP call-audit rows.
+    Calls {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
     },
 }
 
@@ -953,261 +1025,164 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // with the view trees themselves (copy the `views/` dir to a HA
             // standby like any other config).
             let vbase = db_path.unwrap_or_else(|| base.clone());
-            let dir = vbase.join("meta").join("views");
             match action {
                 ViewAction::Define {
                     name,
                     base: src_base,
                     rules,
                 } => {
-                    use grovefs::layout::{valid_view_name, LayoutRules};
-                    if !valid_view_name(&name) {
-                        return Err(format!(
-                            "invalid view name '{name}' (must be one safe path element)"
-                        )
-                        .into());
-                    }
-                    if !valid_view_name(&src_base) {
-                        return Err(format!("invalid base view name '{src_base}'").into());
-                    }
-                    if name == src_base {
-                        return Err("derived view name must differ from its base".into());
-                    }
-                    if vbase.join("meta").join(format!("{name}.db")).is_file() {
-                        return Err(format!(
-                            "'{name}' already names a physical view db — pick another name"
-                        )
-                        .into());
-                    }
-                    // One file slot per name: an existing ALIAS may be replaced
-                    // (a deliberate governance change) but silently turning a
-                    // public alias into a read-only shaped view is not `define`
-                    // 's business.
-                    let self_def_path = dir.join(format!("{name}.layout"));
-                    if let Ok(d) = grovefs::layout::LayoutRules::parse_def_file(&self_def_path) {
-                        if matches!(d, grovefs::layout::ViewDef::Alias(_)) {
-                            return Err(format!(
-                                "'{name}' is a pure alias — remove it first (`grove view rm --name {name}`) before defining a derived view over it"
-                            )
-                            .into());
-                        }
-                    }
-                    // `base` is supplied by --base, so a base line inside the
-                    // rules file is rejected here (LayoutRules::parse has no
-                    // such verb) — one unambiguous source of truth per file.
+                    // The view-governance ops live in `grovefs::mcp` — the CLI
+                    // and the MCP server are two entrances onto ONE validated
+                    // implementation. `--rules` stays a file here; MCP agents
+                    // hand the same text inline.
                     let text = std::fs::read_to_string(&rules)
                         .map_err(|e| format!("cannot read rules file {}: {e}", rules.display()))?;
-                    let r = LayoutRules::parse(&text).map_err(|e| format!("bad layout rules: {e}"))?;
-                    if dir.join(format!("{name}.layout")).is_file() {
-                        println!("view '{name}' already defined — replacing it (live meta-server mounts hot-reload it within their cache TTL)");
-                    }
-                    std::fs::create_dir_all(&dir)?;
-                    std::fs::write(
-                        dir.join(format!("{name}.layout")),
-                        format!("base {src_base}\n{text}"),
-                    )?;
-                    println!(
-                        "defined derived view '{name}' over base '{src_base}': {} hide, {} only, {} reloc rule(s)",
-                        r.hide.len(),
-                        r.only.len(),
-                        r.reloc.len()
-                    );
-                    println!(
-                        "note: mounts of '{name}' are read-only (virtual shape) — write to base view '{src_base}'"
-                    );
-                    if !vbase.join("meta").join(format!("{src_base}.db")).is_file() {
-                        eprintln!(
-                            "note: no local <db-path>/meta/{src_base}.db yet — fine under PG or lazy creation, otherwise run `grove --home ... init --view {src_base}` first"
-                        );
+                    for l in grovefs::mcp::define_view(&vbase, &name, &src_base, &text)? {
+                        match l {
+                            grovefs::mcp::OutLine::Info(s) => println!("{s}"),
+                            grovefs::mcp::OutLine::Note(s) => eprintln!("{s}"),
+                        }
                     }
                 }
                 ViewAction::List => {
-                    let mut names: Vec<String> = Vec::new();
-                    if let Ok(rd) = std::fs::read_dir(&dir) {
-                        for ent in rd.flatten() {
-                            let p = ent.path();
-                            if p.extension().and_then(|e| e.to_str()) == Some("layout") {
-                                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                                    names.push(stem.to_string());
-                                }
-                            }
-                        }
-                    }
-                    names.sort();
-                    if names.is_empty() {
-                        println!(
-                            "no view definitions under {} (every view name maps to its own tree)",
-                            dir.display()
-                        );
-                    }
-                    for n in names {
-                        let d = grovefs::layout::LayoutRules::parse_def_file(
-                            &dir.join(format!("{n}.layout")),
-                        )
-                        .map_err(|e| format!("bad view definition for '{n}': {e}"))?;
-                        match d {
-                            grovefs::layout::ViewDef::Alias(real) => println!(
-                                "alias '{n}' -> real view '{real}' (full tree, writable; '{real}' not mountable by its own name)"
-                            ),
-                            grovefs::layout::ViewDef::Derived(b, r) => println!(
-                                "view '{n}' -> base '{b}': {} hide, {} only, {} reloc rule(s) (read-only)"
-                            ,
-                                r.hide.len(),
-                                r.only.len(),
-                                r.reloc.len()
-                            ),
+                    for l in grovefs::mcp::list_views_text(&vbase)? {
+                        match l {
+                            grovefs::mcp::OutLine::Info(s) => println!("{s}"),
+                            grovefs::mcp::OutLine::Note(s) => eprintln!("{s}"),
                         }
                     }
                 }
                 ViewAction::Alias { name, real, retire } => {
-                    use grovefs::layout::{LayoutRules, ViewDef};
-                    if !grovefs::layout::valid_view_name(&name) {
-                        return Err(format!(
-                            "invalid alias name '{name}' (must be one safe path element)"
-                        )
-                        .into());
-                    }
-                    if !grovefs::layout::valid_view_name(&real) {
-                        return Err(format!("invalid real view name '{real}'").into());
-                    }
-                    if name == real {
-                        return Err("alias name must differ from the real view name".into());
-                    }
-                    if let Some(old) = &retire {
-                        if !grovefs::layout::valid_view_name(old) {
-                            return Err(format!("invalid --retire alias name '{old}'").into());
+                    // Same shared implementation as the MCP `alias_view` tool
+                    // (validation, gapless --retire rotation, notes).
+                    for l in grovefs::mcp::alias_view(&vbase, &name, &real, retire.as_deref())? {
+                        match l {
+                            grovefs::mcp::OutLine::Info(s) => println!("{s}"),
+                            grovefs::mcp::OutLine::Note(s) => eprintln!("{s}"),
                         }
-                        if old == &name {
-                            return Err(
-                                "--retire must name a DIFFERENT (previous) alias, not the one being created"
-                                    .into(),
-                            );
-                        }
-                    }
-                    if vbase.join("meta").join(format!("{name}.db")).is_file() {
-                        return Err(format!(
-                            "'{name}' already names a physical view db — pick another name"
-                        )
-                        .into());
-                    }
-                    // The alias target must be a PHYSICAL view (the storage
-                    // identity the alias maps onto), and must not itself be
-                    // governed: chaining aliases or aliasing a derived view
-                    // would create resolution ambiguity the server does not
-                    // model (M_OPEN resolution is single-hop by design).
-                    let mut alias_to: HashMap<String, String> = HashMap::new();
-                    let mut derived_names: Vec<String> = Vec::new();
-                    if let Ok(rd) = std::fs::read_dir(&dir) {
-                        for ent in rd.flatten() {
-                            let p = ent.path();
-                            if p.extension().and_then(|e| e.to_str()) != Some("layout") {
-                                continue;
-                            }
-                            let stem = match p.file_stem().and_then(|s| s.to_str()) {
-                                Some(s) => s.to_string(),
-                                None => continue,
-                            };
-                            if let Ok(d) = LayoutRules::parse_def_file(&p) {
-                                match d {
-                                    ViewDef::Alias(r) => {
-                                        alias_to.insert(stem, r);
-                                    }
-                                    ViewDef::Derived(..) => derived_names.push(stem),
-                                }
-                            }
-                        }
-                    }
-                    // A requested atomic retirement: verify the old name is
-                    // in fact an alias of THIS real view (never silently drop
-                    // a derived definition or a different view's alias), then
-                    // drop it from the working map so the steady-state check
-                    // below reflects the post-rotation state (one name per
-                    // real view) instead of tripping on the alias we retire
-                    // in this very command.
-                    if let Some(old) = &retire {
-                        match alias_to.get(old) {
-                            Some(r) if r == &real => {
-                                alias_to.remove(old);
-                            }
-                            Some(r) => {
-                                return Err(format!(
-                                    "--retire '{old}' currently aliases a different real view ('{r}'), not '{real}' — rotation must retire the previous name of the same view"
-                                )
-                                .into());
-                            }
-                            None => {
-                                return Err(format!(
-                                    "--retire '{old}' is not a pure alias here (a derived view is separate — `grove view list` shows what '{old}' actually is)"
-                                )
-                                .into());
-                            }
-                        }
-                    }
-                    if alias_to.contains_key(&real) {
-                        return Err(format!(
-                            "alias target '{real}' is itself an alias (-> '{}') — chains are not supported; alias the physical view instead",
-                            alias_to[&real]
-                        )
-                        .into());
-                    }
-                    if derived_names.iter().any(|d| d == &real) {
-                        return Err(format!(
-                            "alias target '{real}' is a derived (virtual) view — aliases map onto a physical view only"
-                        )
-                        .into());
-                    }
-                    if let Some(existing) = alias_to.iter().find(|(_, r)| **r == real) {
-                        if existing.0 != &name {
-                            return Err(format!(
-                                "real view '{real}' is already governed by alias '{}' — one public name per real view; to rotate it gaplessly use `grove view alias --name {name} --real {real} --retire {}`",
-                                existing.0, existing.0
-                            )
-                            .into());
-                        }
-                    }
-                    if dir.join(format!("{name}.layout")).is_file() {
-                        println!(
-                            "view '{name}' already defined — replacing it with the alias (live mounts re-resolve at their next M_OPEN)"
-                        );
-                    }
-                    std::fs::create_dir_all(&dir)?;
-                    // Write the new alias BEFORE removing the retired one: the
-                    // real view is governed by at least one name at every
-                    // instant, so a leaked old name never opens a window where
-                    // the real name becomes mountable by itself.
-                    std::fs::write(dir.join(format!("{name}.layout")), format!("alias {real}\n"))?;
-                    if let Some(old) = &retire {
-                        let _ = std::fs::remove_file(dir.join(format!("{old}.layout")));
-                        println!(
-                            "rotated public name for real view '{real}': '{old}' -> '{name}' (gapless — '{real}' stayed governed throughout, '{old}' no longer resolves)"
-                        );
-                        println!(
-                            "note: ACL grants are keyed to '{real}', so they carried over untouched — legitimate users just remount under '{name}'"
-                        );
-                    } else {
-                        println!("defined pure alias '{name}' -> real view '{real}'");
-                    }
-                    println!(
-                        "note: '{real}' is no longer a mount entry point while this definition exists (mounts by its real name are refused, locally and via meta-server); alias mounts show the FULL tree and are WRITABLE"
-                    );
-                    if !vbase.join("meta").join(format!("{real}.db")).is_file() {
-                        eprintln!(
-                            "note: no local <db-path>/meta/{real}.db yet — fine under PG or lazy creation, otherwise run `grove --home ... init --view {real}` first"
-                        );
                     }
                 }
                 ViewAction::Rm { name } => {
-                    if !grovefs::layout::valid_view_name(&name) {
-                        return Err(format!("invalid view name '{name}'").into());
+                    for l in grovefs::mcp::remove_view(&vbase, &name)? {
+                        match l {
+                            grovefs::mcp::OutLine::Info(s) => println!("{s}"),
+                            grovefs::mcp::OutLine::Note(s) => eprintln!("{s}"),
+                        }
                     }
-                    let p = dir.join(format!("{name}.layout"));
-                    if !p.is_file() {
-                        return Err(
-                            format!("no view definition '{name}' under {}", dir.display()).into()
+                }
+            }
+        }
+        Cmd::Mcp {
+            db_path,
+            require_api_key,
+        } => {
+            // The agent entrance onto the same governance API: an MCP client
+            // spawns this over stdio; EOF on stdin shuts it down. Control
+            // plane only — no mount, no data IO. `--require-api-key` gates
+            // tools/list + tools/call behind a `grove apikey` credential.
+            grovefs::mcp::serve(
+                db_path.unwrap_or_else(|| base.clone()),
+                require_api_key,
+            )?;
+        }
+        Cmd::Apikey { db_path, action } => {
+            // Keys + audit log live beside acl.db in the authoritative meta
+            // root — control-plane state, shared by `grove mcp` at this path.
+            let ak_base = db_path.unwrap_or_else(|| base.clone());
+            let keys = grovefs::apikeys::ApiKeyStore::open(&ak_base)?;
+            match action {
+                ApikeyAction::Create { label } => {
+                    let (id, full) = keys.create(&label)?;
+                    println!("apikey created — shown ONCE (only its SHA-256 is stored; save it now):");
+                    println!("  id:    {id}");
+                    println!("  label: {label}");
+                    println!("  key:   {full}");
+                    println!();
+                    println!("Present it as the `apiKey` param in the MCP `initialize` handshake, or");
+                    println!("export GROVEFS_MCP_API_KEY='{full}' when launching");
+                    println!("`grove mcp --db-path {} --require-api-key`.", ak_base.display());
+                    println!("Revoke later with: grove apikey --db-path {} revoke --id {id}", ak_base.display());
+                }
+                ApikeyAction::List => {
+                    let rows = keys.list()?;
+                    if rows.is_empty() {
+                        println!(
+                            "no api keys yet (under {}); mint one with `grove apikey create --label L`",
+                            ak_base.display()
                         );
+                    } else {
+                        println!(
+                            "{:<3} {:<34} {:<16} {:<25} {:<25} {}",
+                            "#", "id", "label", "created", "last_used", "revoked"
+                        );
+                        for (i, r) in rows.iter().enumerate() {
+                            println!(
+                                "{:<3} {:<34} {:<16} {:<25} {:<25} {}",
+                                i + 1,
+                                r.id,
+                                r.label,
+                                r.created_at,
+                                r.last_used_at.as_deref().unwrap_or("-"),
+                                r.revoked_at.as_deref().unwrap_or("-"),
+                            );
+                        }
                     }
-                    std::fs::remove_file(&p)?;
-                    println!("removed view definition '{name}' (underlying data untouched)");
+                }
+                ApikeyAction::Revoke { id } => {
+                    // Accept an exact id, else a UNIQUE prefix (ids are long hex).
+                    let all = keys.list()?;
+                    let resolved: Vec<_> = if let Some(e) = all.iter().find(|k| k.id == id) {
+                        vec![e]
+                    } else {
+                        all.iter().filter(|k| k.id.starts_with(id.as_str())).collect()
+                    };
+                    match resolved.len() {
+                        0 => {
+                            return Err(format!(
+                                "no api key with id '{id}' (see `grove apikey list`)"
+                            )
+                            .into())
+                        }
+                        1 => {
+                            let k = resolved[0];
+                            if k.revoked_at.is_some() {
+                                println!("apikey: id='{}' (label '{}') is already revoked", k.id, k.label);
+                            } else if keys.revoke(&k.id)? {
+                                println!("apikey: revoked id='{}' (label '{}'); it can no longer authenticate, past calls keep attribution", k.id, k.label);
+                            } else {
+                                println!("apikey: id='{}' became revoked concurrently", k.id);
+                            }
+                        }
+                        n => {
+                            return Err(format!(
+                                "ambiguous id prefix '{id}' matches {n} keys — use a longer prefix or the full id"
+                            )
+                            .into())
+                        }
+                    }
+                }
+                ApikeyAction::Calls { limit } => {
+                    let rows = keys.recent_calls(limit)?;
+                    if rows.is_empty() {
+                        println!("no logged mcp calls yet (a `grove mcp` run appends one row per tools/call here)");
+                    } else {
+                        println!("last {} mcp call(s), newest first:", rows.len());
+                        println!(
+                            "{:<25} {:<34} {:<12} {:<22} {:<4} {}",
+                            "ts", "key_id", "method", "tool", "ok", "detail"
+                        );
+                        for r in &rows {
+                            println!(
+                                "{:<25} {:<34} {:<12} {:<22} {:<4} {}",
+                                r.ts,
+                                r.key_id.as_deref().unwrap_or("-"),
+                                r.method,
+                                if r.tool.is_empty() { "-" } else { r.tool.as_str() },
+                                if r.ok { "yes" } else { "no" },
+                                r.detail,
+                            );
+                        }
+                    }
                 }
             }
         }

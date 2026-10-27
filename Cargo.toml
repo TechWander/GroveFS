@@ -45,6 +45,8 @@ postgres = { version = "0.19", default-features = false }
 # for offline bottleneck diagnosis. Pure-Rust, zero deps. Only touched when
 # `--stats` / `GROVEFS_STATS=1` is on; the disabled path costs one atomic load.
 hdrhistogram = "7"
+serde_json = "1.0.154"
+sha2 = "0.11.1"
 
 [dev-dependencies]
 # Temp dirs for integration tests (metadata DB, remote data-server backing store)

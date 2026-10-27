@@ -32,6 +32,9 @@
 /.govtime/
 /.grovesci/
 /.pgpar/
+/.apitest/
+/.demomcp/
+/.mcptest/
 
 # .build-bin tracks the test/bench scripts and the pkg-config wrapper,
 # but never its run output or captured logs.
@@ -40,6 +43,7 @@
 
 # Stray ad-hoc run logs
 /edge_run.txt
+/.build-bin/*.log
 
 # LaTeX build artifacts under paper/ (only the .tex source is tracked; the
 # rest are regenerable by latexmk/pdflatex).
