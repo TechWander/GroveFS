@@ -10,12 +10,16 @@
 //! - [`fs_impl`]      : the fuser `Filesystem` bridging POSIX calls to the above
 //! - [`remote`]       : TCP data transport (client backend + server), no NFS
 //! - [`acl`]          : optional per-view uid whitelist (advisory access control)
+//! - [`apikeys`]      : API-key auth + call-audit log for the MCP governance server
 //! - [`layout`]       : per-mount presentation overlay (same tree, different lens)
+//! - [`mcp`]          : MCP server exposing the view-governance tools to AI agents
 
 pub mod acl;
+pub mod apikeys;
 pub mod backend;
 pub mod fs_impl;
 pub mod layout;
+pub mod mcp;
 pub mod meta;
 pub mod pg_store;
 pub mod remote;
