@@ -5,10 +5,10 @@
 %%   tlmgr install acmart          # if missing
 %%   latexmk -pdf grovefs-tos.tex  # pdflatex xelatex both fine
 %%
-%% NOTE (honesty): this source was authored in an environment WITHOUT a TeX
-%% distribution, so it has NOT been machine-compiled here. It targets the
-%% acmtos/acmart template and its structures are self-checked for \begin/\end
-%% balance only. Compile once in your own TeX Live before submission.
+%% NOTE: this source has been machine-compiled with TeX Live (latexmk/pdfLaTeX,
+%% 20 pages, no errors) including the Sec. 6 agent-MCP/API-key paragraph, the
+%% Sec. 7 executed mcp/apikey evidence and the Sec. 8 agent-interface
+%% positioning. Re-run `latexmk -pdf grovefs-tos.tex` after any edit.
 
 \documentclass[numberedsection,acmtos]{acmart}
 
@@ -709,7 +709,7 @@ Sec.~\ref{sec:eval}.
 %% ================================================================== 6-10 stub
 \section{Implementation}
 \label{sec:impl}
-GroveFS is \textasciitilde13k lines of Rust. The lens, remote service and
+GroveFS is \textasciitilde17k lines of Rust. The lens, remote service and
 storage backends are each a module behind the two trait seams
 (Figure~\ref{fig:arch}, sizes in Table~\ref{tab:loc}); we summarise the parts
 that matter to the correctness claims. A governed write resolves the display
@@ -785,6 +785,45 @@ server restart. Access is guarded by two-sided tokens; a standby signals
 failover with a dedicated read-only status code kept distinct from a permission
 denial and from data errors.
 
+\paragraph{Agent governance interface (MCP).} View governance is re-exposed
+as a server an AI agent can drive: \texttt{grove mcp} speaks line-delimited
+JSON-RPC~2.0 over stdio, implementing the common method surface of the
+Model Context Protocol (MCP) 2025-06-18 revision---lifecycle
+(\texttt{initialize}/\texttt{ping}), tools (\texttt{tools/list}/\texttt{tools/call}),
+resources (\texttt{resources/list}, \texttt{resources/templates/list},
+\texttt{resources/read}), prompts (\texttt{prompts/list}/\texttt{prompts/get}),
+argument completion (\texttt{completion/complete}), and logging
+(\texttt{logging/setLevel} answered by server-initiated
+\texttt{notifications/message} frames); id-less client notifications are
+accepted but never answered. The protocol is a hand-rolled dispatch loop, not a
+framework binding. Its decisive property is that it is \emph{not a second
+implementation}: every method reuses the same crate functions that back the
+\texttt{grove view} CLI (the six governance and two read-only introspection
+tools), and the resource, prompt and completion surfaces render through the very
+same view-definition and listing renderers, so an agent cannot perform any
+operation the CLI cannot, bypass any governance guard, or observe a listing that
+disagrees with the tool result---the validation, refusal wording and on-disk
+action are byte-identical across the two entrances (one contract, two
+entrances). The interface is control-plane only: it never mounts and reads no
+object bytes, opening the metadata store read-only to render shapes. When an
+agent runtime fronts one server to many callers, an optional API-key gate
+(\texttt{--require-api-key}, keys minted by \texttt{grove apikey}) authenticates
+the \emph{caller} of the governance plane: the state-touching methods
+(\texttt{tools/list}, \texttt{tools/call}, \texttt{resources/list},
+\texttt{resources/templates/list}, \texttt{resources/read},
+\texttt{completion/complete}) are refused with a distinct
+\texttt{-32001} code until a key presented in \texttt{initialize}
+authenticates, while \texttt{initialize}/\texttt{ping}/\texttt{prompts}/* and
+\texttt{logging}/* stay open for the handshake, static playbooks and client
+control; every \texttt{tools/call} and \texttt{resources/read}---the calls that
+reveal or change per-view state---is appended to an audit log attributed to the
+key. Only SHA-256 digests of keys are stored, and revocation marks a key
+ineffective at once while retaining its historical rows. This gate authenticates
+callers of the governance interface; it is orthogonal to, and does not weaken,
+the mount/data admission enforced by tokens and the per-view ACL (I1--I4 are
+untouched). Governance failures return inside the result (\texttt{isError}) per
+MCP convention; only protocol-layer faults use JSON-RPC error codes.
+
 \begin{figure}[t]
 \centering
 \begin{tikzpicture}[node distance=10mm,
@@ -822,6 +861,8 @@ Module & Responsibility & Lines \\
 \texttt{layout.rs}     & lens / derived / alias rendering & $\sim$1.2k \\
 \texttt{remote/meta.rs}& authoritative service, notify, HA & $\sim$3.2k \\
 \texttt{pg\_store.rs}   & PostgreSQL provider, SSI write pool & $\sim$1.5k \\
+\texttt{mcp.rs}        & agent MCP surface, shared governance renderers & $\sim$2.1k \\
+\texttt{apikeys.rs}    & API-key store, auth gate, call audit & $\sim$0.35k \\
 \texttt{backend/*}     & local / remote / sharded objects & $\sim$1.2k \\
 \bottomrule
 \end{tabular}
@@ -960,6 +1001,28 @@ immediately; throughout, the on-disk archive remains byte-identical. This
 exercises all four primitives over one authoritative store for the non-landing
 requirement.
 
+\paragraph{Agent entrance is the same contract (executed).} The
+\texttt{mcp} suite (42 assertions) drives the JSON-RPC server as an MCP client
+would---\texttt{initialize} (checking the advertised capability surface),
+\texttt{tools/list}, \texttt{tools/call}, \texttt{resources/*},
+\texttt{prompts/*}, \texttt{completion/complete}, and
+\texttt{logging/setLevel}~$\rightarrow$~\texttt{notifications/message}---and
+asserts that every answer is byte-identical to what \texttt{grove view} prints
+for the same operation, that a view read as a resource or rendered through
+\texttt{list\_view\_tree} shows the same governed shape as a live mount (private
+subtree pruned, relocated entries homed under their display parent), and that
+protocol faults behave correctly (id-less notifications never answered, a
+malformed frame returns \texttt{-32700} and the server keeps serving, an unknown
+view resource returns \texttt{-32002}). The \texttt{apikey} suite (21 assertions)
+exercises the gate end-to-end: an unauthenticated \texttt{tools/list} is refused
+with \texttt{-32001} while \texttt{initialize} still answers, a presented key
+admits the session and attributes each logged call, a wrong secret is refused,
+revocation takes effect immediately while retaining history, and only the digest
+is persisted. Both suites are wired into \texttt{run\_all.sh} and are pure
+control-plane checks (they mount nothing on the MCP path), evidencing that the
+agent surface introduces no capability or guard the CLI entrance does not
+already enforce.
+
 \begin{table}[t]
 \caption{Expressiveness and correctness of view-governance mechanisms. The
 \texttt{govcheck} harness \emph{executes} these cells: overlay copy-up/staleness
@@ -1072,6 +1135,19 @@ choice is standard; its relevance here is the locking argument in
 Sec.~\ref{sec:theorem}: cross-lens lock
 contention remains correct precisely because lenses never change the inode a
 lock is taken on.
+
+\paragraph{Agent-facing and AI storage interfaces.}
+The recent Model Context Protocol \citep{mcp} standardises how an AI agent
+discovers and invokes tools, resources and prompts over a JSON-RPC server, but
+the protocol says nothing about whether the operations behind those tools are
+themselves sound. GroveFS's MCP surface is deliberately a thin, faithful mirror
+of an already-governed control plane rather than a second implementation, so the
+agent inherits the I1--I4 guarantees and the API-key gate governs only
+\emph{who} may call, not \emph{what} a view is. To our knowledge no prior file system exposes its
+view-governance invariants through such an agent interface; this is an
+integration contribution, orthogonal to the governance results above, and we
+report it as executed evidence (Sec.~\ref{sec:eval}) rather than a novel
+protocol claim.
 
 \section{Discussion}
 \label{sec:discussion}
@@ -1253,6 +1329,11 @@ In \emph{Proc. 38th International Conference on Very Large Data Bases
 (VLDB'12)}, pages 175--186, 2012.\newblock Also, ``Design and
 implementation of serializable snapshot isolation in {PostgreSQL},''
 \emph{IEEE Transactions on Knowledge and Data Engineering}, 27(12), 2015.
+
+\bibitem[{{Model Context Protocol}(2025)}]{mcp}
+{Model Context Protocol}: An Open Protocol for Context Management Between
+Applications and AI Agents, specification revision 2025-06-18.
+\newblock \url{https://modelcontextprotocol.io/}, 2025.
 
 \end{thebibliography}
 

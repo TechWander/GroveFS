@@ -242,6 +242,101 @@ Error: Custom { kind: PermissionDenied, error: "meta-server rejected the access 
 
 守卫(`alias` 命令处 fail-fast,layout 套件第 10/11 节 26 条断言):拒绝 `name == real`、拒绝遮蔽物理 `<name>.db`、拒绝目标是派生视图(别名只映射物理视图)、拒绝**别名链**(`--real` 指向另一个别名)、一个真实视图同时只允许一个对外名(`--retire` 轮换在同一条命令内先写后删,不受此约束卡住);`--retire` 还拒绝指向派生视图或不存在的别名(不会误删形状定义)。本地(`--home`)同契约:挂载先解析 `views/<name>.layout`,别名换名后照常挂载并打印 `alias view 'A' resolves to real view 'R' (full tree, writable)`;直挂被治理的真实名回 `Error: "view 'R' is governed by an alias — mount the alias name instead"`;`grove import --view A` 拒绝以别名为目标(别名不是存储身份,写出无人可读的影子 db)。实现事实:别名解析单跳、每 `M_OPEN` 重扫 `views/` 目录(挂载罕见事件,小目录全读比维护失效协议便宜);轮换/`rm` 只影响**新**挂载(已建立的旧名连接持续到老连接断开,与只读门同语义);被轮换掉的旧名落到按需新建的空命名空间,触不到真实树,故泄露无害;`meta/views/` 是普通文件,HA 备机随 `acl.db` 手工同步;`grove view`/`import` 在存储机执行(操作服务端本地文件)。注意远端拒挂真实名时客户端回显复用 "meta-server rejected the access token" 文案(拒因字节未入协议,行为正确、提示不精确);本地拒挂文案是精确的。**轮换是名字治理(泄露止损),不是安全边界**:硬隔离仍靠 token+ACL——轮换只让旧的公开名不再通向真实树,并不能撤销一个已持有 token 者的既有访问。
 
+### 3.5 智能体定制数据列表:MCP 接口(`grove mcp`)
+
+视图治理(§3.2/§3.4)同时是一套 **MCP(Model Context Protocol)工具**。`grove mcp` 在 stdio 上说换行分隔的 JSON-RPC 2.0(实现 2025-06-18 协议的常用方法面:生命周期 `initialize`/`ping`、工具 `tools/list`/`tools/call`、资源 `resources/list`/`resources/templates/list`/`resources/read`、提示 `prompts/list`/`prompts/get`、补全 `completion/complete`、日志 `logging/setLevel` 与服务端 `notifications/message`;客户端通知一律静默不作答),任何 MCP 客户端(Claude Desktop、IDE 智能体等)把它当子进程拉起,智能体即可**通过接口自动定制数据列表**:查视图、**列出某视图真实呈现的目录清单**(派生视图经其透镜渲染,还能不落盘地预览一副待发布规则会长成啥样)、用内联规则文本发布只读派生透镜(四动词同 `--layout`,规则以文本随行、不落文件)、轮换公开名、删定义、**发布前把整副定义走完全部治理守卫做干跑校验(不写盘)**。与 `grove view` 子命令共用同一套库函数(`grovefs::mcp`)——校验、拒绝文案、落盘动作逐字节相同,一个契约、两个入口,智能体做不出 CLI 做不出的事,也绕不过任何守卫。**探查只读**:`list_view_tree`/`get_view` 以只读方式打开本地 `<db-path>/meta/<view>.db`、经与挂载同一副 `LayoutMeta` 透镜渲染目录清单(不挂载、不读对象字节;远端/PG 后端的树不在此遍历)。**控制面 only**:不挂载、不写数据。默认信任能启动此进程的调用方(= 已持有存储根的操作系统级权限),跨网鉴权仍由服务端 token/ACL 负责;当它被 front 给多个不同调用方时,可用 `grove mcp --require-api-key` **可选地**为接口上 API key 门(见 §3.5.1)。下面全部回显取自真实运行:
+
+```
+# 1) 存储机:建一个物理视图(智能体稍后要在它的树上定制列表)
+$ grove --home $HOME_DIR init --view team --manifest team.manifest
+initialized view 'team' at /data/xy/grovefs/.demomcp/home/meta/team.db
+applied seed manifest .demomcp/team.manifest
+
+# 2) MCP 客户端配置里登记 stdio 服务器(以通用 mcpServers 写法为例):
+#    "grovefs": { "command": "grove", "args": ["mcp", "--db-path", "/data/xy/grovefs/.demomcp/home"] }
+$ grove mcp --db-path $HOME_DIR       # 客户端实际这样拉起:stdin 进帧、stdout 出帧
+
+# 3) 智能体侧 tools/call 与工具结果文本(原样回显):
+[list_views]   {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_views","arguments":{}}}
+{
+  "db_path": "/data/xy/grovefs/.demomcp/home",
+  "defined": [],
+  "physical": [
+    "team"
+  ]
+}
+[preview_rules] "rules": "bog /x"                    # 先发后落:非法动词在发布前被抓住
+bad layout rules: line 1: unknown layout verb 'bog'
+[define_derived_view] {"name":"release","base":"team","rules":"# public release: no private photos\nhide /photos/private"}
+defined derived view 'release' over base 'team': 1 hide, 0 only, 0 reloc rule(s)
+note: mounts of 'release' are read-only (virtual shape) — write to base view 'team'
+[define_derived_view] {"name":"team","base":"team",...}                     # 名与基同名
+isError → derived view name must differ from its base      # 与 CLI 逐字节同文案(治理失败按 MCP 惯例回在结果内)
+[list_views] 再次                                    # 结构化 JSON 回执,字段: name/kind/real_view/规则计数
+view 'release' -> base 'team': 1 hide, 0 only, 0 reloc rule(s) (read-only)   # CLI 对照:`grove view list` 同文案
+
+# 4) 用户侧:直接挂智能体定的名(无 --layout、无本地规则文件)
+$ grove --home $HOME_DIR mount --view release -m /mnt/release &
+derived view 'release' over base 'team': 1 hide, 0 only, 0 reloc rule(s)
+note: derived (virtual) views mount read-only — write to base view 'team'
+$ ls /mnt/release
+docs  photos
+
+# 5) 探查与预览(只读元数据,不挂载、不碰数据字节):
+[list_view_tree] {"view":"team"}              # 先摸清真实路径:智能体据此写规则而非猜
+{"kind":"physical","rendered_from":"team","dir_count":4,"file_count":3,"truncated":false,"entries":[
+  {"path":"/docs","kind":"dir"},{"path":"/docs/2026","kind":"dir"},{"path":"/docs/2026/b.md","kind":"file"},
+  {"path":"/docs/a.md","kind":"file"},{"path":"/photos","kind":"dir"},{"path":"/photos/private","kind":"dir"},
+  {"path":"/photos/private/x.jpg","kind":"file"}]}
+[list_view_tree] {"view":"release"}           # 经已发布透镜渲染:显示路径 /docs /docs/2026 /docs/2026/b.md /docs/a.md /photos(/photos/private 被规则剪除,与挂载所见一致)
+[list_view_tree] {"base":"team","rules":"only /docs"}   # 不落盘预览一副待发布规则:仅 /docs 子树呈现,不写任何 .layout
+[validate_definition] {"name":"release","base":"team","rules":"hide /photos/private"}   # 发布前干跑:把 name+base+rules 走完整套治理守卫,不写盘,回显确切判定
+{"accepted":true,"dry_run":true,"kind":"derived","hide":1,"only":0,"reloc":0,"would_replace_existing_definition":false,"base_view_db_present":true,"note":""}
+[get_view] {"name":"release"}                 # 读回单个透镜原始规则,供“读—改—写”迭代
+{"kind":"derived","base":"team","hide":1,"only":0,"reloc":0,"definition":"base team\nhide /photos/private","mount":"read-only (virtual shape; writes go to the base view)"}
+```
+
+八个工具与参数:治理六个——`list_views`(可选 `db_path`)、`define_derived_view`(`name`/`base`/`rules`,后者为内联规则文本)、`alias_view`(`name`/`real`/可选 `retire` 原子轮换)、`remove_view`(`name`)、`preview_rules`(`rules`,干跑校验动词语法不写盘)、`validate_definition`(`name`/`base`/`rules`,发布前把整副定义走完 define 的全部治理守卫——非法名、名与基同名、遮蔽物理 db、覆盖纯别名、规则语法——拒绝时回与真实发布逐字节相同的文案、接受时回 JSON 判定,绝不写盘);只读探查两个——`list_view_tree`(`view` 或 `base`+`rules` 模拟,可选 `path`/`depth`/`max`/`db_path`;渲染挂载实际所见的路径清单,可经已发布透镜或不落盘模拟一副规则)、`get_view`(`name`,返回单个定义的原始 `definition` 文本与计数)。同一套治理再以 MCP 其余常用方法面二次暴露,复用**完全相同的渲染器**,故资源/提示/补全与工具结果逐字节一致:**资源** `resources/list`/`resources/templates/list`/`resources/read` 把某视图作为可附着上下文——`grovefs://view/<name>/definition`(原样治理文本)与 `/tree`(挂载实见的清单);**提示** `prompts/list`/`prompts/get` 提供两副参数化治理剧本(`reshape-view`、`rotate-alias`);**补全** `completion/complete` 用存储里的真实视图名对 `name`/`base`/`view`/`real` 参数做前缀补全;**日志** `logging/setLevel` 设会话阈值后,服务端在每次应答调用后按严重度(成功 `info`、失败 `warning`)推送 `notifications/message`。语义:全部治理守卫照常适用(派生挂载只读、别名期间真实名拒挂、`--retire` 先写后删;改定义热生效仍只在 `meta-server` 入口,本地挂载挂载时解析一次)。协议细节:通知(无 id)一律不作答;非法帧回 `-32700` 后继续服务;缺参与未知工具按 MCP 惯例回 `isError` 而非协议错误。`db_path` 默认取 `grove mcp --db-path`(回退 `--home`),也可逐调用覆盖。e2e 见 `mcp` 套件(42 条断言:握手能力面声明/发现/内联规则换形/路径探查与形状预览/发布前干跑校验/别名轮换/CLI 同文案/资源枚举与读取/提示实例化/视图名补全/日志阈值→通知/协议错误路径)。
+
+### 3.5.1 给 MCP 接口上把锁:API key 认证与调用审计(`grove apikey`)
+
+智能体运行时常常把一个 `grove mcp` 服务 front 给**多个不同调用方**,此时需要可撤销的凭据与归属审计。`grove apikey` 铸造 API key(**只存 SHA-256 摘要**,明文仅在 `create` 时打印一次,故 `api_keys.db` 泄露也换不出可用凭据),`grove mcp --require-api-key` 据此对所有**读写治理状态的方法**设门——`tools/list`、`tools/call`、`resources/list`、`resources/templates/list`、`resources/read`、`completion/complete`(`initialize` / `ping` / `prompts/*` / `logging/*` 始终开放,好让客户端完成握手、取静态剧本、并控制服务端详谈程度);每一次 `tools/call` 与 `resources/read`(二者读取或改变 per-view 状态)都追加进 `<db-path>/meta/api_keys.db` 的审计表(时间、key、工具、成败、详情),`grove apikey calls` 回读。撤销只把行标记为 revoked(历史调用仍保留归属),撤销后的 key 立即鉴不上。存储镜像 `acl.db`:一处本地 SQLite,控制面状态。下列回显取自真实运行:
+
+```
+# 1) 铸造一个 key(明文只打印一次)
+$ grove apikey --db-path $HOME_DIR create --label claude-desktop
+apikey created — shown ONCE (only its SHA-256 is stored; save it now):
+  id:    2f5f11aa673c43d1bf6e86111de0b45f
+  label: claude-desktop
+  key:   2f5f11aa673c43d1bf6e86111de0b45f:62080e84e9b1...(64 hex secret)
+
+# 2) 门只卡状态方法面:不开 apiKey 的 initialize 照常应答,随后 tools/list 被拒
+$ grove mcp --db-path $HOME_DIR --require-api-key      # 客户端 initialize 不带 apiKey
+{"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"grovefs"},...}}   # initialize 应答(门只卡状态方法面)
+{"jsonrpc":"2.0","id":2,"error":{"code":-32001,"message":"authentication required: present a valid apiKey in the initialize params (or export GROVEFS_MCP_API_KEY for the server)"}}
+
+# 3) 客户端 initialize 携带 "apiKey":"<id>:<secret>" → 该会话鉴权通过,工具面放行:
+[tools/call define_derived_view {"name":"release","base":"team","rules":"hide /photos/private"}]
+defined derived view 'release' over base 'team': 1 hide, 0 only, 0 reloc rule(s)
+
+# 4) 每个调用都留痕,且归属到具体 key(含被拒的未鉴权行)
+$ grove apikey --db-path $HOME_DIR calls --limit 5
+last 3 mcp call(s), newest first:
+ts                        key_id                             method       tool                   ok   detail
+2026-10-26T13:47:21.111877594+00:00 2f5f11aa673c43d1bf6e86111de0b45f   tools/call   define_derived_view    yes  name=release base=team rules=1L
+2026-10-26T13:47:21.110948784+00:00 2f5f11aa673c43d1bf6e86111de0b45f   initialize   -                      yes  authenticated
+2026-10-26T13:47:21.030552102+00:00 -                                  tools/list   -                      no   unauthorized: no valid api key
+
+# 5) 撤销与列表(行保留供历史归属;list 绝不含密文)
+$ grove apikey --db-path $HOME_DIR revoke --id 2f5f11aa673c43d1bf6e86111de0b45f
+revoked id='2f5f11aa673c43d1bf6e86111de0b45f'
+$ grove apikey --db-path $HOME_DIR list
+#   id                                 label            created                   last_used                 revoked
+1   2f5f11aa673c43d1bf6e86111de0b45f   claude-desktop   2026-10-26T13:47:20...    2026-10-26T13:47:21...      -
+```
+
+四个子命令:`create --label L`(铸造并一次性打印 `<id>:<secret>`)、`list`(id/label/created/last_used/revoked,无密文)、`revoke --id ID`(支持精确 id 或唯一前缀)、`calls --limit N`(默认 20,倒序回读审计)。无法自定义握手的客户端,可由运维方导出 `GROVEFS_MCP_API_KEY='<id>:<secret>'` **预鉴权整个服务进程**(`grove mcp` 启动即以该 key 建立身份,客户端 initialize 无须再带)。诚实边界:这把 key 认证的是**治理接口的调用方**——它让某个调用方能(或不能)发治理写命令、并让每条命令可归咎,但不改变治理语义本身,也不碰挂载/数据鉴权(那仍是服务端 token/ACL)。不开 `--require-api-key` 时,服务行为与不设门完全一致(只是照样落审计)。e2e 见 `apikey` 套件(21 条断言:铸造/列表/哈希不落盘/无 key 拒·错 secret 拒·对 key 放行/调用归属/撤销即失效且行保留/短 id 前缀撤销/env 预鉴权/默认不设门回归)。
+
 ## 4. 生产拓扑:中心存储 + 多客户机 LAN 挂载
 
 真实场景:数据放中心集群,多台客户机经 LAN 挂载,同一用户跨机器看到**同一份权威视图**。
@@ -278,7 +373,7 @@ $Y mount --view alice \
 
 > **常见误解纠正**：
 > - 「PG 是客户端跟服务端都要装」→ 错,**只在服务端**(meta-server 进程连 PG),客户端只装 `grove` 二进制、只说 GroveFS 的 TCP 帧协议。
-> - 「上了 PG 写并发会更高」→ 错,meta-server 仍是单一串行写者,PG 模式内部也是单连接串行。PG 的价值是复制/备份/DBA 工具链,不是并行写吞吐。
+> - 「上了 PG 写并发会更高」→ **部分对**：默认 SQLite 仍单写者；但 `--store postgres://…` 会把写改为 SERIALIZABLE 写连接池（至多 8 连接，HopsFS 路线），不相交行上的并发写并行提交、冲突由 SSI 透明重试（`pg_ssi`/`pg_parallel` 套件实测）。并行仅限单个 PG 集群内，不跨集群分区元数据权威；跨集群扩展仍交 PG 自身复制/分片。
 > - 「共享一棵树必须先有 PG」→ 错,默认 SQLite 就支持,`metasrv`/`freshness`/`locks` 三个套件全部纯 SQLite。
 
 ### 跨客户端一致性:两种模式
@@ -407,7 +502,7 @@ $Y acl --db-path /data/cluster revoke --view alice --uid 2000   # 撤销行
 - **有任意行 = 白名单**(无匹配行→ `M_OPEN` `E_AUTH` 拒挂载、挂载 fail-fast；仅 read 授权→ 写意图 op 前动态重查、回 `E_NOTPERM`（客户端 FUSE 侧落 `EPERM`，区别于 HA 备机 `E_ROFS` 切换信号）、读仍放行；写门不缓存故 `revoke` 对已挂载连接即时生效)。
 - 客户端上报的 uid 默认 `geteuid()`,可 `mount --as-uid N` 显式覆盖,用于共享 meta-server 上不同角色的挂载。
 
-**诚实边界**：TCP 客户端自报 uid 属 advisory,真正确定性靠 `--token`；白名单适合「已通过 token 准入的集群内部职责分离」,不适合防内鬼。本地模式（无 `--meta`）仅写读门可拦截挂载；写操作落本地 SQLite 文件,同 uid 无法强制隔离,依赖 OS 文件权限。存储层在服务端为 `<db-path>/meta/acl.db`、本地模式为 `<home>/meta/acl.db`（单表 `view_acl(view,uid,can_read,can_write,PRIMARY KEY(view,uid))`）。另有两个必须知道的行为边界:① **加锁类 op(`flock`/`F_SETLK`,含锁续约)归类为写意图**(它们要写中心 `locks` 表),只读授权(uid 仅 `--read`)对它们的请求一律 `EPERM`——只读角色若需共享锁做读协调,必须给它 `--write`;② **读门只在挂载(`M_OPEN`)时校验一次**,撤掉已建立挂载的读权限后该连接仍会读到自愈(重挂)为止——"`revoke` 即时生效"仅指写门(逐 op 重查)。
+**诚实边界**：TCP 客户端自报 uid 属 advisory,真正确定性靠 `--token`；白名单适合「已通过 token 准入的集群内部职责分离」,不适合防内鬼。本地模式（无 `--meta`）仅写读门可拦截挂载；写操作落本地 SQLite 文件,同 uid 无法强制隔离,依赖 OS 文件权限。存储层在服务端为 `<db-path>/meta/acl.db`、本地模式为 `<home>/meta/acl.db`（单表 `view_acl(view,uid,can_read,can_write,PRIMARY KEY(view,uid))`）；PG 模式（`--store`）下改存同一 PG 实例的共享表 `grovefs_acl.view_acl`，`grove acl` 须带同款 URI 与 meta-server 读写同一张表。另有两个必须知道的行为边界:① **加锁类 op(`flock`/`F_SETLK`,含锁续约)归类为写意图**(它们要写中心 `locks` 表),只读授权(uid 仅 `--read`)对它们的请求一律 `EPERM`——只读角色若需共享锁做读协调,必须给它 `--write`;② **读门只在挂载(`M_OPEN`)时校验一次**,撤掉已建立挂载的读权限后该连接仍会读到自愈(重挂)为止——"`revoke` 即时生效"仅指写门(逐 op 重查)。
 
 ### 6.2 PostgreSQL 元数据后端（可选）
 
@@ -422,7 +517,7 @@ $Y meta-server --db-path /data/cluster --listen 0.0.0.0:50110 \
 
 **注意**：
 - **与自研 HA 不兼容**：`--store postgres://…` + 任一 `--role standby` / `--peer` / `--witness` 会在启动时 fail-fast（`VACUUM INTO` 快照机制仅适用于 SQLite）。PG 高可用请交给 **PostgreSQL 自身的流复制 / logical replication / PITR**——本来就比文件快照更强。
-- `acl.db` 在 PG 模式下**仍属本地 SQLite**（控制面准入状态,不随 view 进 PG 复制域）。
+- **ACL 白名单随元数据面进 PG**：PG 模式下 `grove acl` 须带同款 `--store postgres://…` URI，与 meta-server 读写同一实例的共享表 `grovefs_acl.view_acl`（整条元数据面树+锁+ACL 一次 `pg_dump` 全收）；SQLite 模式仍在 `<db-path>/meta/acl.db`。
 - 为什么不提供 Redis：K/V+TTL 与视图树不同构（事务/行锁/多列索引都是自然需要,硬塞只会同实例重建一个更弱的 PG）。
 
 ---
@@ -440,9 +535,9 @@ $Y --home $BASE mount --view alice --mountpoint /mnt/alice_ro --ro
 
 - `--threads N`(默认 4):FUSE 并发派发工作线程,每线程独立 `/dev/fuse` fd(`clone_fd`,Linux 4.5+)。`0` = 单线程(遗留行为,可作 A/B 对照)。
 - 客户端大 IO 自动分块并行:读 ≥1MiB 按 1MiB 切片并发,写 ≥4MiB 分片并发(零协议改动)。
-- **元数据读并行**(写不并行):每个视图的 `MetaEngine` 除单条写连接外开 `READ_POOL_SIZE = 4` 条附加连接,`lookup`/`getattr`/`readdir` 与 nlink 解析走池,因此同视图并发读不再排在写锁后面;**写仍串行在同一权威连接上**(单写者语义不变)。池连接按 WAL 读事务读已提交数据,自己的写立刻可见(`cargo test` 内 `reads_through_the_pool_observe_committed_writes` 钉住这一点)。HA 备机/只读打开的引擎不预开池,首次读按需懒建并归还,同样有界。PG 引擎(`PgEngine`)现也持一条对等的 `PG_READ_POOL_SIZE = 4` 只读连接池(按 PG 事务读已提交数据,取不到只读连接时回退写连接以如实暴露故障),但写仍串行在单 `client` 上。
+- **元数据读并行**(SQLite 写不并行;PG 写并行见 §6.2):每个视图的 `MetaEngine` 除单条写连接外开 `READ_POOL_SIZE = 4` 条附加连接,`lookup`/`getattr`/`readdir` 与 nlink 解析走池,因此同视图并发读不再排在写锁后面;SQLite **写仍串行在同一权威连接上**(单写者语义不变),PG 写则另走 SERIALIZABLE 写池(§6.2)。池连接按 WAL 读事务读已提交数据,自己的写立刻可见(`cargo test` 内 `reads_through_the_pool_observe_committed_writes` 钉住这一点)。HA 备机/只读打开的引擎不预开池,首次读按需懒建并归还,同样有界。PG 引擎(`PgEngine`)现也持一条对等的 `PG_READ_POOL_SIZE = 4` 只读连接池(按 PG 事务读已提交数据,取不到只读连接时回退写连接以如实暴露故障);写侧 PG 另由 `PG_WRITE_POOL_SIZE = 8` 的 SERIALIZABLE 写池并行提交(§6.2)。
 - **目录列举分页 + READDIRPLUS**(不带开关即生效):`MetaProvider::readdir_page(parent, offset, limit)` 在 SQLite 与 PG 引擎里都下推成 SQL `LIMIT/OFFSET`,FUSE 回调按 32→1024 几何块流式填回复缓冲,因此一个内核 READDIR/READDIRPLUS 请求付 `O(缓冲)` 而不是 `O(整棵目录)`(改造前每个分页都重扫整棵目录并为每条重算 nlink);属性随目录项一次带回(内核 ≥4.6 的 `FUSE_DO_READDIRPLUS`,与上面能力位分属不同的 all-or-nothing 协商组,内核不支持则自然回退普通 READDIR)。同一份 5001 条目录、同一挂载点、每趟新挂载(内核 dentry 空)实测 `ls -l`:**2.56s**;`--no-readdirplus` 只留分页:**5.22s**;改造前基线(HEAD,无分页无 PLUS):**55.34s** —— 三份输出排序后逐字节相同。远端同样已接分页——新 `M_READDIRP` 帧带 `offset/limit` 下推到服务端,同一 5001 条目录经 `meta-server`+`data-server` 实测由改造前 ~54s 降到 **2.29s**(只关 PLUS 保留分页 4.22s,两份输出逐字节相同)。注意作这个改动时先把 READDIRPLUS 接在了不能分页的 provider 上,反而把全量重取次数乘了 ~4 倍,因此现在两者都由 `supports_paged_readdir()` 门控(见下条)。
-- **作用范围**(与上条同口径):只读连接池与 SQL 分页现在两个存储引擎上都——SQLite `MetaEngine` 与 PG `PgEngine`(各 4 连接只读池)。本地 `--home`(SQLite 或 PG)吃满分页与 PLUS;`meta-server` 侧并发 RPC 处理器吃各自后端读池,且 `M_READDIRP` 帧把分页下推到服务端,远端客户端每缓冲只取一页并协商 PLUS(同数据集远端实测 ~54s → 2.29s)。仍走 trait 默认实现(每缓冲一次全量列表、不协商 PLUS)的只有 `--layout`/派生视图的 `LayoutMeta`(隐藏/映射形状无法表示为单条 SQL 页)与对接不含该能力位的老 `meta-server`(`M_OPEN` ack 无第二字节则回退)。元数据**写**并行(多权威)仍未做。判据由 `cargo test` 内 `store_level_paging_is_advertised_only_by_providers_that_page_in_sql` 钉住。
+- **作用范围**(与上条同口径):只读连接池与 SQL 分页现在两个存储引擎上都——SQLite `MetaEngine` 与 PG `PgEngine`(各 4 连接只读池)。本地 `--home`(SQLite 或 PG)吃满分页与 PLUS;`meta-server` 侧并发 RPC 处理器吃各自后端读池,且 `M_READDIRP` 帧把分页下推到服务端,远端客户端每缓冲只取一页并协商 PLUS(同数据集远端实测 ~54s → 2.29s)。仍走 trait 默认实现(每缓冲一次全量列表、不协商 PLUS)的只有 `--layout`/派生视图的 `LayoutMeta`(隐藏/映射形状无法表示为单条 SQL 页)与对接不含该能力位的老 `meta-server`(`M_OPEN` ack 无第二字节则回退)。元数据**写**并行已覆盖 PG 后端(单集群内 SERIALIZABLE 写池,见 §6.2);跨节点多权威/分片的写扩展仍未做。判据由 `cargo test` 内 `store_level_paging_is_advertised_only_by_providers_that_page_in_sql` 钉住。
 - `--no-readdirplus`:关闭 READDIRPLUS 协商,回退普通 READDIR+逐条 `LOOKUP`,供 A/B 基准与兼容性排障(不认该能力的老内核自然就是此行为;provider 不能自身分页的挂载——派生/透镜视图与老服务端——本来也不协商,此开关对它们为空操作)。
 - `--o allow_other` 等额外 fuser 选项透传给挂载。
 
@@ -738,7 +833,7 @@ $Y meta-server --db-path /data/cluster --listen 0.0.0.0:50110 \
      --store postgres://grove:pw@10.0.0.9:5432/grovefs --token $TOK
 ```
 
-客户端命令一字不变(见 §4.1:客户机不装 PG、不持连接串、不感知后端)。每个 view 首次被打开时服务端幂等建 `grovefs_v_<hex(view)>` schema,无需预迁移脚本;`acl.db` 仍落本地 SQLite。备份/HA 改走 PG 自己的工具链(`pg_dump`/`pg_basebackup`/流复制/PITR),见 §12.3。为什么上/不上 PG 的诚实边界见 §4.1。
+客户端命令一字不变(见 §4.1:客户机不装 PG、不持连接串、不感知后端)。每个 view 首次被打开时服务端幂等建 `grovefs_v_<hex(view)>` schema,无需预迁移脚本;ACL 白名单随元数据面进同一实例的共享表 `grovefs_acl.view_acl`（`grove acl` 须带同款 `--store` URI）。备份/HA 改走 PG 自己的工具链(`pg_dump`/`pg_basebackup`/流复制/PITR),见 §12.3。为什么上/不上 PG 的诚实边界见 §4.1。
 
 ---
 
