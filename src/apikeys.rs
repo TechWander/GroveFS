@@ -1,16 +1,16 @@
 //! API-key authentication and a call-audit log for the MCP governance server.
 //!
-//! The `grove mcp` server is a control-plane entrance onto view governance. By
+//! The `grovefs mcp` server is a control-plane entrance onto view governance. By
 //! default it trusts whoever can spawn the process (the same OS-level boundary
 //! as a local `mount`). That is fine for a single operator on one machine, but
 //! an agent runtime often fronts the server to MANY distinct callers, each of
 //! whom should be (a) authenticated by a revocable credential and (b) audited.
 //! This module adds exactly that, WITHOUT changing the default (auth stays
-//! opt-in via `grove mcp --require-api-key`, so the plain server and every
+//! opt-in via `grovefs mcp --require-api-key`, so the plain server and every
 //! existing suite behave identically).
 //!
 //! Design:
-//! - **Keys are stored hashed.** `grove apikey create` mints a random secret,
+//! - **Keys are stored hashed.** `grovefs apikey create` mints a random secret,
 //!   persists only `SHA-256(secret)`, and prints the full plaintext key
 //!   (`<id>:<secret>`) exactly once. A leaked `api_keys.db` therefore hands out
 //!   nothing usable. The `id` half is only a lookup index (not a secret); the
@@ -23,7 +23,7 @@
 //!   `tools/call` are refused until a key authenticates.
 //! - **Every tool call is appended to `mcp_calls`** (timestamp, key id/label,
 //!   tool, success, a compact detail) — attribution and a replayable audit trail,
-//!   queryable with `grove apikey calls`.
+//!   queryable with `grovefs apikey calls`.
 //!
 //! Storage mirrors [`crate::acl::AclStore`]: one local SQLite file at
 //! `<base>/meta/api_keys.db`. It is deliberately SQLite-only — the MCP server
@@ -32,7 +32,7 @@
 //!
 //! Honest boundary: this authenticates CALLERS OF THE MCP GOVERNANCE API, it is
 //! not the mount/data auth path (that stays the server's token/ACL). A caller
-//! admitted by an API key can still only do what `grove view` does — governance
+//! admitted by an API key can still only do what `grovefs view` does — governance
 //! writes — and every such write is logged against that key.
 
 use rusqlite::{params, Connection};

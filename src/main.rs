@@ -35,14 +35,19 @@ use grovefs::meta::MetaProvider;
 use grovefs::remote;
 
 #[derive(Parser)]
-#[command(name = "grove", version, about = "User-view FUSE filesystem, no NFS")]
+#[command(name = "grovefs", version, about = "User-view FUSE filesystem, no NFS")]
 struct Cli {
-    /// Base directory holding `blocks/` (data) and `meta/` (view DBs) for LOCAL
-    /// mode (`init`, a mount without `--meta`/`--data`). Commands that talk to
-    /// one specific store name their own path instead (`meta-server --db-path`,
-    /// `acl --db-path`, `data-server --root`), with `--home` kept as their
-    /// fallback. A fully remote mount (`--data` + `--meta`) needs neither and
-    /// writes nothing here. Defaults to $GROVEFS_HOME or ~/.grovefs.
+    /// LOCAL mode (single machine): the base directory holding `blocks/`
+    /// (data) and `meta/<view>.db` (one view DB per view) — used by `init`
+    /// and by a mount WITHOUT `--meta`/`--data`. Defaults to $GROVEFS_HOME
+    /// or ~/.grovefs.
+    ///
+    /// SERVICE + CLIENT mode (central cluster): clients name the servers
+    /// directly (`mount --meta/--data`) and need NO local store at all —
+    /// nothing is ever written under this path. On the storage nodes
+    /// themselves, commands that own one specific store name their own path
+    /// (`meta-server --db-path`, `acl --db-path`, `data-server --root`);
+    /// `--home` remains only as their backward-compatible fallback.
     #[arg(long, global = true)]
     home: Option<PathBuf>,
 
@@ -54,6 +59,7 @@ struct Cli {
 enum Cmd {
     /// Initialize a view (creates meta DB, optional seed manifest)
     Init {
+        /// View to create (its metadata DB is initialized if absent).
         #[arg(long)]
         view: String,
         /// Optional manifest file: lines of "mkdir <path>" or "touch <path>"
@@ -61,10 +67,18 @@ enum Cmd {
         #[arg(long)]
         manifest: Option<PathBuf>,
     },
-    /// Mount a view at a mountpoint (runs in foreground)
+    /// Mount a view at a mountpoint (detaches into the background by default).
+    ///
+    /// The mount process keeps serving in the background (own session, output to
+    /// `--log-file`) and this command returns once the mountpoint is live.
+    /// Pass `--foreground` to keep it attached to the terminal (systemd
+    /// `Type=exec`, debugging, or scripts that redirect stdout themselves).
+    /// Tear down with `grovefs umount -m <mountpoint>`.
     Mount {
+        /// View to mount — a physical name, or a server-side derived/alias name.
         #[arg(long)]
         view: String,
+        /// Existing directory to mount the view onto.
         #[arg(short, long)]
         mountpoint: PathBuf,
         /// Remote data service address (host:port). If set, object IO is shipped
@@ -164,13 +178,31 @@ enum Cmd {
         /// offline without unmounting. 0/unset disables periodic dumping.
         #[arg(long, default_value_t = 0)]
         stats_interval: u64,
+        /// Stay attached to this terminal instead of detaching to the
+        /// background (the traditional behavior; required for systemd
+        /// `Type=exec` units). Informational output goes to stdout/stderr.
+        #[arg(long)]
+        foreground: bool,
+        /// When detached (the default): file the background mount's
+        /// stdout/stderr append into. Defaults to
+        /// `$TMPDIR/grovefs-mount-<mountpoint>.log`; pass `/dev/null` for a
+        /// fully silent mount. Ignored with `--foreground` unless the
+        /// caller's stdio is a terminal.
+        #[arg(long)]
+        log_file: Option<PathBuf>,
     },
     /// Run the remote data service (central cluster node) backed by local disk
     DataServer {
         /// Listen address, e.g. 0.0.0.0:50052
         #[arg(short, long, default_value = "127.0.0.1:50052")]
         listen: String,
-        /// Directory holding the physical objects on this node
+        /// Directory holding the physical objects on this node. A
+        /// comma-separated list (dir1,dir2,...) spreads objects across several
+        /// storage roots (disks) automatically: each whole object is placed on
+        /// one root by a hash of its key (chunk families pin to their object's
+        /// root), so no client or metadata change is needed and `df` aggregates
+        /// the disks. The root list must stay FIXED for a given store — adding
+        /// or removing a disk re-maps every key. A single path behaves as before.
         #[arg(short, long)]
         root: PathBuf,
         /// Shared secret clients must present (`mount --token`). When set, the
@@ -180,8 +212,10 @@ enum Cmd {
         #[arg(long)]
         token: Option<String>,
     },
-    /// Run the central metadata service: the authoritative per-view DB that
-    /// many `mount --meta` clients share (no NFS; pairs with `data-server`).
+    /// Run the central metadata service many `mount --meta` clients share.
+    ///
+    /// Hosts the authoritative per-view DB that those clients share (no NFS);
+    /// pairs with `data-server`.
     MetaServer {
         /// Listen address, e.g. 0.0.0.0:50053
         #[arg(short, long, default_value = "127.0.0.1:50053")]
@@ -279,14 +313,17 @@ enum Cmd {
     },
     /// Unmount a mountpoint
     Umount {
+        /// The mountpoint to unmount (terminates its background mount).
         #[arg(short, long)]
         mountpoint: PathBuf,
     },
-    /// Manage the per-view uid whitelist. Under SQLite the store lives at
-    /// `<db-path>/meta/acl.db`; under PostgreSQL (`--store postgres://…`)
-    /// it lives in the shared table `grovefs_acl.view_acl`.
-    /// A view with no rows is unrestricted (any uid, once past the token gate,
-    /// may mount); adding any row for a view switches it to whitelist mode.
+    /// Manage the per-view uid whitelist.
+    ///
+    /// Under SQLite the store lives at `<db-path>/meta/acl.db`; under
+    /// PostgreSQL (`--store postgres://…`) it lives in the shared table
+    /// `grovefs_acl.view_acl`. A view with no rows is unrestricted (any uid,
+    /// once past the token gate, may mount); adding any row for a view switches
+    /// it to whitelist mode.
     Acl {
         /// The metadata root holding `meta/acl.db` — deliberately the SAME
         /// option name (and the same directory) as `meta-server --db-path`,
@@ -301,10 +338,11 @@ enum Cmd {
         #[command(subcommand)]
         action: AclAction,
     },
-    /// Manage SERVER-SIDE view definitions — the two governance shapes:
-    /// DERIVED views (named presentation lenses over ONE physical view tree,
-    /// mounted read-only) and pure ALIASES (public-name ↔ real-name mapping,
-    /// writable, real name not mountable). Definitions live in the meta root
+    /// Manage server-side view definitions: derived lenses and pure aliases.
+    ///
+    /// DERIVED views are named presentation lenses over ONE physical view tree,
+    /// mounted read-only; pure ALIASES map a public name to a real name
+    /// (writable, real name not mountable). Definitions live in the meta root
     /// (`<db-path>/meta/views/<name>.layout`), clients simply mount
     /// `--view <name>` and need no local rules file. A `meta-server` resolves
     /// them at `M_OPEN`; a local mount resolves them from `--home`. Rules are
@@ -317,81 +355,86 @@ enum Cmd {
     /// plus an authoritative per-op gate on the meta-server).
     View {
         /// The metadata root holding `meta/views/*.layout` — same option name
-        /// and directory as `meta-server --db-path` / `grove acl --db-path`;
+        /// and directory as `meta-server --db-path` / `grovefs acl --db-path`;
         /// falls back to the global `--home` when omitted.
         #[arg(long)]
         db_path: Option<PathBuf>,
         #[command(subcommand)]
         action: ViewAction,
     },
-    /// Serve view governance over MCP (Model Context Protocol) on stdio, for
-    /// AI agents. An MCP client (agent runtime) spawns this as a subprocess
-    /// and the agent drives the same validated operations as `grove view`:
-    /// list_views / define_derived_view / alias_view / remove_view /
-    /// preview_rules — rules travel as inline text (hide/only/map/link), so
-    /// an agent customizes a data listing's shape without touching files.
-    /// Implements the initialize / ping / tools/list / tools/call core of the
-    /// 2025-06-18 protocol revision with newline-delimited JSON-RPC 2.0
-    /// framing. Control plane only: it writes `<db-path>/meta/views/*.layout`
-    /// definitions (live meta-server mounts hot-reload them) but never mounts
-    /// or touches data. `--db-path` sets the default metadata root (falls
-    /// back to `--home`); a per-call `db_path` argument overrides it.
+    /// Serve view governance over MCP (stdio) so an AI agent can drive it.
+    ///
+    /// An MCP client (agent runtime) spawns this as a subprocess and the agent
+    /// drives the same validated operations as `grovefs view`: list_views /
+    /// define_derived_view / alias_view / remove_view / preview_rules — rules
+    /// travel as inline text (hide/only/map/link), so an agent customizes a
+    /// data listing's shape without touching files. Implements the initialize /
+    /// ping / tools/list / tools/call core of the 2025-06-18 protocol revision
+    /// with newline-delimited JSON-RPC 2.0 framing. Control plane only: it
+    /// writes `<db-path>/meta/views/*.layout` definitions (live meta-server
+    /// mounts hot-reload them) but never mounts or touches data. `--db-path`
+    /// sets the default metadata root (falls back to `--home`); a per-call
+    /// `db_path` argument overrides it.
     Mcp {
         /// Metadata root holding `meta/views/` — same option name and
-        /// directory as `grove view` / `meta-server --db-path`.
+        /// directory as `grovefs view` / `meta-server --db-path`.
         #[arg(long)]
         db_path: Option<PathBuf>,
         /// Require an API key before the tool surface is usable. With it, an
-        /// MCP client must present a `grove apikey create` key as `apiKey` in
+        /// MCP client must present a `grovefs apikey create` key as `apiKey` in
         /// the `initialize` params (or the operator exports
         /// `GROVEFS_MCP_API_KEY` to pre-authenticate the whole server); until a
         /// key authenticates, `tools/list` and `tools/call` are refused with a
         /// JSON-RPC error. `initialize`/`ping` stay open so a client can always
-        /// handshake. Off by default: a plain `grove mcp` trusts whoever can
+        /// handshake. Off by default: a plain `grovefs mcp` trusts whoever can
         /// spawn it (the same OS boundary as a local mount). Either way, every
         /// tool call is appended to `<db-path>/meta/api_keys.db`'s audit log.
         #[arg(long)]
         require_api_key: bool,
     },
-    /// Manage the MCP server's API keys and read its call-audit log. Keys
-    /// authenticate callers of `grove mcp --require-api-key`; they are stored
-    /// as SHA-256 hashes (only the minting `create` shows the plaintext once),
-    /// so a leaked `api_keys.db` hands out nothing usable. Revoking keeps the
-    /// row (so past calls stay attributed) but fails authentication. The audit
-    /// log records every tool call (timestamp, key, tool, success, detail).
+    /// Manage the MCP server's API keys and read its call-audit log.
+    ///
+    /// Keys authenticate callers of `grovefs mcp --require-api-key`; they are
+    /// stored as SHA-256 hashes (only the minting `create` shows the plaintext
+    /// once), so a leaked `api_keys.db` hands out nothing usable. Revoking
+    /// keeps the row (so past calls stay attributed) but fails authentication.
+    /// The audit log records every tool call (timestamp, key, tool, success,
+    /// detail).
     Apikey {
         /// The metadata root holding `meta/api_keys.db` — same option name and
-        /// directory as `grove mcp --db-path` / `meta-server --db-path`; falls
+        /// directory as `grovefs mcp --db-path` / `meta-server --db-path`; falls
         /// back to the global `--home`.
         #[arg(long)]
         db_path: Option<PathBuf>,
         #[command(subcommand)]
         action: ApikeyAction,
     },
-    /// Import an EXISTING local directory tree into a view WITHOUT moving or
-    /// duplicating bytes: every regular file is registered as an object —
-    /// hard-linked into `blocks/` when source and store share a filesystem
-    /// (zero extra bytes; edits through either path stay visible in the
-    /// other), streamed as a copy otherwise — and the directory structure is
-    /// mirrored into the view tree under `--prefix`. Run it where the store
-    /// lives (local `--home`, or the meta/data servers' root — same
-    /// operational envelope as `grove acl`/`grove view`). Re-running is an
-    /// INCREMENTAL import: names already in the view are skipped. Symlinks
-    /// and special files are skipped (counted, never followed). Timestamps,
-    /// mode and owner are preserved from the source. The target must be a
-    /// PHYSICAL view — importing into a derived (virtual) name is refused,
-    /// since virtual views mount read-only. Live `meta-server`
-    /// mounts converge within their attr/dentry TTL (≤2s, no remount); a PG
-    /// backend instead goes through a mounted path (rsync) since the
-    /// authoritative tree lives in Postgres, not in a local db file.
+    /// Import an existing local directory tree into a view, zero-copy where possible.
+    ///
+    /// Every regular file is registered as an object — hard-linked into
+    /// `blocks/` when source and store share a filesystem (zero extra bytes;
+    /// edits through either path stay visible in the other), streamed as a copy
+    /// otherwise — and the directory structure is mirrored into the view tree
+    /// under `--prefix`. Run it where the store lives (local `--home`, or the
+    /// meta/data servers' root — same operational envelope as `grovefs
+    /// acl`/`grovefs view`). Re-running is an INCREMENTAL import: names already
+    /// in the view are skipped. Symlinks and special files are skipped (counted,
+    /// never followed). Timestamps, mode and owner are preserved from the
+    /// source. The target must be a PHYSICAL view — importing into a derived
+    /// (virtual) name is refused, since virtual views mount read-only. Live
+    /// `meta-server` mounts converge within their attr/dentry TTL (≤2s, no
+    /// remount); a PG backend instead goes through a mounted path (rsync) since
+    /// the authoritative tree lives in Postgres, not in a local db file.
     Import {
         /// Metadata root holding `meta/<view>.db` — same option name and
         /// directory as `meta-server --db-path`; falls back to `--home`.
         #[arg(long)]
         db_path: Option<PathBuf>,
-        /// Data root holding `blocks/` — same option name as
-        /// `data-server --root` style paths; defaults to `--db-path` (the
-        /// colocated topology used by every deployment example).
+        /// Data root holding `blocks/` — same option name and values as
+        /// `data-server --root` (a comma-separated list spreads imported
+        /// objects across the node's disks by the same key-hash placement);
+        /// defaults to `--db-path` (the colocated topology used by every
+        /// deployment example).
         #[arg(long)]
         data_root: Option<PathBuf>,
         /// Target view (its meta DB is created if absent, like `init`).
@@ -449,7 +492,7 @@ enum ViewAction {
     /// while the alias exists the real name is not a mount entry point, so
     /// public names can rotate freely without exposing the storage identity.
     /// ACL grants are checked against the REAL name (resolution precedes the
-    /// read gate), so `grove acl allow --view <real> ...` authorizes both
+    /// read gate), so `grovefs acl allow --view <real> ...` authorizes both
     /// doors. Chained aliases, aliases over derived views, and aliasing an
     /// already-governed real name are rejected at this command.
     ///
@@ -619,7 +662,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             stats: stats_on,
             stats_file,
             stats_interval,
+            foreground,
+            log_file,
         } => {
+            // Default `mount` detaches: re-exec this exact command with
+            // `--foreground` in a new session (stdio → log file when attached
+            // to a terminal, inherited otherwise so redirecting scripts keep
+            // their sink), wait for the mountpoint to appear in /proc/mounts,
+            // print a one-line summary, return. Everything below runs in the
+            // child (or in the parent itself with `--foreground`).
+            if !foreground {
+                daemonize_and_await(&view, &mountpoint, log_file.as_deref())?;
+                return Ok(());
+            }
             std::fs::create_dir_all(&mountpoint)?;
             // ---- opt-in per-stage latency telemetry ----
             // Enabled by `--stats` OR env `GROVEFS_STATS=1|true`. Off by default,
@@ -701,7 +756,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // alias is the entry point, not this one (same shape
                         // as the server's M_OPEN refusal).
                         return Err(format!(
-                            "view '{view}' is governed by an alias — mount the alias name instead (`grove view list` shows it)"
+                            "view '{view}' is governed by an alias — mount the alias name instead (`grovefs view list` shows it)"
                         )
                         .into());
                     }
@@ -732,7 +787,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let acl = AclStore::open(&base)?;
                     if !acl.check_read(&effective, uid) {
                         return Err(format!(
-                            "local view '{effective}' is whitelisted; uid {uid} has no read grant (see `grove acl list --view {effective}`)"
+                            "local view '{effective}' is whitelisted; uid {uid} has no read grant (see `grovefs acl list --view {effective}`)"
                         )
                         .into());
                     }
@@ -934,15 +989,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("unmounted view '{view}' at {}", mountpoint.display());
         }
         Cmd::DataServer { listen, root, token } => {
-            std::fs::create_dir_all(&root)?;
-            let backend = Arc::from(backend::open_local(&root)?);
+            // Comma-separated roots = several disks behind one data-server;
+            // placement across them is automatic (see PlacementBackend).
+            let roots: Vec<PathBuf> = root
+                .to_string_lossy()
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .collect();
+            if roots.is_empty() {
+                return Err("data-server --root: no usable path".into());
+            }
+            for r in &roots {
+                std::fs::create_dir_all(r)?;
+            }
+            let backend = Arc::from(backend::open_local_roots(&roots)?);
             let srv = match token.as_deref() {
                 Some(t) if !t.is_empty() => remote::DataServer::with_token(&listen, backend, t),
                 _ => remote::DataServer::new(&listen, backend),
             };
             // Durable fencing token: a witness restart must not zero the epoch
             // and let a deposed primary sneak back in as a writer.
-            let srv = srv.with_fence_store(root.join(".fence_token"));
+            let srv = srv.with_fence_store(roots[0].join(".fence_token"));
             srv.serve()?;
         }
         Cmd::MetaServer {
@@ -1079,7 +1148,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // The agent entrance onto the same governance API: an MCP client
             // spawns this over stdio; EOF on stdin shuts it down. Control
             // plane only — no mount, no data IO. `--require-api-key` gates
-            // tools/list + tools/call behind a `grove apikey` credential.
+            // tools/list + tools/call behind a `grovefs apikey` credential.
             grovefs::mcp::serve(
                 db_path.unwrap_or_else(|| base.clone()),
                 require_api_key,
@@ -1087,7 +1156,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Cmd::Apikey { db_path, action } => {
             // Keys + audit log live beside acl.db in the authoritative meta
-            // root — control-plane state, shared by `grove mcp` at this path.
+            // root — control-plane state, shared by `grovefs mcp` at this path.
             let ak_base = db_path.unwrap_or_else(|| base.clone());
             let keys = grovefs::apikeys::ApiKeyStore::open(&ak_base)?;
             match action {
@@ -1100,14 +1169,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!();
                     println!("Present it as the `apiKey` param in the MCP `initialize` handshake, or");
                     println!("export GROVEFS_MCP_API_KEY='{full}' when launching");
-                    println!("`grove mcp --db-path {} --require-api-key`.", ak_base.display());
-                    println!("Revoke later with: grove apikey --db-path {} revoke --id {id}", ak_base.display());
+                    println!("`grovefs mcp --db-path {} --require-api-key`.", ak_base.display());
+                    println!("Revoke later with: grovefs apikey --db-path {} revoke --id {id}", ak_base.display());
                 }
                 ApikeyAction::List => {
                     let rows = keys.list()?;
                     if rows.is_empty() {
                         println!(
-                            "no api keys yet (under {}); mint one with `grove apikey create --label L`",
+                            "no api keys yet (under {}); mint one with `grovefs apikey create --label L`",
                             ak_base.display()
                         );
                     } else {
@@ -1139,7 +1208,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match resolved.len() {
                         0 => {
                             return Err(format!(
-                                "no api key with id '{id}' (see `grove apikey list`)"
+                                "no api key with id '{id}' (see `grovefs apikey list`)"
                             )
                             .into())
                         }
@@ -1164,7 +1233,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ApikeyAction::Calls { limit } => {
                     let rows = keys.recent_calls(limit)?;
                     if rows.is_empty() {
-                        println!("no logged mcp calls yet (a `grove mcp` run appends one row per tools/call here)");
+                        println!("no logged mcp calls yet (a `grovefs mcp` run appends one row per tools/call here)");
                     } else {
                         println!("last {} mcp call(s), newest first:", rows.len());
                         println!(
@@ -1257,7 +1326,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::fs::create_dir_all(dir)?;
             }
             let meta = MetaEngine::open(&mp)?;
-            let backend = backend::open_local(&droot)?;
+            // Same multi-root contract as `data-server --root`: a
+            // comma-separated --data-root registers imported objects onto the
+            // disk their key hashes to, colocated with the running server.
+            let roots: Vec<PathBuf> = droot
+                .to_string_lossy()
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .collect();
+            if roots.is_empty() {
+                return Err("import --data-root: no usable path".into());
+            }
+            let backend = backend::open_local_roots(&roots)?;
             let mut dirs: std::collections::HashMap<String, i64> =
                 std::collections::HashMap::new();
             dirs.insert("/".to_string(), meta::ROOT_INO);
@@ -1283,7 +1365,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Tallies for `grove import`.
+/// Tallies for `grovefs import`.
 #[derive(Default)]
 struct ImportStats {
     dirs: usize,
@@ -1295,7 +1377,7 @@ struct ImportStats {
 }
 
 /// ensure_dir variant that REUSES pre-existing nodes instead of failing —
-/// what makes a re-run of `grove import` an incremental no-op over the
+/// what makes a re-run of `grovefs import` an incremental no-op over the
 /// already-mirrored parts of the tree.
 fn ensure_dir_soft(
     meta: &MetaEngine,
@@ -1525,6 +1607,159 @@ fn split_parent(path: &str) -> (String, String) {
         }
         None => ("/".to_string(), p.to_string()),
     }
+}
+
+// ---- Detached (background) mounts ------------------------------------------
+//
+// `mount` without `--foreground` re-execs this exact command line with
+// `--foreground` appended, in a brand-new session (setsid) so the mount
+// survives its shell/terminal. Readiness is confirmed by polling
+// /proc/mounts: the parent returns only once the FUSE mount is actually
+// live (or with the child's failure), which makes scripts deterministic —
+// no sleep loops. Stdio: if the parent is attached to a terminal the
+// child's output goes to a log file (`--log-file`, default
+// `$TMPDIR/grovefs-mount-<mountpoint>.log` — deliberately NOT under
+// `--home`, a detached mount still writes nothing there); if the parent's
+// stdio is already redirected (a script's `> x.log 2>&1`), the child
+// inherits those descriptors so existing sinks and greps keep working.
+fn daemonize_and_await(
+    view: &str,
+    mountpoint: &Path,
+    log_file: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::IsTerminal;
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    let attach_tty = std::io::stdout().is_terminal() || std::io::stderr().is_terminal();
+    let log_path = match log_file {
+        Some(p) => Some(p.to_path_buf()),
+        None if attach_tty => {
+            let name = mountpoint
+                .to_string_lossy()
+                .replace(['/', ':'], "-")
+                .trim_matches('-')
+                .to_string();
+            Some(std::env::temp_dir().join(format!(
+                "grovefs-mount-{}.log",
+                if name.is_empty() { "root" } else { &name }
+            )))
+        }
+        None => None,
+    };
+
+    // Candidate strings /proc/mounts may show for this mountpoint (raw, cwd-
+    // joined, kernel-canonical). The dir is created here ONLY so canonicalize
+    // can resolve it pre-mount; the child re-creates it idempotently.
+    let mut wants = vec![mountpoint.to_string_lossy().to_string()];
+    if !mountpoint.is_absolute() {
+        if let Ok(cwd) = std::env::current_dir() {
+            wants.push(cwd.join(mountpoint).to_string_lossy().into_owned());
+        }
+    }
+    let _ = std::fs::create_dir_all(mountpoint);
+    if let Ok(c) = mountpoint.canonicalize() {
+        let s = c.to_string_lossy().into_owned();
+        if !wants.contains(&s) {
+            wants.push(s);
+        }
+    }
+
+    let mut cmd = std::process::Command::new(std::env::current_exe()?);
+    cmd.args(std::env::args_os().skip(1)).arg("--foreground");
+    match &log_path {
+        Some(p) => {
+            if let Some(dir) = p.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let f = std::fs::OpenOptions::new().create(true).append(true).open(p)?;
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::from(f.try_clone()?))
+                .stderr(Stdio::from(f));
+        }
+        None => {
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit());
+        }
+    }
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("spawn background mount: {e}"))?;
+    let pid = child.id();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if mounted_at(&wants) {
+            match &log_path {
+                Some(p) => println!(
+                    "grovefs: mounted view '{view}' at {} (background pid {pid}, log {})",
+                    mountpoint.display(),
+                    p.display()
+                ),
+                None => println!(
+                    "grovefs: mounted view '{view}' at {} (background pid {pid})",
+                    mountpoint.display()
+                ),
+            }
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait()? {
+            // Surface the tail of the child's own error output when we have a
+            // log file; with inherited stdio it already went to the terminal.
+            if let Some(p) = &log_path {
+                if let Ok(data) = std::fs::read(p) {
+                    let start = data.len().saturating_sub(2000);
+                    eprint!("{}", String::from_utf8_lossy(&data[start..]));
+                }
+            }
+            return Err(format!(
+                "grovefs: background mount exited ({status}) before mounting{}",
+                log_path
+                    .as_ref()
+                    .map(|p| format!("; full log {}", p.display()))
+                    .unwrap_or_default()
+            )
+            .into());
+        }
+        if std::time::Instant::now() > deadline {
+            return Err(format!(
+                "grovefs: mount not visible at {} within 30s (background pid {pid} still running)",
+                mountpoint.display()
+            )
+            .into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(80));
+    }
+}
+
+/// True when /proc/mounts carries an entry at any of the given mountpoint
+/// spellings (octal escapes \040 \011 \012 \134 decoded, per proc(5)).
+fn mounted_at(wants: &[String]) -> bool {
+    let Ok(content) = std::fs::read_to_string("/proc/mounts") else {
+        return false;
+    };
+    content.lines().any(|l| {
+        let mut it = l.split_whitespace();
+        let _dev = it.next();
+        match it.next() {
+            Some(mp) => {
+                let mp = mp
+                    .replace("\\040", " ")
+                    .replace("\\011", "\t")
+                    .replace("\\012", "\n")
+                    .replace("\\134", "\\");
+                wants.iter().any(|w| *w == mp)
+            }
+            None => false,
+        }
+    })
 }
 
 fn run_fusermount(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {

@@ -230,3 +230,28 @@ fn meta_event_bus_pushes_invalidations() {
         assert_eq!(proto::get_key(&data, &mut i).unwrap(), expected);
     }
 }
+
+/// S3 zero-provisioning contract: mounting a view the server has never seen
+/// auto-creates its authoritative DB on the M_OPEN handshake — deployments do
+/// not run `init` per user up front. The created tree is immediately writable
+/// and isolated (a second unknown view gets its own fresh root).
+#[test]
+fn mount_of_unknown_view_auto_creates_the_db() {
+    let (addr, d) = spawn_meta_server();
+    let base = d.path().to_path_buf();
+    assert!(!base.join("meta/alice.db").exists(), "precondition: no such view yet");
+
+    let m = connect(&addr, "alice"); // handshake alone
+    assert!(
+        base.join("meta/alice.db").exists(),
+        "M_OPEN for an unknown view must lazily create <base>/meta/<view>.db"
+    );
+
+    // The fresh view is a real, writable, isolated tree.
+    let dir = m.create_node(ROOT_INO, "from-first-write", true, None, 0o755, UID, GID).unwrap();
+    assert_eq!(m.lookup(ROOT_INO, "from-first-write").unwrap().id, dir);
+
+    let m2 = connect(&addr, "bob");
+    assert!(m2.lookup(ROOT_INO, "from-first-write").is_none(), "views stay isolated");
+    assert!(base.join("meta/bob.db").exists());
+}

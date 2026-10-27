@@ -1875,7 +1875,7 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
         return Ok(());
     }
     // Note: the write-gate is re-evaluated per-op inside the loop below (not
-    // cached here), so `grove acl revoke --view V --uid U` immediately closes
+    // cached here), so `grovefs acl revoke --view V --uid U` immediately closes
     // established connections against further writes rather than only on the
     // next M_OPEN handshake (closes a TOCTOU where revoke had no effect on
     // any already-mounted client).
@@ -1953,7 +1953,7 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
         };
         // View write-whitelist: a restricted view refuses mutating ops from a uid
         // without a write grant (reads still served). Unrestricted views grant all.
-        // Re-evaluated per-op so `grove acl revoke` immediately closes established
+        // Re-evaluated per-op so `grovefs acl revoke` immediately closes established
         // connections (see the M_OPEN note above for the TOCTOU rationale).
         //
         // Uses E_NOTPERM (not E_ROFS) so the client's `err_from_code` maps to

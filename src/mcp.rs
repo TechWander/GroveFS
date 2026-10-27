@@ -1,10 +1,10 @@
 //! MCP (Model Context Protocol) integration: lets an AI agent customize
-//! data listings through the same governance API the `grove view` CLI drives.
+//! data listings through the same governance API the `grovefs view` CLI drives.
 //!
 //! Two halves live here:
 //! - **Shared view-governance ops** ([`define_view`], [`alias_view`],
 //!   [`list_views`], [`remove_view`], [`preview_rules`]): every validation and
-//!   file mutation of `grove view …` in one place, so the CLI and the MCP
+//!   file mutation of `grovefs view …` in one place, so the CLI and the MCP
 //!   server cannot drift (one contract, two entrances).
 //! - **A dependency-light MCP server over stdio** ([`serve`]): newline-delimited
 //!   JSON-RPC 2.0 implementing the `initialize` / `tools/list` / `tools/call`
@@ -18,7 +18,7 @@
 //!   back a single definition verbatim. No framework crate: the protocol surface
 //!   we implement is a handful of methods, and serde_json `Value` is enough.
 //!
-//! The MCP entry point is `grove mcp`: an MCP client (Claude Desktop, any
+//! The MCP entry point is `grovefs mcp`: an MCP client (Claude Desktop, any
 //! agent runtime) spawns it as a subprocess, and the agent then lists views,
 //! inspects their listings, and reshapes them (`hide`/`only`/`map`/`link` rules
 //! inline as text — the agent never needs to touch a rules *file*) while live
@@ -42,7 +42,7 @@ use crate::meta::{MetaEngine, MetaProvider, NodeKind, ROOT_INO};
 pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 
 // ---------------------------------------------------------------------------
-// Shared view-governance operations (CLI `grove view` and MCP tools, one impl)
+// Shared view-governance operations (CLI `grovefs view` and MCP tools, one impl)
 // ---------------------------------------------------------------------------
 
 /// One printed line from a governance op: `Info` goes to stdout on the CLI,
@@ -121,7 +121,7 @@ fn check_derived_definition(
     if let Ok(d) = LayoutRules::parse_def_file(&self_def_path) {
         if matches!(d, ViewDef::Alias(_)) {
             return Err(format!(
-                "'{name}' is a pure alias — remove it first (`grove view rm --name {name}`) before defining a derived view over it"
+                "'{name}' is a pure alias — remove it first (`grovefs view rm --name {name}`) before defining a derived view over it"
             ));
         }
     }
@@ -133,7 +133,7 @@ fn check_derived_definition(
 }
 
 /// Every governance op is a flat function over the metadata root — the same
-/// `<db-path>` (falling back to `--home`) that `grove view` takes. Errors are
+/// `<db-path>` (falling back to `--home`) that `grovefs view` takes. Errors are
 /// the exact CLI strings, so an agent sees precisely what a human would.
 pub fn define_view(
     vbase: &Path,
@@ -164,7 +164,7 @@ pub fn define_view(
     )));
     if !vbase.join("meta").join(format!("{base}.db")).is_file() {
         out.push(OutLine::Note(format!(
-            "note: no local <db-path>/meta/{base}.db yet — fine under PG or lazy creation, otherwise run `grove --home ... init --view {base}` first"
+            "note: no local <db-path>/meta/{base}.db yet — fine under PG or lazy creation, otherwise run `grovefs --home ... init --view {base}` first"
         )));
     }
     Ok(out)
@@ -204,7 +204,7 @@ pub fn validate_definition(
         "note": if base_db_exists {
             String::new()
         } else {
-            format!("no local <db-path>/meta/{base}.db yet — fine under PG or lazy creation, otherwise run `grove --home ... init --view {base}` first")
+            format!("no local <db-path>/meta/{base}.db yet — fine under PG or lazy creation, otherwise run `grovefs --home ... init --view {base}` first")
         },
     }))
 }
@@ -287,7 +287,7 @@ pub fn alias_view(
             }
             None => {
                 return Err(format!(
-                    "--retire '{old}' is not a pure alias here (a derived view is separate — `grove view list` shows what '{old}' actually is)"
+                    "--retire '{old}' is not a pure alias here (a derived view is separate — `grovefs view list` shows what '{old}' actually is)"
                 ));
             }
         }
@@ -306,7 +306,7 @@ pub fn alias_view(
     if let Some(existing) = alias_to.iter().find(|(_, r)| **r == real) {
         if existing.0 != name {
             return Err(format!(
-                "real view '{real}' is already governed by alias '{}' — one public name per real view; to rotate it gaplessly use `grove view alias --name {name} --real {real} --retire {}`",
+                "real view '{real}' is already governed by alias '{}' — one public name per real view; to rotate it gaplessly use `grovefs view alias --name {name} --real {real} --retire {}`",
                 existing.0, existing.0
             ));
         }
@@ -343,13 +343,13 @@ pub fn alias_view(
     )));
     if !vbase.join("meta").join(format!("{real}.db")).is_file() {
         out.push(OutLine::Note(format!(
-            "note: no local <db-path>/meta/{real}.db yet — fine under PG or lazy creation, otherwise run `grove --home ... init --view {real}` first"
+            "note: no local <db-path>/meta/{real}.db yet — fine under PG or lazy creation, otherwise run `grovefs --home ... init --view {real}` first"
         )));
     }
     Ok(out)
 }
 
-/// One human-readable line per definition, byte-identical to `grove view list`.
+/// One human-readable line per definition, byte-identical to `grovefs view list`.
 fn entry_line(e: &ViewEntry) -> String {
     match e.kind {
         "alias" => format!(
@@ -1230,7 +1230,7 @@ pub fn handle_request(req: &Value, default_db: &Path, client_version: &mut Optio
                     "title": "GroveFS view governance",
                     "version": env!("CARGO_PKG_VERSION"),
                 },
-                "instructions": "Customize data listings by governing SERVER-SIDE views over one store. If the server was started with `--require-api-key`, pass your credential as `apiKey` (a `grove apikey create` key, format '<id>:<secret>') in the initialize params — the state-touching methods (tools/list, tools/call, resources/list, resources/read, completion/complete) are refused until it authenticates, and every call is logged against your key. Discover: list_views (all slots) and get_view (one slot's exact rules). Explore/preview shape: list_view_tree renders a view's real directory listing — or a base+rules lens SIMULATED before you commit it — so you use exact display paths instead of guessing. Reshape: define_derived_view (hide/only/map/link rules, read-only lenses hot-reloaded into live meta-server mounts), alias_view (public writable names), remove_view. Validate before publishing: preview_rules (dry-run a rules text's verb syntax) and validate_definition (dry-run a whole name+base+rules against every governance guard, writing nothing). Beyond tools, the same governance is exposed as MCP RESOURCES (grovefs://view/<name>/definition and /tree, read via resources/read), PROMPTS (reshape-view and rotate-alias playbooks via prompts/get), and COMPLETION (completion/complete fills a view-name argument from the store); set a threshold with logging/setLevel to receive notifications/message frames per call. Rule paths are absolute view-tree paths; a base line inside rules is rejected. Introspection is metadata-only over a LOCAL store: it never mounts and reads no data bytes.",
+                "instructions": "Customize data listings by governing SERVER-SIDE views over one store. If the server was started with `--require-api-key`, pass your credential as `apiKey` (a `grovefs apikey create` key, format '<id>:<secret>') in the initialize params — the state-touching methods (tools/list, tools/call, resources/list, resources/read, completion/complete) are refused until it authenticates, and every call is logged against your key. Discover: list_views (all slots) and get_view (one slot's exact rules). Explore/preview shape: list_view_tree renders a view's real directory listing — or a base+rules lens SIMULATED before you commit it — so you use exact display paths instead of guessing. Reshape: define_derived_view (hide/only/map/link rules, read-only lenses hot-reloaded into live meta-server mounts), alias_view (public writable names), remove_view. Validate before publishing: preview_rules (dry-run a rules text's verb syntax) and validate_definition (dry-run a whole name+base+rules against every governance guard, writing nothing). Beyond tools, the same governance is exposed as MCP RESOURCES (grovefs://view/<name>/definition and /tree, read via resources/read), PROMPTS (reshape-view and rotate-alias playbooks via prompts/get), and COMPLETION (completion/complete fills a view-name argument from the store); set a threshold with logging/setLevel to receive notifications/message frames per call. Rule paths are absolute view-tree paths; a base line inside rules is rejected. Introspection is metadata-only over a LOCAL store: it never mounts and reads no data bytes.",
             })
         }
         "ping" => json!({}),
@@ -1583,7 +1583,7 @@ pub fn serve(default_db: PathBuf, require_key: bool) -> std::io::Result<()> {
     let mut session = Session::new(default_db, require_key);
     if require_key {
         eprintln!(
-            "[grove mcp] api-key auth REQUIRED (state-touching methods — tools/list, tools/call, resources/*, completion/complete — gated until a key in `initialize` authenticates; mint one with `grove apikey create`)"
+            "[grovefs mcp] api-key auth REQUIRED (state-touching methods — tools/list, tools/call, resources/*, completion/complete — gated until a key in `initialize` authenticates; mint one with `grovefs apikey create`)"
         );
     }
     for line in stdin.lock().lines() {
@@ -1614,7 +1614,7 @@ pub fn serve(default_db: PathBuf, require_key: bool) -> std::io::Result<()> {
         }
         stdout.flush()?;
         if let Some(v) = version_report {
-            eprintln!("[grove mcp] client speaks protocol {v} (serving tools + resources + prompts + completion + logging)");
+            eprintln!("[grovefs mcp] client speaks protocol {v} (serving tools + resources + prompts + completion + logging)");
             session.client_version = None;
         }
     }
@@ -1910,7 +1910,7 @@ mod tests {
         let home = db();
         std::fs::create_dir_all(home.join("meta")).unwrap();
         std::fs::write(home.join("meta/team.db"), b"").unwrap();
-        // Mint a key out-of-band, exactly as `grove apikey create` would.
+        // Mint a key out-of-band, exactly as `grovefs apikey create` would.
         let store = ApiKeyStore::open(&home).unwrap();
         let (_id, key) = store.create("agent-a").unwrap();
 
