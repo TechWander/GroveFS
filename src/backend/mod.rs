@@ -13,6 +13,7 @@
 //!   stable object ids that support random read/write (needed for POSIX write).
 
 pub mod local;
+pub mod placement;
 pub mod sharded;
 
 use std::io::{self, Read};
@@ -80,7 +81,7 @@ pub trait StorageBackend: Send + Sync {
     fn remove(&self, key: &str) -> io::Result<()>;
 
     /// Register an EXISTING local file as the object under `key` — the data
-    /// plane's half of `grove import`. Implementations should avoid copying
+    /// plane's half of `grovefs import`. Implementations should avoid copying
     /// bytes when storage can be shared with the source (a hard link on the
     /// same filesystem); the default streams the file into a fresh object.
     /// The metadata side (`node.data_ref = key`) is the caller's job.
@@ -108,6 +109,16 @@ pub trait StorageBackend: Send + Sync {
 /// `Filesystem` code backend-agnostic (it only ever sees `Box<dyn StorageBackend>`).
 pub fn open_local(root: &std::path::Path) -> io::Result<Box<dyn StorageBackend>> {
     Ok(Box::new(local::LocalBackend::new(root)?))
+}
+
+/// Multi-disk variant: one `data-server` storage root per disk, each whole
+/// object placed on one root by a hash of its key (the root list must stay
+/// fixed for a given store). A single-path list degrades to exactly [`open_local`].
+pub fn open_local_roots(roots: &[std::path::PathBuf]) -> io::Result<Box<dyn StorageBackend>> {
+    if roots.len() == 1 {
+        return open_local(&roots[0]);
+    }
+    Ok(Box::new(placement::PlacementBackend::new(roots)?))
 }
 
 pub use sharded::ShardedBackend;

@@ -7,7 +7,7 @@
 set -u
 cd /data/xy/grovefs
 export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
-Y=./target/release/grove
+Y=./target/release/grovefs
 rm -rf .ltest; mkdir -p .ltest/home .ltest/mnt_base .ltest/mnt_a .ltest/mnt_b .ltest/mnt_c .ltest/mnt_d
 export GROVEFS_HOME=$PWD/.ltest/home
 
@@ -48,11 +48,11 @@ cat > .ltest/d.layout <<'EOF'
 link /shared/lib /proj/mylib
 EOF
 
-$Y mount --view team --mountpoint .ltest/mnt_base --strict > .ltest/base.log 2>&1 &
-$Y mount --view team --mountpoint .ltest/mnt_a   --strict --layout .ltest/a.layout > .ltest/a.log 2>&1 &
-$Y mount --view team --mountpoint .ltest/mnt_b   --strict --layout .ltest/b.layout > .ltest/b.log 2>&1 &
-$Y mount --view team --mountpoint .ltest/mnt_c   --strict --layout .ltest/c.layout > .ltest/c.log 2>&1 &
-$Y mount --view team --mountpoint .ltest/mnt_d   --strict --layout .ltest/d.layout > .ltest/d.log 2>&1 &
+$Y mount --view team --mountpoint .ltest/mnt_base --strict --foreground > .ltest/base.log 2>&1 &
+$Y mount --view team --mountpoint .ltest/mnt_a   --strict --layout .ltest/a.layout --foreground > .ltest/a.log 2>&1 &
+$Y mount --view team --mountpoint .ltest/mnt_b   --strict --layout .ltest/b.layout --foreground > .ltest/b.log 2>&1 &
+$Y mount --view team --mountpoint .ltest/mnt_c   --strict --layout .ltest/c.layout --foreground > .ltest/c.log 2>&1 &
+$Y mount --view team --mountpoint .ltest/mnt_d   --strict --layout .ltest/d.layout --foreground > .ltest/d.log 2>&1 &
 PIDS=$(jobs -p)
 sleep 1.5
 
@@ -113,7 +113,7 @@ T ls "$C/team/raw" >/dev/null && ok "relocated dir traversable" || bad "relocate
 
 echo "===== 8) bad layout file fails fast ====="
 echo "bogus /x" > .ltest/bad.layout
-$Y mount --view team --mountpoint .ltest/mnt_e --layout .ltest/bad.layout > .ltest/e.log 2>&1
+$Y mount --view team --mountpoint .ltest/mnt_e --layout .ltest/bad.layout --foreground > .ltest/e.log 2>&1
 grep -q "unknown layout verb" .ltest/e.log && ok "invalid rules rejected at mount time" || bad "invalid rules not rejected"
 
 echo "===== 9) server-side derived views: --view <name>, no client rules file ====="
@@ -140,9 +140,9 @@ grep -q "docsonly' -> base 'team'" .ltest/vlist.log && grep -q "trimphotos" .lte
 # client mounts by NAME only (no --layout, no rules file, NOT --strict —
 # proving the server-side multi-bucket invalidation push works)
 mkdir -p .ltest/mnt_srv .ltest/mnt_srvbase
-$Y mount --view docsonly -m .ltest/mnt_srv --meta $META --data $DATA > .ltest/srv.log 2>&1 &
+$Y mount --view docsonly -m .ltest/mnt_srv --meta $META --data $DATA --foreground > .ltest/srv.log 2>&1 &
 SP=$!
-$Y mount --view team -m .ltest/mnt_srvbase --meta $META --data $DATA > .ltest/srvb.log 2>&1 &
+$Y mount --view team -m .ltest/mnt_srvbase --meta $META --data $DATA --foreground > .ltest/srvb.log 2>&1 &
 BP2=$!
 sleep 2
 SB=.ltest/mnt_srvbase; SV=.ltest/mnt_srv
@@ -201,7 +201,7 @@ $Y view --db-path .ltest/home define --name broken --base team --rules .ltest/br
 # the SAME read-only contract applies to a LOCAL (--home) derived mount: no
 # server involved, the definition itself forces kernel RO
 mkdir -p .ltest/mnt_ld
-$Y mount --view docsonly -m .ltest/mnt_ld > .ltest/ld.log 2>&1 &
+$Y mount --view docsonly -m .ltest/mnt_ld --foreground > .ltest/ld.log 2>&1 &
 LDP=$!
 sleep 1.5
 grep -q "read-only" .ltest/ld.log \
@@ -239,14 +239,14 @@ $Y view --db-path .ltest/home alias --name pub --real trimphotos > .ltest/ag2.lo
 # mount by ALIAS: full shape and writable
 mkdir -p .ltest/mnt_al
 grep -q "trimphotos" .ltest/ag2.log && ok "guard names the refused target view" || bad "guard message unclear: $(cat .ltest/ag2.log)"
-$Y mount --view pub -m .ltest/mnt_al > .ltest/al_mount.log 2>&1 &
+$Y mount --view pub -m .ltest/mnt_al --foreground > .ltest/al_mount.log 2>&1 &
 ALP=$!
 sleep 1.5
 chk "$(T ls .ltest/mnt_al | tr '\n' ' ')" "data docs photos shared " "alias mount shows the FULL tree (no shape, unlike a derived view)"
 T sh -c "printf 'aw' > .ltest/mnt_al/docs/2026/aliaswrite.md" && ok "alias mount is WRITABLE (name governance, not shape)" || bad "alias mount refused writes"
 T cat .ltest/mnt_al/docs/2026/aliaswrite.md | grep -q aw && ok "alias write reads back" || bad "alias write lost"
 # mounting the governed REAL name locally is refused (the alias is the entry)
-$Y mount --view team -m .ltest/mnt_al 2> .ltest/al_denied.log
+$Y mount --view team -m .ltest/mnt_al --foreground 2> .ltest/al_denied.log
 [ $? -ne 0 ] && grep -q "governed by an alias" .ltest/al_denied.log \
   && ok "local mount of the governed real name is refused" || bad "real name mounted despite governance: $(cat .ltest/al_denied.log)"
 T rm .ltest/mnt_al/docs/2026/aliaswrite.md
@@ -263,7 +263,7 @@ grep -q "alias 'pubnew'" .ltest/vlist_rot.log && ! grep -q "alias 'pub'" .ltest/
   && ok "list shows the new alias only (old name retired)" || bad "list after rotation: $(cat .ltest/vlist_rot.log)"
 # the leaked OLD name no longer reaches the real tree
 mkdir -p .ltest/mnt_old
-$Y mount --view pub -m .ltest/mnt_old > .ltest/rot_old.log 2>&1 &
+$Y mount --view pub -m .ltest/mnt_old --foreground > .ltest/rot_old.log 2>&1 &
 OLDP=$!; sleep 1.5
 [ ! -d .ltest/mnt_old/docs ] && ok "leaked old alias no longer resolves to the real tree" || bad "old alias still exposes team"
 fusermount -u .ltest/mnt_old 2>/dev/null; kill $OLDP 2>/dev/null; wait $OLDP 2>/dev/null; rm -rf .ltest/mnt_old
@@ -272,7 +272,7 @@ fusermount -u .ltest/mnt_old 2>/dev/null; kill $OLDP 2>/dev/null; wait $OLDP 2>/
 rm -f .ltest/home/meta/pub.db
 # the NEW name is the live entry: full tree
 mkdir -p .ltest/mnt_new
-$Y mount --view pubnew -m .ltest/mnt_new > .ltest/rot_new.log 2>&1 &
+$Y mount --view pubnew -m .ltest/mnt_new --foreground > .ltest/rot_new.log 2>&1 &
 NEWP=$!; sleep 1.5
 chk "$(T ls .ltest/mnt_new | tr '\n' ' ')" "data docs photos shared " "rotated alias pubnew serves the full tree"
 fusermount -u .ltest/mnt_new 2>/dev/null; kill $NEWP 2>/dev/null; wait $NEWP 2>/dev/null; rm -rf .ltest/mnt_new
@@ -295,13 +295,13 @@ DSP2=$!
 wait_port $META2 && wait_port $DATA2 || bad "alias servers failed to start"
 mkdir -p .ltest/mnt_ra .ltest/mnt_rr
 # alias mount through the server: full tree, writable (M_OPEN resolved the name)
-$Y mount --view pub -m .ltest/mnt_ra --meta $META2 --data $DATA2 > .ltest/ra.log 2>&1 &
+$Y mount --view pub -m .ltest/mnt_ra --meta $META2 --data $DATA2 --foreground > .ltest/ra.log 2>&1 &
 RAP=$!
 sleep 2
 chk "$(T ls .ltest/mnt_ra | tr '\n' ' ')" "data docs photos shared " "remote alias mount shows the full tree"
 T sh -c "printf 'rw' > .ltest/mnt_ra/docs/2026/ralias.md" && ok "remote alias mount is writable" || bad "remote alias write refused: $(cat .ltest/ra.log)"
 # mounting the REAL name through the same server: refused while governed
-$Y mount --view team -m .ltest/mnt_rr --meta $META2 --data $DATA2 > .ltest/rr.log 2>&1 &
+$Y mount --view team -m .ltest/mnt_rr --meta $META2 --data $DATA2 --foreground > .ltest/rr.log 2>&1 &
 RRP=$!
 sleep 1.5
 [ ! -d .ltest/mnt_rr/docs ] && grep -qiE "rejected|refused|Permission|denied|token" .ltest/rr.log \
@@ -315,14 +315,14 @@ $Y view --db-path .ltest/home alias --name pubr --real team --retire pub > .ltes
   && grep -q gapless .ltest/rot3.log \
   && ok "remote: gapless rotation pub -> pubr (--retire)" || bad "remote rotation: $(cat .ltest/rot3.log)"
 # right after rotation the real name is STILL refused (governed by pubr) — zero window
-$Y mount --view team -m .ltest/mnt_rr --meta $META2 --data $DATA2 > .ltest/rr3.log 2>&1 &
+$Y mount --view team -m .ltest/mnt_rr --meta $META2 --data $DATA2 --foreground > .ltest/rr3.log 2>&1 &
 RR3=$!; sleep 1.5
 [ ! -d .ltest/mnt_rr/docs ] && grep -qiE "token|denied|permission|refus" .ltest/rr3.log \
   && ok "remote: real name stays refused across the rotation (no gap)" || bad "gap during rotation: $(cat .ltest/rr3.log)"
 kill $RR3 2>/dev/null; wait $RR3 2>/dev/null
 # the rotated name serves the full tree
 mkdir -p .ltest/mnt_rp
-$Y mount --view pubr -m .ltest/mnt_rp --meta $META2 --data $DATA2 > .ltest/rp.log 2>&1 &
+$Y mount --view pubr -m .ltest/mnt_rp --meta $META2 --data $DATA2 --foreground > .ltest/rp.log 2>&1 &
 RPP=$!; sleep 2
 chk "$(T ls .ltest/mnt_rp | tr '\n' ' ')" "data docs photos shared " "remote: rotated alias pubr serves the full tree"
 fusermount -u .ltest/mnt_rp 2>/dev/null; kill $RPP 2>/dev/null; wait $RPP 2>/dev/null
@@ -337,7 +337,7 @@ MSP3=$!
 $Y data-server --listen $DATA2 --root .ltest/home > .ltest/data_srv3.log 2>&1 &
 DSP3=$!
 wait_port $META2 && wait_port $DATA2 || bad "post-rm servers failed to start"
-$Y mount --view team -m .ltest/mnt_rr --meta $META2 --data $DATA2 > .ltest/rr2.log 2>&1 &
+$Y mount --view team -m .ltest/mnt_rr --meta $META2 --data $DATA2 --foreground > .ltest/rr2.log 2>&1 &
 RRP2=$!
 sleep 2
 chk "$(T ls .ltest/mnt_rr | tr '\n' ' ')" "data docs photos shared " "real name mountable again after the alias is removed"

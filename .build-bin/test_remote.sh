@@ -5,7 +5,7 @@
 set -u
 cd /data/xy/grovefs
 export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
-Y=./target/release/grove
+Y=./target/release/grovefs
 ADDR=127.0.0.1:50099
 
 rm -rf .test; mkdir -p .test/rhome .test/rsrv .test/mnt_r
@@ -21,7 +21,7 @@ echo "=== init alice view (empty tree) ==="
 $Y init --view alice > /dev/null
 
 echo "=== mount alice against REMOTE backend ==="
-$Y mount --view alice --mountpoint .test/mnt_r --data $ADDR > .test/mnt_r.log 2>&1 &
+$Y mount --view alice --mountpoint .test/mnt_r --data $ADDR --foreground > .test/mnt_r.log 2>&1 &
 MP=$!
 sleep 1.0
 
@@ -49,8 +49,8 @@ chk "$dst" "$src" "4MB over network md5 identical"
 chk "$(T stat -c '%s' $M/blob.bin)" "4194304" "size via mount over network"
 
 echo "===== 3) objects physically live on SERVER disk, not client ====="
-chk "$(ls .test/rhome/blocks 2>/dev/null | wc -l)" "0" "client keeps no physical objects"
-srv=$(ls .test/rsrv/blocks 2>/dev/null | wc -l)
+chk "$(find .test/rhome/blocks -type f 2>/dev/null | wc -l)" "0" "client keeps no physical objects"
+srv=$(find .test/rsrv/blocks -type f 2>/dev/null | wc -l)
 if [ "$srv" -ge 1 ]; then ok "server holds object(s) ($srv)"; else bad "server has no objects"; fi
 
 echo "===== 4) append + truncate roundtrip over network ====="
@@ -60,10 +60,10 @@ T truncate -s 6 $M/docs/hello.txt
 chk "$(T stat -c '%s' $M/docs/hello.txt)" "6" "truncate over network"
 
 echo "===== 5) GC over network: rm deletes server-side object ====="
-before=$(ls .test/rsrv/blocks | wc -l)
+before=$(find .test/rsrv/blocks -type f | wc -l)
 T rm $M/blob.bin
 sleep 0.3
-after=$(ls .test/rsrv/blocks | wc -l)
+after=$(find .test/rsrv/blocks -type f | wc -l)
 if [ "$after" -lt "$before" ]; then ok "GC freed server object ($before -> $after)"; else bad "GC did not free ($before -> $after)"; fi
 
 echo "===== 6) rename + rmdir over remote ====="

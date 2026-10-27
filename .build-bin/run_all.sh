@@ -29,12 +29,12 @@
 #   govtime     governance convergence timing (paper Sec. 7.4): hot-reload / push-inval / --retire latencies
 #   grovesci    astronomy "non-landing data" end-to-end case (paper Sec. 7): zero-copy
 #               import + read-only derived data-release + revocable public alias
-#   mcp         `grove mcp`: AI-agent entrance onto view governance over stdio
+#   mcp         `grovefs mcp`: AI-agent entrance onto view governance over stdio
 #               JSON-RPC (inline-rule lenses, alias rotation, CLI-identical
 #               contract, protocol error paths)
-#   apikey      `grove apikey` + `grove mcp --require-api-key`: API-key auth
+#   apikey      `grovefs apikey` + `grovefs mcp --require-api-key`: API-key auth
 #               (hashed at rest) + per-call audit log — gate/admit/revoke/env
-#               pre-auth and the opt-in default (a plain `grove mcp` stays open)
+#               pre-auth and the opt-in default (a plain `grovefs mcp` stays open)
 #   pg          PostgreSQL metadata backend e2e (self-skips if PG unreachable)
 #   pg_parallel PostgreSQL SERIALIZABLE/SSI parallel-write e2e (self-skips if
 #               PG unreachable); drives three concurrent FUSE clients against

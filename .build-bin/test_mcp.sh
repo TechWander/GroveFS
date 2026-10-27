@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# MCP integration e2e (`grove mcp`): an AI agent's entrance onto view
+# MCP integration e2e (`grovefs mcp`): an AI agent's entrance onto view
 # governance. Drives the stdio JSON-RPC server the way an MCP client does —
 # initialize -> tools/list -> tools/call — and asserts the AGENT-SIDE effects
 # that matter: a data listing's shape is customized with inline rule TEXT (no
 # rules file), live mounts hot-reload it, and every answer is byte-identical
-# to what the `grove view` CLI prints for the same operation (one contract,
+# to what the `grovefs view` CLI prints for the same operation (one contract,
 # two entrances). Also checks the protocol plumbing (notifications never
 # answered, malformed frames -> -32700, tool errors inside results) and the
 # broader MCP method surface an agent's client uses: resources/* (a view as
@@ -14,7 +14,7 @@
 set -u
 cd /data/xy/grovefs
 export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
-Y=./target/release/grove
+Y=./target/release/grovefs
 BASE=$PWD/.mcptest/home
 fusermount -u .mcptest/mnt .mcptest/mnt_al 2>/dev/null   # drop last run's mounts
 fusermount -uz .mcptest/mnt .mcptest/mnt_al 2>/dev/null  # lazy fallback, then rm
@@ -85,7 +85,7 @@ else bad "define: $(resp 4 || echo NO-RESPONSE)"; fi
 [ -f "$BASE/meta/views/release.layout" ] && ok "definition landed at meta/views/release.layout" || bad "no definition file"
 
 # A live LOCAL mount of that name serves the agent-chosen shape, read-only.
-$Y --home "$BASE" mount --view release -m .mcptest/mnt > .mcptest/mnt.log 2>&1 &
+$Y --home "$BASE" mount --view release -m .mcptest/mnt --foreground > .mcptest/mnt.log 2>&1 &
 BPID=$!
 for i in $(seq 40); do [ -f .mcptest/mnt/docs/a.md ] && break; sleep 0.5; done
 # `only` keeps the governed subtree and synthesizes its display parents, so
@@ -109,7 +109,7 @@ if have 5 '.result.content[0].text|test("already defined — replacing|defined d
 else bad "redefine: $(resp 5 || echo NO-RESPONSE)"; fi
 fusermount -u .mcptest/mnt 2>/dev/null; kill $BPID 2>/dev/null
 for i in $(seq 20); do ! mountpoint -q .mcptest/mnt 2>/dev/null && break; sleep 0.3; done
-$Y --home "$BASE" mount --view release -m .mcptest/mnt > .mcptest/mnt2.log 2>&1 &
+$Y --home "$BASE" mount --view release -m .mcptest/mnt --foreground > .mcptest/mnt2.log 2>&1 &
 BPID=$!
 for i in $(seq 40); do [ -f .mcptest/mnt/docs/a.md ] && break; sleep 0.5; done
 if [ -d .mcptest/mnt/docs ] && [ -d .mcptest/mnt/photos ] && [ ! -e .mcptest/mnt/photos/private ]; then
@@ -184,12 +184,12 @@ say '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"alias_view"
 if have 6 '.result.content[0].text|test("defined pure alias .teamA. -> real view .team.")'; then
   ok "alias_view defined public name teamA"
 else bad "alias: $(resp 6 || echo NO-RESPONSE)"; fi
-if ! $Y --home "$BASE" mount --view team -m .mcptest/nonexistent 2>.mcptest/refused.log; then
+if ! $Y --home "$BASE" mount --view team -m .mcptest/nonexistent --foreground 2>.mcptest/refused.log; then
   grep -q "governed by an alias" .mcptest/refused.log \
     && ok "real name 'team' refused as mount entry while governed (same contract as CLI)" \
     || bad "refused for the wrong reason: $(cat .mcptest/refused.log)"
 else bad "governed real name still mountable"; fusermount -u .mcptest/nonexistent 2>/dev/null; fi
-$Y --home "$BASE" mount --view teamA -m .mcptest/mnt_al > .mcptest/mnt_al.log 2>&1 &
+$Y --home "$BASE" mount --view teamA -m .mcptest/mnt_al --foreground > .mcptest/mnt_al.log 2>&1 &
 APID=$!
 for i in $(seq 40); do [ -f .mcptest/mnt_al/docs/a.md ] && break; sleep 0.5; done
 if [ -d .mcptest/mnt_al/photos ] && T sh -c 'echo w > .mcptest/mnt_al/docs/w.txt' 2>/dev/null; then
@@ -213,7 +213,7 @@ else bad "list_views: $(resp 8 || echo NO-RESPONSE)"; fi
 # One contract, two entrances: the CLI sees the agent's state verbatim.
 $Y view --db-path "$BASE" list > .mcptest/cli_list.log 2>&1
 grep -q "view 'release' -> base 'team': 1 hide, 0 only, 0 reloc rule(s) (read-only)" .mcptest/cli_list.log \
-  && ok "CLI 'grove view list' shows the agent-defined lens verbatim" || bad "CLI view list: $(cat .mcptest/cli_list.log)"
+  && ok "CLI 'grovefs view list' shows the agent-defined lens verbatim" || bad "CLI view list: $(cat .mcptest/cli_list.log)"
 
 # ------------------------------------------------------------------ error paths
 echo "===== 4) protocol + tool error paths ====="

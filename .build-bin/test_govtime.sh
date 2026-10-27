@@ -17,7 +17,7 @@
 set -u
 cd /data/xy/grovefs
 export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
-Y=./target/release/grove
+Y=./target/release/grovefs
 rm -rf .govtime; mkdir -p .govtime/home .govtime/mnt_base .govtime/mnt_dv .govtime/mnt_al
 export GROVEFS_HOME=$PWD/.govtime/home
 
@@ -64,9 +64,9 @@ trap cleanup EXIT
 wait_port $META && wait_port $DATA && ok "meta/data servers up" || { bad "servers failed to start"; exit 1; }
 
 # writable base mount + a derived viewer mounted BY NAME, non-strict (kernel TTL caching on)
-$Y mount --view team -m .govtime/mnt_base --meta $META --data $DATA > .govtime/base.log 2>&1 &
+$Y mount --view team -m .govtime/mnt_base --meta $META --data $DATA --foreground > .govtime/base.log 2>&1 &
 $Y view --db-path "$GROVEFS_HOME" define --name dv --base team --rules .govtime/narrow.rules > .govtime/def.log 2>&1
-$Y mount --view dv -m .govtime/mnt_dv --meta $META --data $DATA > .govtime/dv.log 2>&1 &
+$Y mount --view dv -m .govtime/mnt_dv --meta $META --data $DATA --foreground > .govtime/dv.log 2>&1 &
 sleep 2
 SB=.govtime/mnt_base; SV=.govtime/mnt_dv
 chk "$(T ls $SV | tr '\n' ' ')" "docs " "derived viewer starts narrowed to /docs"
@@ -112,12 +112,12 @@ rt=$(( ($(ns)-rt0)/1000000 ))
 [ $rrc -eq 0 ] && grep -q gapless .govtime/rot.log && ok "gapless rotation pub -> pubnew" || bad "rotation failed: $(cat .govtime/rot.log)"
 echo "  INFO --retire command latency: ${rt}ms"
 # the retired old name must NOT resolve to the real tree (zero window)
-$Y mount --view pub -m .govtime/mnt_al --meta $META --data $DATA > .govtime/old.log 2>&1 &
+$Y mount --view pub -m .govtime/mnt_al --meta $META --data $DATA --foreground > .govtime/old.log 2>&1 &
 OLDP=$!; sleep 1.5
 [ ! -d .govtime/mnt_al/docs ] && ok "retired alias does not reach the real tree (no leak window)" || bad "old alias still served team"
 kill $OLDP 2>/dev/null; wait $OLDP 2>/dev/null; fusermount -u .govtime/mnt_al 2>/dev/null; rm -rf .govtime/mnt_al; mkdir -p .govtime/mnt_al
 # the new name serves the full tree immediately
-$Y mount --view pubnew -m .govtime/mnt_al --meta $META --data $DATA > .govtime/new.log 2>&1 &
+$Y mount --view pubnew -m .govtime/mnt_al --meta $META --data $DATA --foreground > .govtime/new.log 2>&1 &
 NEWP=$!; sleep 2
 chk "$(T ls .govtime/mnt_al | tr '\n' ' ')" "docs photos " "rotated alias pubnew serves the tree"
 T rm .govtime/mnt_al/docs/a.md 2>/dev/null; fusermount -u .govtime/mnt_al 2>/dev/null; kill $NEWP 2>/dev/null; wait $NEWP 2>/dev/null

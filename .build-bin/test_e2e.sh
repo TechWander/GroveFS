@@ -6,7 +6,7 @@
 set -u
 cd /data/xy/grovefs
 export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
-Y=./target/release/grove
+Y=./target/release/grovefs
 rm -rf .test; mkdir -p .test/home .test/mnt_alice .test/mnt_bob
 export GROVEFS_HOME=$PWD/.test/home
 
@@ -25,13 +25,13 @@ EOF
 $Y init --view alice --manifest .test/alice.manifest >/dev/null
 $Y init --view bob   --manifest .test/bob.manifest   >/dev/null
 
-$Y mount --view alice --mountpoint .test/mnt_alice > .test/alice.log 2>&1 &
+$Y mount --view alice --mountpoint .test/mnt_alice --foreground > .test/alice.log 2>&1 &
 AP=$!
-$Y mount --view bob   --mountpoint .test/mnt_bob   > .test/bob.log   2>&1 &
+$Y mount --view bob   --mountpoint .test/mnt_bob   --foreground > .test/bob.log   2>&1 &
 BP=$!
 sleep 1.2
 
-cleanup(){ fusermount -u .test/mnt_alice 2>/dev/null; fusermount -u .test/mnt_bob 2>/dev/null; kill $AP $BP 2>/dev/null; }
+cleanup(){ fusermount -u .test/mnt_alice 2>/dev/null; fusermount -u .test/mnt_bob 2>/dev/null; fusermount -u .test/mnt_d 2>/dev/null; kill $AP $BP 2>/dev/null; }
 trap cleanup EXIT
 
 A=.test/mnt_alice
@@ -75,11 +75,35 @@ chk "$dst" "$src" "4MB copy integrity (md5 identical)"
 chk "$(T stat -c '%s' $A/blob.bin)" "4194304" "4MB file size via mount"
 
 echo "===== 6) GC: after rm, orphan block is reclaimed ====="
-before=$(ls .test/home/blocks | wc -l)
+before=$(find .test/home/blocks -type f | wc -l)   # fan-out buckets: count object FILES
 T rm $A/blob.bin
 sleep 0.3
-after=$(ls .test/home/blocks | wc -l)
+after=$(find .test/home/blocks -type f | wc -l)
 if [ "$after" -lt "$before" ]; then ok "GC reclaimed orphan block ($before -> $after)"; else bad "GC did not reclaim block ($before -> $after)"; fi
+
+echo "===== 7) detached (background) mount: default 'mount' daemon contract ====="
+mkdir -p .test/mnt_d
+OUT=$(timeout 5 $Y mount --view alice --mountpoint .test/mnt_d --log-file .test/daemon.log 2>&1); RC=$?
+chk "$RC" "0" "detached mount returns 0"
+if echo "$OUT" | grep -q 'background pid'; then ok "one-line summary with background pid"; else bad "summary line missing (got: $OUT)"; fi
+DPID=$(echo "$OUT" | sed -E 's/.*background pid ([0-9]+).*/\1/')
+MPD=$(realpath .test/mnt_d)
+if grep -q " $MPD " /proc/mounts; then ok "mountpoint live in /proc/mounts right after return"; else bad "mountpoint not in /proc/mounts"; fi
+T sh -c "printf 'daemon' > .test/mnt_d/dfile.txt"
+chk "$(T cat .test/mnt_d/dfile.txt)" "daemon" "read/write through detached mount"
+if grep -q 'mounting view' .test/daemon.log 2>/dev/null; then ok "info output went to --log-file, terminal stayed clean"; else bad "--log-file missing mount record"; fi
+$Y umount -m .test/mnt_d >/dev/null 2>&1
+sleep 0.5
+if grep -q " $MPD " /proc/mounts; then bad "umount left the mount up"; else ok "umount removes the mount"; fi
+if kill -0 "$DPID" 2>/dev/null; then bad "daemon pid $DPID survived umount"; else ok "daemon process exited on umount"; fi
+# default log path (no --log-file) when attached to a tty: /tmp/grovefs-mount-*.log
+# (`script` gives the mount a real PTY; `timeout` + artifact check keep this
+# deterministic even if the PTY wrapper lags on exit)
+fusermount -u .test/mnt_d 2>/dev/null
+timeout 10 script -qc "$Y mount --view alice --mountpoint .test/mnt_d" /dev/null < /dev/null > /dev/null 2>&1 || true
+DL=$(ls -t /tmp/grovefs-mount-*mnt_d.log 2>/dev/null | head -1)
+if [ -n "$DL" ]; then ok "tty default log created ($(basename "$DL"))"; else bad "tty default log not created"; fi
+$Y umount -m .test/mnt_d >/dev/null 2>&1; rm -f "$DL"
 
 echo
 echo "==================== SUMMARY: pass=$pass fail=$fail ===================="

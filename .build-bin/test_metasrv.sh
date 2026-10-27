@@ -12,7 +12,7 @@ set -u
 cd /data/xy/grovefs
 export LC_ALL=C LANG=C
 export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
-Y=./target/release/grove
+Y=./target/release/grovefs
 
 META=127.0.0.1:50094
 DATA=127.0.0.1:50095
@@ -32,11 +32,11 @@ if wait_port $META; then MP_OK=1; else MP_OK=0; fi
 [ "$MP_OK" = 1 ] || { echo "servers failed to start"; cat .msrv/data.log .msrv/meta.log; }
 
 # ---- three client mounts, each with its own --home (no local authority) ----
-$Y --home .msrv/m1 mount --view alice --mountpoint .msrv/mnt_a --meta $META --data $DATA > .msrv/a.log 2>&1 &
+$Y --home .msrv/m1 mount --view alice --mountpoint .msrv/mnt_a --meta $META --data $DATA --foreground > .msrv/a.log 2>&1 &
 AP=$!
-$Y --home .msrv/m2 mount --view alice --mountpoint .msrv/mnt_b --meta $META --data $DATA > .msrv/b.log 2>&1 &
+$Y --home .msrv/m2 mount --view alice --mountpoint .msrv/mnt_b --meta $META --data $DATA --foreground > .msrv/b.log 2>&1 &
 BP=$!
-$Y --home .msrv/m3 mount --view bob   --mountpoint .msrv/mnt_bob --meta $META --data $DATA > .msrv/bob.log 2>&1 &
+$Y --home .msrv/m3 mount --view bob   --mountpoint .msrv/mnt_bob --meta $META --data $DATA --foreground > .msrv/bob.log 2>&1 &
 OP=$!
 sleep 1.5
 
@@ -93,7 +93,7 @@ echo "===== 7) data lives centrally, not on the clients ====="
 # leave a fresh object so the central store is guaranteed non-empty after the
 # step-6 deletion GC'd the earlier one
 T sh -c "printf 'central-bytes' > $A/keep.bin"; sync "$A" 2>/dev/null; sleep 0.3
-blk=$(ls .msrv/central/data/blocks 2>/dev/null | wc -l)
+blk=$(find .msrv/central/data/blocks -type f 2>/dev/null | wc -l)   # fan-out buckets: count object FILES
 [ "$blk" -ge 1 ] && ok "objects stored on central data-server ($blk)" || bad "no objects in central blocks"
 [ ! -d .msrv/m1/blocks ] && ok "client m1 has no local blocks dir" || bad "client m1 unexpectedly holds blocks"
 
@@ -101,9 +101,9 @@ echo "===== 8) --strict coherence: peer overwrite visible on an already-read fil
 # This is exactly the case the default (cached) mounts get wrong (see step 4
 # note): a file the peer already looked up once is not re-read until the TTL.
 # Two MORE clients of the same user, mounted --strict, bypass that cache.
-$Y --home .msrv/m4 mount --view alice --mountpoint .msrv/mnt_s1 --meta $META --data $DATA --strict > .msrv/s1.log 2>&1 &
+$Y --home .msrv/m4 mount --view alice --mountpoint .msrv/mnt_s1 --meta $META --data $DATA --strict --foreground > .msrv/s1.log 2>&1 &
 SP1=$!
-$Y --home .msrv/m5 mount --view alice --mountpoint .msrv/mnt_s2 --meta $META --data $DATA --strict > .msrv/s2.log 2>&1 &
+$Y --home .msrv/m5 mount --view alice --mountpoint .msrv/mnt_s2 --meta $META --data $DATA --strict --foreground > .msrv/s2.log 2>&1 &
 SP2=$!
 sleep 1.5
 S1=.msrv/mnt_s1; S2=.msrv/mnt_s2

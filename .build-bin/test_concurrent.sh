@@ -16,7 +16,7 @@ cd /data/xy/grovefs
 # locale-independent (this host's default locale is Chinese).
 export LC_ALL=C LANG=C
 export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
-Y=./target/release/grove
+Y=./target/release/grovefs
 
 rm -rf .ctest; mkdir -p .ctest/home .ctest/m1 .ctest/m2
 export GROVEFS_HOME=$PWD/.ctest/home
@@ -29,9 +29,9 @@ mkdir seed
 EOF
 $Y init --view shared --manifest .ctest/shared.manifest >/dev/null
 
-$Y mount --view shared --mountpoint .ctest/m1 > .ctest/m1.log 2>&1 &
+$Y mount --view shared --mountpoint .ctest/m1 --foreground > .ctest/m1.log 2>&1 &
 P1=$!
-$Y mount --view shared --mountpoint .ctest/m2 > .ctest/m2.log 2>&1 &
+$Y mount --view shared --mountpoint .ctest/m2 --foreground > .ctest/m2.log 2>&1 &
 P2=$!
 sleep 1.2
 
@@ -99,10 +99,10 @@ chk "$eio" "0" "no EIO/EBUSY from write contention"
 echo "===== 3) concurrent cross-mount hardlink unlink -> object GC exactly once ====="
 printf 'shared-bytes' > "$M1/h.txt"
 ln "$M1/h.txt" "$M1/h2.txt"            # nlink == 2, one data object
-hbefore=$(T ls "$BLK" | wc -l)
+hbefore=$(T find "$BLK" -type f | wc -l)   # fan-out buckets: count object FILES
 ( rm "$M1/h.txt" & rm "$M2/h2.txt" & wait )
 sleep 0.3
-hafter=$(T ls "$BLK" | wc -l)
+hafter=$(T find "$BLK" -type f | wc -l)
 gone=0
 [ -e "$M1/h.txt" ] && gone=1
 [ -e "$M2/h2.txt" ] && gone=1

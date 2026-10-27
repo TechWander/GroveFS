@@ -1,6 +1,6 @@
 //! grovefs library: the reusable pieces of the per-view FUSE filesystem.
 //!
-//! Split out from the `grove` binary so that the metadata engine, the storage
+//! Split out from the `grovefs` binary so that the metadata engine, the storage
 //! backend abstraction, and the remote wire protocol can be unit-tested without
 //! mounting anything.
 //!

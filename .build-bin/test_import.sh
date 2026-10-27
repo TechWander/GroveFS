@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# e2e for `grove import`: mirror an EXISTING local directory tree into a view
+# e2e for `grovefs import`: mirror an EXISTING local directory tree into a view
 # with ZERO copies where the filesystem allows — objects are hard links that
 # share the source's inode (no extra bytes; live edits visible through BOTH
 # paths), timestamps/mode are preserved, GC never eats the source, re-runs
@@ -9,7 +9,7 @@
 set -u
 cd /data/xy/grovefs
 export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
-Y=./target/release/grove
+Y=./target/release/grovefs
 rm -rf .itest
 mkdir -p .itest/home .itest/src/photos/2026 .itest/src/docs .itest/mnt
 export GROVEFS_HOME=$PWD/.itest/home
@@ -45,7 +45,7 @@ grep -q "3 object(s) (3 hardlinked zero-copy, 0 copied)" .itest/imp.log \
 hl=$(find .itest/home/blocks -type f -links 2 2>/dev/null | wc -l | tr -d ' ')
 chk "$hl" "3" "3 blocks objects share their source inodes"
 
-$Y mount --view legacy -m .itest/mnt --strict > .itest/mnt.log 2>&1 &
+$Y mount --view legacy -m .itest/mnt --strict --foreground > .itest/mnt.log 2>&1 &
 MP=$!
 sleep 1.5
 cleanup(){ fusermount -u .itest/mnt .itest/mnt_r .itest/mnt_v 2>/dev/null; kill $MP $MSP $DSP $RP $VP 2>/dev/null; }
@@ -60,9 +60,9 @@ chk "$m1" "$m2" "mtime preserved from the source (not stamped import time)"
 chk "$(T stat -c %a $M/legacy/docs/quarter.txt)" "$(stat -c %a .itest/src/docs/quarter.txt)" "mode preserved"
 
 echo "===== 3) passthrough: one inode, both paths live ====="
-T sh -c "printf 'edited via grove\n' > $M/legacy/docs/quarter.txt" \
+T sh -c "printf 'edited via grovefs\n' > $M/legacy/docs/quarter.txt" \
   && ok "write through the mount onto an imported file" || bad "mount-side write failed"
-chk "$(cat .itest/src/docs/quarter.txt)" "edited via grove" "source path sees the mount's edit (shared inode)"
+chk "$(cat .itest/src/docs/quarter.txt)" "edited via grovefs" "source path sees the mount's edit (shared inode)"
 echo 'source side change' > .itest/src/photos/2026/y.jpg
 sleep 3   # attr/dentry TTL lets the mount converge on the external edit
 chk "$(T cat $M/legacy/photos/2026/y.jpg)" "$(cat .itest/src/photos/2026/y.jpg)" "external edit on the source shows through after the TTL"
@@ -106,9 +106,9 @@ $Y view --db-path .itest/home define --name albumview --base legacy --rules .ite
   && ok "define derived view over the imported base" || bad "define failed: $(cat .itest/def.log)"
 
 mkdir -p .itest/mnt_r .itest/mnt_v
-$Y mount --view legacy   -m .itest/mnt_r --meta $META --data $DATA > .itest/r.log 2>&1 &
+$Y mount --view legacy   -m .itest/mnt_r --meta $META --data $DATA --foreground > .itest/r.log 2>&1 &
 RP=$!
-$Y mount --view albumview -m .itest/mnt_v --meta $META --data $DATA > .itest/v.log 2>&1 &
+$Y mount --view albumview -m .itest/mnt_v --meta $META --data $DATA --foreground > .itest/v.log 2>&1 &
 VP=$!
 sleep 2
 R=.itest/mnt_r; V=.itest/mnt_v

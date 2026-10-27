@@ -135,7 +135,7 @@
     <div class="grid">
       <div class="card"><h4>视图 view</h4><p>每个用户一棵独立目录树(含自定义层级),存在一个 SQLite 库:<code>&lt;home&gt;/meta/&lt;view&gt;.db</code>。不同用户互不可见。</p></div>
       <div class="card"><h4>数据对象 object</h4><p>文件的真实字节。一个文件 = <code>blocks/</code> 下一个以 UUID 命名的对象(或条带化的多个分块)。视图目录项指向对象 key。</p></div>
-      <div class="card"><h4>基目录 <code>--home</code></h4><p>同时容纳 <code>blocks/</code>(数据)和 <code>meta/</code>(视图)的物理根。默认 <code>$GROVEFS_HOME</code> 或 <code>~/.grovefs</code>。<code>meta-server</code> 用子命令自己的 <code>--db-path</code> 指元数据根(视图库在 <code>&lt;db-path&gt;/meta/</code>),语义更明确。</p></div>
+      <div class="card"><h4>基目录 <code>--home</code></h4><p><b>单机模式</b>:<code>blocks/</code>(数据)+ <code>meta/&lt;view&gt;.db</code>(视图)的本地根,供 <code>init</code> 与不带 <code>--meta</code>/<code>--data</code> 的挂载使用;默认 <code>$GROVEFS_HOME</code> 或 <code>~/.grovefs</code>。<b>服务/客户端模式</b>:客户端不需要它(远程挂载本地零落盘);存储机上的持库命令各自声明自己的根(<code>meta-server --db-path</code>、<code>acl --db-path</code>、<code>data-server --root</code>),优先于 <code>--home</code>,后者仅作兼容回退。</p></div>
     </div>
     <div class="note"><b>关键:</b>视图与数据天然分离。视图只是「目录树 + 指针」,字节永远在 <code>blocks/</code>。这正是"不同用户挂载显示不同列表、数据都在硬盘上"的实现基础。</div>
     <div class="note"><b><code>--view</code> 与路径容量</b>:<code>--view</code> 是视图命名空间的<b>任意标签</b>,与 <b>Linux 用户名无关</b>——不调 <code>getpwnam</code>、不校验 uid、不要求 <code>useradd</code>。<code>alice</code>、<code>team-a</code>、<code>u42</code>、<code>研究组</code> 都可用,只用作 ① <code>&lt;home&gt;/meta/&lt;view&gt;.db</code> 库文件名 ② FUSE mount 上的 <code>grovefs:&lt;view&gt;</code> 标签。<b>鉴权 = 能访问 <code>--home</code>/<code>blocks/</code> + 可选 <code>--token</code></b>,不来自 Linux 用户身份。一个用户一棵树,树内可 <code>mkdir</code>/<code>touch</code> <b>任意多个</b>文件与目录、<b>任意深度</b>,与自家 home 无差异;跨用户隔离的粒度是「整棵视图树」而不是单个路径。<code>--manifest</code> 只是骨架预建入口,不是路径数量上限。</div>
@@ -186,7 +186,7 @@
     <h3>一次写请求的完整路径（数据面 / 元数据面各走一半）</h3>
     <pre class="tree">
 app <span class="k">write()/close()</span>
-   ├─ <span class="k">数据面</span>   → RemoteBackend ─TCP帧→ data-server → <span class="c">blocks/&lt;key&gt;（UUID、扁平存）</span>
+   ├─ <span class="k">数据面</span>   → RemoteBackend ─TCP帧→ data-server → <span class="c">blocks/&lt;2hex&gt;/&lt;key&gt;（UUID、256 桶自动扇出）</span>
    │                                    <span class="c">≥4MiB 分片并发；大文件跨多 data-server 条带</span>
    └─ <span class="k">元数据面</span> → RemoteMeta   ─TCP帧→ meta-server → <span class="c">权威视图树（默认 SQLite，或 PostgreSQL）</span>
           <span class="c">create / rename / setattr / touch_mtime …</span>
@@ -201,16 +201,16 @@ app <span class="k">write()/close()</span>
   <section id="quick">
     <h2 class="title"><span class="num">3</span>快速上手(单机本地模式)</h2>
     <p class="lead">数据和视图都在本机同一个 <code>--home</code>,无需任何 server,先体验功能最快。</p>
-    <pre><code>Y=./target/release/grove
+    <pre><code>Y=./target/release/grovefs
 BASE=/data/myfs                       <span class="cmt"># 物理基目录</span>
 
 <span class="cmt"># 1) 初始化两个用户的视图</span>
 $Y --home $BASE init --view alice
 $Y --home $BASE init --view bob
 
-<span class="cmt"># 2) 挂载(前台运行,Ctrl-C 即卸载;或加 & 后台)</span>
+<span class="cmt"># 2) 挂载(默认转后台:挂载点就绪即返回,只打一行摘要;前台附着用 --foreground)</span>
 $Y --home $BASE mount --view alice --mountpoint /mnt/alice
-$Y --home $BASE mount --view bob   --mountpoint /mnt/bob     <span class="cmt"># 另一终端</span>
+$Y --home $BASE mount --view bob   --mountpoint /mnt/bob
 
 <span class="cmt"># 3) 像普通目录一样读写、建自定义层级</span>
 mkdir -p /mnt/alice/projects/2026
@@ -293,7 +293,7 @@ $Y acl --db-path /data/cluster allow   --view alice --uid 1000 --read --write
 $Y acl --db-path /data/cluster allow   --view alice --uid 2000 --read
 $Y acl --db-path /data/cluster list    --view alice          <span class="cmt"># 查看已授权 uid</span>
 $Y acl --db-path /data/cluster revoke  --view alice --uid 2000   <span class="cmt"># 撤销行</span></code></pre>
-    <p>存储位于 <code>&lt;db-path&gt;/meta/acl.db</code>（即 meta-server 同一元数据根下的 <code>meta/</code>；PG 模式下改存同一 PG 实例的共享表 <code>grovefs_acl.view_acl</code>，<code>grove acl</code> 须带同款 <code>--store</code> URI，见 §6.2），单表 <code>view_acl(view, uid, can_read, can_write, PRIMARY KEY(view, uid))</code>。查询为单条 <code>(NOT EXISTS …) OR EXISTS (… AND can_read=1)</code> 谓词，<b>任何 DB 错误一律 fail-closed</b>（归 false，绝不因库错而误放行）。语义：<b>无行 = 无约束</b>（任何 uid 挂同一 view 都放行，向后兼容旧行为）；<b>有任意行 = 白名单</b>（无匹配行→ <code>M_OPEN</code> <code>E_AUTH</code> 拒挂载、挂载 fail-fast；仅 read 授权→ 写意图 op 前<b>逐 op 动态重查</b>、回 <code>E_NOTPERM</code>（客户端 FUSE 侧落 <code>EPERM</code>，区别于 HA 备机 <code>E_ROFS</code> 故障转移信号），读仍放行）。写门不在 <code>M_OPEN</code> 缓存，故 <code>acl revoke</code>/降级对已建立连接即时生效。本地模式（无 <code>--meta</code>）同样走读门校验；写门落本地 SQLite 文件，同 uid 无法强制隔离，依赖 OS 文件权限。客户端上报 uid 默认 <code>geteuid()</code>，可 <code>mount --as-uid N</code> 显式覆盖，用于共享 <code>meta-server</code> 上按角色挂载。</p>
+    <p>存储位于 <code>&lt;db-path&gt;/meta/acl.db</code>（即 meta-server 同一元数据根下的 <code>meta/</code>；PG 模式下改存同一 PG 实例的共享表 <code>grovefs_acl.view_acl</code>，<code>grovefs acl</code> 须带同款 <code>--store</code> URI，见 §6.2），单表 <code>view_acl(view, uid, can_read, can_write, PRIMARY KEY(view, uid))</code>。查询为单条 <code>(NOT EXISTS …) OR EXISTS (… AND can_read=1)</code> 谓词，<b>任何 DB 错误一律 fail-closed</b>（归 false，绝不因库错而误放行）。语义：<b>无行 = 无约束</b>（任何 uid 挂同一 view 都放行，向后兼容旧行为）；<b>有任意行 = 白名单</b>（无匹配行→ <code>M_OPEN</code> <code>E_AUTH</code> 拒挂载、挂载 fail-fast；仅 read 授权→ 写意图 op 前<b>逐 op 动态重查</b>、回 <code>E_NOTPERM</code>（客户端 FUSE 侧落 <code>EPERM</code>，区别于 HA 备机 <code>E_ROFS</code> 故障转移信号），读仍放行）。写门不在 <code>M_OPEN</code> 缓存，故 <code>acl revoke</code>/降级对已建立连接即时生效。本地模式（无 <code>--meta</code>）同样走读门校验；写门落本地 SQLite 文件，同 uid 无法强制隔离，依赖 OS 文件权限。客户端上报 uid 默认 <code>geteuid()</code>，可 <code>mount --as-uid N</code> 显式覆盖，用于共享 <code>meta-server</code> 上按角色挂载。</p>
     <div class="warn"><b>诚实边界</b>：TCP 客户端自报 uid 属 <b>advisory</b>（客户端可伪造），真正的准入仍由 <code>--token</code> 把关；白名单适合“已通过 token 准入的集群内部职责分离”，不适合防内鬼。另两个行为边界：① <b>加锁类 op（<code>flock</code>/<code>F_SETLK</code>，含锁续约）归为写意图</b>（要写中心 <code>locks</code> 表），只读授权对它们一律 <code>EPERM</code>，只读角色需共享锁就得给 <code>--write</code>；② <b>读门只在挂载（<code>M_OPEN</code>）时校验一次</b>，“revoke 即时生效”仅指写门（逐 op 重查），撤读后已建立连接会读到重挂为止。由 <code>test_acl.sh</code> 22 个断言证明（无行时任何 uid 放行、有行后未授权 <code>E_AUTH</code>、read-only 写回 <code>EPERM</code>、revoke 后门重新打开、本地 <code>--as-uid</code> 同名拦截、以及 §5b TOCTOU 回归：就地 rw→ro 降级后存活挂载即时拒写、读仍放行 …）。</div>
 
     <h3>6.2 元数据后端可切换：SQLite ↔ PostgreSQL</h3>
@@ -310,7 +310,7 @@ $Y mount --view alice \\
      --data 10.0.0.5:50100 --meta 10.0.0.5:50110 -m /mnt/alice</code></pre>
     <ul>
       <li><b>PG 模式与自研 HA 互斥</b>：<code>--store postgres://…</code> + 任一 <code>--role standby / --peer / --witness</code> 在启动时直接 fail-fast（<code>VACUUM INTO</code> 快照复制是 SQLite 特性）；PG 上 HA 请交给 PostgreSQL 自己的<b>流复制 / logical replication / PITR</b>——那本来就是比文件级快照更强的机制。</li>
-      <li><b>ACL 白名单随元数据面同迁</b>：SQLite 模式下落 <code>&lt;db-path&gt;/meta/acl.db</code>；PG 模式下改存同一 PG 实例里的共享表 <code>grovefs_acl.view_acl</code>（<code>meta-server</code> 的门控与 <code>grove acl --store</code> 读的都是它）——整条元数据面（树 + 锁 + ACL）收进一个库，一次 <code>pg_dump</code> 即全量备份；此时 <code>&lt;db-path&gt;</code> 只剩派生视图定义等配置文件，不再持 acl.db。</li>
+      <li><b>ACL 白名单随元数据面同迁</b>：SQLite 模式下落 <code>&lt;db-path&gt;/meta/acl.db</code>；PG 模式下改存同一 PG 实例里的共享表 <code>grovefs_acl.view_acl</code>（<code>meta-server</code> 的门控与 <code>grovefs acl --store</code> 读的都是它）——整条元数据面（树 + 锁 + ACL）收进一个库，一次 <code>pg_dump</code> 即全量备份；此时 <code>&lt;db-path&gt;</code> 只剩派生视图定义等配置文件，不再持 acl.db。</li>
       <li>建表由服务端在 view 首次 <code>M_OPEN</code> 时幂等 <code>CREATE SCHEMA IF NOT EXISTS</code> + <code>CREATE TABLE IF NOT EXISTS</code> 完成，不需要预迁移脚本；根节点固定 id=1，<code>setval(pg_get_serial_sequence(...), MAX(id))</code> 对齐序列，<code>ROOT_INO</code> 语义与 SQLite 完全一致。</li>
       <li><b>写并行（PG 独有，opt-in）</b>：默认 SQLite 后端对同一 view 是<b>单写者</b>（一条权威连接 + 互斥锁）；换 <code>--store postgres://…</code> 后写路径改为至多 <code>PG_WRITE_POOL_SIZE = 8</code> 连接的 <b>SERIALIZABLE 写连接池</b>（HopsFS 路线，事务基座交给 PostgreSQL 自带 SSI）：不相交 <code>(parent_id, name)</code> 行上的并发写真正并行提交，读写重叠的一例由 SSI 中止并透明重试（200µs–25ms 指数退避、<code>SERIALIZATION_MAX_ATTEMPTS = 12</code>），<code>SQLSTATE 40001/40P01</code> 绝不外泄给 POSIX 调用方；<code>rename</code> 的环检查读、<code>unlink</code> 的引用计数 GC 读都并回同一事务。这是把「单权威写者」放宽为「单权威调度（serially equivalent）」，I1–I4 在任意 SSI 接受的调度下逐条不变。</li>
       <li><b>为什么没做 Redis</b>：Redis 的 K/V+TTL 模型与视图树（rename/unlink/hardlink/refcount GC 需事务、锁需行级仲裁）不同构——把 relational 语义硬塞进 Redis 等于在应用层重做一个 PG，收益为负。<b>GroveFS 只加 PG，不加 Redis</b>。</li>
@@ -337,7 +337,7 @@ $Y mount --view alice \\
 
     <h3>8.1 物理布局</h3>
     <ul>
-      <li><b>单对象</b>:<code>blocks/&lt;key&gt;</code>,一文件=一对象文件,扁平存放(不用深层目录,避免 inode/目录项膨胀)。</li>
+      <li><b>单对象</b>:<code>blocks/&lt;2hex&gt;/&lt;key&gt;</code>,一文件=一对象文件;对象按 key 哈希自动扇出进 256 个桶子目录,单层即止——单目录条目数不随总量增长,千万级对象下备份/遍历工具不退化;旧扁平存储自动回退可读,后台惰性收敛进桶,零人工迁移。</li>
       <li><b>key 命名</b>:写入时生成 UUID 作对象 key,存进视图 <code>data_ref</code> 字段。</li>
       <li><b>条带编码</b>:<code>data_ref</code> = <code>s&lt;N&gt;:&lt;stripe_bytes&gt;:&lt;uuid&gt;</code>,第 i 块 key = <code>{uuid}#{i}</code>,落在 <code>servers[i % N]</code>。<b>无 <code>s</code> 前缀 = 旧单对象</b>,天然向后兼容。</li>
     </ul>
@@ -437,10 +437,10 @@ $Y mount --view alice --data ... --meta ... --token s3cr3t -m /mnt/alice</code><
   <!-- 11 -->
   <section id="ops">
     <h2 class="title"><span class="num">11</span>运维与验证</h2>
-    <pre><code>$Y umount --mountpoint /mnt/alice     <span class="cmt"># 卸载</span>
-fusermount -u /mnt/alice              <span class="cmt"># 等价(前台进程 Ctrl-C 即卸载)</span>
-ps aux | grep grove                  <span class="cmt"># 查看在跑的 server / mount</span></code></pre>
-    <div class="note"><b>挂载是前台阻塞式</b>(<code>Session::notifier() + run()</code>);常驻用 <code>nohup ... &amp;</code> 或 systemd。<b>不要</b>用 <code>spawn + BackgroundSession::join()</code> 当阻塞等待——<code>join()</code> 会立即卸载。</div>
+    <pre><code>$Y umount --mountpoint /mnt/alice     <span class="cmt"># 卸载(后台挂载进程随之退出)</span>
+fusermount -u /mnt/alice              <span class="cmt"># 等价(前台挂载则 Ctrl-C 即卸载)</span>
+ps aux | grep grovefs                  <span class="cmt"># 查看在跑的 server / mount</span></code></pre>
+    <div class="note"><b>挂载默认转后台</b>:<code>mount</code> 自我 re-exec 成独立会话进程,等挂载点在 <code>/proc/mounts</code> 真正生效才返回(脚本免 sleep 轮询),终端只打一行摘要(含 pid 与日志路径);后台进程输出追加进 <code>--log-file</code>(默认 <code>$TMPDIR/grovefs-mount-&lt;挂载点&gt;.log</code>,<code>--log-file /dev/null</code> 完全静音),<code>grovefs umount -m MP</code> 卸载并终止它。<code>--foreground</code> 保留传统终端附着式(systemd <code>Type=exec</code> unit、调试必备)。内核实现备注:session 仍走 <code>Session::notifier() + run()</code> 阻塞式,<b>不要</b>用 <code>spawn + BackgroundSession::join()</code> 当阻塞等待——<code>join()</code> 会立即卸载。</div>
     <h3>回归验证</h3>
     <pre><code>export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config LC_ALL=C LANG=C
 bash .build-bin/run_all.sh                <span class="cmt"># 全板 26 套件:build+unit+posix+edge+e2e+remote+errors</span>
@@ -462,8 +462,8 @@ which fusermount fusermount3 || true       <span class="cmt"># 至少有一个(�
 
     <h3>12.1 构建并安装</h3>
     <pre><code>cargo build --release
-sudo install -m 755 target/release/grove /usr/local/bin/grove
-grove --version</code></pre>
+sudo install -m 755 target/release/grovefs /usr/local/bin/grovefs
+grovefs --version</code></pre>
     <p>中心与客户机装<b>同一个二进制</b>,子命令决定角色;无系统 pkg-config 时按 <a href="#ops">§11</a> 挂仓库自带 shim。</p>
 
     <h3>12.2 规划:节点、目录、端口</h3>
@@ -489,7 +489,7 @@ Description=GroveFS data-server
 After=local-fs.target
 [Service]
 EnvironmentFile=/etc/grovefs/grovefs.env
-ExecStart=/usr/local/bin/grove data-server --listen 0.0.0.0:50100 --root /data/cluster --token ${GROVE_TOKEN}
+ExecStart=/usr/local/bin/grovefs data-server --listen 0.0.0.0:50100 --root /data/cluster --token ${GROVE_TOKEN}
 Restart=on-failure
 RestartSec=2
 [Install]
@@ -501,7 +501,7 @@ Description=GroveFS meta-server
 After=local-fs.target
 [Service]
 EnvironmentFile=/etc/grovefs/grovefs.env
-ExecStart=/usr/local/bin/grove meta-server --db-path /data/cluster --listen 0.0.0.0:50110 --token ${GROVE_TOKEN}
+ExecStart=/usr/local/bin/grovefs meta-server --db-path /data/cluster --listen 0.0.0.0:50110 --token ${GROVE_TOKEN}
 Restart=on-failure
 RestartSec=2
 [Install]
@@ -513,7 +513,7 @@ sudo systemctl enable --now grove-data-server grove-meta-server
 ss -lntp | grep -E '50100|50110'</code></pre>
 
     <h3>12.5 客户机:模板挂载单元(一个 view 一个实例)</h3>
-    <p>mount 前台服务且内置 SIGTERM 处理:<code>systemctl stop</code> 会自动 <code>fusermount -u</code> 干净卸载,不留死挂载。</p>
+    <p>mount 单元带 <code>--foreground</code> 保持进程附着(<code>Type=exec</code> 要盯住服务进程本体),内置 SIGTERM 处理:<code>systemctl stop</code> 会自动 <code>fusermount -u</code> 干净卸载,不留死挂载。</p>
     <pre><code><span class="cmt"># /etc/systemd/system/grove-mount@.service —— %i = 视图名,挂载点 /mnt/%i</span>
 [Unit]
 Description=GroveFS mount view %i
@@ -522,7 +522,7 @@ Wants=network-online.target
 [Service]
 EnvironmentFile=/etc/grovefs/grovefs.env
 ExecStartPre=-/usr/bin/fusermount -u /mnt/%i   <span class="cmt"># 清掉上次异常退出的死挂载(- = 失败也继续)</span>
-ExecStart=/usr/local/bin/grove mount --view %i --data 10.0.0.5:50100 --meta 10.0.0.5:50110 --token ${GROVE_TOKEN} -m /mnt/%i
+ExecStart=/usr/local/bin/grovefs mount --view %i --foreground --data 10.0.0.5:50100 --meta 10.0.0.5:50110 --token ${GROVE_TOKEN} -m /mnt/%i
 Restart=on-failure
 RestartSec=2
 [Install]
@@ -561,12 +561,12 @@ $Y mount --view alice --meta 10.0.0.5:50110,10.0.0.6:50111 --data 10.0.0.5:50100
     <h3>12.9 PostgreSQL 后端部署(只改 meta-server 一处)</h3>
     <pre><code><span class="cmt"># 1) 建库并给连接角色建 schema 的权限(view 首开时服务端幂等建表,无需预迁移)</span>
 createdb grovefs
-psql -c "GRANT CREATE,CONNECT ON DATABASE grovefs TO grove;"
+psql -c "GRANT CREATE,CONNECT ON DATABASE grovefs TO grovefs;"
 <span class="cmt"># 2) --store 与 --role standby/--peer/--witness 互斥,同时给会启动即 fail-fast</span>
 $Y meta-server --db-path /data/cluster --listen 0.0.0.0:50110 \
      --store postgres://grove:pw@10.0.0.9:5432/grovefs --token $TOK
 
-<span class="cmt"># 3) ACL 控制面同在库里：grove acl 须带同款 --store（与 meta-server 读同一张 grovefs_acl.view_acl）</span>
+<span class="cmt"># 3) ACL 控制面同在库里：grovefs acl 须带同款 --store（与 meta-server 读同一张 grovefs_acl.view_acl）</span>
 $Y acl --db-path /data/cluster --store postgres://grove:pw@10.0.0.9:5432/grovefs list --view alice</code></pre>
     <p>客户端命令一字不变(<a href="#share">§6.1/§6.2</a>:客户机不装 PG、不持连接串、PG 账密只存在于这台机的启动命令里);每 view 映射 <code>grovefs_v_&lt;hex(view)&gt;</code> schema;ACL 白名单随元数据面进同一实例的共享表 <code>grovefs_acl.view_acl</code>(见上面示例 3 与 §13.2);备份/HA 改走 PG 工具链(<code>pg_dump</code>/<code>pg_basebackup</code>/流复制/PITR,见 <a href="#maint">§13.3</a>)。</p>
   </section>
@@ -590,12 +590,12 @@ journalctl -u grove-meta-server --since yesterday | grep -E 'meta HA|sync-repl|f
       <tr><td><code>meta HA: promotion refused/deferred</code></td><td>提升被否(对端持更高 token 或前任租约尚活)</td><td>正常:绝不双主;两半都拒升则查 witness 多数派</td></tr>
       <tr><td><code>invalidation listener stopped: token rejected</code></td><td>客户端失效推送通道被 token 拒(中心 token 换了)</td><td>用新 token 重启对应 grove-mount@ 实例</td></tr>
     </table>
-    <p class="lead">日志等级:<code>RUST_LOG</code> 控制 tracing 过滤(默认 <code>warn</code>),常规运维建议 <code>info</code>(unit 里加 <code>Environment=RUST_LOG=info</code>);无集中 metrics 接口(未实现),健康判断 = 进程 active + 端口在听 + 挂点在位 + 上表关键字无新增异常行。</p>
+    <p class="lead">日志等级:<code>RUST_LOG</code> 控制 tracing 过滤(默认 <code>warn</code>),常规运维建议 <code>info</code>(unit 里加 <code>Environment=RUST_LOG=info</code>);后台挂载(默认形态)的输出落在其 <code>--log-file</code>/<code>$TMPDIR/grovefs-mount-&lt;挂载点&gt;.log</code>,前台挂载(<code>--foreground</code>/systemd 单元)才进终端或 journal;无集中 metrics 接口(未实现),健康判断 = 进程 active + 端口在听 + 挂点在位 + 上表关键字无新增异常行。</p>
 
     <h3>13.2 备份什么</h3>
     <table>
       <tr><th>件</th><th>位置</th><th>方式</th></tr>
-      <tr><td>数据对象</td><td><code>&lt;中心&gt;/blocks/</code></td><td>普通目录,<code>rsync -a</code>/文件系统快照直接备;用过 <code>grove import</code>(§15.7)后部分对象是与源目录共享的硬链接——<code>rsync -a -H</code>/<code>cp -a</code> 保留链接免内容翻倍,源目录也应进同一备份</td></tr>
+      <tr><td>数据对象</td><td><code>&lt;中心&gt;/blocks/</code></td><td>普通目录,<code>rsync -a</code>/文件系统快照直接备;用过 <code>grovefs import</code>(§15.7)后部分对象是与源目录共享的硬链接——<code>rsync -a -H</code>/<code>cp -a</code> 保留链接免内容翻倍,源目录也应进同一备份</td></tr>
       <tr><td>权威视图</td><td><code>&lt;db-path&gt;/meta/&lt;view&gt;.db</code>(含 WAL)</td><td><b>勿在有写活动时裸拷</b>;流程见 13.3</td></tr>
       <tr><td>ACL</td><td>SQLite：<code>&lt;db-path&gt;/meta/acl.db</code>；PG：共享表 <code>grovefs_acl.view_acl</code></td><td>SQLite 同上一行(随中心根目录备份);PG 模式下 ACL 已进库,一次 <code>pg_dump</code> 连树带 ACL 全覆盖,不再有单独的 acl 文件</td></tr>
       <tr><td>视图定义(派生/别名)</td><td><code>&lt;db-path&gt;/meta/views/*.layout</code></td><td>普通文本文件,随 <code>acl.db</code> 一起拷(HA 备机也需手工同步,见 §15.6/§15.8)</td></tr>
@@ -611,7 +611,7 @@ journalctl -u grove-meta-server --since yesterday | grep -E 'meta HA|sync-repl|f
 
     <h3>13.4 升级与滚动变更</h3>
     <ul>
-      <li><b>客户端二进制</b>(单台无中断):<code>systemctl stop grove-mount@alice</code> → 替换 <code>/usr/local/bin/grove</code> → <code>start</code>。直接 kill 不行——死挂载要 <code>fusermount -u</code> 手工清。</li>
+      <li><b>客户端二进制</b>(单台无中断):<code>systemctl stop grove-mount@alice</code> → 替换 <code>/usr/local/bin/grovefs</code> → <code>start</code>。直接 kill 不行——死挂载要 <code>fusermount -u</code> 手工清。</li>
       <li><b>中心 server(无 HA)</b>:替换二进制 → <code>systemctl restart grove-data-server grove-meta-server</code>,接受秒级 IO 暂停。客户机挂载进程<b>不需要</b>跟着重启——远程链路对 server 重启透明(resilience 套件:连接池整体丢弃后有限退避重连)。</li>
       <li><b>HA 滚动升级</b>:先升级并拉起 standby → stop primary(≤3s <code>PROMOTE_TIMEOUT</code> 内备提升,客户端自动切地址)→ 升级旧主并以 standby 拉起(自动降级回初始形态)。混版未经验证,同一次大版本升级请中心与客户机保持同版。</li>
     </ul>
@@ -619,11 +619,11 @@ journalctl -u grove-meta-server --since yesterday | grep -E 'meta HA|sync-repl|f
     <h3>13.5 故障处理速查表</h3>
     <table>
       <tr><th>症状</th><th>第一反应</th><th>解释</th></tr>
-      <tr><td><code>ls</code> 报 <code>Transport endpoint is not connected</code></td><td><code>fusermount -u /mnt/x</code>(或 <code>grove umount -m /mnt/x</code>)后重启 mount 服务</td><td>挂载 daemon 死了/被 kill,留下死挂载点</td></tr>
+      <tr><td><code>ls</code> 报 <code>Transport endpoint is not connected</code></td><td><code>fusermount -u /mnt/x</code>(或 <code>grovefs umount -m /mnt/x</code>)后重启 mount 服务</td><td>挂载 daemon 死了/被 kill,留下死挂载点</td></tr>
       <tr><td>挂载即报 <code>Permission denied</code></td><td>比对客户端与两个 server 的 token</td><td><code>OP_OPEN</code>/<code>M_OPEN</code> 握手不过不重试,fail-fast</td></tr>
       <tr><td>挂载被拒 <code>whitelisted; uid N has no read grant</code></td><td>中心 <code>acl list --view V</code>,补授权或 <code>--as-uid</code> 换槽位</td><td>ACL 白名单生效;root 跑的 systemd 挂载上报 uid=0</td></tr>
       <tr><td>写全部 <code>EPERM</code>、读正常</td><td><code>acl list</code> 查写门是否被 revoke/降级</td><td>写门逐 op 重查即时生效;<b>这是权限不是故障</b>,故意区别于 <code>EROFS</code>。另一来源:旧/改造客户端挂着派生(虚拟)视图名写(服务端派生只读门禁同样回 <code>EPERM</code>,§15.6)</td></tr>
-      <tr><td>挂基名被拒 <code>"governed by an alias"</code>(本地)或服务端拒挂(远端回显复用 token 文案,§15.8)</td><td><code>grove view list</code> 查该真实名是否被纯别名治理</td><td>预期行为:别名是其唯一挂载入口;要恢复基名直挂,<code>grove view rm --name &lt;别名&gt;</code>(仅影响新挂载)</td></tr>
+      <tr><td>挂基名被拒 <code>"governed by an alias"</code>(本地)或服务端拒挂(远端回显复用 token 文案,§15.8)</td><td><code>grovefs view list</code> 查该真实名是否被纯别名治理</td><td>预期行为:别名是其唯一挂载入口;要恢复基名直挂,<code>grovefs view rm --name &lt;别名&gt;</code>(仅影响新挂载)</td></tr>
       <tr><td>远程挂载写全部 <code>EROFS</code></td><td><code>journalctl -u grove-meta-server</code> 看 fenced/写冻结/角色;<code>findmnt</code> 看挂载行是否带 <code>ro</code></td><td>三种正常情形:① 该节点是 standby(只读等提升);② witness 多数派不可达触发 fail-safe 写冻结——修仲裁可达性,宁停写不双写;③ 挂的是<b>派生(虚拟)视图名</b>(只读契约,§15.6)——改挂基名写</td></tr>
       <tr><td><code>flock</code> 看似被占住,持有者机器已整机崩溃</td><td>等 ≤15s(<code>LOCK_LEASE_SECS</code>)lease 过期自动扫</td><td>无 <code>release</code> 信号时 lease 是唯一兜底;正常进程崩溃是即时回收</td></tr>
       <tr><td>data-server 重启后客户机 IO 卡一下又好了</td><td>无需动作</td><td>连接池整体丢弃后有限退避重连(resilience 证明)</td></tr>
@@ -653,28 +653,28 @@ journalctl -u grove-meta-server --since yesterday | grep -E 'meta HA|sync-repl|f
         两台同 <span class="k">--view share</span> → 同一棵树,A 写 B 秒可见</pre>
 
     <h3>14.0 关于「数据库用 sqlite3」</h3>
-    <div class="ok"><b>不装任何东西</b>:GroveFS 默认元数据引擎就是 SQLite,用 <code>rusqlite bundled</code> 把 SQLite <b>源码编译进了 grove 二进制</b>——进程内引擎,不是需安装的数据库服务。<b>不要</b>给 meta-server 传 <code>--store</code>(传了才切 PG);权威树就是普通文件 <code>/data/meta/share.db</code>(+WAL 伴生文件)。<b>有写活动时勿用 sqlite3 CLI 打开/裸拷该文件</b>,备份流程见 <a href="#maint">§13.3</a>。</div>
+    <div class="ok"><b>不装任何东西</b>:GroveFS 默认元数据引擎就是 SQLite,用 <code>rusqlite bundled</code> 把 SQLite <b>源码编译进了 grovefs 二进制</b>——进程内引擎,不是需安装的数据库服务。<b>不要</b>给 meta-server 传 <code>--store</code>(传了才切 PG);权威树就是普通文件 <code>/data/meta/share.db</code>(+WAL 伴生文件)。<b>有写活动时勿用 sqlite3 CLI 打开/裸拷该文件</b>,备份流程见 <a href="#maint">§13.3</a>。</div>
 
     <h3>14.1 三台装同一二进制</h3>
     <pre><code>cargo build --release
 <span class="cmt"># 分发安装(同版!混版未经验证)</span>
 for H in 192.168.1.10 192.168.1.11 192.168.1.12; do
-  scp target/release/grove $H:/tmp/ &amp;&amp; ssh $H 'sudo install -m 755 /tmp/grove /usr/local/bin/grove'
+  scp target/release/grovefs $H:/tmp/ &amp;&amp; ssh $H 'sudo install -m 755 /tmp/grovefs /usr/local/bin/grovefs'
 done
-grove --version</code></pre>
+grovefs --version</code></pre>
     <p class="lead">意义:单二进制多角色,子命令决定当存储端还是客户端;SQLite 静态链入,客户机除 <code>fusermount</code> 外零额外依赖。</p>
 
     <h3>14.2 存储机:目录 + token,并分发 env 到两台客户端</h3>
     <pre><code>sudo mkdir -p /data          <span class="cmt"># 基目录;blocks/ 与 meta/ 都在服务首次启动时自动建</span>
 sudo mkdir -p /etc/grovefs
 sudo bash -c 'umask 077; echo "GROVE_TOKEN=$(openssl rand -hex 16)" > /etc/grovefs/grovefs.env'</code></pre>
-    <p>目录布局:<code>/data/blocks/</code> 存文件真实字节(UUID 命名的扁平对象);<code>/data/meta/share.db</code> 存视图目录树;<code>/data/meta/acl.db</code> 只在用过 <code>acl allow</code> 后出现(§14.7)。视图与对象分离——目录项持 <code>data_ref</code> 指针关联两者。env 用 scp 分发到两台客户端的 <code>/etc/grovefs/</code>(chmod 600),三处 token 一一致。</p>
+    <p>目录布局:<code>/data/blocks/</code> 存文件真实字节(UUID 命名的对象文件,按 key 哈希分布在 256 个桶子目录里);<code>/data/meta/share.db</code> 存视图目录树;<code>/data/meta/acl.db</code> 只在用过 <code>acl allow</code> 后出现(§14.7)。视图与对象分离——目录项持 <code>data_ref</code> 指针关联两者。env 用 scp 分发到两台客户端的 <code>/etc/grovefs/</code>(chmod 600),三处 token 一一致。</p>
 
     <h3>14.3 存储机:手工起两个服务(先验后常驻)</h3>
     <pre><code><span class="cmt"># 窗口1 数据服务;TOK=$(grep -o '=.*' /etc/grovefs/grovefs.env | cut -d= -f2)</span>
-grove data-server --listen 0.0.0.0:50100 --root /data --token "$TOK"
+grovefs data-server --listen 0.0.0.0:50100 --root /data --token "$TOK"
 <span class="cmt"># 窗口2 元数据服务(--db-path 指元数据根)</span>
-grove meta-server --db-path /data --listen 0.0.0.0:50110 --token "$TOK"
+grovefs meta-server --db-path /data --listen 0.0.0.0:50110 --token "$TOK"
 ss -lntp | grep -E '50100|50110'      <span class="cmt"># 两行都在即成功</span></code></pre>
     <table>
       <tr><th>参数</th><th>取值</th><th>意义</th></tr>
@@ -696,7 +696,7 @@ Description=GroveFS data-server
 After=local-fs.target
 [Service]
 EnvironmentFile=/etc/grovefs/grovefs.env
-ExecStart=/usr/local/bin/grove data-server --listen 0.0.0.0:50100 --root /data --token ${GROVE_TOKEN}
+ExecStart=/usr/local/bin/grovefs data-server --listen 0.0.0.0:50100 --root /data --token ${GROVE_TOKEN}
 Restart=on-failure
 RestartSec=2
 [Install]
@@ -708,7 +708,7 @@ Description=GroveFS meta-server
 After=local-fs.target
 [Service]
 EnvironmentFile=/etc/grovefs/grovefs.env
-ExecStart=/usr/local/bin/grove meta-server --db-path /data --listen 0.0.0.0:50110 --token ${GROVE_TOKEN}
+ExecStart=/usr/local/bin/grovefs meta-server --db-path /data --listen 0.0.0.0:50110 --token ${GROVE_TOKEN}
 Restart=on-failure
 RestartSec=2
 [Install]
@@ -722,7 +722,7 @@ sudo ufw allow from 192.168.1.0/24 to any port 50110 proto tcp</code></pre>
     <h3>14.5 客户端 A(192.168.1.11)读写挂载</h3>
     <pre><code>sudo mkdir -p /mnt/da
 TOK=$(grep -o '=.*' /etc/grovefs/grovefs.env | cut -d= -f2)
-sudo grove mount --view share \
+sudo grovefs mount --view share \
      --data 192.168.1.10:50100 --meta 192.168.1.10:50110 --token "$TOK" <span class="k">-m /mnt/da</span></code></pre>
     <table>
       <tr><th>参数</th><th>取值</th><th>意义</th></tr>
@@ -743,7 +743,7 @@ Wants=network-online.target
 [Service]
 EnvironmentFile=/etc/grovefs/grovefs.env
 ExecStartPre=-/usr/bin/fusermount -u /mnt/da
-ExecStart=/usr/local/bin/grove mount --view share --data 192.168.1.10:50100 --meta 192.168.1.10:50110 --token ${GROVE_TOKEN} -m /mnt/da
+ExecStart=/usr/local/bin/grovefs mount --view share --foreground --data 192.168.1.10:50100 --meta 192.168.1.10:50110 --token ${GROVE_TOKEN} -m /mnt/da
 Restart=on-failure
 RestartSec=2
 [Install]
@@ -756,7 +756,7 @@ findmnt -T /mnt/da        <span class="cmt"># 期望:源 grovefs:share</span></c
     <p class="lead">要其他用户也能访问挂点:ExecStart 加 <code>--o allow_other</code> + 本机 <code>/etc/fuse.conf</code> 开 <code>user_allow_other</code>。</p>
 
     <h3>14.6 客户端 B(192.168.1.12)只读挂载 + 验收</h3>
-    <pre><code>sudo grove mount --view share \
+    <pre><code>sudo grovefs mount --view share \
      --data 192.168.1.10:50100 --meta 192.168.1.10:50110 --token "$TOK" <span class="k">--ro</span> <span class="k">-m /mnt/db</span></code></pre>
     <table>
       <tr><th>参数</th><th>意义</th></tr>
@@ -771,7 +771,7 @@ Wants=network-online.target
 [Service]
 EnvironmentFile=/etc/grovefs/grovefs.env
 ExecStartPre=-/usr/bin/fusermount -u /mnt/db
-ExecStart=/usr/local/bin/grove mount --view share --data 192.168.1.10:50100 --meta 192.168.1.10:50110 --token ${GROVE_TOKEN} --ro -m /mnt/db
+ExecStart=/usr/local/bin/grovefs mount --view share --foreground --data 192.168.1.10:50100 --meta 192.168.1.10:50110 --token ${GROVE_TOKEN} --ro -m /mnt/db
 Restart=on-failure
 RestartSec=2
 [Install]
@@ -790,14 +790,14 @@ sudo touch /mnt/db/x            <span class="cmt"># 期望:Read-only file system
 
     <h3>14.7 可选加固:服务端硬只读(视图白名单)</h3>
     <pre><code><span class="cmt"># 存储机：两个角色槽,只给 A 开写门</span>
-sudo grove acl --db-path /data allow --view share --uid 1001 --read --write
-sudo grove acl --db-path /data allow --view share --uid 1002 --read
-sudo grove acl --db-path /data list  --view share
+sudo grovefs acl --db-path /data allow --view share --uid 1001 --read --write
+sudo grovefs acl --db-path /data allow --view share --uid 1002 --read
+sudo grovefs acl --db-path /data list  --view share
 <span class="cmt"># 两台客户端 ExecStart 换成下面两行全文后,各自 daemon-reload + restart</span>
 <span class="cmt"># A:/etc/systemd/system/grove-mount.service</span>
-ExecStart=/usr/local/bin/grove mount --view share --data 192.168.1.10:50100 --meta 192.168.1.10:50110 --token ${GROVE_TOKEN} --as-uid 1001 -m /mnt/da
+ExecStart=/usr/local/bin/grovefs mount --view share --foreground --data 192.168.1.10:50100 --meta 192.168.1.10:50110 --token ${GROVE_TOKEN} --as-uid 1001 -m /mnt/da
 <span class="cmt"># B:(--ro 保留,双保险)</span>
-ExecStart=/usr/local/bin/grove mount --view share --data 192.168.1.10:50100 --meta 192.168.1.10:50110 --token ${GROVE_TOKEN} --as-uid 1002 --ro -m /mnt/db
+ExecStart=/usr/local/bin/grovefs mount --view share --foreground --data 192.168.1.10:50100 --meta 192.168.1.10:50110 --token ${GROVE_TOKEN} --as-uid 1002 --ro -m /mnt/db
 <span class="cmt"># 生效:</span>
 sudo systemctl daemon-reload &amp;&amp; sudo systemctl restart grove-mount</code></pre>
     <table>
@@ -818,18 +818,18 @@ sudo systemctl daemon-reload &amp;&amp; sudo systemctl restart grove-mount</code
     <p class="lead">日常维护全部适用 <a href="#maint">§13</a>;IP 对应:存储机=192.168.1.10,写端=192.168.1.11,只读端=192.168.1.12。</p>
 
     <h3>14.9 全程终端实录(真实实测输出,逐字未改)</h3>
-    <p class="lead">拍摄条件:grove 0.1.0 @ Ubuntu 20.04,<b>单机三合一等价拓扑</b>——命令里的 <code>127.0.0.1:5010x</code> 对应你三机中的 <code>192.168.1.10:5010x</code>,<code>/tmp/grove_case/data</code> 对应 <code>/data</code>,<code>/tmp/grove_case/mnt_da|mnt_db</code> 对应 <code>/mnt/da|/mnt/db</code>。以下每一段都是真实终端回显(含中文报错);token 是一次性随机值,已作废。重跑脚本见仓库 <code>.build-bin/run_case_demo.sh</code>。</p>
+    <p class="lead">拍摄条件:grovefs 0.1.0 @ Ubuntu 20.04,<b>单机三合一等价拓扑</b>——命令里的 <code>127.0.0.1:5010x</code> 对应你三机中的 <code>192.168.1.10:5010x</code>,<code>/tmp/grove_case/data</code> 对应 <code>/data</code>,<code>/tmp/grove_case/mnt_da|mnt_db</code> 对应 <code>/mnt/da|/mnt/db</code>。以下每一段都是真实终端回显(含中文报错);token 是一次性随机值,已作废。重跑脚本见仓库 <code>.build-bin/run_case_demo.sh</code>。</p>
 
     <h4>① 存储机:取 token、前台起两服务、确认监听</h4>
     <pre class="term"><b>$</b> grep -o '=.*' /etc/grovefs/grovefs.env | cut -d= -f2
 690987478d9cb1a4fee062db6a3d04c4
-<b>$</b> ./grove data-server --listen 127.0.0.1:50100 --root /tmp/grove_case/data --token "$TOK"
+<b>$</b> ./grovefs data-server --listen 127.0.0.1:50100 --root /tmp/grove_case/data --token "$TOK"
 <i>data-server listening on 127.0.0.1:50100</i>          <i># 三机上用 0.0.0.0:50100,这行会显示 0.0.0.0</i>
-<b>$</b> ./grove meta-server --db-path /tmp/grove_case/data --listen 127.0.0.1:50110 --token "$TOK"
+<b>$</b> ./grovefs meta-server --db-path /tmp/grove_case/data --listen 127.0.0.1:50110 --token "$TOK"
 <i>meta-server listening on 127.0.0.1:50110 (base /tmp/grove_case/data, role Primary)</i>
 <b>$</b> ss -lntp | grep -E "5010|5011"
-<i>LISTEN    0         128              127.0.0.1:50110            0.0.0.0:*        users:(("grove",pid=1733230,fd=4))
-LISTEN    0         128              127.0.0.1:50100            0.0.0.0:*        users:(("grove",pid=1733225,fd=3))</i>
+<i>LISTEN    0         128              127.0.0.1:50110            0.0.0.0:*        users:(("grovefs",pid=1733230,fd=4))
+LISTEN    0         128              127.0.0.1:50100            0.0.0.0:*        users:(("grovefs",pid=1733225,fd=3))</i>
 <b>$</b> ls /tmp/grove_case/data   <i># 两个服务启动时自动把骨架建好了</i>
 <i>blocks
 meta</i>
@@ -837,7 +837,7 @@ meta</i>
 <i>0</i>                              <i># 还没写文件,对象盘空着是对的</i></pre>
 
     <h4>② 客户端 A:读写挂载 + 写文件</h4>
-    <pre class="term"><b>$</b> ./grove mount --view share --data 127.0.0.1:50100 --meta 127.0.0.1:50110 --token "$TOK" -m /tmp/grove_case/mnt_da   <i># 远程挂载不需要 --home</i>
+    <pre class="term"><b>$</b> ./grovefs mount --view share --data 127.0.0.1:50100 --meta 127.0.0.1:50110 --token "$TOK" -m /tmp/grove_case/mnt_da   <i># 远程挂载不需要 --home</i>
 <i>using remote metadata service at 127.0.0.1:50110
 using remote data service at 127.0.0.1:50100
 mounting view 'share' at /tmp/grove_case/mnt_da (fully remote: no local store)</i>
@@ -866,7 +866,7 @@ fa513481-830f-4719-b5a7-156e1ace1c96</i>
 <i>acl.db  share.db  share.db-shm  share.db-wal</i></pre>
 
     <h4>③ 客户端 B:只读挂载,读得到、写不进</h4>
-    <pre class="term"><b>$</b> ./grove mount --view share --data 127.0.0.1:50100 --meta 127.0.0.1:50110 --token "$TOK" --ro -m /tmp/grove_case/mnt_db
+    <pre class="term"><b>$</b> ./grovefs mount --view share --data 127.0.0.1:50100 --meta 127.0.0.1:50110 --token "$TOK" --ro -m /tmp/grove_case/mnt_db
 <i>using remote metadata service at 127.0.0.1:50110
 using remote data service at 127.0.0.1:50100
 mounting view 'share' at /tmp/grove_case/mnt_db (fully remote: no local store, read-only)</i>
@@ -893,11 +893,11 @@ from_a.txt</i>
 <i>round2-1792235543</i></pre>
 
     <h4>⑤ 存储机：ACL 白名单 + 干净收尾</h4>
-    <pre class="term"><b>$</b> ./grove acl --db-path /tmp/grove_case/data allow --view share --uid 1001 --read --write   <i># --db-path 与 meta-server 同名,指同一个元数据根</i>
+    <pre class="term"><b>$</b> ./grovefs acl --db-path /tmp/grove_case/data allow --view share --uid 1001 --read --write   <i># --db-path 与 meta-server 同名,指同一个元数据根</i>
 <i>acl: granted view='share' uid=1001 read=true write=true</i>
-<b>$</b> ./grove acl --db-path /tmp/grove_case/data allow --view share --uid 1002 --read
+<b>$</b> ./grovefs acl --db-path /tmp/grove_case/data allow --view share --uid 1002 --read
 <i>acl: granted view='share' uid=1002 read=true write=false</i>
-<b>$</b> ./grove acl --db-path /tmp/grove_case/data list --view share
+<b>$</b> ./grovefs acl --db-path /tmp/grove_case/data list --view share
 <i>view 'share' is whitelisted:
   uid 1001 read=true write=true
   uid 1002 read=true write=false</i>
@@ -915,22 +915,22 @@ B umount ok</i></pre>
     <h3>15.1 服务端两个各自独立的目录旋钮</h3>
     <table>
       <tr><th>旋钮</th><th>存什么</th><th>能放哪</th></tr>
-      <tr><td><code>data-server --root DIR</code></td><td>数据基目录:自动建 <code>&lt;root&gt;/blocks/</code>,字节以 UUID 扁平存那里</td><td>任意路径/挂载点,不存在自动建</td></tr>
+      <tr><td><code>data-server --root DIR</code></td><td>数据基目录:自动建 <code>&lt;root&gt;/blocks/</code> 与 256 个桶,字节按 key 哈希存入 <code>blocks/&lt;2hex&gt;/&lt;key&gt;</code>;可逗号分隔多路径做多盘自动放置(整对象按 key 哈希选一条盘;根列表须固定,增删盘会重映射所有 key)</td><td>任意路径/挂载点,不存在自动建</td></tr>
       <tr><td><code>meta-server --db-path DIR</code></td><td>权威视图树 <code>&lt;db-path&gt;/meta/&lt;view&gt;.db</code>(+<code>acl.db</code>)</td><td>任意路径,可与对象盘不同盘</td></tr>
     </table>
     <pre><code><span class="cmt"># 对象盘改指大盘(/mnt/bigdisk)：改 unit 的 --root，并声明挂载依赖：</span>
-# ExecStart=/usr/local/bin/grove data-server --listen 0.0.0.0:50100 --root /mnt/bigdisk --token ${GROVE_TOKEN}
+# ExecStart=/usr/local/bin/grovefs data-server --listen 0.0.0.0:50100 --root /mnt/bigdisk --token ${GROVE_TOKEN}
 # [Unit] 加： Requires=mnt-bigdisk.mount / After=mnt-bigdisk.mount
 sudo systemctl daemon-reload &amp;&amp; sudo systemctl restart grove-data-server
 
 <span class="cmt"># 搬迁已有对象目录(安全：key 只是 UUID 不含路径)：停客户端写→停服务→rsync→改 --root→拉起</span>
 rsync -a /data/blocks/ /mnt/bigdisk/blocks/</code></pre>
-    <p class="lead"><b>例外——条带文件</b>：布局自描述在 <code>data_ref</code>(<code>s&lt;N&gt;:&lt;stripe&gt;:&lt;uuid&gt;</code>)但 chunk i 落哪台由 <code>--data</code> 列表<b>顺序</b>(<code>servers[i%N]</code>)决定——多地址列表顺序/台数一变，已写条带文件找不回分块；单地址无此问题。<b>多盘聚合两条正路</b>：OS 层 LVM/mdadm 合成一个文件系统再挂 <code>--root</code>；或多台 data-server + <code>--data a,b,c</code> 条带（≥16MiB 才分块，链路未饱和才有收益）。无 per-directory 配额/存储分层（未实现）。</p>
+    <p class="lead"><b>例外——条带文件</b>：布局自描述在 <code>data_ref</code>(<code>s&lt;N&gt;:&lt;stripe&gt;:&lt;uuid&gt;</code>)但 chunk i 落哪台由 <code>--data</code> 列表<b>顺序</b>(<code>servers[i%N]</code>)决定——多地址列表顺序/台数一变，已写条带文件找不回分块；单地址无此问题。<b>多盘聚合正路</b>：一条 data-server 挂多盘——<code>--root /data,/mnt/d2,...</code> 逗号分隔多存储根，整对象按 key 哈希自动放置到其中一条盘，statfs 自动聚合全盘容量；但根列表对同一存储须<b>固定</b>（放置是哈希 mod 根数，增删盘会重映射所有 key、使旧对象按新布局不可达），扩容宜一次性配齐多根，或在 OS 层用 LVM/mdadm 合成一个文件系统再挂单路径 <code>--root</code>；或多台 data-server + <code>--data a,b,c</code> 条带（≥16MiB 才分块，链路未饱和才有收益）。无 per-directory 配额/存储分层（未实现）。</p>
 
-    <h3>15.2 存量大量数据进来:两条正路,首选零拷贝 <code>grove import</code></h3>
+    <h3>15.2 存量大量数据进来:两条正路,首选零拷贝 <code>grovefs import</code></h3>
     <p class="lead"><b>首选——原地登记不搬家</b>(同文件系统,§15.7):字节零复制、秒级完成、时间戳/权限保真。需要重组数据、PG 后端、或想让大文件享受条带时,走<b>备选——经 FUSE 写路径灌入</b>:</p>
     <pre><code><span class="cmt"># 首选：在存储机一条命令登记整棵已存在的目录树（不读内容、不占额外盘）</span>
-grove import --db-path /data/cluster --view legacy --source /data/legacy --prefix /legacy
+grovefs import --db-path /data/cluster --view legacy --source /data/legacy --prefix /legacy
 <span class="cmt"># 备选：在任一台已挂载客户端分批灌入（层级随写自动成型）</span>
 rsync -a /srv/legacy/ /mnt/da/imported/
 <span class="cmt"># ≥4MiB 写自动分片并发；多地址且 ≥16MiB 自动条带——导入无需特殊调优</span>
@@ -956,11 +956,11 @@ rm imported/report.pdf                             <span class="cmt"># 安全：
 
     <h3>15.4 “B 只想看到一部分”：现有三条路 + 未实现清单</h3>
     <ol>
-      <li><b><code>mount --layout</code> 显示透镜(§15.5)，或其服务端集中定义版——派生视图(§15.6)</b>：B 的挂载加 <code>only /by_public</code> 或 <code>hide /photos/private</code>(本地规则)，或由管理员 <code>grove view define</code> 后 B 直接 <code>mount --view &lt;派生名&gt;</code>(免分发规则文件、可按名配 ACL)——字节零复制、其它挂载无感；但两者都是显示定制<b>不是硬安全边界</b>(B 不带透镜/直挂基名仍见全树，拦住他的是 ACL/token)。区别在写权限：<b>派生(虚拟)视图挂载一律只读</b>(形状由服务端治理，写只能走基名)，而客户端自备的 <code>--layout</code> 透镜仍可写(直写真实条目)——B 需要可写形状就用 <code>--layout</code>，只要只读分发形状就用派生视图。</li>
+      <li><b><code>mount --layout</code> 显示透镜(§15.5)，或其服务端集中定义版——派生视图(§15.6)</b>：B 的挂载加 <code>only /by_public</code> 或 <code>hide /photos/private</code>(本地规则)，或由管理员 <code>grovefs view define</code> 后 B 直接 <code>mount --view &lt;派生名&gt;</code>(免分发规则文件、可按名配 ACL)——字节零复制、其它挂载无感；但两者都是显示定制<b>不是硬安全边界</b>(B 不带透镜/直挂基名仍见全树，拦住他的是 ACL/token)。区别在写权限：<b>派生(虚拟)视图挂载一律只读</b>(形状由服务端治理，写只能走基名)，而客户端自备的 <code>--layout</code> 透镜仍可写(直写真实条目)——B 需要可写形状就用 <code>--layout</code>，只要只读分发形状就用派生视图。</li>
       <li><b>同 view + 目录约定</b>：B 只进 <code>by_public/</code> 这类发布目录——简单，但约定不是强制(B 能 <code>cd</code> 到任何地方)。</li>
       <li><b>拆两个 view + 灌两遍</b>：<code>share_pub</code> 只放可公开内容(rsync <code>--include/--exclude</code> 筛)，B 挂它配 ACL——硬隔离真只读，代价是公开部分字节多一份。要真安全隔离选这条。</li>
     </ol>
-    <p class="lead"><b>未实现(诚实标注)</b>：子树挂载 <code>--subpath</code>/<code>--prefix</code>(<code>--layout only/hide</code> 是显示裁剪，不是路径 chroot)；跨 view 硬链接/共享对象(link 只在树内，分视图即两份字节)；导入后源目录的持续自动同步(watcher/定时重扫)——<code>grove import</code> 是手动幂等增量命令；per-directory ACL(粒度是 view × uid；<code>--layout</code> 可做目录级显示裁剪但不构成强制隔离)。</p>
+    <p class="lead"><b>未实现(诚实标注)</b>：子树挂载 <code>--subpath</code>/<code>--prefix</code>(<code>--layout only/hide</code> 是显示裁剪，不是路径 chroot)；跨 view 硬链接/共享对象(link 只在树内，分视图即两份字节)；导入后源目录的持续自动同步(watcher/定时重扫)——<code>grovefs import</code> 是手动幂等增量命令；per-directory ACL(粒度是 view × uid；<code>--layout</code> 可做目录级显示裁剪但不构成强制隔离)。</p>
 
     <h3>15.5 显示透镜：<code>mount --layout rules.txt</code></h3>
     <p class="lead">同一棵存储树、同一份字节，不同客户端挂载时各自套一层显示规则(源路径 = 存储树坐标，<code>#</code> 注释，绝对路径)：</p>
@@ -975,7 +975,7 @@ rm imported/report.pdf                             <span class="cmt"># 安全：
 $ cat lens.txt
 hide /photos/private
 map /data/raw /team/raw
-$ grove --home $BASE mount --view alice -m /mnt/alice --layout lens.txt
+$ grovefs --home $BASE mount --view alice -m /mnt/alice --layout lens.txt
 layout overlay lens.txt: 1 hide, 0 only, 1 reloc rule(s)
 
 $ ls /mnt/alice                     <span class="cmt"># data docs photos team；team 是合成的</span>
@@ -984,40 +984,40 @@ $ echo hi &gt; /mnt/alice/team/raw/note.txt   <span class="cmt"># 写直通源�
 $ mkdir /mnt/alice/team             <span class="cmt"># 脚手架名已占用 → 文件已存在(EEXIST)</span></code></pre>
     <p class="lead">机制：<code>LayoutMeta</code> 装饰器包在 <code>MetaProvider</code>(本地 MetaEngine 或远程 RemoteMeta)外层，只做显示坐标↔源坐标的翻译：<b>真实条目保持真实 inode</b>，数据 IO/锁/条带/GC/失效推送全部直通；合成脚手架目录用虚拟 inode。经透镜删除作用于源条目；<code>map</code>/<code>link</code> 子树内部仍按源路径接受 <code>hide</code>/<code>only</code> 过滤。守卫：向纯合成目录创建返回 EPERM，撞透镜已显示名返回 EEXIST，规则文件非法挂载直接 fail-fast。透镜不落盘、不改服务端状态，可与 <code>--ro</code>、ACL 组合；共享 meta-server 时合成目录下条目的失效推送按源路径广播、可能不命中透镜坐标，建议配 <code>--strict</code>。回归：<code>run_all.sh</code> 的 <code>layout</code> 套件(78 项断言，含第 9 节服务端派生视图与热换形、派生挂载只读〔远程/本地〕，见 §15.6；第 10/11 节纯别名与 <code>--retire</code> 原子轮换，见 §15.8)。客户端自备的 <code>--layout</code> 透镜保持可写——它是物理视图上的本地显示定制，不是服务端治理的虚拟形状。</p>
 
-    <h3>15.6 服务端派生视图：<code>grove view define</code> + <code>mount --view &lt;派生名&gt;</code></h3>
-    <p class="lead">§15.5 的透镜规则由各客户端自备；想把形状<b>集中管理在服务端</b>（团队共享一个显示契约、按名授权），用派生视图：<code>grove view define</code> 把规则写进 meta 根的 <code>&lt;db-path&gt;/meta/views/&lt;name&gt;.layout</code>（首行 <code>base &lt;物理视图&gt;</code>，余行即 §15.5 四动词），客户端只 <code>mount --view &lt;派生名&gt;</code>，<b>不需本地规则文件</b>。派生（虚拟）视图<b>一律只读挂载</b>——形状集中治理、只分发不修改，写入只属于原（基名）视图；要可写的自定义形状用 §15.5 客户端自备的 <code>--layout</code> 透镜：</p>
+    <h3>15.6 服务端派生视图：<code>grovefs view define</code> + <code>mount --view &lt;派生名&gt;</code></h3>
+    <p class="lead">§15.5 的透镜规则由各客户端自备；想把形状<b>集中管理在服务端</b>（团队共享一个显示契约、按名授权），用派生视图：<code>grovefs view define</code> 把规则写进 meta 根的 <code>&lt;db-path&gt;/meta/views/&lt;name&gt;.layout</code>（首行 <code>base &lt;物理视图&gt;</code>，余行即 §15.5 四动词），客户端只 <code>mount --view &lt;派生名&gt;</code>，<b>不需本地规则文件</b>。派生（虚拟）视图<b>一律只读挂载</b>——形状集中治理、只分发不修改，写入只属于原（基名）视图；要可写的自定义形状用 §15.5 客户端自备的 <code>--layout</code> 透镜：</p>
     <table>
       <tr><th>命令</th><th>参数释义</th><th>效果</th></tr>
-      <tr><td><code>grove view --db-path D define --name V --base B --rules F</code></td><td>D=meta 根(同 meta-server/acl 的 <code>--db-path</code>)，V=派生名，B=物理视图名，F=规则文件</td><td>写入/替换 <code>D/meta/views/V.layout</code>；<code>V</code> 的挂载<b>只读</b>(写走 <code>B</code>)；对 <code>meta-server</code>，已挂载连接 ≤2s 内<b>热换形</b>(免重挂)；本地挂载下次挂载生效</td></tr>
-      <tr><td><code>grove view --db-path D list</code></td><td>—</td><td>列出全部派生视图及其 base/规则计数</td></tr>
-      <tr><td><code>grove view --db-path D rm --name V</code></td><td>V=派生名</td><td>只删定义，<b>不动任何数据</b></td></tr>
+      <tr><td><code>grovefs view --db-path D define --name V --base B --rules F</code></td><td>D=meta 根(同 meta-server/acl 的 <code>--db-path</code>)，V=派生名，B=物理视图名，F=规则文件</td><td>写入/替换 <code>D/meta/views/V.layout</code>；<code>V</code> 的挂载<b>只读</b>(写走 <code>B</code>)；对 <code>meta-server</code>，已挂载连接 ≤2s 内<b>热换形</b>(免重挂)；本地挂载下次挂载生效</td></tr>
+      <tr><td><code>grovefs view --db-path D list</code></td><td>—</td><td>列出全部派生视图及其 base/规则计数</td></tr>
+      <tr><td><code>grovefs view --db-path D rm --name V</code></td><td>V=派生名</td><td>只删定义，<b>不动任何数据</b></td></tr>
     </table>
     <pre><code>$ cat docsonly.rules
 # show only the docs subtree
 only /docs
-$ grove view --db-path $BASE define --name docsonly --base team --rules docsonly.rules
+$ grovefs view --db-path $BASE define --name docsonly --base team --rules docsonly.rules
 defined derived view 'docsonly' over base 'team': 0 hide, 1 only, 0 reloc rule(s)
 note: mounts of 'docsonly' are read-only (virtual shape) — write to base view 'team'
-$ grove view --db-path $BASE define --name team --base team --rules docsonly.rules   <span class="cmt"># 名与基同名</span>
+$ grovefs view --db-path $BASE define --name team --base team --rules docsonly.rules   <span class="cmt"># 名与基同名</span>
 Error: "derived view name must differ from its base"
-$ grove view --db-path $BASE list
+$ grovefs view --db-path $BASE list
 view 'docsonly' -> base 'team': 0 hide, 1 only, 0 reloc rule(s)
 
-$ grove --home $BASE mount --view docsonly -m /mnt/lens &amp;   <span class="cmt"># 本地：直挂派生名，无 --layout</span>
+$ grovefs --home $BASE mount --view docsonly -m /mnt/lens &amp;   <span class="cmt"># 本地：直挂派生名，无 --layout</span>
 derived view 'docsonly' over base 'team': 0 hide, 1 only, 0 reloc rule(s)
 note: derived (virtual) views mount read-only — write to base view 'team'
-$ grove mount --view docsonly --meta 10.0.0.5:50110 --data 10.0.0.5:50100 -m /mnt/lens_r &amp;   <span class="cmt"># 远程：同样只给名，M_OPEN 握手带只读标志</span>
+$ grovefs mount --view docsonly --meta 10.0.0.5:50110 --data 10.0.0.5:50100 -m /mnt/lens_r &amp;   <span class="cmt"># 远程：同样只给名，M_OPEN 握手带只读标志</span>
 $ ls /mnt/lens                     <span class="cmt"># 只有 docs；基名 team 挂出来仍是全树，且可写</span>
 docs
 $ echo x &gt; /mnt/lens/docs/new.md    <span class="cmt"># 经虚拟视图的写一律拒绝</span>
 bash: /mnt/lens/docs/new.md: Read-only file system</code></pre>
     <p class="lead">机制：meta-server 维护<b>双层注册表</b>——物理 store(按 base 名) + 派生 <code>LayoutMeta</code> 单例(按客户可见名)：<code>M_OPEN</code> 时解析 <code>meta/views/&lt;view&gt;.layout</code>，命中则用 base 的 store 包一层规则引擎，此后该名的所有请求/事件/快照都经这层翻译，<b>同名跨机同形、虚拟 inode 一致</b>；派生订阅者同时注册进自身名与 base 名两个桶、写双播，基侧写在非 <code>--strict</code> 下也能对派生挂载即时可见（<code>layout</code> 套件第 9 节 e2e 实证，含 <b>re-define 热换形</b>：同一条已建立挂载在替换定义后 ≤5s 自动变宽/变窄、只读契约不变，全程未重挂）。<b>只读硬契约三层强制</b>：<code>M_OPEN</code> 握手回包带派生标志字节→客户端直接落内核只读挂载(写/锁写即时 <code>EROFS</code>、零往返)；服务端另对派生名的写意图 op 加独立权威门禁(回 <code>E_NOTPERM</code>→<code>EPERM</code>，有意不用 <code>E_ROFS</code> 以免被误读为 HA 故障转移信号)，旧/伪造客户端绕不过；本地(<code>--home</code>)派生挂载在挂载时同判强制 RO。协议向后兼容：旧服务端回包无标志字节→视为物理视图保持可写；旧客户端忽略新增字节。<b>改定义热生效机制</b>：服务端在每次分发 op 前检查定义文件 mtime（本地 stat，相对 FUSE 往返可忽略），变化则 evict 重建 <code>LayoutMeta</code>，客户端缓存 TTL（≤2s）内收敛；<code>view rm</code> 有意<b>不</b>热作用（已挂载者保持打开时的形状到重挂，避免正在使用的树被抽掉）；热重载仅限 meta-server，本地(<code>--home</code>)挂载在挂载时解析一次。守卫：拒 <code>name==base</code>、拒嵌套(base 必须是物理视图)、拒遮蔽已有 <code>&lt;name&gt;.db</code>、非法规则 fail-fast。与 <code>acl</code> 组合可按派生名放行读访问(写永远走基名，对派生名给 <code>--write</code> 也不会变可写)；本地模式(<code>--home</code>)同机制：无 <code>--layout</code> 时自动解析 <code>&lt;home&gt;/meta/views/&lt;view&gt;.layout</code>(显式 <code>--layout</code> 优先，不叠两层)。HA 下快照按物理基名命名推送；<code>meta/views/</code> 是控制面配置，备机需手工同步(同 <code>acl.db</code>)。</p>
 
-    <h3>15.7 存量数据零拷贝导入：<code>grove import</code>，目录原地不动</h3>
-    <p>服务端已有一批数据（如 <code>/data/legacy</code>）想让客户端按视图获取时，不必先灌一遍：<code>grove import</code> 把<b>已存在的本地目录树</b>登记进视图，字节原地不动——同文件系统下对象就是源文件的硬链接（零额外字节，两路径同一 inode、双向实时可见），跨设备自动退化为流式拷贝：</p>
-    <pre><code>$ grove --home /data/cluster import --view legacy --source /data/legacy --dry-run
+    <h3>15.7 存量数据零拷贝导入：<code>grovefs import</code>，目录原地不动</h3>
+    <p>服务端已有一批数据（如 <code>/data/legacy</code>）想让客户端按视图获取时，不必先灌一遍：<code>grovefs import</code> 把<b>已存在的本地目录树</b>登记进视图，字节原地不动——同文件系统下对象就是源文件的硬链接（零额外字节，两路径同一 inode、双向实时可见），跨设备自动退化为流式拷贝：</p>
+    <pre><code>$ grovefs --home /data/cluster import --view legacy --source /data/legacy --dry-run
 <span class="cmt">dry run: view 'legacy' under /legacy would mirror 3 dir(s) and 2 file(s) (symlinks/special files and names already in the view are skipped on the real run)</span>
-$ grove --home /data/cluster import --view legacy --source /data/legacy
+$ grovefs --home /data/cluster import --view legacy --source /data/legacy
 <span class="cmt">imported into view 'legacy' under /legacy: 3 dir(s), 2 object(s) (2 hardlinked zero-copy, 0 copied), 0 skipped, 0 failed</span>
 $ echo "new" &gt; /mnt/da/legacy/docs/quarter.txt   <span class="cmt"># 客户端挂载内写 → 源路径同 inode 同步可见</span>
 $ cat /data/legacy/docs/quarter.txt
@@ -1025,54 +1025,54 @@ new
 $ rm /mnt/da/legacy/photos/2026/y.jpg            <span class="cmt"># 视图里删名字 → 只摘 blocks/ 链接，源文件毫发无损</span></code></pre>
     <table>
       <tr><th>命令</th><th>参数释义</th><th>效果</th></tr>
-      <tr><td><code>grove import --view V --source DIR</code></td><td>V=目标视图(不存在则建)，DIR=已存在源目录</td><td>整棵树镜像进视图(默认前缀 <code>/&lt;DIR名&gt;</code>)：目录建节点、文件硬链接进 <code>blocks/</code> 并登记；mtime/atime/权限/属主保真</td></tr>
+      <tr><td><code>grovefs import --view V --source DIR</code></td><td>V=目标视图(不存在则建)，DIR=已存在源目录</td><td>整棵树镜像进视图(默认前缀 <code>/&lt;DIR名&gt;</code>)：目录建节点、文件硬链接进 <code>blocks/</code> 并登记；mtime/atime/权限/属主保真</td></tr>
       <tr><td><code>... --prefix P</code></td><td>P=视图内目标目录</td><td>镜像到指定前缀下，不存在自动建</td></tr>
       <tr><td><code>... --db-path D [--data-root R]</code></td><td>D=meta 根，R=存储根(默认 D)</td><td>meta-server 部署下在<b>存储机</b>执行，直写权威 <code>meta/V.db</code> 与 <code>R/blocks/</code>；已挂载客户端靠 TTL(≤2s)收敛</td></tr>
       <tr><td><code>... --dry-run</code></td><td>—</td><td>只报告将导入多少目录/文件，<b>连视图 db 都不创建</b></td></tr>
     </table>
-    <p class="lead">语义要点(<code>import</code> 套件 34 断言)：<b>重跑即增量</b>(已有名字跳过、新文件补登)；<b>GC 只摘链接</b>(源路径永不因视图操作被删)；导入条目与原生写入完全同权(读写/锁/快照/失效推送全适用)，能被 §15.6 派生视图 <code>map</code>/<code>link</code> 组成任意虚拟目录形状——该形状挂载<b>只读</b>(写走导入的原视图，经双播推送穿透到虚拟形状可见；套件第 6 节实证：<code>map /legacy/photos /album</code> 后客户端 <code>mount --view albumview</code> 直达导入字节、经虚拟目录写被 <code>EROFS</code> 拒)；<code>grove import</code> 也拒绝以派生名为目标(否则写出无人可读的影子 <code>&lt;view&gt;.db</code>)。回归：<code>run_all.sh</code> 的 <code>import</code> 套件。</p>
+    <p class="lead">语义要点(<code>import</code> 套件 34 断言)：<b>重跑即增量</b>(已有名字跳过、新文件补登)；<b>GC 只摘链接</b>(源路径永不因视图操作被删)；导入条目与原生写入完全同权(读写/锁/快照/失效推送全适用)，能被 §15.6 派生视图 <code>map</code>/<code>link</code> 组成任意虚拟目录形状——该形状挂载<b>只读</b>(写走导入的原视图，经双播推送穿透到虚拟形状可见；套件第 6 节实证：<code>map /legacy/photos /album</code> 后客户端 <code>mount --view albumview</code> 直达导入字节、经虚拟目录写被 <code>EROFS</code> 拒)；<code>grovefs import</code> 也拒绝以派生名为目标(否则写出无人可读的影子 <code>&lt;view&gt;.db</code>)。回归：<code>run_all.sh</code> 的 <code>import</code> 套件。</p>
 
-    <h3>15.8 纯别名：名字治理：<code>grove view alias</code></h3>
+    <h3>15.8 纯别名：名字治理：<code>grovefs view alias</code></h3>
     <p class="lead">§15.6 的派生视图治理“长什么样”；<b>纯别名</b>治理“叫什么”：名字就是别名，映射值才是真实名。定义同放 <code>&lt;db-path&gt;/meta/views/&lt;name&gt;.layout</code>，首行 <code>alias &lt;真实视图&gt;</code>、<b>不带任何规则行</b>。与派生视图恰成正反两面：<b>别名挂载全树可写</b>(它就是真实视图的原形)，而<b>真实名从此不是挂载入口</b>——本地(<code>--home</code>)与 <code>meta-server</code> 都拒挂被治理的真实名：公开名与存储身份解耦，对外名字可自由轮换，猜出真实名也挂不进来：</p>
     <table>
       <tr><th>命令</th><th>参数释义</th><th>效果</th></tr>
-      <tr><td><code>grove view --db-path D alias --name A --real R</code></td><td>A=公开名，R=物理视图名</td><td>写入/替换 <code>D/meta/views/A.layout</code>(内容仅 <code>alias R</code>)；挂 <code>A</code>=全树<b>可写</b>；<code>R</code> 从此<b>不可直挂</b>(本地与服务端均拒)</td></tr>
+      <tr><td><code>grovefs view --db-path D alias --name A --real R</code></td><td>A=公开名，R=物理视图名</td><td>写入/替换 <code>D/meta/views/A.layout</code>(内容仅 <code>alias R</code>)；挂 <code>A</code>=全树<b>可写</b>；<code>R</code> 从此<b>不可直挂</b>(本地与服务端均拒)</td></tr>
       <tr><td>挂载</td><td>无任何额外参数</td><td><code>mount --view A</code> 即得真实视图全树；远程在 <code>M_OPEN</code> 服务端解析，<b>ACL 按真实名判定</b>(解析在读门之前)，<code>acl allow --view R</code> 一条授权对别名与基名同时生效</td></tr>
-      <tr><td><code>grove view --db-path D rm --name A</code></td><td>—</td><td>删别名，真实名对<b>新</b>挂载恢复可挂(已建立连接不受影响)</td></tr>
-      <tr><td><code>grove view --db-path D alias --name A2 --real R --retire A</code></td><td>A2=新公开名，A=被泄露的旧别名</td><td><b>原子轮换</b>：先写 <code>A2</code> 再删 <code>A</code>，真实名 <code>R</code> 全程被治理、<b>无裸露窗口</b>；旧名 <code>A</code> 立即失效(挂它只落到一个按需新建的空视图，触不到真实树)；ACL 记在 <code>R</code> 上故授权不动，合法用户改用 <code>A2</code> 重挂即可</td></tr>
+      <tr><td><code>grovefs view --db-path D rm --name A</code></td><td>—</td><td>删别名，真实名对<b>新</b>挂载恢复可挂(已建立连接不受影响)</td></tr>
+      <tr><td><code>grovefs view --db-path D alias --name A2 --real R --retire A</code></td><td>A2=新公开名，A=被泄露的旧别名</td><td><b>原子轮换</b>：先写 <code>A2</code> 再删 <code>A</code>，真实名 <code>R</code> 全程被治理、<b>无裸露窗口</b>；旧名 <code>A</code> 立即失效(挂它只落到一个按需新建的空视图，触不到真实树)；ACL 记在 <code>R</code> 上故授权不动，合法用户改用 <code>A2</code> 重挂即可</td></tr>
     </table>
-    <pre><code>$ grove view --db-path $BASE alias --name teamwork --real team
+    <pre><code>$ grovefs view --db-path $BASE alias --name teamwork --real team
 defined pure alias 'teamwork' -&gt; real view 'team'
 note: 'team' is no longer a mount entry point while this definition exists (mounts by its real name are refused, locally and via meta-server); alias mounts show the FULL tree and are WRITABLE
-$ grove view --db-path $BASE list
+$ grovefs view --db-path $BASE list
 view 'docsonly' -&gt; base 'team': 0 hide, 1 only, 0 reloc rule(s) (read-only)
 alias 'teamwork' -&gt; real view 'team' (full tree, writable; 'team' not mountable by its own name)
-$ grove mount --view teamwork -m /mnt/work --meta 10.0.0.5:50241 --data 10.0.0.5:50240   <span class="cmt"># 全树、可写</span>
+$ grovefs mount --view teamwork -m /mnt/work --meta 10.0.0.5:50241 --data 10.0.0.5:50240   <span class="cmt"># 全树、可写</span>
 mounting view 'teamwork' at /mnt/work (fully remote: no local store)
 $ echo hello &gt; /mnt/work/docs/2026/new.md   <span class="cmt"># 别名写入即真实树，经派生名挂载穿透可见</span>
-$ grove mount --view team -m /mnt/t --meta 10.0.0.5:50241 --data 10.0.0.5:50240   <span class="cmt"># 直挂被治理的真实名：服务端拒挂</span>
+$ grovefs mount --view team -m /mnt/t --meta 10.0.0.5:50241 --data 10.0.0.5:50240   <span class="cmt"># 直挂被治理的真实名：服务端拒挂</span>
 Error: Custom { kind: PermissionDenied, error: "meta-server rejected the access token" }
-$ grove --home $BASE mount --view team -m /mnt/t   <span class="cmt"># 本地同契约</span>
-Error: "view 'team' is governed by an alias — mount the alias name instead (`grove view list` shows it)"
+$ grovefs --home $BASE mount --view team -m /mnt/t   <span class="cmt"># 本地同契约</span>
+Error: "view 'team' is governed by an alias — mount the alias name instead (`grovefs view list` shows it)"
 $ findmnt /mnt/work | tail -1   <span class="cmt"># 别名 rw；派生名的挂载行是 ro</span></code></pre>
     <p class="lead">公开名泄露后，<b>一条 <code>--retire</code> 命令原子轮换</b>(先写新名再删旧名，真实名全程不可直挂、无裸露窗口；ACL 记在真实名上，授权原样沿用)：</p>
-    <pre><code>$ grove view --db-path $BASE alias --name teamwork2 --real team --retire teamwork   <span class="cmt"># 'teamwork' 已泄露，换成 'teamwork2'</span>
+    <pre><code>$ grovefs view --db-path $BASE alias --name teamwork2 --real team --retire teamwork   <span class="cmt"># 'teamwork' 已泄露，换成 'teamwork2'</span>
 rotated public name for real view 'team': 'teamwork' -&gt; 'teamwork2' (gapless — 'team' stayed governed throughout, 'teamwork' no longer resolves)
 note: ACL grants are keyed to 'team', so they carried over untouched — legitimate users just remount under 'teamwork2'
-$ grove view --db-path $BASE list
+$ grovefs view --db-path $BASE list
 alias 'teamwork2' -&gt; real view 'team' (full tree, writable; 'team' not mountable by its own name)
-$ grove mount --view teamwork -m /mnt/leak --meta ... --data ...   <span class="cmt"># 拿旧泄露名再挂：空，不再解析到真实树</span>
+$ grovefs mount --view teamwork -m /mnt/leak --meta ... --data ...   <span class="cmt"># 拿旧泄露名再挂：空，不再解析到真实树</span>
 $ ls /mnt/leak   <span class="cmt"># (命名空间按需新建，数据不外泄)</span></code></pre>
-    <p class="lead">守卫(<code>alias</code> 命令处 fail-fast，<code>layout</code> 套件第 10/11 节 26 条断言)：拒 <code>name == real</code>、拒遮蔽物理 <code>&lt;name&gt;.db</code>、拒目标是派生视图(别名只映射物理视图)、拒<b>别名链</b>(<code>--real</code> 指向另一个别名)、一个真实视图同时只允许一个对外名(<code>--retire</code> 在同一条命令内先写后删、不受此约束卡住，且拒指向派生视图或不存在的别名，不会误删形状定义)；<code>define</code> 也拒遮蔽已有别名名。本地(<code>--home</code>)同契约：挂载先解析 <code>views/&lt;name&gt;.layout</code>，别名换名后照常挂载并打印 <code>alias view 'A' resolves to real view 'R' (full tree, writable)</code>；直挂被治理真实名回 <code>"view 'R' is governed by an alias"</code>；<code>grove import</code> 拒别名目标(别名不是存储身份，写出无人可读的影子 db)。实现事实：别名解析<b>单跳</b>、每 <code>M_OPEN</code> 重扫 <code>views/</code> 目录(挂载罕见事件，小目录全读比维护失效协议便宜)，已建立连接不受定义增删/轮换影响(同读门语义，轮换/<code>rm</code> 只作用于<b>新</b>挂载)；被轮换掉的旧名落到按需新建的空命名空间、触不到真实树，故泄露无害；<code>meta/views/</code> 是普通文件，HA 备机随 <code>acl.db</code> 手工同步。如实标注：远端拒挂真实名时客户端回显复用 "meta-server rejected the access token" 文案(<code>E_AUTH</code> 共用码，拒因字节未入协议，行为正确、提示不精确)，本地拒挂文案精确；<b>轮换是名字治理(泄露止损)而非安全边界</b>——公开名终究要分发，且轮换不能撤销一个已持有 token 者的既有访问，硬边界仍是 token+ACL。</p>
+    <p class="lead">守卫(<code>alias</code> 命令处 fail-fast，<code>layout</code> 套件第 10/11 节 26 条断言)：拒 <code>name == real</code>、拒遮蔽物理 <code>&lt;name&gt;.db</code>、拒目标是派生视图(别名只映射物理视图)、拒<b>别名链</b>(<code>--real</code> 指向另一个别名)、一个真实视图同时只允许一个对外名(<code>--retire</code> 在同一条命令内先写后删、不受此约束卡住，且拒指向派生视图或不存在的别名，不会误删形状定义)；<code>define</code> 也拒遮蔽已有别名名。本地(<code>--home</code>)同契约：挂载先解析 <code>views/&lt;name&gt;.layout</code>，别名换名后照常挂载并打印 <code>alias view 'A' resolves to real view 'R' (full tree, writable)</code>；直挂被治理真实名回 <code>"view 'R' is governed by an alias"</code>；<code>grovefs import</code> 拒别名目标(别名不是存储身份，写出无人可读的影子 db)。实现事实：别名解析<b>单跳</b>、每 <code>M_OPEN</code> 重扫 <code>views/</code> 目录(挂载罕见事件，小目录全读比维护失效协议便宜)，已建立连接不受定义增删/轮换影响(同读门语义，轮换/<code>rm</code> 只作用于<b>新</b>挂载)；被轮换掉的旧名落到按需新建的空命名空间、触不到真实树，故泄露无害；<code>meta/views/</code> 是普通文件，HA 备机随 <code>acl.db</code> 手工同步。如实标注：远端拒挂真实名时客户端回显复用 "meta-server rejected the access token" 文案(<code>E_AUTH</code> 共用码，拒因字节未入协议，行为正确、提示不精确)，本地拒挂文案精确；<b>轮换是名字治理(泄露止损)而非安全边界</b>——公开名终究要分发，且轮换不能撤销一个已持有 token 者的既有访问，硬边界仍是 token+ACL。</p>
 
-    <h3>15.9 智能体定制数据列表：MCP 接口：<code>grove mcp</code></h3>
-    <p class="lead">§15.6/§15.8 的视图治理同时是一套 <b>MCP(Model Context Protocol)工具</b>：<code>grove mcp</code> 在 stdio 上说换行分隔的 JSON-RPC 2.0(实现 2025-06-18 协议的常用方法面：生命周期 <code>initialize</code>/<code>ping</code>、工具 <code>tools/list</code>/<code>tools/call</code>、资源 <code>resources/list</code>/<code>resources/templates/list</code>/<code>resources/read</code>、提示 <code>prompts/list</code>/<code>prompts/get</code>、补全 <code>completion/complete</code>、日志 <code>logging/setLevel</code> 与服务端 <code>notifications/message</code>；客户端通知一律静默不作答)，任何 MCP 客户端(Claude Desktop、IDE 智能体等)把它当子进程拉起，智能体即可<b>通过接口自动定制数据列表的形状</b>——查视图、<b>探查某视图真实呈现的目录清单并按绝对显示路径写规则</b>(<code>list_view_tree</code> 经已发布透镜渲染、还能不落盘预览一副待发布规则的形状，<code>get_view</code> 读回单个定义原文)、用<b>内联规则文本</b>发布只读派生透镜、轮换公开名、删定义、<b>发布前把整副定义走完全部治理守卫做干跑校验</b>(<code>validate_definition</code>，不写盘)；规则以文本随行(<code>hide</code>/<code>only</code>/<code>map</code>/<code>link</code>，同 <code>--layout</code> 四动词)，智能体<b>不需要碰任何文件</b>。八个工具与 <code>grove view</code> 子命令共用<b>同一套库函数</b>(<code>grovefs::mcp</code>)：一个契约、两个入口，校验/拒绝文案/落盘动作逐字节相同，智能体做不出 CLI 做不出的事，也绕不过任何守卫。</p>
+    <h3>15.9 智能体定制数据列表：MCP 接口：<code>grovefs mcp</code></h3>
+    <p class="lead">§15.6/§15.8 的视图治理同时是一套 <b>MCP(Model Context Protocol)工具</b>：<code>grovefs mcp</code> 在 stdio 上说换行分隔的 JSON-RPC 2.0(实现 2025-06-18 协议的常用方法面：生命周期 <code>initialize</code>/<code>ping</code>、工具 <code>tools/list</code>/<code>tools/call</code>、资源 <code>resources/list</code>/<code>resources/templates/list</code>/<code>resources/read</code>、提示 <code>prompts/list</code>/<code>prompts/get</code>、补全 <code>completion/complete</code>、日志 <code>logging/setLevel</code> 与服务端 <code>notifications/message</code>；客户端通知一律静默不作答)，任何 MCP 客户端(Claude Desktop、IDE 智能体等)把它当子进程拉起，智能体即可<b>通过接口自动定制数据列表的形状</b>——查视图、<b>探查某视图真实呈现的目录清单并按绝对显示路径写规则</b>(<code>list_view_tree</code> 经已发布透镜渲染、还能不落盘预览一副待发布规则的形状，<code>get_view</code> 读回单个定义原文)、用<b>内联规则文本</b>发布只读派生透镜、轮换公开名、删定义、<b>发布前把整副定义走完全部治理守卫做干跑校验</b>(<code>validate_definition</code>，不写盘)；规则以文本随行(<code>hide</code>/<code>only</code>/<code>map</code>/<code>link</code>，同 <code>--layout</code> 四动词)，智能体<b>不需要碰任何文件</b>。八个工具与 <code>grovefs view</code> 子命令共用<b>同一套库函数</b>(<code>grovefs::mcp</code>)：一个契约、两个入口，校验/拒绝文案/落盘动作逐字节相同，智能体做不出 CLI 做不出的事，也绕不过任何守卫。</p>
     <table>
       <tr><th>工具</th><th>参数</th><th>效果(与 CLI 同校验同文案)</th></tr>
-      <tr><td><code>list_views</code></td><td>可选 <code>db_path</code></td><td>结构化 JSON：物理视图列表 + 已治理定义(name/kind/real_view/规则计数)，智能体可直接行动；等价 <code>grove view list</code></td></tr>
-      <tr><td><code>define_derived_view</code></td><td><code>name</code>/<code>base</code>/<code>rules</code>(内联文本)</td><td>写入 <code>&lt;db-path&gt;/meta/views/&lt;name&gt;.layout</code>，等价 <code>grove view define</code>；<code>mount --view name</code> 即得只读形状</td></tr>
-      <tr><td><code>alias_view</code></td><td><code>name</code>/<code>real</code>/可选 <code>retire</code></td><td>发布纯公开名 / <code>--retire</code> 无空轮换，等价 <code>grove view alias</code>(全树可写、真实名拒挂)</td></tr>
-      <tr><td><code>remove_view</code></td><td><code>name</code></td><td>删定义(不动数据)，等价 <code>grove view rm</code></td></tr>
+      <tr><td><code>list_views</code></td><td>可选 <code>db_path</code></td><td>结构化 JSON：物理视图列表 + 已治理定义(name/kind/real_view/规则计数)，智能体可直接行动；等价 <code>grovefs view list</code></td></tr>
+      <tr><td><code>define_derived_view</code></td><td><code>name</code>/<code>base</code>/<code>rules</code>(内联文本)</td><td>写入 <code>&lt;db-path&gt;/meta/views/&lt;name&gt;.layout</code>，等价 <code>grovefs view define</code>；<code>mount --view name</code> 即得只读形状</td></tr>
+      <tr><td><code>alias_view</code></td><td><code>name</code>/<code>real</code>/可选 <code>retire</code></td><td>发布纯公开名 / <code>--retire</code> 无空轮换，等价 <code>grovefs view alias</code>(全树可写、真实名拒挂)</td></tr>
+      <tr><td><code>remove_view</code></td><td><code>name</code></td><td>删定义(不动数据)，等价 <code>grovefs view rm</code></td></tr>
       <tr><td><code>preview_rules</code></td><td><code>rules</code>(内联文本)</td><td>干跑校验四动词规则、<b>不写盘</b>——非法动词在落地前被抓住</td></tr>
       <tr><td><code>validate_definition</code></td><td><code>name</code>/<code>base</code>/<code>rules</code></td><td><b>发布前干跑</b>：把整副定义走完 <code>define_derived_view</code> 的全部治理守卫(非法名、名与基同名、遮蔽物理 db、覆盖纯别名、规则语法)，拒绝时回与真实发布逐字节相同的文案、接受时回 JSON 判定(<code>accepted</code>/计数/<code>would_replace_existing_definition</code>/<code>base_view_db_present</code>)，<b>绝不写盘</b></td></tr>
       <tr><td><code>list_view_tree</code></td><td><code>view</code> 或 <code>base</code>+<code>rules</code>；可选 <code>path</code>/<code>depth</code>/<code>max</code>/<code>db_path</code></td><td><b>只读探查</b>：以只读方式打开本地 <code>&lt;db-path&gt;/meta/&lt;view&gt;.db</code>、经与挂载同一副 <code>LayoutMeta</code> 透镜渲染真实目录清单(不挂载、不读对象字节)，返回带绝对显示路径的 JSON；也可 <code>base</code>+<code>rules</code> 不落盘预览一副待发布形状；按 <code>path</code>/<code>depth</code>/<code>max</code> 收窄大树的遍历。远端/PG 后端的树不在此遍历</td></tr>
@@ -1080,8 +1080,8 @@ $ ls /mnt/leak   <span class="cmt"># (命名空间按需新建，数据不外泄
     </table>
     <p class="lead">同一治理再以 MCP 其余常用方法面二次暴露,复用<b>完全相同的渲染器</b>(<code>grovefs::mcp</code>),故资源/提示/补全与工具结果<b>逐字节一致</b>:<b>资源</b>(把视图作为可附着上下文,无需 <code>tools/call</code>)——<code>resources/list</code>/<code>resources/templates/list</code> 枚举、<code>resources/read</code> 读取 <code>grovefs://view/&lt;name&gt;/definition</code>(原样治理文本,等价 <code>get_view</code>)与 <code>grovefs://view/&lt;name&gt;/tree</code>(挂载实见的清单,等价 <code>list_view_tree</code>);<b>提示</b>(参数化治理剧本)——<code>prompts/list</code>/<code>prompts/get</code> 提供 <code>reshape-view</code>(base+goal)与 <code>rotate-alias</code>(real/new/old)两副 playbook;<b>补全</b>——<code>completion/complete</code> 对 <code>name</code>/<code>base</code>/<code>view</code>/<code>real</code> 参数用存储里的真实视图名做大小写不敏感前缀补全;<b>日志</b>——<code>logging/setLevel</code> 设会话阈值后,服务端在每次应答调用后按严重度(成功 <code>info</code>、失败 <code>warning</code>)推送 <code>notifications/message</code>。</p>
     <pre><code><span class="cmt"># 客户端配置一行(mcpServers)，重启客户端即生效——无需任何注册/发现步骤：</span>
-#   "grovefs": { "command": "grove", "args": ["mcp", "--db-path", "$BASE"] }
-$ grove mcp --db-path $BASE     <span class="cmt"># 客户端实际这样拉起：stdin 进帧、stdout 出帧</span>
+#   "grovefs": { "command": "grovefs", "args": ["mcp", "--db-path", "$BASE"] }
+$ grovefs mcp --db-path $BASE     <span class="cmt"># 客户端实际这样拉起：stdin 进帧、stdout 出帧</span>
 <span class="cmt"># 智能体侧 tools/call 的入参与回显(工具结果文本原样呈现)：</span>
 [list_views]  {} <span class="cmt"># 起始只有物理视图</span>
 {"db_path":"$BASE","defined":[],"physical":["team"]}
@@ -1091,29 +1091,29 @@ bad layout rules: line 1: unknown layout verb 'bog'
 defined derived view 'release' over base 'team': 1 hide, 0 only, 0 reloc rule(s)
 note: mounts of 'release' are read-only (virtual shape) — write to base view 'team'
 <span class="cmt"># 用户侧直接挂智能体定的名(无 --layout、无本地文件)：</span>
-$ grove --home $BASE mount --view release -m /mnt/rel &amp;
+$ grovefs --home $BASE mount --view release -m /mnt/rel &amp;
 derived view 'release' over base 'team': 1 hide, 0 only, 0 reloc rule(s)
 note: derived (virtual) views mount read-only — write to base view 'team'
 $ ls /mnt/rel
 docs  photos
 [define_derived_view] {"name":"team","base":"team",...}   <span class="cmt"># 名与基同名</span>
 isError → derived view name must differ from its base    <span class="cmt"># 与 CLI 逐字节同文案</span></code></pre>
-    <p class="lead">语义与边界：全部治理守卫照常适用(派生挂载只读、别名期间真实名拒挂、<code>--retire</code> 先写后删；改定义<b>热生效仍只在 <code>meta-server</code> 入口</b>，本地 <code>--home</code> 挂载在挂载时解析一次)。协议细节按 MCP 惯例：<b>治理失败回在结果内</b>(<code>isError: true</code> + CLI 原文，智能体可见、不崩)，只有协议层错误才走 JSON-RPC error；通知(无 id)一律不作答；非法帧回 <code>-32700</code> 后继续服务。<b>控制面 only</b>：不挂载、不读不写数据。默认信任能启动此进程的调用方(= 已持有存储根的操作系统级权限)，跨网鉴权仍由服务端 token/ACL 负责；当它被 front 给多个不同调用方时，可用 <code>grove mcp --require-api-key</code> <b>可选地</b>为接口上 API key 门(见下)。<code>db_path</code> 默认取 <code>grove mcp --db-path</code>(回退 <code>--home</code>)，也可逐调用覆盖。探查工具 <code>list_view_tree</code>/<code>get_view</code> 是<b>纯元数据只读</b>：只读打开本地 <code>&lt;db-path&gt;/meta/&lt;view&gt;.db</code>、经与挂载同一副 <code>LayoutMeta</code> 透镜渲染(不挂载、不读对象字节；远端/PG 后端的树不在此遍历)；<code>validate_definition</code> 是<b>发布前干跑</b>，走完 define 的全部治理守卫但不写盘。回归：<code>run_all.sh</code> 的 <code>mcp</code> 套件(42 条断言：握手能力面声明/发现/内联规则换形/路径探查与形状预览/发布前干跑校验/别名无空轮换/与 CLI 逐字节同文案/资源枚举与读取/提示实例化/视图名补全/日志阈值→通知/通知不作答与非法帧恢复)。</p>
+    <p class="lead">语义与边界：全部治理守卫照常适用(派生挂载只读、别名期间真实名拒挂、<code>--retire</code> 先写后删；改定义<b>热生效仍只在 <code>meta-server</code> 入口</b>，本地 <code>--home</code> 挂载在挂载时解析一次)。协议细节按 MCP 惯例：<b>治理失败回在结果内</b>(<code>isError: true</code> + CLI 原文，智能体可见、不崩)，只有协议层错误才走 JSON-RPC error；通知(无 id)一律不作答；非法帧回 <code>-32700</code> 后继续服务。<b>控制面 only</b>：不挂载、不读不写数据。默认信任能启动此进程的调用方(= 已持有存储根的操作系统级权限)，跨网鉴权仍由服务端 token/ACL 负责；当它被 front 给多个不同调用方时，可用 <code>grovefs mcp --require-api-key</code> <b>可选地</b>为接口上 API key 门(见下)。<code>db_path</code> 默认取 <code>grovefs mcp --db-path</code>(回退 <code>--home</code>)，也可逐调用覆盖。探查工具 <code>list_view_tree</code>/<code>get_view</code> 是<b>纯元数据只读</b>：只读打开本地 <code>&lt;db-path&gt;/meta/&lt;view&gt;.db</code>、经与挂载同一副 <code>LayoutMeta</code> 透镜渲染(不挂载、不读对象字节；远端/PG 后端的树不在此遍历)；<code>validate_definition</code> 是<b>发布前干跑</b>，走完 define 的全部治理守卫但不写盘。回归：<code>run_all.sh</code> 的 <code>mcp</code> 套件(42 条断言：握手能力面声明/发现/内联规则换形/路径探查与形状预览/发布前干跑校验/别名无空轮换/与 CLI 逐字节同文案/资源枚举与读取/提示实例化/视图名补全/日志阈值→通知/通知不作答与非法帧恢复)。</p>
 
-    <h3>15.9.1 给 MCP 接口上把锁：API key 认证与调用审计(<code>grove apikey</code>)</h3>
-    <p class="lead">智能体运行时常把一个 <code>grove mcp</code> 服务 front 给<b>多个不同调用方</b>，此时需要可撤销的凭据与归属审计。<code>grove apikey</code> 铸造 API key(<b>只存 SHA-256 摘要</b>，明文仅在 <code>create</code> 时打印一次，故 <code>api_keys.db</code> 泄露也换不出可用凭据)；<code>grove mcp --require-api-key</code> 据此对所有<b>读写治理状态的方法</b>设门——<code>tools/list</code>、<code>tools/call</code>、<code>resources/list</code>、<code>resources/templates/list</code>、<code>resources/read</code>、<code>completion/complete</code>(<code>initialize</code> / <code>ping</code> / <code>prompts/*</code> / <code>logging/*</code> 始终开放，好让客户端完成握手并出示 key)；每一次 <code>tools/call</code> 与 <code>resources/read</code>(二者读取或改变 per-view 状态)都追加进 <code>&lt;db-path&gt;/meta/api_keys.db</code> 的审计表(时间、key、工具、成败、详情)，<code>grove apikey calls</code> 回读。撤销只把行标记为 revoked(历史调用仍保留归属)，撤销后的 key 立即鉴不上。存储镜像 <code>acl.db</code>：一处本地 SQLite，控制面状态。四个子命令：<code>create --label L</code> / <code>list</code> / <code>revoke --id ID</code>(支持精确 id 或唯一前缀) / <code>calls --limit N</code>(默认 20，倒序)。无法自定义握手的客户端，可由运维方导出 <code>GROVEFS_MCP_API_KEY='&lt;id&gt;:&lt;secret&gt;'</code> <b>预鉴权整个服务进程</b>。诚实边界：这把 key 认证的是<b>治理接口的调用方</b>，不改变治理语义本身、也不碰挂载/数据鉴权(那仍是服务端 token/ACL)；不开 <code>--require-api-key</code> 时服务行为与不设门完全一致(只是照样落审计)。回归：<code>apikey</code> 套件(21 条断言：铸造/列表/哈希不落盘/无 key 拒·错 secret 拒·对 key 放行/调用归属/撤销即失效且行保留/短 id 前缀撤销/env 预鉴权/默认不设门回归)。</p>
-    <pre><code>$ grove apikey --db-path $BASE create --label claude-desktop   <span class="cmt"># 铸造，明文只打印一次</span>
+    <h3>15.9.1 给 MCP 接口上把锁：API key 认证与调用审计(<code>grovefs apikey</code>)</h3>
+    <p class="lead">智能体运行时常把一个 <code>grovefs mcp</code> 服务 front 给<b>多个不同调用方</b>，此时需要可撤销的凭据与归属审计。<code>grovefs apikey</code> 铸造 API key(<b>只存 SHA-256 摘要</b>，明文仅在 <code>create</code> 时打印一次，故 <code>api_keys.db</code> 泄露也换不出可用凭据)；<code>grovefs mcp --require-api-key</code> 据此对所有<b>读写治理状态的方法</b>设门——<code>tools/list</code>、<code>tools/call</code>、<code>resources/list</code>、<code>resources/templates/list</code>、<code>resources/read</code>、<code>completion/complete</code>(<code>initialize</code> / <code>ping</code> / <code>prompts/*</code> / <code>logging/*</code> 始终开放，好让客户端完成握手并出示 key)；每一次 <code>tools/call</code> 与 <code>resources/read</code>(二者读取或改变 per-view 状态)都追加进 <code>&lt;db-path&gt;/meta/api_keys.db</code> 的审计表(时间、key、工具、成败、详情)，<code>grovefs apikey calls</code> 回读。撤销只把行标记为 revoked(历史调用仍保留归属)，撤销后的 key 立即鉴不上。存储镜像 <code>acl.db</code>：一处本地 SQLite，控制面状态。四个子命令：<code>create --label L</code> / <code>list</code> / <code>revoke --id ID</code>(支持精确 id 或唯一前缀) / <code>calls --limit N</code>(默认 20，倒序)。无法自定义握手的客户端，可由运维方导出 <code>GROVEFS_MCP_API_KEY='&lt;id&gt;:&lt;secret&gt;'</code> <b>预鉴权整个服务进程</b>。诚实边界：这把 key 认证的是<b>治理接口的调用方</b>，不改变治理语义本身、也不碰挂载/数据鉴权(那仍是服务端 token/ACL)；不开 <code>--require-api-key</code> 时服务行为与不设门完全一致(只是照样落审计)。回归：<code>apikey</code> 套件(21 条断言：铸造/列表/哈希不落盘/无 key 拒·错 secret 拒·对 key 放行/调用归属/撤销即失效且行保留/短 id 前缀撤销/env 预鉴权/默认不设门回归)。</p>
+    <pre><code>$ grovefs apikey --db-path $BASE create --label claude-desktop   <span class="cmt"># 铸造，明文只打印一次</span>
 apikey created — shown ONCE (only its SHA-256 is stored; save it now):
   id:    2f5f11aa673c43d1bf6e86111de0b45f
   label: claude-desktop
   key:   2f5f11aa673c43d1bf6e86111de0b45f:62080e84e9b1...(64 hex secret)
-$ grove mcp --db-path $BASE --require-api-key     <span class="cmt"># 客户端 initialize 不带 apiKey</span>
+$ grovefs mcp --db-path $BASE --require-api-key     <span class="cmt"># 客户端 initialize 不带 apiKey</span>
 {"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"grovefs"},...}}   <span class="cmt"># initialize 照常应答(门只卡读写治理状态的方法)</span>
 {"jsonrpc":"2.0","id":2,"error":{"code":-32001,"message":"authentication required: present a valid apiKey in the initialize params (or export GROVEFS_MCP_API_KEY for the server)"}}
 <span class="cmt"># initialize 携带 "apiKey":"&lt;id&gt;:&lt;secret&gt;" → 该会话鉴权通过，工具面放行：</span>
 [tools/call define_derived_view {"name":"release","base":"team","rules":"hide /photos/private"}]
 defined derived view 'release' over base 'team': 1 hide, 0 only, 0 reloc rule(s)
-$ grove apikey --db-path $BASE calls --limit 5    <span class="cmt"># 每个调用都留痕，且归属到具体 key</span>
+$ grovefs apikey --db-path $BASE calls --limit 5    <span class="cmt"># 每个调用都留痕，且归属到具体 key</span>
 ts                        key_id                             method       tool                   ok   detail
 2026-10-26T13:47:21.111877594+00:00 2f5f11aa673c43d1bf6e86111de0b45f   tools/call   define_derived_view    yes  name=release base=team rules=1L
 2026-10-26T13:47:21.110948784+00:00 2f5f11aa673c43d1bf6e86111de0b45f   initialize   -                      yes  authenticated
@@ -1124,24 +1124,24 @@ ts                        key_id                             method       tool  
     <h2 class="title"><span class="num">16</span>命令速查</h2>
     <table>
       <tr><th>目的</th><th>命令</th></tr>
-      <tr><td>建视图</td><td><code>grove --home H init --view U [--manifest M]</code></td></tr>
-      <tr><td>本地挂载</td><td><code>grove --home H mount --view U -m MP [--ro] [--strict] [--threads N] [--as-uid N] [--layout F] [--no-readdirplus] [--stats [--stats-file F] [--stats-interval S]]</code></td></tr>
-      <tr><td>远程挂载</td><td><code>grove --home H mount --view U -m MP --data A[,A2] --meta M[,M_bak] [--token T] [--as-uid N] [--layout F] [--stats [--stats-file F] [--stats-interval S]]</code></td></tr>
+      <tr><td>建视图</td><td><code>grovefs --home H init --view U [--manifest M]</code></td></tr>
+      <tr><td>本地挂载</td><td><code>grovefs --home H mount --view U -m MP [--ro] [--strict] [--threads N] [--as-uid N] [--layout F] [--no-readdirplus] [--stats [--stats-file F] [--stats-interval S]] [--foreground|--log-file F]</code>(默认转后台,挂载点就绪即返回)</td></tr>
+      <tr><td>远程挂载</td><td><code>grovefs --home H mount --view U -m MP --data A[,A2] --meta M[,M_bak] [--token T] [--as-uid N] [--layout F] [--stats [--stats-file F] [--stats-interval S]] [--foreground|--log-file F]</code>(不需要 <code>--home</code>;默认转后台)</td></tr>
       <tr><td>显示规则文件</td><td>每行 <code>hide &lt;src&gt;</code> / <code>only &lt;src&gt;</code> / <code>map &lt;src&gt; &lt;dst&gt;</code> / <code>link &lt;src&gt; &lt;dst&gt;</code>(<code>#</code> 注释，绝对路径，见 §15.5)</td></tr>
-      <tr><td>定义派生视图</td><td><code>grove view --db-path D define --name V --base B --rules F</code>(存于 <code>D/meta/views/V.layout</code>，<code>mount --view V</code> 即得形状，虚拟视图挂载只读、写走基名 <code>B</code>，见 §15.6)</td></tr>
-      <tr><td>定义纯别名</td><td><code>grove view --db-path D alias --name A --real R</code>(公开名 1:1 映射真实视图：<code>A</code> 全树可写，<code>R</code> 不可直挂，见 §15.8)</td></tr>
-      <tr><td>泄露后轮换公开名</td><td><code>grove view --db-path D alias --name A2 --real R --retire A</code>(先写后删零窗口：<code>A</code> 失效、<code>R</code> 全程不可直挂、ACL 授权不动，见 §15.8)</td></tr>
-      <tr><td>列出/删除视图定义</td><td><code>grove view --db-path D list</code> / <code>grove view --db-path D rm --name V</code>(派生/别名同目录同命令，只删定义，不动数据)</td></tr>
-      <tr><td>智能体接口(MCP)</td><td><code>grove mcp --db-path D [--require-api-key]</code>(stdio JSON-RPC：由 MCP 客户端作为子进程拉起，提供治理六工具 <code>list_views</code>/<code>define_derived_view</code>/<code>alias_view</code>/<code>remove_view</code>/<code>preview_rules</code>/<code>validate_definition</code> + 只读探查两工具 <code>list_view_tree</code>/<code>get_view</code>，规则内联文本；与 <code>grove view</code> 同校验同文案，控制面 only；同一治理另经 <code>resources/*</code>/<code>prompts/*</code>/<code>completion/complete</code>/<code>logging/setLevel</code> 常用方法面暴露；<code>--require-api-key</code> 可选地为<b>读写治理状态的方法</b>上 API key 门并记录调用审计，见 §15.9/§15.9.1)</td></tr>
-      <tr><td>MCP API key 管理</td><td><code>grove apikey --db-path D create --label L</code> / <code>list</code> / <code>revoke --id ID</code>(支持唯一前缀) / <code>calls --limit N</code>(默认 20)：铸造/列表/撤销/回读调用审计，只存 SHA-256 摘要，见 §15.9.1</td></tr>
-      <tr><td>导入存量目录</td><td><code>grove import --view V --source DIR [--prefix P] [--data-root R] [--dry-run]</code>(同盘硬链接零拷贝，重跑增量；在存储机执行，见 §15.7)</td></tr>
-      <tr><td>卸载</td><td><code>grove umount -m MP</code></td></tr>
-      <tr><td>数据服务</td><td><code>grove data-server --listen IP:PORT --root DIR [--token T]</code></td></tr>
-      <tr><td>元数据服务(默认 SQLite)</td><td><code>grove meta-server --db-path D --listen IP:PORT [--token T] [--role primary|standby --peer ADDR [--sync-repl] [--witness ADDR[,ADDR...]]]</code></td></tr>
-      <tr><td>元数据服务(PostgreSQL 后端)</td><td><code>grove meta-server --db-path D --listen IP:PORT --store postgres://user:pw@host:5432/dbname</code>(与 <code>--role standby / --peer / --witness</code> 互斥)</td></tr>
-      <tr><td>视图白名单授权</td><td><code>grove acl --db-path D [--store postgres://…] allow --view V --uid N [--read] [--write]</code>(PG 模式须带与 meta-server 同款 <code>--store</code> URI，读写同一张 <code>grovefs_acl.view_acl</code>)</td></tr>
-      <tr><td>视图白名单撤销</td><td><code>grove acl --db-path D revoke --view V --uid N</code></td></tr>
-      <tr><td>视图白名单查询</td><td><code>grove acl --db-path D list --view V</code></td></tr>
+      <tr><td>定义派生视图</td><td><code>grovefs view --db-path D define --name V --base B --rules F</code>(存于 <code>D/meta/views/V.layout</code>，<code>mount --view V</code> 即得形状，虚拟视图挂载只读、写走基名 <code>B</code>，见 §15.6)</td></tr>
+      <tr><td>定义纯别名</td><td><code>grovefs view --db-path D alias --name A --real R</code>(公开名 1:1 映射真实视图：<code>A</code> 全树可写，<code>R</code> 不可直挂，见 §15.8)</td></tr>
+      <tr><td>泄露后轮换公开名</td><td><code>grovefs view --db-path D alias --name A2 --real R --retire A</code>(先写后删零窗口：<code>A</code> 失效、<code>R</code> 全程不可直挂、ACL 授权不动，见 §15.8)</td></tr>
+      <tr><td>列出/删除视图定义</td><td><code>grovefs view --db-path D list</code> / <code>grovefs view --db-path D rm --name V</code>(派生/别名同目录同命令，只删定义，不动数据)</td></tr>
+      <tr><td>智能体接口(MCP)</td><td><code>grovefs mcp --db-path D [--require-api-key]</code>(stdio JSON-RPC：由 MCP 客户端作为子进程拉起，提供治理六工具 <code>list_views</code>/<code>define_derived_view</code>/<code>alias_view</code>/<code>remove_view</code>/<code>preview_rules</code>/<code>validate_definition</code> + 只读探查两工具 <code>list_view_tree</code>/<code>get_view</code>，规则内联文本；与 <code>grovefs view</code> 同校验同文案，控制面 only；同一治理另经 <code>resources/*</code>/<code>prompts/*</code>/<code>completion/complete</code>/<code>logging/setLevel</code> 常用方法面暴露；<code>--require-api-key</code> 可选地为<b>读写治理状态的方法</b>上 API key 门并记录调用审计，见 §15.9/§15.9.1)</td></tr>
+      <tr><td>MCP API key 管理</td><td><code>grovefs apikey --db-path D create --label L</code> / <code>list</code> / <code>revoke --id ID</code>(支持唯一前缀) / <code>calls --limit N</code>(默认 20)：铸造/列表/撤销/回读调用审计，只存 SHA-256 摘要，见 §15.9.1</td></tr>
+      <tr><td>导入存量目录</td><td><code>grovefs import --view V --source DIR [--prefix P] [--data-root R] [--dry-run]</code>(同盘硬链接零拷贝，重跑增量；在存储机执行，见 §15.7)</td></tr>
+      <tr><td>卸载</td><td><code>grovefs umount -m MP</code></td></tr>
+      <tr><td>数据服务</td><td><code>grovefs data-server --listen IP:PORT --root DIR [--token T]</code></td></tr>
+      <tr><td>元数据服务(默认 SQLite)</td><td><code>grovefs meta-server --db-path D --listen IP:PORT [--token T] [--role primary|standby --peer ADDR [--sync-repl] [--witness ADDR[,ADDR...]]]</code></td></tr>
+      <tr><td>元数据服务(PostgreSQL 后端)</td><td><code>grovefs meta-server --db-path D --listen IP:PORT --store postgres://user:pw@host:5432/dbname</code>(与 <code>--role standby / --peer / --witness</code> 互斥)</td></tr>
+      <tr><td>视图白名单授权</td><td><code>grovefs acl --db-path D [--store postgres://…] allow --view V --uid N [--read] [--write]</code>(PG 模式须带与 meta-server 同款 <code>--store</code> URI，读写同一张 <code>grovefs_acl.view_acl</code>)</td></tr>
+      <tr><td>视图白名单撤销</td><td><code>grovefs acl --db-path D revoke --view V --uid N</code></td></tr>
+      <tr><td>视图白名单查询</td><td><code>grovefs acl --db-path D list --view V</code></td></tr>
     </table>
   </section>
 
@@ -1156,18 +1156,18 @@ ts                        key_id                             method       tool  
       <li><b>验证环境</b>:全部在 127.0.0.1 回环(模拟 LAN)验证,尚未做真实多机与 fio 级基准。</li>
       <li><b>视图白名单 uid</b>:客户端上报 uid 属 <b>advisory</b>(TCP 客户端可伪造或 <code>--as-uid</code> 覆盖),真正的集群准入仍由 <code>--token</code> 把关;白名单适合已通过 token 的集群内部分工,不适合防内鬼或多租户外部隔离。只读授权连 <code>flock</code>/共享锁也会被拒(锁 op 归写意图);读门仅挂载时校验,撤读对已建立连接到重挂才生效(写门才是逐 op 即时)。</li>
       <li><b>显示透镜 <code>--layout</code></b>:是<b>显示层定制而非安全边界</b>——绕过透镜直接挂同一 view 仍见全树,硬隔离用独立 view + ACL/token;向纯合成目录创建/重命名进入返回 EPERM、撞透镜已显示名返回 EEXIST、<code>only</code> 模式白名单外不可写;symlink 目标文本不改写;共享 meta-server 下合成目录条目失效推送可能不命中透镜坐标(建议 <code>--strict</code>);规则限同一 view 内部重排,不支持跨 view 引用。</li>
-      <li><b>服务端派生视图 <code>grove view</code></b>：<b>一律只读挂载(硬契约)</b>——形状集中治理、只分发不修改，写只属于基名视图；三层强制(<code>M_OPEN</code> 协商内核 RO→客户端 <code>EROFS</code>；服务端派生名逐 op 权威门禁回 <code>E_NOTPERM</code>；本地 <code>--home</code> 挂载时同判)。若需<b>可写</b>的自定义形状，用客户端自备的 <code>mount --layout</code> 透镜(§15.5，直写真实条目)。其余：同样<b>不是安全边界</b>——直挂基名仍见全树(拦住他的是 ACL/token,不是形状);<code>define</code> 替换<b>热生效</b>(服务端逐 op 检查定义 mtime,已挂载连接 ≤2s TTL 内自动换形、免重挂,换形后只读契约不变),<code>view rm</code> 不热作用(已挂载者保持旧形状到重挂);换形时旧虚拟 ino 上的合成路径/fd 可能落回 ENOENT,真实条目 inode 稳定不受影响;不嵌套(base 须是物理视图)、不得与基同名、不得遮蔽物理 db;<code>meta/views/</code> 是控制面配置,HA 备机需手工同步(同 <code>acl.db</code>);热重载仅限 meta-server,本地(<code>--home</code>)挂载仍在挂载时解析一次。</li>
-      <li><b>服务端纯别名 <code>grove view alias</code></b>：与派生视图的正反面——别名挂载全树<b>可写</b>、真实名被治理后<b>不可直挂</b>(本地与服务端均拒)；单跳解析、每 <code>M_OPEN</code> 重扫 <code>views/</code>(挂载是罕见事件)；拒别名链/派生目标/一真实名多别名；<code>import</code> 拒别名目标；删别名仅影响<b>新</b>挂载(已建立连接不受影响，同 <code>view rm</code> 语义)；远端拒挂真实名时客户端回显复用 token 拒因文案(<code>E_AUTH</code> 共用码，行为正确、提示不精确)，本地拒挂文案精确；改名不是安全机制(公开名终究要分发)，真实名隐藏属名字治理，硬边界仍是 token+ACL。</li>
-      <li><b>智能体接口 <code>grove mcp</code></b>：把视图治理以 MCP 工具暴露给智能体，与 <code>grove view</code> 共用同一套库函数(<b>一个契约、两个入口</b>，校验/拒绝文案/落盘动作逐字节相同)，智能体做不出 CLI 做不出的事、也绕不过任何守卫。<b>控制面 only</b>：不挂载、不读不写数据；默认信任能启动此进程的调用方(跨网准入仍由服务端 token/ACL 负责)，但 <code>--require-api-key</code> <b>可选地</b>为接口上 API key 门(<code>grove apikey</code> 铸造/列表/撤销、只存 SHA-256、调用日志归属，见 §15.9.1)。热生效仅限 <code>meta-server</code> 入口(本地 <code>--home</code> 挂载解析一次)。已覆盖 2025-06-18 协议的常用方法面(手写 JSON-RPC，未引框架 crate)：生命周期 <code>initialize</code>/<code>ping</code>、工具 <code>tools/list</code>/<code>tools/call</code>、资源 <code>resources/list</code>/<code>resources/templates/list</code>/<code>resources/read</code>、提示 <code>prompts/list</code>/<code>prompts/get</code>、补全 <code>completion/complete</code>、日志 <code>logging/setLevel</code> 与服务端 <code>notifications/message</code>；客户端通知一律静默不作答。这些读面均复用与工具同一套治理渲染器(<code>grovefs::mcp</code>)，故资源/提示/补全结果与工具结果逐字节一致，不引入独立逻辑；尚未做的是资源订阅(<code>subscribe</code>)与各面的 <code>listChanged</code> 推送(当前均声明为 <code>false</code>)。</li>
-      <li><b>零拷贝导入 <code>grove import</code></b>:硬链接要求源与 <code>blocks/</code> 同文件系统(跨盘自动退化为独立拷贝并如实计数);外部工具以 <b>rename/替换写</b>更新源文件(vim 默认行为)时,视图侧保持旧 inode 的最后内容,需对新内容重跑 import(已有名字跳过,可换 <code>--prefix</code> 强制重登记);symlink/特殊文件有意跳过;导入对象为单文件,不走 ≥16MiB 跨 server 条带;meta-server 部署下 import 直写权威 db 文件,需在存储机执行、已挂载靠 TTL(≤2s)收敛而非即时推送;PG 后端不支持(权威树在 Postgres,走挂载点 rsync 灌入);<code>--source</code> 建议与存储根同盘并保留——删源仅失去「源路径」别名(数据在 <code>blocks/</code> 链接里不丢),但外部改名/迁移后视图与字节实体的关联只剩 <code>blocks/</code> 一条路径。</li>
-      <li><b>PostgreSQL 后端与 HA 互斥</b>:<code>--store postgres://…</code> 下自研 HA(<code>--role standby / --peer / --witness</code>)在启动时 fail-fast;<code>backup_to_bytes</code> 返回错误——高可用请交给 PG 自带的<b>流复制 / logical replication / PITR</b>,不在 GroveFS 里重一个共识。ACL 白名单在 PG 模式下随元数据面迁入同一实例的共享表 <code>grovefs_acl.view_acl</code>（<code>grove acl</code> 须带同款 <code>--store</code> URI）。</li>
+      <li><b>服务端派生视图 <code>grovefs view</code></b>：<b>一律只读挂载(硬契约)</b>——形状集中治理、只分发不修改，写只属于基名视图；三层强制(<code>M_OPEN</code> 协商内核 RO→客户端 <code>EROFS</code>；服务端派生名逐 op 权威门禁回 <code>E_NOTPERM</code>；本地 <code>--home</code> 挂载时同判)。若需<b>可写</b>的自定义形状，用客户端自备的 <code>mount --layout</code> 透镜(§15.5，直写真实条目)。其余：同样<b>不是安全边界</b>——直挂基名仍见全树(拦住他的是 ACL/token,不是形状);<code>define</code> 替换<b>热生效</b>(服务端逐 op 检查定义 mtime,已挂载连接 ≤2s TTL 内自动换形、免重挂,换形后只读契约不变),<code>view rm</code> 不热作用(已挂载者保持旧形状到重挂);换形时旧虚拟 ino 上的合成路径/fd 可能落回 ENOENT,真实条目 inode 稳定不受影响;不嵌套(base 须是物理视图)、不得与基同名、不得遮蔽物理 db;<code>meta/views/</code> 是控制面配置,HA 备机需手工同步(同 <code>acl.db</code>);热重载仅限 meta-server,本地(<code>--home</code>)挂载仍在挂载时解析一次。</li>
+      <li><b>服务端纯别名 <code>grovefs view alias</code></b>：与派生视图的正反面——别名挂载全树<b>可写</b>、真实名被治理后<b>不可直挂</b>(本地与服务端均拒)；单跳解析、每 <code>M_OPEN</code> 重扫 <code>views/</code>(挂载是罕见事件)；拒别名链/派生目标/一真实名多别名；<code>import</code> 拒别名目标；删别名仅影响<b>新</b>挂载(已建立连接不受影响，同 <code>view rm</code> 语义)；远端拒挂真实名时客户端回显复用 token 拒因文案(<code>E_AUTH</code> 共用码，行为正确、提示不精确)，本地拒挂文案精确；改名不是安全机制(公开名终究要分发)，真实名隐藏属名字治理，硬边界仍是 token+ACL。</li>
+      <li><b>智能体接口 <code>grovefs mcp</code></b>：把视图治理以 MCP 工具暴露给智能体，与 <code>grovefs view</code> 共用同一套库函数(<b>一个契约、两个入口</b>，校验/拒绝文案/落盘动作逐字节相同)，智能体做不出 CLI 做不出的事、也绕不过任何守卫。<b>控制面 only</b>：不挂载、不读不写数据；默认信任能启动此进程的调用方(跨网准入仍由服务端 token/ACL 负责)，但 <code>--require-api-key</code> <b>可选地</b>为接口上 API key 门(<code>grovefs apikey</code> 铸造/列表/撤销、只存 SHA-256、调用日志归属，见 §15.9.1)。热生效仅限 <code>meta-server</code> 入口(本地 <code>--home</code> 挂载解析一次)。已覆盖 2025-06-18 协议的常用方法面(手写 JSON-RPC，未引框架 crate)：生命周期 <code>initialize</code>/<code>ping</code>、工具 <code>tools/list</code>/<code>tools/call</code>、资源 <code>resources/list</code>/<code>resources/templates/list</code>/<code>resources/read</code>、提示 <code>prompts/list</code>/<code>prompts/get</code>、补全 <code>completion/complete</code>、日志 <code>logging/setLevel</code> 与服务端 <code>notifications/message</code>；客户端通知一律静默不作答。这些读面均复用与工具同一套治理渲染器(<code>grovefs::mcp</code>)，故资源/提示/补全结果与工具结果逐字节一致，不引入独立逻辑；尚未做的是资源订阅(<code>subscribe</code>)与各面的 <code>listChanged</code> 推送(当前均声明为 <code>false</code>)。</li>
+      <li><b>零拷贝导入 <code>grovefs import</code></b>:硬链接要求源与 <code>blocks/</code> 同文件系统(跨盘自动退化为独立拷贝并如实计数);外部工具以 <b>rename/替换写</b>更新源文件(vim 默认行为)时,视图侧保持旧 inode 的最后内容,需对新内容重跑 import(已有名字跳过,可换 <code>--prefix</code> 强制重登记);symlink/特殊文件有意跳过;导入对象为单文件,不走 ≥16MiB 跨 server 条带;meta-server 部署下 import 直写权威 db 文件,需在存储机执行、已挂载靠 TTL(≤2s)收敛而非即时推送;PG 后端不支持(权威树在 Postgres,走挂载点 rsync 灌入);<code>--source</code> 建议与存储根同盘并保留——删源仅失去「源路径」别名(数据在 <code>blocks/</code> 链接里不丢),但外部改名/迁移后视图与字节实体的关联只剩 <code>blocks/</code> 一条路径。</li>
+      <li><b>PostgreSQL 后端与 HA 互斥</b>:<code>--store postgres://…</code> 下自研 HA(<code>--role standby / --peer / --witness</code>)在启动时 fail-fast;<code>backup_to_bytes</code> 返回错误——高可用请交给 PG 自带的<b>流复制 / logical replication / PITR</b>,不在 GroveFS 里重一个共识。ACL 白名单在 PG 模式下随元数据面迁入同一实例的共享表 <code>grovefs_acl.view_acl</code>（<code>grovefs acl</code> 须带同款 <code>--store</code> URI）。</li>
       <li><b>元数据读并行 / 目录分页的作用范围</b>:只读连接池与 <code>LIMIT/OFFSET</code> 分页现在长在<b>两个存储引擎</b>(SQLite <code>MetaEngine</code> 与 PG <code>PgEngine</code>)里,各自 4 连接只读池。本地 <code>--home</code>(SQLite 或 PG)吃满分页与 PLUS;<code>meta-server</code> 的并发处理器吃各自后端的池,且新增的 <code>M_READDIRP</code> 帧带 <code>offset/limit</code> 把分页下推到服务端,远端客户端每缓冲只取一页并协商 <code>FUSE_READDIRPLUS</code>(同一 5001 条目录远端实测由改造前 ~54s → 2.29s,只关 PLUS 保留分页 4.22s)。仍走 trait 默认实现(每缓冲一次全量列表、不协商 PLUS)的只有 <code>LayoutMeta</code> 派生/透镜(隐藏/映射形状无法表示为单条 SQL 页)与对接<b>不含该能力位的老 <code>meta-server</code></b> 的挂载(<code>M_OPEN</code> ack 无第二字节则回退)。元数据<b>写</b>并行已覆盖 PG 后端(单集群内 SERIALIZABLE 写池,见 §6.2);<b>跨节点多权威/分片</b>的写扩展仍未做。判据 <code>MetaProvider::supports_paged_readdir()</code> 由单测 <code>store_level_paging_is_advertised_only_by_providers_that_page_in_sql</code> 钉住。</li>
     </ul>
     <div class="ok">凡未实测数字处,文档不做收益声称;凡有限制处,均在代码注释与本节明示。</div>
   </section>
 
   <footer>
-    GroveFS · 用户视图 FUSE 文件系统使用说明 &nbsp;|&nbsp; 参数以 <code>grove &lt;sub&gt; --help</code> 实测输出为准 &nbsp;|&nbsp; 单文件自包含 HTML,可直接浏览器打开或离线分发。
+    GroveFS · 用户视图 FUSE 文件系统使用说明 &nbsp;|&nbsp; 参数以 <code>grovefs &lt;sub&gt; --help</code> 实测输出为准 &nbsp;|&nbsp; 单文件自包含 HTML,可直接浏览器打开或离线分发。
   </footer>
 </main>
 </div>

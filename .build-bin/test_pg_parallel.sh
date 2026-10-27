@@ -18,7 +18,7 @@ set -u
 cd /data/xy/grovefs
 export LC_ALL=C LANG=C
 export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
-Y=./target/release/grove
+Y=./target/release/grovefs
 
 PGHOST=127.0.0.1
 PGPORT=5432
@@ -64,11 +64,11 @@ RA=0; RB=0; RC=0
 trap cleanup EXIT
 
 echo "===== 2) mount three independent clients on the same PG-backed view ====="
-$Y --home .pgpar/m1 mount --view "$VIEW" --mountpoint .pgpar/mnt_a --meta $META --data $DATA > .pgpar/mnt_a.log 2>&1 &
+$Y --home .pgpar/m1 mount --view "$VIEW" --mountpoint .pgpar/mnt_a --meta $META --data $DATA --foreground > .pgpar/mnt_a.log 2>&1 &
 RA=$!
-$Y --home .pgpar/m2 mount --view "$VIEW" --mountpoint .pgpar/mnt_b --meta $META --data $DATA > .pgpar/mnt_b.log 2>&1 &
+$Y --home .pgpar/m2 mount --view "$VIEW" --mountpoint .pgpar/mnt_b --meta $META --data $DATA --foreground > .pgpar/mnt_b.log 2>&1 &
 RB=$!
-$Y --home .pgpar/m3 mount --view "$VIEW" --mountpoint .pgpar/mnt_c --meta $META --data $DATA > .pgpar/mnt_c.log 2>&1 &
+$Y --home .pgpar/m3 mount --view "$VIEW" --mountpoint .pgpar/mnt_c --meta $META --data $DATA --foreground > .pgpar/mnt_c.log 2>&1 &
 RC=$!
 sleep 2.5
 A=.pgpar/mnt_a; B=.pgpar/mnt_b; C=.pgpar/mnt_c
@@ -188,7 +188,7 @@ done
 # Schema name matches `pg_store::schema_for`: `grovefs_v_` + lower-hex of the
 # view name's UTF-8 bytes (injection-safe & case-stable for PG identifiers).
 VIEW_HEX=$(printf '%s' "$VIEW" | od -An -tx1 | tr -d ' \n')
-hot_rows=$(PGPASSWORD=grovepw psql -h $PGHOST -p $PGPORT -U grove -d grovefs -tAX \
+hot_rows=$(PGPASSWORD=grovepw psql -h $PGHOST -p $PGPORT -U grovefs -d grovefs -tAX \
     -c "SELECT COUNT(*) FROM grovefs_v_${VIEW_HEX}.node WHERE name='hot' AND parent_id=1" 2>/dev/null || echo ERR)
 chk "$hot_rows" "1" "PG权威表 view='$VIEW' 下 'hot' 行数 = 1 (SSI 拦截在 DB 层而非仅 FUSE dentry)"
 

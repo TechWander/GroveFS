@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # API-key authentication + MCP call-audit log e2e. Covers BOTH halves:
-#   (1) the `grove apikey` CLI — create/list/revoke/calls, keys hashed at rest;
-#   (2) the gated server `grove mcp --require-api-key` — tools/list + tools/call
+#   (1) the `grovefs apikey` CLI — create/list/revoke/calls, keys hashed at rest;
+#   (2) the gated server `grovefs mcp --require-api-key` — tools/list + tools/call
 #       refused until an `initialize`-presented key (or a server-wide
 #       GROVEFS_MCP_API_KEY) authenticates, and every call attributed in the log.
-# It also pins the DEFAULT behavior: a plain `grove mcp` needs no key. Uses the
+# It also pins the DEFAULT behavior: a plain `grovefs mcp` needs no key. Uses the
 # file-piped stdio pattern (stdin EOF shuts the server), deterministic for
 # request->response assertions. Assertion-based; emits a SUMMARY line run_all reads.
 set -u
 cd /data/xy/grovefs
-Y=./target/release/grove
+Y=./target/release/grovefs
 BASE=$PWD/.apitest/home
 rm -rf .apitest
 mkdir -p .apitest/home
@@ -36,7 +36,7 @@ $Y init --view team --manifest .apitest/team.manifest > .apitest/init.log 2>&1 \
   && ok "seeded physical view 'team'" || { bad "init failed: $(cat .apitest/init.log)"; exit 1; }
 
 # ---------------------------------------------------------------- CLI: create/list
-echo "===== 1) grove apikey create + list (keys hashed at rest) ====="
+echo "===== 1) grovefs apikey create + list (keys hashed at rest) ====="
 COUT=$($Y apikey --db-path "$BASE" create --label agentA 2>&1)
 ID=$(echo "$COUT"   | sed -n 's/^  id:    //p')
 KEY=$(echo "$COUT"  | sed -n 's/^  key:   //p')
@@ -91,7 +91,7 @@ else bad "key not admitted: $(cat .apitest/out_ok)"; fi
 [ -f "$BASE/meta/views/apr.layout" ] && ok "authenticated define wrote the definition" || bad "authenticated define did not land"
 
 # -------------------------------------------------------------- audit-log checks
-echo "===== 3) every call is logged + attributed (grove apikey calls) ====="
+echo "===== 3) every call is logged + attributed (grovefs apikey calls) ====="
 CALLS=$($Y apikey --db-path "$BASE" calls --limit 60 2>&1)
 echo "$CALLS" | grep -F "define_derived_view" | grep -qF "$ID" \
   && ok "audit log records the authenticated define, attributed to the key id" \
@@ -147,7 +147,7 @@ if [ "$(fget .apitest/out_env 2 '.result.tools|length')" = "8" ]; then
 else bad "env pre-auth did not admit tools/list: $(cat .apitest/out_env)"; fi
 
 # ----------------------------------------------- default server is unchanged (no gate)
-echo "===== 6) regression: plain 'grove mcp' (no --require-api-key) needs no key ====="
+echo "===== 6) regression: plain 'grovefs mcp' (no --require-api-key) needs no key ====="
 frames "" > .apitest/in_plain
 T $Y mcp --db-path "$BASE" < .apitest/in_plain > .apitest/out_plain 2>/dev/null
 if [ "$(fget .apitest/out_plain 2 '.result.tools|length')" = "8" ]; then

@@ -23,7 +23,7 @@ set -u
 cd /data/xy/grovefs
 export LC_ALL=C LANG=C
 export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
-Y=./target/release/grove
+Y=./target/release/grovefs
 
 N=${N:-500}
 META_A=127.0.0.1:50126
@@ -40,7 +40,7 @@ trap cleanup EXIT
 wait_port(){ local a=$1; for _ in $(seq 1 100); do (echo >/dev/tcp/${a%%:*}/${a##*:}) 2>/dev/null && return 0; sleep 0.05; done; return 1; }
 
 # ---- A) local mount ----
-$Y mount --view alice --mountpoint .blk/mnt > .blk/mnt.log 2>&1 &
+$Y mount --view alice --mountpoint .blk/mnt --foreground > .blk/mnt.log 2>&1 &
 MP=$!
 sleep 1.2
 F=.blk/mnt/bench.lk
@@ -78,7 +78,7 @@ DP=$!
 $Y meta-server --db-path .blk/centralmeta --listen $META_A > .blk/meta.log 2>&1 &
 AMP=$!
 wait_port $DATA; wait_port $META_A
-$Y --home .blk/chome mount --view alice --mountpoint .blk/mnt_meta --meta "$META_A" --data $DATA > .blk/mnt_meta.log 2>&1 &
+$Y --home .blk/chome mount --view alice --mountpoint .blk/mnt_meta --meta "$META_A" --data $DATA --foreground > .blk/mnt_meta.log 2>&1 &
 MPM=$!
 sleep 2
 MF=.blk/mnt_meta/bench.lk

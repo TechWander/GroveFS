@@ -4,7 +4,7 @@
 set -u
 cd /data/xy/grovefs
 export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
-Y=./target/debug/grove
+Y=./target/debug/grovefs
 W=$(mktemp -d)
 mkdir -p "$W/home" "$W/mnt"
 export GROVEFS_HOME="$W/home"
@@ -18,7 +18,7 @@ echo "== init =="
 $Y init --view t >/dev/null 2>&1 || fail "init"
 
 echo "== mount WITH --stats =="
-$Y mount --view t --mountpoint "$MNT" --stats --stats-file "$STATS" >"$MLOG" 2>&1 &
+$Y mount --view t --mountpoint "$MNT" --stats --stats-file "$STATS" --foreground >"$MLOG" 2>&1 &
 MP=$!
 sleep 1.5
 kill -0 $MP 2>/dev/null || { cat "$MLOG"; fail "mount died"; }
@@ -57,7 +57,7 @@ grep -q 'per-stage latency telemetry' "$MLOG" || fail "no exit report on stderr"
 grep -q 'write.backend_total' "$STATS" || fail "--stats-file missing stage rows"
 echo "  ok: exit report on stderr + stats-file"
 
-$Y mount --view t --mountpoint "$MNT" >"$MLOG" 2>&1 &
+$Y mount --view t --mountpoint "$MNT" --foreground >"$MLOG" 2>&1 &
 MP=$!
 sleep 1.5
 ls -a "$MNT" | grep -q '.grove-stats' && fail ".grove-stats visible WITHOUT --stats (governance leak)"

@@ -18,7 +18,7 @@
 set -u
 cd /data/xy/grovefs
 export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
-Y=./target/release/grove
+Y=./target/release/grovefs
 ADDR=127.0.0.1:50098
 SIZE_MB=${SIZE_MB:-512}
 
@@ -27,7 +27,7 @@ export GROVEFS_HOME=$PWD/.br/home
 $Y data-server --listen $ADDR --root $PWD/.br/srv > .br/srv.log 2>&1 &
 SP=$!
 $Y init --view perf >/dev/null
-$Y mount --view perf --mountpoint .br/mnt --data $ADDR > .br/mnt.log 2>&1 &
+$Y mount --view perf --mountpoint .br/mnt --data $ADDR --foreground > .br/mnt.log 2>&1 &
 MP=$!
 sleep 1.0
 cleanup(){ fusermount -u .br/mnt 2>/dev/null; kill $MP $SP 2>/dev/null; }

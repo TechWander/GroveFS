@@ -1,4 +1,4 @@
-//! Unit coverage for the data plane of `grove import`: registering an
+//! Unit coverage for the data plane of `grovefs import`: registering an
 //! EXISTING file as an object must be zero-copy (hard link) when source and
 //! store share a filesystem, and the shared inode must stay live through
 //! every path of the object interface.
@@ -33,8 +33,9 @@ fn import_at_hardlinks_zero_copy_and_shares_the_inode() {
     drop(f);
     assert_eq!(be.read("k1", 13, 8).unwrap(), b"!!".to_vec());
 
-    // The blocks path is a second link on the SAME inode (nlink == 2).
-    let obj = fs::metadata(root.join("blocks").join("k1")).unwrap();
+    // The blocks path is a second link on the SAME inode (nlink == 2). It
+    // lives under the fan-out bucket, resolved through the backend itself.
+    let obj = fs::metadata(be.object_path("k1")).unwrap();
     assert_eq!(obj.nlink(), 2);
     assert_eq!(obj.ino(), src_ino, "both paths name one inode");
 }
@@ -52,7 +53,7 @@ fn gc_remove_drops_only_the_blocks_link_not_the_source() {
     // Unlinking the object (what view-level GC does) must leave the user's
     // original dataset path fully intact — importing can never destroy data.
     be.remove("k2").unwrap();
-    assert!(!root.join("blocks").join("k2").exists());
+    assert!(!be.object_path("k2").exists());
     assert_eq!(fs::read_to_string(&src_path).unwrap(), "precious");
 }
 

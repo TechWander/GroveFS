@@ -238,7 +238,11 @@ tree-structure physically live.
 \texttt{MetaProvider} trait (view-tree access: lookup, getattr, readdir,
 create, rename, unlink, setattr, lock) and a \texttt{StorageBackend} trait
 (object IO). Local engines store one SQLite database per view and objects
-under \texttt{blocks/}; remote clients talk over a custom framed TCP protocol
+under \texttt{blocks/}, fanned out over 256 hash-bucketed subdirectories so
+no single directory grows with the object count (tens of millions of objects
+keep per-directory entry counts, and with them backup and traversal cost,
+bounded); the placement is a pure function of the object key, so metadata
+pointers are unaware of it. Remote clients talk over a custom framed TCP protocol
 to a central \texttt{meta-server} and \texttt{data-server}; a sharded backend
 stripes objects across several data-servers. The authoritative metadata store
 is either the embedded engine or PostgreSQL (schema-per-view, transactional
@@ -786,7 +790,7 @@ failover with a dedicated read-only status code kept distinct from a permission
 denial and from data errors.
 
 \paragraph{Agent governance interface (MCP).} View governance is re-exposed
-as a server an AI agent can drive: \texttt{grove mcp} speaks line-delimited
+as a server an AI agent can drive: \texttt{grovefs mcp} speaks line-delimited
 JSON-RPC~2.0 over stdio, implementing the common method surface of the
 Model Context Protocol (MCP) 2025-06-18 revision---lifecycle
 (\texttt{initialize}/\texttt{ping}), tools (\texttt{tools/list}/\texttt{tools/call}),
@@ -798,7 +802,7 @@ argument completion (\texttt{completion/complete}), and logging
 accepted but never answered. The protocol is a hand-rolled dispatch loop, not a
 framework binding. Its decisive property is that it is \emph{not a second
 implementation}: every method reuses the same crate functions that back the
-\texttt{grove view} CLI (the six governance and two read-only introspection
+\texttt{grovefs view} CLI (the six governance and two read-only introspection
 tools), and the resource, prompt and completion surfaces render through the very
 same view-definition and listing renderers, so an agent cannot perform any
 operation the CLI cannot, bypass any governance guard, or observe a listing that
@@ -807,7 +811,7 @@ action are byte-identical across the two entrances (one contract, two
 entrances). The interface is control-plane only: it never mounts and reads no
 object bytes, opening the metadata store read-only to render shapes. When an
 agent runtime fronts one server to many callers, an optional API-key gate
-(\texttt{--require-api-key}, keys minted by \texttt{grove apikey}) authenticates
+(\texttt{--require-api-key}, keys minted by \texttt{grovefs apikey}) authenticates
 the \emph{caller} of the governance plane: the state-touching methods
 (\texttt{tools/list}, \texttt{tools/call}, \texttt{resources/list},
 \texttt{resources/templates/list}, \texttt{resources/read},
@@ -1007,7 +1011,7 @@ would---\texttt{initialize} (checking the advertised capability surface),
 \texttt{tools/list}, \texttt{tools/call}, \texttt{resources/*},
 \texttt{prompts/*}, \texttt{completion/complete}, and
 \texttt{logging/setLevel}~$\rightarrow$~\texttt{notifications/message}---and
-asserts that every answer is byte-identical to what \texttt{grove view} prints
+asserts that every answer is byte-identical to what \texttt{grovefs view} prints
 for the same operation, that a view read as a resource or rendered through
 \texttt{list\_view\_tree} shows the same governed shape as a live mount (private
 subtree pruned, relocated entries homed under their display parent), and that

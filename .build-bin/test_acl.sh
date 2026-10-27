@@ -13,7 +13,7 @@ set -u
 cd /data/xy/grovefs
 export LC_ALL=C LANG=C
 export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
-Y=./target/release/grove
+Y=./target/release/grovefs
 
 META=127.0.0.1:50098
 DATA=127.0.0.1:50099
@@ -56,14 +56,14 @@ RWP=0; ROP=0
 trap cleanup EXIT
 
 echo "===== 3) DENIED mount: uid 3000 (no read grant) fails fast ====="
-$Y --home .acl/m3 mount --view alice --mountpoint .acl/mnt_denied --meta $META --data $DATA --as-uid 3000 > .acl/denied.log 2>&1
+$Y --home .acl/m3 mount --view alice --mountpoint .acl/mnt_denied --meta $META --data $DATA --as-uid 3000 --foreground > .acl/denied.log 2>&1
 DEN=$?
 [ "$DEN" != 0 ] && ok "uid3000 mount rejected (rc=$DEN)" || bad "uid3000 should be denied but mount returned 0"
 grep -qi "reject\|permission" .acl/denied.log && ok "denied log cites rejection" || bad "denied log unclear ($(cat .acl/denied.log))"
 [ ! -d .acl/mnt_denied/projects ] && ok "denied mountpoint produced no tree" || bad "denied mount somehow active"
 
 echo "===== 4) RW mount: uid 1000 can create + write ====="
-$Y --home .acl/m1 mount --view alice --mountpoint .acl/mnt_rw --meta $META --data $DATA --as-uid 1000 > .acl/rw.log 2>&1 &
+$Y --home .acl/m1 mount --view alice --mountpoint .acl/mnt_rw --meta $META --data $DATA --as-uid 1000 --foreground > .acl/rw.log 2>&1 &
 RWP=$!
 sleep 1.5
 A=.acl/mnt_rw
@@ -73,7 +73,7 @@ sync "$A" 2>/dev/null; sleep 2.3
 chk "$(T cat $A/notes.txt)" "secret" "uid1000 reads back its file"
 
 echo "===== 5) RO mount: uid 2000 reads but cannot write ====="
-$Y --home .acl/m2 mount --view alice --mountpoint .acl/mnt_ro --meta $META --data $DATA --as-uid 2000 > .acl/ro.log 2>&1 &
+$Y --home .acl/m2 mount --view alice --mountpoint .acl/mnt_ro --meta $META --data $DATA --as-uid 2000 --foreground > .acl/ro.log 2>&1 &
 ROP=$!
 sleep 1.5
 B=.acl/mnt_ro

@@ -16,7 +16,7 @@
 set -u
 cd /data/xy/grovefs
 export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
-Y=./target/release/grove
+Y=./target/release/grovefs
 SIZE_MB=${SIZE_MB:-512}
 BS=${BS:-1M}
 
@@ -35,7 +35,7 @@ run_case(){ # $1 = --threads value; echoes 3 lines of results
   local TH=$1 TAG="t$1"
   rm -rf .bt-$TAG; mkdir -p .bt-$TAG/home .bt-$TAG/mnt
   GROVEFS_HOME=$PWD/.bt-$TAG/home $Y init --view perf >/dev/null
-  GROVEFS_HOME=$PWD/.bt-$TAG/home $Y mount --view perf --mountpoint .bt-$TAG/mnt --threads $TH > .bt-$TAG/mnt.log 2>&1 &
+  GROVEFS_HOME=$PWD/.bt-$TAG/home $Y mount --view perf --mountpoint .bt-$TAG/mnt --threads $TH --foreground > .bt-$TAG/mnt.log 2>&1 &
   local MP=$!
   sleep 1.0
   local M=.bt-$TAG/mnt

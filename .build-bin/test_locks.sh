@@ -27,7 +27,7 @@ export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
 # this up through `LockLease::secs()` reading the env at first call.
 export GROVEFS_LOCK_LEASE_SECS=3
 
-Y=./target/release/grove
+Y=./target/release/grovefs
 
 rm -rf .locks; mkdir -p .locks/home .locks/m1 .locks/m2
 export GROVEFS_HOME=$PWD/.locks/home
@@ -53,9 +53,9 @@ M2=.locks/m2
 # instances agree on lease duration and cross-process visibility is guaranteed
 # by the shared `locks` SQLite table (WAL + busy_timeout already proven by the
 # `concurrent` suite).
-$Y mount --view alice --mountpoint $M1 > .locks/m1.log 2>&1 &
+$Y mount --view alice --mountpoint $M1 --foreground > .locks/m1.log 2>&1 &
 P1=$!
-$Y mount --view alice --mountpoint $M2 > .locks/m2.log 2>&1 &
+$Y mount --view alice --mountpoint $M2 --foreground > .locks/m2.log 2>&1 &
 P2=$!
 sleep 1.5
 
@@ -234,7 +234,7 @@ BP=$!
 wait_port $DATA && wait_port $META_A && wait_port $META_B || bad "HA ports did not come up"
 
 # Client mounts via failover list against the HA pair.
-$Y --home .locks/ha/chome mount --view alice --mountpoint .locks/ha/mnt --meta "$META_A,$META_B" --data $DATA > .locks/ha/mnt.log 2>&1 &
+$Y --home .locks/ha/chome mount --view alice --mountpoint .locks/ha/mnt --meta "$META_A,$META_B" --data $DATA --foreground > .locks/ha/mnt.log 2>&1 &
 CP=$!
 sleep 2
 # HA client's alice view is created on-demand server-side, so it only has /

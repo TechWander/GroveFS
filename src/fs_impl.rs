@@ -15,10 +15,10 @@
 use crate::backend::StorageBackend;
 use crate::meta::{LockType, MetaError, MetaProvider, NodeInfo, NodeKind};
 use fuser::{
-    BsdFileFlags, Errno, FileAttr, FileHandle, FileType, FopenFlags, Generation, InitFlags,
-    INodeNo, KernelConfig, LockOwner, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen, ReplyStatfs,
-    ReplyWrite, Request, TimeOrNow, WriteFlags,
+    AccessFlags, BsdFileFlags, Errno, FileAttr, FileHandle, FileType, FopenFlags, Generation,
+    InitFlags, IoctlFlags, INodeNo, KernelConfig, LockOwner, OpenFlags, RenameFlags, ReplyAttr,
+    ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyIoctl,
+    ReplyLock, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
 use parking_lot::RwLock;
 use std::ffi::OsStr;
@@ -818,6 +818,79 @@ impl fuser::Filesystem for GroveFS {
             self.meta.release_locks_of_owner(o.0);
         }
         reply.ok();
+    }
+
+    /// close(2) lands here. Every write was already persisted synchronously in
+    /// `write()` — this layer holds no user-side buffering — so an empty flush
+    /// SUCCEEDS, which is the correct POSIX answer. The trait default replies
+    /// `ENOSYS`, which surfaces to applications as a spurious `close()` failure
+    /// (and logs a WARN). Lock teardown deliberately does NOT happen here: a
+    /// `flush` fires on EVERY close and its `lock_owner` need not match the
+    /// `setlk` holder, so reclamation stays with last-close `release` above
+    /// (the authoritative signal).
+    fn flush(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _lock_owner: LockOwner,
+        reply: ReplyEmpty,
+    ) {
+        reply.ok();
+    }
+
+    /// The four callbacks below keep the trait defaults' exact `ENOSYS` answers
+    /// — behavior is unchanged to the bit — and only suppress the defaults'
+    /// `warn!("[Not Implemented] …")`, so a healthy mount leaves no log noise:
+    ///   * `access`: permission checks run kernel-side off the cached getattr
+    ///     attributes unless `default_permissions`; ENOSYS is the normal answer
+    ///     for a FUSE fs without an explicit access hook.
+    ///   * xattr ops: the view stores no extended attributes, so every verb
+    ///     answers ENOSYS and libfuse's `security.capability` probe falls back
+    ///     cleanly (and silently) to the plain attribute path.
+    ///   * `ioctl`: no device ioctls live behind a networked object store.
+    fn access(&self, _req: &Request, _ino: INodeNo, _mask: AccessFlags, reply: ReplyEmpty) {
+        reply.error(Errno::ENOSYS);
+    }
+
+    fn getxattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, _size: u32, reply: ReplyXattr) {
+        reply.error(Errno::ENOSYS);
+    }
+
+    fn setxattr(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _name: &OsStr,
+        _value: &[u8],
+        _flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        reply.error(Errno::ENOSYS);
+    }
+
+    fn removexattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
+        reply.error(Errno::ENOSYS);
+    }
+
+    fn listxattr(&self, _req: &Request, _ino: INodeNo, _size: u32, reply: ReplyXattr) {
+        reply.error(Errno::ENOSYS);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ioctl(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _flags: IoctlFlags,
+        _cmd: u32,
+        _in_data: &[u8],
+        _out_size: u32,
+        reply: ReplyIoctl,
+    ) {
+        reply.error(Errno::ENOSYS);
     }
 
     /// F_GETLK: report the first lock currently blocking the requested interval

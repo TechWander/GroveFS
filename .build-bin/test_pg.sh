@@ -16,7 +16,7 @@ set -u
 cd /data/xy/grovefs
 export LC_ALL=C LANG=C
 export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
-Y=./target/release/grove
+Y=./target/release/grovefs
 
 PGHOST=127.0.0.1
 PGPORT=5432
@@ -52,7 +52,7 @@ T(){ timeout 8 "$@"; }
 psql_in_docker(){
     if sudo -n docker ps --format '{{.Names}}' 2>/dev/null | grep -qx postgres; then
         sudo -n docker exec -e PGPASSWORD=grovepw postgres \
-            psql -U grove -d grovefs -tA -c "$1" 2>/dev/null
+            psql -U grovefs -d grovefs -tA -c "$1" 2>/dev/null
     else
         echo ""
     fi
@@ -82,7 +82,7 @@ RAP=0; RBP=0
 trap cleanup EXIT
 
 echo "===== 3) mount A: first op creates the grovefs_v_<hex> schema in PG ====="
-$Y --home .pgtest/m1 mount --view "$VIEW" --mountpoint .pgtest/mnt_a --meta $META --data $DATA > .pgtest/mnt_a.log 2>&1 &
+$Y --home .pgtest/m1 mount --view "$VIEW" --mountpoint .pgtest/mnt_a --meta $META --data $DATA --foreground > .pgtest/mnt_a.log 2>&1 &
 RAP=$!
 sleep 1.5
 A=.pgtest/mnt_a
@@ -113,7 +113,7 @@ else
 fi
 
 echo "===== 5) mount B on same view: cross-client convergence (shared PG tree) ====="
-$Y --home .pgtest/m2 mount --view "$VIEW" --mountpoint .pgtest/mnt_b --meta $META --data $DATA > .pgtest/mnt_b.log 2>&1 &
+$Y --home .pgtest/m2 mount --view "$VIEW" --mountpoint .pgtest/mnt_b --meta $META --data $DATA --foreground > .pgtest/mnt_b.log 2>&1 &
 RBP=$!
 sleep 2.5
 B=.pgtest/mnt_b

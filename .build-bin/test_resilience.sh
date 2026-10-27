@@ -15,7 +15,7 @@
 set -u
 cd /data/xy/grovefs
 export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
-Y=./target/release/grove
+Y=./target/release/grovefs
 ADDR=127.0.0.1:50098
 HOST=${ADDR%:*}; PORT=${ADDR#*:}
 
@@ -50,7 +50,7 @@ echo "===== A) server up: mount alice + seed ====="
 start_server 1
 $Y init --view alice >/dev/null
 $Y init --view bob   >/dev/null
-$Y mount --view alice --mountpoint $A --data $ADDR > .rtest/a.log 2>&1 & MA=$!
+$Y mount --view alice --mountpoint $A --data $ADDR --foreground > .rtest/a.log 2>&1 & MA=$!
 sleep 1.2
 timeout 10 sh -c "printf 'persistent payload\n' > $A/seed.txt" && sync
 chk "$(timeout 5 cat $A/seed.txt)" "persistent payload" "seed written+read on live server"
@@ -69,7 +69,7 @@ timeout 10 sh -c "printf 'recovered\n' > $A/recovered.txt"; rc=$?
 chk "$rc" "0" "create succeeds after server restart (reconnect)"
 chk "$(timeout 5 cat $A/recovered.txt)" "recovered" "post-reconnect write is readable"
 chk "$(timeout 5 md5sum $A/seed.txt | awk '{print $1}')" "$seed_md5" "pre-outage data persisted across restart"
-if ls .rtest/rsrv/blocks >/dev/null 2>&1 && [ "$(ls .rtest/rsrv/blocks | wc -l)" -ge 2 ]; then ok "reconnected writes landed on the (new) server disk"; else bad "server disk missing objects"; fi
+if find .rtest/rsrv/blocks -type f >/dev/null 2>&1 && [ "$(find .rtest/rsrv/blocks -type f | wc -l)" -ge 2 ]; then ok "reconnected writes landed on the (new) server disk"; else bad "server disk missing objects"; fi
 
 echo "===== D) live pool + immediate restart: silent transparent retry ====="
 timeout 10 sh -c "printf 'more\n' >> $A/recovered.txt" && sync   # ensure a warm pooled socket is in use
@@ -79,7 +79,7 @@ chk "$rc" "0" "op over a stale pooled socket recovers with NO error surfaced"
 chk "$(timeout 5 cat $A/transparent.txt)" "transparent" "transparently-recovered write is readable"
 
 echo "===== E) two client mounts vs one server: concurrent + isolated ====="
-$Y mount --view bob --mountpoint $B --data $ADDR > .rtest/b.log 2>&1 & MB=$!
+$Y mount --view bob --mountpoint $B --data $ADDR --foreground > .rtest/b.log 2>&1 & MB=$!
 sleep 1.2
 p1=""; p2=""
 timeout 30 sh -c "for n in \$(seq 1 200); do echo a-\$n > $A/mc.txt; done" & p1=$!

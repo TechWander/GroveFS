@@ -6,7 +6,7 @@ description = "A user-view FUSE filesystem with pluggable storage backend, no NF
 license = "MIT"
 
 [[bin]]
-name = "grove"
+name = "grovefs"
 path = "src/main.rs"
 
 [lib]

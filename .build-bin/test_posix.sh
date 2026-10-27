@@ -5,7 +5,7 @@
 set -u
 cd /data/xy/grovefs
 export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
-Y=./target/release/grove
+Y=./target/release/grovefs
 rm -rf .ptest; mkdir -p .ptest/home .ptest/mnt
 export GROVEFS_HOME=$PWD/.ptest/home
 
@@ -15,7 +15,7 @@ touch docs/orig.txt
 EOF
 $Y init --view carol --manifest .ptest/man >/dev/null
 
-$Y mount --view carol --mountpoint .ptest/mnt > .ptest/mount.log 2>&1 &
+$Y mount --view carol --mountpoint .ptest/mnt --foreground > .ptest/mount.log 2>&1 &
 MP=$!
 sleep 1.2
 cleanup(){ fusermount -u .ptest/mnt 2>/dev/null; kill $MP 2>/dev/null; }
@@ -39,24 +39,24 @@ if [ -L "$M/link" ]; then echo "  OK: link is a symlink (-L)"; pass=$((pass+1));
 chk "$(stat -L -c '%s' $M/link 2>/dev/null)" "17" "stat -L follows to target size"
 
 echo "===== C) hardlink: ln shares bytes, both names, GC waits for last ====="
-before=$(ls .ptest/home/blocks | wc -l)
+before=$(find .ptest/home/blocks -type f | wc -l)   # fan-out buckets: count object FILES
 T ln $M/docs/orig.txt $M/docs/hard.txt
 chk "$(cat $M/docs/hard.txt)" "original content" "hardlink sees same content"
 chk "$(stat -c '%h' $M/docs/orig.txt)" "2" "nlink is 2 after hardlink"
 inodes=$(stat -c '%i' $M/docs/orig.txt $M/docs/hard.txt | sort -u | wc -l)
 chk "$inodes" "1" "both hardlink names share one inode (stat %i)"
-inl=$(ls .ptest/home/blocks | wc -l)
+inl=$(find .ptest/home/blocks -type f | wc -l)
 chk "$inl" "$before" "hardlink added NO new physical object"
 # modify via one name, observe via the other (shared object)
 T sh -c "echo 'UPDATED' >> $M/docs/hard.txt"
 chk "$(grep -c UPDATED $M/docs/orig.txt)" "1" "write via hardlink visible on orig"
 T rm $M/docs/orig.txt
-after1=$(ls .ptest/home/blocks | wc -l)
+after1=$(find .ptest/home/blocks -type f | wc -l)
 chk "$after1" "$inl" "removing one hardlink keeps object (refcount>0)"
 chk "$(cat $M/docs/hard.txt)" "original content
 UPDATED" "content intact after first unlink"
 T rm $M/docs/hard.txt
-after2=$(ls .ptest/home/blocks | wc -l)
+after2=$(find .ptest/home/blocks -type f | wc -l)
 chk "$after2" "$((inl-1))" "removing last hardlink frees the object"
 
 echo "===== D) statfs via df ====="

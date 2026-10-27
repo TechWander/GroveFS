@@ -32,7 +32,7 @@
 set -u
 cd /data/xy/grovefs
 export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
-Y=./target/release/grove
+Y=./target/release/grovefs
 S1=127.0.0.1:50141
 S2=127.0.0.1:50142
 SIZE_MB=${SIZE_MB:-512}
@@ -47,12 +47,12 @@ rate(){ awk -v s="$1" -v t="$2" 'BEGIN{ if(t>0) printf "%.1f", s/t; else print "
 # ---- single-server mount ----
 $Y data-server --listen $S1 --root $PWD/.bs/r1 > .bs/s1.log 2>&1 & P1=$!
 $Y init --view perf1 >/dev/null
-$Y mount --view perf1 --mountpoint .bs/mnt1 --data $S1 > .bs/mnt1.log 2>&1 & M1=$!
+$Y mount --view perf1 --mountpoint .bs/mnt1 --data $S1 --foreground > .bs/mnt1.log 2>&1 & M1=$!
 sleep 1.0
 # ---- two-server striped mount ----
 $Y data-server --listen $S2 --root $PWD/.bs/r2 > .bs/s2.log 2>&1 & P2=$!
 $Y init --view perf2 >/dev/null
-$Y mount --view perf2 --mountpoint .bs/mnt2 --data "$S1,$S2" > .bs/mnt2.log 2>&1 & M2=$!
+$Y mount --view perf2 --mountpoint .bs/mnt2 --data "$S1,$S2" --foreground > .bs/mnt2.log 2>&1 & M2=$!
 sleep 1.0
 
 cleanup(){ fusermount -u .bs/mnt1 .bs/mnt2 2>/dev/null; kill $M1 $M2 $P1 $P2 2>/dev/null; }
@@ -74,6 +74,6 @@ r2=$(secs dd if=.bs/mnt2/t.img of=/dev/null bs=1M)
 echo "  2-stripe  read   bs=1M: ${r2}s  ($(rate $SIZE_MB $r2) MB/s)"
 
 echo "  --- striped file really spans both roots ---"
-echo "    r1 blocks=$(ls .bs/r1/blocks 2>/dev/null | wc -l) r2 blocks=$(ls .bs/r2/blocks 2>/dev/null | wc -l)"
+echo "    r1 blocks=$(find .bs/r1/blocks -type f 2>/dev/null | wc -l) r2 blocks=$(find .bs/r2/blocks -type f 2>/dev/null | wc -l)"
 echo "  speedup write: $(awk -v a=$w1 -v b=$w2 'BEGIN{if(b>0)printf "%.2fx", a/b}')  read: $(awk -v a=$r1 -v b=$r2 'BEGIN{if(b>0)printf "%.2fx", a/b}')"
 echo DONE

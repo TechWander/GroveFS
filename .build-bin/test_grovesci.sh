@@ -24,7 +24,7 @@
 set -u
 cd /data/xy/grovefs
 export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
-Y=./target/release/grove
+Y=./target/release/grovefs
 rm -rf .grovesci; mkdir -p .grovesci/home .grovesci/mnt_dr .grovesci/mnt_al .grovesci/mnt_refused
 export GROVEFS_HOME=$PWD/.grovesci/home
 SRC=.grovesci/survey
@@ -80,7 +80,7 @@ EOF
 $Y view --db-path "$GROVEFS_HOME" define --name dr --base arch --rules .grovesci/dr.rules > .grovesci/def.log 2>&1 \
   && ok "derived public-release view 'dr' defined over the archive" || { bad "define failed: $(cat .grovesci/def.log)"; exit 1; }
 # Mount the derived view BY NAME -- no local rule file, shape is central.
-$Y mount --view dr -m .grovesci/mnt_dr --meta $META --data $DATA > .grovesci/dr.log 2>&1 &
+$Y mount --view dr -m .grovesci/mnt_dr --meta $META --data $DATA --foreground > .grovesci/dr.log 2>&1 &
 DRP=$!; sleep 2
 DR=.grovesci/mnt_dr
 # Friendly relocation: raw products appear under /release, not /survey/raw.
@@ -112,24 +112,24 @@ echo "===== C) revocable public alias with gapless rotation ====="
 $Y view --db-path "$GROVEFS_HOME" alias --name archive-open --real arch > .grovesci/al.log 2>&1 \
   && ok "public alias 'archive-open' -> archive defined" || bad "alias create: $(cat .grovesci/al.log)"
 # The public name serves the (unshaped) tree for the partner.
-$Y mount --view archive-open -m .grovesci/mnt_al --meta $META --data $DATA > .grovesci/mntal.log 2>&1 &
+$Y mount --view archive-open -m .grovesci/mnt_al --meta $META --data $DATA --foreground > .grovesci/mntal.log 2>&1 &
 ALP=$!; sleep 2
 if T ls .grovesci/mnt_al/survey >/dev/null 2>&1; then ok "public alias reaches the archive tree" ; else bad "alias did not serve the tree"; fi
 kill $ALP 2>/dev/null; wait $ALP 2>/dev/null; fusermount -u .grovesci/mnt_al 2>/dev/null
 # The governed REAL storage name is refused as a direct mount entry (leak-proof).
-$Y mount --view arch -m .grovesci/mnt_refused --meta $META --data $DATA > .grovesci/ref.log 2>&1 &
+$Y mount --view arch -m .grovesci/mnt_refused --meta $META --data $DATA --foreground > .grovesci/ref.log 2>&1 &
 RFP=$!; sleep 1.5
 if [ ! -d .grovesci/mnt_refused/survey ]; then ok "real storage name 'arch' is refused as a mount entry (storage identity not exposed)"; else bad "real name still mountable"; fi
 kill $RFP 2>/dev/null; wait $RFP 2>/dev/null; fusermount -u .grovesci/mnt_refused 2>/dev/null
 # If the public name leaks, --retire yanks it atomically (old dead, new live).
 $Y view --db-path "$GROVEFS_HOME" alias --name archive-vault --real arch --retire archive-open > .grovesci/rot.log 2>&1 \
   && ok "gapless rotation archive-open -> archive-vault" || bad "retire rotation failed: $(cat .grovesci/rot.log)"
-$Y mount --view archive-open -m .grovesci/mnt_al --meta $META --data $DATA > .grovesci/old.log 2>&1 &
+$Y mount --view archive-open -m .grovesci/mnt_al --meta $META --data $DATA --foreground > .grovesci/old.log 2>&1 &
 OLDP=$!; sleep 1.5
 [ ! -d .grovesci/mnt_al/survey ] && ok "leaked public name no longer reaches the archive (revoked, no window)" \
                                  || bad "retired public name still served the archive"
 kill $OLDP 2>/dev/null; wait $OLDP 2>/dev/null; fusermount -u .grovesci/mnt_al 2>/dev/null; rm -rf .grovesci/mnt_al; mkdir -p .grovesci/mnt_al
-$Y mount --view archive-vault -m .grovesci/mnt_al --meta $META --data $DATA > .grovesci/new.log 2>&1 &
+$Y mount --view archive-vault -m .grovesci/mnt_al --meta $META --data $DATA --foreground > .grovesci/new.log 2>&1 &
 NWP=$!; sleep 2
 if T ls .grovesci/mnt_al/survey >/dev/null 2>&1; then ok "rotated public name serves the archive immediately" ; else bad "new alias did not serve"; fi
 fusermount -u .grovesci/mnt_al 2>/dev/null; kill $NWP 2>/dev/null; wait $NWP 2>/dev/null

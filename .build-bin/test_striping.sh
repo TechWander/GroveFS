@@ -15,7 +15,7 @@
 set -u
 cd /data/xy/grovefs
 export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
-Y=./target/release/grove
+Y=./target/release/grovefs
 # two data servers, distinct roots — the striping targets.
 A=127.0.0.1:50121
 B=127.0.0.1:50122
@@ -33,7 +33,7 @@ sleep 0.8
 
 echo "=== init alice view + mount across BOTH servers ==="
 $Y init --view alice > /dev/null
-$Y mount --view alice --mountpoint .striping/mnt --data "$A,$B" > .striping/mnt.log 2>&1 &
+$Y mount --view alice --mountpoint .striping/mnt --data "$A,$B" --foreground > .striping/mnt.log 2>&1 &
 PM=$!
 sleep 1.2
 
@@ -47,7 +47,7 @@ ok(){ echo "  OK: $1"; pass=$((pass+1)); }
 bad(){ echo "  FAIL: $1"; fail=$((fail+1)); }
 chk(){ if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got '$1' want '$2')"; fi; }
 T(){ timeout 20 "$@"; }
-blocks(){ ls "$1"/blocks 2>/dev/null | wc -l; }
+blocks(){ find "$1"/blocks -type f 2>/dev/null | wc -l; }   # objects live in 256 fan-out buckets; count FILES, not dir entries
 
 echo "===== 1) create tree + roundtrip over the sharded backend ====="
 T mkdir $M/docs
@@ -115,14 +115,14 @@ echo "===== 7) backward compat: single --data mount uses bare-uuid keys ====="
 # a single address must NOT emit the s-prefix layout (old objects keep working).
 # use a distinct user so its local view DB never contends with the sharded mount.
 $Y init --view bob > /dev/null
-$Y mount --view bob --mountpoint .striping/mnt_legacy --data $A > .striping/mnt_legacy.log 2>&1 &
+$Y mount --view bob --mountpoint .striping/mnt_legacy --data $A --foreground > .striping/mnt_legacy.log 2>&1 &
 PL=$!
 sleep 1.2
 T sh -c "printf 'legacy-single' > .striping/mnt_legacy/leg.txt"
 chk "$(T cat .striping/mnt_legacy/leg.txt)" "legacy-single" "single-address mount round-trips (unchanged path)"
 # its object key must be a bare uuid (striped keys carry a '#' chunk marker; a
 # single-address RemoteBackend never emits one) on server A
-if ls .striping/sA/blocks 2>/dev/null | grep -vq '#'; then ok "legacy object stored under a bare uuid key (no '#' stripe marker)"; else bad "single-address mount wrote a striped key"; fi
+if find .striping/sA/blocks -type f 2>/dev/null | grep -qv '#'; then ok "legacy object stored under a bare uuid key (no '#' stripe marker)"; else bad "single-address mount wrote a striped key"; fi
 
 echo
 echo "==================== SUMMARY: pass=$pass fail=$fail ===================="

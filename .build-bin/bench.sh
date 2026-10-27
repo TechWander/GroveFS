@@ -6,12 +6,12 @@
 set -u
 cd /data/xy/grovefs
 export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
-Y=./target/release/grove
+Y=./target/release/grovefs
 rm -rf .bench; mkdir -p .bench/home .bench/mnt
 export GROVEFS_HOME=$PWD/.bench/home
 
 $Y init --view perf >/dev/null
-$Y mount --view perf --mountpoint .bench/mnt > .bench/mnt.log 2>&1 &
+$Y mount --view perf --mountpoint .bench/mnt --foreground > .bench/mnt.log 2>&1 &
 MP=$!
 sleep 1.0
 cleanup(){ fusermount -u .bench/mnt 2>/dev/null; kill $MP 2>/dev/null; rm -f .bench/direct.img; }

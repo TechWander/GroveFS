@@ -7,7 +7,7 @@
 set -u
 cd /data/xy/grovefs
 export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
-Y=./target/release/grove
+Y=./target/release/grovefs
 rm -rf .xtest; mkdir -p .xtest/home .xtest/mnt .xtest/mnt_ro
 export GROVEFS_HOME=$PWD/.xtest/home
 
@@ -45,7 +45,7 @@ cleanup(){ fusermount -u .xtest/mnt 2>/dev/null; fusermount -u .xtest/mnt_ro 2>/
 trap cleanup EXIT
 
 # ---------- RW mount ----------
-$Y mount --view erruser --mountpoint .xtest/mnt > .xtest/mnt.log 2>&1 &
+$Y mount --view erruser --mountpoint .xtest/mnt --foreground > .xtest/mnt.log 2>&1 &
 MP=$!
 sleep 1.2
 M=.xtest/mnt
@@ -64,7 +64,7 @@ chk "$(probe "os.link('$M/docs', '$M/docs_hl')")" "$E_PERM" "hardlink of a direc
 
 # ---------- RO mount (unmount RW first so the per-user DB isn't opened twice) ----------
 fusermount -u $M 2>/dev/null; kill $MP 2>/dev/null; wait $MP 2>/dev/null
-$Y mount --view erruser --mountpoint .xtest/mnt_ro --ro > .xtest/mnt_ro.log 2>&1 &
+$Y mount --view erruser --mountpoint .xtest/mnt_ro --ro --foreground > .xtest/mnt_ro.log 2>&1 &
 MPRO=$!
 sleep 1.2
 R=.xtest/mnt_ro

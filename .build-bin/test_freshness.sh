@@ -22,7 +22,7 @@ set -u
 cd /data/xy/grovefs
 export LC_ALL=C LANG=C
 export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
-Y=./target/release/grove
+Y=./target/release/grovefs
 
 META=127.0.0.1:50156
 DATA=127.0.0.1:50157
@@ -38,9 +38,9 @@ MP=$!
 wait_port $DATA && wait_port $META || { echo "servers failed"; exit 1; }
 
 # ---- two NON-STRICT client mounts of the same user ----
-$Y --home .fresh/m1 mount --view alice --mountpoint .fresh/mnt_a --meta $META --data $DATA > .fresh/a.log 2>&1 &
+$Y --home .fresh/m1 mount --view alice --mountpoint .fresh/mnt_a --meta $META --data $DATA --foreground > .fresh/a.log 2>&1 &
 AP=$!
-$Y --home .fresh/m2 mount --view alice --mountpoint .fresh/mnt_b --meta $META --data $DATA > .fresh/b.log 2>&1 &
+$Y --home .fresh/m2 mount --view alice --mountpoint .fresh/mnt_b --meta $META --data $DATA --foreground > .fresh/b.log 2>&1 &
 BP=$!
 sleep 2
 

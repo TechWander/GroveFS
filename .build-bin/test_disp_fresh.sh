@@ -18,7 +18,7 @@ set -u
 cd /data/xy/grovefs
 export LC_ALL=C LANG=C
 export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
-Y=./target/release/grove
+Y=./target/release/grovefs
 
 META=127.0.0.1:50168
 DATA=127.0.0.1:50169
@@ -34,7 +34,7 @@ MP=$!
 wait_port $DATA && wait_port $META || { echo "servers failed to start"; exit 1; }
 
 # ---- seed the base view 'alice' with /data/raw as a real dir ----
-$Y --home .dfresh/mA mount --view alice --mountpoint .dfresh/mntA --meta $META --data $DATA > .dfresh/a.log 2>&1 &
+$Y --home .dfresh/mA mount --view alice --mountpoint .dfresh/mntA --meta $META --data $DATA --foreground > .dfresh/a.log 2>&1 &
 AP=$!
 sleep 1
 mkdir -p .dfresh/mntA/data/raw
@@ -51,7 +51,7 @@ EOF
 sleep 0.5
 
 # ---- B mounts the derived view 'dview' ----
-$Y --home .dfresh/mB mount --view dview --mountpoint .dfresh/mntB --meta $META --data $DATA > .dfresh/b.log 2>&1 &
+$Y --home .dfresh/mB mount --view dview --mountpoint .dfresh/mntB --meta $META --data $DATA --foreground > .dfresh/b.log 2>&1 &
 BP=$!
 sleep 2
 
