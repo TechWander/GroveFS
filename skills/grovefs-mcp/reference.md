@@ -1,19 +1,25 @@
-# GroveFS MCP 参考（方法面 / 错误码 / 落盘效果 / CLI 对照）
+# GroveFS MCP Reference (method surface / error codes / on-disk effects / CLI cross-reference)
 
-本文件是 [SKILL.md](SKILL.md) 的细则附录：只讲实现里真实存在的东西，逐条对应 `src/mcp.rs`。
+Appendix to [SKILL.md](SKILL.md). Everything here exists in the implementation;
+each item maps to `src/mcp.rs`.
 
-## 1. 服务与握手
+## 1. Serving and handshake
 
 ```
 grovefs mcp [--db-path <D>] [--home <H>] [--require-api-key]
 ```
 
-- `--db-path`：治理库根（含 `meta/`、`meta/views/`），与 `grovefs view` / `meta-server --db-path` 同一个目录概念；缺省回退 `--home`，再回退 `$GROVEFS_HOME` / `~/.grovefs`。
-- 每个工具都带可选 `db_path`，**逐调用覆盖**默认根（一个进程服务多个存储根）。
-- 帧格式：换行分隔的 JSON-RPC 2.0，一行一帧，UTF-8，stdin 进 / stdout 出。
-- `initialize` 的 `params`：`protocolVersion`（原样回声，不校验）、`capabilities`、`clientInfo`，
-  以及可选 **`apiKey: "<ID>:<SECRET>"`**（唯一能带凭据的开放方法）。
-- 握手成功回：
+- `--db-path`: the governance library root (contains `meta/` and `meta/views/`) —
+  the same directory concept as `grovefs view` / `meta-server --db-path`; defaults
+  by falling back to `--home`, then `$GROVEFS_HOME` / `~/.grovefs`.
+- Every tool carries an optional `db_path` that **overrides the root per call**
+  (one process serving several store roots).
+- Framing: newline-delimited JSON-RPC 2.0, one frame per line, UTF-8, in on
+  stdin / out on stdout.
+- `initialize` `params`: `protocolVersion` (echoed back verbatim, not validated),
+  `capabilities`, `clientInfo`, plus the optional
+  **`apiKey: "<ID>:<SECRET>"`** (the only open method that can carry a credential).
+- A successful handshake answers:
 
 ```json
 {"protocolVersion":"2025-06-18",
@@ -23,123 +29,151 @@ grovefs mcp [--db-path <D>] [--home <H>] [--require-api-key]
  "instructions":"…"}
 ```
 
-`instructions` 是服务端自带的操作手册（发现/预览/换形/干跑四段话 + 鉴权提示）：客户端会把它注入上下文，
-所以**本 skill 不重复它的文案**，只补上实现细节与坑位。工具自己的 `description` 同样自解释。
+`instructions` is the server's own operating manual (four paragraphs on
+discover / preview / reshape / dry-run, plus the authentication hint). Clients
+inject it into context, so **this skill deliberately does not repeat its
+wording** — it only adds implementation details and pitfalls. Each tool's own
+`description` is likewise self-explanatory.
 
-- 客户端随后发 `notifications/initialized`（**无 id，永不作答**）。
+- The client then sends `notifications/initialized` (**no id, never answered**).
 
-## 2. 方法面与鉴权门
+## 2. Method surface and the authentication gate
 
-| 方法 | `--require-api-key` 时 | 说明 |
+| Method | Under `--require-api-key` | Notes |
 |---|---|---|
-| `initialize` | 开放 | 唯一可携带 `apiKey` 的方法；成功即给会话盖章身份（后续审计归属） |
-| `ping` | 开放 | 回 `{}` |
-| `notifications/*`、`initialized` | 开放 | 静默接收，**不作答**（别等回包） |
-| `tools/list` | **门** | 回 9 个工具 + 自描述 schema |
-| `tools/call` | **门** | 治理失败在结果内（`isError`），不进 JSON-RPC 错误层 |
-| `resources/list` | **门** | 逐槽枚举（物理→tree；派生/别名/fork→definition+tree）；库读不出时 `-32603` |
-| `resources/templates/list` | **门** | 两副模板（静态） |
-| `resources/read` | **门** | URI 不合法/未知视图 → `-32002`（坏 URI 是协议问题，不是治理拒绝） |
-| `completion/complete` | **门** | 只用 `params.argument`（`ref` 被忽略）；非视图名类参数回空列表 |
-| `prompts/list` | 开放 | 两副剧本 |
-| `prompts/get` | 开放 | 缺参/未知提示 → `-32602` |
-| `logging/setLevel` | 开放 | 只调本会话详谈程度，从不被门挡住 |
-| 其它 | — | 有 id → `-32601 method not found: <m>`；无 id 的未知通知保持静默 |
+| `initialize` | open | the only method that can carry `apiKey`; success stamps the session's identity (later audit attribution) |
+| `ping` | open | answers `{}` |
+| `notifications/*`, `initialized` | open | received silently, **never answered** (don't wait for a reply) |
+| `tools/list` | **gated** | 9 tools plus self-describing schemas |
+| `tools/call` | **gated** | governance failures stay inside the result (`isError`), never the JSON-RPC error layer |
+| `resources/list` | **gated** | enumerates slot by slot (physical→tree; derived/alias/fork→definition+tree); `-32603` if the store cannot be read |
+| `resources/templates/list` | **gated** | two templates (static) |
+| `resources/read` | **gated** | malformed URI / unknown view → `-32002` (a bad URI is a protocol problem, not a governance refusal) |
+| `completion/complete` | **gated** | uses `params.argument` only (`ref` is ignored); non-view-name arguments answer an empty list |
+| `prompts/list` | open | two playbooks |
+| `prompts/get` | open | missing/unknown prompt → `-32602` |
+| `logging/setLevel` | open | only tunes this session's verbosity; never behind the gate |
+| anything else | — | with an id → `-32601 method not found: <m>`; an unknown notification without an id stays silent |
 
-未鉴权碰门内方法 → `-32001`，文案：
-`authentication required: present a valid apiKey in the initialize params (or export GROVEFS_MCP_API_KEY for the server)`；
-同时按审计规则记一条失败（`unauthorized: no valid api key`）。
+Unauthenticated access to a gated method → `-32001` with
+`authentication required: present a valid apiKey in the initialize params (or export GROVEFS_MCP_API_KEY for the server)`;
+the audit log also records a failure per the audit rules
+(`unauthorized: no valid api key`).
 
-## 3. 错误码
+## 3. Error codes
 
-| 码 | 触发 | 典型文案 |
+| Code | Trigger | Typical text |
 |---|---|---|
-| `-32700` | 非法 JSON 帧 | `parse error: …`（**服务继续可用**，不会掉线） |
-| `-32601` | 未知方法且带 id | `method not found: foo/bar` |
-| `-32602` | 参数问题：`resources/read` 缺 `uri`、`prompts/get` 缺/错参数、`completion/complete` 内部错 | `unknown prompt '<x>'` / `rotate-alias needs arguments 'real', 'new' and 'old'` |
-| `-32603` | 内部错误：`resources/list` 读不出存储 | — |
-| `-32001` | 鉴权门 | 见上 |
-| `-32002` | 资源 URI 不可用 | `unsupported resource uri '<uri>' (expected grovefs://view/<name>/(definition\|tree))` / `resource uri '<uri>' names no view` |
-| （无码） | 治理拒绝、缺工具参数、未知工具 | 结果内 `isError:true` + 与 CLI 逐字相同的文案 |
+| `-32700` | malformed JSON frame | `parse error: …` (**the server keeps serving**; the stream is not dropped) |
+| `-32601` | unknown method with an id | `method not found: foo/bar` |
+| `-32602` | argument problems: `resources/read` without `uri`, `prompts/get` missing/wrong arguments, internal error in `completion/complete` | `unknown prompt '<x>'` / `rotate-alias needs arguments 'real', 'new' and 'old'` |
+| `-32603` | internal error: `resources/list` cannot read the store | — |
+| `-32001` | authentication gate | see above |
+| `-32002` | resource URI unavailable | `unsupported resource uri '<uri>' (expected grovefs://view/<name>/(definition\|tree))` / `resource uri '<uri>' names no view` |
+| (no code) | governance refusals, missing tool arguments, unknown tools | `isError:true` inside the result + the CLI's verbatim wording |
 
-## 4. 资源（与工具结果逐字节相同）
+## 4. Resources (byte-identical to tool results)
 
-模板：
+Templates:
 
 ```json
 [{"uriTemplate":"grovefs://view/{name}/definition","name":"view-definition","mimeType":"application/json"},
  {"uriTemplate":"grovefs://view/{name}/tree","name":"view-tree","mimeType":"application/json"}]
 ```
 
-- `grovefs://view/<name>/definition`：该槽的**逐字治理文本**（派生规则原文，或别名/fork 的 `base <x>` 行）；物理视图回它的挂载语义说明。等价于 `get_view`。
-- `grovefs://view/<name>/tree`：挂载实际所见的清单（经真实透镜渲染，含合成目录），等价于 `list_view_tree {"view":"<name>"}`。
+- `grovefs://view/<name>/definition`: the slot's **verbatim governance text**
+  (raw derived rules, or the `base <x>` line of an alias/fork); a physical view
+  answers its mount semantics. Equivalent to `get_view`.
+- `grovefs://view/<name>/tree`: the listing a mount actually sees (rendered
+  through the real lens, synthetic directories included). Equivalent to
+  `list_view_tree {"view":"<name>"}`.
 
-两者（资源与工具）回的 `entries[].size` 都是**元数据字段而非字节数**：目录 `4096`、文件 `0`、
-软链为 target 字符长度——遍历只读元数据，不向数据面问对象长度（工具描述与 `instructions` 已自述这一点）。
+In both (resources and tools) `entries[].size` is a **metadata field, not a byte
+count**: dirs `4096`, files `0`, symlinks their target's character length — the
+walk reads metadata only and never asks the data plane for object lengths (the
+tool description and `instructions` both say so).
 
-`resources/read` 的信封是 `{"contents":[{"uri","mimeType","text"}]}`，`text` 里才是与工具结果逐字节相同的 JSON 串
-（所以客户端取内容时要先剥一层 `contents[0].text`）。
+The `resources/read` envelope is `{"contents":[{"uri","mimeType","text"}]}`; the
+byte-identical JSON string lives inside `text` (so a client must peel
+`contents[0].text` first).
 
-## 5. 提示（剧本，实例化成一条 user 消息）
+## 5. Prompts (playbooks, instantiated into one user message)
 
-| 提示 | 参数 | 内容 |
+| Prompt | Arguments | Content |
 |---|---|---|
-| `reshape-view` | ★`base`，`goal`（可选） | 五步「读真实路径 → 起草规则 → `validate_definition` 干跑 → `define_derived_view` 发布 → `list_view_tree` 复核」，全程控制面、不挂载 |
-| `rotate-alias` | ★`real` ★`new` ★`old` | 一条 `alias_view {name:new, real, retire:old}` 先写后删无缝轮换；再 `list_views` 确认；老连接自行排空 |
+| `reshape-view` | ★`base`, `goal` (optional) | five steps "read real paths → draft rules → `validate_definition` dry run → `define_derived_view` publish → `list_view_tree` verify"; control plane throughout, no mounts |
+| `rotate-alias` | ★`real` ★`new` ★`old` | one `alias_view {name:new, real, retire:old}` writes before removing, so the public name never has a gap; then `list_views` to confirm; old connections drain on their own |
 
-## 6. 补全与日志
+## 6. Completion and logging
 
-- `completion/complete`：`{"argument":{"name":"base","value":"re"}}` → 回本地存储里前缀匹配（大小写不敏感）的视图名
-  `{"completion":{"values":[…],"total":N,"hasMore":bool}}`（最多 100 条）。只对 `name`/`base`/`view`/`real` 生效；**只查本地 SQLite**，不触达远端/PG。
-- `logging/setLevel`：`{"level":"warning"}`。设了阈值之后，服务端在**被应答的调用**之后追加
-  `notifications/message` 帧（`logger: "grove-mcp"`），但**只有严重度达到阈值才推**：成功是 `info` + `<method> ok`，
-  任何拒绝或失败是 `warning` + `<method> failed: <reason>` —— 阈值设为 `warning` 时，一次成功调用什么都不推。
-  记日志的调用：`tools/call`、`tools/list`、`resources/list`、`resources/read`、`prompts/get`、`completion/complete`；
-  `initialize`/`ping`/`prompts/list`/模板列表保持安静。通知帧排在应答**之后**写出，stdout 仍是合法帧流。
-  严重度单调：`debug 10 < info 20 < notice 30 < warning 40 < error 50 < critical 60 < alert 70 < emergency 80`，未知名字按 `info` 计。
+- `completion/complete`: `{"argument":{"name":"base","value":"re"}}` → view names
+  from the local store matching the prefix (case-insensitive), as
+  `{"completion":{"values":[…],"total":N,"hasMore":bool}}` (at most 100). Works only
+  for `name`/`base`/`view`/`real`; **queries local SQLite only**, never
+  remote/PG.
+- `logging/setLevel`: `{"level":"warning"}`. Once a threshold is set, the server
+  appends `notifications/message` frames (logger `"grove-mcp"`) **after the
+  answered call**, but **only at or above the threshold**: success is `info` +
+  `<method> ok`, any refusal or failure is `warning` + `<method> failed: <reason>`
+  — with the threshold at `warning`, a successful call pushes nothing at all.
+  Logged calls: `tools/call`, `tools/list`, `resources/list`, `resources/read`,
+  `prompts/get`, `completion/complete`; `initialize`/`ping`/`prompts/list`/
+  templates stay quiet. Notification frames are written **after** the response,
+  so stdout remains a valid frame stream.
+  Severity ordering: `debug 10 < info 20 < notice 30 < warning 40 < error 50 <
+  critical 60 < alert 70 < emergency 80`; unknown names count as `info`.
 
-## 7. 每个写工具在盘上留下什么（可用来做旁路核验）
+## 7. What each writing tool leaves on disk (usable for out-of-band verification)
 
-| 工具 | 落盘 |
+| Tool | On-disk effect |
 |---|---|
-| `define_derived_view` | 覆写 `<db>/meta/views/<name>.layout`（首行 `base <base>` + 规则行） |
-| `alias_view` | 写 `<db>/meta/views/<name>.layout`（`base <real>`）；带 `retire` 时**先写新再删旧** |
-| `fork_view` | 新树 `<db>/meta/<name>.db`（+`-wal`/`-shm`）+ `<db>/meta/views/<name>.layout`，并更新跨视图账本 `refs.db` |
-| `remove_view` | 删 `.layout`；若槽是 fork，连带删它的 `meta/<name>.db*` 并 `rebuild_ledger` |
-| `preview_rules` / `validate_definition` / 三个只读探查 | **什么都不写** |
+| `define_derived_view` | overwrites `<db>/meta/views/<name>.layout` (first line `base <base>` + rule lines) |
+| `alias_view` | writes `<db>/meta/views/<name>.layout` (`base <real>`); with `retire`, **writes the new one before deleting the old** |
+| `fork_view` | new tree `<db>/meta/<name>.db` (plus `-wal`/`-shm`) + `<db>/meta/views/<name>.layout`, and updates the cross-view ledger `refs.db` |
+| `remove_view` | deletes the `.layout`; if the slot was a fork, also deletes its `meta/<name>.db*` and runs `rebuild_ledger` |
+| `preview_rules` / `validate_definition` / the three read-only probes | **write nothing** |
 
-## 8. CLI 对照（同一套库函数、同一套拒绝文案）
+## 8. CLI cross-reference (same library functions, same refusal texts)
 
-| MCP 工具 | CLI 等价 |
+| MCP tool | CLI equivalent |
 |---|---|
 | `list_views` | `grovefs view list` |
-| `define_derived_view` | `grovefs view define --name N --base B --rules F`（规则走**文件**，不是内联文本） |
+| `define_derived_view` | `grovefs view define --name N --base B --rules F` (rules come from a **file**, not inline text) |
 | `alias_view` | `grovefs view alias --name N --real R [--retire OLD]` |
 | `fork_view` | `grovefs view fork --name N --base B` |
 | `remove_view` | `grovefs view rm --name N` |
 
-**接口独有的四个**（CLI 无同名子命令；它们是 `grovefs::mcp` 里的只读探查 / 干跑库函数）：
-`get_view`、`list_view_tree`、`preview_rules`、`validate_definition`。CLI 侧近似做法：直接读
-`<db>/meta/views/<name>.layout`；先 `mount --layout FILE` 临时挂一副透镜看形状；非法规则在
-`view define` 处 fail-fast ——而接口能在**不落盘**的前提下拿到同一判决。
+**Four interface-only calls** (no same-named CLI subcommand; they are read-only
+probe / dry-run library functions in `grovefs::mcp`):
+`get_view`, `list_view_tree`, `preview_rules`, `validate_definition`. The
+approximate CLI equivalents: read `<db>/meta/views/<name>.layout` directly;
+temporarily `mount --layout FILE` to see a lens's shape; illegal rules fail fast
+at `view define` — whereas the interface reaches the same verdict **without
+touching disk**.
 
-**只有 CLI 有、MCP 没有的**（别在接口里找）：`init` / `view create`（建物理基）、`mount` / `umount`、
-`import`（零拷贝登记存量）、`view export` / `view import`（单视图命名空间跨机搬运）、
-`apikey *`（铸 key、scope、审计回读、撤销）、`meta-server` / `data-server`、条带/HA/GC。
-接口 = `grovefs view` 的同一套治理，**智能体做不出 CLI 做不出的事，也绕不过任何守卫**。
+**CLI-only, not in MCP** (don't look for them here): `init` / `view create`
+(building physical bases), `mount` / `umount`, `import` (zero-copy registration
+of existing data), `view export` / `view import` (cross-machine namespace
+transfer for one view), `apikey *` (minting keys, scopes, audit read-back,
+revocation), `meta-server` / `data-server`, striping / HA / GC.
+The interface = the same governance as `grovefs view`; **an agent can do nothing
+the CLI cannot, and bypass no guard**.
 
-> 名字对照提醒：CLI 侧另有 `grovefs view import`（把某视图的**元数据命名空间**从 JSONL 导入本存储根，跨机搬迁用）；
-> 它与数据面的 `grovefs import --view V --source DIR`（存量字节零拷贝登记）**同名不同义**。两者都不在 MCP 工具面里。
+> Naming caution: the CLI also has `grovefs view import` (importing one view's
+> **metadata namespace** from JSONL into this store root, for cross-machine
+> moves); it shares a name with the data-plane
+> `grovefs import --view V --source DIR` (zero-copy registration of existing
+> bytes) but means something else. Neither is in the MCP tool surface.
 
-## 9. 常见故障 → 处置
+## 9. Common failures → what to do
 
-| 现象 | 原因 | 处置 |
+| Symptom | Cause | Remedy |
 |---|---|---|
-| 拉起即 `-32001` | 服务端 `--require-api-key`，客户端没在 `initialize` 带 `apiKey` | 用 `grovefs apikey create --label agent --for mcp` 铸 key（明文只打印一次），放进 `initialize.params.apiKey` 或服务端 `GROVEFS_MCP_API_KEY` |
-| 鉴不上：`invalid api key id` / `invalid api key secret` / `has been revoked` | 明文抄错、被撤销、或 id:secret 拼错 | `grovefs apikey list` 对 id，必要时重铸 |
-| 鉴不上但 key 有效 | scope 不含 MCP 平面 | 重铸为 `--for mcp`（或 `--for any`）；`--for mount` 的 key 开不了治理接口 |
-| `no local metadata tree for view 'X' … LOCAL SQLite store only` | `list_view_tree` 只走本地 `meta/X.db`，远端/PG 后端不被遍历 | 在存储机上用 CLI，或本地留一份元数据（`view import`） |
-| `no physical base tree … PostgreSQL-backed view cannot be forked` | fork 需要本地 SQLite 裸基 | 先 `grovefs --home H init/view create --view B`，或改用派生视图 |
-| 写完 `.layout` 但挂载仍是旧形状 | 本地裸挂载挂载时解析一次 | 重挂；经 `meta-server` 的挂载则在 ≤2s 内自动换形 |
-| `list_view_tree` 回 `truncated:true` | 命中 `depth`(6)/`max`(800) 界 | 用 `path` 下钻分段，或调大 `depth`/`max` |
-| 发通知后一直等回包卡住 | 无 id 帧按设计不作答 | 只发不带等待；等应答只对带 id 的请求 |
+| `-32001` right at startup | server ran with `--require-api-key`, client sent no `apiKey` in `initialize` | mint a key with `grovefs apikey create --label agent --for mcp` (plaintext printed once), put it in `initialize.params.apiKey` or export `GROVEFS_MCP_API_KEY` on the server |
+| Auth fails: `invalid api key id` / `invalid api key secret` / `has been revoked` | plaintext transcribed wrong, revoked, or id:secret pasted incorrectly | match the id via `grovefs apikey list`; re-mint if needed |
+| Auth fails though the key is valid | scope does not include the MCP plane | re-mint with `--for mcp` (or `--for any`); a `--for mount` key cannot open the governance interface |
+| `no local metadata tree for view 'X' … LOCAL SQLite store only` | `list_view_tree` only walks local `meta/X.db`; remote/PG-backed trees are not walked | use the CLI on the store machine, or keep a local metadata copy (`view import`) |
+| `no physical base tree … PostgreSQL-backed view cannot be forked` | fork needs a local SQLite bare base | first `grovefs --home H init/view create --view B`, or use a derived view instead |
+| Wrote the `.layout` but the mount still shows the old shape | a bare local mount resolves its definition once at mount time | remount; mounts through `meta-server` reshape themselves within ≤2s |
+| `list_view_tree` answers `truncated:true` | hit the `depth`(6)/`max`(800) bounds | drill down with `path` in segments, or raise `depth`/`max` |
+| Hangs waiting for a reply after sending a notification | id-less frames are never answered by design | send notifications without waiting; only await replies for requests with an id |

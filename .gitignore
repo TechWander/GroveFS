@@ -12,7 +12,9 @@
 /.demo_real/
 /.demo_srv/
 /.etest/
+/.ftest/
 /.fresh/
+/.migtest/
 /.ha/
 /.ha_sync_test/
 /.locks/
@@ -22,7 +24,6 @@
 /.striping/
 /.test/
 /.xtest/
-/.acl/
 /.pgtest/
 /.pgtest2/
 /.ltest/
@@ -35,6 +36,7 @@
 /.apitest/
 /.demomcp/
 /.mcptest/
+/.mktest/
 
 # .build-bin tracks the test/bench scripts and the pkg-config wrapper,
 # but never its run output or captured logs.

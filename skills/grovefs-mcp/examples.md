@@ -1,19 +1,24 @@
-# 真实回显样例
+# Real Transcripts
 
-下面全部是本仓库上跑出来的原始输出（二进制 `./target/release/grovefs`，协议 `2025-06-18`），
-不是我拼的示例。标注 `[stderr]` 的行是客户端脚本的诊断输出，不属于协议帧。
+Everything below is raw output produced against this repository (binary
+`./target/release/grovefs`, protocol `2025-06-18`) — not hand-written examples.
+Lines marked `[stderr]` are diagnostics from the client script, not protocol
+frames.
 
-样例存储根由 CLI 造出（MCP 不建物理基视图）：
+The sample store root was built with the CLI (the MCP entrance never creates
+physical base views):
 
 ```bash
 grovefs --home <D>/store import --view team --source <D>/seeds
 # imported into view 'team' under /seeds: 4 dir(s), 3 object(s) (3 hardlinked zero-copy, 0 copied), 0 skipped, 0 failed
 ```
 
-注意 `import` 把源目录**整体挂在 `/seeds` 下**，所以真实显示路径是 `/seeds/photos/private` 而不是
-`/photos/private`。**这就是为什么规则必须照 `list_view_tree` 的回包写，不能照源目录结构猜。**
+Note that `import` nests the source directory **under `/seeds`**, so the real
+display path is `/seeds/photos/private`, not `/photos/private`.
+**This is exactly why rules must be written from a `list_view_tree` response and
+never guessed from the source directory layout.**
 
-## 1. 一副只读透镜：看 → 写规则 → 发布 → 复核
+## 1. One read-only lens: look → write rules → publish → verify
 
 ```bash
 python3 scripts/mcp_call.py --db-path <D>/store call list_view_tree '{"view":"team"}'
@@ -40,10 +45,12 @@ python3 scripts/mcp_call.py --db-path <D>/store call list_view_tree '{"view":"te
 }
 ```
 
-`size` 是元数据里的 `size` 字段，**不是文件字节数**：遍历不向数据面问对象长度，
-所以目录回 `4096`（stat 占位）、文件回 `0`、软链回 target 文本的字符长度。
-工具描述与 `initialize` 的 `instructions` 已把这个口径写清；要真实大小请挂载后 `stat`，
-别拿这个字段当用量或校验。
+`size` is the `size` field in the metadata, **not a file's byte count**: the walk
+never asks the data plane for object lengths, so dirs answer `4096` (the stat
+placeholder), files answer `0`, and symlinks answer their target's character
+length. The tool description and the `initialize` `instructions` both state this
+explicitly; mount and `stat` for real sizes, and never use this field for usage
+or checksums.
 
 ```bash
 python3 scripts/mcp_call.py --db-path <D>/store --quiet \
@@ -76,9 +83,10 @@ python3 scripts/mcp_call.py --db-path <D>/store --quiet call list_view_tree '{"v
 }
 ```
 
-`/seeds/photos` 还在、它底下的 `private` 没了 —— 这就是挂载将看到的形状。同一形状也能作为资源取到（§4）。
+`/seeds/photos` is still there and the `private` under it is gone — this is the
+shape a mount will show. The same shape is also available as a resource (§4).
 
-## 2. 拒绝长什么样（`isError`，不是协议错误）
+## 2. What a refusal looks like (`isError`, not a protocol error)
 
 ```bash
 ... call preview_rules '{"rules":"bog /x"}'
@@ -101,9 +109,10 @@ derived view name must differ from its base
 no local metadata tree for view 'ghost' (.migtest/skill/store/meta/ghost.db) — list_view_tree introspects a LOCAL SQLite store only; a remote/PG-backed tree is not walked here
 ```
 
-这三条的文案与 `grovefs view …` 完全相同（同一套库函数）。客户端脚本把它们当 exit code 3 上报，而不是崩溃。
+All three texts are identical to what `grovefs view …` prints (same library
+functions). The client script reports them as exit code 3 instead of crashing.
 
-## 3. 裸帧（不经任何客户端库）
+## 3. Raw frames (no client library at all)
 
 ```bash
 printf '%s\n%s\n%s\n' \
@@ -113,17 +122,19 @@ printf '%s\n%s\n%s\n' \
  | grovefs mcp --db-path <D>/store
 ```
 
-回帧只有两条——`notifications/initialized` **没有回包**，这是设计而非丢包：
+Only two frames come back — `notifications/initialized` **gets no reply**, by
+design rather than by packet loss:
 
 ```
 {"id":1,"jsonrpc":"2.0","result":{"capabilities":{"completions":{},"logging":{},"prompts":{"listChanged":false},"resources":{"listChanged":false,"subscribe":false},"tools":{"listChanged":false}},"instructions":"Customize data listings by governing SERVER-SIDE views over one store. …","protocolVersion":"2025-06-18","serverInfo":{"name":"grovefs","title":"GroveFS view governance","version":"0.1.0"}}}
 {"id":2,"jsonrpc":"2.0","result":{"content":[{"text":"{\n  \"db_path\": \".migtest/skill/store\",\n  \"defined\": [\n    {\n      \"hide\": 1,\n      \"kind\": \"derived\",\n      \"line\": \"view 'release' -> base 'team': 1 hide, 0 only, 0 reloc rule(s) (read-only)\",\n      \"mount\": \"read-only (derived)\",\n      \"name\": \"release\",\n ...
 ```
 
-`initialize` 结果里的 `instructions` 就是服务端自带的操作手册；MCP 客户端会把它注入上下文，
-所以本 skill 不重复它的措辞。
+The `instructions` field in the `initialize` result is the server's own
+operating manual; MCP clients inject it into context, so this skill does not
+repeat its wording.
 
-## 4. 资源 / 补全 / 日志推送
+## 4. Resources / completion / log pushes
 
 ```bash
 ... read grovefs://view/release/definition
@@ -140,7 +151,7 @@ printf '%s\n%s\n%s\n' \
 }
 ```
 
-要内容得先剥一层 `contents[0].text`（它本身才是 JSON 文本）。
+You must peel `contents[0].text` first (that inner string is the JSON payload).
 
 ```bash
 ... complete base 'r'
@@ -150,7 +161,7 @@ printf '%s\n%s\n%s\n' \
 ```
 
 ```bash
-... setlevel warning call list_view_tree '{"view":"ghost"}'      # 被拒的调用
+... setlevel warning call list_view_tree '{"view":"ghost"}'      # a refused call
 ```
 ```
 [stderr] [setlevel] warning — later calls may push notifications/message
@@ -158,10 +169,12 @@ printf '%s\n%s\n%s\n' \
 [stderr] the tool refused this call (isError) — not a protocol error
 ```
 
-阈值设 `warning` 时，**成功的调用不会有推送**（`info` 达不到门限）——别把「没推送」当成「没执行」。
-推送帧排在应答**之后**，所以客户端要能读到它（本目录的 `mcp_call.py` 在拿到应答后再排空一小段）。
+With the threshold at `warning`, **successful calls push nothing** (`info` does
+not reach the gate) — never read "no push" as "not executed". Push frames are
+written **after** the response, so the client must keep reading (the
+`mcp_call.py` in this directory drains a short window after each answer).
 
-## 5. 一视图一公开名，以及无缝轮换
+## 5. One public name per view, and gapless rotation
 
 ```bash
 ... call alias_view '{"name":"team-public","real":"team"}'
@@ -172,19 +185,20 @@ note: 'team' is no longer a mount entry point while this definition exists (moun
 ```
 
 ```bash
-... call alias_view '{"name":"team-2","real":"team"}'            # 想再加一个公开名
+... call alias_view '{"name":"team-2","real":"team"}'            # trying to add a second public name
 ```
 ```
 real view 'team' is already governed by alias 'team-public' — one public name per real view; to rotate it gaplessly use `grovefs view alias --name team-2 --real team --retire team-public`
 ```
 
-正确做法是把旧名一起撤掉（先写后删，公开名不断档）：
+The correct move retires the old name in the same call (write-before-remove, so
+the public name never has a gap):
 
 ```bash
 ... call alias_view '{"name":"team-public2","real":"team","retire":"team-public"}'
 ```
 
-## 6. 上门（`--require-api-key`）与审计
+## 6. The gate (`--require-api-key`) and the audit
 
 ```bash
 python3 scripts/mcp_call.py --db-path <D>/store --server-arg --require-api-key list
@@ -194,23 +208,28 @@ python3 scripts/mcp_call.py --db-path <D>/store --server-arg --require-api-key l
 [stderr]   → this entrance is gated: present apiKey in initialize params (--api-key ID:SECRET) or export GROVEFS_MCP_API_KEY for the server
 ```
 
-带凭据即可（key 用 CLI 铸，明文只出现一次）：
+Presenting a credential works (mint the key via the CLI; the plaintext appears
+once):
 
 ```bash
 grovefs apikey --db-path <D>/store create --label agent --for mcp     # → "<id>:<secret>"
-python3 scripts/mcp_call.py --db-path <D>/store --server-arg --require-api-key --api-key '<id>:<secret>' list   # 正常出 9 个工具
-grovefs apikey --db-path <D>/store calls                              # 被拒的 tools/list 也在审计里
+python3 scripts/mcp_call.py --db-path <D>/store --server-arg --require-api-key --api-key '<id>:<secret>' list   # normal 9-tool answer
+grovefs apikey --db-path <D>/store calls                              # the refused tools/list is in the audit too
 ```
 
-## 7. 接线自检
+## 7. Wiring self-test
 
-`bash scripts/smoke.sh` 会在 `mktemp -d` 的临时存储根上跑完整流程（发现 → 预览 → 干跑 → 发布 →
-复核 → 守卫 → 别名轮换 → fork → 资源/提示/补全 → 日志 → 清理 → API key 门与审计），逐条打印断言：
+`bash scripts/smoke.sh` runs the full workflow on a `mktemp -d` throwaway store
+root (discover → preview → dry-run → publish → verify → guards → alias rotation
+→ fork → resources/prompts/completion → logging → cleanup → API-key gate and
+audit), printing every assertion:
 
 ```
-SUMMARY: pass=40 fail=0
+SUMMARY: pass=43 fail=0
 ALL MCP CHECKS PASSED
 ```
 
-任何一条 `FAIL:` 都是**这个 skill 与实现的约定被破坏**的信号（实现改了文案、或客户端发帧方式不对），
-不是数据问题：脚本从不碰真实存储根，跑完即删。
+Any `FAIL:` line means **the contract between this skill and the implementation
+has been broken** (the implementation changed a wording, or the client framing
+here is wrong) — it is never a data problem: the script never touches a real
+store root and deletes its temp dir on exit.

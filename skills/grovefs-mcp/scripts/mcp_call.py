@@ -50,10 +50,15 @@ def die(msg, code):
 
 
 def find_binary(explicit):
+    # The skill lives at <repo>/skills/grovefs-mcp/scripts/, so the release
+    # binary is two levels above the script's directory; the cwd-relative
+    # candidates cover invocations from the repo root or an install prefix.
+    here = os.path.dirname(os.path.abspath(__file__))
     for cand in (
         explicit,
         os.environ.get("GROVEFS_BIN"),
         shutil.which("grovefs"),
+        os.path.join(here, "..", "..", "target", "release", "grovefs"),
         "./target/release/grovefs",
         "../release/grovefs",
     ):
