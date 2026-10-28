@@ -114,7 +114,7 @@ pub struct LayoutRules {
     pub reloc: Vec<Reloc>,
 }
 
-/// What a server-side `<db-path>/meta/views/<name>.layout` declares. The two
+/// What a server-side `<db-path>/meta/views/<name>.layout` declares. The
 /// shapes share one file slot and are mutually exclusive per entry:
 /// - [`ViewDef::Derived`]: first line `base <physical view>` plus rule verbs
 ///   — a centrally defined virtual shape; mounts are READ-ONLY (every write
@@ -124,10 +124,17 @@ pub struct LayoutRules {
 ///   WRITABLE, and the real name stops being mountable through a
 ///   `meta-server` (name governance, so public names can rotate without
 ///   exposing storage identity).
+/// - [`ViewDef::Fork`]: a lone `fork <physical view>` line, no rules — an
+///   INDEPENDENT metadata tree seeded from the base view at creation time
+///   (`<db-path>/meta/<name>.db`, content bytes shared through the cross-view
+///   ledger). Structure (mkdir/rename/unlink) is writable; CONTENT writes are
+///   refused, and a delete removes only this view's names — the base's tree
+///   and the shared bytes are untouched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ViewDef {
     Derived(String, LayoutRules),
     Alias(String),
+    Fork(String),
 }
 
 /// Normalize an absolute rule path: `/a//b/` -> `/a/b`; root is `/`.
@@ -219,8 +226,12 @@ impl LayoutRules {
                     }
                 }
                 "map" | "link" => {
-                    let f = it.next().ok_or_else(|| format!("'{verb}' needs <src> <dst>"))?;
-                    let t = it.next().ok_or_else(|| format!("'{verb}' needs <src> <dst>"))?;
+                    let f = it
+                        .next()
+                        .ok_or_else(|| format!("'{verb}' needs <src> <dst>"))?;
+                    let t = it
+                        .next()
+                        .ok_or_else(|| format!("'{verb}' needs <src> <dst>"))?;
                     if it.next().is_some() {
                         return err(format!("'{verb}' takes exactly two paths"));
                     }
@@ -232,7 +243,11 @@ impl LayoutRules {
                     if r.reloc.iter().any(|x| x.to == to) {
                         return err(format!("destination '{to}' used by two rules"));
                     }
-                    r.reloc.push(Reloc { from, to, keep_src: verb == "link" });
+                    r.reloc.push(Reloc {
+                        from,
+                        to,
+                        keep_src: verb == "link",
+                    });
                 }
                 other => return err(format!("unknown layout verb '{other}'")),
             }
@@ -260,9 +275,14 @@ impl LayoutRules {
             if line.starts_with("base ") || line.starts_with("base\t") {
                 let mut it = line.split_whitespace();
                 it.next().unwrap();
-                let b = it.next().ok_or_else(|| format!("line {}: 'base' needs a view name", ln + 1))?;
+                let b = it
+                    .next()
+                    .ok_or_else(|| format!("line {}: 'base' needs a view name", ln + 1))?;
                 if it.next().is_some() {
-                    return Err(format!("line {}: 'base' takes exactly one view name", ln + 1));
+                    return Err(format!(
+                        "line {}: 'base' takes exactly one view name",
+                        ln + 1
+                    ));
                 }
                 if base.is_some() {
                     return Err(format!("line {}: duplicate 'base' directive", ln + 1));
@@ -287,8 +307,8 @@ impl LayoutRules {
         Self::parse_view(&text)
     }
 
-    /// Parse a server-side named-view definition in either of its TWO
-    /// governance shapes (they are mutually exclusive in one file):
+    /// Parse a server-side named-view definition in one of its THREE
+    /// governance shapes (mutually exclusive in one file):
     /// - `base <view>` + rule verbs → a DERIVED (virtual) view: centrally
     ///   shaped, mounted READ-ONLY.
     /// - `alias <view>` alone → a PURE ALIAS: the externally used name maps
@@ -296,8 +316,12 @@ impl LayoutRules {
     ///   a `meta-server` then refuses mounts of the real name itself, so
     ///   public names can be renamed freely while the storage identity
     ///   stays unexposed ("the name is the alias, the mapping is the entry").
+    /// - `fork <view>` alone → a FORK: an independent metadata tree seeded
+    ///   from the base at creation; structure writable, content read-only,
+    ///   deletes remove only this view's names.
     pub fn parse_def(text: &str) -> Result<ViewDef, String> {
         let mut alias: Option<String> = None;
+        let mut fork: Option<String> = None;
         let mut has_base = false;
         let mut rules_seen = false;
         for (ln, raw) in text.lines().enumerate() {
@@ -312,13 +336,40 @@ impl LayoutRules {
                     .next()
                     .ok_or_else(|| format!("line {}: 'alias' needs a view name", ln + 1))?;
                 if it.next().is_some() {
-                    return Err(format!("line {}: 'alias' takes exactly one view name", ln + 1));
+                    return Err(format!(
+                        "line {}: 'alias' takes exactly one view name",
+                        ln + 1
+                    ));
                 }
                 if !valid_view_name(v) {
                     return Err(format!("line {}: invalid view name '{v}'", ln + 1));
                 }
                 if alias.replace(v.to_string()).is_some() {
-                    return Err(format!("line {}: at most one `alias` line per definition", ln + 1));
+                    return Err(format!(
+                        "line {}: at most one `alias` line per definition",
+                        ln + 1
+                    ));
+                }
+            } else if line.starts_with("fork ") || line.starts_with("fork\t") {
+                let mut it = line.split_whitespace();
+                it.next().unwrap();
+                let v = it
+                    .next()
+                    .ok_or_else(|| format!("line {}: 'fork' needs a view name", ln + 1))?;
+                if it.next().is_some() {
+                    return Err(format!(
+                        "line {}: 'fork' takes exactly one view name",
+                        ln + 1
+                    ));
+                }
+                if !valid_view_name(v) {
+                    return Err(format!("line {}: invalid view name '{v}'", ln + 1));
+                }
+                if fork.replace(v.to_string()).is_some() {
+                    return Err(format!(
+                        "line {}: at most one `fork` line per definition",
+                        ln + 1
+                    ));
                 }
             } else if line.starts_with("base ") || line.starts_with("base\t") {
                 has_base = true;
@@ -326,17 +377,31 @@ impl LayoutRules {
                 rules_seen = true;
             }
         }
-        match (alias, has_base) {
-            (Some(v), false) => {
+        match (alias, fork, has_base) {
+            (Some(v), None, false) => {
                 if rules_seen {
-                    return Err("`alias` definitions carry no rule lines (use `base` for a shaped view)".to_string());
+                    return Err(
+                        "`alias` definitions carry no rule lines (use `base` for a shaped view)"
+                            .to_string(),
+                    );
                 }
                 Ok(ViewDef::Alias(v))
             }
-            (None, true) => Self::parse_view(text).map(|(b, r)| ViewDef::Derived(b, r)),
-            (Some(_), true) => Err("definition has both `alias` and `base` lines".to_string()),
-            (None, false) => Err(
-                "view definition needs a `base <view>` or `alias <view>` line".to_string(),
+            (None, Some(v), false) => {
+                if rules_seen {
+                    return Err("`fork` definitions carry no rule lines (a fork is an independent tree, not a lens)".to_string());
+                }
+                Ok(ViewDef::Fork(v))
+            }
+            (None, None, true) => Self::parse_view(text).map(|(b, r)| ViewDef::Derived(b, r)),
+            (Some(_), Some(_), _) => {
+                Err("definition has both `alias` and `fork` lines".to_string())
+            }
+            (Some(_), _, true) => Err("definition has both `alias` and `base` lines".to_string()),
+            (_, Some(_), true) => Err("definition has both `fork` and `base` lines".to_string()),
+            (None, None, false) => Err(
+                "view definition needs a `base <view>`, `alias <view>` or `fork <view>` line"
+                    .to_string(),
             ),
         }
     }
@@ -379,8 +444,7 @@ impl LayoutRules {
         if self.only.is_empty() {
             return true;
         }
-        self.only.iter().any(|s| is_anc(s, p))
-            || self.reloc.iter().any(|r| is_anc(&r.from, p))
+        self.only.iter().any(|s| is_anc(s, p)) || self.reloc.iter().any(|r| is_anc(&r.from, p))
     }
 
     /// Is this source path the `from` of a `map` (non-alias) relocation? Its
@@ -441,7 +505,9 @@ impl LayoutMeta {
                 cur = jjoin(&cur, c);
             }
             if let Some(leaf) = comps.last() {
-                trie.entry(cur).or_default().insert(leaf.to_string(), r.from.clone());
+                trie.entry(cur)
+                    .or_default()
+                    .insert(leaf.to_string(), r.from.clone());
             }
         }
         Self {
@@ -511,7 +577,8 @@ impl LayoutMeta {
         }
         {
             let mut st = self.st.lock();
-            st.resolve.insert(path.to_string(), (Instant::now(), Some(cur)));
+            st.resolve
+                .insert(path.to_string(), (Instant::now(), Some(cur)));
             for (ino, p) in chain {
                 st.src_path.insert(ino, (Instant::now(), p));
             }
@@ -605,7 +672,13 @@ impl LayoutMeta {
     /// override so `..` and attrs stay inside the lens even on later
     /// by-inode calls; `link` aliases keep their source identity persistent
     /// (the entry is genuinely visible in both places).
-    fn leaf_node(&self, src_path: &str, name: &str, parent_ino: i64, parent_disp: &str) -> Option<NodeInfo> {
+    fn leaf_node(
+        &self,
+        src_path: &str,
+        name: &str,
+        parent_ino: i64,
+        parent_disp: &str,
+    ) -> Option<NodeInfo> {
         let ino = self.resolve_src(src_path)?;
         let mut n = self.inner.getattr(ino)?;
         n.name = name.to_string();
@@ -633,7 +706,11 @@ impl LayoutMeta {
         }
         let mut st = self.st.lock();
         if let Some(&v) = st.virt_by_path.get(cp) {
-            let (p, pi) = st.virt_by_ino.get(&v).cloned().unwrap_or_else(|| (cp.to_string(), parent_ino));
+            let (p, pi) = st
+                .virt_by_ino
+                .get(&v)
+                .cloned()
+                .unwrap_or_else(|| (cp.to_string(), parent_ino));
             return Self::synth_dir(v, basename(&p), pi, self.uid, self.gid, self.born);
         }
         let v = st.next_vino;
@@ -668,7 +745,14 @@ impl LayoutMeta {
     fn virt_get(&self, ino: i64) -> Option<NodeInfo> {
         let st = self.st.lock();
         let (p, parent) = st.virt_by_ino.get(&ino).cloned()?;
-        Some(Self::synth_dir(ino, basename(&p), parent, self.uid, self.gid, self.born))
+        Some(Self::synth_dir(
+            ino,
+            basename(&p),
+            parent,
+            self.uid,
+            self.gid,
+            self.born,
+        ))
     }
 
     /// True when (parent, name) is occupied by a LENS rule at the display
@@ -690,8 +774,15 @@ impl LayoutMeta {
                 None => return false,
             }
         };
-        self.trie.get(&dp).map(|m| m.contains_key(name)).unwrap_or(false)
-            || self.vdirs.get(&dp).map(|v| v.iter().any(|d| d == name)).unwrap_or(false)
+        self.trie
+            .get(&dp)
+            .map(|m| m.contains_key(name))
+            .unwrap_or(false)
+            || self
+                .vdirs
+                .get(&dp)
+                .map(|v| v.iter().any(|d| d == name))
+                .unwrap_or(false)
     }
 
     /// Translate a *display* (parent_ino, name) that may address a relocated
@@ -700,7 +791,10 @@ impl LayoutMeta {
     fn translate_entry(&self, parent: i64, name: &str) -> Result<Option<(i64, String)>, MetaError> {
         let dp = if self.is_virtual(parent) {
             let st = self.st.lock();
-            st.virt_by_ino.get(&parent).map(|x| x.0.clone()).ok_or(MetaError::NotFound)?
+            st.virt_by_ino
+                .get(&parent)
+                .map(|x| x.0.clone())
+                .ok_or(MetaError::NotFound)?
         } else if parent == ROOT_INO {
             "/".to_string()
         } else {
@@ -712,7 +806,12 @@ impl LayoutMeta {
             let sin = self.resolve_src(&sdir).ok_or(MetaError::NotFound)?;
             return Ok(Some((sin, sname)));
         }
-        if self.vdirs.get(&dp).map(|v| v.iter().any(|d| d == name)).unwrap_or(false) {
+        if self
+            .vdirs
+            .get(&dp)
+            .map(|v| v.iter().any(|d| d == name))
+            .unwrap_or(false)
+        {
             // Refusing to unlink/rmdir lens scaffolding: it has no source row.
             return Err(MetaError::OpNotPermitted);
         }
@@ -721,7 +820,13 @@ impl LayoutMeta {
 
     /// Children a rule dictionary owes under this display path, appended to
     /// `out` (deduplicated by `seen`). Used by both readdir and lookup sides.
-    fn rule_children(&self, dp: &str, parent_ino: i64, out: &mut Vec<NodeInfo>, seen: &mut HashSet<String>) {
+    fn rule_children(
+        &self,
+        dp: &str,
+        parent_ino: i64,
+        out: &mut Vec<NodeInfo>,
+        seen: &mut HashSet<String>,
+    ) {
         if let Some(m) = self.trie.get(dp) {
             for (name, sp) in m {
                 if seen.contains(name) {
@@ -755,19 +860,33 @@ impl MetaProvider for LayoutMeta {
             if let Some(sp) = self.trie.get(&pv).and_then(|m| m.get(name)) {
                 return self.leaf_node(sp, name, parent, &pv);
             }
-            if self.vdirs.get(&pv).map(|v| v.iter().any(|d| d == name)).unwrap_or(false) {
+            if self
+                .vdirs
+                .get(&pv)
+                .map(|v| v.iter().any(|d| d == name))
+                .unwrap_or(false)
+            {
                 let cp = jjoin(&pv, name);
                 return Some(self.vdir_node(&cp, parent));
             }
             return None;
         }
-        let dp = if parent == ROOT_INO { "/".to_string() } else { self.disp_path_of(parent)? };
+        let dp = if parent == ROOT_INO {
+            "/".to_string()
+        } else {
+            self.disp_path_of(parent)?
+        };
         // a) relocated display leaf wins over whatever the source holds here.
         if let Some(sp) = self.trie.get(&dp).and_then(|m| m.get(name)) {
             return self.leaf_node(sp, name, parent, &dp);
         }
         // b) synthesized intermediate dir of some destination path.
-        if self.vdirs.get(&dp).map(|v| v.iter().any(|d| d == name)).unwrap_or(false) {
+        if self
+            .vdirs
+            .get(&dp)
+            .map(|v| v.iter().any(|d| d == name))
+            .unwrap_or(false)
+        {
             let cp = jjoin(&dp, name);
             return Some(self.vdir_node(&cp, parent));
         }
@@ -853,8 +972,16 @@ impl MetaProvider for LayoutMeta {
             let child_src = jjoin(&sp, &n.name);
             // Filtered away, or replaced by a rule of the same display name.
             if self.rules.blocked_src(&child_src)
-                || self.trie.get(&dp).map(|m| m.contains_key(&n.name)).unwrap_or(false)
-                || self.vdirs.get(&dp).map(|v| v.iter().any(|d| *d == n.name)).unwrap_or(false)
+                || self
+                    .trie
+                    .get(&dp)
+                    .map(|m| m.contains_key(&n.name))
+                    .unwrap_or(false)
+                || self
+                    .vdirs
+                    .get(&dp)
+                    .map(|v| v.iter().any(|d| *d == n.name))
+                    .unwrap_or(false)
             {
                 continue;
             }
@@ -904,14 +1031,23 @@ impl MetaProvider for LayoutMeta {
         if !self.rules.writable_src(&jjoin(&sp, name)) {
             return Err(MetaError::OpNotPermitted);
         }
-        let r = self.inner.create_node(parent, name, is_dir, data_ref, mode, uid, gid);
+        let r = self
+            .inner
+            .create_node(parent, name, is_dir, data_ref, mode, uid, gid);
         if r.is_ok() {
             self.invalidate();
         }
         r
     }
 
-    fn create_symlink(&self, parent: i64, name: &str, target: &str, uid: u32, gid: u32) -> Result<i64, MetaError> {
+    fn create_symlink(
+        &self,
+        parent: i64,
+        name: &str,
+        target: &str,
+        uid: u32,
+        gid: u32,
+    ) -> Result<i64, MetaError> {
         if self.is_virtual(parent) {
             return Err(MetaError::OpNotPermitted);
         }
@@ -965,7 +1101,14 @@ impl MetaProvider for LayoutMeta {
         Ok(r)
     }
 
-    fn rename(&self, parent: i64, name: &str, new_parent: i64, new_name: &str, noreplace: bool) -> Result<Option<String>, MetaError> {
+    fn rename(
+        &self,
+        parent: i64,
+        name: &str,
+        new_parent: i64,
+        new_name: &str,
+        noreplace: bool,
+    ) -> Result<Option<String>, MetaError> {
         if self.is_virtual(new_parent) {
             return Err(MetaError::OpNotPermitted);
         }
@@ -987,7 +1130,9 @@ impl MetaProvider for LayoutMeta {
         if !self.rules.writable_src(&jjoin(&sp, new_name)) {
             return Err(MetaError::OpNotPermitted);
         }
-        let r = self.inner.rename(fp, &fname, new_parent, new_name, noreplace)?;
+        let r = self
+            .inner
+            .rename(fp, &fname, new_parent, new_name, noreplace)?;
         self.invalidate();
         Ok(r)
     }
@@ -1013,13 +1158,29 @@ impl MetaProvider for LayoutMeta {
         }
     }
 
-    fn lock_op(&self, ino: i64, owner: u64, start: u64, end: u64, ty: LockType, pid: u32, sid: u64) -> Result<Option<LockConflict>, MetaError> {
+    fn lock_op(
+        &self,
+        ino: i64,
+        owner: u64,
+        start: u64,
+        end: u64,
+        ty: LockType,
+        pid: u32,
+        sid: u64,
+    ) -> Result<Option<LockConflict>, MetaError> {
         if self.is_virtual(ino) {
             return Err(MetaError::NotFound);
         }
         self.inner.lock_op(ino, owner, start, end, ty, pid, sid)
     }
-    fn get_lock(&self, ino: i64, owner: u64, start: u64, end: u64, ty: LockType) -> Option<LockConflict> {
+    fn get_lock(
+        &self,
+        ino: i64,
+        owner: u64,
+        start: u64,
+        end: u64,
+        ty: LockType,
+    ) -> Option<LockConflict> {
         if self.is_virtual(ino) {
             return None;
         }
@@ -1141,6 +1302,24 @@ mod tests {
             LayoutRules::parse_def("base alice\nonly /docs\n"),
             Ok(ViewDef::Derived(b, _)) if b == "alice"
         ));
+    }
+
+    #[test]
+    fn parse_fork_definition() {
+        // FORK: one line, no rules — an independent tree seeded from a base.
+        let d = LayoutRules::parse_def("# private workspace\nfork team\n").unwrap();
+        assert_eq!(d, ViewDef::Fork("team".to_string()));
+        // A fork is not a lens: rules, a `base` line, or a second shape all clash.
+        assert!(LayoutRules::parse_def("fork team\nonly /docs\n").is_err());
+        assert!(LayoutRules::parse_def("fork team\nbase team\n").is_err());
+        assert!(LayoutRules::parse_def("fork a\nfork b\n").is_err());
+        assert!(LayoutRules::parse_def("alias a\nfork b\n").is_err());
+        assert!(LayoutRules::parse_def("fork").is_err());
+        assert!(LayoutRules::parse_def("fork a b").is_err());
+        assert!(LayoutRules::parse_def("fork ../x").is_err());
+        // The derived-view parser (used where only a lens makes sense) must not
+        // silently accept the fork verb.
+        assert!(LayoutRules::parse_view("fork team\n").is_err());
     }
 
     #[test]

@@ -12,14 +12,21 @@
 //!
 //! Wire framing reuses [`super::proto`] (fixed header + variable body, big-endian
 //! integers, one request/response per socket). Metadata adds a connection-level
-//! `M_OPEN` handshake that binds a socket to a view. Responses reuse the
+//! `M_OPEN` handshake that binds a socket to a view and admits the caller: the
+//! body carries `view`, the static cluster `token`, the self-reported `uid` and an
+//! optional per-caller `api_key` (a `grovefs apikey --for mount|any` credential,
+//! required only when the server runs `--require-api-key`). Responses reuse the
 //! `(status, val, data)` triple: for metadata `status` is 0 on success or a small
 //! [`MetaError`] code (1..7) — *not* an errno — and `data` carries serialized
-//! [`NodeInfo`].
+//! [`NodeInfo`]. On an [`E_AUTH`] refusal `data` instead spells out the cause, so a
+//! client can show the real reason (wrong token, unknown/revoked/scoped key,
+//! view-binding refusal) rather than guessing from the status code alone.
 
 use super::proto;
 use crate::layout::{LayoutMeta, LayoutRules, ViewDef};
-use crate::meta::{LockConflict, LockType, MetaEngine, MetaError, MetaProvider, MetaStore, NodeInfo, NodeKind};
+use crate::meta::{
+    LockConflict, LockType, MetaEngine, MetaError, MetaProvider, MetaStore, NodeInfo, NodeKind,
+};
 use crate::stats;
 use fuser::{INodeNo, Notifier};
 use libc::EIO;
@@ -95,9 +102,15 @@ const E_TYPEMISMATCH: i32 = 4;
 const E_NOTPERM: i32 = 5;
 const E_CYCLE: i32 = 6;
 const E_DB: i32 = 7;
-// Returned by the server on the M_OPEN handshake when the presented token does
-// not match the server's configured one. Not a MetaError code — it only ever
-// appears during connect, where the client maps it to a PermissionDenied error.
+// Returned by the server on the M_OPEN handshake (and mid-session, on a revoke
+// recheck) when the caller is not admitted: a token that does not match the
+// server's configured one, a missing/unknown/revoked/wrong-scope api key when
+// `--require-api-key` is on, or a view-bound key opening a view it is not
+// bound to. Not a
+// MetaError code — it only ever appears during connect (where the client maps it
+// to a PermissionDenied error) or as a refusal on an established session. The
+// `data` payload states the cause in plain text; an old server sends none, and
+// the client then falls back to the historical "rejected the access token" text.
 const E_AUTH: i32 = 8;
 // Returned by a HA *standby* (or a demoted ex-primary) for any write-intent op
 // while it is read-only. Not a MetaError code; the client reads it as a signal
@@ -180,6 +193,11 @@ fn err_from_code(c: i32) -> MetaError {
         E_TYPEMISMATCH => MetaError::TypeMismatch,
         E_NOTPERM => MetaError::OpNotPermitted,
         E_CYCLE => MetaError::BadParentCycle,
+        // A mid-session auth refusal (revoked key). Reported as a permission
+        // failure, not a db fault: the mount is already being torn down by
+        // [`RemoteMeta::note_refusal`], and `EPERM` is the honest answer for the
+        // op that lost its credential.
+        E_AUTH => MetaError::OpNotPermitted,
         _ => MetaError::Db("remote meta error".to_string()),
     }
 }
@@ -251,7 +269,12 @@ fn decode_lock_conflict(data: &[u8]) -> Option<LockConflict> {
     let end = proto::read_u64(data, &mut i).ok()?;
     let ty = LockType::from_u8(get_u8(data, &mut i).ok()?)?;
     let pid = proto::read_u32(data, &mut i).ok()?;
-    Some(LockConflict { start, end, ty, pid })
+    Some(LockConflict {
+        start,
+        end,
+        ty,
+        pid,
+    })
 }
 
 // --- NodeInfo (de)serialization --------------------------------------------
@@ -352,9 +375,17 @@ pub struct RemoteMeta {
     active: AtomicUsize,
     view: String,
     token: String,
-    /// Mount process uid presented on the `M_OPEN` handshake so the central
-    /// `meta-server` can apply the optional per-view uid whitelist
-    /// ([`crate::acl::AclStore']). Self-reported (advisory), not a hard identity.
+    /// API key (`<id>:<secret>`) presented on `M_OPEN` to a `meta-server`
+    /// started with `--require-api-key`; empty when the server is gated by the
+    /// static token (or by nothing).
+    api_key: String,
+    /// Set once the first `M_OPEN` has been accepted, so a later refusal is
+    /// recognized as an auth LOSS on a live mount (a revoke landing
+    /// mid-session) rather than a mount-setup configuration error.
+    opened: std::sync::atomic::AtomicBool,
+    /// Mount process uid presented on the `M_OPEN` handshake and recorded in
+    /// the server's call audit as the presenting identity. Self-reported
+    /// (advisory), not a hard identity — access control is the token / API-key gate.
     uid: u32,
     pool: Arc<Mutex<Vec<TcpStream>>>,
     max_conns: usize,
@@ -378,6 +409,11 @@ pub struct RemoteMeta {
     /// full `M_READDIR` per kernel buffer, no READDIRPLUS. Refreshed on every
     /// (re)handshake so a failover re-reads the cap from the live node.
     paged: AtomicU8,
+    /// Nonzero when the `M_OPEN` ack flagged a FORK view: its metadata tree is
+    /// writable (mkdir/rename/unlink) but CONTENT writes are refused with
+    /// EROFS, because the bytes are shared with the base view. Refreshed on
+    /// every (re)handshake; absent on an old server -> 0 (pre-fork behavior).
+    content_ro: AtomicU8,
 }
 
 impl RemoteMeta {
@@ -389,7 +425,7 @@ impl RemoteMeta {
     }
 
     /// The presenting uid: the mount process's real euid, reported to the
-    /// server's optional view whitelist.
+    /// server's call audit.
     fn self_uid() -> u32 {
         unsafe { libc::geteuid() }
     }
@@ -408,18 +444,30 @@ impl RemoteMeta {
 
     /// Like [`RemoteMeta::new_with_token`], but presents an explicit `uid` on the
     /// handshake (the `mount --as-uid` override) instead of the process euid, so
-    /// a shared meta-server can be exercised/used under a chosen whitelist slot.
-    pub fn new_with_token_uid(
+    /// a shared meta-server can be exercised/used under a chosen presenting uid.
+    pub fn new_with_token_uid(addr: &str, view: &str, token: &str, uid: u32) -> io::Result<Self> {
+        Self::new_with_creds(addr, view, token, uid, "")
+    }
+
+    /// Like [`RemoteMeta::new_with_token_uid`], but also presents `api_key`
+    /// (`<id>:<secret>`, from `grovefs apikey create --for mount`) in the
+    /// `M_OPEN` handshake — what a `meta-server --require-api-key` demands. The
+    /// server keeps re-verifying that key while the mount lives, so revoking it
+    /// closes established connections, not just new ones.
+    pub fn new_with_creds(
         addr: &str,
         view: &str,
         token: &str,
         uid: u32,
+        api_key: &str,
     ) -> io::Result<Self> {
         let this = Self {
             addrs: split_addrs(addr),
             active: AtomicUsize::new(0),
             view: view.to_string(),
             token: token.to_string(),
+            api_key: api_key.to_string(),
+            opened: std::sync::atomic::AtomicBool::new(false),
             uid,
             pool: Arc::new(Mutex::new(Vec::new())),
             max_conns: 32,
@@ -429,9 +477,11 @@ impl RemoteMeta {
             fence: Arc::new(AtomicU64::new(0)),
             readonly: AtomicU8::new(0),
             paged: AtomicU8::new(0),
+            content_ro: AtomicU8::new(0),
         };
         // Probe once (connect + handshake) so mount fails fast on a dead server.
         let (s, _) = this.connect_fresh()?;
+        this.opened.store(true, Ordering::SeqCst);
         this.put_conn(s);
         Ok(this)
     }
@@ -443,6 +493,15 @@ impl RemoteMeta {
     /// servers old enough to omit the handshake flag.
     pub fn is_readonly_view(&self) -> bool {
         self.readonly.load(Ordering::SeqCst) != 0
+    }
+
+    /// True when the bound view name is a FORK: its metadata tree is the
+    /// client's to organize (mkdir/rename/unlink are served), but CONTENT
+    /// writes (write/truncate) must be refused with EROFS because the bytes are
+    /// shared with the base view. Signalled by `M_OPEN` ack byte [2]; false for
+    /// physical/derived views and against servers old enough to omit it.
+    pub fn is_content_ro_view(&self) -> bool {
+        self.content_ro.load(Ordering::SeqCst) != 0
     }
 
     fn get_conn(&self) -> io::Result<(TcpStream, bool)> {
@@ -475,6 +534,7 @@ impl RemoteMeta {
                         proto::put_key(&mut body, &self.view);
                         proto::put_key(&mut body, &self.token);
                         proto::put_u32(&mut body, self.uid);
+                        proto::put_key(&mut body, &self.api_key);
                         let mut s = s;
                         match Self::call(&mut s, M_OPEN, &body) {
                             Ok((0, epoch, data)) => {
@@ -495,16 +555,32 @@ impl RemoteMeta {
                                 // not offered READDIRPLUS.
                                 self.paged
                                     .store(data.get(1).copied().unwrap_or(0), Ordering::SeqCst);
+                                // Third ack byte (if present) = FORK: structure
+                                // writable, content read-only (EROFS at the FUSE
+                                // layer). Absent on an old server -> fully writable.
+                                self.content_ro
+                                    .store(data.get(2).copied().unwrap_or(0), Ordering::SeqCst);
                                 self.active.store(idx, Ordering::Relaxed);
                                 return Ok((s, false));
                             }
-                            // A rejected token is a configuration error, not a
-                            // transient one — retrying or failing over can't fix it.
-                            Ok((E_AUTH, _, _)) => {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::PermissionDenied,
-                                    "meta-server rejected the access token",
-                                ));
+                            // A rejected credential is a configuration error, not
+                            // a transient one — retrying or failing over can't fix
+                            // it. The server's payload names the actual cause
+                            // (missing key / wrong secret / revoked / view not
+                            // admitted), so the operator sees that instead of E_AUTH.
+                            Ok((E_AUTH, _, reason)) => {
+                                let why = if reason.is_empty() {
+                                    "meta-server rejected the access token".to_string()
+                                } else {
+                                    String::from_utf8_lossy(&reason).into_owned()
+                                };
+                                // Accepted at setup, refused now: the credential
+                                // died mid-session. Ask for a clean unmount rather
+                                // than serving a mount that can never succeed.
+                                if self.opened.load(Ordering::SeqCst) {
+                                    super::signal_auth_loss(&why);
+                                }
+                                return Err(io::Error::new(io::ErrorKind::PermissionDenied, why));
                             }
                             Ok((_, _, _)) => {
                                 last_err = io::Error::from_raw_os_error(EIO);
@@ -540,6 +616,7 @@ impl RemoteMeta {
         let (mut s, reused) = self.get_conn()?;
         match Self::call(&mut s, op, body) {
             Ok(r) => {
+                self.note_refusal(&r);
                 self.put_conn(s);
                 Ok(r)
             }
@@ -556,6 +633,7 @@ impl RemoteMeta {
                 let (mut s2, _) = self.connect_fresh()?;
                 match Self::call(&mut s2, op, body) {
                     Ok(r) => {
+                        self.note_refusal(&r);
                         self.put_conn(s2);
                         Ok(r)
                     }
@@ -563,6 +641,25 @@ impl RemoteMeta {
                 }
             }
         }
+    }
+
+    /// An `E_AUTH` on a metadata op (as opposed to on the `M_OPEN` handshake,
+    /// which [`RemoteMeta::connect_fresh`] handles itself) can only be the
+    /// server's live-credential re-check: the alias gate fires at open, and the
+    /// per-op read-only-key gate answers `E_NOTPERM`. So it means one
+    /// thing — this connection's api key was just revoked — and the mount must
+    /// not go on serving a view its credential no longer opens. The op itself
+    /// still fails normally for the caller (see [`err_from_code`]).
+    fn note_refusal(&self, r: &(i32, u64, Vec<u8>)) {
+        if r.0 != E_AUTH || !self.opened.load(Ordering::SeqCst) {
+            return;
+        }
+        let why = if r.2.is_empty() {
+            "meta-server revoked this connection's api key".to_string()
+        } else {
+            String::from_utf8_lossy(&r.2).into_owned()
+        };
+        super::signal_auth_loss(&why);
     }
 
     fn call(s: &mut TcpStream, op: u8, body: &[u8]) -> io::Result<(i32, u64, Vec<u8>)> {
@@ -622,7 +719,12 @@ impl MetaProvider for RemoteMeta {
         // Only page over the wire when the handshake said the server's store can
         // page. Otherwise slice a single full listing (the pre-paging behaviour).
         if self.paged.load(Ordering::SeqCst) == 0 {
-            return self.readdir(parent).into_iter().skip(offset).take(limit).collect();
+            return self
+                .readdir(parent)
+                .into_iter()
+                .skip(offset)
+                .take(limit)
+                .collect();
         }
         let mut b = Vec::new();
         put_i64(&mut b, parent);
@@ -635,7 +737,12 @@ impl MetaProvider for RemoteMeta {
             // directory: fall back to slicing one full listing. `round_trip`
             // already re-handshakes on a stale socket, so `paged` reflects the
             // live node before the next page call.
-            _ => self.readdir(parent).into_iter().skip(offset).take(limit).collect(),
+            _ => self
+                .readdir(parent)
+                .into_iter()
+                .skip(offset)
+                .take(limit)
+                .collect(),
         }
     }
 
@@ -665,7 +772,14 @@ impl MetaProvider for RemoteMeta {
         self.call_id(M_CREATE, &b)
     }
 
-    fn create_symlink(&self, parent: i64, name: &str, target: &str, uid: u32, gid: u32) -> Result<i64, MetaError> {
+    fn create_symlink(
+        &self,
+        parent: i64,
+        name: &str,
+        target: &str,
+        uid: u32,
+        gid: u32,
+    ) -> Result<i64, MetaError> {
         let mut b = Vec::new();
         put_i64(&mut b, parent);
         proto::put_key(&mut b, target);
@@ -702,7 +816,14 @@ impl MetaProvider for RemoteMeta {
         }
     }
 
-    fn rename(&self, parent: i64, name: &str, new_parent: i64, new_name: &str, noreplace: bool) -> Result<Option<String>, MetaError> {
+    fn rename(
+        &self,
+        parent: i64,
+        name: &str,
+        new_parent: i64,
+        new_name: &str,
+        noreplace: bool,
+    ) -> Result<Option<String>, MetaError> {
         let mut b = Vec::new();
         put_i64(&mut b, parent);
         proto::put_key(&mut b, name);
@@ -780,7 +901,14 @@ impl MetaProvider for RemoteMeta {
         }
     }
 
-    fn get_lock(&self, ino: i64, owner: u64, start: u64, end: u64, ty: LockType) -> Option<LockConflict> {
+    fn get_lock(
+        &self,
+        ino: i64,
+        owner: u64,
+        start: u64,
+        end: u64,
+        ty: LockType,
+    ) -> Option<LockConflict> {
         let mut b = Vec::new();
         put_i64(&mut b, ino);
         proto::put_u64(&mut b, owner);
@@ -933,6 +1061,9 @@ pub enum StoreKind {
 struct MetaRuntime {
     base: PathBuf,
     token: String,
+    /// Per-caller credential gate for `M_OPEN` and live sessions; `None` keeps
+    /// the static-token/LAN-trusted behavior byte-for-byte.
+    keys: Option<Arc<crate::apikeys::ApiKeyStore>>,
     cache: Arc<Mutex<HashMap<String, Arc<MetaStore>>>>,
     subs: Subscribers,
     ha: Option<Arc<HaState>>,
@@ -977,12 +1108,6 @@ struct MetaRuntime {
     /// arbiter node, not merely bounded (see [`super::server`]'s data-plane gate
     /// and [`super::client::RemoteBackend`]).
     witness: Option<String>,
-    /// Optional per-view uid whitelist (`<base>/meta/acl.db`). Unrestricted views
-    /// (no rows) are served to everyone; restricted views gate the `M_OPEN` read
-    /// (else `E_AUTH`) and each write-intent op per-op (else `E_NOTPERM`, so an
-    /// active writer loses privileges the instant a grant is revoked — no
-    /// TOCTOU cache). See [`crate::acl`].
-    acl: Arc<crate::acl::AclStore>,
     /// Which metadata backend `engine_for` should open against (see
     /// [`StoreKind`]). `Pg(_)` disables the GroveFS-native HA paths by
     /// construction: `serve()` rejects the `--role standby`/`--peer`/`--witness`
@@ -1026,7 +1151,11 @@ impl MetaRuntime {
     /// return their `base`; plain/physical names return themselves. Only
     /// meaningful after [`view_provider`] has resolved the name once.
     fn physical_base(&self, view: &str) -> String {
-        self.bases.lock().get(view).cloned().unwrap_or_else(|| view.to_string())
+        self.bases
+            .lock()
+            .get(view)
+            .cloned()
+            .unwrap_or_else(|| view.to_string())
     }
 
     /// Is `view` a DERIVED (virtual) view name — i.e. served through a
@@ -1073,7 +1202,13 @@ impl MetaRuntime {
         let mine = ha.epoch.load(Ordering::SeqCst);
         let addrs = split_addrs(w);
         let q = quorum_size(addrs.len());
-        let res = witness_quorum(&addrs, &self.token, mine, WITNESS_LEASE, WITNESS_PROBE_TIMEOUT);
+        let res = witness_quorum(
+            &addrs,
+            &self.token,
+            mine,
+            WITNESS_LEASE,
+            WITNESS_PROBE_TIMEOUT,
+        );
         if res.fenced(q) {
             ha.set_role(Role::Standby);
             ha.epoch.store(res.prev_max, Ordering::SeqCst);
@@ -1106,6 +1241,9 @@ pub struct MetaServer {
     listen: String,
     base: PathBuf,
     token: String,
+    /// Optional per-caller credential gate (`--require-api-key`), backed by the
+    /// same `<base>/meta/api_keys.db` `grovefs apikey` / `grovefs mcp` use.
+    keys: Option<Arc<crate::apikeys::ApiKeyStore>>,
     role: Role,
     peer: Option<String>,
     sync_repl: bool,
@@ -1127,6 +1265,7 @@ impl MetaServer {
             listen: listen.to_string(),
             base: base.to_path_buf(),
             token: String::new(),
+            keys: None,
             role: Role::Primary,
             peer: None,
             sync_repl: false,
@@ -1143,12 +1282,25 @@ impl MetaServer {
             listen: listen.to_string(),
             base: base.to_path_buf(),
             token: token.to_string(),
+            keys: None,
             role: Role::Primary,
             peer: None,
             sync_repl: false,
             witness: None,
             store: StoreKind::Sqlite,
         }
+    }
+
+    /// Additionally demand a `grovefs apikey` credential (scope `mount` or
+    /// `any`) on every `M_OPEN`, so mount admission becomes per-caller and
+    /// revocable rather than one static cluster secret. Independent of the
+    /// token: with both configured, a client must satisfy both. The store is
+    /// re-consulted for LIVE connections (`ApiKeyStore::is_live`, once per
+    /// `KEY_RECHECK` window per session), so `grovefs apikey revoke` closes an
+    /// established mount instead of only refusing the next one.
+    pub fn with_api_keys(mut self, store: crate::apikeys::ApiKeyStore) -> Self {
+        self.keys = Some(Arc::new(store));
+        self
     }
 
     /// Configure this node's HA role and its peer's address. A `Primary` with a
@@ -1226,10 +1378,6 @@ impl MetaServer {
     ///   [`io::ErrorKind::InvalidInput`] because GroveFS-native HA snapshot
     ///   shipping (`VACUUM INTO`) is a SQLite-specific mechanism; run PG with
     ///   PostgreSQL's own streaming/logical replication instead.
-    ///
-    /// Under PG the ACL whitelist also lives in a shared `grovefs_acl.view_acl`
-    /// table (one `pg_dump` covers the entire metadata plane); under SQLite it
-    /// stays at `<base>/meta/acl.db`.
     pub fn with_store(mut self, uri: Option<String>) -> Self {
         match uri {
             Some(u) if u.starts_with("postgres://") || u.starts_with("postgresql://") => {
@@ -1254,22 +1402,6 @@ impl MetaServer {
             ));
         }
         std::fs::create_dir_all(self.base.join("meta"))?;
-        // Open the ACL store BEFORE binding so a client (or the
-        // test board's `wait_port` + log grep) never sees the listen port
-        // reachable while the ACL setup is still running — otherwise
-        // the port becomes connectable before the `synchronous replication ON`
-        // / `registered fencing epoch` log lines have flushed, and readiness
-        // probes race startup I/O.
-        //
-        // Under PG the ACL lives in a shared `grovefs_acl.view_acl` table
-        // (single `pg_dump` covers everything); under SQLite it stays at
-        // `<base>/meta/acl.db`.
-        let acl = Arc::new(match &self.store {
-            StoreKind::Pg(uri) => crate::acl::AclStore::open_pg(uri)
-                .unwrap_or_else(|e| panic!("open PG acl: {e}")),
-            StoreKind::Sqlite => crate::acl::AclStore::open(&self.base)
-                .expect("open acl.db"),
-        });
         let listener = TcpListener::bind(&self.listen)?;
         println!(
             "meta-server listening on {} (base {}, role {:?}{})",
@@ -1281,6 +1413,11 @@ impl MetaServer {
                 .map(|p| format!(", peer {p}"))
                 .unwrap_or_default()
         );
+        if self.keys.is_some() {
+            // Same honesty line as the data plane: an operator reading the log
+            // must know why the next mount got refused.
+            println!("meta-server: api-key auth REQUIRED (present `mount --api-key`, minted by `grovefs apikey create --for mount|any`); a revoke closes live mounts on their next op");
+        }
         // HA coordination is live only when a peer was configured or we start as
         // a standby; otherwise `ha = None` preserves single-node semantics.
         let ha = if self.peer.is_some() || self.role == Role::Standby {
@@ -1291,6 +1428,7 @@ impl MetaServer {
         let rt = Arc::new(MetaRuntime {
             base: self.base.clone(),
             token: self.token.clone(),
+            keys: self.keys.clone(),
             cache: Arc::new(Mutex::new(HashMap::new())),
             subs: Arc::new(Mutex::new(HashMap::new())),
             ha: ha.clone(),
@@ -1299,7 +1437,6 @@ impl MetaServer {
             sync_repl: self.sync_repl && self.peer.is_some(),
             standby_push: Mutex::new(()),
             witness: self.witness.clone(),
-            acl,
             store: self.store.clone(),
             views: Arc::new(Mutex::new(HashMap::new())),
             bases: Arc::new(Mutex::new(HashMap::new())),
@@ -1344,7 +1481,8 @@ impl MetaServer {
                     let mine = ha.epoch.load(Ordering::SeqCst);
                     let addrs = split_addrs(w);
                     let q = quorum_size(addrs.len());
-                    let res = witness_quorum(&addrs, &rt.token, mine, WITNESS_LEASE, CONTROL_TIMEOUT);
+                    let res =
+                        witness_quorum(&addrs, &rt.token, mine, WITNESS_LEASE, CONTROL_TIMEOUT);
                     if res.fenced(q) {
                         ha.set_role(Role::Standby);
                         ha.epoch.store(res.prev_max, Ordering::SeqCst);
@@ -1390,10 +1528,10 @@ pub fn serve_on_meta(listener: TcpListener, base: PathBuf) {
 /// Accept loop with an access token (`""` disables the check). Single-node (no
 /// HA), matching the historical behavior all existing tests rely on.
 pub fn serve_on_meta_auth(listener: TcpListener, base: PathBuf, token: &str) {
-    let acl_base = base.clone();
     let rt = Arc::new(MetaRuntime {
         base,
         token: token.to_string(),
+        keys: None,
         cache: Arc::new(Mutex::new(HashMap::new())),
         subs: Arc::new(Mutex::new(HashMap::new())),
         ha: None,
@@ -1402,9 +1540,6 @@ pub fn serve_on_meta_auth(listener: TcpListener, base: PathBuf, token: &str) {
         sync_repl: false,
         standby_push: Mutex::new(()),
         witness: None,
-        acl: Arc::new(
-            crate::acl::AclStore::open(&acl_base).expect("open acl.db"),
-        ),
         store: StoreKind::Sqlite,
         views: Arc::new(Mutex::new(HashMap::new())),
         bases: Arc::new(Mutex::new(HashMap::new())),
@@ -1504,13 +1639,17 @@ fn load_aliases(base: &Path) -> HashMap<String, String> {
 /// Deliberate limits (documented honestly): no nesting — a derived view's
 /// `base` must name a physical tree, and a derived name cannot shadow a
 /// physical db (checked at define time and here). Derived views are display
-/// customization, NOT a security boundary; hard isolation stays view+ACL+token.
+/// customization, NOT a security boundary; hard isolation stays view + API-key/token.
 /// They are, however, READ-ONLY by contract: the M_OPEN ack flags them so the
 /// client mounts kernel read-only, and the per-op gate above refuses every
 /// write-intent op for a derived name — mutations belong to the original
 /// (physical) view, so a virtual shape can never be half-edited through.
 fn view_provider(rt: &MetaRuntime, view: &str) -> io::Result<Arc<dyn MetaProvider>> {
-    let def = rt.base.join("meta").join("views").join(format!("{view}.layout"));
+    let def = rt
+        .base
+        .join("meta")
+        .join("views")
+        .join(format!("{view}.layout"));
     // Bind the cached clone FIRST: an `if let Some(p) = rt.views.lock()...`
     // would keep the guard alive through the whole block (temporary lifetime
     // rules), and the eviction path below locks `views` again — a non-reentrant
@@ -1528,17 +1667,12 @@ fn view_provider(rt: &MetaRuntime, view: &str) -> io::Result<Arc<dyn MetaProvide
         // entries (no `defs` row) are never re-checked — a definition
         // appearing out-of-band for an already-resolved physical name would
         // ambiguously shadow its db, so it is deliberately ignored.
-        let stale = rt
-            .defs
-            .lock()
-            .get(view)
-            .copied()
-            .map_or(false, |seen| {
-                std::fs::metadata(&def)
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .map_or(false, |now| now != seen)
-            });
+        let stale = rt.defs.lock().get(view).copied().map_or(false, |seen| {
+            std::fs::metadata(&def)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .map_or(false, |now| now != seen)
+        });
         if !stale {
             return Ok(p);
         }
@@ -1549,37 +1683,91 @@ fn view_provider(rt: &MetaRuntime, view: &str) -> io::Result<Arc<dyn MetaProvide
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "bad view name"));
     }
     let (provider, base): (Arc<dyn MetaProvider>, String) = if def.is_file() {
-        let (b, rules) =
-            LayoutRules::parse_view_file(&def).map_err(io::Error::other)?;
-        if b == view {
-            return Err(io::Error::other("view definition base equals its own name"));
-        }
-        // The base must be a physical tree: no lens over a lens, which would
-        // also make eviction/subscription resolution ambiguous.
-        if rt.base.join("meta").join("views").join(format!("{b}.layout")).is_file() {
-            return Err(io::Error::other("derived view cannot build on another derived view"));
-        }
-        if rt.base.join("meta").join(format!("{view}.db")).is_file() {
-            // a physical <view>.db exists — the name would be ambiguous
-            return Err(io::Error::other("view name shadows a physical db"));
-        }
-        let store = store_for(rt, &b)?;
-        // Record the exact mtime the lens was built from AFTER parsing, so a
-        // concurrent edit shows up as stale on the next check (eventually
-        // convergent, never serves a shape newer than its recorded mtime).
-        if let Ok(md) = std::fs::metadata(&def) {
-            if let Ok(mtime) = md.modified() {
-                rt.defs.lock().insert(view.to_string(), mtime);
+        match LayoutRules::parse_def_file(&def).map_err(io::Error::other)? {
+            ViewDef::Fork(_) => {
+                // A FORK owns an independent metadata tree at `<base>/meta/<name>.db`;
+                // the definition only records which physical view seeded it. It is
+                // resolved like a physical store (same cache, same subscriptions)
+                // but deliberately NOT recorded in `defs`: `is_derived` stays
+                // false, so structure writes are admitted while the client-side
+                // ack flag (below) keeps content writes out.
+                let path = rt.base.join("meta").join(format!("{view}.db"));
+                if !path.is_file() {
+                    return Err(io::Error::other(format!(
+                        "fork view '{view}' has no tree ({}) — removed out-of-band?",
+                        path.display()
+                    )));
+                }
+                let store = store_for(rt, view)?;
+                (
+                    Arc::clone(&store) as Arc<dyn MetaProvider>,
+                    view.to_string(),
+                )
+            }
+            ViewDef::Alias(_) => {
+                return Err(io::Error::other(
+                    "alias definitions are resolved before view_provider and cannot be served as a tree",
+                ));
+            }
+            ViewDef::Derived(b, rules) => {
+                if b == view {
+                    return Err(io::Error::other("view definition base equals its own name"));
+                }
+                // The base must be a physical tree: no lens over a lens, which would
+                // also make eviction/subscription resolution ambiguous.
+                if rt
+                    .base
+                    .join("meta")
+                    .join("views")
+                    .join(format!("{b}.layout"))
+                    .is_file()
+                {
+                    return Err(io::Error::other(
+                        "derived view cannot build on another derived view",
+                    ));
+                }
+                if rt.base.join("meta").join(format!("{view}.db")).is_file() {
+                    // a physical <view>.db exists — the name would be ambiguous
+                    return Err(io::Error::other("view name shadows a physical db"));
+                }
+                let store = store_for(rt, &b)?;
+                // Record the exact mtime the lens was built from AFTER parsing, so a
+                // concurrent edit shows up as stale on the next check (eventually
+                // convergent, never serves a shape newer than its recorded mtime).
+                if let Ok(md) = std::fs::metadata(&def) {
+                    if let Ok(mtime) = md.modified() {
+                        rt.defs.lock().insert(view.to_string(), mtime);
+                    }
+                }
+                (Arc::new(LayoutMeta::new(store, rules)), b)
             }
         }
-        (Arc::new(LayoutMeta::new(store, rules)), b)
     } else {
         let store = store_for(rt, view)?;
-        (Arc::clone(&store) as Arc<dyn MetaProvider>, view.to_string())
+        (
+            Arc::clone(&store) as Arc<dyn MetaProvider>,
+            view.to_string(),
+        )
     };
     rt.bases.lock().insert(view.to_string(), base);
     rt.views.lock().insert(view.to_string(), provider.clone());
     Ok(provider)
+}
+
+/// Does `view` carry a `fork <base>` definition? Read per `M_OPEN` (mounts are
+/// rare and the definition dir is small control-plane config). A fork's own
+/// metadata tree is writable, but its CONTENT is not — the bytes are shared
+/// with the base view through the cross-view ledger, so uploading belongs to a
+/// base view. The server cannot gate bytes (they bypass the meta plane), so it
+/// tells the client via ack byte [2] and the FUSE layer refuses `write` /
+/// truncate with EROFS. Honest boundary: a raw protocol client that skips the
+/// FUSE layer can still write to the data plane.
+fn is_fork_def(base: &Path, view: &str) -> bool {
+    let p = base
+        .join("meta")
+        .join("views")
+        .join(format!("{view}.layout"));
+    matches!(LayoutRules::parse_def_file(&p), Ok(ViewDef::Fork(_)))
 }
 
 // --- server-side invalidation event bus ------------------------------------
@@ -1769,7 +1957,10 @@ fn inode_change_events(engine: &dyn MetaProvider, ino: i64) -> Vec<Event> {
     let mut evs = vec![Event::Inode { ino }];
     if let Some(n) = engine.getattr(ino) {
         if !n.name.is_empty() {
-            evs.push(Event::Entry { parent: n.parent_id, name: n.name });
+            evs.push(Event::Entry {
+                parent: n.parent_id,
+                name: n.name,
+            });
         }
     }
     evs
@@ -1796,10 +1987,13 @@ fn serve_subscriber(
     // other views' delivery stays independent of the global registry lock.
     let sink = Arc::new(Mutex::new(handle));
     for b in buckets {
-        subs.lock().entry(b.clone()).or_default().insert(id, Arc::clone(&sink));
+        subs.lock()
+            .entry(b.clone())
+            .or_default()
+            .insert(id, Arc::clone(&sink));
     }
     proto::send_response(&mut writer, 0, 0, &[])?; // subscribe ack
-    // The client sends no further requests here; drain until it hangs up.
+                                                   // The client sends no further requests here; drain until it hangs up.
     let result = loop {
         match proto::recv_request(&mut reader) {
             Ok(_) => continue,
@@ -1826,8 +2020,8 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
     let mut writer = stream;
 
     // First frame distinguishes a client from a peer's replication control
-    // connection: clients always open with `M_OPEN { view, token }`; the peer
-    // opens directly with `M_PING`/`M_PUSH` (never bound to a view).
+    // connection: clients always open with `M_OPEN { view, token, uid, api_key }`;
+    // the peer opens directly with `M_PING`/`M_PUSH` (never bound to a view).
     let (op, body) = proto::recv_request(&mut reader)?;
     if op == M_PING || op == M_PUSH {
         return handle_control_conn(&mut reader, &mut writer, rt, op, body);
@@ -1840,45 +2034,117 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
     let mut view = proto::get_key(&body, &mut i).unwrap_or_default();
     let presented = proto::get_key(&body, &mut i).unwrap_or_default();
     // Optional presenting uid appended by the client handshake (older clients
-    // omit it -> uid 0, which is simply denied on a whitelisted view).
+    // omit it -> uid 0, recorded as such in the call audit).
     let uid = proto::read_u32(&body, &mut i).unwrap_or(0);
+    // Optional api key appended by newer clients (an old client omits it, so it
+    // only fails when this server actually demands one).
+    let api_key = proto::get_key(&body, &mut i).unwrap_or_default();
+    // The name the client mounted, kept alongside the post-alias real name so a
+    // view-bound key can be checked against either (bind to the tree or to its
+    // public alias).
+    let presented_name = view.clone();
     // Enforce the shared secret when one is configured; an empty server token
     // accepts any client (backward-compatible, LAN-trusted).
     if !rt.token.is_empty() && presented != rt.token {
-        proto::send_response(&mut writer, E_AUTH, 0, &[])?;
+        proto::send_response(
+            &mut writer,
+            E_AUTH,
+            0,
+            b"meta-server rejected the access token",
+        )?;
         return Ok(());
+    }
+    // Per-caller credential gate (`--require-api-key`), checked right after the
+    // cluster token and BEFORE any view/alias resolution: it decides WHO may
+    // connect, never WHICH view. A refusal carries its cause in the payload so
+    // the client prints the reason (missing key / wrong secret / revoked /
+    // wrong scope) instead of a bare E_AUTH.
+    let mut authed: Option<crate::apikeys::AuthedKey> = None;
+    if let Some(store) = &rt.keys {
+        match store.authenticate_mount(&api_key) {
+            Ok(a) => {
+                let _ = store.log_call(
+                    Some(&a),
+                    "meta",
+                    "M_OPEN",
+                    true,
+                    &format!("view='{}' uid={}", view, uid),
+                );
+                authed = Some(a);
+            }
+            Err(e) => {
+                let _ = store.log_call(
+                    None,
+                    "meta",
+                    "M_OPEN",
+                    false,
+                    &format!("view='{view}': {e}"),
+                );
+                proto::send_response(&mut writer, E_AUTH, 0, e.as_bytes())?;
+                return Ok(());
+            }
+        }
     }
     // PURE ALIAS resolution (name governance): an `alias <real>` definition
     // in meta/views/ makes the alias the public mount surface for a physical
-    // view. The swap happens BEFORE the ACL read gate and every downstream
-    // engine/bucket decision, so the alias simply IS the real view — grants
-    // written against the real name keep holding through it, and the full
+    // view. The swap happens BEFORE the view-binding check and every downstream
+    // engine/bucket decision, so the alias simply IS the real view — a key bound
+    // to the real name keeps working through it, and the full
     // tree stays writable (no rules, so no read-only flag). Conversely, once
     // a real name is governed by ANY alias, mounting it directly is refused:
     // the mapping is the entry point — which is the whole point, letting an
     // operator rotate public names freely while the storage identity stays
     // unexposed. Rescanned per M_OPEN (a small control-plane dir scan; mount
-    // establishment is rare); established connections are untouched, exactly
-    // like the read gate — deleting an alias reopens the real name only for
-    // new mounts.
+    // establishment is rare); established connections are untouched — deleting
+    // an alias reopens the real name only for new mounts.
     let aliases = load_aliases(&rt.base);
     if let Some(real) = aliases.get(&view) {
         view = real.clone();
     } else if aliases.values().any(|r| r == &view) {
-        proto::send_response(&mut writer, E_AUTH, 0, &[])?;
+        proto::send_response(
+            &mut writer,
+            E_AUTH,
+            0,
+            format!(
+                "view '{view}' is governed by an alias — mount the alias name instead (`grovefs view list` shows it)"
+            )
+            .as_bytes(),
+        )?;
         return Ok(());
     }
-    // View whitelist: an unrestricted view (no ACL rows) admits any uid; a
-    // restricted one refuses the open outright unless `uid` holds a read grant.
-    if !rt.acl.check_read(&view, uid) {
-        proto::send_response(&mut writer, E_AUTH, 0, &[])?;
-        return Ok(());
+    // View binding (`apikey create --view NAME`): a bound key may only open the
+    // physical view it names — or an alias that resolves to it, and equally the
+    // alias name itself, so an operator can bind to whichever name is the mount
+    // surface. Checked AFTER alias resolution so it holds against the real tree
+    // (grants written for the physical name keep working through a rotated
+    // alias). An unbound key (`view: None`, a system-level credential) admits any
+    // view and skips this entirely. Refusal is E_AUTH (it is an access-decision
+    // failure, not a data error).
+    if let Some(a) = &authed {
+        if let Some(bound) = &a.view {
+            if bound != &view && bound != &presented_name {
+                if let Some(store) = &rt.keys {
+                    let _ = store.log_call(
+                        authed.as_ref(),
+                        "meta",
+                        "M_OPEN",
+                        false,
+                        &format!("view='{view}': key bound to view '{bound}'"),
+                    );
+                }
+                proto::send_response(
+                    &mut writer,
+                    E_AUTH,
+                    0,
+                    format!(
+                        "permission denied: this api key is bound to view '{bound}', not '{view}'"
+                    )
+                    .as_bytes(),
+                )?;
+                return Ok(());
+            }
+        }
     }
-    // Note: the write-gate is re-evaluated per-op inside the loop below (not
-    // cached here), so `grovefs acl revoke --view V --uid U` immediately closes
-    // established connections against further writes rather than only on the
-    // next M_OPEN handshake (closes a TOCTOU where revoke had no effect on
-    // any already-mounted client).
     // Validate the view resolves (physical db or a parseable derived-view
     // definition) before acking. We deliberately do NOT hold this provider for
     // the whole connection: under HA a fresh replicated snapshot evicts the
@@ -1909,15 +2175,22 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
         .as_ref()
         .map(|h| h.epoch.load(Ordering::SeqCst) as u64)
         .unwrap_or(0);
-    // The ack body carries two flag bytes:
-    //   [0] nonzero when `view` is a DERIVED (virtual) view — the client mounts
+    // The ack body carries three flag bytes:
+    //   [0] nonzero when `view` is a DERIVED (virtual) view OR the presenting
+    //       key is read-only (`apikey create --ro`) — the client mounts
     //       read-only so writes fail locally with EROFS instead of round-tripping
     //       to a gate (the per-op gate below stays authoritative regardless);
     //   [1] nonzero when the server pages directory listings in its own store,
-    //       unlocking the small M_READDIRP RPC + READDIRPLUS on the client.
-    // An old client reads only byte [0] and ignores byte [1]; an old server
-    // sends just [0], so a new client sees no [1] and stays on full readdirs.
-    let ack_flags = [rt.is_derived(&view) as u8, paged_cap];
+    //       unlocking the small M_READDIRP RPC + READDIRPLUS on the client;
+    //   [2] nonzero when `view` is a FORK: the metadata tree is writable but
+    //       CONTENT writes are refused client-side with EROFS (bytes are shared
+    //       with the base view).
+    // Old clients read only the bytes they know and ignore the rest; an old
+    // server sends just [0], so a new client sees no [1]/[2] and keeps the
+    // pre-paging / pre-fork writable behavior.
+    let client_ro = rt.is_derived(&view) || authed.as_ref().map(|a| a.ro).unwrap_or(false);
+    let content_ro = is_fork_def(&rt.base, &view);
+    let ack_flags = [client_ro as u8, paged_cap, content_ro as u8];
     proto::send_response(&mut writer, 0, open_epoch, &ack_flags)?;
 
     // Distinguish a subscriber (becomes an event sink, sends no requests) from a
@@ -1938,6 +2211,17 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
     }
     let mut pending = Some((op, body));
 
+    // Live-credential re-check (`--require-api-key`): at most one store lookup
+    // per `KEY_RECHECK` window for this session, so a revoke reaches an
+    // ESTABLISHED mount, bounded by the re-check window rather than the next
+    // handshake.
+    let mut next_key_check = Instant::now() + crate::apikeys::KEY_RECHECK;
+    // A read-only key (`apikey create --ro`) is refused every write-intent op
+    // here, server-side, so "read-only" holds even against a client that mounted
+    // without `-o ro` (the ack flag above already nudges honest clients to a
+    // read-only mount, but this gate is the authoritative one).
+    let key_ro = authed.as_ref().map(|a| a.ro).unwrap_or(false);
+
     loop {
         let (op, body) = match pending.take() {
             Some(v) => v,
@@ -1951,15 +2235,28 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
                 }
             },
         };
-        // View write-whitelist: a restricted view refuses mutating ops from a uid
-        // without a write grant (reads still served). Unrestricted views grant all.
-        // Re-evaluated per-op so `grovefs acl revoke` immediately closes established
-        // connections (see the M_OPEN note above for the TOCTOU rationale).
-        //
+        if let (Some(store), Some(a)) = (&rt.keys, &authed) {
+            if Instant::now() >= next_key_check {
+                if !store.is_live(&a.id, crate::apikeys::Scope::Mount) {
+                    let why = "authentication failed: this api key has been revoked";
+                    let _ = store.log_call(
+                        Some(a),
+                        "meta",
+                        "M_OPEN",
+                        false,
+                        &format!("view='{view}': {why}"),
+                    );
+                    let _ = proto::send_response(&mut writer, E_AUTH, 0, why.as_bytes());
+                    return Ok(());
+                }
+                next_key_check = Instant::now() + crate::apikeys::KEY_RECHECK;
+            }
+        }
+        // Read-only credential: refuse a write-intent op from an `--ro` key.
         // Uses E_NOTPERM (not E_ROFS) so the client's `err_from_code` maps to
         // `MetaError::OpNotPermitted` → `EPERM` at the FUSE reply, distinct
         // from an HA-standby's E_ROFS failover signal.
-        if is_write_op(op) && !rt.acl.check_write(&view, uid) {
+        if is_write_op(op) && key_ro {
             proto::send_response(&mut writer, E_NOTPERM, 0, &[])?;
             continue;
         }
@@ -2063,7 +2360,12 @@ fn handle_control_conn(
                         if sender_epoch > my_epoch {
                             ha.epoch.store(sender_epoch, Ordering::SeqCst);
                         }
-                        proto::send_response(writer, 0, ha.epoch.load(Ordering::SeqCst) as u64, &[])?;
+                        proto::send_response(
+                            writer,
+                            0,
+                            ha.epoch.load(Ordering::SeqCst) as u64,
+                            &[],
+                        )?;
                     }
                     Role::Primary => {
                         // We are the primary (perhaps promoted). A peer pinging with
@@ -2079,12 +2381,15 @@ fn handle_control_conn(
                 let snap = body[i..].to_vec();
                 // Only a standby installs pushes; a node that has promoted (or a
                 // plain primary) is authoritative and rejects the stale copy.
-                if ha.role() == Role::Standby
-                    && install_snapshot(&rt, &view, &snap).is_ok()
-                {
+                if ha.role() == Role::Standby && install_snapshot(&rt, &view, &snap).is_ok() {
                     proto::send_response(writer, 0, 0, &[])?;
                 } else {
-                    proto::send_response(writer, E_EPOCH, ha.epoch.load(Ordering::SeqCst) as u64, &[])?;
+                    proto::send_response(
+                        writer,
+                        E_EPOCH,
+                        ha.epoch.load(Ordering::SeqCst) as u64,
+                        &[],
+                    )?;
                 }
             }
             M_FORWARD => {
@@ -2205,19 +2510,20 @@ fn push_snapshot_now(rt: &MetaRuntime, view: &str) {
     // tree it reads — and be named as such, or the standby would install a db
     // file under the derived label.
     let base = rt.physical_base(view);
-    let snap = match store_for(rt, &base).and_then(|s| {
-        s.backup_to_bytes().map_err(io::Error::other)
-    }) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
+    let snap =
+        match store_for(rt, &base).and_then(|s| s.backup_to_bytes().map_err(io::Error::other)) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
     // Serialize pushes: the standby must see a coherent snapshot sequence and
     // the control protocol is a strict request/response stream.
     let _g = rt.standby_push.lock();
     let mut conn = match TcpStream::connect(&peer) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("meta sync-repl: peer {peer} unreachable ({e}); degraded to async for this op");
+            eprintln!(
+                "meta sync-repl: peer {peer} unreachable ({e}); degraded to async for this op"
+            );
             return;
         }
     };
@@ -2236,7 +2542,10 @@ fn push_snapshot_now(rt: &MetaRuntime, view: &str) {
             // Standby has already promoted past us: stand down (same path as
             // the periodic replicator's heartbeat handling).
             ha.set_role(Role::Standby);
-            ha.epoch.store((peer_epoch as i64).max(ha.epoch.load(Ordering::SeqCst)), Ordering::SeqCst);
+            ha.epoch.store(
+                (peer_epoch as i64).max(ha.epoch.load(Ordering::SeqCst)),
+                Ordering::SeqCst,
+            );
             rt.evict();
             *ha.last_peer.lock() = Instant::now();
             eprintln!("meta sync-repl: demoted to standby (peer epoch {peer_epoch})");
@@ -2288,10 +2597,12 @@ fn witness_probe_one(
     // on a blackholed arbiter for the OS default, so resolve first then use
     // `connect_timeout`. All three timeouts share `timeout` so one probe is
     // hard-capped no matter where it stalls.
-    let sock = addr
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("arbiter {addr} did not resolve")))?;
+    let sock = addr.to_socket_addrs()?.next().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("arbiter {addr} did not resolve"),
+        )
+    })?;
     let mut conn = TcpStream::connect_timeout(&sock, timeout)?;
     conn.set_read_timeout(Some(timeout))?;
     conn.set_write_timeout(Some(timeout))?;
@@ -2403,7 +2714,13 @@ fn classify(replies: &[(i64, bool)], epoch: i64) -> Quorum {
 /// token stores — neither freezes writes (B) nor lets a stale primary resurrect
 /// (C). `n == 1` short-circuits to a single in-line probe (no threads, identical
 /// to the pre-quorum behavior).
-fn witness_quorum(addrs: &[String], token: &str, epoch: i64, ttl: Duration, timeout: Duration) -> Quorum {
+fn witness_quorum(
+    addrs: &[String],
+    token: &str,
+    epoch: i64,
+    ttl: Duration,
+    timeout: Duration,
+) -> Quorum {
     if addrs.len() == 1 {
         return match witness_probe_one(&addrs[0], token, epoch, ttl, timeout) {
             Ok((prev, granted)) => classify(&[(prev, granted)], epoch),
@@ -2528,7 +2845,10 @@ fn start_replicator(rt: Arc<MetaRuntime>) {
             if st == E_EPOCH {
                 // Peer is authoritative at a higher epoch: stand down to standby.
                 ha.set_role(Role::Standby);
-                ha.epoch.store((peer_epoch as i64).max(ha.epoch.load(Ordering::SeqCst)), Ordering::SeqCst);
+                ha.epoch.store(
+                    (peer_epoch as i64).max(ha.epoch.load(Ordering::SeqCst)),
+                    Ordering::SeqCst,
+                );
                 rt.evict(); // reopen views read-only for serving
                 *ha.last_peer.lock() = Instant::now(); // don't instantly re-promote
                 eprintln!("meta HA: demoted to standby (peer epoch {peer_epoch})");
@@ -2645,7 +2965,8 @@ fn start_promotion_watchdog(rt: Arc<MetaRuntime>, ha: Arc<HaState>) {
                 //  - below a reachable/incumbent quorum: an incumbent lease is
                 //    still live, or too few arbiters are reachable, so we cannot
                 //    PROVE an exclusive claim and refuse to promote blind.
-                ha.epoch.store(res.prev_max.max(candidate), Ordering::SeqCst);
+                ha.epoch
+                    .store(res.prev_max.max(candidate), Ordering::SeqCst);
                 *ha.last_peer.lock() = Instant::now(); // back off, retry next window
                 if res.fenced(q) {
                     eprintln!("meta HA: promotion refused (a quorum of {q}/{} arbiters holds {} >= candidate {candidate}); fail-safe refusing to promote (a peer is provably ahead)", addrs.len(), res.prev_max);
@@ -2673,7 +2994,11 @@ fn start_promotion_watchdog(rt: Arc<MetaRuntime>, ha: Arc<HaState>) {
 }
 
 /// Execute one metadata operation against the view's engine.
-fn dispatch_meta(engine: &dyn MetaProvider, op: u8, body: &[u8]) -> (i32, u64, Vec<u8>, Vec<Event>) {
+fn dispatch_meta(
+    engine: &dyn MetaProvider,
+    op: u8,
+    body: &[u8],
+) -> (i32, u64, Vec<u8>, Vec<Event>) {
     let mut i = 0usize;
     macro_rules! bail {
         ($e:expr) => {
@@ -2682,31 +3007,60 @@ fn dispatch_meta(engine: &dyn MetaProvider, op: u8, body: &[u8]) -> (i32, u64, V
     }
     match op {
         M_LOOKUP => {
-            let parent = match get_i64(body, &mut i) { Ok(v) => v, Err(_) => return (E_DB, 0, Vec::new(), Vec::new()) };
-            let name = match proto::get_key(body, &mut i) { Ok(v) => v, Err(_) => return (E_DB, 0, Vec::new(), Vec::new()) };
+            let parent = match get_i64(body, &mut i) {
+                Ok(v) => v,
+                Err(_) => return (E_DB, 0, Vec::new(), Vec::new()),
+            };
+            let name = match proto::get_key(body, &mut i) {
+                Ok(v) => v,
+                Err(_) => return (E_DB, 0, Vec::new(), Vec::new()),
+            };
             match engine.lookup(parent, &name) {
-                Some(n) => { let mut d = Vec::new(); put_node(&mut d, &n); (0, 0, d, Vec::new()) }
+                Some(n) => {
+                    let mut d = Vec::new();
+                    put_node(&mut d, &n);
+                    (0, 0, d, Vec::new())
+                }
                 None => (E_NOTFOUND, 0, Vec::new(), Vec::new()),
             }
         }
         M_GETATTR => {
-            let ino = match get_i64(body, &mut i) { Ok(v) => v, Err(_) => return (E_DB, 0, Vec::new(), Vec::new()) };
+            let ino = match get_i64(body, &mut i) {
+                Ok(v) => v,
+                Err(_) => return (E_DB, 0, Vec::new(), Vec::new()),
+            };
             match engine.getattr(ino) {
-                Some(n) => { let mut d = Vec::new(); put_node(&mut d, &n); (0, 0, d, Vec::new()) }
+                Some(n) => {
+                    let mut d = Vec::new();
+                    put_node(&mut d, &n);
+                    (0, 0, d, Vec::new())
+                }
                 None => (E_NOTFOUND, 0, Vec::new(), Vec::new()),
             }
         }
         M_READDIR => {
-            let parent = match get_i64(body, &mut i) { Ok(v) => v, Err(_) => return (E_DB, 0, Vec::new(), Vec::new()) };
+            let parent = match get_i64(body, &mut i) {
+                Ok(v) => v,
+                Err(_) => return (E_DB, 0, Vec::new(), Vec::new()),
+            };
             let nodes = engine.readdir(parent);
             let mut d = Vec::new();
             put_nodes(&mut d, &nodes);
             (0, 0, d, Vec::new())
         }
         M_READDIRP => {
-            let parent = match get_i64(body, &mut i) { Ok(v) => v, Err(_) => return (E_DB, 0, Vec::new(), Vec::new()) };
-            let offset = match proto::read_u64(body, &mut i) { Ok(v) => v, Err(_) => return (E_DB, 0, Vec::new(), Vec::new()) };
-            let limit = match proto::read_u64(body, &mut i) { Ok(v) => v, Err(_) => return (E_DB, 0, Vec::new(), Vec::new()) };
+            let parent = match get_i64(body, &mut i) {
+                Ok(v) => v,
+                Err(_) => return (E_DB, 0, Vec::new(), Vec::new()),
+            };
+            let offset = match proto::read_u64(body, &mut i) {
+                Ok(v) => v,
+                Err(_) => return (E_DB, 0, Vec::new(), Vec::new()),
+            };
+            let limit = match proto::read_u64(body, &mut i) {
+                Ok(v) => v,
+                Err(_) => return (E_DB, 0, Vec::new(), Vec::new()),
+            };
             // Page inside the store (LIMIT/OFFSET) rather than shipping the whole
             // directory per kernel buffer. Reached only for a server whose store
             // advertises paging (the M_READDIRP cap), so `engine` is a physical
@@ -2717,46 +3071,95 @@ fn dispatch_meta(engine: &dyn MetaProvider, op: u8, body: &[u8]) -> (i32, u64, V
             (0, 0, d, Vec::new())
         }
         M_CREATE => {
-            let parent = match get_i64(body, &mut i) { Ok(v) => v, Err(_) => return (E_DB, 0, Vec::new(), Vec::new()) };
+            let parent = match get_i64(body, &mut i) {
+                Ok(v) => v,
+                Err(_) => return (E_DB, 0, Vec::new(), Vec::new()),
+            };
             let is_dir = get_u8(body, &mut i).unwrap_or(0) != 0;
-            let data_ref = match get_opt(body, &mut i) { Ok(v) => v, Err(_) => return (E_DB, 0, Vec::new(), Vec::new()) };
+            let data_ref = match get_opt(body, &mut i) {
+                Ok(v) => v,
+                Err(_) => return (E_DB, 0, Vec::new(), Vec::new()),
+            };
             let mode = proto::read_u32(body, &mut i).unwrap_or(0);
             let uid = proto::read_u32(body, &mut i).unwrap_or(0);
             let gid = proto::read_u32(body, &mut i).unwrap_or(0);
-            let name = match proto::get_key(body, &mut i) { Ok(v) => v, Err(_) => return (E_DB, 0, Vec::new(), Vec::new()) };
+            let name = match proto::get_key(body, &mut i) {
+                Ok(v) => v,
+                Err(_) => return (E_DB, 0, Vec::new(), Vec::new()),
+            };
             match engine.create_node(parent, &name, is_dir, data_ref.as_deref(), mode, uid, gid) {
-                Ok(id) => (0, id as u64, Vec::new(), vec![Event::Entry { parent, name }]),
+                Ok(id) => (
+                    0,
+                    id as u64,
+                    Vec::new(),
+                    vec![Event::Entry { parent, name }],
+                ),
                 Err(e) => bail!(e),
             }
         }
         M_SYMLINK => {
-            let parent = match get_i64(body, &mut i) { Ok(v) => v, Err(_) => return (E_DB, 0, Vec::new(), Vec::new()) };
-            let target = match proto::get_key(body, &mut i) { Ok(v) => v, Err(_) => return (E_DB, 0, Vec::new(), Vec::new()) };
+            let parent = match get_i64(body, &mut i) {
+                Ok(v) => v,
+                Err(_) => return (E_DB, 0, Vec::new(), Vec::new()),
+            };
+            let target = match proto::get_key(body, &mut i) {
+                Ok(v) => v,
+                Err(_) => return (E_DB, 0, Vec::new(), Vec::new()),
+            };
             let uid = proto::read_u32(body, &mut i).unwrap_or(0);
             let gid = proto::read_u32(body, &mut i).unwrap_or(0);
-            let name = match proto::get_key(body, &mut i) { Ok(v) => v, Err(_) => return (E_DB, 0, Vec::new(), Vec::new()) };
+            let name = match proto::get_key(body, &mut i) {
+                Ok(v) => v,
+                Err(_) => return (E_DB, 0, Vec::new(), Vec::new()),
+            };
             match engine.create_symlink(parent, &name, &target, uid, gid) {
-                Ok(id) => (0, id as u64, Vec::new(), vec![Event::Entry { parent, name }]),
+                Ok(id) => (
+                    0,
+                    id as u64,
+                    Vec::new(),
+                    vec![Event::Entry { parent, name }],
+                ),
                 Err(e) => bail!(e),
             }
         }
         M_LINK => {
-            let src_ino = match get_i64(body, &mut i) { Ok(v) => v, Err(_) => return (E_DB, 0, Vec::new(), Vec::new()) };
-            let new_parent = match get_i64(body, &mut i) { Ok(v) => v, Err(_) => return (E_DB, 0, Vec::new(), Vec::new()) };
-            let new_name = match proto::get_key(body, &mut i) { Ok(v) => v, Err(_) => return (E_DB, 0, Vec::new(), Vec::new()) };
+            let src_ino = match get_i64(body, &mut i) {
+                Ok(v) => v,
+                Err(_) => return (E_DB, 0, Vec::new(), Vec::new()),
+            };
+            let new_parent = match get_i64(body, &mut i) {
+                Ok(v) => v,
+                Err(_) => return (E_DB, 0, Vec::new(), Vec::new()),
+            };
+            let new_name = match proto::get_key(body, &mut i) {
+                Ok(v) => v,
+                Err(_) => return (E_DB, 0, Vec::new(), Vec::new()),
+            };
             match engine.link_node(src_ino, new_parent, &new_name) {
                 Ok(id) => (
                     0,
                     id as u64,
                     Vec::new(),
-                    vec![Event::Entry { parent: new_parent, name: new_name }, Event::Inode { ino: src_ino }],
+                    vec![
+                        Event::Entry {
+                            parent: new_parent,
+                            name: new_name,
+                        },
+                        Event::Inode { ino: src_ino },
+                    ],
                 ),
                 Err(e) => bail!(e),
             }
         }
         M_UNLINK => {
-            let parent = match get_i64(body, &mut i) { Ok(v) => v, Err(_) => return (E_DB, 0, Vec::new(), Vec::new()) };
-            let name = match proto::get_key(body, &mut i) { Ok(v) => v, Err(_) => return (E_DB, 0, Vec::new(), Vec::new()) };
+            let parent = match get_i64(body, &mut i) {
+                Ok(v) => v,
+                Err(_) => return (E_DB, 0, Vec::new(), Vec::new()),
+            };
+            let name = match proto::get_key(body, &mut i) {
+                Ok(v) => v,
+                Err(_) => return (E_DB, 0, Vec::new(), Vec::new()),
+            };
             match engine.unlink(parent, &name) {
                 Ok(gc) => {
                     let mut d = Vec::new();
@@ -2769,10 +3172,22 @@ fn dispatch_meta(engine: &dyn MetaProvider, op: u8, body: &[u8]) -> (i32, u64, V
             }
         }
         M_RENAME => {
-            let parent = match get_i64(body, &mut i) { Ok(v) => v, Err(_) => return (E_DB, 0, Vec::new(), Vec::new()) };
-            let name = match proto::get_key(body, &mut i) { Ok(v) => v, Err(_) => return (E_DB, 0, Vec::new(), Vec::new()) };
-            let new_parent = match get_i64(body, &mut i) { Ok(v) => v, Err(_) => return (E_DB, 0, Vec::new(), Vec::new()) };
-            let new_name = match proto::get_key(body, &mut i) { Ok(v) => v, Err(_) => return (E_DB, 0, Vec::new(), Vec::new()) };
+            let parent = match get_i64(body, &mut i) {
+                Ok(v) => v,
+                Err(_) => return (E_DB, 0, Vec::new(), Vec::new()),
+            };
+            let name = match proto::get_key(body, &mut i) {
+                Ok(v) => v,
+                Err(_) => return (E_DB, 0, Vec::new(), Vec::new()),
+            };
+            let new_parent = match get_i64(body, &mut i) {
+                Ok(v) => v,
+                Err(_) => return (E_DB, 0, Vec::new(), Vec::new()),
+            };
+            let new_name = match proto::get_key(body, &mut i) {
+                Ok(v) => v,
+                Err(_) => return (E_DB, 0, Vec::new(), Vec::new()),
+            };
             // Trailing RENAME_NOREPLACE flag byte; absent (older client) => 0.
             let noreplace = body.get(i).copied().unwrap_or(0) != 0;
             match engine.rename(parent, &name, new_parent, &new_name, noreplace) {
@@ -2785,43 +3200,65 @@ fn dispatch_meta(engine: &dyn MetaProvider, op: u8, body: &[u8]) -> (i32, u64, V
                         0,
                         0,
                         d,
-                        vec![Event::Entry { parent, name }, Event::Entry { parent: new_parent, name: new_name }],
+                        vec![
+                            Event::Entry { parent, name },
+                            Event::Entry {
+                                parent: new_parent,
+                                name: new_name,
+                            },
+                        ],
                     )
                 }
                 Err(e) => bail!(e),
             }
         }
         M_SETMODE => {
-            let ino = match get_i64(body, &mut i) { Ok(v) => v, Err(_) => return (E_DB, 0, Vec::new(), Vec::new()) };
+            let ino = match get_i64(body, &mut i) {
+                Ok(v) => v,
+                Err(_) => return (E_DB, 0, Vec::new(), Vec::new()),
+            };
             let mode = proto::read_u32(body, &mut i).unwrap_or(0);
             engine.set_mode(ino, mode);
             (0, 0, Vec::new(), inode_change_events(engine, ino))
         }
         M_SETUIDGID => {
-            let ino = match get_i64(body, &mut i) { Ok(v) => v, Err(_) => return (E_DB, 0, Vec::new(), Vec::new()) };
+            let ino = match get_i64(body, &mut i) {
+                Ok(v) => v,
+                Err(_) => return (E_DB, 0, Vec::new(), Vec::new()),
+            };
             let uid = proto::read_u32(body, &mut i).unwrap_or(0);
             let gid = proto::read_u32(body, &mut i).unwrap_or(0);
             engine.set_uid_gid(ino, uid, gid);
             (0, 0, Vec::new(), inode_change_events(engine, ino))
         }
         M_SETTIMES => {
-            let ino = match get_i64(body, &mut i) { Ok(v) => v, Err(_) => return (E_DB, 0, Vec::new(), Vec::new()) };
+            let ino = match get_i64(body, &mut i) {
+                Ok(v) => v,
+                Err(_) => return (E_DB, 0, Vec::new(), Vec::new()),
+            };
             let atime = get_opt_i64(body, &mut i).unwrap_or(None);
             let mtime = get_opt_i64(body, &mut i).unwrap_or(None);
             engine.set_times(ino, atime, mtime);
             (0, 0, Vec::new(), inode_change_events(engine, ino))
         }
         M_TOUCH => {
-            let ino = match get_i64(body, &mut i) { Ok(v) => v, Err(_) => return (E_DB, 0, Vec::new(), Vec::new()) };
+            let ino = match get_i64(body, &mut i) {
+                Ok(v) => v,
+                Err(_) => return (E_DB, 0, Vec::new(), Vec::new()),
+            };
             engine.touch_mtime(ino);
             (0, 0, Vec::new(), inode_change_events(engine, ino))
         }
         M_SETLK => {
-            let ino = match get_i64(body, &mut i) { Ok(v) => v, Err(_) => return (E_DB, 0, Vec::new(), Vec::new()) };
+            let ino = match get_i64(body, &mut i) {
+                Ok(v) => v,
+                Err(_) => return (E_DB, 0, Vec::new(), Vec::new()),
+            };
             let owner = proto::read_u64(body, &mut i).unwrap_or(0);
             let start = proto::read_u64(body, &mut i).unwrap_or(0);
             let end = proto::read_u64(body, &mut i).unwrap_or(u64::MAX);
-            let ty = LockType::from_u8(get_u8(body, &mut i).unwrap_or(2)).unwrap_or(LockType::Unlock);
+            let ty =
+                LockType::from_u8(get_u8(body, &mut i).unwrap_or(2)).unwrap_or(LockType::Unlock);
             let pid = proto::read_u32(body, &mut i).unwrap_or(0);
             let sid = proto::read_u64(body, &mut i).unwrap_or(0);
             match engine.lock_op(ino, owner, start, end, ty, pid, sid) {
@@ -2835,7 +3272,10 @@ fn dispatch_meta(engine: &dyn MetaProvider, op: u8, body: &[u8]) -> (i32, u64, V
             }
         }
         M_GETLK => {
-            let ino = match get_i64(body, &mut i) { Ok(v) => v, Err(_) => return (E_DB, 0, Vec::new(), Vec::new()) };
+            let ino = match get_i64(body, &mut i) {
+                Ok(v) => v,
+                Err(_) => return (E_DB, 0, Vec::new(), Vec::new()),
+            };
             let owner = proto::read_u64(body, &mut i).unwrap_or(0);
             let start = proto::read_u64(body, &mut i).unwrap_or(0);
             let end = proto::read_u64(body, &mut i).unwrap_or(u64::MAX);
@@ -2875,11 +3315,24 @@ fn dispatch_meta(engine: &dyn MetaProvider, op: u8, body: &[u8]) -> (i32, u64, V
 /// and not retried against a backup). Used by the mount's listener thread so
 /// invalidation pushes keep flowing after a failover.
 pub fn open_event_stream(addr: &str, view: &str, token: &str, uid: u32) -> io::Result<TcpStream> {
+    open_event_stream_keyed(addr, view, token, uid, "")
+}
+
+/// Like [`open_event_stream`], but presents `api_key` on the `M_OPEN`
+/// handshake — what a `meta-server --require-api-key` demands, so the mount's
+/// invalidation subscription carries the same credential as its work sockets.
+pub fn open_event_stream_keyed(
+    addr: &str,
+    view: &str,
+    token: &str,
+    uid: u32,
+    api_key: &str,
+) -> io::Result<TcpStream> {
     let mut last = io::Error::new(io::ErrorKind::ConnectionRefused, "no meta addr");
     for a in split_addrs(addr) {
-        match try_open_event_stream(&a, view, token, uid) {
+        match try_open_event_stream(&a, view, token, uid, api_key) {
             Ok(s) => return Ok(s),
-            // A rejected token is a config error on every node; don't rotate.
+            // A rejected credential is a config error on every node; don't rotate.
             Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return Err(e),
             Err(e) => last = e,
         }
@@ -2887,7 +3340,13 @@ pub fn open_event_stream(addr: &str, view: &str, token: &str, uid: u32) -> io::R
     Err(last)
 }
 
-fn try_open_event_stream(addr: &str, view: &str, token: &str, uid: u32) -> io::Result<TcpStream> {
+fn try_open_event_stream(
+    addr: &str,
+    view: &str,
+    token: &str,
+    uid: u32,
+    api_key: &str,
+) -> io::Result<TcpStream> {
     let mut s = TcpStream::connect(addr)?;
     s.set_read_timeout(None)?; // block waiting for pushed events
     s.set_write_timeout(Some(Duration::from_secs(5)))?;
@@ -2896,13 +3355,17 @@ fn try_open_event_stream(addr: &str, view: &str, token: &str, uid: u32) -> io::R
     proto::put_key(&mut body, view);
     proto::put_key(&mut body, token);
     proto::put_u32(&mut body, uid);
+    proto::put_key(&mut body, api_key);
     proto::send_request(&mut s, M_OPEN, &body)?;
-    let (st, _, _) = proto::recv_response(&mut s)?;
+    let (st, _, reason) = proto::recv_response(&mut s)?;
     if st == E_AUTH {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "meta-server rejected the access token",
-        ));
+        // The server states the cause in the payload (an old one sends none).
+        let why = if reason.is_empty() {
+            "meta-server rejected the access token".to_string()
+        } else {
+            String::from_utf8_lossy(&reason).into_owned()
+        };
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, why));
     }
     if st != 0 {
         return Err(io::Error::from_raw_os_error(EIO));
@@ -2947,6 +3410,7 @@ pub fn spawn_invalidation_listener(
     addr: &str,
     view: &str,
     token: &str,
+    api_key: &str,
     uid: u32,
     notifier: Notifier,
     display: Option<Arc<dyn MetaProvider>>,
@@ -2954,11 +3418,25 @@ pub fn spawn_invalidation_listener(
     let addr = addr.to_string();
     let view = view.to_string();
     let token = token.to_string();
+    let api_key = api_key.to_string();
     thread::spawn(move || loop {
-        match run_event_stream(&addr, &view, &token, uid, &notifier, display.as_ref()) {
-            // A rejected token is a config error; retrying can't fix it.
+        match run_event_stream(
+            &addr,
+            &view,
+            &token,
+            &api_key,
+            uid,
+            &notifier,
+            display.as_ref(),
+        ) {
+            // A rejected credential can't be fixed by retrying. If this mount was
+            // already serving, the refusal means its key was revoked (or the
+            // server was reconfigured under it) — the same auth LOSS the work
+            // connections report, so ask for the same clean unmount instead of
+            // silently keeping a keyless mount alive with no invalidations.
             Err(ref e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                eprintln!("invalidation listener stopped: token rejected");
+                super::signal_auth_loss(&e.to_string());
+                eprintln!("invalidation listener stopped: {e}");
                 return;
             }
             // EOF / transport error: back off briefly, then reconnect fresh.
@@ -2971,11 +3449,12 @@ fn run_event_stream(
     addr: &str,
     view: &str,
     token: &str,
+    api_key: &str,
     uid: u32,
     notifier: &Notifier,
     display: Option<&Arc<dyn MetaProvider>>,
 ) -> io::Result<()> {
-    let mut s = open_event_stream(addr, view, token, uid)?;
+    let mut s = open_event_stream_keyed(addr, view, token, uid, api_key)?;
     loop {
         let (kind, val, data) = proto::recv_response(&mut s)?;
         match kind {
@@ -3010,7 +3489,10 @@ mod ha_tests {
     #[test]
     fn split_addrs_parses_failover_list() {
         // The client's `--meta a,b` parsing that drives failover.
-        assert_eq!(split_addrs("10.0.0.1:1,10.0.0.2:1"), vec!["10.0.0.1:1", "10.0.0.2:1"]);
+        assert_eq!(
+            split_addrs("10.0.0.1:1,10.0.0.2:1"),
+            vec!["10.0.0.1:1", "10.0.0.2:1"]
+        );
         // whitespace tolerated, empties dropped
         assert_eq!(split_addrs(" a , , b "), vec!["a", "b"]);
         // a single address stays a single-element list (legacy behavior intact)
@@ -3024,9 +3506,15 @@ mod ha_tests {
         // A forwarded batch must decode to the identical events on the standby,
         // preserving Entry(parent,name) and Inode(ino) payloads.
         let events = vec![
-            Event::Entry { parent: 1, name: "alpha.txt".to_string() },
+            Event::Entry {
+                parent: 1,
+                name: "alpha.txt".to_string(),
+            },
             Event::Inode { ino: 42 },
-            Event::Entry { parent: 7, name: "dir/sub".to_string() },
+            Event::Entry {
+                parent: 7,
+                name: "dir/sub".to_string(),
+            },
         ];
         let mut body = Vec::new();
         proto::put_key(&mut body, "alice");
@@ -3037,7 +3525,16 @@ mod ha_tests {
         assert_eq!(view, "alice");
         assert_eq!(back.len(), 3);
         match (&back[0], &back[2]) {
-            (Event::Entry { parent: p1, name: n1 }, Event::Entry { parent: p2, name: n2 }) => {
+            (
+                Event::Entry {
+                    parent: p1,
+                    name: n1,
+                },
+                Event::Entry {
+                    parent: p2,
+                    name: n2,
+                },
+            ) => {
                 assert_eq!((*p1, n1.as_str()), (1, "alpha.txt"));
                 assert_eq!((*p2, n2.as_str()), (7, "dir/sub"));
             }
@@ -3052,10 +3549,30 @@ mod ha_tests {
     #[test]
     fn write_ops_are_gated_reads_are_not() {
         // The standby's read-only gate keys off exactly this classification.
-        for op in [M_CREATE, M_SYMLINK, M_LINK, M_UNLINK, M_RENAME, M_SETMODE, M_SETUIDGID, M_SETTIMES, M_TOUCH] {
+        for op in [
+            M_CREATE,
+            M_SYMLINK,
+            M_LINK,
+            M_UNLINK,
+            M_RENAME,
+            M_SETMODE,
+            M_SETUIDGID,
+            M_SETTIMES,
+            M_TOUCH,
+        ] {
             assert!(is_write_op(op), "op {op} must be write-intent");
         }
-        for op in [M_OPEN, M_LOOKUP, M_GETATTR, M_READDIR, M_READDIRP, M_SUBSCRIBE, M_PING, M_PUSH, M_FORWARD] {
+        for op in [
+            M_OPEN,
+            M_LOOKUP,
+            M_GETATTR,
+            M_READDIR,
+            M_READDIRP,
+            M_SUBSCRIBE,
+            M_PING,
+            M_PUSH,
+            M_FORWARD,
+        ] {
             assert!(!is_write_op(op), "op {op} must not be write-intent");
         }
     }
@@ -3068,7 +3585,10 @@ mod ha_tests {
         // paged readdir stitches back into the exact full listing.
         use crate::meta::ROOT_INO;
 
-        let dir = tempfile::Builder::new().prefix("yf_pagedir_").tempdir().unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("yf_pagedir_")
+            .tempdir()
+            .unwrap();
         let base = dir.path().to_path_buf();
         std::fs::create_dir_all(base.join("meta")).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3076,7 +3596,10 @@ mod ha_tests {
         std::thread::spawn(move || serve_on_meta_auth(listener, base, ""));
 
         let meta = RemoteMeta::new(&addr, "alice").expect("handshake with a live server");
-        assert!(meta.supports_paged_readdir(), "a SQLite-backed server advertises store-level paging");
+        assert!(
+            meta.supports_paged_readdir(),
+            "a SQLite-backed server advertises store-level paging"
+        );
 
         let n = 7;
         for i in 0..n {
@@ -3096,7 +3619,10 @@ mod ha_tests {
             stitched.extend(page.into_iter().map(|x| x.name));
             off += 3;
         }
-        assert_eq!(stitched, full, "M_READDIRP pages must equal the full readdir");
+        assert_eq!(
+            stitched, full,
+            "M_READDIRP pages must equal the full readdir"
+        );
     }
 
     #[test]
@@ -3107,7 +3633,10 @@ mod ha_tests {
         use crate::backend::{self, StorageBackend};
         use crate::remote::server::{serve_on_auth, Fence};
 
-        let dir = tempfile::Builder::new().prefix("yf_fencewt_").tempdir().unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("yf_fencewt_")
+            .tempdir()
+            .unwrap();
         let backend: Arc<dyn StorageBackend> = Arc::from(backend::open_local(dir.path()).unwrap());
         let fence = Arc::new(Fence::new_in_memory());
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3127,6 +3656,7 @@ mod ha_tests {
         let rt = Arc::new(MetaRuntime {
             base: dir.path().to_path_buf(),
             token: String::new(),
+            keys: None,
             cache: Arc::new(Mutex::new(HashMap::new())),
             views: Arc::new(Mutex::new(HashMap::new())),
             bases: Arc::new(Mutex::new(HashMap::new())),
@@ -3138,15 +3668,20 @@ mod ha_tests {
             sync_repl: false,
             standby_push: Mutex::new(()),
             witness: Some(waddr),
-            acl: Arc::new(crate::acl::AclStore::open(dir.path()).unwrap()),
             store: StoreKind::Sqlite,
         });
 
         // Witness holds nothing above our epoch: the first proof grants a lease
         // and we keep authority, staying Primary.
-        assert!(!rt.fenced_for_write(), "a still-authoritative primary must not self-fence");
+        assert!(
+            !rt.fenced_for_write(),
+            "a still-authoritative primary must not self-fence"
+        );
         assert_eq!(ha.role(), Role::Primary);
-        assert!(ha.lease_valid(), "a successful proof establishes a live lease");
+        assert!(
+            ha.lease_valid(),
+            "a successful proof establishes a live lease"
+        );
 
         // With a live lease the next write is admitted from the LOCAL fast path —
         // no arbiter round-trip, because the witness cannot have handed the lease
@@ -3168,8 +3703,16 @@ mod ha_tests {
             rt.fenced_for_write(),
             "an expired lease forces re-proof, which must fence a higher witness epoch"
         );
-        assert_eq!(ha.role(), Role::Standby, "fence must demote to standby immediately");
-        assert_eq!(ha.epoch.load(Ordering::SeqCst), 9, "must adopt the witness epoch");
+        assert_eq!(
+            ha.role(),
+            Role::Standby,
+            "fence must demote to standby immediately"
+        );
+        assert_eq!(
+            ha.epoch.load(Ordering::SeqCst),
+            9,
+            "must adopt the witness epoch"
+        );
     }
 
     #[test]
@@ -3177,7 +3720,11 @@ mod ha_tests {
         // A single arbiter (the legacy `--witness` shape) needs exactly 1 grant,
         // so the quorum path is a strict superset of the old single-witness one.
         assert_eq!(quorum_size(1), 1);
-        assert_eq!(quorum_size(2), 2, "2 nodes need BOTH (no majority shortcut)");
+        assert_eq!(
+            quorum_size(2),
+            2,
+            "2 nodes need BOTH (no majority shortcut)"
+        );
         assert_eq!(quorum_size(3), 2);
         assert_eq!(quorum_size(4), 3);
         assert_eq!(quorum_size(5), 3);
@@ -3189,10 +3736,16 @@ mod ha_tests {
         // old single witness did — advancing wins+leases, being ahead fences.
         let q = quorum_size(1);
         let ahead_of_us = classify(&[(7, true)], 5);
-        assert!(ahead_of_us.fenced(q), "a higher token at the lone arbiter fences");
+        assert!(
+            ahead_of_us.fenced(q),
+            "a higher token at the lone arbiter fences"
+        );
         assert!(!ahead_of_us.leased(q));
         let we_lead = classify(&[(3, true)], 5);
-        assert!(we_lead.won(q) && we_lead.leased(q), "raising the lone arbiter wins");
+        assert!(
+            we_lead.won(q) && we_lead.leased(q),
+            "raising the lone arbiter wins"
+        );
         assert!(!we_lead.fenced(q));
         let unreachable = classify(&[], 5); // the probe errored: no reply
         assert_eq!(unreachable.reachable, 0);
@@ -3207,14 +3760,26 @@ mod ha_tests {
         let q = quorum_size(3);
         let one_grant = classify(&[(3, true), (3, false), (3, false)], 5);
         assert_eq!(one_grant.advances, 1);
-        assert!(!one_grant.leased(q) && !one_grant.won(q), "1/3 is below quorum");
+        assert!(
+            !one_grant.leased(q) && !one_grant.won(q),
+            "1/3 is below quorum"
+        );
         let two_grants = classify(&[(3, true), (3, true), (3, false)], 5);
-        assert!(two_grants.won(q) && two_grants.leased(q), "2/3 grants win the quorum");
+        assert!(
+            two_grants.won(q) && two_grants.leased(q),
+            "2/3 grants win the quorum"
+        );
         let one_ahead = classify(&[(7, false), (3, true), (3, true)], 5);
         assert!(!one_ahead.fenced(q), "one higher arbiter does not fence");
         let two_ahead = classify(&[(7, false), (8, false), (3, true)], 5);
-        assert!(two_ahead.fenced(q), "a majority holding higher epochs fences us");
-        assert_eq!(two_ahead.prev_max, 8, "adopt the highest witness token we saw");
+        assert!(
+            two_ahead.fenced(q),
+            "a majority holding higher epochs fences us"
+        );
+        assert_eq!(
+            two_ahead.prev_max, 8,
+            "adopt the highest witness token we saw"
+        );
     }
 
     #[test]
@@ -3231,6 +3796,9 @@ mod ha_tests {
         // Two arbiters already at 6 renew us (held), only one still advances:
         assert_eq!(loser.held, 2);
         assert_eq!(loser.advances, 1);
-        assert!(!loser.won(q), "a same-value collision must NOT re-win the quorum");
+        assert!(
+            !loser.won(q),
+            "a same-value collision must NOT re-win the quorum"
+        );
     }
 }

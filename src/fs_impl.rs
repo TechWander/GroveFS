@@ -16,7 +16,7 @@ use crate::backend::StorageBackend;
 use crate::meta::{LockType, MetaError, MetaProvider, NodeInfo, NodeKind};
 use fuser::{
     AccessFlags, BsdFileFlags, Errno, FileAttr, FileHandle, FileType, FopenFlags, Generation,
-    InitFlags, IoctlFlags, INodeNo, KernelConfig, LockOwner, OpenFlags, RenameFlags, ReplyAttr,
+    INodeNo, InitFlags, IoctlFlags, KernelConfig, LockOwner, OpenFlags, RenameFlags, ReplyAttr,
     ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyIoctl,
     ReplyLock, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
@@ -62,6 +62,16 @@ pub struct GroveFS {
     /// (both are applied for `--ro`), so the view stays read-only even if the
     /// kernel-level flag were somehow not honored for a given request.
     readonly: bool,
+    /// When set, CONTENT of existing files is read-only while the tree stays
+    /// writable: `write` and a `setattr` size change (truncate/extend, O_TRUNC)
+    /// are refused with EROFS, but mkdir/rename/unlink/symlink/link and
+    /// attribute updates pass through. This is how a FORK mounts: it owns its
+    /// metadata tree (organize it freely) while the bytes are shared with the
+    /// base view, so uploading content belongs to the base view only. Set from
+    /// the server's M_OPEN ack (remote) or the `fork <base>` definition
+    /// (local). Honest boundary: it is a CLIENT-side gate — a raw protocol
+    /// client that skips this FUSE layer can still write to the data plane.
+    content_ro: bool,
     /// Strict coherence: disable the kernel's attribute/dentry cache (TTL 0) and
     /// read file data straight through (`FopenFlags::FOPEN_DIRECT_IO`, bypassing
     /// the page cache). Chosen for multi-client mounts that share a `meta-server`, where
@@ -119,6 +129,7 @@ impl GroveFS {
         meta: Arc<dyn MetaProvider>,
         backend: Arc<dyn StorageBackend>,
         readonly: bool,
+        content_ro: bool,
         strict: bool,
         readdirplus: bool,
         cache_ttl_secs: u64,
@@ -129,6 +140,7 @@ impl GroveFS {
             ino_to_key: RwLock::new(std::collections::HashMap::new()),
             last_write_touch: RwLock::new(std::collections::HashMap::new()),
             readonly,
+            content_ro,
             strict,
             readdirplus,
             cache_ttl: Duration::from_secs(cache_ttl_secs),
@@ -464,15 +476,33 @@ impl fuser::Filesystem for GroveFS {
         }
         if uid.is_some() || gid.is_some() {
             let node = self.meta.getattr(ino.0 as i64);
-            let cur_uid = node.as_ref().map(|n| n.uid).unwrap_or(unsafe { libc::getuid() });
-            let cur_gid = node.as_ref().map(|n| n.gid).unwrap_or(unsafe { libc::getgid() });
-            self.meta.set_uid_gid(ino.0 as i64, uid.unwrap_or(cur_uid), gid.unwrap_or(cur_gid));
+            let cur_uid = node
+                .as_ref()
+                .map(|n| n.uid)
+                .unwrap_or(unsafe { libc::getuid() });
+            let cur_gid = node
+                .as_ref()
+                .map(|n| n.gid)
+                .unwrap_or(unsafe { libc::getgid() });
+            self.meta
+                .set_uid_gid(ino.0 as i64, uid.unwrap_or(cur_uid), gid.unwrap_or(cur_gid));
         }
         if let Some(new_size) = size {
+            // A fork mounts structure-writable / content-read-only: truncating
+            // (or extending) an existing object changes its BYTES, which is
+            // exactly what a derived view may not do. Attribute-only setattr
+            // (mode/owner/times below) stays allowed.
+            if self.content_ro {
+                reply.error(Errno::EROFS);
+                return;
+            }
             // Truncate / extend the backing object (O_TRUNC also lands here).
             let node = self.meta.getattr(ino.0 as i64);
             match node {
-                Some(n) if n.is_dir() => { reply.error(Errno::EISDIR); return; }
+                Some(n) if n.is_dir() => {
+                    reply.error(Errno::EISDIR);
+                    return;
+                }
                 Some(n) => {
                     if let Some(k) = &n.data_ref {
                         if let Err(e) = self.backend.truncate(k, new_size) {
@@ -482,7 +512,10 @@ impl fuser::Filesystem for GroveFS {
                         self.meta.touch_mtime(ino.0 as i64);
                     }
                 }
-                None => { reply.error(Errno::ENOENT); return; }
+                None => {
+                    reply.error(Errno::ENOENT);
+                    return;
+                }
             }
         }
         // Honor explicit atime/mtime updates (utimes / touch / SET_ATIME etc.).
@@ -497,7 +530,14 @@ impl fuser::Filesystem for GroveFS {
         }
     }
 
-    fn symlink(&self, req: &Request, parent: INodeNo, link_name: &OsStr, target: &Path, reply: ReplyEntry) {
+    fn symlink(
+        &self,
+        req: &Request,
+        parent: INodeNo,
+        link_name: &OsStr,
+        target: &Path,
+        reply: ReplyEntry,
+    ) {
         if self.readonly {
             reply.error(Errno::EROFS);
             return;
@@ -508,10 +548,15 @@ impl fuser::Filesystem for GroveFS {
             reply.error(Errno::EINVAL);
             return;
         }
-        match self.meta.create_symlink(parent.0 as i64, &name, &tgt, req.uid(), req.gid()) {
+        match self
+            .meta
+            .create_symlink(parent.0 as i64, &name, &tgt, req.uid(), req.gid())
+        {
             Ok(id) => {
                 match self.meta.getattr(id) {
-                    Some(node) => reply.entry(&self.short_ttl(), &self.build_attr(&node), Generation(0)),
+                    Some(node) => {
+                        reply.entry(&self.short_ttl(), &self.build_attr(&node), Generation(0))
+                    }
                     // The just-created inode was concurrently unlinked between
                     // `create` (which released the meta lock) and this lookup.
                     // Report it gone rather than unwrapping `None` into a
@@ -533,7 +578,14 @@ impl fuser::Filesystem for GroveFS {
         }
     }
 
-    fn link(&self, _req: &Request, ino: INodeNo, newparent: INodeNo, newname: &OsStr, reply: ReplyEntry) {
+    fn link(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        newparent: INodeNo,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
         if self.readonly {
             reply.error(Errno::EROFS);
             return;
@@ -542,7 +594,9 @@ impl fuser::Filesystem for GroveFS {
         match self.meta.link_node(ino.0 as i64, newparent.0 as i64, &name) {
             Ok(id) => {
                 match self.meta.getattr(id) {
-                    Some(node) => reply.entry(&self.short_ttl(), &self.build_attr(&node), Generation(0)),
+                    Some(node) => {
+                        reply.entry(&self.short_ttl(), &self.build_attr(&node), Generation(0))
+                    }
                     // The just-created inode was concurrently unlinked between
                     // `create` (which released the meta lock) and this lookup.
                     // Report it gone rather than unwrapping `None` into a
@@ -554,7 +608,16 @@ impl fuser::Filesystem for GroveFS {
         }
     }
 
-    fn mknod(&self, req: &Request, parent: INodeNo, name: &OsStr, mode: u32, umask: u32, rdev: u32, reply: ReplyEntry) {
+    fn mknod(
+        &self,
+        req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        rdev: u32,
+        reply: ReplyEntry,
+    ) {
         // We only materialize regular files via mknod (S_IFREG). Special files
         // (fifo/char/block/socket) are not backed by a data object here.
         if self.readonly {
@@ -579,7 +642,15 @@ impl fuser::Filesystem for GroveFS {
             return;
         }
         let perm = mode & !umask & 0o7777;
-        match self.meta.create_node(parent.0 as i64, &name_str, false, Some(&key), perm, req.uid(), req.gid()) {
+        match self.meta.create_node(
+            parent.0 as i64,
+            &name_str,
+            false,
+            Some(&key),
+            perm,
+            req.uid(),
+            req.gid(),
+        ) {
             Ok(id) => {
                 match self.meta.getattr(id) {
                     Some(node) => {
@@ -592,21 +663,42 @@ impl fuser::Filesystem for GroveFS {
                     None => reply.error(Errno::ENOENT),
                 }
             }
-            Err(e) => { let _ = self.backend.remove(&key); reply.error(Self::err_to_errno(e)); }
+            Err(e) => {
+                let _ = self.backend.remove(&key);
+                reply.error(Self::err_to_errno(e));
+            }
         }
     }
 
-    fn mkdir(&self, req: &Request, parent: INodeNo, name: &OsStr, mode: u32, umask: u32, reply: ReplyEntry) {
+    fn mkdir(
+        &self,
+        req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        reply: ReplyEntry,
+    ) {
         if self.readonly {
             reply.error(Errno::EROFS);
             return;
         }
         let name_str = name.to_string_lossy().to_string();
         let perm = mode & !umask;
-        match self.meta.create_node(parent.0 as i64, &name_str, true, None, perm, req.uid(), req.gid()) {
+        match self.meta.create_node(
+            parent.0 as i64,
+            &name_str,
+            true,
+            None,
+            perm,
+            req.uid(),
+            req.gid(),
+        ) {
             Ok(id) => {
                 match self.meta.getattr(id) {
-                    Some(node) => reply.entry(&self.short_ttl(), &self.build_attr(&node), Generation(0)),
+                    Some(node) => {
+                        reply.entry(&self.short_ttl(), &self.build_attr(&node), Generation(0))
+                    }
                     // The just-created inode was concurrently unlinked between
                     // `create` (which released the meta lock) and this lookup.
                     // Report it gone rather than unwrapping `None` into a
@@ -657,7 +749,13 @@ impl fuser::Filesystem for GroveFS {
                         let attr = self.build_attr(&node);
                         // Echo the inode as the handle: IO resolves by inode, so fh is
                         // opaque here. Returning it keeps the reply shape valid.
-                        reply.created(&self.short_ttl(), &attr, Generation(0), FileHandle(id as u64), FopenFlags::empty());
+                        reply.created(
+                            &self.short_ttl(),
+                            &attr,
+                            Generation(0),
+                            FileHandle(id as u64),
+                            FopenFlags::empty(),
+                        );
                     }
                     // Raced with a concurrent unlink of the just-created name:
                     // reply ENOENT instead of panicking a FUSE worker on `None`
@@ -691,7 +789,17 @@ impl fuser::Filesystem for GroveFS {
         }
     }
 
-    fn read(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, size: u32, _flags: OpenFlags, _lock_owner: Option<LockOwner>, reply: ReplyData) {
+    fn read(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        size: u32,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
+        reply: ReplyData,
+    ) {
         if stats::enabled() && ino.0 == STATS_INO {
             reply.data(&Self::stats_slice(offset, size as usize));
             return;
@@ -747,6 +855,11 @@ impl fuser::Filesystem for GroveFS {
             reply.error(Errno::EROFS);
             return;
         }
+        if self.content_ro {
+            // Fork view: the tree is the client's to organize, its bytes are not.
+            reply.error(Errno::EROFS);
+            return;
+        }
         // Outermost per-op write latency (kernel-visible "write speed"); the gap
         // to (key_resolve + backend_total + touch_mtime) is unmeasured glue.
         let _op = stats::start(stats::Stage::OpWrite);
@@ -792,7 +905,14 @@ impl fuser::Filesystem for GroveFS {
         reply.written(n as u32);
     }
 
-    fn fsync(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, _datasync: bool, reply: ReplyEmpty) {
+    fn fsync(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
         match self.key_for_ino(ino.0) {
             Some(k) => match self.backend.fsync(&k) {
                 Ok(()) => reply.ok(),
@@ -802,7 +922,16 @@ impl fuser::Filesystem for GroveFS {
         }
     }
 
-    fn release(&self, _req: &Request, _ino: INodeNo, _fh: FileHandle, _flags: OpenFlags, lock_owner: Option<LockOwner>, _flush: bool, reply: ReplyEmpty) {
+    fn release(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _flags: OpenFlags,
+        lock_owner: Option<LockOwner>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
         // Intentionally keep the ino->key entry: with writeback cache the kernel
         // may still flush this inode's dirty pages after close. `forget` prunes it
         // once the inode is truly dead.
@@ -853,7 +982,14 @@ impl fuser::Filesystem for GroveFS {
         reply.error(Errno::ENOSYS);
     }
 
-    fn getxattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, _size: u32, reply: ReplyXattr) {
+    fn getxattr(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _name: &OsStr,
+        _size: u32,
+        reply: ReplyXattr,
+    ) {
         reply.error(Errno::ENOSYS);
     }
 
@@ -917,7 +1053,10 @@ impl fuser::Filesystem for GroveFS {
                 return;
             }
         };
-        match self.meta.get_lock(ino.0 as i64, lock_owner.0, start, end, ty) {
+        match self
+            .meta
+            .get_lock(ino.0 as i64, lock_owner.0, start, end, ty)
+        {
             Some(c) => reply.locked(c.start, c.end, c.ty.to_fuse_i32(), c.pid),
             None => reply.locked(0, 0, 2 /* F_UNLCK */, 0),
         }
@@ -964,10 +1103,18 @@ impl fuser::Filesystem for GroveFS {
         // fine and keeps the meta protocol simple.
         const BLOCKING_POLL_MS: u64 = 100;
         const BLOCKING_WAIT_MAX_MS: u64 = 600_000; // 10 min safety cap
-        let deadline = std::time::Instant::now()
-            + std::time::Duration::from_millis(BLOCKING_WAIT_MAX_MS);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(BLOCKING_WAIT_MAX_MS);
         loop {
-            match self.meta.lock_op(ino.0 as i64, lock_owner.0, start, end, ty, pid, self.lock_sid) {
+            match self.meta.lock_op(
+                ino.0 as i64,
+                lock_owner.0,
+                start,
+                end,
+                ty,
+                pid,
+                self.lock_sid,
+            ) {
                 Ok(None) => {
                     // A granted Read/Write lock must be kept alive: start the
                     // per-mount renewal heartbeat (idempotent) so peers see it
@@ -994,7 +1141,9 @@ impl fuser::Filesystem for GroveFS {
                 }
                 Err(MetaError::Db(s)) => {
                     // Read-only open on HA standby surfaces here; report EROFS.
-                    if s.to_lowercase().contains("readonly") || s.to_lowercase().contains("read-only") {
+                    if s.to_lowercase().contains("readonly")
+                        || s.to_lowercase().contains("read-only")
+                    {
                         reply.error(Errno::EROFS);
                     } else {
                         reply.error(Errno::EIO);
@@ -1060,7 +1209,10 @@ impl fuser::Filesystem for GroveFS {
         let noreplace = flags.contains(RenameFlags::RENAME_NOREPLACE);
         let from = name.to_string_lossy().to_string();
         let to = newname.to_string_lossy().to_string();
-        match self.meta.rename(parent.0 as i64, &from, newparent.0 as i64, &to, noreplace) {
+        match self
+            .meta
+            .rename(parent.0 as i64, &from, newparent.0 as i64, &to, noreplace)
+        {
             Ok(gc) => {
                 // Renaming over an existing file drops that file's last name; free
                 // its storage blob so the space does not leak (mirrors unlink).
@@ -1112,7 +1264,11 @@ impl fuser::Filesystem for GroveFS {
             reply.ok();
             return;
         }
-        let parent_ino = if ino == INodeNo::ROOT { ino.0 } else { node.parent_id as u64 };
+        let parent_ino = if ino == INodeNo::ROOT {
+            ino.0
+        } else {
+            node.parent_id as u64
+        };
         let parent_attr = match self.meta.getattr(parent_ino as i64) {
             Some(p) => self.build_attr(&p),
             None => self_attr,
@@ -1185,7 +1341,14 @@ impl fuser::Filesystem for GroveFS {
         reply.ok();
     }
 
-    fn readdir(&self, _req: &Request, ino: INodeNo, _fh: FileHandle, offset: u64, mut reply: ReplyDirectory) {
+    fn readdir(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        mut reply: ReplyDirectory,
+    ) {
         // A resume at the control node's cookie means the listing (including the
         // synthetic row) already ended -> EOF. Guards against re-emitting it.
         if stats::enabled() && ino == INodeNo::ROOT && offset == STATS_COOKIE {
@@ -1194,8 +1357,14 @@ impl fuser::Filesystem for GroveFS {
         }
         let node = match self.meta.getattr(ino.0 as i64) {
             Some(n) if n.is_dir() => n,
-            Some(_) => { reply.error(Errno::ENOTDIR); return; }
-            None => { reply.error(Errno::ENOENT); return; }
+            Some(_) => {
+                reply.error(Errno::ENOTDIR);
+                return;
+            }
+            None => {
+                reply.error(Errno::ENOENT);
+                return;
+            }
         };
         // Deterministic listing: ".", ".." then children (SQL already ORDER BY
         // name), so index-based resume stays stable across calls. Children are
@@ -1203,13 +1372,22 @@ impl fuser::Filesystem for GroveFS {
         // offsets match the READDIRPLUS ones, which the kernel may interleave
         // with these on the same directory handle.
         let skip = offset as usize;
-        let parent_ino = if ino == INodeNo::ROOT { ino.0 } else { node.parent_id as u64 };
+        let parent_ino = if ino == INodeNo::ROOT {
+            ino.0
+        } else {
+            node.parent_id as u64
+        };
         if skip <= 1 {
             if skip == 0 && reply.add(ino, 1, FileType::Directory, OsStr::new(".")) {
                 reply.ok();
                 return;
             }
-            if reply.add(INodeNo(parent_ino), 2, FileType::Directory, OsStr::new("..")) {
+            if reply.add(
+                INodeNo(parent_ino),
+                2,
+                FileType::Directory,
+                OsStr::new(".."),
+            ) {
                 reply.ok();
                 return;
             }
@@ -1241,7 +1419,15 @@ impl fuser::Filesystem for GroveFS {
         // children are exhausted, occupying one trailing slot with its own
         // opaque cookie. This leaves the real-children enumeration byte-for-byte
         // unchanged and never runs when `--stats` is off.
-        if stats::enabled() && ino == INodeNo::ROOT && reply.add(INodeNo(STATS_INO), STATS_COOKIE, FileType::RegularFile, OsStr::new(STATS_NAME)) {
+        if stats::enabled()
+            && ino == INodeNo::ROOT
+            && reply.add(
+                INodeNo(STATS_INO),
+                STATS_COOKIE,
+                FileType::RegularFile,
+                OsStr::new(STATS_NAME),
+            )
+        {
             reply.ok();
             return;
         }
@@ -1249,7 +1435,12 @@ impl fuser::Filesystem for GroveFS {
     }
 
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        if self.meta.getattr(ino.0 as i64).map(|n| n.is_dir()).unwrap_or(false) {
+        if self
+            .meta
+            .getattr(ino.0 as i64)
+            .map(|n| n.is_dir())
+            .unwrap_or(false)
+        {
             reply.opened(FileHandle(0), FopenFlags::empty());
         } else {
             reply.error(Errno::ENOTDIR);
@@ -1342,7 +1533,10 @@ mod tests {
     fn write_touch_debounces_per_inode() {
         let mut map = std::collections::HashMap::new();
         let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
-        assert!(should_touch_write(&mut map, 7, t0), "first write always touches");
+        assert!(
+            should_touch_write(&mut map, 7, t0),
+            "first write always touches"
+        );
         assert!(
             !should_touch_write(&mut map, 7, t0 + Duration::from_millis(50)),
             "50ms later is inside the window"
@@ -1357,7 +1551,11 @@ mod tests {
             "exactly the window elapsed fires (and re-stamps)"
         );
         // Separate inode has its own window (new file while streaming another).
-        assert!(should_touch_write(&mut map, 8, t0 + Duration::from_millis(201)));
+        assert!(should_touch_write(
+            &mut map,
+            8,
+            t0 + Duration::from_millis(201)
+        ));
     }
 
     /// Regression guard for the amplification math the P2 claim rests on:

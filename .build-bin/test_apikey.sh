@@ -47,6 +47,22 @@ else bad "create output unexpected: $COUT"; fi
 LOUT=$($Y apikey --db-path "$BASE" list 2>&1)
 echo "$LOUT" | grep -qF "$ID" && echo "$LOUT" | grep -q "agentA" \
   && ok "list shows the new key by id + label" || bad "list missing key: $LOUT"
+# --view filters by the view a key can OPEN: a team-bound key shows up under
+# `--view team`, while the unbound (system) key is summarized separately
+# rather than dumped into the per-view answer.
+$Y apikey --db-path "$BASE" create --label team-mount --for mount --view team > .apitest/ak_team.log 2>&1 \
+  && ok "minted a view-bound key (--for mount --view team)" || bad "view-bound create: $(cat .apitest/ak_team.log)"
+VOUT=$($Y apikey --db-path "$BASE" list --view team 2>&1)
+if echo "$VOUT" | grep -q "team-mount" && ! echo "$VOUT" | grep -q "agentA"; then
+  ok "list --view team shows only the team-bound key"
+else bad "view-filtered list wrong: $VOUT"; fi
+echo "$VOUT" | grep -q "1 bound key(s) for view 'team' of 2 total" \
+  && ok "filtered list reports bound/total counts" || bad "count line missing: $VOUT"
+echo "$VOUT" | grep -q "1 unbound key(s) admit every view too" \
+  && ok "unbound keys are summarized as admitting every view" || bad "unbound note missing: $VOUT"
+$Y apikey --db-path "$BASE" list > .apitest/ak_all.log 2>&1
+grep -q "team-mount" .apitest/ak_all.log && grep -q "agentA" .apitest/ak_all.log \
+  && ok "unfiltered list still shows every key" || bad "unfiltered list wrong: $(cat .apitest/ak_all.log)"
 # The plaintext secret must NOT be recoverable from the on-disk store (hash only).
 if [ -f "$BASE/meta/api_keys.db" ] && ! grep -a -q "$SECRET" "$BASE/meta/api_keys.db"; then
   ok "api_keys.db stores only the hash — the plaintext secret is not on disk"
@@ -84,7 +100,7 @@ else bad "wrong secret admitted: $(cat .apitest/out_bad)"; fi
 # (c) the real key in initialize -> admitted; a governance write succeeds.
 frames "$KEY" > .apitest/in_ok
 T $Y mcp --db-path "$BASE" --require-api-key < .apitest/in_ok > .apitest/out_ok 2>/dev/null
-if [ "$(fget .apitest/out_ok 2 '.result.tools|length')" = "8" ] \
+if [ "$(fget .apitest/out_ok 2 '.result.tools|length')" = "9" ] \
    && [ "$(fget .apitest/out_ok 4 .result.isError)" != "true" ]; then
   ok "initialize(apiKey) authenticates the session; tools/list + define admitted"
 else bad "key not admitted: $(cat .apitest/out_ok)"; fi
@@ -142,7 +158,7 @@ KEY3=$(echo "$C3" | sed -n 's/^  key:   //p')
 frames "" > .apitest/in_env        # initialize WITHOUT a key
 GROVEFS_MCP_API_KEY="$KEY3" T $Y mcp --db-path "$BASE" --require-api-key \
   < .apitest/in_env > .apitest/out_env 2>/dev/null
-if [ "$(fget .apitest/out_env 2 '.result.tools|length')" = "8" ]; then
+if [ "$(fget .apitest/out_env 2 '.result.tools|length')" = "9" ]; then
   ok "GROVEFS_MCP_API_KEY pre-authenticates the server (handshake needs no key)"
 else bad "env pre-auth did not admit tools/list: $(cat .apitest/out_env)"; fi
 
@@ -150,7 +166,7 @@ else bad "env pre-auth did not admit tools/list: $(cat .apitest/out_env)"; fi
 echo "===== 6) regression: plain 'grovefs mcp' (no --require-api-key) needs no key ====="
 frames "" > .apitest/in_plain
 T $Y mcp --db-path "$BASE" < .apitest/in_plain > .apitest/out_plain 2>/dev/null
-if [ "$(fget .apitest/out_plain 2 '.result.tools|length')" = "8" ]; then
+if [ "$(fget .apitest/out_plain 2 '.result.tools|length')" = "9" ]; then
   ok "opt-in honored: without --require-api-key the tool surface stays open (logged, not gated)"
 else bad "plain server unexpectedly gated: $(cat .apitest/out_plain)"; fi
 

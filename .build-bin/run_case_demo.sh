@@ -58,12 +58,14 @@ echo "round2-$(date +%s)" > $S/mnt_da/round2.txt
 sleep 0.3
 cat $S/mnt_db/round2.txt
 echo
-echo '### [存储机] $ grovefs acl --db-path /data allow --view share --uid 1001 --read --write'
-./bin/grovefs acl --db-path $S/data allow --view share --uid 1001 --read --write 2>&1
-echo '### [存储机] $ grovefs acl --db-path /data allow --view share --uid 1002 --read'
-./bin/grovefs acl --db-path $S/data allow --view share --uid 1002 --read 2>&1
-echo '### [存储机] $ grovefs acl --db-path /data list --view share'
-./bin/grovefs acl --db-path $S/data list --view share 2>&1
+echo '### [存储机] $ grovefs apikey --db-path /data create --label reader --for mount --view share --ro'
+./bin/grovefs apikey --db-path $S/data create --label reader --for mount --view share --ro 2>&1
+echo '### [存储机] $ grovefs apikey --db-path /data create --label writer --for mount --view share'
+./bin/grovefs apikey --db-path $S/data create --label writer --for mount --view share 2>&1
+echo '### [存储机] $ grovefs apikey --db-path /data list'
+./bin/grovefs apikey --db-path $S/data list 2>&1
+echo '# (a --view-bound key only opens that view; --ro is enforced server-side when the'
+echo '#  meta-server runs --require-api-key — the credential is the per-caller gate)'
 echo
 echo '### 收尾: fusermount -u 两处 + 停服务'
 fusermount -u $S/mnt_da && echo "A umount ok"

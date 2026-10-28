@@ -47,12 +47,19 @@ fn parse_layout(key: &str) -> Option<Layout> {
     if n == 0 || stripe == 0 || base.is_empty() {
         return None;
     }
-    Some(Layout { n, stripe, base: base.to_string() })
+    Some(Layout {
+        n,
+        stripe,
+        base: base.to_string(),
+    })
 }
 
 impl ShardedBackend {
     pub fn new(servers: Vec<Arc<dyn StorageBackend>>, stripe: u64) -> Self {
-        assert!(!servers.is_empty(), "ShardedBackend needs at least one server");
+        assert!(
+            !servers.is_empty(),
+            "ShardedBackend needs at least one server"
+        );
         Self {
             servers,
             stripe: stripe.max(1),
@@ -253,27 +260,25 @@ impl StorageBackend for ShardedBackend {
                     let errs = &errs;
                     let base = l.base.clone();
                     let n = l.n.min(servers.len());
-                    handles.push(
-                        scope.spawn(move || -> (u64, Vec<u8>) {
-                            let idx = i as usize % n;
-                            let ck = format!("{}#{}", base, i);
-                            let rd = {
-                                let _t = stats::start(stats::Stage::IoShardServerOp);
-                                servers[idx].read(&ck, sub_off, sub_len)
-                            };
-                            match rd {
-                                Ok(buf) => (i, buf),
-                                Err(e) if e.kind() == io::ErrorKind::NotFound => (i, Vec::new()),
-                                Err(e) => {
-                                    let mut g = errs.lock().unwrap();
-                                    if g.is_none() {
-                                        *g = Some(e);
-                                    }
-                                    (i, Vec::new())
+                    handles.push(scope.spawn(move || -> (u64, Vec<u8>) {
+                        let idx = i as usize % n;
+                        let ck = format!("{}#{}", base, i);
+                        let rd = {
+                            let _t = stats::start(stats::Stage::IoShardServerOp);
+                            servers[idx].read(&ck, sub_off, sub_len)
+                        };
+                        match rd {
+                            Ok(buf) => (i, buf),
+                            Err(e) if e.kind() == io::ErrorKind::NotFound => (i, Vec::new()),
+                            Err(e) => {
+                                let mut g = errs.lock().unwrap();
+                                if g.is_none() {
+                                    *g = Some(e);
                                 }
+                                (i, Vec::new())
                             }
-                        }),
-                    );
+                        }
+                    }));
                 }
                 for h in handles {
                     results.push(h.join().unwrap());
@@ -321,7 +326,11 @@ impl StorageBackend for ShardedBackend {
                 let (s, ck) = self.chunk(&l, i);
                 let w = {
                     let _t = stats::start(stats::Stage::IoShardServerOp);
-                    self.servers[s].write(&ck, sub_off, &data[(i * l.stripe + sub_off - offset) as usize..][..sub_len])
+                    self.servers[s].write(
+                        &ck,
+                        sub_off,
+                        &data[(i * l.stripe + sub_off - offset) as usize..][..sub_len],
+                    )
                 };
                 written += w?;
             }
@@ -422,7 +431,9 @@ impl StorageBackend for ShardedBackend {
             }
         }
         // `hi` is the first absent chunk; `hi-1` is the trailing (present) chunk.
-        let last = self.chunk_len(&l, hi - 1)?.ok_or_else(|| io::Error::from_raw_os_error(libc::EIO))?;
+        let last = self
+            .chunk_len(&l, hi - 1)?
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EIO))?;
         Ok((hi - 1) * l.stripe + last)
     }
 
@@ -532,7 +543,10 @@ impl StorageBackend for ShardedBackend {
                     // GC stays best-effort, but a failed chunk delete means a
                     // permanent orphan (nothing sweeps later) — say so loudly.
                     if let Err(e) = self.servers[s].remove(&ck) {
-                        eprintln!("striped GC: remove chunk #{i} of {} on server {s} failed: {e}", l.base);
+                        eprintln!(
+                            "striped GC: remove chunk #{i} of {} on server {s} failed: {e}",
+                            l.base
+                        );
                     }
                 }
                 Probe::Absent => missing_run += 1,
@@ -756,12 +770,19 @@ mod tests {
         sb.write(&key, off, &tail).unwrap();
 
         // The far write must be reflected in the length, not hidden by the hole.
-        assert_eq!(sb.len(&key).unwrap(), off + tail.len() as u64, "len must span the hole");
+        assert_eq!(
+            sb.len(&key).unwrap(),
+            off + tail.len() as u64,
+            "len must span the hole"
+        );
 
         // Head intact, hole reads as zeros, tail intact — full reconstruction.
         let all = sb.read(&key, 0, (off as usize) + tail.len()).unwrap();
         assert_eq!(&all[..100], &head[..], "head preserved");
-        assert!(all[100..(off as usize)].iter().all(|&b| b == 0), "hole must read as zeros");
+        assert!(
+            all[100..(off as usize)].iter().all(|&b| b == 0),
+            "hole must read as zeros"
+        );
         assert_eq!(&all[(off as usize)..], &tail[..], "far tail preserved");
 
         // Targeted reads at the boundaries.
@@ -832,7 +853,11 @@ mod tests {
     fn statvfs_aggregates_every_member_not_just_first() {
         // Three members with distinct capacities must sum, not report server 0.
         let sb = ShardedBackend::new(
-            vec![mock(100, 40, 255, false), mock(200, 60, 255, false), mock(300, 80, 255, false)],
+            vec![
+                mock(100, 40, 255, false),
+                mock(200, 60, 255, false),
+                mock(300, 80, 255, false),
+            ],
             4096,
         );
         let agg = sb.statvfs().unwrap();
@@ -849,7 +874,11 @@ mod tests {
         // A conservative namemax (min) and skipping a failed member while still
         // aggregating the reachable ones (understating capacity = safe).
         let sb = ShardedBackend::new(
-            vec![mock(100, 40, 255, false), mock(100, 40, 64, true), mock(100, 40, 128, false)],
+            vec![
+                mock(100, 40, 255, false),
+                mock(100, 40, 64, true),
+                mock(100, 40, 128, false),
+            ],
             4096,
         );
         let agg = sb.statvfs().unwrap();
@@ -861,8 +890,14 @@ mod tests {
 
     #[test]
     fn statvfs_errors_only_when_no_member_reports() {
-        let sb = ShardedBackend::new(vec![mock(100, 40, 255, true), mock(100, 40, 255, true)], 4096);
-        assert!(sb.statvfs().is_err(), "all members down must surface an error, not fake stats");
+        let sb = ShardedBackend::new(
+            vec![mock(100, 40, 255, true), mock(100, 40, 255, true)],
+            4096,
+        );
+        assert!(
+            sb.statvfs().is_err(),
+            "all members down must surface an error, not fake stats"
+        );
     }
 
     #[test]

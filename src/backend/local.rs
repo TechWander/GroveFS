@@ -315,7 +315,10 @@ mod tests {
         let _be = LocalBackend::new(&root).unwrap();
         for b in 0..BUCKETS {
             let name = String::from_utf8_lossy(&hex_pair(b)).to_string();
-            assert!(root.join("blocks").join(&name).is_dir(), "missing bucket {name}");
+            assert!(
+                root.join("blocks").join(&name).is_dir(),
+                "missing bucket {name}"
+            );
         }
         // bucket_hex lands inside the precreated set for arbitrary keys.
         for key in [
@@ -350,12 +353,19 @@ mod tests {
                 p.parent().unwrap().file_name().unwrap(),
                 String::from_utf8_lossy(&bucket_hex(&key)).as_ref()
             );
-            assert!(!root.join("blocks").join(&key).exists(), "new object landed at the flat root");
+            assert!(
+                !root.join("blocks").join(&key).exists(),
+                "new object landed at the flat root"
+            );
             buckets.insert(p.parent().unwrap().file_name().unwrap().to_owned());
         }
         // Uniform mod-256 hashing of 4096 distinct keys keeps every bucket at
         // ~16 entries; a prefix-correlated scheme would collapse to a handful.
-        assert!(buckets.len() >= 200, "only {} distinct buckets used", buckets.len());
+        assert!(
+            buckets.len() >= 200,
+            "only {} distinct buckets used",
+            buckets.len()
+        );
         // One object's own chunk family must not stack either.
         let mut chunk_buckets = std::collections::HashSet::new();
         for i in 0..1000u32 {
@@ -368,7 +378,11 @@ mod tests {
                     .to_owned(),
             );
         }
-        assert!(chunk_buckets.len() >= 50, "chunk family stacked in {} buckets", chunk_buckets.len());
+        assert!(
+            chunk_buckets.len() >= 50,
+            "chunk family stacked in {} buckets",
+            chunk_buckets.len()
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -389,7 +403,11 @@ mod tests {
         assert_eq!(obj.ino(), ino, "imported object shares the source inode");
         assert_eq!(obj.nlink(), 2);
         be.remove("imp-key").unwrap();
-        assert_eq!(fs::read_to_string(&src).unwrap(), "legacy", "GC never hurts the source");
+        assert_eq!(
+            fs::read_to_string(&src).unwrap(),
+            "legacy",
+            "GC never hurts the source"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

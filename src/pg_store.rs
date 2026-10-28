@@ -96,7 +96,13 @@ struct RawNode {
     ino: i64,
 }
 
-const COLS: &str = "id, parent_id, name, is_dir, data_ref, link_target, mode, uid, gid, mtime, atime, ctime, ino";
+const COLS: &str =
+    "id, parent_id, name, is_dir, data_ref, link_target, mode, uid, gid, mtime, atime, ctime, ino";
+
+/// Shared cross-view holder ledger, living in its own schema so all views book
+/// one set of counts (see `ensure_schema`). Mirrors SQLite's `<meta>/refs.db`.
+const PG_REFS_SCHEMA: &str = "grovefs_refs";
+const PG_REFS_TABLE: &str = "grovefs_refs.holders";
 
 fn parse_node(r: &postgres::Row) -> RawNode {
     RawNode {
@@ -410,7 +416,17 @@ impl PgEngine {
              CREATE INDEX IF NOT EXISTS locks_ino    ON {locks}(ino, l_start, l_end);
              CREATE INDEX IF NOT EXISTS locks_owner  ON {locks}(owner);
              CREATE INDEX IF NOT EXISTS locks_sid    ON {locks}(sid);
-             CREATE INDEX IF NOT EXISTS locks_expire ON {locks}(expires_at);"
+             CREATE INDEX IF NOT EXISTS locks_expire ON {locks}(expires_at);
+             -- Shared cross-view blob holder ledger: one row per data_ref that
+             -- SOME view holds with its last name. Lives in its own schema, not
+             -- the per-view schema, so every view books/unbooks the same counts
+             -- (mirrors SQLite's <meta>/refs.db). GC is only safe when a view's
+             -- last name for a key leaves AND this count reaches zero.
+             CREATE SCHEMA IF NOT EXISTS {PG_REFS_SCHEMA};
+             CREATE TABLE IF NOT EXISTS {PG_REFS_TABLE} (
+                 data_ref TEXT PRIMARY KEY,
+                 holders  BIGINT NOT NULL
+             );"
         ))
         .map_err(io_e)?;
         // Seed the root (id 1) if absent, then align the BIGSERIAL sequence so
@@ -575,7 +591,10 @@ impl PgEngine {
             }
             NodeKind::Symlink => (
                 1,
-                raw.link_target.as_ref().map(|s| s.len() as u64).unwrap_or(0),
+                raw.link_target
+                    .as_ref()
+                    .map(|s| s.len() as u64)
+                    .unwrap_or(0),
             ),
             NodeKind::Regular => {
                 let links: i64 = c
@@ -640,9 +659,10 @@ impl PgEngine {
                 let kind = Self::node_kind(r);
                 let (nlink, size) = match kind {
                     NodeKind::Dir => (2 + *subdir_map.get(&r.id).unwrap_or(&0) as u64, 4096u64),
-                    NodeKind::Symlink => {
-                        (1, r.link_target.as_ref().map(|s| s.len() as u64).unwrap_or(0))
-                    }
+                    NodeKind::Symlink => (
+                        1,
+                        r.link_target.as_ref().map(|s| s.len() as u64).unwrap_or(0),
+                    ),
                     NodeKind::Regular => {
                         let links = *nlink_map.get(&r.ino).unwrap_or(&1);
                         (links.max(1) as u64, 0u64)
@@ -704,8 +724,9 @@ impl PgEngine {
     pub fn readdir_page(&self, parent: i64, offset: usize, limit: usize) -> Vec<NodeInfo> {
         let _t = stats::start(stats::Stage::MetaReaddirPage);
         let node = self.t("node");
-        let sql =
-            format!("SELECT {COLS} FROM {node} WHERE parent_id=$1 ORDER BY name LIMIT $2 OFFSET $3");
+        let sql = format!(
+            "SELECT {COLS} FROM {node} WHERE parent_id=$1 ORDER BY name LIMIT $2 OFFSET $3"
+        );
         self.with_read(|c| {
             let rows = match c.query(&sql, &[&parent, &(limit as i64), &(offset as i64)]) {
                 Ok(r) => r,
@@ -748,6 +769,12 @@ impl PgEngine {
         // SSI abort on the loser (retried — it will then see the row and
         // hit `EEXIST` on the second attempt).
         self.with_serial_retry(|tx| {
+            // Is this the view's FIRST name for the key (count before INSERT)?
+            // Only then does the shared cross-view ledger take a new hold.
+            let first_name = match data_ref {
+                Some(dr) => view_name_count(tx, &node, dr)? == 0,
+                None => false,
+            };
             let id: i64 = tx
                 .query(
                     &format!(
@@ -775,6 +802,11 @@ impl PgEngine {
                 &format!("UPDATE {node} SET ino=$1 WHERE id=$1"),
                 &[&id],
             )?;
+            if first_name {
+                if let Some(dr) = data_ref {
+                    ledger_add_tx(tx, dr)?;
+                }
+            }
             Ok(id)
         })
     }
@@ -806,7 +838,12 @@ impl PgEngine {
         self.insert(parent, name, false, None, Some(target), 0o0777, uid, gid)
     }
 
-    pub fn link_node(&self, src_ino: i64, new_parent: i64, new_name: &str) -> Result<i64, MetaError> {
+    pub fn link_node(
+        &self,
+        src_ino: i64,
+        new_parent: i64,
+        new_name: &str,
+    ) -> Result<i64, MetaError> {
         let _t = stats::start(stats::Stage::MetaCreate);
         let node = self.t("node");
         let t = now();
@@ -834,6 +871,8 @@ impl PgEngine {
             if is_dir == 1 || data_ref.is_none() {
                 return Err(WriteErr::Hard(MetaError::OpNotPermitted));
             }
+            // First name for the key in this view (count before the INSERT)?
+            let first_name = view_name_count(tx, &node, data_ref.as_deref().unwrap())? == 0;
             tx.execute(
                 &format!(
                     "INSERT INTO {node} (parent_id,name,is_dir,data_ref,link_target,mode,uid,gid,mtime,atime,ctime,ino)
@@ -850,6 +889,9 @@ impl PgEngine {
                     &src_ino,
                 ],
             )?;
+            if first_name {
+                ledger_add_tx(tx, data_ref.as_deref().unwrap())?;
+            }
             Ok(src_ino)
         })
     }
@@ -940,16 +982,10 @@ impl PgEngine {
                     &[&tid],
                 )?;
                 if let Some(dr) = tgt_ref {
-                    let refs: i64 = tx
-                        .query(
-                            &format!("SELECT COUNT(*) FROM {node} WHERE data_ref=$1"),
-                            &[&dr],
-                        )?
-                        .first()
-                        .map(|r| r.get::<_, i64>(0))
-                        .unwrap_or(0);
-                    if refs == 0 {
-                        gc = Some(dr);
+                    // Blob is freeable only once this view holds no other name
+                    // AND the cross-view ledger confirms no other view does.
+                    if view_name_count(tx, &node, &dr)? == 0 {
+                        gc = ledger_remove_tx(tx, &dr)?;
                     }
                 }
             }
@@ -973,7 +1009,9 @@ impl PgEngine {
         self.with_serial_retry(|tx| {
             let row = tx
                 .query(
-                    &format!("SELECT id, is_dir, data_ref FROM {node} WHERE parent_id=$1 AND name=$2"),
+                    &format!(
+                        "SELECT id, is_dir, data_ref FROM {node} WHERE parent_id=$1 AND name=$2"
+                    ),
                     &[&parent, &name],
                 )?
                 .into_iter()
@@ -995,22 +1033,13 @@ impl PgEngine {
                     return Err(WriteErr::Hard(MetaError::NotEmpty));
                 }
             }
-            tx.execute(
-                &format!("DELETE FROM {node} WHERE id=$1"),
-                &[&id],
-            )?;
+            tx.execute(&format!("DELETE FROM {node} WHERE id=$1"), &[&id])?;
             let gc = match &data_ref {
                 Some(dr) => {
-                    let refs: i64 = tx
-                        .query(
-                            &format!("SELECT COUNT(*) FROM {node} WHERE data_ref=$1"),
-                            &[&dr],
-                        )?
-                        .first()
-                        .map(|r| r.get::<_, i64>(0))
-                        .unwrap_or(0);
-                    if refs == 0 {
-                        Some(dr.clone())
+                    // Last name in this view AND no other view (ledger) still
+                    // references it -> freeable; otherwise kept.
+                    if view_name_count(tx, &node, dr)? == 0 {
+                        ledger_remove_tx(tx, dr)?
                     } else {
                         None
                     }
@@ -1102,7 +1131,9 @@ impl PgEngine {
         // Admin path (only reachable from SQLite-HA code that PG rejects at
         // startup, so it is effectively dead here): checkout/requeue directly,
         // no need to build an SSI tx for a one-shot UPSERT.
-        let mut c = self.checkout_writer().map_err(|me| std::io::Error::other(me.to_string()))?;
+        let mut c = self
+            .checkout_writer()
+            .map_err(|me| std::io::Error::other(me.to_string()))?;
         let r = c.execute(
             &format!(
                 "INSERT INTO {ctrl} (k,v) VALUES ('epoch',$1) ON CONFLICT(k) DO UPDATE SET v=excluded.v"
@@ -1331,6 +1362,70 @@ fn is_descendant_tx(
     Ok(false)
 }
 
+/// How many names THIS view still holds for `dr` (inside the caller's tx,
+/// before/after the node write it brackets). Used to detect the 0->1 and 1->0
+/// transitions that decide when the shared ledger is booked/released.
+fn view_name_count(
+    tx: &mut postgres::Transaction<'_>,
+    node: &str,
+    dr: &str,
+) -> Result<i64, WriteErr> {
+    Ok(tx
+        .query(
+            &format!("SELECT COUNT(*) FROM {node} WHERE data_ref=$1"),
+            &[&dr],
+        )?
+        .first()
+        .map(|r| r.get::<_, i64>(0))
+        .unwrap_or(0))
+}
+
+/// Book this view as a holder of `dr` (call when its name count goes 0->1, in
+/// the same tx as the node INSERT). `ON CONFLICT DO UPDATE` keeps the row
+/// atomic under concurrent holders from other views; an SSI clash retries the
+/// whole body.
+fn ledger_add_tx(tx: &mut postgres::Transaction<'_>, dr: &str) -> Result<(), WriteErr> {
+    tx.execute(
+        &format!(
+            "INSERT INTO {PG_REFS_TABLE} (data_ref, holders) VALUES ($1, 1)
+             ON CONFLICT (data_ref) DO UPDATE SET holders = {PG_REFS_TABLE}.holders + 1"
+        ),
+        &[&dr],
+    )?;
+    Ok(())
+}
+
+/// Drop this view's hold on `dr` (call when its LAST name in the view is
+/// removed, same tx as the node DELETE). Returns `Some(dr)` when no view holds
+/// it anymore (caller GCs) and `None` when another still does. A missing row is
+/// "no other holder", matching the pre-ledger single-view behaviour.
+fn ledger_remove_tx(
+    tx: &mut postgres::Transaction<'_>,
+    dr: &str,
+) -> Result<Option<String>, WriteErr> {
+    let left: Option<i64> = tx
+        .query(
+            &format!("UPDATE {PG_REFS_TABLE} SET holders = holders - 1 WHERE data_ref=$1 RETURNING holders"),
+            &[&dr],
+        )?
+        .into_iter()
+        .next()
+        .map(|r| r.get::<_, i64>(0));
+    match left {
+        Some(h) if h <= 0 => {
+            tx.execute(
+                &format!("DELETE FROM {PG_REFS_TABLE} WHERE data_ref=$1"),
+                &[&dr],
+            )?;
+            Ok(Some(dr.to_string()))
+        }
+        Some(_) => Ok(None),
+        // No ledger row: never booked against a shared key -> free it as the
+        // pre-ledger engine did for every private object.
+        None => Ok(Some(dr.to_string())),
+    }
+}
+
 /// Internal marker returned by [`PgEngine::with_serial_retry`] bodies so the
 /// driver can decide between "retry the whole body with backoff" (SSI abort)
 /// and "propagate to the caller" (POSIX-visible failures such as `EEXIST`,
@@ -1427,7 +1522,14 @@ impl MetaProvider for PgEngine {
     ) -> Result<i64, MetaError> {
         PgEngine::create_node(self, parent, name, is_dir, data_ref, mode, uid, gid)
     }
-    fn create_symlink(&self, parent: i64, name: &str, target: &str, uid: u32, gid: u32) -> Result<i64, MetaError> {
+    fn create_symlink(
+        &self,
+        parent: i64,
+        name: &str,
+        target: &str,
+        uid: u32,
+        gid: u32,
+    ) -> Result<i64, MetaError> {
         PgEngine::create_symlink(self, parent, name, target, uid, gid)
     }
     fn link_node(&self, src_ino: i64, new_parent: i64, new_name: &str) -> Result<i64, MetaError> {
@@ -1436,7 +1538,14 @@ impl MetaProvider for PgEngine {
     fn unlink(&self, parent: i64, name: &str) -> Result<Option<String>, MetaError> {
         PgEngine::unlink(self, parent, name)
     }
-    fn rename(&self, parent: i64, name: &str, new_parent: i64, new_name: &str, noreplace: bool) -> Result<Option<String>, MetaError> {
+    fn rename(
+        &self,
+        parent: i64,
+        name: &str,
+        new_parent: i64,
+        new_name: &str,
+        noreplace: bool,
+    ) -> Result<Option<String>, MetaError> {
         PgEngine::rename(self, parent, name, new_parent, new_name, noreplace)
     }
     fn set_mode(&self, ino: i64, mode: u32) {
@@ -1464,7 +1573,14 @@ impl MetaProvider for PgEngine {
     ) -> Result<Option<LockConflict>, MetaError> {
         PgEngine::lock_op(self, ino, owner, start, end, ty, pid, sid)
     }
-    fn get_lock(&self, ino: i64, owner: u64, start: u64, end: u64, ty: LockType) -> Option<LockConflict> {
+    fn get_lock(
+        &self,
+        ino: i64,
+        owner: u64,
+        start: u64,
+        end: u64,
+        ty: LockType,
+    ) -> Option<LockConflict> {
         PgEngine::get_lock(self, ino, owner, start, end, ty)
     }
     fn release_locks_of_owner(&self, owner: u64) {

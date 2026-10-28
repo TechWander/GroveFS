@@ -64,8 +64,8 @@ if have 1 '.result.capabilities|(has("tools") and has("resources") and has("prom
 else bad "capabilities: $(resp 1 || echo NO-RESPONSE)"; fi
 say '{"jsonrpc":"2.0","method":"notifications/initialized"}'
 say '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
-if have 2 '[.result.tools[].name]|sort==["alias_view","define_derived_view","get_view","list_view_tree","list_views","preview_rules","remove_view","validate_definition"]'; then
-  ok "tools/list advertises exactly the eight governance + introspection tools"
+if have 2 '[.result.tools[].name]|sort==["alias_view","define_derived_view","fork_view","get_view","list_view_tree","list_views","preview_rules","remove_view","validate_definition"]'; then
+  ok "tools/list advertises exactly the nine governance + introspection tools"
 else bad "tools/list: $(resp 2 || echo NO-RESPONSE)"; fi
 # The notification must NOT have produced a response frame (id-less = no answer).
 if jq -e 'select(has("id")|not)' "$MCPOUT" >/dev/null 2>&1; then
@@ -205,10 +205,36 @@ else bad "rotation: $(resp 7 || echo NO-RESPONSE)"; fi
 # list_views answers as structured JSON an agent can act on (the tool result
 # TEXT itself parses as JSON — unwrap it, then assert on the payload).
 say '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"list_views","arguments":{}}}'
-LV=$(resp 8 | jq -r '.result.content[0].text' 2>/dev/null | jq -e '(.physical|index("team")) and (.defined|map(.name)|sort==["release","teamB"]) and (.defined|map(select(.kind=="derived"))[0].only==0) and (.physical|index("acl")==null)' 2>/dev/null)
+LV=$(resp 8 | jq -r '.result.content[0].text' 2>/dev/null | jq -e '(.physical|index("team")) and (.defined|map(.name)|sort==["release","teamB"]) and (.defined|map(select(.kind=="derived"))[0].only==0)' 2>/dev/null)
 if [ "$LV" = "true" ]; then
   ok "list_views reports physical trees + governed definitions (post-reload kinds)"
 else bad "list_views: $(resp 8 || echo NO-RESPONSE)"; fi
+
+# A FORK: an independent metadata tree seeded from the physical base — the
+# agent asks for organization rights without upload rights, and can drop it
+# again without ever touching 'team'. Same ops the CLI drives.
+say '{"jsonrpc":"2.0","id":60,"method":"tools/call","params":{"name":"fork_view","arguments":{"name":"lab","base":"team"}}}'
+if have 60 '.result.isError==null and (.result.content[0].text|test("forked view .lab. from base .team."))'; then
+  ok "fork_view seeded an independent tree (shared bytes, no copies)"
+else bad "fork_view: $(resp 60 || echo NO-RESPONSE)"; fi
+[ -f "$BASE/meta/lab.db" ] && ok "fork owns meta/lab.db beside the base tree" || bad "fork tree missing"
+say '{"jsonrpc":"2.0","id":61,"method":"tools/call","params":{"name":"list_views","arguments":{}}}'
+if resp 61 | jq -r '.result.content[0].text' 2>/dev/null | jq -e '(.physical|index("lab")) and (.defined|map(select(.name=="lab" and .kind=="fork" and .real_view=="team"))|length==1)' >/dev/null 2>&1; then
+  ok "list_views reports the fork as kind=fork of its base"
+else bad "list_views fork entry: $(resp 61 || echo NO-RESPONSE)"; fi
+say '{"jsonrpc":"2.0","id":62,"method":"tools/call","params":{"name":"get_view","arguments":{"name":"lab"}}}'
+if resp 62 | jq -r '.result.content[0].text' 2>/dev/null | jq -e '.kind=="fork" and .own_tree=="meta/lab.db" and (.mount|test("content read-only"))' >/dev/null 2>&1; then
+  ok "get_view spells out the fork's mount contract + own tree"
+else bad "get_view fork: $(resp 62 || echo NO-RESPONSE)"; fi
+say '{"jsonrpc":"2.0","id":63,"method":"tools/call","params":{"name":"alias_view","arguments":{"name":"labpub","real":"lab"}}}'
+if have 63 '.result.isError==true and (.result.content[0].text|test("is a fork"))'; then
+  ok "alias_view refuses a fork target (tree identity, not a public name)"
+else bad "alias-to-fork: $(resp 63 || echo NO-RESPONSE)"; fi
+say '{"jsonrpc":"2.0","id":64,"method":"tools/call","params":{"name":"remove_view","arguments":{"name":"lab"}}}'
+if have 64 '.result.content[0].text|test("removed fork view .lab. of base .team.")'; then
+  [ ! -f "$BASE/meta/lab.db" ] && [ -f "$BASE/meta/team.db" ] \
+    && ok "remove_view deleted the fork tree only (base tree intact)" || bad "fork rm left the wrong files"
+else bad "fork rm: $(resp 64 || echo NO-RESPONSE)"; fi
 
 # One contract, two entrances: the CLI sees the agent's state verbatim.
 $Y view --db-path "$BASE" list > .mcptest/cli_list.log 2>&1

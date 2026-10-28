@@ -8,15 +8,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use grovefs::backend::{self, StorageBackend};
-use grovefs::remote::{proto, server::{serve_on, serve_on_auth}, RemoteBackend};
+use grovefs::remote::{
+    proto,
+    server::{serve_on, serve_on_auth},
+    RemoteBackend,
+};
 
 fn spawn_server() -> (String, tempfile::TempDir) {
     let dir = tempfile::Builder::new()
         .prefix("grovefs_rsrv_")
         .tempdir()
         .unwrap();
-    let backend: Arc<dyn StorageBackend> =
-        Arc::from(backend::open_local(dir.path()).unwrap());
+    let backend: Arc<dyn StorageBackend> = Arc::from(backend::open_local(dir.path()).unwrap());
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     std::thread::spawn(move || serve_on(listener, backend));
@@ -136,7 +139,9 @@ fn remote_chunked_read_stitches_in_order() {
     c.create(key).unwrap();
     // 5 MiB of position-dependent pattern, written in 1MiB slices.
     let size = 5usize << 20;
-    let data: Vec<u8> = (0..size).map(|i| (i.wrapping_mul(31) % 251) as u8).collect();
+    let data: Vec<u8> = (0..size)
+        .map(|i| (i.wrapping_mul(31) % 251) as u8)
+        .collect();
     let mut sent = 0usize;
     while sent < size {
         let n = (size - sent).min(1 << 20);
@@ -168,7 +173,10 @@ fn remote_chunked_read_past_eof_zero_pads() {
     let back = c.read(key, 0, 4 << 20).unwrap(); // ask 4 MiB
     assert_eq!(back.len(), 4 << 20, "chunked read must return exactly len");
     assert!(back[..3 << 20].iter().all(|&b| b == 7));
-    assert!(back[3 << 20..].iter().all(|&b| b == 0), "past-EOF must be zeros");
+    assert!(
+        back[3 << 20..].iter().all(|&b| b == 0),
+        "past-EOF must be zeros"
+    );
 }
 
 /// P3: writes >= 4MiB take the parallel chunked path; content must land
@@ -187,7 +195,9 @@ fn remote_chunked_write_roundtrip() {
     assert_eq!(c.len(key).unwrap(), 1024 + payload.len() as u64);
     // Spot-check each 4MiB slice border through the small-read path.
     for (i, chunk) in payload.chunks(4 << 20).enumerate() {
-        let got = c.read(key, 1024 + (i as u64) * (4 << 20), chunk.len() - 1).unwrap();
+        let got = c
+            .read(key, 1024 + (i as u64) * (4 << 20), chunk.len() - 1)
+            .unwrap();
         assert_eq!(got, &chunk[..chunk.len() - 1], "slice {i} border");
     }
 }
@@ -200,8 +210,7 @@ fn spawn_server_auth(token: &str) -> (String, tempfile::TempDir) {
         .prefix("grovefs_rsrv_auth_")
         .tempdir()
         .unwrap();
-    let backend: Arc<dyn StorageBackend> =
-        Arc::from(backend::open_local(dir.path()).unwrap());
+    let backend: Arc<dyn StorageBackend> = Arc::from(backend::open_local(dir.path()).unwrap());
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let token = token.to_string();
@@ -235,11 +244,19 @@ fn data_server_token_auth_gates_access() {
     let e = RemoteBackend::new_with_token(&addr, "")
         .err()
         .expect("empty token must be rejected");
-    assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "empty token: {e:?}");
+    assert_eq!(
+        e.kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "empty token: {e:?}"
+    );
     let e = RemoteBackend::new_with_token(&addr, "guessed")
         .err()
         .expect("wrong token must be rejected");
-    assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "wrong token: {e:?}");
+    assert_eq!(
+        e.kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "wrong token: {e:?}"
+    );
 
     // The victim's data really landed centrally and remains readable only to a
     // client that presents the right token.
@@ -250,13 +267,16 @@ fn data_server_token_auth_gates_access() {
 /// Spin up a data-server whose witness [`Fence`] the test holds a shared handle
 /// to, so it can raise the fencing token out-of-band (simulating a peer node's
 /// promotion) while a client drives the data plane over a real socket.
-fn spawn_fenced_server() -> (String, Arc<grovefs::remote::server::Fence>, tempfile::TempDir) {
+fn spawn_fenced_server() -> (
+    String,
+    Arc<grovefs::remote::server::Fence>,
+    tempfile::TempDir,
+) {
     let dir = tempfile::Builder::new()
         .prefix("grovefs_fsrv_")
         .tempdir()
         .unwrap();
-    let backend: Arc<dyn StorageBackend> =
-        Arc::from(backend::open_local(dir.path()).unwrap());
+    let backend: Arc<dyn StorageBackend> = Arc::from(backend::open_local(dir.path()).unwrap());
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let fence = Arc::new(grovefs::remote::server::Fence::new_in_memory());
@@ -297,7 +317,11 @@ fn stale_epoch_write_is_fenced_then_allowed_when_token_caught_up() {
     // one-shot retry cannot recover -> the content write is refused with EROFS...
     epoch.store(4, Ordering::SeqCst);
     let e = c.write("obj", 0, b"stale!").unwrap_err();
-    assert_eq!(e.raw_os_error(), Some(libc::EROFS), "stale write must be fenced");
+    assert_eq!(
+        e.raw_os_error(),
+        Some(libc::EROFS),
+        "stale write must be fenced"
+    );
     // ...and the bytes truly did NOT land: read-back still yields the aligned data.
     assert_eq!(c.read("obj", 0, 16).unwrap(), b"aligned");
 

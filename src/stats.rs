@@ -357,12 +357,19 @@ impl Registry {
     pub fn report_csv(&self) -> String {
         use std::fmt::Write as _;
         let mut out = String::new();
-        let _ = writeln!(out, "stage,group,ops,p50_us,p90_us,p99_us,max_us,mean_us,total_us,bytes");
+        let _ = writeln!(
+            out,
+            "stage,group,ops,p50_us,p90_us,p99_us,max_us,mean_us,total_us,bytes"
+        );
         for &stage in Stage::ALL {
             let h = self.merged(stage);
             let n = h.len();
             let bytes = self.stages[stage as usize].bytes.load(Ordering::Relaxed);
-            let total = if n > 0 { (n as f64 * h.mean()) as u64 } else { 0 };
+            let total = if n > 0 {
+                (n as f64 * h.mean()) as u64
+            } else {
+                0
+            };
             let _ = writeln!(
                 out,
                 "{},{},{},{},{},{},{},{:.0},{},{},",
@@ -550,7 +557,10 @@ mod tests {
         // The discriminant must equal the ALL position, since the registry is
         // indexed by `Stage as usize`.
         for (i, &s) in Stage::ALL.iter().enumerate() {
-            assert_eq!(s as usize, i, "Stage discriminant drifted from ALL order at {i}");
+            assert_eq!(
+                s as usize, i,
+                "Stage discriminant drifted from ALL order at {i}"
+            );
         }
     }
 
@@ -558,10 +568,17 @@ mod tests {
     fn counter_all_labels_unique() {
         let mut seen = std::collections::HashSet::new();
         for &c in Counter::ALL {
-            assert!(seen.insert(c.name()), "duplicate counter label {}", c.name());
+            assert!(
+                seen.insert(c.name()),
+                "duplicate counter label {}",
+                c.name()
+            );
         }
         for (i, &c) in Counter::ALL.iter().enumerate() {
-            assert_eq!(c as usize, i, "Counter discriminant drifted from ALL order at {i}");
+            assert_eq!(
+                c as usize, i,
+                "Counter discriminant drifted from ALL order at {i}"
+            );
         }
     }
 
@@ -570,14 +587,21 @@ mod tests {
         let r = Registry::new();
         // Spread 100 samples of 100us across shards to exercise the merge path.
         for i in 0..100u64 {
-            r.record(Stage::ReadBackendTotal, 100 + (i % 10), (i as usize) % SHARDS);
+            r.record(
+                Stage::ReadBackendTotal,
+                100 + (i % 10),
+                (i as usize) % SHARDS,
+            );
         }
         r.add_bytes(Stage::ReadBackendTotal, 4096);
         let merged = r.merged(Stage::ReadBackendTotal);
         assert_eq!(merged.len(), 100, "all shards must fold into the merge");
         assert!(merged.max() >= 100);
         let m = r.report_text();
-        assert!(m.contains("read.backend_total"), "report must list the stage");
+        assert!(
+            m.contains("read.backend_total"),
+            "report must list the stage"
+        );
         assert!(m.contains("ops=100"), "report must show the count");
 
         // Unrecorded stage is present but zero, keeping the dump shape stable.
@@ -588,7 +612,10 @@ mod tests {
         // CSV has a header + one data row per stage.
         let csv = r.report_csv();
         assert!(csv.starts_with("stage,group,ops"));
-        assert_eq!(csv.lines().count(), 1 + Stage::ALL.len() + Counter::ALL.len());
+        assert_eq!(
+            csv.lines().count(),
+            1 + Stage::ALL.len() + Counter::ALL.len()
+        );
     }
 
     #[test]
@@ -597,8 +624,14 @@ mod tests {
         r.count(Counter::BytesRead, 1000);
         r.count(Counter::BytesRead, 500);
         r.count(Counter::PgSsiRetry, 3);
-        assert_eq!(r.counters[Counter::BytesRead as usize].load(Ordering::Relaxed), 1500);
-        assert_eq!(r.counters[Counter::PgSsiRetry as usize].load(Ordering::Relaxed), 3);
+        assert_eq!(
+            r.counters[Counter::BytesRead as usize].load(Ordering::Relaxed),
+            1500
+        );
+        assert_eq!(
+            r.counters[Counter::PgSsiRetry as usize].load(Ordering::Relaxed),
+            3
+        );
     }
 
     #[test]
@@ -609,7 +642,11 @@ mod tests {
         // sub-bucket, so we only assert it landed as exactly one sample.
         r.record(Stage::IoShardRead, u64::MAX, 0);
         let h = r.merged(Stage::IoShardRead);
-        assert_eq!(h.len(), 1, "saturating_record still adds exactly one sample");
+        assert_eq!(
+            h.len(),
+            1,
+            "saturating_record still adds exactly one sample"
+        );
         assert!(h.max() > 0);
     }
 

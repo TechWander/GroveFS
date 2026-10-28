@@ -26,7 +26,7 @@ use libc::{EACCES, EIO, ENOENT, EROFS};
 use parking_lot::Mutex;
 use std::io;
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -54,6 +54,14 @@ const MAX_PARALLEL_SLICES: usize = 8;
 pub struct RemoteBackend {
     addr: String,
     token: String,
+    /// API key (`<id>:<secret>`) presented on `OP_OPEN` to a data-server started
+    /// with `--require-api-key`. Empty for servers gated by the static token (or
+    /// by nothing), which is the pre-existing behavior.
+    api_key: String,
+    /// Set once the first handshake has been accepted: any later refusal is then
+    /// an auth LOSS on a live mount (a revoke landing mid-session), which
+    /// `OP_OPEN`'s refusal path reports through [`super::signal_auth_loss`].
+    opened: AtomicBool,
     pool: Arc<Mutex<Vec<TcpStream>>>,
     max_conns: usize,
     connect_timeout: Duration,
@@ -87,9 +95,22 @@ impl RemoteBackend {
     /// client fails fast rather than retrying, because a wrong secret is a
     /// configuration error, not a transient one.
     pub fn new_with_token(addr: &str, token: &str) -> io::Result<Self> {
+        Self::new_with_creds(addr, token, "")
+    }
+
+    /// Like [`Self::new_with_token`], but also presents `api_key`
+    /// (`<id>:<secret>`, minted by `grovefs apikey create --for mount`) on the
+    /// `OP_OPEN` handshake — the credential form a `data-server
+    /// --require-api-key` demands, so access is per-caller and revocable
+    /// instead of one static cluster token. The server re-verifies the key while
+    /// this connection lives, so a revoke reaches established mounts too (see
+    /// [`crate::apikeys::KEY_RECHECK`]).
+    pub fn new_with_creds(addr: &str, token: &str, api_key: &str) -> io::Result<Self> {
         let this = Self {
             addr: addr.to_string(),
             token: token.to_string(),
+            api_key: api_key.to_string(),
+            opened: AtomicBool::new(false),
             pool: Arc::new(Mutex::new(Vec::new())),
             max_conns: 64,
             connect_timeout: Duration::from_secs(5),
@@ -101,6 +122,7 @@ impl RemoteBackend {
         // Probe once: TCP connect + OP_OPEN handshake, so mount fails fast on a
         // dead or unauthorized server.
         let (s, _) = this.connect_fresh()?;
+        this.opened.store(true, Ordering::SeqCst);
         this.put_conn(s);
         Ok(this)
     }
@@ -156,11 +178,12 @@ impl RemoteBackend {
     /// Open a brand-new socket, retrying with a small bounded backoff so a
     /// mid-restart data-server is tolerated rather than surfacing an instant
     /// ECONNREFUSED. Runs the mandatory `OP_OPEN` handshake before returning,
-    /// so the socket is ready to serve data-plane requests. A token rejection
-    /// (server replies `EACCES`) fails fast — retrying can't fix a wrong secret.
+    /// so the socket is ready to serve data-plane requests. An auth rejection
+    /// (server replies `EACCES`) fails fast — retrying can't fix a wrong secret
+    /// — and carries the server's refusal text (in the response payload) so an
+    /// operator sees *which* half failed (missing key, wrong secret, revoked).
     fn connect_fresh(&self) -> io::Result<(TcpStream, bool)> {
-        let mut last_err =
-            io::Error::new(io::ErrorKind::ConnectionRefused, "no connect attempt");
+        let mut last_err = io::Error::new(io::ErrorKind::ConnectionRefused, "no connect attempt");
         for attempt in 0..self.connect_retries {
             match TcpStream::connect(&self.addr) {
                 Ok(s) => {
@@ -169,14 +192,21 @@ impl RemoteBackend {
                     s.set_nodelay(true)?; // LAN: avoid Nagle delaying small request frames
                     let mut body = Vec::new();
                     proto::put_key(&mut body, &self.token);
+                    proto::put_key(&mut body, &self.api_key);
                     let mut s = s;
                     match Self::call(&mut s, proto::OP_OPEN, &body) {
                         Ok((0, _, _)) => return Ok((s, false)),
-                        Ok((EACCES, _, _)) => {
-                            return Err(io::Error::new(
-                                io::ErrorKind::PermissionDenied,
-                                "data-server rejected the access token",
-                            ));
+                        Ok((EACCES, _, reason)) => {
+                            let why =
+                                refusal_text(&reason, "data-server rejected the access token");
+                            // A refusal AFTER the mount was serving means the
+                            // credential died mid-session (revoked): the mount
+                            // cannot serve legitimately, so ask for a clean
+                            // unmount instead of a live-but-refused view.
+                            if self.opened.load(Ordering::SeqCst) {
+                                super::signal_auth_loss(&why);
+                            }
+                            return Err(io::Error::new(io::ErrorKind::PermissionDenied, why));
                         }
                         Ok((_, _, _)) => {
                             last_err = io::Error::from_raw_os_error(EIO);
@@ -227,6 +257,7 @@ impl RemoteBackend {
         };
         match first {
             Ok(r) => {
+                self.note_refusal(&r);
                 self.put_conn(s);
                 Ok(r)
             }
@@ -241,6 +272,7 @@ impl RemoteBackend {
                 let (mut s2, _) = self.connect_fresh()?;
                 match Self::call(&mut s2, op, body) {
                     Ok(r) => {
+                        self.note_refusal(&r);
                         self.put_conn(s2);
                         Ok(r)
                     }
@@ -248,6 +280,20 @@ impl RemoteBackend {
                 }
             }
         }
+    }
+
+    /// An `EACCES` on a DATA op (not a handshake) is only ever an auth verdict:
+    /// `dispatch` reports storage failures as `ENOENT`/`EIO`/`EROFS`/`ENOSYS`
+    /// and never `EACCES`, so this can only be the server's live-credential
+    /// re-check refusing us — a revoke landing on this established connection.
+    /// The op still fails normally for the caller (`EACCES`), and the mount
+    /// tears itself down rather than serving a view it can no longer back.
+    fn note_refusal(&self, r: &(i32, u64, Vec<u8>)) {
+        if r.0 != EACCES || !self.opened.load(Ordering::SeqCst) {
+            return;
+        }
+        let why = refusal_text(&r.2, "data-server revoked this connection's api key");
+        super::signal_auth_loss(&why);
     }
 
     /// One send + one recv on a borrowed socket.
@@ -526,6 +572,20 @@ fn status_to_io(status: i32) -> io::Result<()> {
     if status == 0 {
         Ok(())
     } else {
-        Err(io::Error::from_raw_os_error(if status == 0 { EIO } else { status }))
+        Err(io::Error::from_raw_os_error(if status == 0 {
+            EIO
+        } else {
+            status
+        }))
+    }
+}
+
+/// Decode an auth-refusal payload into a message. An old server sends an empty
+/// body, so the fallback text keeps the pre-existing wording.
+fn refusal_text(data: &[u8], fallback: &str) -> String {
+    if data.is_empty() {
+        fallback.to_string()
+    } else {
+        String::from_utf8_lossy(data).into_owned()
     }
 }

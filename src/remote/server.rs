@@ -219,6 +219,13 @@ pub struct DataServer {
     listen: String,
     backend: Arc<dyn StorageBackend>,
     token: String,
+    /// Optional per-caller credential gate (`--require-api-key`). When set, every
+    /// `OP_OPEN` must present a live key from this store whose scope admits the
+    /// mount plane — turning data access into revocable, attributable
+    /// credentials instead of one static cluster token. The store is the same
+    /// `api_keys.db` the MCP server and `grovefs apikey` manage (see
+    /// [`crate::apikeys`]); an empty presentation is simply refused.
+    keys: Option<Arc<crate::apikeys::ApiKeyStore>>,
     /// Shared fencing-witness token (HA). Serves two gates: `OP_FENCE` folds a
     /// node's epoch in and echoes the previously-held value, so the data-server
     /// acts as the third arbiter that tells a stale ex-primary to stand down even
@@ -237,6 +244,7 @@ impl DataServer {
             listen: listen.to_string(),
             backend,
             token: String::new(),
+            keys: None,
             fence: Arc::new(Fence::new_in_memory()),
         }
     }
@@ -250,8 +258,18 @@ impl DataServer {
             listen: listen.to_string(),
             backend,
             token: token.to_string(),
+            keys: None,
             fence: Arc::new(Fence::new_in_memory()),
         }
+    }
+
+    /// Additionally require a `grovefs apikey` credential (scope `mount` or
+    /// `any`) on every `OP_OPEN`. Independent of the static token: when both
+    /// are configured a client must satisfy both, so a leaked cluster token
+    /// alone no longer buys access to the keyspace.
+    pub fn with_api_keys(mut self, store: crate::apikeys::ApiKeyStore) -> Self {
+        self.keys = Some(Arc::new(store));
+        self
     }
 
     /// Back the fencing token with a durable file at `path` (loaded if it
@@ -266,7 +284,16 @@ impl DataServer {
     pub fn serve(&self) -> io::Result<()> {
         let listener = TcpListener::bind(&self.listen)?;
         println!("data-server listening on {}", self.listen);
-        serve_on_auth(listener, self.backend.clone(), &self.token, self.fence.clone());
+        if self.keys.is_some() {
+            println!("data-server: api-key auth REQUIRED (present `mount --api-key`, minted by `grovefs apikey create --for mount|any`); a revoke closes live connections on the next op");
+        }
+        serve_auth_keys(
+            listener,
+            self.backend.clone(),
+            &self.token,
+            self.fence.clone(),
+            self.keys.clone(),
+        );
         Ok(())
     }
 }
@@ -275,7 +302,13 @@ impl DataServer {
 /// no access token. Kept for backward compatibility with callers/tests that
 /// start a plain server.
 pub fn serve_on(listener: TcpListener, backend: Arc<dyn StorageBackend>) {
-    serve_on_auth(listener, backend, "", Arc::new(Fence::new_in_memory()))
+    serve_auth_keys(
+        listener,
+        backend,
+        "",
+        Arc::new(Fence::new_in_memory()),
+        None,
+    )
 }
 
 /// Accept loop with an access token (`""` disables the check) and a shared
@@ -286,6 +319,18 @@ pub fn serve_on_auth(
     token: &str,
     fence: Arc<Fence>,
 ) {
+    serve_auth_keys(listener, backend, token, fence, None)
+}
+
+/// Accept loop with the full auth surface: an optional static token and an
+/// optional per-caller API-key store.
+fn serve_auth_keys(
+    listener: TcpListener,
+    backend: Arc<dyn StorageBackend>,
+    token: &str,
+    fence: Arc<Fence>,
+    keys: Option<Arc<crate::apikeys::ApiKeyStore>>,
+) {
     let token = token.to_string();
     for stream in listener.incoming() {
         match stream {
@@ -293,8 +338,9 @@ pub fn serve_on_auth(
                 let backend = backend.clone();
                 let token = token.clone();
                 let fence = fence.clone();
+                let keys = keys.clone();
                 thread::spawn(move || {
-                    if let Err(e) = handle_conn(s, backend, &token, fence) {
+                    if let Err(e) = handle_conn(s, backend, &token, fence, keys) {
                         // A client hanging up is normal; log only real protocol errors.
                         if e.kind() != io::ErrorKind::UnexpectedEof {
                             eprintln!("conn error: {e}");
@@ -312,6 +358,7 @@ fn handle_conn(
     backend: Arc<dyn StorageBackend>,
     token: &str,
     fence: Arc<Fence>,
+    keys: Option<Arc<crate::apikeys::ApiKeyStore>>,
 ) -> io::Result<()> {
     stream.set_nodelay(true)?;
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -327,11 +374,52 @@ fn handle_conn(
     }
     let mut i = 0usize;
     let presented = proto::get_key(&body, &mut i).unwrap_or_default();
+    // Optional api key appended by newer clients (an old client omits it, which
+    // only fails when the server actually demands one — same layout rule as the
+    // meta plane's uid field).
+    let api_key = proto::get_key(&body, &mut i).unwrap_or_default();
     if !token.is_empty() && presented != token {
-        proto::send_response(&mut writer, EACCES, 0, &[])?;
+        proto::send_response(
+            &mut writer,
+            EACCES,
+            0,
+            b"data-server rejected the access token",
+        )?;
         return Ok(());
     }
+    let mut authed: Option<crate::apikeys::AuthedKey> = None;
+    if let Some(store) = &keys {
+        match store.authenticate_mount(&api_key) {
+            Ok(a) => {
+                let _ = store.log_call(Some(&a), "data", "OP_OPEN", true, "");
+                authed = Some(a);
+            }
+            Err(e) => {
+                // Refuse, and say why in the payload so `mount` prints the actual
+                // cause (missing key vs wrong secret vs revoked) instead of EACCES.
+                let _ = store.log_call(None, "data", "OP_OPEN", false, &e);
+                proto::send_response(&mut writer, EACCES, 0, e.as_bytes())?;
+                return Ok(());
+            }
+        }
+    }
     proto::send_response(&mut writer, 0, 0, &[])?; // handshake ack
+
+    // Live-credential re-check: one store lookup per connection per
+    // `KEY_RECHECK` window (a control-plane query, off the per-byte hot path),
+    // so `grovefs apikey revoke` closes an ESTABLISHED data connection instead
+    // of only refusing the next mount. Only checked when traffic arrives: an
+    // idle socket holds no access. The next client op sees the refusal and,
+    // because its credential was accepted at setup, tears its mount down
+    // cleanly (see [`super::signal_auth_loss`]).
+    let mut next_check = std::time::Instant::now() + crate::apikeys::KEY_RECHECK;
+    // A read-only key (`apikey create --ro`) may not write content either. The
+    // meta plane already gated the tree by view binding; here the object keys
+    // are content-addressed and view-agnostic, so the one credential axis the
+    // data plane can enforce is read-only — a hard cap that holds even if a
+    // client mounted without `-o ro`. EROFS mirrors the fencing gate (a
+    // read-only verdict, not an auth loss, so the client keeps its mount).
+    let key_ro = authed.as_ref().map(|a| a.ro).unwrap_or(false);
 
     loop {
         let (op, body) = match proto::recv_request(&mut reader) {
@@ -344,6 +432,17 @@ fn handle_conn(
                 return Err(e);
             }
         };
+        if let (Some(store), Some(a)) = (&keys, &authed) {
+            if std::time::Instant::now() >= next_check {
+                if !store.is_live(&a.id, crate::apikeys::Scope::Mount) {
+                    let why = "authentication failed: this api key has been revoked";
+                    let _ = store.log_call(Some(a), "data", "OP_OPEN", false, why);
+                    let _ = proto::send_response(&mut writer, EACCES, 0, why.as_bytes());
+                    return Ok(());
+                }
+                next_check = std::time::Instant::now() + crate::apikeys::KEY_RECHECK;
+            }
+        }
         // Fencing witness: fold the sender's epoch into the monotonic token and
         // echo back the value held BEFORE this claim (`prev`). Never touches the
         // storage backend; a monotonic CAS (plus optional persist) is all the
@@ -376,6 +475,10 @@ fn handle_conn(
         // linearized entirely before, or entirely after, any promotion. This is
         // what turns "bounded window" into "no torn write" on this node.
         if proto::is_data_write(op) {
+            if key_ro {
+                proto::send_response(&mut writer, EROFS, 0, &[])?;
+                continue;
+            }
             if body.len() < 8 {
                 proto::send_response(&mut writer, EIO, 0, &[])?;
                 continue;
@@ -402,7 +505,15 @@ fn dispatch(backend: &dyn StorageBackend, op: u8, body: &[u8]) -> (i32, u64, Vec
         return match backend.statvfs() {
             Ok(s) => {
                 let mut d = Vec::with_capacity(56);
-                for v in [s.tblocks, s.bfree, s.bavail, s.files, s.ffree, s.bsize, s.namemax as u64] {
+                for v in [
+                    s.tblocks,
+                    s.bfree,
+                    s.bavail,
+                    s.files,
+                    s.ffree,
+                    s.bsize,
+                    s.namemax as u64,
+                ] {
                     d.extend_from_slice(&v.to_be_bytes());
                 }
                 (0, 0, d)
@@ -570,7 +681,9 @@ mod tests {
 
         // Release the "write"; now the promotion may proceed.
         drop(held);
-        let prev = rx.recv_timeout(Duration::from_secs(2)).expect("claim proceeds after drain");
+        let prev = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("claim proceeds after drain");
         promoter.join().unwrap();
         assert_eq!(prev, 5, "won the fold: prev 5 < 6, token now 6");
         assert_eq!(f.peek(), 6);
@@ -590,7 +703,11 @@ mod tests {
         // A competing higher epoch is REFUSED while the 5 lease is live — the
         // arbiter cannot have two live holders at once.
         let (prev, _, granted) = f.lease(6, 60_000);
-        assert_eq!((prev, granted), (5, false), "promotion blocked by live lease");
+        assert_eq!(
+            (prev, granted),
+            (5, false),
+            "promotion blocked by live lease"
+        );
         assert_eq!(f.peek(), 5, "token unchanged by the refused promotion");
         // The holder renews its own epoch: granted, token stays 5.
         let (prev, _, granted) = f.lease(5, 60_000);
@@ -608,7 +725,11 @@ mod tests {
         let f = Fence::new_in_memory();
         assert!(f.lease(5, 0).2, "cold grant");
         let (prev, _, granted) = f.lease(6, 60_000);
-        assert_eq!((prev, granted), (5, true), "expired lease lets the promote through");
+        assert_eq!(
+            (prev, granted),
+            (5, true),
+            "expired lease lets the promote through"
+        );
         assert_eq!(f.peek(), 6);
     }
 }

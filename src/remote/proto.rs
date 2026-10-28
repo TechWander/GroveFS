@@ -39,10 +39,14 @@ pub const OP_TRUNC: u8 = 6;
 pub const OP_REMOVE: u8 = 7;
 pub const OP_STATFS: u8 = 8;
 /// Mandatory first frame after TCP accept: body carries the client's access
-/// token via [`put_key`]. The server replies with `(0, 0, [])` on acceptance or
-/// `EACCES` on rejection before any data-plane op is served. An empty server
-/// token accepts any presented token, preserving the original LAN-trusted
-/// behavior for callers who started the server without one.
+/// token via [`put_key`], then an optional API key (`<id>:<secret>`) for a
+/// server started with `--require-api-key`. The server replies with
+/// `(0, 0, [])` on acceptance, or `EACCES` — with the refusal cause as the
+/// payload, so the client can print *why* — before any data-plane op is served.
+/// An empty server token accepts any presented token, preserving the original
+/// LAN-trusted behavior for callers who started the server without one, and an
+/// old client that omits the API-key field simply fails the gate it must not
+/// bypass (the field is only demanded when the server was told to demand it).
 pub const OP_OPEN: u8 = 9;
 /// Fencing-witness claim (HA). A meta-server node presents
 /// `[u64 sender_epoch]` and the data-server (the shared component both HA nodes
@@ -71,10 +75,7 @@ pub const OP_FENCE: u8 = 10;
 /// accepted, so single-node and non-witness deployments are byte-for-byte
 /// unchanged apart from the 8-byte prefix.
 pub fn is_data_write(op: u8) -> bool {
-    matches!(
-        op,
-        OP_CREATE | OP_WRITE | OP_TRUNC | OP_REMOVE | OP_FSYNC
-    )
+    matches!(op, OP_CREATE | OP_WRITE | OP_TRUNC | OP_REMOVE | OP_FSYNC)
 }
 
 /// Append a u16-length-prefixed UTF-8 key to `buf`.
@@ -88,7 +89,10 @@ pub fn is_data_write(op: u8) -> bool {
 /// corrupting a frame; the on-wire format is intentionally left at u16.
 pub fn put_key(buf: &mut Vec<u8>, key: &str) {
     let k = key.as_bytes();
-    debug_assert!(k.len() <= u16::MAX as usize, "put_key: key exceeds u16 length prefix");
+    debug_assert!(
+        k.len() <= u16::MAX as usize,
+        "put_key: key exceeds u16 length prefix"
+    );
     buf.extend_from_slice(&(k.len() as u16).to_be_bytes());
     buf.extend_from_slice(k);
 }
@@ -159,7 +163,10 @@ pub fn recv_request<R: Read>(r: &mut R) -> io::Result<(u8, Vec<u8>)> {
     r.read_exact(&mut hdr)?;
     let magic = u32::from_be_bytes(hdr[0..4].try_into().unwrap());
     if magic != MAGIC {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "proto: bad magic"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "proto: bad magic",
+        ));
     }
     let op = hdr[4];
     let blen = u32::from_be_bytes(hdr[5..9].try_into().unwrap()) as usize;
@@ -194,7 +201,10 @@ pub fn recv_response<R: Read>(r: &mut R) -> io::Result<(i32, u64, Vec<u8>)> {
     r.read_exact(&mut hdr)?;
     let magic = u32::from_be_bytes(hdr[0..4].try_into().unwrap());
     if magic != MAGIC {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "proto: bad magic"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "proto: bad magic",
+        ));
     }
     let status = i32::from_be_bytes(hdr[4..8].try_into().unwrap());
     let val = u64::from_be_bytes(hdr[8..16].try_into().unwrap());
