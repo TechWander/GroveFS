@@ -11,7 +11,10 @@ use grovefs::backend::{self, sharded::ShardedBackend, StorageBackend};
 use grovefs::remote::{server::serve_on, RemoteBackend};
 
 fn spawn_server() -> String {
-    let dir = tempfile::Builder::new().prefix("grovefs_tp_").tempdir().unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("grovefs_tp_")
+        .tempdir()
+        .unwrap();
     let backend: Arc<dyn StorageBackend> = Arc::from(backend::open_local(dir.path()).unwrap());
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
@@ -46,10 +49,7 @@ fn stripe_read_throughput_probe() {
     sa.write("obj", 0, &payload).unwrap();
 
     // --- two-server striped ---
-    let members: Vec<Arc<dyn StorageBackend>> = vec![
-        Arc::new(client(&a)),
-        Arc::new(client(&b)),
-    ];
+    let members: Vec<Arc<dyn StorageBackend>> = vec![Arc::new(client(&a)), Arc::new(client(&b))];
     let sb = ShardedBackend::new(members, 16 * 1024 * 1024);
     let key = sb.new_key("striped");
     sb.create(&key).unwrap();

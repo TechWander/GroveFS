@@ -22,3 +22,43 @@ pub mod server;
 pub use client::RemoteBackend;
 pub use meta::{open_event_stream, spawn_invalidation_listener, MetaServer, RemoteMeta};
 pub use server::DataServer;
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// One-shot switch armed by `mount` the moment the FUSE session is genuinely
+/// serving (right after the SIGTERM/SIGINT unmount helper is installed).
+/// [`signal_auth_loss`] only tears a mount down when this is set, so a
+/// credential problem detected during mount SETUP fails fast as a plain error
+/// instead of signalling a session that never started.
+static MOUNT_SERVING: AtomicBool = AtomicBool::new(false);
+
+pub fn arm_mount_serving() {
+    MOUNT_SERVING.store(true, Ordering::SeqCst);
+}
+
+/// A mount whose credential was accepted at setup and is now REFUSED
+/// mid-session (the server revoked the API key, or an operator rotated it out
+/// of the store) has no way to serve the view legitimately. Returning an error
+/// per operation would leave a live but broken mountpoint, and a bare `exit`
+/// would leave the kernel endpoint stale (`Transport endpoint is not
+/// connected`, needing a manual `fusermount -u`). Instead: ask the existing
+/// term-unmount helper to take the mountpoint down cleanly, so the caller sees
+/// a normal unmount and the process exits through its own shutdown path.
+///
+/// A SIGTERM to self is exactly what `grovefs umount` simulates, so this reuses
+/// the one already-tested teardown path (and it is inert until
+/// [`arm_mount_serving`] has run).
+pub fn signal_auth_loss(reason: &str) {
+    if !MOUNT_SERVING.load(Ordering::SeqCst) {
+        return;
+    }
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::SeqCst) {
+        eprintln!("grovefs: access refused by the server ({reason}) — unmounting this view");
+    }
+    // Safe even if the watcher is gone: the signal only ends a process that had
+    // already decided it cannot serve this view.
+    unsafe {
+        libc::kill(std::process::id() as libc::pid_t, libc::SIGTERM);
+    }
+}

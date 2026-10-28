@@ -115,9 +115,7 @@ fn parallel_create_distinct_parents_completes() {
                     let name = format!("f{t}_{i}");
                     let key = format!("k{t}_{i}");
                     e.create_node(p, &name, false, Some(&key), 0o644, 1000, 1000)
-                        .unwrap_or_else(|err| {
-                            panic!("parallel create[{t}][{i}] failed: {err:?}")
-                        });
+                        .unwrap_or_else(|err| panic!("parallel create[{t}][{i}] failed: {err:?}"));
                 }
             })
         })

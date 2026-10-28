@@ -66,11 +66,17 @@ fn fanout_scales_and_keeps_directories_bounded() {
     let mut distinct_buckets = 0usize;
     for b in 0..256u64 {
         let d = root.join("blocks").join(format!("{b:02x}"));
-        if std::fs::read_dir(&d).map(|mut r| r.next().is_some()).unwrap_or(false) {
+        if std::fs::read_dir(&d)
+            .map(|mut r| r.next().is_some())
+            .unwrap_or(false)
+        {
             distinct_buckets += 1;
         }
     }
-    assert_eq!(distinct_buckets, 256, "objects must spread over every bucket");
+    assert_eq!(
+        distinct_buckets, 256,
+        "objects must spread over every bucket"
+    );
     assert_eq!(
         std::fs::read_dir(root.join("blocks"))
             .unwrap()
@@ -110,23 +116,28 @@ fn fanout_scales_and_keeps_directories_bounded() {
     let read_secs = t1.elapsed().as_secs_f64();
     let per_read_ms = read_secs * 1000.0 / reads as f64;
 
+    println!("\n==== grovefs S1 fan-out benchmark ({} objects) ====", n);
     println!(
-        "\n==== grovefs S1 fan-out benchmark ({} objects) ====",
-        n
+        "  create : {create_secs:.2}s  ({:.0} objects/sec)",
+        n as f64 / create_secs
     );
-    println!("  create : {create_secs:.2}s  ({:.0} objects/sec)", n as f64 / create_secs);
     println!("  buckets used: 256/256, fullest bucket = {max_bucket} entries (mean {ideal:.0})");
     println!("  random read: {reads} ops in {read_secs:.2}s  ({:.1} ops/sec, {per_read_ms:.4} ms/op avg)",
         reads as f64 / read_secs);
     println!("  a flat single-directory store would hold all {n} entries in ONE dir;");
-    println!("  fan-out caps any directory at ~{} entries (n/256), path stays 2 joins deep.",
-        max_bucket);
+    println!(
+        "  fan-out caps any directory at ~{} entries (n/256), path stays 2 joins deep.",
+        max_bucket
+    );
     println!("  ======================================================\n");
 
     // Absolute floor sanity: throughput must be non-degenerate (this is not a
     // perf *target*, just a guard that we are not accidentally measuring a hang).
     assert!(create_secs > 0.0 && read_secs > 0.0);
-    assert!(reads as f64 / read_secs > 1000.0, "random read collapsed to {per_read_ms:.1} ms/op");
+    assert!(
+        reads as f64 / read_secs > 1000.0,
+        "random read collapsed to {per_read_ms:.1} ms/op"
+    );
 
     std::mem::drop(be);
     let _ = std::fs::remove_dir_all(&root);

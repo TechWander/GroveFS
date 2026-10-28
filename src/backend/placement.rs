@@ -70,7 +70,10 @@ impl PlacementBackend {
         let mut members = Vec::with_capacity(roots.len());
         for r in roots {
             let backend = Arc::new(super::local::LocalBackend::new(r)?) as Arc<dyn StorageBackend>;
-            members.push(Member { root: r.clone(), backend });
+            members.push(Member {
+                root: r.clone(),
+                backend,
+            });
         }
         Ok(Self { members })
     }
@@ -208,15 +211,23 @@ mod tests {
             be.create(&key).unwrap();
             be.write(&key, 0, b"payload").unwrap();
             // The object physically exists on exactly one root.
-            let owned: Vec<usize> =
-                (0..4).filter(|r| bucket_file(&roots[*r], &key).exists()).collect();
-            assert_eq!(owned.len(), 1, "key {key} on roots {owned:?}, want exactly one");
+            let owned: Vec<usize> = (0..4)
+                .filter(|r| bucket_file(&roots[*r], &key).exists())
+                .collect();
+            assert_eq!(
+                owned.len(),
+                1,
+                "key {key} on roots {owned:?}, want exactly one"
+            );
             per_root[owned[0]] += 1;
             assert_eq!(be.read(&key, 0, 32).unwrap(), b"payload".to_vec());
             assert_eq!(be.len(&key).unwrap(), 7);
         }
         for c in per_root {
-            assert!(c > 40, "root got only {c} of 400 objects — placement skewed");
+            assert!(
+                c > 40,
+                "root got only {c} of 400 objects — placement skewed"
+            );
         }
         cleanup(&roots);
     }
@@ -235,9 +246,17 @@ mod tests {
         }
         let owner = |k: &str| (0..3).find(|r| bucket_file(&roots[*r], k).exists());
         let anchor = owner(base).expect("base object placed");
-        assert_eq!(owner("nonexistent-peek-0"), None, "probe-free absent key must exist nowhere");
+        assert_eq!(
+            owner("nonexistent-peek-0"),
+            None,
+            "probe-free absent key must exist nowhere"
+        );
         for i in 0..40u32 {
-            assert_eq!(owner(&format!("{base}#{i}")), Some(anchor), "chunk #{i} drifted off the object's root");
+            assert_eq!(
+                owner(&format!("{base}#{i}")),
+                Some(anchor),
+                "chunk #{i} drifted off the object's root"
+            );
         }
         cleanup(&roots);
     }

@@ -35,24 +35,48 @@ fn names(v: &[grovefs::meta::NodeInfo]) -> Vec<String> {
 fn seed_tree(tag: &str) -> std::sync::Arc<MetaEngine> {
     let path = tmpdb(tag);
     let eng = std::sync::Arc::new(MetaEngine::open(&path).unwrap());
-    let docs = eng.create_node(ROOT_INO, "docs", true, None, 0o0755, 1000, 1000).unwrap();
-    let d26 = eng.create_node(docs, "2026", true, None, 0o0755, 1000, 1000).unwrap();
-    eng.create_node(d26, "a.md", false, Some("ka"), 0o0644, 1000, 1000).unwrap();
-    let d25 = eng.create_node(docs, "2025", true, None, 0o0755, 1000, 1000).unwrap();
-    eng.create_node(d25, "old.md", false, Some("ko"), 0o0644, 1000, 1000).unwrap();
+    let docs = eng
+        .create_node(ROOT_INO, "docs", true, None, 0o0755, 1000, 1000)
+        .unwrap();
+    let d26 = eng
+        .create_node(docs, "2026", true, None, 0o0755, 1000, 1000)
+        .unwrap();
+    eng.create_node(d26, "a.md", false, Some("ka"), 0o0644, 1000, 1000)
+        .unwrap();
+    let d25 = eng
+        .create_node(docs, "2025", true, None, 0o0755, 1000, 1000)
+        .unwrap();
+    eng.create_node(d25, "old.md", false, Some("ko"), 0o0644, 1000, 1000)
+        .unwrap();
 
-    let photos = eng.create_node(ROOT_INO, "photos", true, None, 0o0755, 1000, 1000).unwrap();
-    let priv_ = eng.create_node(photos, "private", true, None, 0o0755, 1000, 1000).unwrap();
-    eng.create_node(priv_, "x.jpg", false, Some("kx"), 0o0644, 1000, 1000).unwrap();
-    let pub_ = eng.create_node(photos, "public", true, None, 0o0755, 1000, 1000).unwrap();
-    eng.create_node(pub_, "y.jpg", false, Some("ky"), 0o0644, 1000, 1000).unwrap();
+    let photos = eng
+        .create_node(ROOT_INO, "photos", true, None, 0o0755, 1000, 1000)
+        .unwrap();
+    let priv_ = eng
+        .create_node(photos, "private", true, None, 0o0755, 1000, 1000)
+        .unwrap();
+    eng.create_node(priv_, "x.jpg", false, Some("kx"), 0o0644, 1000, 1000)
+        .unwrap();
+    let pub_ = eng
+        .create_node(photos, "public", true, None, 0o0755, 1000, 1000)
+        .unwrap();
+    eng.create_node(pub_, "y.jpg", false, Some("ky"), 0o0644, 1000, 1000)
+        .unwrap();
 
-    let data = eng.create_node(ROOT_INO, "data", true, None, 0o0755, 1000, 1000).unwrap();
-    let raw = eng.create_node(data, "raw", true, None, 0o0755, 1000, 1000).unwrap();
-    eng.create_node(raw, "big.bin", false, Some("kb"), 0o0644, 1000, 1000).unwrap();
+    let data = eng
+        .create_node(ROOT_INO, "data", true, None, 0o0755, 1000, 1000)
+        .unwrap();
+    let raw = eng
+        .create_node(data, "raw", true, None, 0o0755, 1000, 1000)
+        .unwrap();
+    eng.create_node(raw, "big.bin", false, Some("kb"), 0o0644, 1000, 1000)
+        .unwrap();
 
-    let shared = eng.create_node(ROOT_INO, "shared", true, None, 0o0755, 1000, 1000).unwrap();
-    eng.create_node(shared, "lib", true, None, 0o0755, 1000, 1000).unwrap();
+    let shared = eng
+        .create_node(ROOT_INO, "shared", true, None, 0o0755, 1000, 1000)
+        .unwrap();
+    eng.create_node(shared, "lib", true, None, 0o0755, 1000, 1000)
+        .unwrap();
     eng
 }
 
@@ -91,11 +115,19 @@ fn only_mode_refuses_writes_into_pass_through_ancestor() {
     // /docs is shown only as a path to /docs/2026; a new sibling could never
     // appear in the lens, so creation there is refused (EPERM).
     let e = l.create_node(docs, "sneak", true, None, 0o0755, 1000, 1000);
-    assert!(matches!(e, Err(grovefs::meta::MetaError::OpNotPermitted)), "{e:?}");
+    assert!(
+        matches!(e, Err(grovefs::meta::MetaError::OpNotPermitted)),
+        "{e:?}"
+    );
     // but inside the shown subtree it succeeds.
     let d26 = eng.lookup(docs, "2026").unwrap().id;
-    assert!(l.create_node(d26, "b.md", false, Some("kbb"), 0o0644, 1000, 1000).is_ok());
-    assert_eq!(names(&l.readdir(d26)), vec!["a.md".to_string(), "b.md".to_string()]);
+    assert!(l
+        .create_node(d26, "b.md", false, Some("kbb"), 0o0644, 1000, 1000)
+        .is_ok());
+    assert_eq!(
+        names(&l.readdir(d26)),
+        vec!["a.md".to_string(), "b.md".to_string()]
+    );
 }
 
 #[test]
@@ -108,7 +140,11 @@ fn map_relocates_and_governs_write_through() {
     assert!(root_names.contains(&"team".to_string()), "{root_names:?}");
     assert!(root_names.contains(&"data".to_string()), "{root_names:?}");
     let data = eng.lookup(ROOT_INO, "data").unwrap().id;
-    assert_eq!(names(&l.readdir(data)), Vec::<String>::new(), "raw vacated /data");
+    assert_eq!(
+        names(&l.readdir(data)),
+        Vec::<String>::new(),
+        "raw vacated /data"
+    );
     assert!(l.lookup(data, "raw").is_none());
 
     // Enter the relocated dir under the lens.
@@ -122,26 +158,42 @@ fn map_relocates_and_governs_write_through() {
 
     // Writing through the lens lands on the real entry and is visible in BOTH
     // the relocated view and the raw engine.
-    l.create_node(raw, "more.bin", false, Some("km"), 0o0644, 1000, 1000).unwrap();
-    assert_eq!(names(&l.readdir(raw)), vec!["big.bin".to_string(), "more.bin".to_string()]);
+    l.create_node(raw, "more.bin", false, Some("km"), 0o0644, 1000, 1000)
+        .unwrap();
+    assert_eq!(
+        names(&l.readdir(raw)),
+        vec!["big.bin".to_string(), "more.bin".to_string()]
+    );
     assert!(eng.lookup(raw, "more.bin").is_some());
 
     // Creating directly inside a lens-only (synthesized) dir is refused.
     let e = l.create_node(team, "oops", true, None, 0o0755, 1000, 1000);
-    assert!(matches!(e, Err(grovefs::meta::MetaError::OpNotPermitted)), "{e:?}");
+    assert!(
+        matches!(e, Err(grovefs::meta::MetaError::OpNotPermitted)),
+        "{e:?}"
+    );
     // A name the lens already shows (the synthesized 'team' at root) is
     // taken: a plain mkdir there is EEXIST, not a hidden source entry.
     let e = l.create_node(ROOT_INO, "team", true, None, 0o0755, 1000, 1000);
     assert!(matches!(e, Err(grovefs::meta::MetaError::Exists)), "{e:?}");
-    assert!(eng.lookup(ROOT_INO, "team").is_none(), "no hidden source twin");
+    assert!(
+        eng.lookup(ROOT_INO, "team").is_none(),
+        "no hidden source twin"
+    );
     // An unknown name under scaffolding is ENOENT, not EPERM.
     let e = l.unlink(team, "ghost");
-    assert!(matches!(e, Err(grovefs::meta::MetaError::NotFound)), "{e:?}");
+    assert!(
+        matches!(e, Err(grovefs::meta::MetaError::NotFound)),
+        "{e:?}"
+    );
 
     // Unlinking via the lens removes the real source entry — but the moved
     // dir still has children, so clear those first (POSIX rmdir semantics are
     // unchanged through the lens: ENOTEMPTY is refused, empties delete).
-    assert!(matches!(l.unlink(team, "raw"), Err(grovefs::meta::MetaError::NotEmpty)));
+    assert!(matches!(
+        l.unlink(team, "raw"),
+        Err(grovefs::meta::MetaError::NotEmpty)
+    ));
     l.unlink(raw, "more.bin").unwrap();
     l.unlink(raw, "big.bin").unwrap();
     l.unlink(team, "raw").unwrap();
@@ -178,7 +230,10 @@ fn map_of_a_file_keeps_data_io_addressable() {
     assert_eq!(n.kind, NodeKind::Regular);
     assert_eq!(n.data_ref.as_deref(), Some("ka"));
     // vacated its original spot.
-    let d26 = eng.lookup(eng.lookup(ROOT_INO, "docs").unwrap().id, "2026").unwrap().id;
+    let d26 = eng
+        .lookup(eng.lookup(ROOT_INO, "docs").unwrap().id, "2026")
+        .unwrap()
+        .id;
     assert!(l.lookup(d26, "a.md").is_none());
 }
 
@@ -187,14 +242,20 @@ fn no_rules_is_transparent_passthrough() {
     let eng = seed_tree("none");
     let l = lens_over(eng.clone(), "");
     // Empty lens must not disturb anything.
-    assert_eq!(names(&l.readdir(ROOT_INO)), vec![
-        "data".to_string(),
-        "docs".to_string(),
-        "photos".to_string(),
-        "shared".to_string(),
-    ]);
+    assert_eq!(
+        names(&l.readdir(ROOT_INO)),
+        vec![
+            "data".to_string(),
+            "docs".to_string(),
+            "photos".to_string(),
+            "shared".to_string(),
+        ]
+    );
     let docs = eng.lookup(ROOT_INO, "docs").unwrap().id;
-    assert_eq!(names(&l.readdir(docs)), vec!["2025".to_string(), "2026".to_string()]);
+    assert_eq!(
+        names(&l.readdir(docs)),
+        vec!["2025".to_string(), "2026".to_string()]
+    );
 }
 
 /// A `map` rule renders an entry under a SYNTHESIZED parent: `display_targets`
@@ -212,7 +273,10 @@ fn display_targets_fires_for_relocated_entry() {
     // The returned parent must match what the lens traversal allocates.
     let team_node = l.lookup(ROOT_INO, "team").expect("/team must exist");
     let (tp, tn) = &targets[0];
-    assert_eq!(*tp, team_node.id, "display parent = traversal-allocated ino");
+    assert_eq!(
+        *tp, team_node.id,
+        "display parent = traversal-allocated ino"
+    );
     assert_eq!(tn.as_str(), "raw", "display name = basename(dst)");
     // Non-relocated: empty.
     let docs_ino = eng.lookup(ROOT_INO, "docs").unwrap().id;

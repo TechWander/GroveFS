@@ -8,10 +8,15 @@
 //! - regular file       : is_dir=0, data_ref=Some(key), link_target=None
 //! - symbolic link      : is_dir=0, data_ref=None,   link_target=Some(path)
 //!
-//! Hard links share one `data_ref`; the object is GC'd only when the last node
-//! referencing it disappears (see [`MetaEngine::unlink`]). Because a client only
-//! ever queries its own view DB, files it cannot see are never materialized on
-//! the network — isolation is enforced here, not by permission bits.
+//! Hard links share one `data_ref`; inside a view the object is GC'd only when
+//! the last node referencing it disappears (see [`MetaEngine::unlink`]), and
+//! ACROSS views a shared key (two views holding names for one `data_ref`, e.g.
+//! the same source imported twice) is guarded by the cross-view holder ledger
+//! in `<base>/meta/refs.db` (see the ledger section below) — a blob is only
+//! physically freeable when its last name in a view goes AND no other view
+//! holds it. Because a client only ever queries its own view DB, files it
+//! cannot see are never materialized on the network — isolation is enforced
+//! here, not by permission bits.
 //!
 //! Inode model: a FUSE inode number == `node.ino`. Root is always ino 1.
 //! Multiple directory entries (rows) may share one `ino` — that *is* a hard
@@ -19,7 +24,10 @@
 //! size and the same timestamps. Fresh files/dirs get `ino == row id`.
 
 use rusqlite::{params, Connection, OpenFlags, TransactionBehavior};
-use std::collections::HashMap;
+use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -156,6 +164,806 @@ impl NodeInfo {
     }
 }
 
+// ===================== cross-view blob reference ledger ====================
+//
+// A `data_ref` names ONE backend object, but several physical views can hold
+// names for the same key: `grovefs import` of the same source file into two
+// views resolves to the same content key, and an operator can seed two trees
+// over shared objects. The per-view `node.data_ref` refcount can only see names
+// inside its own db — left alone, a delete in view A would hand the caller a
+// freed key and GC the bytes view B still lists. So bookkeeping lives beside
+// the view trees, in `<base>/meta/refs.db`: one row per data_ref that SOME view
+// holds with its last name, counting how many VIEWS hold it. A blob is only
+// physically freeable when its last name in a view is removed AND no other view
+// holds a name (see [`ledger_remove`]).
+//
+// Mechanics: every view engine ATTACHes the sibling `refs.db` as schema `refs`
+// at open, so the ledger row moves inside the SAME IMMEDIATE transaction as the
+// node INSERT/DELETE it books — commit is atomic across both files and a crash
+// can never strand a still-referenced object (the failure mode would be a
+// leaked holder row, i.e. a blob kept too long, never one freed too early).
+// Deadlock control: `BEGIN IMMEDIATE` takes the write lock of EVERY attached
+// db at start, so each ledger-touching txn locks `refs.db` first and its view
+// db second in one fixed global order — cycles are structurally impossible
+// even with WAL's non-detecting busy handler; `busy_timeout` just queues the
+// losers. Within one process several engines (several mutexes) share refs.db,
+// so ledger writers additionally take [`LEDGER_SERIAL`] BEFORE their engine
+// lock (a process-wide order; cross-process order is the db-lock order).
+//
+// Staleness boundary: a view db deleted out-of-band (`rm <view>.db`, a fresh
+// `--home`) never decrements its holders — the ledger over-counts, blobs are
+// kept too long, and `grovefs refs rebuild` rewrites the ledger from the trees
+// that actually exist. An absent/never-written `refs.db` behaves exactly like
+// the pre-ledger single-view world (no other view known -> free on last name),
+// so existing stores and suites are unchanged until they share a key.
+
+/// The shared ledger file beside the view trees (`<meta dir>/refs.db`).
+pub const REFS_DB: &str = "refs.db";
+/// The schema name every engine connection ATTACHes the ledger under.
+pub const REFS_SCHEMA: &str = "refs";
+
+/// Process-wide lock ordering for ledger writes (taken BEFORE the engine lock).
+static LEDGER_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Serialize a write op that may touch the shared ledger: takes
+/// [`LEDGER_SERIAL`] first, then runs `f` (which internally takes its engine
+/// lock). All grovefs processes in one deployment run the same code, so every
+/// ledger writer acquires the two locks in one order and cannot deadlock
+/// against the db-level queueing.
+pub fn with_ledger_serial<T>(f: impl FnOnce() -> T) -> T {
+    let _g = LEDGER_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    f()
+}
+
+/// ATTACH the sibling ledger and make sure its table exists (idempotent).
+/// Called on every non-readonly engine open; a read-only open attaches only
+/// best-effort when the file already exists (a standby never writes, and a
+/// count query against an unattached schema simply reads "no other view").
+fn attach_refs_ledger(conn: &Connection, path: &Path) -> rusqlite::Result<()> {
+    let ledger = path
+        .parent()
+        .map(|d| d.join(REFS_DB))
+        .ok_or_else(|| rusqlite::Error::InvalidParameterName("view db has no parent dir".into()))?;
+    if let Some(dir) = ledger.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let lit = ledger.to_string_lossy().replace("'", "''");
+    // ATTACH has no `IF NOT EXISTS`; each engine opens a fresh connection and
+    // attaches exactly once here, so re-attaching the same alias is not a
+    // concern. The table is created idempotently for a brand-new ledger file.
+    conn.execute_batch(&format!(
+        "ATTACH DATABASE '{lit}' AS {REFS_SCHEMA};
+         CREATE TABLE IF NOT EXISTS {REFS_SCHEMA}.holders (
+             data_ref TEXT PRIMARY KEY,
+             holders  INTEGER NOT NULL
+         );"
+    ))?;
+    Ok(())
+}
+
+/// Does another view's tree already hold a name for `dr`? Read through the
+/// attached ledger (an unattached/missing schema answers `false` — the
+/// pre-ledger behaviour). `tx` is any rusqlite transaction on the engine
+/// connection, so the read shares the txn's snapshot with its DELETE.
+pub fn other_view_holds(tx: &rusqlite::Transaction<'_>, dr: &str) -> bool {
+    tx.query_row(
+        &format!("SELECT 1 FROM {REFS_SCHEMA}.holders WHERE data_ref=?1 LIMIT 1"),
+        params![dr],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+/// Book this view as holding a name for `dr` (call when the view's name count
+/// for `dr` goes 0 -> 1, inside the same tx as the node INSERT).
+pub fn ledger_add(tx: &rusqlite::Transaction<'_>, dr: &str) -> rusqlite::Result<()> {
+    tx.execute(
+        &format!(
+            "INSERT INTO {REFS_SCHEMA}.holders (data_ref, holders) VALUES (?1, 1)
+             ON CONFLICT(data_ref) DO UPDATE SET holders = holders + 1"
+        ),
+        params![dr],
+    )?;
+    Ok(())
+}
+
+/// Drop this view's hold on `dr` (call when the view's LAST name for `dr` is
+/// removed, inside the same tx as the node DELETE). Returns `Some(dr)` when the
+/// blob is now physically freeable — no view holds it anymore — and `None` when
+/// another view still does (the caller GCs only on `Some`). A missing row is
+/// treated as "no other holder", matching the pre-ledger single-view semantics.
+pub fn ledger_remove(tx: &rusqlite::Transaction<'_>, dr: &str) -> Option<String> {
+    let n = tx
+        .execute(
+            &format!("UPDATE {REFS_SCHEMA}.holders SET holders = holders - 1 WHERE data_ref=?1"),
+            params![dr],
+        )
+        .unwrap_or(0);
+    if n > 0 {
+        let left: i64 = tx
+            .query_row(
+                &format!("SELECT holders FROM {REFS_SCHEMA}.holders WHERE data_ref=?1"),
+                params![dr],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if left <= 0 {
+            let _ = tx.execute(
+                &format!("DELETE FROM {REFS_SCHEMA}.holders WHERE data_ref=?1"),
+                params![dr],
+            );
+            return Some(dr.to_string());
+        }
+        None
+    } else {
+        // No ledger row: this view was never booked against a shared key (or
+        // the ledger predates the tree). The same-view refcount already read 0
+        // at this call site, so freeing here is what the pre-ledger engine did
+        // for every private object — keep that behaviour exactly.
+        Some(dr.to_string())
+    }
+}
+
+/// Outcome of [`fork_view`]: directory entries copied and DISTINCT blobs the
+/// new tree now co-holds with its source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForkStats {
+    pub nodes: i64,
+    pub blobs: i64,
+}
+
+/// Seed an INDEPENDENT metadata tree `name` as a point-in-time copy of the
+/// physical view `base_view`'s tree (`<base>/meta/<name>.db`). Content bytes
+/// are SHARED, not copied: every distinct `data_ref` in the copy is booked once
+/// against the new view in the cross-view ledger, so a delete in either tree
+/// frees a blob only when its last name in the last holding view disappears.
+///
+/// Not copied on purpose: `ctrl` (the HA fencing epoch — a fork is a new view,
+/// not a standby replica) and `locks` (transient leases of the source mount).
+/// Inode numbers ARE copied, so hard links inside the base stay hard links in
+/// the fork; new nodes in the fork keep allocating `ino == row id`, which can
+/// never collide because every copied id already exists.
+///
+/// The source is read through a SEPARATE read-only connection (WAL readers never
+/// block the base view's writers); the destination is built in one IMMEDIATE
+/// transaction that also books the ledger, so a crash leaves either no fork or a
+/// fully seeded one.
+pub fn fork_view(base: &Path, base_view: &str, name: &str) -> Result<ForkStats, String> {
+    let meta_dir = base.join("meta");
+    let src_path = meta_dir.join(format!("{base_view}.db"));
+    let dst_path = meta_dir.join(format!("{name}.db"));
+    if !src_path.is_file() {
+        return Err(format!(
+            "no physical base tree {} — a fork copies a local SQLite tree",
+            src_path.display()
+        ));
+    }
+    if dst_path.exists() {
+        return Err(format!("fork target {} already exists", dst_path.display()));
+    }
+    // Snapshot the source rows first. `ino` is normalized at copy time: a
+    // legacy row (pre-`ino` column) must land with a usable inode number.
+    struct Row {
+        id: i64,
+        parent_id: Option<i64>,
+        name: String,
+        is_dir: i64,
+        data_ref: Option<String>,
+        link_target: Option<String>,
+        mode: i64,
+        uid: i64,
+        gid: i64,
+        mtime: i64,
+        atime: i64,
+        ctime: i64,
+        ino: Option<i64>,
+    }
+    let src = Connection::open_with_flags(&src_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| format!("cannot open base tree {}: {e}", src_path.display()))?;
+    let _ = src.execute_batch("PRAGMA busy_timeout=5000;");
+    let rows: Vec<Row> = {
+        let mut stmt = src
+            .prepare(
+                "SELECT id,parent_id,name,is_dir,data_ref,link_target,mode,uid,gid,mtime,atime,ctime,ino
+                 FROM node ORDER BY id",
+            )
+            .map_err(|e| format!("cannot read base tree {}: {e}", src_path.display()))?;
+        let iter = stmt
+            .query_map([], |r| {
+                Ok(Row {
+                    id: r.get(0)?,
+                    parent_id: r.get(1)?,
+                    name: r.get(2)?,
+                    is_dir: r.get(3)?,
+                    data_ref: r.get(4)?,
+                    link_target: r.get(5)?,
+                    mode: r.get(6)?,
+                    uid: r.get(7)?,
+                    gid: r.get(8)?,
+                    mtime: r.get(9)?,
+                    atime: r.get(10)?,
+                    ctime: r.get(11)?,
+                    ino: r.get(12)?,
+                })
+            })
+            .map_err(|e| format!("cannot read base tree {}: {e}", src_path.display()))?;
+        iter.filter_map(|x| x.ok()).collect()
+    };
+    drop(src);
+    if rows.is_empty() {
+        return Err(format!(
+            "base tree {} has no root row — refusing to fork an empty store",
+            src_path.display()
+        ));
+    }
+    let blobs: HashSet<String> = rows.iter().filter_map(|r| r.data_ref.clone()).collect();
+    // Create the destination tree (schema + root + ledger attached), then
+    // REPLACE its root with the copied rows inside one ledger-ordered tx.
+    let eng = MetaEngine::open(&dst_path)
+        .map_err(|e| format!("cannot create fork tree {}: {e}", dst_path.display()))?;
+    let nodes = rows.len() as i64;
+    let nblobs = blobs.len() as i64;
+    with_ledger_serial(|| {
+        let mut conn = eng.conn.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("DELETE FROM node", [])?;
+        {
+            let mut ins = tx.prepare(
+                "INSERT INTO node
+                 (id,parent_id,name,is_dir,data_ref,link_target,mode,uid,gid,mtime,atime,ctime,ino)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            )?;
+            for r in &rows {
+                let ino = r.ino.unwrap_or(r.id);
+                ins.execute(params![
+                    r.id,
+                    r.parent_id,
+                    r.name,
+                    r.is_dir,
+                    r.data_ref,
+                    r.link_target,
+                    r.mode,
+                    r.uid,
+                    r.gid,
+                    r.mtime,
+                    r.atime,
+                    r.ctime,
+                    ino
+                ])?;
+            }
+        }
+        // Book the fork's hold on every distinct blob. If the BASE view was
+        // never booked (a store predating the ledger, never rebuilt), book it
+        // too — otherwise the base's last-name delete would see holders==1,
+        // drop it to 0, and free a blob the fork still names.
+        for dr in &blobs {
+            let booked = tx
+                .query_row(
+                    &format!("SELECT 1 FROM {REFS_SCHEMA}.holders WHERE data_ref=?1 LIMIT 1"),
+                    params![dr],
+                    |_| Ok(()),
+                )
+                .is_ok();
+            if !booked {
+                ledger_add(&tx, dr)?;
+            }
+            ledger_add(&tx, dr)?;
+        }
+        tx.commit()?;
+        Ok::<(), rusqlite::Error>(())
+    })
+    .map_err(|e| format!("cannot seed fork tree {}: {e}", dst_path.display()))?;
+    Ok(ForkStats {
+        nodes,
+        blobs: nblobs,
+    })
+}
+
+/// Portable METADATA export: the node rows of one view, one JSON object per
+/// line, header first. Content bytes are deliberately NOT included — a node
+/// references its blob by `data_ref` only, and the on-disk location is derived
+/// from that key (FNV-1a bucket + key), so copying the store's `blocks/` tree
+/// to another machine preserves every reference. No host path, device id,
+/// hostname or absolute path is stored in the export.
+pub const VIEW_EXPORT_FORMAT: &str = "grovefs-view-metadata";
+pub const VIEW_EXPORT_VERSION: u64 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewExportStats {
+    pub nodes: i64,
+    pub blobs: i64,
+    pub kind: String,
+}
+
+fn node_row_json(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+    Ok(json!({
+        "id": r.get::<_, i64>(0)?,
+        "parent_id": r.get::<_, Option<i64>>(1)?,
+        "name": r.get::<_, String>(2)?,
+        "is_dir": r.get::<_, i64>(3)?,
+        "data_ref": r.get::<_, Option<String>>(4)?,
+        "link_target": r.get::<_, Option<String>>(5)?,
+        "mode": r.get::<_, i64>(6)?,
+        "uid": r.get::<_, i64>(7)?,
+        "gid": r.get::<_, i64>(8)?,
+        "mtime": r.get::<_, i64>(9)?,
+        "atime": r.get::<_, i64>(10)?,
+        "ctime": r.get::<_, i64>(11)?,
+        "ino": r.get::<_, Option<i64>>(12)?,
+    }))
+}
+
+/// Export one view's metadata tree to `out` as line-delimited JSON (header +
+/// one object per node, ordered by id). The source is read through a separate
+/// READ-ONLY connection inside one snapshot transaction, so a concurrent
+/// writer yields a consistent point-in-time copy (WAL readers never block it).
+/// `kind` is `fork` when a `fork <base>` definition slot exists, `physical`
+/// otherwise; virtual names have no tree of their own and are refused.
+pub fn export_view(
+    base: &Path,
+    view: &str,
+    out: &Path,
+    force: bool,
+) -> Result<ViewExportStats, String> {
+    let src_path = base.join("meta").join(format!("{view}.db"));
+    if !src_path.is_file() {
+        return Err(format!(
+            "no metadata tree {} — '{view}' is not a physical tree (an alias or derived view has only a definition file under meta/views/; a PostgreSQL-backed view lives in Postgres)",
+            src_path.display()
+        ));
+    }
+    if out.exists() && !force {
+        return Err(format!(
+            "output {} already exists — pass --force to overwrite it",
+            out.display()
+        ));
+    }
+    let def_path = base
+        .join("meta")
+        .join("views")
+        .join(format!("{view}.layout"));
+    let definition = std::fs::read_to_string(&def_path).ok();
+    let kind = match definition.as_deref() {
+        Some(t) if t.lines().any(|l| l.trim_start().starts_with("fork ")) => "fork",
+        _ => "physical",
+    };
+    // Write beside the destination then rename, so an interrupted export never
+    // leaves a half-written file at the requested path.
+    let mut tmp = out.to_path_buf();
+    let name = out.file_name().and_then(|n| n.to_str()).unwrap_or("export");
+    tmp.set_file_name(format!(".{name}.tmp-{}", std::process::id()));
+
+    let src = Connection::open_with_flags(&src_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| format!("cannot open tree {}: {e}", src_path.display()))?;
+    let _ = src.execute_batch("PRAGMA busy_timeout=5000;");
+    src.execute_batch("BEGIN")
+        .map_err(|e| format!("cannot start export snapshot: {e}"))?;
+    let counts: (i64, i64) = src
+        .query_row(
+            "SELECT COUNT(*), COUNT(DISTINCT data_ref) FROM node",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(|e| format!("cannot count tree {}: {e}", src_path.display()))?;
+    let write_result = (|| -> Result<(), String> {
+        let f = File::create(&tmp).map_err(|e| format!("cannot create {}: {e}", tmp.display()))?;
+        let mut w = BufWriter::new(f);
+        let header = json!({
+            "format": VIEW_EXPORT_FORMAT,
+            "version": VIEW_EXPORT_VERSION,
+            "view": view,
+            "kind": kind,
+            "definition": definition,
+            "exported_at": now(),
+            "nodes": counts.0,
+            "blobs": counts.1,
+        });
+        writeln!(w, "{header}").map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+        let mut stmt = src
+            .prepare(
+                "SELECT id,parent_id,name,is_dir,data_ref,link_target,mode,uid,gid,mtime,atime,ctime,ino
+                 FROM node ORDER BY id",
+            )
+            .map_err(|e| format!("cannot read tree {}: {e}", src_path.display()))?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|e| format!("cannot read tree {}: {e}", src_path.display()))?;
+        while let Some(r) = rows
+            .next()
+            .map_err(|e| format!("cannot read tree {}: {e}", src_path.display()))?
+        {
+            let row = node_row_json(r)
+                .map_err(|e| format!("cannot read tree {}: {e}", src_path.display()))?;
+            writeln!(w, "{row}").map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+        }
+        w.flush()
+            .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+        w.get_ref()
+            .sync_all()
+            .map_err(|e| format!("cannot flush {}: {e}", tmp.display()))?;
+        Ok(())
+    })();
+    let _ = src.execute_batch("COMMIT");
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    std::fs::rename(&tmp, out).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("cannot move export into {}: {e}", out.display())
+    })?;
+    Ok(ViewExportStats {
+        nodes: counts.0,
+        blobs: counts.1,
+        kind: kind.to_string(),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewImportStats {
+    pub nodes: i64,
+    pub blobs: i64,
+    pub kind: String,
+    pub replaced: bool,
+}
+
+/// Import a metadata tree written by [`export_view`] as `<base>/meta/<view>.db`.
+/// The target must not be governed by a definition; an existing tree is only
+/// overwritten with `replace` (and every mount/meta-server using the store must
+/// be stopped first). Rows are inserted in ONE transaction with their original
+/// ids/inodes, so hard links stay hard links, then the cross-view ledger is
+/// rebuilt from the trees that actually exist. Content bytes are not touched:
+/// the caller must have copied the referenced blobs into the target store.
+pub fn import_view(
+    base: &Path,
+    view: &str,
+    input: &Path,
+    replace: bool,
+) -> Result<ViewImportStats, String> {
+    let meta_dir = base.join("meta");
+    std::fs::create_dir_all(&meta_dir)
+        .map_err(|e| format!("cannot create {}: {e}", meta_dir.display()))?;
+    let dst = meta_dir.join(format!("{view}.db"));
+    let f = File::open(input).map_err(|e| format!("cannot open {}: {e}", input.display()))?;
+    let mut rdr = BufReader::new(f);
+    let mut header_line = String::new();
+    if rdr
+        .read_line(&mut header_line)
+        .map_err(|e| format!("cannot read {}: {e}", input.display()))?
+        == 0
+    {
+        return Err(format!(
+            "{} is empty — not a grovefs view export",
+            input.display()
+        ));
+    }
+    if header_line.len() > (1 << 20) {
+        return Err(format!("{}:1: header line too long", input.display()));
+    }
+    let header: Value = serde_json::from_str(header_line.trim_end()).map_err(|e| {
+        format!(
+            "{}:1: not a grovefs view export header ({e})",
+            input.display()
+        )
+    })?;
+    if header["format"] != VIEW_EXPORT_FORMAT {
+        return Err(format!(
+            "{}:1: unknown format '{}' (expected '{VIEW_EXPORT_FORMAT}')",
+            input.display(),
+            header["format"].as_str().unwrap_or("<missing>")
+        ));
+    }
+    let version = header["version"].as_u64().unwrap_or(0);
+    if version != VIEW_EXPORT_VERSION {
+        return Err(format!(
+            "{}:1: unsupported export version {version} (this build reads {VIEW_EXPORT_VERSION})",
+            input.display()
+        ));
+    }
+    let claimed_nodes = header["nodes"].as_i64();
+    let claimed_blobs = header["blobs"].as_i64();
+    let kind = header["kind"].as_str().unwrap_or("physical").to_string();
+    let replaced = dst.exists();
+    if replaced && !replace {
+        return Err(format!(
+            "target metadata tree {} already exists — pass --replace to overwrite it (stop every mount/meta-server using this store first)",
+            dst.display()
+        ));
+    }
+    // Build BESIDE the destination and rename at the very end: a corrupt export
+    // (or a crash mid-import) never destroys an existing tree and never leaves a
+    // half-written one behind. The temp name does not end in `.db`, so
+    // `rebuild_ledger` and every view lister ignore it.
+    let tmp = meta_dir.join(format!(".{view}.import-{}-{}", std::process::id(), now()));
+    let side = |p: &std::path::Path, ext: &str| -> std::path::PathBuf {
+        let mut s = p.as_os_str().to_os_string();
+        s.push(ext);
+        std::path::PathBuf::from(s)
+    };
+    let scratch = |ext: &str| side(&tmp, ext);
+    for ext in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(scratch(ext));
+    }
+    let built = (|| -> Result<(i64, i64), String> {
+        let eng = MetaEngine::open(&tmp)
+            .map_err(|e| format!("cannot build target tree {}: {e}", tmp.display()))?;
+        let res = with_ledger_serial(|| -> Result<(i64, i64), String> {
+            let mut conn = eng.conn.lock();
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|e| format!("cannot start import transaction: {e}"))?;
+            tx.execute("DELETE FROM node", [])
+                .map_err(|e| format!("cannot clear the target tree: {e}"))?;
+            let mut nodes = 0i64;
+            let mut blobs: HashSet<String> = HashSet::new();
+            {
+                let mut ins = tx
+                .prepare(
+                    "INSERT INTO node
+                     (id,parent_id,name,is_dir,data_ref,link_target,mode,uid,gid,mtime,atime,ctime,ino)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                )
+                .map_err(|e| format!("cannot prepare the target tree: {e}"))?;
+                let mut line = String::new();
+                let mut lineno = 1usize;
+                loop {
+                    line.clear();
+                    let n = rdr
+                        .read_line(&mut line)
+                        .map_err(|e| format!("cannot read {}: {e}", input.display()))?;
+                    if n == 0 {
+                        break;
+                    }
+                    lineno += 1;
+                    if line.len() > (4 << 20) {
+                        return Err(format!("{}:{lineno}: line too long", input.display()));
+                    }
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let v: Value = serde_json::from_str(line.trim_end())
+                        .map_err(|e| format!("{}:{lineno}: invalid JSON: {e}", input.display()))?;
+                    let id = v["id"].as_i64().ok_or_else(|| {
+                        format!("{}:{lineno}: missing integer \"id\"", input.display())
+                    })?;
+                    let parent_id = match v.get("parent_id") {
+                        None | Some(Value::Null) => None,
+                        Some(x) => Some(x.as_i64().ok_or_else(|| {
+                            format!(
+                                "{}:{lineno}: \"parent_id\" must be an integer or null",
+                                input.display()
+                            )
+                        })?),
+                    };
+                    let name = v["name"].as_str().ok_or_else(|| {
+                        format!("{}:{lineno}: missing string \"name\"", input.display())
+                    })?;
+                    if name.is_empty() {
+                        return Err(format!("{}:{lineno}: empty name", input.display()));
+                    }
+                    let is_dir = v["is_dir"].as_i64().ok_or_else(|| {
+                        format!("{}:{lineno}: missing integer \"is_dir\"", input.display())
+                    })?;
+                    if is_dir != 0 && is_dir != 1 {
+                        return Err(format!(
+                            "{}:{lineno}: \"is_dir\" must be 0 or 1, got {is_dir}",
+                            input.display()
+                        ));
+                    }
+                    let data_ref = v["data_ref"].as_str().map(str::to_string);
+                    let link_target = v["link_target"].as_str().map(str::to_string);
+                    let mode =
+                        v["mode"]
+                            .as_i64()
+                            .unwrap_or(if is_dir == 1 { 0o755 } else { 0o644 });
+                    let uid = v["uid"].as_i64().unwrap_or(0);
+                    let gid = v["gid"].as_i64().unwrap_or(0);
+                    let t = now();
+                    let mtime = v["mtime"].as_i64().unwrap_or(t);
+                    let atime = v["atime"].as_i64().unwrap_or(mtime);
+                    let ctime = v["ctime"].as_i64().unwrap_or(mtime);
+                    let ino = v["ino"].as_i64().unwrap_or(id);
+                    ins.execute(params![
+                        id,
+                        parent_id,
+                        name,
+                        is_dir,
+                        data_ref,
+                        link_target,
+                        mode,
+                        uid,
+                        gid,
+                        mtime,
+                        atime,
+                        ctime,
+                        ino
+                    ])
+                    .map_err(|e| {
+                        format!("{}:{lineno}: cannot insert node {id}: {e}", input.display())
+                    })?;
+                    if let Some(dr) = &data_ref {
+                        blobs.insert(dr.clone());
+                    }
+                    nodes += 1;
+                }
+            }
+            let root_rows: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM node WHERE parent_id IS NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(|e| format!("cannot validate the imported tree: {e}"))?;
+            if root_rows != 1 {
+                return Err(format!(
+                "import rejected: expected exactly one root row (parent_id NULL), found {root_rows}"
+            ));
+            }
+            let (root_id, root_is_dir): (i64, i64) = tx
+                .query_row(
+                    "SELECT id, is_dir FROM node WHERE parent_id IS NULL",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map_err(|e| format!("cannot validate the imported tree: {e}"))?;
+            if root_id != ROOT_INO || root_is_dir != 1 {
+                return Err(format!(
+                "import rejected: root row must be id {ROOT_INO} and a directory (got id {root_id}, is_dir {root_is_dir})"
+            ));
+            }
+            let dangling: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM node c LEFT JOIN node p ON c.parent_id=p.id
+                 WHERE c.parent_id IS NOT NULL AND (p.id IS NULL OR p.is_dir=0)",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(|e| format!("cannot validate the imported tree: {e}"))?;
+            if dangling != 0 {
+                return Err(format!(
+                "import rejected: {dangling} node(s) point at a missing or non-directory parent"
+            ));
+            }
+            if let Some(c) = claimed_nodes {
+                if c != nodes {
+                    return Err(format!(
+                        "import rejected: header declares {c} node(s), file carries {nodes}"
+                    ));
+                }
+            }
+            if let Some(c) = claimed_blobs {
+                if c != blobs.len() as i64 {
+                    return Err(format!(
+                        "import rejected: header declares {c} blob reference(s), file carries {}",
+                        blobs.len()
+                    ));
+                }
+            }
+            tx.commit()
+                .map_err(|e| format!("cannot commit the imported tree: {e}"))?;
+            Ok((nodes, blobs.len() as i64))
+        });
+        // Fold the WAL back into the main file before the tree is moved into
+        // place, so the rename carries a self-contained database.
+        let _ = eng
+            .conn
+            .lock()
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        drop(eng);
+        res
+    })();
+    let (nodes, blobs) = match built {
+        Ok(v) => v,
+        Err(e) => {
+            for ext in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(scratch(ext));
+            }
+            return Err(e);
+        }
+    };
+    // Install: drop the OLD sidecars first, then let `rename` atomically replace
+    // the old db — at every instant either the old tree or the new one is in
+    // place, never a mixture and never nothing.
+    for ext in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(side(&dst, ext));
+    }
+    if let Err(e) = std::fs::rename(&tmp, &dst) {
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(scratch(ext));
+        }
+        return Err(format!(
+            "cannot install imported tree {}: {e}",
+            dst.display()
+        ));
+    }
+    // A TRUNCATE checkpoint normally removes the sidecars; carry any that
+    // survive along so the db keeps its WAL pair.
+    for ext in ["-wal", "-shm"] {
+        if scratch(ext).exists() {
+            let _ = std::fs::rename(scratch(ext), side(&dst, ext));
+        }
+    }
+    rebuild_ledger(base)
+        .map_err(|e| format!("imported the tree but cannot rebuild {}: {e}", REFS_DB))?;
+    Ok(ViewImportStats {
+        nodes,
+        blobs,
+        kind,
+        replaced,
+    })
+}
+
+/// Rewrite the ledger from the trees that actually exist: `data_ref` -> the
+/// number of DISTINCT view dbs holding a name for it. Backs `grovefs refs
+/// rebuild` after out-of-band view-db removal (the only over-count source).
+pub fn rebuild_ledger(base: &Path) -> rusqlite::Result<usize> {
+    let meta_dir = base.join("meta");
+    let mut views: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&meta_dir) {
+        for ent in rd.flatten() {
+            let p = ent.path();
+            let name = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            // Control-plane dbs never carry node rows; skip them and the ledger
+            // itself (a stray match would just count zero refs anyway).
+            if name.ends_with(".db") && name != REFS_DB && name != "api_keys.db" {
+                views.push(p);
+            }
+        }
+    }
+    // If this fails the very next `Connection::open` surfaces the real error.
+    let _ = std::fs::create_dir_all(&meta_dir);
+    let mut conn = Connection::open(meta_dir.join(REFS_DB))?;
+    conn.execute_batch(
+        "PRAGMA busy_timeout=5000;
+         PRAGMA journal_mode=WAL;
+         CREATE TABLE IF NOT EXISTS holders (
+             data_ref TEXT PRIMARY KEY,
+             holders  INTEGER NOT NULL
+         );",
+    )?;
+    // One IMMEDIATE tx over the whole rewrite: concurrent ledger writers queue
+    // on the write lock, so an add landing during the rebuild is not wiped.
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute("DELETE FROM holders", [])?;
+    let mut counted = 0usize;
+    {
+        // Scoped so `stmt`'s borrow of `tx` ends before `tx.commit()` moves it.
+        let mut stmt = tx.prepare(
+            "INSERT INTO holders (data_ref, holders) VALUES (?1, 1)
+             ON CONFLICT(data_ref) DO UPDATE SET holders = holders + 1",
+        )?;
+        for vp in &views {
+            let ro =
+                Connection::open_with_flags(vp, OpenFlags::SQLITE_OPEN_READ_ONLY).and_then(|c| {
+                    c.execute_batch("PRAGMA busy_timeout=5000;")?;
+                    Ok(c)
+                });
+            let ro = match ro {
+                Ok(c) => c,
+                // A half-written/locked sibling db: skip it rather than fail the
+                // whole rebuild (it simply won't count as a holder this round).
+                Err(_) => continue,
+            };
+            let mut q =
+                ro.prepare("SELECT DISTINCT data_ref FROM node WHERE data_ref IS NOT NULL")?;
+            let refs: Vec<String> = q
+                .query_map([], |r| r.get::<_, String>(0))?
+                .filter_map(|x| x.ok())
+                .collect();
+            for dr in refs {
+                stmt.execute(params![dr])?;
+                counted += 1;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(counted)
+}
+
 fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -250,7 +1058,13 @@ const COLS: &str =
 /// is a fixed, trusted SQL fragment (e.g. `AND is_dir=1`), never user input.
 /// Keys with no matching rows are absent from `out`; the caller applies the
 /// per-field default (0 sub-dirs, or a floor of 1 hard link).
-fn grouped_counts(conn: &Connection, keycol: &str, tail: &str, keys: &[i64], out: &mut HashMap<i64, i64>) {
+fn grouped_counts(
+    conn: &Connection,
+    keycol: &str,
+    tail: &str,
+    keys: &[i64],
+    out: &mut HashMap<i64, i64>,
+) {
     const CHUNK: usize = 500;
     for chunk in keys.chunks(CHUNK) {
         if chunk.is_empty() {
@@ -260,8 +1074,10 @@ fn grouped_counts(conn: &Connection, keycol: &str, tail: &str, keys: &[i64], out
         let sql = format!(
             "SELECT {keycol}, COUNT(*) FROM node WHERE {keycol} IN ({placeholders}) {tail} GROUP BY {keycol}"
         );
-        let args: Vec<&dyn rusqlite::types::ToSql> =
-            chunk.iter().map(|v| v as &dyn rusqlite::types::ToSql).collect();
+        let args: Vec<&dyn rusqlite::types::ToSql> = chunk
+            .iter()
+            .map(|v| v as &dyn rusqlite::types::ToSql)
+            .collect();
         if let Ok(mut stmt) = conn.prepare_cached(&sql) {
             if let Ok(rows) = stmt.query_map(args.as_slice(), |r| {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
@@ -306,6 +1122,16 @@ impl MetaEngine {
         }?;
         if readonly {
             let _ = conn.execute_batch("PRAGMA busy_timeout=5000;");
+            // Best-effort ledger attach (no DDL — the file must already exist):
+            // a standby never writes, and its cross-view hold checks simply read
+            // "no other view" when the sibling refs.db is absent.
+            if path
+                .parent()
+                .map(|d| d.join(REFS_DB).is_file())
+                .unwrap_or(false)
+            {
+                let _ = attach_refs_ledger(&conn, path);
+            }
             return Ok(Self {
                 conn: parking_lot::Mutex::new(conn),
                 read_pool: parking_lot::Mutex::new(Vec::new()),
@@ -356,7 +1182,10 @@ impl MetaEngine {
         // Migration: older DBs may predate link_target / ino / locks.sid. Ignore
         // "duplicate column"; existing lock rows get sid=0 (never renewed, so
         // they simply age out on the lease — harmless at upgrade time).
-        let _ = conn.execute("ALTER TABLE locks ADD COLUMN sid INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute(
+            "ALTER TABLE locks ADD COLUMN sid INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         let _ = conn.execute("ALTER TABLE node ADD COLUMN link_target TEXT", []);
         let _ = conn.execute("ALTER TABLE node ADD COLUMN ino INTEGER", []);
         // Backfill ino for rows inserted before the column existed: one inode per name.
@@ -366,6 +1195,11 @@ impl MetaEngine {
         // setattr-path UPDATE key on `ino`, not the rowid `id`; without this index
         // each is a full table scan. This is the single hottest metadata read.
         conn.execute("CREATE INDEX IF NOT EXISTS idx_node_ino ON node(ino)", [])?;
+        // Attach the shared cross-view holder ledger (sibling refs.db) so every
+        // IMMEDIATE tx below takes its write lock FIRST (uniform global lock
+        // order, no cycles) and books adds/removes inside the same commit as
+        // the node rows they describe. See the ledger section at the top.
+        attach_refs_ledger(&conn, path)?;
 
         let has_root: i64 = conn
             .query_row(
@@ -497,7 +1331,10 @@ impl MetaEngine {
             let _ = rc.execute_batch("PRAGMA busy_timeout=5000;");
             rc
         });
-        ReadGuard { conn: Some(c), eng: self }
+        ReadGuard {
+            conn: Some(c),
+            eng: self,
+        }
     }
 
     /// Resolve (parent, name) -> node. This is the FUSE `lookup` hot path.
@@ -568,13 +1405,11 @@ impl MetaEngine {
                 Ok(s) => s,
                 Err(_) => return Vec::new(),
             };
-            let rows = match stmt.query_map(
-                params![parent, limit as i64, offset as i64],
-                row_to_raw,
-            ) {
-                Ok(r) => r,
-                Err(_) => return Vec::new(),
-            };
+            let rows =
+                match stmt.query_map(params![parent, limit as i64, offset as i64], row_to_raw) {
+                    Ok(r) => r,
+                    Err(_) => return Vec::new(),
+                };
             rows.filter_map(|r| r.ok()).collect::<Vec<_>>()
         };
         self.finalize_batch(&raws)
@@ -622,16 +1457,32 @@ impl MetaEngine {
     ) -> Result<i64, MetaError> {
         let _t = stats::start(stats::Stage::MetaCreate);
         let t = now();
-        let mut conn = self.conn.lock();
-        // Atomic, exactly like rename/unlink/lock_op: one IMMEDIATE tx wraps the
-        // INSERT *and* the `ino = rowid` back-fill. Two autocommit statements
-        // would let a concurrent reader on a separate WAL connection observe the
-        // row between them with `ino IS NULL` (invisible to `WHERE ino=?`), and a
-        // crash in that window would leave a dangling NULL-ino row until the next
-        // open's back-fill. A failed INSERT (constraint) rolls the tx back and
-        // still surfaces as Exists; the UPDATE's error is propagated, not swallowed.
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
+        // Ledger-ordered write: see [`with_ledger_serial`] (one process-wide
+        // lock order for everything that can book the shared refs ledger).
+        with_ledger_serial(|| {
+            let mut conn = self.conn.lock();
+            // Atomic, exactly like rename/unlink/lock_op: one IMMEDIATE tx wraps the
+            // INSERT *and* the `ino = rowid` back-fill. Two autocommit statements
+            // would let a concurrent reader on a separate WAL connection observe the
+            // row between them with `ino IS NULL` (invisible to `WHERE ino=?`), and a
+            // crash in that window would leave a dangling NULL-ino row until the next
+            // open's back-fill. A failed INSERT (constraint) rolls the tx back and
+            // still surfaces as Exists; the UPDATE's error is propagated, not swallowed.
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // Is this the view's FIRST name for the key (count before the INSERT)?
+            // Only then does the cross-view ledger take a new hold.
+            let first_name = data_ref
+                .map(|dr| {
+                    tx.query_row(
+                        "SELECT COUNT(*) FROM node WHERE data_ref=?1",
+                        params![dr],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .unwrap_or(0)
+                        == 0
+                })
+                .unwrap_or(false);
+            tx.execute(
             "INSERT INTO node (parent_id,name,is_dir,data_ref,link_target,mode,uid,gid,mtime,atime,ctime)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?9)",
             params![parent, name, is_dir as i64, data_ref, link_target, mode, uid, gid, t],
@@ -644,40 +1495,65 @@ impl MetaEngine {
             }
             other => MetaError::Db(other.to_string()),
         })?;
-        let rowid = tx.last_insert_rowid();
-        // A brand-new name owns a fresh inode: ino == its own row id.
-        tx.execute("UPDATE node SET ino=?1 WHERE id=?1", params![rowid])?;
-        tx.commit()?;
-        Ok(rowid)
+            let rowid = tx.last_insert_rowid();
+            // A brand-new name owns a fresh inode: ino == its own row id.
+            tx.execute("UPDATE node SET ino=?1 WHERE id=?1", params![rowid])?;
+            if first_name {
+                if let Some(dr) = data_ref {
+                    ledger_add(&tx, dr)?;
+                }
+            }
+            tx.commit()?;
+            Ok(rowid)
+        })
     }
 
     /// Create a hard link: a new directory entry that SHARES `src_ino`'s inode
     /// (same data object, same size, same timestamps). Only regular files may be
     /// hard-linked (POSIX forbids linking dirs). Returns the shared inode number.
-    pub fn link_node(&self, src_ino: i64, new_parent: i64, new_name: &str) -> Result<i64, MetaError> {
+    pub fn link_node(
+        &self,
+        src_ino: i64,
+        new_parent: i64,
+        new_name: &str,
+    ) -> Result<i64, MetaError> {
         let _t = stats::start(stats::Stage::MetaCreate);
-        let conn = self.conn.lock();
-        let row = conn
-            .query_row(
-                "SELECT is_dir,data_ref,mode,uid,gid FROM node WHERE ino=?1 LIMIT 1",
-                params![src_ino],
-                |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, Option<String>>(1)?,
-                        r.get::<_, i64>(2)?,
-                        r.get::<_, i64>(3)?,
-                        r.get::<_, i64>(4)?,
-                    ))
-                },
-            )
-            .map_err(|_| MetaError::NotFound)?;
-        let (is_dir, data_ref, mode, uid, gid) = row;
-        if is_dir == 1 || data_ref.is_none() {
-            return Err(MetaError::OpNotPermitted);
-        }
-        let t = now();
-        conn.execute(
+        with_ledger_serial(|| {
+            let mut conn = self.conn.lock();
+            // One IMMEDIATE tx over read-source + INSERT (+ ledger bookkeeping):
+            // the 0->1 name-count transition must be decided against the same
+            // snapshot the new row commits in, or two racing hard-link creators
+            // could each read "count 0" and double-book this view's hold.
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let row = tx
+                .query_row(
+                    "SELECT is_dir,data_ref,mode,uid,gid FROM node WHERE ino=?1 LIMIT 1",
+                    params![src_ino],
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, Option<String>>(1)?,
+                            r.get::<_, i64>(2)?,
+                            r.get::<_, i64>(3)?,
+                            r.get::<_, i64>(4)?,
+                        ))
+                    },
+                )
+                .map_err(|_| MetaError::NotFound)?;
+            let (is_dir, data_ref, mode, uid, gid) = row;
+            if is_dir == 1 || data_ref.is_none() {
+                return Err(MetaError::OpNotPermitted);
+            }
+            let t = now();
+            let first_name = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM node WHERE data_ref=?1",
+                    params![data_ref],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                == 0;
+            tx.execute(
             "INSERT INTO node (parent_id,name,is_dir,data_ref,link_target,mode,uid,gid,mtime,atime,ctime,ino)
              VALUES (?1,?2,0,?3,NULL,?4,?5,?6,?7,?7,?7,?8)",
             params![new_parent, new_name, data_ref, mode, uid, gid, t, src_ino],
@@ -690,7 +1566,14 @@ impl MetaEngine {
             }
             other => MetaError::Db(other.to_string()),
         })?;
-        Ok(src_ino)
+            if first_name {
+                if let Some(dr) = data_ref.as_deref() {
+                    ledger_add(&tx, dr)?;
+                }
+            }
+            tx.commit()?;
+            Ok(src_ino)
+        })
     }
 
     /// Rename / move a node within the view tree (custom hierarchy lives here).
@@ -698,102 +1581,118 @@ impl MetaEngine {
     /// cycle check -> replace target -> reparent) is atomic and takes the write
     /// lock up front, so two concurrent mounts can never observe a half-applied
     /// rename.
-    pub fn rename(&self, parent: i64, name: &str, new_parent: i64, new_name: &str, noreplace: bool) -> Result<Option<String>, MetaError> {
+    pub fn rename(
+        &self,
+        parent: i64,
+        name: &str,
+        new_parent: i64,
+        new_name: &str,
+        noreplace: bool,
+    ) -> Result<Option<String>, MetaError> {
         let _t = stats::start(stats::Stage::MetaRename);
         let t = now();
-        let mut conn = self.conn.lock();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (src_id, src_ino): (i64, Option<i64>) = tx
-            .query_row(
-                "SELECT id,ino FROM node WHERE parent_id=?1 AND name=?2",
-                params![parent, name],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .map_err(|_| MetaError::NotFound)?;
-        // Refuse to move a directory into its own subtree (would corrupt the tree).
-        if self.is_descendant_locked(&tx, new_parent, src_id) {
-            return Err(MetaError::BadParentCycle);
-        }
-        let tgt: Option<(i64, i64, Option<String>, Option<i64>)> = tx
-            .query_row(
-                "SELECT id,is_dir,data_ref,ino FROM node WHERE parent_id=?1 AND name=?2",
-                params![new_parent, new_name],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Option<i64>>(3)?)),
-            )
-            .ok();
-        // rename(a, a): the target row IS the source row — a successful no-op.
-        // Without this guard the DELETE below would remove the source and the
-        // later UPDATE would match nothing, silently destroying the entry.
-        // The same-inode case covers two *different* hard link names of one
-        // file: POSIX (man 2 rename) also mandates a silent no-op there, but
-        // the row-id guard alone would miss it and delete the target name,
-        // shrinking nlink (a link vanishes). Compare ino, not just row id.
-        if let Some((tid, _, _, tino)) = &tgt {
-            if *tid == src_id || (*tino).is_some() && *tino == src_ino {
-                tx.commit()?;
-                return Ok(None);
+        with_ledger_serial(|| {
+            let mut conn = self.conn.lock();
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let (src_id, src_ino): (i64, Option<i64>) = tx
+                .query_row(
+                    "SELECT id,ino FROM node WHERE parent_id=?1 AND name=?2",
+                    params![parent, name],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map_err(|_| MetaError::NotFound)?;
+            // Refuse to move a directory into its own subtree (would corrupt the tree).
+            if self.is_descendant_locked(&tx, new_parent, src_id) {
+                return Err(MetaError::BadParentCycle);
             }
-        }
-        // RENAME_NOREPLACE: an existing target must fail with EEXIST instead of
-        // being silently overwritten and destroyed.
-        if tgt.is_some() && noreplace {
-            return Err(MetaError::Exists);
-        }
-        // Blob freed by overwriting a target that held the last name to its data;
-        // the caller GCs it in the storage backend (mirrors unlink's refcount rule).
-        let mut gc: Option<String> = None;
-        if let Some((tid, is_dir, tgt_ref, _)) = tgt {
-            let src_is_dir: i64 = tx
-                .query_row("SELECT is_dir FROM node WHERE id=?1", params![src_id], |r| r.get(0))
-                .unwrap_or(0);
-            if src_is_dir != is_dir {
-                return Err(MetaError::TypeMismatch);
+            let tgt: Option<(i64, i64, Option<String>, Option<i64>)> = tx
+                .query_row(
+                    "SELECT id,is_dir,data_ref,ino FROM node WHERE parent_id=?1 AND name=?2",
+                    params![new_parent, new_name],
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                            r.get::<_, Option<i64>>(3)?,
+                        ))
+                    },
+                )
+                .ok();
+            // rename(a, a): the target row IS the source row — a successful no-op.
+            // Without this guard the DELETE below would remove the source and the
+            // later UPDATE would match nothing, silently destroying the entry.
+            // The same-inode case covers two *different* hard link names of one
+            // file: POSIX (man 2 rename) also mandates a silent no-op there, but
+            // the row-id guard alone would miss it and delete the target name,
+            // shrinking nlink (a link vanishes). Compare ino, not just row id.
+            if let Some((tid, _, _, tino)) = &tgt {
+                if *tid == src_id || (*tino).is_some() && *tino == src_ino {
+                    tx.commit()?;
+                    return Ok(None);
+                }
             }
-            // Renaming a directory over an EXISTING directory requires the target
-            // be empty: deleting a non-empty one orphans its children (their
-            // parent_id points at the removed row). POSIX: ENOTEMPTY.
-            if is_dir == 1 {
-                let kids: i64 = tx
+            // RENAME_NOREPLACE: an existing target must fail with EEXIST instead of
+            // being silently overwritten and destroyed.
+            if tgt.is_some() && noreplace {
+                return Err(MetaError::Exists);
+            }
+            // Blob freed by overwriting a target that held the last name to its data;
+            // the caller GCs it in the storage backend (mirrors unlink's refcount rule).
+            let mut gc: Option<String> = None;
+            if let Some((tid, is_dir, tgt_ref, _)) = tgt {
+                let src_is_dir: i64 = tx
                     .query_row(
-                        "SELECT COUNT(*) FROM node WHERE parent_id=?1",
-                        params![tid],
+                        "SELECT is_dir FROM node WHERE id=?1",
+                        params![src_id],
                         |r| r.get(0),
                     )
                     .unwrap_or(0);
-                if kids > 0 {
-                    return Err(MetaError::NotEmpty);
+                if src_is_dir != is_dir {
+                    return Err(MetaError::TypeMismatch);
+                }
+                // Renaming a directory over an EXISTING directory requires the target
+                // be empty: deleting a non-empty one orphans its children (their
+                // parent_id points at the removed row). POSIX: ENOTEMPTY.
+                if is_dir == 1 {
+                    let kids: i64 = tx
+                        .query_row(
+                            "SELECT COUNT(*) FROM node WHERE parent_id=?1",
+                            params![tid],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(0);
+                    if kids > 0 {
+                        return Err(MetaError::NotEmpty);
+                    }
+                }
+                tx.execute("DELETE FROM node WHERE id=?1", params![tid])?;
+                // A dir/symlink target has no data_ref (gc stays None); a regular-file
+                // target's blob is freed only once no OTHER NAME in this view AND no
+                // other view (ledger) still references it.
+                if let Some(dr) = tgt_ref {
+                    let refs: i64 = tx
+                        .query_row(
+                            "SELECT COUNT(*) FROM node WHERE data_ref=?1",
+                            params![dr],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(0);
+                    if refs == 0 {
+                        gc = ledger_remove(&tx, &dr);
+                    }
                 }
             }
-            tx.execute("DELETE FROM node WHERE id=?1", params![tid])?;
-            // A dir/symlink target has no data_ref (gc stays None); a regular-file
-            // target's blob is freed only once no other name still references it.
-            if let Some(dr) = tgt_ref {
-                let refs: i64 = tx
-                    .query_row(
-                        "SELECT COUNT(*) FROM node WHERE data_ref=?1",
-                        params![dr],
-                        |r| r.get(0),
-                    )
-                    .unwrap_or(0);
-                if refs == 0 {
-                    gc = Some(dr);
-                }
-            }
-        }
-        tx.execute(
-            "UPDATE node SET parent_id=?1, name=?2, ctime=?3 WHERE id=?4",
-            params![new_parent, new_name, t, src_id],
-        )?;
-        tx.commit()?;
-        Ok(gc)
+            tx.execute(
+                "UPDATE node SET parent_id=?1, name=?2, ctime=?3 WHERE id=?4",
+                params![new_parent, new_name, t, src_id],
+            )?;
+            tx.commit()?;
+            Ok(gc)
+        })
     }
 
-    fn is_descendant_locked(
-        &self,
-        conn: &Connection,
-        new_parent: i64,
-        src_id: i64,
-    ) -> bool {
+    fn is_descendant_locked(&self, conn: &Connection, new_parent: i64, src_id: i64) -> bool {
         // Walk ancestors of new_parent; if we reach src_id it's a cycle.
         let mut cur = new_parent;
         for _ in 0..4096 {
@@ -801,7 +1700,11 @@ impl MetaEngine {
                 return true;
             }
             let parent: Option<i64> = conn
-                .query_row("SELECT parent_id FROM node WHERE id=?1", params![cur], |r| r.get(0))
+                .query_row(
+                    "SELECT parent_id FROM node WHERE id=?1",
+                    params![cur],
+                    |r| r.get(0),
+                )
                 .unwrap_or(None);
             match parent {
                 Some(p) => cur = p,
@@ -820,43 +1723,61 @@ impl MetaEngine {
     /// makes the loser of a lock race wait rather than error.
     pub fn unlink(&self, parent: i64, name: &str) -> Result<Option<String>, MetaError> {
         let _t = stats::start(stats::Stage::MetaUnlink);
-        let mut conn = self.conn.lock();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (id, is_dir, data_ref) = tx
-            .query_row(
-                "SELECT id,is_dir,data_ref FROM node WHERE parent_id=?1 AND name=?2",
-                params![parent, name],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<String>>(2)?)),
-            )
-            .map_err(|_| MetaError::NotFound)?;
-        if is_dir == 1 {
-            let kids: i64 = tx
+        // Ledger-ordered write (see [`with_ledger_serial`]): the holder count and
+        // the node rows it describes leave in one IMMEDIATE commit.
+        with_ledger_serial(|| {
+            let mut conn = self.conn.lock();
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let (id, is_dir, data_ref) = tx
                 .query_row(
-                    "SELECT COUNT(*) FROM node WHERE parent_id=?1",
-                    params![id],
-                    |r| r.get(0),
+                    "SELECT id,is_dir,data_ref FROM node WHERE parent_id=?1 AND name=?2",
+                    params![parent, name],
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                        ))
+                    },
                 )
-                .unwrap_or(0);
-            if kids > 0 {
-                return Err(MetaError::NotEmpty);
-            }
-        }
-        tx.execute("DELETE FROM node WHERE id=?1", params![id])?;
-        let gc = match &data_ref {
-            Some(dr) => {
-                let refs: i64 = tx
+                .map_err(|_| MetaError::NotFound)?;
+            if is_dir == 1 {
+                let kids: i64 = tx
                     .query_row(
-                        "SELECT COUNT(*) FROM node WHERE data_ref=?1",
-                        params![dr],
+                        "SELECT COUNT(*) FROM node WHERE parent_id=?1",
+                        params![id],
                         |r| r.get(0),
                     )
                     .unwrap_or(0);
-                if refs == 0 { Some(dr.clone()) } else { None }
+                if kids > 0 {
+                    return Err(MetaError::NotEmpty);
+                }
             }
-            None => None,
-        };
-        tx.commit()?;
-        Ok(gc)
+            tx.execute("DELETE FROM node WHERE id=?1", params![id])?;
+            // The blob is freeable only once this view holds no other name for the
+            // key AND the cross-view ledger confirms no other view holds it (the
+            // last remove deletes the holder row and returns the key). See
+            // [`ledger_remove`].
+            let gc = match &data_ref {
+                Some(dr) => {
+                    let refs: i64 = tx
+                        .query_row(
+                            "SELECT COUNT(*) FROM node WHERE data_ref=?1",
+                            params![dr],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(0);
+                    if refs == 0 {
+                        ledger_remove(&tx, dr)
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            };
+            tx.commit()?;
+            Ok(gc)
+        })
     }
 
     /// Update a file's mtime/ctime (after a write or truncate). Applies to every
@@ -875,17 +1796,26 @@ impl MetaEngine {
         let t = now();
         let conn = self.conn.lock();
         if let Some(a) = atime {
-            let _ = conn.execute("UPDATE node SET atime=?1, ctime=?2 WHERE ino=?3", params![a, t, ino]);
+            let _ = conn.execute(
+                "UPDATE node SET atime=?1, ctime=?2 WHERE ino=?3",
+                params![a, t, ino],
+            );
         }
         if let Some(m) = mtime {
-            let _ = conn.execute("UPDATE node SET mtime=?1, ctime=?2 WHERE ino=?3", params![m, t, ino]);
+            let _ = conn.execute(
+                "UPDATE node SET mtime=?1, ctime=?2 WHERE ino=?3",
+                params![m, t, ino],
+            );
         }
     }
 
     pub fn set_mode(&self, ino: i64, mode: u32) {
         let t = now();
         let conn = self.conn.lock();
-        let _ = conn.execute("UPDATE node SET mode=?1, ctime=?2 WHERE ino=?3", params![mode, t, ino]);
+        let _ = conn.execute(
+            "UPDATE node SET mode=?1, ctime=?2 WHERE ino=?3",
+            params![mode, t, ino],
+        );
     }
 
     pub fn set_uid_gid(&self, ino: i64, uid: u32, gid: u32) {
@@ -926,7 +1856,8 @@ impl MetaEngine {
     pub fn backup_to_bytes(&self) -> rusqlite::Result<Vec<u8>> {
         static SNAP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = SNAP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = std::env::temp_dir().join(format!("grovefs_snap_{}_{}.db", std::process::id(), n));
+        let tmp =
+            std::env::temp_dir().join(format!("grovefs_snap_{}_{}.db", std::process::id(), n));
         let _ = std::fs::remove_file(&tmp);
         let conn = self.conn.lock();
         let r = conn.execute("VACUUM INTO ?1", params![tmp.to_string_lossy().as_ref()]);
@@ -977,10 +1908,7 @@ impl MetaEngine {
         let mut conn = self.conn.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = now();
-        tx.execute(
-            "DELETE FROM locks WHERE expires_at < ?1",
-            params![now],
-        )?;
+        tx.execute("DELETE FROM locks WHERE expires_at < ?1", params![now])?;
         let s = start.min(i64::MAX as u64) as i64;
         let e = end.min(i64::MAX as u64) as i64;
         match ty {
@@ -1018,7 +1946,16 @@ impl MetaEngine {
                 tx.execute(
                     "INSERT INTO locks (ino, owner, sid, l_start, l_end, pid, ltype, expires_at) \
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-                    params![ino, owner as i64, sid as i64, s, e, pid as i64, ty.to_u8() as i64, now + LockLease::secs()],
+                    params![
+                        ino,
+                        owner as i64,
+                        sid as i64,
+                        s,
+                        e,
+                        pid as i64,
+                        ty.to_u8() as i64,
+                        now + LockLease::secs()
+                    ],
                 )?;
             }
         }
@@ -1046,7 +1983,14 @@ impl MetaEngine {
              AND (?6 = 1 OR ltype = 1) \
              LIMIT 1",
             params![ino, owner as i64, now, e, s, ty.to_u8() as i64],
-            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?)),
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            },
         )
         .ok()
         .map(|(cs, ce, ct, cp)| LockConflict {
@@ -1118,7 +2062,11 @@ impl MetaEngine {
                 (2 + subdirs as u64, 4096u64)
             }
             NodeKind::Symlink => {
-                let n = raw.link_target.as_ref().map(|s| s.len() as u64).unwrap_or(0);
+                let n = raw
+                    .link_target
+                    .as_ref()
+                    .map(|s| s.len() as u64)
+                    .unwrap_or(0);
                 (1, n)
             }
             NodeKind::Regular => {
@@ -1194,16 +2142,23 @@ impl MetaEngine {
             let _f = stats::start(stats::Stage::SqliteFinalizeCount);
             let conn = self.read_conn();
             grouped_counts(&conn, "ino", "", &reg_inos, &mut nlink_map);
-            grouped_counts(&conn, "parent_id", "AND is_dir=1", &dir_ids, &mut subdir_map);
+            grouped_counts(
+                &conn,
+                "parent_id",
+                "AND is_dir=1",
+                &dir_ids,
+                &mut subdir_map,
+            );
         }
         raws.iter()
             .map(|r| {
                 let kind = Self::node_kind(r);
                 let (nlink, size) = match kind {
                     NodeKind::Dir => (2 + *subdir_map.get(&r.id).unwrap_or(&0) as u64, 4096u64),
-                    NodeKind::Symlink => {
-                        (1, r.link_target.as_ref().map(|s| s.len() as u64).unwrap_or(0))
-                    }
+                    NodeKind::Symlink => (
+                        1,
+                        r.link_target.as_ref().map(|s| s.len() as u64).unwrap_or(0),
+                    ),
                     NodeKind::Regular => {
                         let links = *nlink_map.get(&r.ino).unwrap_or(&1);
                         (links.max(1) as u64, 0u64)
@@ -1253,7 +2208,11 @@ pub trait MetaProvider: Send + Sync {
     /// derived/layout lens, or a remote client against a server too old to page)
     /// keep working through the default below, just without the O(page) win.
     fn readdir_page(&self, parent: i64, offset: usize, limit: usize) -> Vec<NodeInfo> {
-        self.readdir(parent).into_iter().skip(offset).take(limit).collect()
+        self.readdir(parent)
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect()
     }
     /// Whether [`Self::readdir_page`] is a real sub-query or just a slice of a
     /// full listing. Only engines that can page *inside their store* answer
@@ -1275,10 +2234,24 @@ pub trait MetaProvider: Send + Sync {
         uid: u32,
         gid: u32,
     ) -> Result<i64, MetaError>;
-    fn create_symlink(&self, parent: i64, name: &str, target: &str, uid: u32, gid: u32) -> Result<i64, MetaError>;
+    fn create_symlink(
+        &self,
+        parent: i64,
+        name: &str,
+        target: &str,
+        uid: u32,
+        gid: u32,
+    ) -> Result<i64, MetaError>;
     fn link_node(&self, src_ino: i64, new_parent: i64, new_name: &str) -> Result<i64, MetaError>;
     fn unlink(&self, parent: i64, name: &str) -> Result<Option<String>, MetaError>;
-    fn rename(&self, parent: i64, name: &str, new_parent: i64, new_name: &str, noreplace: bool) -> Result<Option<String>, MetaError>;
+    fn rename(
+        &self,
+        parent: i64,
+        name: &str,
+        new_parent: i64,
+        new_name: &str,
+        noreplace: bool,
+    ) -> Result<Option<String>, MetaError>;
     fn set_mode(&self, ino: i64, mode: u32);
     fn set_uid_gid(&self, ino: i64, uid: u32, gid: u32);
     fn set_times(&self, ino: i64, atime: Option<i64>, mtime: Option<i64>);
@@ -1300,7 +2273,14 @@ pub trait MetaProvider: Send + Sync {
         sid: u64,
     ) -> Result<Option<LockConflict>, MetaError>;
     /// F_GETLK: report the first blocking lock without modifying state.
-    fn get_lock(&self, ino: i64, owner: u64, start: u64, end: u64, ty: LockType) -> Option<LockConflict>;
+    fn get_lock(
+        &self,
+        ino: i64,
+        owner: u64,
+        start: u64,
+        end: u64,
+        ty: LockType,
+    ) -> Option<LockConflict>;
     /// FUSE `release`/`flush` cleanup: drop every lock held by `owner`.
     fn release_locks_of_owner(&self, owner: u64);
     /// Renewal heartbeat: extend the lease on every lock row owned by session
@@ -1321,7 +2301,8 @@ pub trait MetaProvider: Send + Sync {
     /// already-known handle value; `RemoteMeta` reconnects to pick up a promoted
     /// node's higher epoch.
     fn fetch_fence_epoch(&self) -> u64 {
-        self.fence_handle().load(std::sync::atomic::Ordering::SeqCst)
+        self.fence_handle()
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -1354,7 +2335,14 @@ impl MetaProvider for MetaEngine {
     ) -> Result<i64, MetaError> {
         MetaEngine::create_node(self, parent, name, is_dir, data_ref, mode, uid, gid)
     }
-    fn create_symlink(&self, parent: i64, name: &str, target: &str, uid: u32, gid: u32) -> Result<i64, MetaError> {
+    fn create_symlink(
+        &self,
+        parent: i64,
+        name: &str,
+        target: &str,
+        uid: u32,
+        gid: u32,
+    ) -> Result<i64, MetaError> {
         MetaEngine::create_symlink(self, parent, name, target, uid, gid)
     }
     fn link_node(&self, src_ino: i64, new_parent: i64, new_name: &str) -> Result<i64, MetaError> {
@@ -1363,7 +2351,14 @@ impl MetaProvider for MetaEngine {
     fn unlink(&self, parent: i64, name: &str) -> Result<Option<String>, MetaError> {
         MetaEngine::unlink(self, parent, name)
     }
-    fn rename(&self, parent: i64, name: &str, new_parent: i64, new_name: &str, noreplace: bool) -> Result<Option<String>, MetaError> {
+    fn rename(
+        &self,
+        parent: i64,
+        name: &str,
+        new_parent: i64,
+        new_name: &str,
+        noreplace: bool,
+    ) -> Result<Option<String>, MetaError> {
         MetaEngine::rename(self, parent, name, new_parent, new_name, noreplace)
     }
     fn set_mode(&self, ino: i64, mode: u32) {
@@ -1391,7 +2386,14 @@ impl MetaProvider for MetaEngine {
     ) -> Result<Option<LockConflict>, MetaError> {
         MetaEngine::lock_op(self, ino, owner, start, end, ty, pid, sid)
     }
-    fn get_lock(&self, ino: i64, owner: u64, start: u64, end: u64, ty: LockType) -> Option<LockConflict> {
+    fn get_lock(
+        &self,
+        ino: i64,
+        owner: u64,
+        start: u64,
+        end: u64,
+        ty: LockType,
+    ) -> Option<LockConflict> {
         MetaEngine::get_lock(self, ino, owner, start, end, ty)
     }
     fn release_locks_of_owner(&self, owner: u64) {
@@ -1422,7 +2424,11 @@ pub enum MetaStore {
 
 impl MetaStore {
     /// Open a SQLite store for `<base>/meta/<view>.db` (`readonly` for a standby).
-    pub fn open_sqlite(base: &std::path::Path, view: &str, readonly: bool) -> rusqlite::Result<Self> {
+    pub fn open_sqlite(
+        base: &std::path::Path,
+        view: &str,
+        readonly: bool,
+    ) -> rusqlite::Result<Self> {
         let path = base.join("meta").join(format!("{view}.db"));
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -1432,7 +2438,8 @@ impl MetaStore {
 
     /// Open a PostgreSQL store for `view` in the database at `conn_uri`.
     pub fn open_pg(conn_uri: &str, view: &str, readonly: bool) -> std::io::Result<Self> {
-        crate::pg_store::PgEngine::open(conn_uri, view, readonly).map(|p| MetaStore::Pg(Box::new(p)))
+        crate::pg_store::PgEngine::open(conn_uri, view, readonly)
+            .map(|p| MetaStore::Pg(Box::new(p)))
     }
 
     pub fn get_epoch(&self) -> i64 {
@@ -1444,14 +2451,18 @@ impl MetaStore {
 
     pub fn set_epoch(&self, e: i64) -> std::io::Result<()> {
         match self {
-            MetaStore::Sqlite(m) => m.set_epoch(e).map_err(|err| std::io::Error::other(err.to_string())),
+            MetaStore::Sqlite(m) => m
+                .set_epoch(e)
+                .map_err(|err| std::io::Error::other(err.to_string())),
             MetaStore::Pg(p) => p.set_epoch(e),
         }
     }
 
     pub fn backup_to_bytes(&self) -> std::io::Result<Vec<u8>> {
         match self {
-            MetaStore::Sqlite(m) => m.backup_to_bytes().map_err(|err| std::io::Error::other(err.to_string())),
+            MetaStore::Sqlite(m) => m
+                .backup_to_bytes()
+                .map_err(|err| std::io::Error::other(err.to_string())),
             MetaStore::Pg(p) => p.backup_to_bytes(),
         }
     }
@@ -1459,16 +2470,28 @@ impl MetaStore {
 
 impl MetaProvider for MetaStore {
     fn lookup(&self, parent: i64, name: &str) -> Option<NodeInfo> {
-        match self { MetaStore::Sqlite(m) => m.lookup(parent, name), MetaStore::Pg(p) => p.lookup(parent, name) }
+        match self {
+            MetaStore::Sqlite(m) => m.lookup(parent, name),
+            MetaStore::Pg(p) => p.lookup(parent, name),
+        }
     }
     fn getattr(&self, ino: i64) -> Option<NodeInfo> {
-        match self { MetaStore::Sqlite(m) => m.getattr(ino), MetaStore::Pg(p) => p.getattr(ino) }
+        match self {
+            MetaStore::Sqlite(m) => m.getattr(ino),
+            MetaStore::Pg(p) => p.getattr(ino),
+        }
     }
     fn readdir(&self, parent: i64) -> Vec<NodeInfo> {
-        match self { MetaStore::Sqlite(m) => m.readdir(parent), MetaStore::Pg(p) => p.readdir(parent) }
+        match self {
+            MetaStore::Sqlite(m) => m.readdir(parent),
+            MetaStore::Pg(p) => p.readdir(parent),
+        }
     }
     fn readdir_page(&self, parent: i64, offset: usize, limit: usize) -> Vec<NodeInfo> {
-        match self { MetaStore::Sqlite(m) => m.readdir_page(parent, offset, limit), MetaStore::Pg(p) => p.readdir_page(parent, offset, limit) }
+        match self {
+            MetaStore::Sqlite(m) => m.readdir_page(parent, offset, limit),
+            MetaStore::Pg(p) => p.readdir_page(parent, offset, limit),
+        }
     }
     fn supports_paged_readdir(&self) -> bool {
         // Both concrete stores page inside their own store (SQLite via
@@ -1484,51 +2507,131 @@ impl MetaProvider for MetaStore {
         }
     }
     #[allow(clippy::too_many_arguments)]
-    fn create_node(&self, parent: i64, name: &str, is_dir: bool, data_ref: Option<&str>, mode: u32, uid: u32, gid: u32) -> Result<i64, MetaError> {
-        match self { MetaStore::Sqlite(m) => m.create_node(parent, name, is_dir, data_ref, mode, uid, gid), MetaStore::Pg(p) => p.create_node(parent, name, is_dir, data_ref, mode, uid, gid) }
+    fn create_node(
+        &self,
+        parent: i64,
+        name: &str,
+        is_dir: bool,
+        data_ref: Option<&str>,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<i64, MetaError> {
+        match self {
+            MetaStore::Sqlite(m) => m.create_node(parent, name, is_dir, data_ref, mode, uid, gid),
+            MetaStore::Pg(p) => p.create_node(parent, name, is_dir, data_ref, mode, uid, gid),
+        }
     }
-    fn create_symlink(&self, parent: i64, name: &str, target: &str, uid: u32, gid: u32) -> Result<i64, MetaError> {
-        match self { MetaStore::Sqlite(m) => m.create_symlink(parent, name, target, uid, gid), MetaStore::Pg(p) => p.create_symlink(parent, name, target, uid, gid) }
+    fn create_symlink(
+        &self,
+        parent: i64,
+        name: &str,
+        target: &str,
+        uid: u32,
+        gid: u32,
+    ) -> Result<i64, MetaError> {
+        match self {
+            MetaStore::Sqlite(m) => m.create_symlink(parent, name, target, uid, gid),
+            MetaStore::Pg(p) => p.create_symlink(parent, name, target, uid, gid),
+        }
     }
     fn link_node(&self, src_ino: i64, new_parent: i64, new_name: &str) -> Result<i64, MetaError> {
-        match self { MetaStore::Sqlite(m) => m.link_node(src_ino, new_parent, new_name), MetaStore::Pg(p) => p.link_node(src_ino, new_parent, new_name) }
+        match self {
+            MetaStore::Sqlite(m) => m.link_node(src_ino, new_parent, new_name),
+            MetaStore::Pg(p) => p.link_node(src_ino, new_parent, new_name),
+        }
     }
     fn unlink(&self, parent: i64, name: &str) -> Result<Option<String>, MetaError> {
-        match self { MetaStore::Sqlite(m) => m.unlink(parent, name), MetaStore::Pg(p) => p.unlink(parent, name) }
+        match self {
+            MetaStore::Sqlite(m) => m.unlink(parent, name),
+            MetaStore::Pg(p) => p.unlink(parent, name),
+        }
     }
-    fn rename(&self, parent: i64, name: &str, new_parent: i64, new_name: &str, noreplace: bool) -> Result<Option<String>, MetaError> {
-        match self { MetaStore::Sqlite(m) => m.rename(parent, name, new_parent, new_name, noreplace), MetaStore::Pg(p) => p.rename(parent, name, new_parent, new_name, noreplace) }
+    fn rename(
+        &self,
+        parent: i64,
+        name: &str,
+        new_parent: i64,
+        new_name: &str,
+        noreplace: bool,
+    ) -> Result<Option<String>, MetaError> {
+        match self {
+            MetaStore::Sqlite(m) => m.rename(parent, name, new_parent, new_name, noreplace),
+            MetaStore::Pg(p) => p.rename(parent, name, new_parent, new_name, noreplace),
+        }
     }
     fn set_mode(&self, ino: i64, mode: u32) {
-        match self { MetaStore::Sqlite(m) => m.set_mode(ino, mode), MetaStore::Pg(p) => p.set_mode(ino, mode) }
+        match self {
+            MetaStore::Sqlite(m) => m.set_mode(ino, mode),
+            MetaStore::Pg(p) => p.set_mode(ino, mode),
+        }
     }
     fn set_uid_gid(&self, ino: i64, uid: u32, gid: u32) {
-        match self { MetaStore::Sqlite(m) => m.set_uid_gid(ino, uid, gid), MetaStore::Pg(p) => p.set_uid_gid(ino, uid, gid) }
+        match self {
+            MetaStore::Sqlite(m) => m.set_uid_gid(ino, uid, gid),
+            MetaStore::Pg(p) => p.set_uid_gid(ino, uid, gid),
+        }
     }
     fn set_times(&self, ino: i64, atime: Option<i64>, mtime: Option<i64>) {
-        match self { MetaStore::Sqlite(m) => m.set_times(ino, atime, mtime), MetaStore::Pg(p) => p.set_times(ino, atime, mtime) }
+        match self {
+            MetaStore::Sqlite(m) => m.set_times(ino, atime, mtime),
+            MetaStore::Pg(p) => p.set_times(ino, atime, mtime),
+        }
     }
     fn touch_mtime(&self, ino: i64) {
-        match self { MetaStore::Sqlite(m) => m.touch_mtime(ino), MetaStore::Pg(p) => p.touch_mtime(ino) }
+        match self {
+            MetaStore::Sqlite(m) => m.touch_mtime(ino),
+            MetaStore::Pg(p) => p.touch_mtime(ino),
+        }
     }
     #[allow(clippy::too_many_arguments)]
-    fn lock_op(&self, ino: i64, owner: u64, start: u64, end: u64, ty: LockType, pid: u32, sid: u64) -> Result<Option<LockConflict>, MetaError> {
-        match self { MetaStore::Sqlite(m) => m.lock_op(ino, owner, start, end, ty, pid, sid), MetaStore::Pg(p) => p.lock_op(ino, owner, start, end, ty, pid, sid) }
+    fn lock_op(
+        &self,
+        ino: i64,
+        owner: u64,
+        start: u64,
+        end: u64,
+        ty: LockType,
+        pid: u32,
+        sid: u64,
+    ) -> Result<Option<LockConflict>, MetaError> {
+        match self {
+            MetaStore::Sqlite(m) => m.lock_op(ino, owner, start, end, ty, pid, sid),
+            MetaStore::Pg(p) => p.lock_op(ino, owner, start, end, ty, pid, sid),
+        }
     }
-    fn get_lock(&self, ino: i64, owner: u64, start: u64, end: u64, ty: LockType) -> Option<LockConflict> {
-        match self { MetaStore::Sqlite(m) => m.get_lock(ino, owner, start, end, ty), MetaStore::Pg(p) => p.get_lock(ino, owner, start, end, ty) }
+    fn get_lock(
+        &self,
+        ino: i64,
+        owner: u64,
+        start: u64,
+        end: u64,
+        ty: LockType,
+    ) -> Option<LockConflict> {
+        match self {
+            MetaStore::Sqlite(m) => m.get_lock(ino, owner, start, end, ty),
+            MetaStore::Pg(p) => p.get_lock(ino, owner, start, end, ty),
+        }
     }
     fn release_locks_of_owner(&self, owner: u64) {
-        match self { MetaStore::Sqlite(m) => m.release_locks_of_owner(owner), MetaStore::Pg(p) => p.release_locks_of_owner(owner) }
+        match self {
+            MetaStore::Sqlite(m) => m.release_locks_of_owner(owner),
+            MetaStore::Pg(p) => p.release_locks_of_owner(owner),
+        }
     }
     fn renew_locks(&self, sid: u64) {
-        match self { MetaStore::Sqlite(m) => m.renew_locks(sid), MetaStore::Pg(p) => p.renew_locks(sid) }
+        match self {
+            MetaStore::Sqlite(m) => m.renew_locks(sid),
+            MetaStore::Pg(p) => p.renew_locks(sid),
+        }
     }
     fn fence_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
-        match self { MetaStore::Sqlite(m) => m.fence_handle(), MetaStore::Pg(p) => p.fence_handle() }
+        match self {
+            MetaStore::Sqlite(m) => m.fence_handle(),
+            MetaStore::Pg(p) => p.fence_handle(),
+        }
     }
 }
-
 
 struct RawNode {
     id: i64,
@@ -1612,8 +2715,13 @@ mod tests {
         let id = e
             .create_node(ROOT_INO, "f", false, Some("datak"), 0o644, 1000, 1000)
             .unwrap();
-        assert!(e.rename(ROOT_INO, "f", ROOT_INO, "f", false).is_ok(), "rename(a,a) must succeed");
-        let n = e.lookup(ROOT_INO, "f").expect("entry must survive rename(a,a)");
+        assert!(
+            e.rename(ROOT_INO, "f", ROOT_INO, "f", false).is_ok(),
+            "rename(a,a) must succeed"
+        );
+        let n = e
+            .lookup(ROOT_INO, "f")
+            .expect("entry must survive rename(a,a)");
         assert_eq!(n.id, id, "no-op must keep the same inode");
     }
 
@@ -1625,13 +2733,27 @@ mod tests {
     fn rename_over_nonempty_directory_returns_enotempty() {
         let dir = tempfile::tempdir().unwrap();
         let e = MetaEngine::open(&dir.path().join("view.db")).unwrap();
-        let _a = e.create_node(ROOT_INO, "a", true, None, 0o755, 1000, 1000).unwrap();
-        let b = e.create_node(ROOT_INO, "b", true, None, 0o755, 1000, 1000).unwrap();
-        e.create_node(b, "inside_b", false, Some("k2"), 0o644, 1000, 1000).unwrap();
+        let _a = e
+            .create_node(ROOT_INO, "a", true, None, 0o755, 1000, 1000)
+            .unwrap();
+        let b = e
+            .create_node(ROOT_INO, "b", true, None, 0o755, 1000, 1000)
+            .unwrap();
+        e.create_node(b, "inside_b", false, Some("k2"), 0o644, 1000, 1000)
+            .unwrap();
         let r = e.rename(ROOT_INO, "a", ROOT_INO, "b", false);
-        assert!(matches!(r, Err(MetaError::NotEmpty)), "expected NotEmpty, got {r:?}");
-        assert!(e.lookup(ROOT_INO, "a").is_some(), "source dir must survive the refused rename");
-        assert!(e.lookup(b, "inside_b").is_some(), "target's child must not be orphaned");
+        assert!(
+            matches!(r, Err(MetaError::NotEmpty)),
+            "expected NotEmpty, got {r:?}"
+        );
+        assert!(
+            e.lookup(ROOT_INO, "a").is_some(),
+            "source dir must survive the refused rename"
+        );
+        assert!(
+            e.lookup(b, "inside_b").is_some(),
+            "target's child must not be orphaned"
+        );
     }
 
     /// Correctness contrast: a file over a dir is TypeMismatch, and a dir over
@@ -1640,16 +2762,32 @@ mod tests {
     fn rename_over_empty_directory_succeeds() {
         let dir = tempfile::tempdir().unwrap();
         let e = MetaEngine::open(&dir.path().join("view.db")).unwrap();
-        let _a = e.create_node(ROOT_INO, "a", false, Some("ka"), 0o644, 1000, 1000).unwrap();
-        let _b = e.create_node(ROOT_INO, "b", true, None, 0o755, 1000, 1000).unwrap();
+        let _a = e
+            .create_node(ROOT_INO, "a", false, Some("ka"), 0o644, 1000, 1000)
+            .unwrap();
+        let _b = e
+            .create_node(ROOT_INO, "b", true, None, 0o755, 1000, 1000)
+            .unwrap();
         assert!(matches!(
             e.rename(ROOT_INO, "a", ROOT_INO, "b", false),
             Err(MetaError::TypeMismatch)
         ));
-        let c = e.create_node(ROOT_INO, "c", true, None, 0o755, 1000, 1000).unwrap();
-        assert!(e.rename(ROOT_INO, "c", ROOT_INO, "b", false).is_ok(), "dir over empty dir ok");
-        assert!(e.lookup(ROOT_INO, "c").is_none(), "source name gone after move");
-        assert_eq!(e.lookup(ROOT_INO, "b").map(|n| n.id), Some(c), "moved dir now holds the name");
+        let c = e
+            .create_node(ROOT_INO, "c", true, None, 0o755, 1000, 1000)
+            .unwrap();
+        assert!(
+            e.rename(ROOT_INO, "c", ROOT_INO, "b", false).is_ok(),
+            "dir over empty dir ok"
+        );
+        assert!(
+            e.lookup(ROOT_INO, "c").is_none(),
+            "source name gone after move"
+        );
+        assert_eq!(
+            e.lookup(ROOT_INO, "b").map(|n| n.id),
+            Some(c),
+            "moved dir now holds the name"
+        );
     }
 
     /// Renaming a file over an EXISTING file must report the overwritten target's
@@ -1661,12 +2799,24 @@ mod tests {
     fn rename_over_file_returns_freed_blob_key() {
         let dir = tempfile::tempdir().unwrap();
         let e = MetaEngine::open(&dir.path().join("view.db")).unwrap();
-        e.create_node(ROOT_INO, "src", false, Some("ksrc"), 0o644, 1000, 1000).unwrap();
-        e.create_node(ROOT_INO, "dst", false, Some("kdst"), 0o644, 1000, 1000).unwrap();
+        e.create_node(ROOT_INO, "src", false, Some("ksrc"), 0o644, 1000, 1000)
+            .unwrap();
+        e.create_node(ROOT_INO, "dst", false, Some("kdst"), 0o644, 1000, 1000)
+            .unwrap();
         let gc = e.rename(ROOT_INO, "src", ROOT_INO, "dst", false).unwrap();
-        assert_eq!(gc.as_deref(), Some("kdst"), "overwritten file's blob must be freed");
+        assert_eq!(
+            gc.as_deref(),
+            Some("kdst"),
+            "overwritten file's blob must be freed"
+        );
         assert!(e.lookup(ROOT_INO, "src").is_none(), "source name gone");
-        assert_eq!(e.lookup(ROOT_INO, "dst").and_then(|n| n.data_ref).as_deref(), Some("ksrc"), "dst now holds src's data");
+        assert_eq!(
+            e.lookup(ROOT_INO, "dst")
+                .and_then(|n| n.data_ref)
+                .as_deref(),
+            Some("ksrc"),
+            "dst now holds src's data"
+        );
     }
 
     /// A target that is a hard link (its data_ref still has another name after the
@@ -1675,9 +2825,12 @@ mod tests {
     fn rename_over_hardlinked_target_does_not_gc() {
         let dir = tempfile::tempdir().unwrap();
         let e = MetaEngine::open(&dir.path().join("view.db")).unwrap();
-        let dst = e.create_node(ROOT_INO, "dst", false, Some("kdst"), 0o644, 1000, 1000).unwrap();
+        let dst = e
+            .create_node(ROOT_INO, "dst", false, Some("kdst"), 0o644, 1000, 1000)
+            .unwrap();
         e.link_node(dst, ROOT_INO, "dst_alias").unwrap(); // second name -> same data_ref
-        e.create_node(ROOT_INO, "src", false, Some("ksrc"), 0o644, 1000, 1000).unwrap();
+        e.create_node(ROOT_INO, "src", false, Some("ksrc"), 0o644, 1000, 1000)
+            .unwrap();
         let gc = e.rename(ROOT_INO, "src", ROOT_INO, "dst", false).unwrap();
         assert_eq!(gc, None, "still-referenced blob must not be freed");
     }
@@ -1687,12 +2840,26 @@ mod tests {
     fn rename_noreplace_over_existing_fails() {
         let dir = tempfile::tempdir().unwrap();
         let e = MetaEngine::open(&dir.path().join("view.db")).unwrap();
-        e.create_node(ROOT_INO, "src", false, Some("ksrc"), 0o644, 1000, 1000).unwrap();
-        e.create_node(ROOT_INO, "dst", false, Some("kdst"), 0o644, 1000, 1000).unwrap();
+        e.create_node(ROOT_INO, "src", false, Some("ksrc"), 0o644, 1000, 1000)
+            .unwrap();
+        e.create_node(ROOT_INO, "dst", false, Some("kdst"), 0o644, 1000, 1000)
+            .unwrap();
         let r = e.rename(ROOT_INO, "src", ROOT_INO, "dst", true);
-        assert!(matches!(r, Err(MetaError::Exists)), "expected Exists, got {r:?}");
-        assert!(e.lookup(ROOT_INO, "src").is_some(), "noreplace must not move src");
-        assert_eq!(e.lookup(ROOT_INO, "dst").and_then(|n| n.data_ref).as_deref(), Some("kdst"), "dst untouched");
+        assert!(
+            matches!(r, Err(MetaError::Exists)),
+            "expected Exists, got {r:?}"
+        );
+        assert!(
+            e.lookup(ROOT_INO, "src").is_some(),
+            "noreplace must not move src"
+        );
+        assert_eq!(
+            e.lookup(ROOT_INO, "dst")
+                .and_then(|n| n.data_ref)
+                .as_deref(),
+            Some("kdst"),
+            "dst untouched"
+        );
     }
 
     /// RENAME_NOREPLACE onto a free name is a normal move (Ok, no GC).
@@ -1700,7 +2867,8 @@ mod tests {
     fn rename_noreplace_to_free_name_succeeds() {
         let dir = tempfile::tempdir().unwrap();
         let e = MetaEngine::open(&dir.path().join("view.db")).unwrap();
-        e.create_node(ROOT_INO, "src", false, Some("ksrc"), 0o644, 1000, 1000).unwrap();
+        e.create_node(ROOT_INO, "src", false, Some("ksrc"), 0o644, 1000, 1000)
+            .unwrap();
         let gc = e.rename(ROOT_INO, "src", ROOT_INO, "fresh", true).unwrap();
         assert_eq!(gc, None, "move to a free name frees nothing");
         assert!(e.lookup(ROOT_INO, "src").is_none());
@@ -1717,10 +2885,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let e = MetaEngine::open(&dir.path().join("view.db")).unwrap();
         for i in 0..100 {
-            e.create_node(ROOT_INO, &format!("f{i:03}"), false, Some(&format!("k{i}")), 0o644, 1000, 1000)
-                .unwrap();
+            e.create_node(
+                ROOT_INO,
+                &format!("f{i:03}"),
+                false,
+                Some(&format!("k{i}")),
+                0o644,
+                1000,
+                1000,
+            )
+            .unwrap();
         }
-        e.create_node(ROOT_INO, "sub", true, None, 0o755, 1000, 1000).unwrap();
+        e.create_node(ROOT_INO, "sub", true, None, 0o755, 1000, 1000)
+            .unwrap();
         let full: Vec<String> = e.readdir(ROOT_INO).into_iter().map(|n| n.name).collect();
         assert_eq!(full.len(), 101, "100 files + 1 subdir");
         for chunk in [1usize, 7, 32, 100, 1024] {
@@ -1734,7 +2911,10 @@ mod tests {
                 paged.extend(page.into_iter().map(|n| n.name));
                 off += chunk;
             }
-            assert_eq!(paged, full, "chunk size {chunk} must reassemble the listing");
+            assert_eq!(
+                paged, full,
+                "chunk size {chunk} must reassemble the listing"
+            );
         }
         // An offset past the end and a zero limit are empty pages, not panics.
         assert!(e.readdir_page(ROOT_INO, full.len(), 10).is_empty());
@@ -1748,20 +2928,31 @@ mod tests {
     fn reads_through_the_pool_observe_committed_writes() {
         let dir = tempfile::tempdir().unwrap();
         let e = MetaEngine::open(&dir.path().join("view.db")).unwrap();
-        let id = e.create_node(ROOT_INO, "fresh", false, Some("kfresh"), 0o644, 1000, 1000).unwrap();
+        let id = e
+            .create_node(ROOT_INO, "fresh", false, Some("kfresh"), 0o644, 1000, 1000)
+            .unwrap();
         assert_eq!(
             e.lookup(ROOT_INO, "fresh").map(|n| n.id),
             Some(id),
             "lookup must see the insert"
         );
         assert_eq!(
-            e.readdir_page(ROOT_INO, 0, 8).into_iter().map(|n| n.name).collect::<Vec<_>>(),
+            e.readdir_page(ROOT_INO, 0, 8)
+                .into_iter()
+                .map(|n| n.name)
+                .collect::<Vec<_>>(),
             vec!["fresh".to_string()],
             "paged readdir must see the insert"
         );
         e.unlink(ROOT_INO, "fresh").unwrap();
-        assert!(e.lookup(ROOT_INO, "fresh").is_none(), "lookup must see the delete");
-        assert!(e.readdir_page(ROOT_INO, 0, 8).is_empty(), "paged readdir must see the delete");
+        assert!(
+            e.lookup(ROOT_INO, "fresh").is_none(),
+            "lookup must see the delete"
+        );
+        assert!(
+            e.readdir_page(ROOT_INO, 0, 8).is_empty(),
+            "paged readdir must see the delete"
+        );
     }
 
     /// The batched directory finalize must agree with the scalar one entry-for-
@@ -1777,21 +2968,26 @@ mod tests {
         let e = MetaEngine::open(&dir.path().join("view.db")).unwrap();
 
         // A directory with three directory children: nlink = 2 + 3 = 5.
-        let d2 = e.create_node(ROOT_INO, "d2", true, None, 0o755, 1000, 1000).unwrap();
+        let d2 = e
+            .create_node(ROOT_INO, "d2", true, None, 0o755, 1000, 1000)
+            .unwrap();
         for n in ["a", "b", "c"] {
             e.create_node(d2, n, true, None, 0o755, 1000, 1000).unwrap();
         }
         // A directory with no directory children: nlink = 2.
-        e.create_node(ROOT_INO, "d0", true, None, 0o755, 1000, 1000).unwrap();
+        e.create_node(ROOT_INO, "d0", true, None, 0o755, 1000, 1000)
+            .unwrap();
         // A lone regular file: nlink = 1.
-        e.create_node(ROOT_INO, "solo", false, Some("ksolo"), 0o644, 1000, 1000).unwrap();
+        e.create_node(ROOT_INO, "solo", false, Some("ksolo"), 0o644, 1000, 1000)
+            .unwrap();
         // A hard-linked pair (same inode, two names): nlink = 2 for both.
         let hl = e
             .create_node(ROOT_INO, "hl", false, Some("khl"), 0o644, 1000, 1000)
             .unwrap();
         e.link_node(hl, ROOT_INO, "hl2").unwrap();
         // A symlink: nlink = 1, size = target length.
-        e.create_symlink(ROOT_INO, "sl", "/some/target", 1000, 1000).unwrap();
+        e.create_symlink(ROOT_INO, "sl", "/some/target", 1000, 1000)
+            .unwrap();
 
         // Ground truth for the aggregate fields of the root listing.
         let expect: HashMap<&str, (u64, u64)> = HashMap::from([
@@ -1833,7 +3029,10 @@ mod tests {
             .iter()
             .find(|n| n.name == "hl_elsewhere")
             .expect("cross-directory alias present in the d2 page");
-        assert_eq!(alias.nlink, 3, "global hard-link count (hl + hl2 + hl_elsewhere)");
+        assert_eq!(
+            alias.nlink, 3,
+            "global hard-link count (hl + hl2 + hl_elsewhere)"
+        );
         assert_eq!(
             e.lookup(ROOT_INO, "hl").map(|n| n.nlink),
             Some(3),
@@ -1853,10 +3052,12 @@ mod tests {
     #[test]
     fn store_level_paging_is_advertised_only_by_providers_that_page_in_sql() {
         let dir = tempfile::tempdir().unwrap();
-        let eng: std::sync::Arc<dyn MetaProvider> = std::sync::Arc::new(
-            MetaEngine::open(&dir.path().join("view.db")).unwrap(),
+        let eng: std::sync::Arc<dyn MetaProvider> =
+            std::sync::Arc::new(MetaEngine::open(&dir.path().join("view.db")).unwrap());
+        assert!(
+            eng.supports_paged_readdir(),
+            "SQLite pages with LIMIT/OFFSET"
         );
-        assert!(eng.supports_paged_readdir(), "SQLite pages with LIMIT/OFFSET");
 
         // The server-side wrapper now forwards paging method-by-method, so the
         // meta-server can serve M_READDIRP as a real sub-query — and, gated on
@@ -1864,13 +3065,22 @@ mod tests {
         let store: std::sync::Arc<dyn MetaProvider> = std::sync::Arc::new(MetaStore::Sqlite(
             MetaEngine::open(&dir.path().join("other.db")).unwrap(),
         ));
-        assert!(store.supports_paged_readdir(), "wrapper forwards the SQLite engine's paging");
+        assert!(
+            store.supports_paged_readdir(),
+            "wrapper forwards the SQLite engine's paging"
+        );
         // Forwarding is not just the flag: the pages must stitch back into the
         // exact full listing `readdir` returns.
         for _ in 0..5 {
-            store.create_node(ROOT_INO, "n", false, None, 0o644, 0, 0).ok();
+            store
+                .create_node(ROOT_INO, "n", false, None, 0o644, 0, 0)
+                .ok();
         }
-        let full: Vec<String> = store.readdir(ROOT_INO).into_iter().map(|n| n.name).collect();
+        let full: Vec<String> = store
+            .readdir(ROOT_INO)
+            .into_iter()
+            .map(|n| n.name)
+            .collect();
         let mut stitched = Vec::new();
         let mut off = 0usize;
         loop {
@@ -1881,7 +3091,10 @@ mod tests {
             stitched.extend(page.into_iter().map(|n| n.name));
             off += 2;
         }
-        assert_eq!(stitched, full, "forwarded readdir_page stitches into readdir");
+        assert_eq!(
+            stitched, full,
+            "forwarded readdir_page stitches into readdir"
+        );
 
         // A derived lens over the same engine keeps the trait default (false):
         // its shaped view has no single SQL page equivalent, so it is not
@@ -1889,6 +3102,369 @@ mod tests {
         let lens: std::sync::Arc<dyn MetaProvider> = std::sync::Arc::new(
             crate::layout::LayoutMeta::new(eng.clone(), crate::layout::LayoutRules::default()),
         );
-        assert!(!lens.supports_paged_readdir(), "a derived lens cannot page in SQL");
+        assert!(
+            !lens.supports_paged_readdir(),
+            "a derived lens cannot page in SQL"
+        );
+    }
+
+    /// The bug the ledger fixes: two physical views share a `data_ref` (an
+    /// `import` of one source resolving to the same content key, or an
+    /// operator seeding two trees over one object). Deleting the last name in
+    /// view A must NOT free bytes view B still lists — only the delete that
+    /// removes the final holder's last name returns the key for GC.
+    #[test]
+    fn cross_view_shared_key_is_not_gc_until_last_holder_leaves() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two view dbs in one meta dir -> both ATTACH the same refs.db.
+        let a = MetaEngine::open(&dir.path().join("a.db")).unwrap();
+        let b = MetaEngine::open(&dir.path().join("b.db")).unwrap();
+        a.create_node(ROOT_INO, "f", false, Some("shared"), 0o644, 1000, 1000)
+            .unwrap();
+        b.create_node(ROOT_INO, "g", false, Some("shared"), 0o644, 1000, 1000)
+            .unwrap();
+        // View A drops its only name: the ledger still counts view B as a
+        // holder, so nothing is freed.
+        assert_eq!(
+            a.unlink(ROOT_INO, "f").unwrap().as_deref(),
+            None,
+            "key held by another view"
+        );
+        // View B now holds the last name across all views; removing it frees it.
+        assert_eq!(
+            b.unlink(ROOT_INO, "g").unwrap().as_deref(),
+            Some("shared"),
+            "last holder leaves -> GC"
+        );
+    }
+
+    /// A fork is an independent tree that SHARES bytes: it copies names, keeps
+    /// hard links, and books one ledger hold per distinct data_ref. Deleting a
+    /// name in either tree must not free a blob the other still names; the last
+    /// name in the last view frees it.
+    #[test]
+    fn fork_copies_tree_and_shares_blobs_until_last_holder_leaves() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = dir.path().join("meta");
+        std::fs::create_dir_all(&meta).unwrap();
+        {
+            let e = MetaEngine::open(&meta.join("base.db")).unwrap();
+            let d = e
+                .create_node(ROOT_INO, "docs", true, None, 0o755, 1000, 1000)
+                .unwrap();
+            let f = e
+                .create_node(d, "a.txt", false, Some("shared"), 0o644, 1000, 1000)
+                .unwrap();
+            // A hard link inside the base must survive as a hard link (same ino).
+            e.link_node(f, d, "b.txt").unwrap();
+            e.create_node(ROOT_INO, "own.txt", false, Some("own"), 0o644, 1000, 1000)
+                .unwrap();
+        }
+        let st = fork_view(dir.path(), "base", "copy").unwrap();
+        assert_eq!(st.nodes, 5, "root + docs + two hard-linked names + own.txt");
+        assert_eq!(st.blobs, 2, "shared + own");
+        let copy = MetaEngine::open(&meta.join("copy.db")).unwrap();
+        let docs = copy.lookup(ROOT_INO, "docs").expect("dir copied");
+        let a = copy.lookup(docs.id, "a.txt").expect("file copied");
+        let b = copy.lookup(docs.id, "b.txt").expect("hard link copied");
+        assert_eq!(
+            (a.data_ref.as_deref(), a.nlink),
+            (b.data_ref.as_deref(), b.nlink),
+            "hard link stays one inode in the fork (same blob, shared link count)"
+        );
+        assert_eq!(a.nlink, 2, "one inode, two names after the copy");
+        // The fork can organize its tree freely...
+        copy.create_node(ROOT_INO, "scratch", true, None, 0o755, 1000, 1000)
+            .unwrap();
+        // ...but removing a shared name must not free the blob: the base holds it.
+        let base = MetaEngine::open(&meta.join("base.db")).unwrap();
+        assert_eq!(
+            copy.unlink(docs.id, "a.txt").unwrap(),
+            None,
+            "base still names shared"
+        );
+        assert_eq!(
+            base.unlink(docs.id, "a.txt").unwrap(),
+            None,
+            "fork still names shared"
+        );
+        // Last name across both trees: one hard link remains in the fork (b.txt).
+        assert_eq!(
+            base.unlink(docs.id, "b.txt").unwrap(),
+            None,
+            "fork still names shared via b.txt"
+        );
+        assert_eq!(
+            copy.unlink(docs.id, "b.txt").unwrap().as_deref(),
+            Some("shared"),
+            "last holder frees"
+        );
+    }
+
+    /// A base tree predating the ledger has no holder rows. Forking must book
+    /// the BASE's hold too, or the base's last-name delete would see the fork's
+    /// single hold, drop it to zero, and free bytes the fork still names.
+    #[test]
+    fn fork_self_heals_a_base_that_predates_the_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = dir.path().join("meta");
+        std::fs::create_dir_all(&meta).unwrap();
+        {
+            let e = MetaEngine::open(&meta.join("legacy.db")).unwrap();
+            e.create_node(ROOT_INO, "f", false, Some("k"), 0o644, 1000, 1000)
+                .unwrap();
+        }
+        // Simulate a pre-ledger store: the view tree exists, refs.db does not.
+        std::fs::remove_file(meta.join("refs.db")).unwrap();
+        fork_view(dir.path(), "legacy", "copy").unwrap();
+        let base = MetaEngine::open(&meta.join("legacy.db")).unwrap();
+        let copy = MetaEngine::open(&meta.join("copy.db")).unwrap();
+        assert_eq!(
+            base.unlink(ROOT_INO, "f").unwrap(),
+            None,
+            "fork still holds k"
+        );
+        assert_eq!(
+            copy.unlink(ROOT_INO, "f").unwrap().as_deref(),
+            Some("k"),
+            "last holder frees"
+        );
+    }
+
+    /// Refusals: no source tree, and never overwrite an existing target db.
+    #[test]
+    fn fork_refuses_missing_source_and_existing_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = dir.path().join("meta");
+        std::fs::create_dir_all(&meta).unwrap();
+        assert!(fork_view(dir.path(), "absent", "copy").is_err());
+        {
+            let _e = MetaEngine::open(&meta.join("base.db")).unwrap();
+        }
+        std::fs::write(meta.join("copy.db"), b"not a tree").unwrap();
+        assert!(fork_view(dir.path(), "base", "copy").is_err());
+        assert!(fork_view(dir.path(), "base", "base").is_err());
+    }
+
+    /// Export -> import round-trip: ids and inode numbers survive (hard links
+    /// stay hard links), timestamps/mode/ownership travel, and the destination
+    /// tree is a normal writable base view. Content bytes are NOT in the file:
+    /// the `data_ref` keys are the only link to the store.
+    #[test]
+    fn export_import_roundtrip_preserves_tree_and_hardlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_meta = dir.path().join("src/meta");
+        std::fs::create_dir_all(&src_meta).unwrap();
+        {
+            let e = MetaEngine::open(&src_meta.join("team.db")).unwrap();
+            let d = e
+                .create_node(ROOT_INO, "docs", true, None, 0o755, 1000, 1001)
+                .unwrap();
+            let f = e
+                .create_node(d, "a.txt", false, Some("blob-a"), 0o640, 1000, 1001)
+                .unwrap();
+            e.link_node(f, d, "b.txt").unwrap();
+            e.create_symlink(ROOT_INO, "link", "docs/a.txt", 1000, 1001)
+                .unwrap();
+            e.set_times(f, Some(111), Some(222));
+        }
+        let out = dir.path().join("team.jsonl");
+        let st = export_view(&dir.path().join("src"), "team", &out, false).unwrap();
+        assert_eq!(st.nodes, 5, "root + docs + two names + symlink");
+        assert_eq!(st.blobs, 1);
+        assert_eq!(st.kind, "physical");
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(text.lines().count(), 6, "header + five node rows");
+        assert!(text.contains("\"format\":\"grovefs-view-metadata\""));
+        assert!(text.contains("\"blobs\":1"));
+
+        let dst_meta = dir.path().join("dst/meta");
+        std::fs::create_dir_all(&dst_meta).unwrap();
+        let ist = import_view(&dir.path().join("dst"), "copy", &out, false).unwrap();
+        assert_eq!((ist.nodes, ist.blobs), (5, 1));
+        assert!(!ist.replaced);
+        let copy = MetaEngine::open(&dst_meta.join("copy.db")).unwrap();
+        let docs = copy.lookup(ROOT_INO, "docs").expect("dir imported");
+        let a = copy.lookup(docs.id, "a.txt").expect("file imported");
+        let b = copy.lookup(docs.id, "b.txt").expect("hard link imported");
+        // `NodeInfo.id` IS the inode number: equal ids prove the two names still
+        // name one inode. Both directory entries keep their exported row ids.
+        assert_eq!(
+            (a.id, b.id),
+            (3, 3),
+            "one inode, two names stays a hard link"
+        );
+        let rows: i64 = copy
+            .conn
+            .lock()
+            .query_row("SELECT COUNT(*) FROM node WHERE id IN (3,4)", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 2, "row ids survive the trip");
+        assert_eq!(a.nlink, 2);
+        assert_eq!(a.data_ref.as_deref(), Some("blob-a"));
+        assert_eq!((a.mode, a.uid, a.gid), (0o640, 1000, 1001));
+        assert_eq!((a.atime, a.mtime), (111, 222));
+        let l = copy.lookup(ROOT_INO, "link").expect("symlink imported");
+        assert_eq!(l.link_target.as_deref(), Some("docs/a.txt"));
+    }
+
+    /// Export/import guards: no source tree, no silent overwrite of the export
+    /// file, and an existing target tree requires the explicit `replace` (an
+    /// offline migration choice, never the default).
+    #[test]
+    fn export_import_refuse_silent_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = dir.path().join("meta");
+        std::fs::create_dir_all(&meta).unwrap();
+        {
+            let e = MetaEngine::open(&meta.join("team.db")).unwrap();
+            e.create_node(ROOT_INO, "f", false, Some("k"), 0o644, 1000, 1000)
+                .unwrap();
+        }
+        let out = dir.path().join("team.jsonl");
+        assert!(export_view(dir.path(), "ghost", &out, false).is_err());
+        export_view(dir.path(), "team", &out, false).unwrap();
+        assert!(
+            export_view(dir.path(), "team", &out, false).is_err(),
+            "an existing export file must not be silently overwritten"
+        );
+        export_view(dir.path(), "team", &out, true).unwrap();
+        assert!(
+            import_view(dir.path(), "team", &out, false).is_err(),
+            "an existing target tree needs --replace"
+        );
+        let st = import_view(dir.path(), "team", &out, true).unwrap();
+        assert!(st.replaced);
+        assert_eq!(st.nodes, 2, "root + f");
+    }
+
+    /// A hand-edited/corrupt export is rejected BEFORE the target is replaced:
+    /// unknown format/version, dangling parents and a header node count that
+    /// disagrees with the body all fail the transaction.
+    #[test]
+    fn import_rejects_bad_header_dangling_parent_and_count_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("meta")).unwrap();
+        let bad = dir.path().join("bad.jsonl");
+        std::fs::write(&bad, "{\"format\":\"other\",\"version\":1}\n").unwrap();
+        assert!(import_view(dir.path(), "v", &bad, false).is_err());
+        std::fs::write(
+            &bad,
+            "{\"format\":\"grovefs-view-metadata\",\"version\":99}\n",
+        )
+        .unwrap();
+        assert!(import_view(dir.path(), "v", &bad, false).is_err());
+
+        let dangling = format!(
+            "{{\"format\":\"grovefs-view-metadata\",\"version\":1,\"kind\":\"physical\",\"nodes\":2}}\n{}\n{}\n",
+            serde_json::json!({"id":1,"parent_id":null,"name":"/","is_dir":1}),
+            serde_json::json!({"id":2,"parent_id":99,"name":"f","is_dir":0})
+        );
+        std::fs::write(&bad, dangling).unwrap();
+        let err = import_view(dir.path(), "v", &bad, false).unwrap_err();
+        assert!(err.contains("missing or non-directory parent"), "{err}");
+
+        let mismatch = format!(
+            "{{\"format\":\"grovefs-view-metadata\",\"version\":1,\"nodes\":9}}\n{}\n",
+            serde_json::json!({"id":1,"parent_id":null,"name":"/","is_dir":1})
+        );
+        std::fs::write(&bad, mismatch).unwrap();
+        let err = import_view(dir.path(), "v2", &bad, false).unwrap_err();
+        assert!(err.contains("header declares 9"), "{err}");
+    }
+
+    /// A failed `replace` must leave the PREVIOUS tree installed: the import is
+    /// built beside the destination and renamed only after every row and check
+    /// passed, so there is no window in which the old tree is gone.
+    #[test]
+    fn failed_replace_keeps_the_previous_tree_and_leaves_no_scratch() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("meta")).unwrap();
+        let good = dir.path().join("good.jsonl");
+        let text = format!(
+            "{{\"format\":\"grovefs-view-metadata\",\"version\":1,\"nodes\":2}}\n{}\n{}\n",
+            serde_json::json!({"id":1,"parent_id":null,"name":"/","is_dir":1}),
+            serde_json::json!({"id":2,"parent_id":1,"name":"keep","is_dir":0,"data_ref":"k"})
+        );
+        std::fs::write(&good, text).unwrap();
+        import_view(dir.path(), "v", &good, false).unwrap();
+
+        let bad = dir.path().join("bad.jsonl");
+        std::fs::write(
+            &bad,
+            format!(
+                "{{\"format\":\"grovefs-view-metadata\",\"version\":1}}\n{}\n{}\n",
+                serde_json::json!({"id":1,"parent_id":null,"name":"/","is_dir":1}),
+                serde_json::json!({"id":2,"parent_id":99,"name":"x","is_dir":0})
+            ),
+        )
+        .unwrap();
+        let err = import_view(dir.path(), "v", &bad, true).unwrap_err();
+        assert!(err.contains("missing or non-directory parent"), "{err}");
+
+        let e = MetaEngine::open(&dir.path().join("meta/v.db")).unwrap();
+        assert_eq!(e.lookup(ROOT_INO, "keep").unwrap().id, 2);
+        let scratch: Vec<_> = std::fs::read_dir(dir.path().join("meta"))
+            .unwrap()
+            .flatten()
+            .filter(|x| x.file_name().to_string_lossy().contains(".import-"))
+            .collect();
+        assert!(scratch.is_empty(), "scratch trees left behind: {scratch:?}");
+    }
+
+    /// Within one view, the second name for a key must not double-book the
+    /// ledger (count 0->1 only): unlinking one of two hard links frees nothing,
+    /// unlinking the last does.
+    #[test]
+    fn same_view_hardlink_books_ledger_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = MetaEngine::open(&dir.path().join("a.db")).unwrap();
+        let ino = a
+            .create_node(ROOT_INO, "f", false, Some("k"), 0o644, 1000, 1000)
+            .unwrap();
+        a.link_node(ino, ROOT_INO, "h").unwrap();
+        assert_eq!(
+            a.unlink(ROOT_INO, "f").unwrap().as_deref(),
+            None,
+            "one name still refers"
+        );
+        assert_eq!(
+            a.unlink(ROOT_INO, "h").unwrap().as_deref(),
+            Some("k"),
+            "last name frees"
+        );
+    }
+
+    /// A view db removed out-of-band never decremented its hold, so the ledger
+    /// over-counts and would keep a blob forever. `rebuild_ledger` rewrites
+    /// holders from the trees that still exist, unblocking the GC.
+    #[test]
+    fn rebuild_ledger_clears_stale_holders() {
+        let dir = tempfile::tempdir().unwrap();
+        // Match production layout: view dbs and refs.db all live under <base>/meta.
+        let meta = dir.path().join("meta");
+        std::fs::create_dir_all(&meta).unwrap();
+        {
+            let a = MetaEngine::open(&meta.join("a.db")).unwrap();
+            a.create_node(ROOT_INO, "f", false, Some("k"), 0o644, 1000, 1000)
+                .unwrap();
+        } // drop a's engine so its db file can be removed
+        std::fs::remove_file(meta.join("a.db")).unwrap();
+        // Stale holder for "k" lingers from the deleted view; rebuild scans the
+        // surviving trees (none reference k) and rewrites the ledger empty.
+        let counted = rebuild_ledger(dir.path()).unwrap();
+        assert_eq!(counted, 0, "no surviving view references k");
+        // A fresh view that creates then unlinks the key now frees it (the
+        // orphaned holder row no longer suppresses GC).
+        let c = MetaEngine::open(&meta.join("c.db")).unwrap();
+        c.create_node(ROOT_INO, "z", false, Some("k"), 0o644, 1000, 1000)
+            .unwrap();
+        assert_eq!(
+            c.unlink(ROOT_INO, "z").unwrap().as_deref(),
+            Some("k"),
+            "ledger rebuilt -> GC works"
+        );
     }
 }

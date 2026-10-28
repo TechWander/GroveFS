@@ -2,16 +2,16 @@
 //! data listings through the same governance API the `grovefs view` CLI drives.
 //!
 //! Two halves live here:
-//! - **Shared view-governance ops** ([`define_view`], [`alias_view`],
+//! - **Shared view-governance ops** ([`define_view`], [`fork_view`], [`alias_view`],
 //!   [`list_views`], [`remove_view`], [`preview_rules`]): every validation and
 //!   file mutation of `grovefs view …` in one place, so the CLI and the MCP
 //!   server cannot drift (one contract, two entrances).
 //! - **A dependency-light MCP server over stdio** ([`serve`]): newline-delimited
 //!   JSON-RPC 2.0 implementing the `initialize` / `tools/list` / `tools/call`
-//!   core of the 2025-06-18 protocol revision, with eight tools: six governance
+//!   core of the 2025-06-18 protocol revision, with nine tools: seven governance
 //!   writes/validations mapping 1:1 to the ops above (`validate_definition` runs
 //!   the FULL publish guard set as a no-write dry run, beyond `preview_rules`'
-//!   verb-syntax check) plus two read-only
+//!   verb-syntax check; [`fork_view`] seeds an independent tree) plus two read-only
 //!   introspection tools ([`view_tree`], [`describe_view`]) that let an agent
 //!   discover the real paths a listing shows (rendering an existing view through
 //!   its own lens, or simulating an unpublished `base` + `rules` pair) and read
@@ -27,6 +27,8 @@
 //! The two introspection tools are metadata-only: they open a view's LOCAL
 //! SQLite tree read-only and walk it (through the same [`LayoutMeta`] lens a
 //! mount uses), touching no object bytes, mounting nothing, and doing no auth.
+//! That also means the `size` a tree render reports is the METADATA field, not
+//! the object's byte count — see [`TreeEntry`] for the exact per-kind meaning.
 
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -119,10 +121,18 @@ fn check_derived_definition(
     // shaped view is not `define`'s business.
     let self_def_path = dir.join(format!("{name}.layout"));
     if let Ok(d) = LayoutRules::parse_def_file(&self_def_path) {
-        if matches!(d, ViewDef::Alias(_)) {
-            return Err(format!(
-                "'{name}' is a pure alias — remove it first (`grovefs view rm --name {name}`) before defining a derived view over it"
-            ));
+        match d {
+            ViewDef::Alias(_) => {
+                return Err(format!(
+                    "'{name}' is a pure alias — remove it first (`grovefs view rm --name {name}`) before defining a derived view over it"
+                ));
+            }
+            ViewDef::Fork(_) => {
+                return Err(format!(
+                    "'{name}' is a fork (an independent metadata tree) — remove it first (`grovefs view rm --name {name}`) before defining a derived view over it"
+                ));
+            }
+            ViewDef::Derived(..) => {}
         }
     }
     // `base` is supplied by --base, so a base line inside the rules text is
@@ -251,6 +261,7 @@ pub fn alias_view(
     // does not model (M_OPEN resolution is single-hop by design).
     let mut alias_to: HashMap<String, String> = HashMap::new();
     let mut derived_names: Vec<String> = Vec::new();
+    let mut fork_names: Vec<String> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&dir) {
         for ent in rd.flatten() {
             let p = ent.path();
@@ -267,6 +278,7 @@ pub fn alias_view(
                         alias_to.insert(stem, r);
                     }
                     ViewDef::Derived(..) => derived_names.push(stem),
+                    ViewDef::Fork(_) => fork_names.push(stem),
                 }
             }
         }
@@ -303,6 +315,11 @@ pub fn alias_view(
             "alias target '{real}' is a derived (virtual) view — aliases map onto a physical view only"
         ));
     }
+    if fork_names.iter().any(|f| f == real) {
+        return Err(format!(
+            "alias target '{real}' is a fork (an independent metadata tree) — aliases map onto a physical view only; give the fork its own key binding (`apikey create --view {real}`) instead"
+        ));
+    }
     if let Some(existing) = alias_to.iter().find(|(_, r)| **r == real) {
         if existing.0 != name {
             return Err(format!(
@@ -324,14 +341,15 @@ pub fn alias_view(
     // Write the new alias BEFORE removing the retired one: the real view is
     // governed by at least one name at every instant, so a leaked old name
     // never opens a window where the real name becomes mountable by itself.
-    std::fs::write(dir.join(format!("{name}.layout")), format!("alias {real}\n")).map_err(|e| e.to_string())?;
+    std::fs::write(
+        dir.join(format!("{name}.layout")),
+        format!("alias {real}\n"),
+    )
+    .map_err(|e| e.to_string())?;
     if let Some(old) = &retire {
         let _ = std::fs::remove_file(dir.join(format!("{old}.layout")));
         out.push(OutLine::Info(format!(
             "rotated public name for real view '{real}': '{old}' -> '{name}' (gapless — '{real}' stayed governed throughout, '{old}' no longer resolves)"
-        )));
-        out.push(OutLine::Note(format!(
-            "note: ACL grants are keyed to '{real}', so they carried over untouched — legitimate users just remount under '{name}'"
         )));
     } else {
         out.push(OutLine::Info(format!(
@@ -349,12 +367,85 @@ pub fn alias_view(
     Ok(out)
 }
 
+/// Create an INDEPENDENT metadata tree `name` seeded from the physical view
+/// `base`: a FORK. Content bytes are shared (ledger-booked), so the fork costs
+/// metadata only; structure (mkdir/rename/unlink/symlink) is writable while
+/// content writes are refused client-side with EROFS, and a delete removes
+/// only the fork's own names — the base's tree stays exactly as it was.
+/// Refused: a name that already has a definition or a physical db, a governed
+/// base (fork a physical tree, not a lens/alias/fork), and any store whose
+/// base tree is not a local SQLite db (PostgreSQL-backed views cannot be
+/// forked yet — the authoritative tree lives in Postgres, not in a file).
+pub fn fork_view(vbase: &Path, name: &str, base: &str) -> Result<Vec<OutLine>, String> {
+    if !valid_view_name(name) {
+        return Err(format!(
+            "invalid fork name '{name}' (must be one safe path element)"
+        ));
+    }
+    if !valid_view_name(base) {
+        return Err(format!("invalid base view name '{base}'"));
+    }
+    if name == base {
+        return Err("fork name must differ from its base".into());
+    }
+    let meta_dir = vbase.join("meta");
+    let dir = meta_dir.join("views");
+    if dir.join(format!("{name}.layout")).is_file() {
+        return Err(format!(
+            "view '{name}' already has a definition — remove it first (`grovefs view rm --name {name}`) before forking"
+        ));
+    }
+    if meta_dir.join(format!("{name}.db")).is_file() {
+        return Err(format!(
+            "'{name}' already names a physical view db — pick another name"
+        ));
+    }
+    if dir.join(format!("{base}.layout")).is_file() {
+        return Err(format!(
+            "base '{base}' is governed by a definition (alias/derived/fork) — fork the physical base tree instead"
+        ));
+    }
+    if !meta_dir.join(format!("{base}.db")).is_file() {
+        return Err(format!(
+            "no physical base tree {}/meta/{base}.db — `fork` copies a LOCAL SQLite tree; create the base first (`grovefs view create --view {base}`). A PostgreSQL-backed view cannot be forked (its authoritative tree lives in Postgres, not in a file)",
+            vbase.display()
+        ));
+    }
+    let stats = crate::meta::fork_view(vbase, base, name)?;
+    // Record the definition only AFTER the tree exists, so a crash never leaves
+    // a name that resolves to a missing tree. A failed write rolls the fresh db
+    // back (best effort) rather than leaving an unreferenced tree behind.
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    if let Err(e) = std::fs::write(dir.join(format!("{name}.layout")), format!("fork {base}\n")) {
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(meta_dir.join(format!("{name}.db{ext}")));
+        }
+        return Err(format!("cannot record fork definition for '{name}': {e}"));
+    }
+    Ok(vec![
+        OutLine::Info(format!(
+            "forked view '{name}' from base '{base}': {} entries, {} shared object(s)",
+            stats.nodes, stats.blobs
+        )),
+        OutLine::Note(format!(
+            "note: '{name}' is an independent metadata tree — mkdir/rename/unlink are writable, content writes (write/truncate) are refused with EROFS; deletes remove only this view's names and never touch '{base}'"
+        )),
+        OutLine::Note(format!(
+            "note: content bytes are SHARED with '{base}' (cross-view ledger): the object is freed only when no view holds a name for it anymore"
+        )),
+    ])
+}
+
 /// One human-readable line per definition, byte-identical to `grovefs view list`.
 fn entry_line(e: &ViewEntry) -> String {
     match e.kind {
         "alias" => format!(
             "alias '{}' -> real view '{}' (full tree, writable; '{}' not mountable by its own name)",
             e.name, e.real_view, e.real_view
+        ),
+        "fork" => format!(
+            "fork '{}' of base '{}' (independent tree: structure writable, content refused EROFS; deletes touch only this view)",
+            e.name, e.real_view
         ),
         _ => format!(
             "view '{}' -> base '{}': {} hide, {} only, {} reloc rule(s) (read-only)",
@@ -401,6 +492,14 @@ pub fn list_views(vbase: &Path) -> Result<StoreViews, String> {
                 only: r.only.len(),
                 reloc: r.reloc.len(),
             },
+            ViewDef::Fork(b) => ViewEntry {
+                name: n,
+                kind: "fork",
+                real_view: b,
+                hide: 0,
+                only: 0,
+                reloc: 0,
+            },
         });
     }
     let mut physical: Vec<String> = Vec::new();
@@ -409,10 +508,10 @@ pub fn list_views(vbase: &Path) -> Result<StoreViews, String> {
             let p = ent.path();
             if p.extension().and_then(|e| e.to_str()) == Some("db") {
                 if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                    // `acl.db` (the view whitelist) and `api_keys.db` (the MCP
-                    // key/audit store) are control-plane stores, not view trees
-                    // — never surface them as mountable names.
-                    if stem != "acl" && stem != "api_keys" {
+                    // `api_keys.db` (the MCP key/audit store) and `refs.db` (the
+                    // cross-view holder ledger) are control-plane stores, not view
+                    // trees — never surface them as mountable names.
+                    if stem != "api_keys" && stem != "refs" {
                         physical.push(stem.to_string());
                     }
                 }
@@ -425,7 +524,9 @@ pub fn list_views(vbase: &Path) -> Result<StoreViews, String> {
 }
 
 /// CLI-facing rendering of [`list_views`] (byte-identical to the old inline
-/// `ViewAction::List` output, including the empty-state line).
+/// `ViewAction::List` output, plus the BARE base views that carry no definition
+/// of their own — the tree a fork or a lens is seeded from — so one command
+/// answers "what views exist here, and what is each one?").
 pub fn list_views_text(vbase: &Path) -> Result<Vec<OutLine>, String> {
     let s = list_views(vbase)?;
     let dir = vbase.join("meta").join("views");
@@ -439,24 +540,73 @@ pub fn list_views_text(vbase: &Path) -> Result<Vec<OutLine>, String> {
     for e in &s.defined {
         out.push(OutLine::Info(entry_line(e)));
     }
+    // Bare base views: physical trees with NO definition slot. A defined name
+    // is reported above (a fork's own db is its tree, not a separate base).
+    let bare: Vec<&String> = s
+        .physical
+        .iter()
+        .filter(|p| !s.defined.iter().any(|e| &e.name == *p))
+        .collect();
+    for p in bare {
+        out.push(OutLine::Info(format!(
+            "base view '{p}' -> own tree meta/{p}.db (read-write; deletes free a shared object only when no view holds it)"
+        )));
+    }
     Ok(out)
 }
 
-/// Remove a view DEFINITION (derived or alias — the file slot is shared).
-/// Underlying data untouched; already-mounted clients keep their resolved
-/// lens until they remount (or the server cache evicts it).
+/// Remove a view DEFINITION (derived, alias or fork — the file slot is
+/// shared). For a derived view or an alias the underlying data is untouched;
+/// already-mounted clients keep their resolved lens until they remount (or the
+/// server cache evicts it). For a FORK the definition owns an independent
+/// metadata tree, so removing it also deletes `meta/<name>.db` (+ WAL/SHM) and
+/// rebuilds the cross-view ledger from the surviving trees — content bytes the
+/// base still holds stay, bytes no view holds anymore become freeable.
 pub fn remove_view(vbase: &Path, name: &str) -> Result<Vec<OutLine>, String> {
     if !valid_view_name(name) {
         return Err(format!("invalid view name '{name}'"));
     }
-    let p = vbase.join("meta").join("views").join(format!("{name}.layout"));
+    let p = vbase
+        .join("meta")
+        .join("views")
+        .join(format!("{name}.layout"));
     if !p.is_file() {
         return Err(format!(
             "no view definition '{name}' under {}",
             vbase.join("meta").join("views").display()
         ));
     }
+    let def = LayoutRules::parse_def_file(&p)
+        .map_err(|e| format!("bad view definition for '{name}': {e}"))?;
     std::fs::remove_file(&p).map_err(|e| e.to_string())?;
+    if let ViewDef::Fork(base) = def {
+        let meta_dir = vbase.join("meta");
+        // Definition is gone first: the name stops resolving even if a db file
+        // lingers (e.g. a live meta-server still holds its handle open).
+        for ext in ["", "-wal", "-shm"] {
+            let db = meta_dir.join(format!("{name}.db{ext}"));
+            if db.exists() {
+                std::fs::remove_file(&db).map_err(|e| {
+                    format!(
+                        "removed the definition but cannot delete the fork tree {}: {e}",
+                        db.display()
+                    )
+                })?;
+            }
+        }
+        // The fork's holds died with its tree: rewrite the ledger from what
+        // survives so the baseline can actually free its own bytes again.
+        crate::meta::rebuild_ledger(vbase)
+            .map_err(|e| format!("fork tree removed, but the ledger rebuild failed: {e}"))?;
+        return Ok(vec![
+            OutLine::Info(format!(
+                "removed fork view '{name}' of base '{base}' (its own metadata tree is gone; content bytes stay while any view — including '{base}' — still holds a name for them)"
+            )),
+            OutLine::Note(
+                "note: a live mount of a removed fork keeps its already-resolved names until it remounts; new mounts are refused".to_string(),
+            ),
+        ]);
+    }
     Ok(vec![OutLine::Info(format!(
         "removed view definition '{name}' (underlying data untouched)"
     ))])
@@ -501,11 +651,18 @@ const DEFAULT_MAX_ENTRIES: usize = 800;
 
 /// One rendered entry of a view listing: an absolute DISPLAY path (exactly the
 /// string an agent feeds back into a `hide`/`only`/`map` rule), its kind, and
-/// its byte size (0 for directories in this read-only render).
+/// the `size` field of its metadata node. Because the walk is metadata-only (it
+/// never asks the data backend for object bytes — that is what a mount's
+/// `getattr` does), this is NOT a file's byte count: `dir` entries carry the
+/// stat placeholder 4096, `file` entries carry 0, and `link` entries carry the
+/// length of their target text. Treat `size` as "this tool does not measure
+/// content"; take `du`/`stat` through a mount when you need real bytes.
 #[derive(Debug)]
 pub struct TreeEntry {
     pub path: String,
     pub kind: &'static str,
+    /// Metadata `size` field: 4096 for a dir, 0 for a file, target length for a
+    /// symlink. Never the object's byte count (see the type-level note).
     pub size: u64,
 }
 
@@ -578,9 +735,22 @@ fn walk_tree(
             NodeKind::Regular => "file",
             NodeKind::Symlink => "link",
         };
-        out.push(TreeEntry { path: child.clone(), kind, size: n.size });
+        out.push(TreeEntry {
+            path: child.clone(),
+            kind,
+            size: n.size,
+        });
         if n.is_dir() && depth < max_depth {
-            walk_tree(provider, n.id, &child, depth + 1, max_depth, max, out, truncated);
+            walk_tree(
+                provider,
+                n.id,
+                &child,
+                depth + 1,
+                max_depth,
+                max,
+                out,
+                truncated,
+            );
             if *truncated {
                 return;
             }
@@ -609,19 +779,21 @@ pub fn view_tree(
                 if !valid_view_name(view) {
                     return Err(format!("invalid view name '{view}'"));
                 }
-                let slot = vbase.join("meta").join("views").join(format!("{view}.layout"));
+                let slot = vbase
+                    .join("meta")
+                    .join("views")
+                    .join(format!("{view}.layout"));
                 if slot.is_file() {
                     match LayoutRules::parse_def_file(&slot)
-                        .map_err(|e| format!("bad view definition for '{view}': {e}"))? {
+                        .map_err(|e| format!("bad view definition for '{view}': {e}"))?
+                    {
                         ViewDef::Derived(base, rules) => {
                             let eng = open_meta_ro(vbase, &base)?;
-                            let lens: Arc<dyn MetaProvider> =
-                                Arc::new(LayoutMeta::new(eng, rules));
+                            let lens: Arc<dyn MetaProvider> = Arc::new(LayoutMeta::new(eng, rules));
                             (lens, "derived", base)
                         }
-                        ViewDef::Alias(real) => {
-                            (open_meta_ro(vbase, &real)?, "alias", real)
-                        }
+                        ViewDef::Alias(real) => (open_meta_ro(vbase, &real)?, "alias", real),
+                        ViewDef::Fork(_) => (open_meta_ro(vbase, view)?, "fork", view.to_string()),
                     }
                 } else {
                     (open_meta_ro(vbase, view)?, "physical", view.to_string())
@@ -631,8 +803,7 @@ pub fn view_tree(
                 if !valid_view_name(base) {
                     return Err(format!("invalid base view name '{base}'"));
                 }
-                let r = LayoutRules::parse(rules)
-                    .map_err(|e| format!("bad layout rules: {e}"))?;
+                let r = LayoutRules::parse(rules).map_err(|e| format!("bad layout rules: {e}"))?;
                 let eng = open_meta_ro(vbase, base)?;
                 let lens: Arc<dyn MetaProvider> = Arc::new(LayoutMeta::new(eng, r));
                 (lens, "simulated", base.to_string())
@@ -656,8 +827,23 @@ pub fn view_tree(
     };
     let mut entries = Vec::new();
     let mut truncated = false;
-    walk_tree(provider.as_ref(), start_ino, &root_path, 0, max_depth, cap, &mut entries, &mut truncated);
-    Ok(ShapeTree { kind, rendered_from, root_path, entries, truncated })
+    walk_tree(
+        provider.as_ref(),
+        start_ino,
+        &root_path,
+        0,
+        max_depth,
+        cap,
+        &mut entries,
+        &mut truncated,
+    );
+    Ok(ShapeTree {
+        kind,
+        rendered_from,
+        root_path,
+        entries,
+        truncated,
+    })
 }
 
 /// Full detail of ONE view slot for read-modify-write editing: what `list_views`
@@ -667,26 +853,37 @@ pub fn describe_view(vbase: &Path, name: &str) -> Result<Value, String> {
     if !valid_view_name(name) {
         return Err(format!("invalid view name '{name}'"));
     }
-    let slot = vbase.join("meta").join("views").join(format!("{name}.layout"));
+    let slot = vbase
+        .join("meta")
+        .join("views")
+        .join(format!("{name}.layout"));
     if slot.is_file() {
         let text = std::fs::read_to_string(&slot)
             .map_err(|e| format!("cannot read definition '{}': {e}", slot.display()))?;
-        return Ok(match LayoutRules::parse_def_file(&slot)
-            .map_err(|e| format!("bad view definition for '{name}': {e}"))?
-        {
-            ViewDef::Alias(real) => json!({
-                "name": name, "kind": "alias", "real_view": real,
-                "mount": "read-write (full tree under the public name)",
-                "real_name_mountable": false,
-                "definition": text,
-            }),
-            ViewDef::Derived(base, r) => json!({
-                "name": name, "kind": "derived", "base": base,
-                "mount": "read-only (virtual shape; writes go to the base view)",
-                "hide": r.hide.len(), "only": r.only.len(), "reloc": r.reloc.len(),
-                "definition": text,
-            }),
-        });
+        return Ok(
+            match LayoutRules::parse_def_file(&slot)
+                .map_err(|e| format!("bad view definition for '{name}': {e}"))?
+            {
+                ViewDef::Alias(real) => json!({
+                    "name": name, "kind": "alias", "real_view": real,
+                    "mount": "read-write (full tree under the public name)",
+                    "real_name_mountable": false,
+                    "definition": text,
+                }),
+                ViewDef::Derived(base, r) => json!({
+                    "name": name, "kind": "derived", "base": base,
+                    "mount": "read-only (virtual shape; writes go to the base view)",
+                    "hide": r.hide.len(), "only": r.only.len(), "reloc": r.reloc.len(),
+                    "definition": text,
+                }),
+                ViewDef::Fork(base) => json!({
+                    "name": name, "kind": "fork", "base": base,
+                    "mount": "structure read-write / content read-only (independent tree; deletes touch only this view)",
+                    "own_tree": format!("meta/{name}.db"),
+                    "definition": text,
+                }),
+            },
+        );
     }
     if vbase.join("meta").join(format!("{name}.db")).is_file() {
         return Ok(json!({
@@ -720,7 +917,7 @@ pub fn resource_templates() -> Value {
           "mimeType": "application/json" },
         { "uriTemplate": "grovefs://view/{name}/tree",
           "name": "view-tree",
-          "description": "The directory listing a mount of this view actually shows, rendered through its lens (metadata only — no mount, no data bytes).",
+          "description": "The directory listing a mount of this view actually shows, rendered through its lens (metadata only — no mount, no data bytes; `size` is the metadata field, so dirs read 4096 and files read 0).",
           "mimeType": "application/json" },
     ])
 }
@@ -758,17 +955,21 @@ pub fn list_resources(vbase: &Path) -> Result<Value, String> {
 /// Read one resource by URI, delegating to `describe_view` / `view_tree` so the
 /// bytes match the corresponding tool result exactly.
 pub fn read_resource(vbase: &Path, uri: &str) -> Result<Value, String> {
-    let rest = uri
-        .strip_prefix(VIEW_URI_PREFIX)
-        .ok_or_else(|| format!("unsupported resource uri '{uri}' (expected {VIEW_URI_PREFIX}<name>/(definition|tree))"))?;
-    let (name, facet) = rest
-        .rsplit_once('/')
-        .ok_or_else(|| format!("malformed resource uri '{uri}' (expected .../<name>/(definition|tree))"))?;
+    let rest = uri.strip_prefix(VIEW_URI_PREFIX).ok_or_else(|| {
+        format!(
+            "unsupported resource uri '{uri}' (expected {VIEW_URI_PREFIX}<name>/(definition|tree))"
+        )
+    })?;
+    let (name, facet) = rest.rsplit_once('/').ok_or_else(|| {
+        format!("malformed resource uri '{uri}' (expected .../<name>/(definition|tree))")
+    })?;
     if name.is_empty() {
         return Err(format!("resource uri '{uri}' names no view"));
     }
     let text = match facet {
-        "definition" => serde_json::to_string_pretty(&describe_view(vbase, name)?).unwrap_or_default(),
+        "definition" => {
+            serde_json::to_string_pretty(&describe_view(vbase, name)?).unwrap_or_default()
+        }
         "tree" => {
             let t = view_tree(vbase, TreeTarget::Existing(name), None, 0, 0)?;
             let dir_count = t.entries.iter().filter(|e| e.kind == "dir").count();
@@ -858,7 +1059,7 @@ pub fn get_prompt(name: &str, arguments: &Value) -> Result<Value, String> {
                 return Err("rotate-alias needs arguments 'real', 'new' and 'old'".into());
             }
             let text = format!(
-"Gaplessly rotate the public alias for real view '{real}': replace '{old}' with '{new}' in ONE command so the storage name is never left mountable.\n1. alias_view {{\"name\":\"{new}\",\"real\":\"{real}\",\"retire\":\"{old}\"}} — write-before-delete: '{new}' resolves, '{old}' stops resolving, '{real}' stays governed (not directly mountable) throughout, and since ACL grants are keyed to '{real}' they carry over untouched.\n2. list_views — confirm '{new}' -> '{real}' is present and '{old}' is gone.\n3. Any client still on '{old}' remounts under '{new}' (rotation only affects NEW mounts; established connections drain on close)."
+"Gaplessly rotate the public alias for real view '{real}': replace '{old}' with '{new}' in ONE command so the storage name is never left mountable.\n1. alias_view {{\"name\":\"{new}\",\"real\":\"{real}\",\"retire\":\"{old}\"}} — write-before-delete: '{new}' resolves, '{old}' stops resolving, '{real}' stays governed (not directly mountable) throughout.\n2. list_views — confirm '{new}' -> '{real}' is present and '{old}' is gone.\n3. Any client still on '{old}' remounts under '{new}' (rotation only affects NEW mounts; established connections drain on close)."
 );
             Ok(json!({
                 "description": format!("rotate alias '{old}' -> '{new}' for '{real}'"),
@@ -902,13 +1103,13 @@ fn str_prop(desc: &str) -> Value {
     json!({ "type": "string", "description": desc })
 }
 
-/// The five exposed tools, in stable order, with self-describing schemas —
+/// The nine exposed tools, in stable order, with self-describing schemas —
 /// an agent reads these descriptions as its whole operating manual.
 pub fn tool_defs() -> Value {
     json!([
         {
             "name": "list_views",
-            "description": "List every view in the store: physical view trees (storage identities, mountable read-write) and governed definitions — derived views (read-only shaped lenses over a base view) and pure aliases (writable public names for a real view; while an alias exists its real name is not a mount entry point). Answers as JSON: {physical:[...], defined:[{name,kind,real_view,hide,only,reloc}]}.",
+            "description": "List every view in the store: physical view trees (storage identities, mountable read-write) and governed definitions — derived views (read-only shaped lenses over a base view), pure aliases (writable public names for a real view; while an alias exists its real name is not a mount entry point) and forks (independent metadata trees seeded from a physical view: structure writable, content read-only, deletes touch only the fork). Answers as JSON: {physical:[...], defined:[{name,kind,real_view,hide,only,reloc}]}.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -932,7 +1133,7 @@ pub fn tool_defs() -> Value {
         },
         {
             "name": "alias_view",
-            "description": "Create or replace a PURE ALIAS: a public writable name for a physical view (name governance, not shape). The alias mounts the FULL tree read-write, and while it exists the real name is refused as a mount entry point — locally and via meta-server. ACL grants stay keyed to the real view. Pass `retire` to rotate a previous alias of the SAME real view gaplessly (write-before-delete: the real name never becomes mountable). Chaining aliases and aliasing a derived view are rejected.",
+            "description": "Create or replace a PURE ALIAS: a public writable name for a physical view (name governance, not shape). The alias mounts the FULL tree read-write, and while it exists the real name is refused as a mount entry point — locally and via meta-server. Pass `retire` to rotate a previous alias of the SAME real view gaplessly (write-before-delete: the real name never becomes mountable). Chaining aliases and aliasing a derived view are rejected.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -945,8 +1146,21 @@ pub fn tool_defs() -> Value {
             }
         },
         {
+            "name": "fork_view",
+            "description": "Create a FORK: an INDEPENDENT metadata tree named `name`, seeded as a point-in-time copy of the physical view `base` (`<db-path>/meta/<name>.db`). Content bytes are SHARED through the cross-view ledger (no copies), so the fork costs metadata only. Structure (mkdir/rename/unlink/symlink/link) is WRITABLE; content writes (write/truncate) are refused with EROFS client-side. Deleting a name in the fork removes only the fork's own metadata — the base tree is untouched, and a shared object is freed only when no view holds a name for it. Requires a local SQLite base tree (PostgreSQL-backed views cannot be forked yet).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": str_prop("Fork view name (one safe path element, must differ from base)"),
+                    "base": str_prop("Physical base view whose tree seeds the fork"),
+                    "db_path": str_prop("Metadata root; defaults to the server's --db-path/--home")
+                },
+                "required": ["name", "base"]
+            }
+        },
+        {
             "name": "remove_view",
-            "description": "Remove a view DEFINITION by name (derived or alias — they share a slot). Underlying data is untouched; already-mounted clients keep their resolved lens until remount. Removing an alias makes the real name mountable again for NEW mounts.",
+            "description": "Remove a view DEFINITION by name (derived, alias or fork — they share a slot). For derived/alias the underlying data is untouched; already-mounted clients keep their resolved lens until remount, and removing an alias makes the real name mountable again for NEW mounts. For a fork this also deletes its independent metadata tree and rebuilds the cross-view ledger (content bytes survive while any view still holds them).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -983,7 +1197,7 @@ pub fn tool_defs() -> Value {
         },
         {
             "name": "list_view_tree",
-            "description": "DISCOVERY + SHAPE PREVIEW: render the directory listing a mount would actually show, read from the view's LOCAL metadata (no mount, no data IO). Give `view` (physical, derived — rendered through its real lens including synthesized dirs, or alias — the full real tree) to inspect an existing listing, OR `base` + inline `rules` to preview an UNPUBLISHED lens before committing it. Returns JSON {kind, rendered_from, root_path, dir_count, file_count, truncated, entries:[{path,kind,size}]} where each `path` is an absolute DISPLAY path — exactly the string to reuse in a hide/only/map rule. Use this to learn which paths exist instead of guessing. Remote/PG-backed trees are not walked (needs a local meta/<view>.db).",
+            "description": "DISCOVERY + SHAPE PREVIEW: render the directory listing a mount would actually show, read from the view's LOCAL metadata (no mount, no data IO). Give `view` (physical, derived — rendered through its real lens including synthesized dirs, or alias — the full real tree) to inspect an existing listing, OR `base` + inline `rules` to preview an UNPUBLISHED lens before committing it. Returns JSON {kind, rendered_from, root_path, dir_count, file_count, truncated, entries:[{path,kind,size}]} where each `path` is an absolute DISPLAY path — exactly the string to reuse in a hide/only/map rule. Use this to learn which paths exist instead of guessing. `size` is the metadata field, NOT a byte count: dirs report 4096, files 0, symlinks their target length (the walk never asks the data backend) — stat through a mount for real sizes. Remote/PG-backed trees are not walked (needs a local meta/<view>.db).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1017,7 +1231,8 @@ pub fn tool_defs() -> Value {
 /// error text), per MCP convention — the JSON-RPC layer stays for protocol
 /// errors only, so the agent's client surfaces the message instead of dying.
 pub fn call_tool(name: &str, args: &Value, default_db: &Path) -> Value {
-    let err = |msg: String| json!({ "content": [{ "type": "text", "text": msg }], "isError": true });
+    let err =
+        |msg: String| json!({ "content": [{ "type": "text", "text": msg }], "isError": true });
     let ok_lines = |lines: Vec<OutLine>| {
         let text: String = lines
             .iter()
@@ -1047,7 +1262,11 @@ pub fn call_tool(name: &str, args: &Value, default_db: &Path) -> Value {
                         json!({
                             "name": e.name, "kind": e.kind, "real_view": e.real_view,
                             "hide": e.hide, "only": e.only, "reloc": e.reloc,
-                            "mount": if e.kind == "alias" { "read-write (alias)" } else { "read-only (derived)" },
+                            "mount": match e.kind {
+                                "alias" => "read-write (alias)",
+                                "fork" => "structure read-write / content read-only (fork)",
+                                _ => "read-only (derived)",
+                            },
                             "line": entry_line(e),
                         })
                     })
@@ -1095,6 +1314,20 @@ pub fn call_tool(name: &str, args: &Value, default_db: &Path) -> Value {
                 Err(e) => err(e),
             }
         }
+        "fork_view" => {
+            let vname = match s("name") {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            let vbase = match s("base") {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            match fork_view(&db, &vname, &vbase) {
+                Ok(lines) => ok_lines(lines),
+                Err(e) => err(e),
+            }
+        }
         "remove_view" => {
             let vname = match s("name") {
                 Ok(v) => v,
@@ -1129,7 +1362,9 @@ pub fn call_tool(name: &str, args: &Value, default_db: &Path) -> Value {
                 Err(e) => return e,
             };
             match validate_definition(&db, &vname, &vbase, &rules) {
-                Ok(v) => json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&v).unwrap_or_default() }] }),
+                Ok(v) => {
+                    json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&v).unwrap_or_default() }] })
+                }
                 Err(e) => err(e),
             }
         }
@@ -1139,7 +1374,9 @@ pub fn call_tool(name: &str, args: &Value, default_db: &Path) -> Value {
                 Err(e) => return e,
             };
             match describe_view(&db, &vname) {
-                Ok(v) => json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&v).unwrap_or_default() }] }),
+                Ok(v) => {
+                    json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&v).unwrap_or_default() }] })
+                }
                 Err(e) => err(e),
             }
         }
@@ -1148,23 +1385,30 @@ pub fn call_tool(name: &str, args: &Value, default_db: &Path) -> Value {
             let base = args.get("base").and_then(|v| v.as_str());
             let rules = args.get("rules").and_then(|v| v.as_str());
             let path = args.get("path").and_then(|v| v.as_str());
-            let depth = args.get("depth").and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(0);
-            let max = args.get("max").and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(0);
-            let target = match (view, base, rules) {
-                (Some(v), _, _) => TreeTarget::Existing(v),
-                (None, Some(b), Some(r)) => TreeTarget::Simulate { base: b, rules: r },
-                (None, Some(b), None) => {
-                    return err(format!(
+            let depth = args
+                .get("depth")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(0);
+            let max = args
+                .get("max")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(0);
+            let target =
+                match (view, base, rules) {
+                    (Some(v), _, _) => TreeTarget::Existing(v),
+                    (None, Some(b), Some(r)) => TreeTarget::Simulate { base: b, rules: r },
+                    (None, Some(b), None) => {
+                        return err(format!(
                         "'base' also needs inline 'rules' to simulate a lens (got base '{b}' alone)"
                     ))
-                }
-                (None, None, _) => {
-                    return err(
+                    }
+                    (None, None, _) => return err(
                         "provide 'view' (an existing view) or 'base' + 'rules' (a simulated lens)"
                             .into(),
-                    )
-                }
-            };
+                    ),
+                };
             match view_tree(&db, target, path, depth, max) {
                 Ok(t) => {
                     let dir_count = t.entries.iter().filter(|e| e.kind == "dir").count();
@@ -1202,11 +1446,18 @@ fn error_frame(id: Value, code: i64, message: String) -> Value {
 }
 
 /// Answer one request frame. `None` = a notification (no response is written).
-pub fn handle_request(req: &Value, default_db: &Path, client_version: &mut Option<String>) -> Option<Value> {
+pub fn handle_request(
+    req: &Value,
+    default_db: &Path,
+    client_version: &mut Option<String>,
+) -> Option<Value> {
     // Notifications carry no id — they must never be answered.
     let id = req.get("id").filter(|v| !v.is_null()).cloned();
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
-    let params = req.get("params").cloned().unwrap_or(Value::Object(Map::new()));
+    let params = req
+        .get("params")
+        .cloned()
+        .unwrap_or(Value::Object(Map::new()));
     let result: Value = match method {
         "initialize" => {
             *client_version = params
@@ -1230,7 +1481,7 @@ pub fn handle_request(req: &Value, default_db: &Path, client_version: &mut Optio
                     "title": "GroveFS view governance",
                     "version": env!("CARGO_PKG_VERSION"),
                 },
-                "instructions": "Customize data listings by governing SERVER-SIDE views over one store. If the server was started with `--require-api-key`, pass your credential as `apiKey` (a `grovefs apikey create` key, format '<id>:<secret>') in the initialize params — the state-touching methods (tools/list, tools/call, resources/list, resources/read, completion/complete) are refused until it authenticates, and every call is logged against your key. Discover: list_views (all slots) and get_view (one slot's exact rules). Explore/preview shape: list_view_tree renders a view's real directory listing — or a base+rules lens SIMULATED before you commit it — so you use exact display paths instead of guessing. Reshape: define_derived_view (hide/only/map/link rules, read-only lenses hot-reloaded into live meta-server mounts), alias_view (public writable names), remove_view. Validate before publishing: preview_rules (dry-run a rules text's verb syntax) and validate_definition (dry-run a whole name+base+rules against every governance guard, writing nothing). Beyond tools, the same governance is exposed as MCP RESOURCES (grovefs://view/<name>/definition and /tree, read via resources/read), PROMPTS (reshape-view and rotate-alias playbooks via prompts/get), and COMPLETION (completion/complete fills a view-name argument from the store); set a threshold with logging/setLevel to receive notifications/message frames per call. Rule paths are absolute view-tree paths; a base line inside rules is rejected. Introspection is metadata-only over a LOCAL store: it never mounts and reads no data bytes.",
+                "instructions": "Customize data listings by governing SERVER-SIDE views over one store. If the server was started with `--require-api-key`, pass your credential as `apiKey` (a `grovefs apikey create` key, format '<id>:<secret>') in the initialize params — the state-touching methods (tools/list, tools/call, resources/list, resources/read, completion/complete) are refused until it authenticates, and every call is logged against your key. Discover: list_views (all slots) and get_view (one slot's exact rules). Explore/preview shape: list_view_tree renders a view's real directory listing — or a base+rules lens SIMULATED before you commit it — so you use exact display paths instead of guessing. Reshape: define_derived_view (hide/only/map/link rules, read-only lenses hot-reloaded into live meta-server mounts), alias_view (public writable names), remove_view. Validate before publishing: preview_rules (dry-run a rules text's verb syntax) and validate_definition (dry-run a whole name+base+rules against every governance guard, writing nothing). Beyond tools, the same governance is exposed as MCP RESOURCES (grovefs://view/<name>/definition and /tree, read via resources/read), PROMPTS (reshape-view and rotate-alias playbooks via prompts/get), and COMPLETION (completion/complete fills a view-name argument from the store); set a threshold with logging/setLevel to receive notifications/message frames per call. Rule paths are absolute view-tree paths; a base line inside rules is rejected. Introspection is metadata-only over a LOCAL store: it never mounts and reads no data bytes, so a rendered tree reports the metadata `size` field rather than byte counts (dirs 4096, files 0, symlinks their target length) — stat through a mount if you need real sizes.",
             })
         }
         "ping" => json!({}),
@@ -1255,8 +1506,9 @@ pub fn handle_request(req: &Value, default_db: &Path, client_version: &mut Optio
             let uri = match params.get("uri").and_then(|u| u.as_str()) {
                 Some(u) => u,
                 None => {
-                    return id
-                        .map(|id| error_frame(id, -32602, "resources/read requires a 'uri'".into()))
+                    return id.map(|id| {
+                        error_frame(id, -32602, "resources/read requires a 'uri'".into())
+                    })
                 }
             };
             match read_resource(default_db, uri) {
@@ -1297,9 +1549,7 @@ pub fn handle_request(req: &Value, default_db: &Path, client_version: &mut Optio
         }
         // Anything else: method-not-found only when an id was present (a real
         // request); a bare unknown notification stays silent.
-        _ => {
-            return id.map(|id| error_frame(id, -32601, format!("method not found: {method}")))
-        }
+        _ => return id.map(|id| error_frame(id, -32601, format!("method not found: {method}"))),
     };
     id.map(|id| result_frame(id, result))
 }
@@ -1340,7 +1590,10 @@ fn call_outcome(resp: &Option<Value>) -> (bool, String) {
             if let Some(err) = v.get("error") {
                 (false, clip(err["message"].as_str().unwrap_or("error")))
             } else if v["result"]["isError"].as_bool().unwrap_or(false) {
-                (false, clip(v["result"]["content"][0]["text"].as_str().unwrap_or("")))
+                (
+                    false,
+                    clip(v["result"]["content"][0]["text"].as_str().unwrap_or("")),
+                )
             } else {
                 (true, String::new())
             }
@@ -1384,8 +1637,16 @@ fn is_loggable_call(method: &str) -> bool {
 /// requested URI for a `resources/read`, else empty.
 fn audit_subject(method: &str, params: &Value) -> String {
     match method {
-        "tools/call" => params.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string(),
-        "resources/read" => params.get("uri").and_then(|u| u.as_str()).unwrap_or("").to_string(),
+        "tools/call" => params
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "resources/read" => params
+            .get("uri")
+            .and_then(|u| u.as_str())
+            .unwrap_or("")
+            .to_string(),
         _ => String::new(),
     }
 }
@@ -1503,7 +1764,13 @@ impl Session {
         if self.require_key && gated && self.authed.is_none() {
             if let Some(s) = &self.store {
                 let subject = audit_subject(method, &params);
-                let _ = s.log_call(None, method, &subject, false, "unauthorized: no valid api key");
+                let _ = s.log_call(
+                    None,
+                    method,
+                    &subject,
+                    false,
+                    "unauthorized: no valid api key",
+                );
             }
             let msg = "authentication required: present a valid apiKey in the initialize params (or export GROVEFS_MCP_API_KEY for the server)";
             return id.map(|id| error_frame(id, -32001, msg.to_string()));
@@ -1652,17 +1919,27 @@ mod tests {
 
     #[test]
     fn notifications_are_never_answered() {
-        assert!(
-            ask(&json!({"jsonrpc":"2.0","method":"notifications/initialized"}), Path::new("/")).is_none()
-        );
+        assert!(ask(
+            &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            Path::new("/")
+        )
+        .is_none());
         // A request (with id) for an unknown method gets method-not-found.
-        let r = ask(&json!({"jsonrpc":"2.0","id":2,"method":"foo/bar"}), Path::new("/")).unwrap();
+        let r = ask(
+            &json!({"jsonrpc":"2.0","id":2,"method":"foo/bar"}),
+            Path::new("/"),
+        )
+        .unwrap();
         assert_eq!(r["error"]["code"], -32601);
     }
 
     #[test]
-    fn tools_list_advertises_the_eight_governance_tools() {
-        let r = ask(&json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}), Path::new("/")).unwrap();
+    fn tools_list_advertises_the_nine_governance_tools() {
+        let r = ask(
+            &json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}),
+            Path::new("/"),
+        )
+        .unwrap();
         let names: Vec<&str> = r["result"]["tools"]
             .as_array()
             .unwrap()
@@ -1675,6 +1952,7 @@ mod tests {
                 "list_views",
                 "define_derived_view",
                 "alias_view",
+                "fork_view",
                 "remove_view",
                 "preview_rules",
                 "validate_definition",
@@ -1702,7 +1980,10 @@ mod tests {
             .unwrap()
         };
         let text = |v: &Value| -> String {
-            v["result"]["content"][0]["text"].as_str().unwrap().to_string()
+            v["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_string()
         };
         // preview: a bad rule never lands, with line-accurate parser errors.
         let bad = call(10, "preview_rules", json!({"rules": "bogber /x"}));
@@ -1713,7 +1994,9 @@ mod tests {
             "define_derived_view",
             json!({"name": "docsonly", "base": "team", "rules": "# cut\nonly /docs"}),
         );
-        assert!(text(&d).contains("defined derived view 'docsonly' over base 'team': 0 hide, 1 only, 0 reloc rule(s)"));
+        assert!(text(&d).contains(
+            "defined derived view 'docsonly' over base 'team': 0 hide, 1 only, 0 reloc rule(s)"
+        ));
         assert!(home.join("meta/views/docsonly.layout").is_file());
         // name == base is the same refusal the CLI prints.
         let same = call(
@@ -1748,11 +2031,7 @@ mod tests {
         assert_eq!(vv["base_view_db_present"], true);
         assert!(!home.join("meta/views/newsafe.layout").exists());
         // alias, then list sees BOTH governance shapes plus the physical tree.
-        let a = call(
-            13,
-            "alias_view",
-            json!({"name": "public", "real": "team"}),
-        );
+        let a = call(13, "alias_view", json!({"name": "public", "real": "team"}));
         assert!(text(&a).contains("defined pure alias 'public' -> real view 'team'"));
         let l = call(14, "list_views", json!({}));
         let parsed: Value = serde_json::from_str(&text(&l)).unwrap();
@@ -1767,7 +2046,9 @@ mod tests {
             "alias_view",
             json!({"name": "public2", "real": "team", "retire": "public"}),
         );
-        assert!(text(&rot).contains("rotated public name for real view 'team': 'public' -> 'public2'"));
+        assert!(
+            text(&rot).contains("rotated public name for real view 'team': 'public' -> 'public2'")
+        );
         assert!(!home.join("meta/views/public.layout").exists());
         // remove both definitions; data (team.db) untouched.
         for (i, n) in [(16, "docsonly"), (17, "public2")] {
@@ -1778,6 +2059,89 @@ mod tests {
         let gone = call(18, "remove_view", json!({"name": "docsonly"}));
         assert_eq!(gone["result"]["isError"], true);
         assert!(text(&gone).starts_with("no view definition 'docsonly' under"));
+    }
+
+    /// A fork is created, listed, described, protected from aliasing and
+    /// removed THROUGH THE TOOLS (the same ops the CLI drives), and its own
+    /// tree disappears on removal while the base tree survives.
+    #[test]
+    fn fork_lifecycle_over_tool_calls() {
+        let home = db();
+        std::fs::create_dir_all(home.join("meta")).unwrap();
+        {
+            let m = MetaEngine::open(&home.join("meta/base.db")).unwrap();
+            let d = m
+                .create_node(ROOT_INO, "docs", true, None, 0o0755, 0, 0)
+                .unwrap();
+            m.create_node(d, "a.md", false, Some("k-a"), 0o0644, 0, 0)
+                .unwrap();
+        }
+        let call = |id: i64, name: &str, args: Value| {
+            ask(
+                &json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+                        "params":{"name":name,"arguments":args}}),
+                &home,
+            )
+            .unwrap()
+        };
+        let text = |v: &Value| -> String {
+            v["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        // A missing base tree is refused with the honest PG caveat.
+        let nob = call(30, "fork_view", json!({"name": "lab", "base": "ghost"}));
+        assert_eq!(nob["result"]["isError"], true);
+        assert!(text(&nob).contains("no physical base tree"));
+        assert!(text(&nob).contains("PostgreSQL"));
+        // Fork the real tree: 3 entries (root+docs+a.md), 1 shared blob.
+        let f = call(31, "fork_view", json!({"name": "lab", "base": "base"}));
+        assert!(
+            text(&f).contains("forked view 'lab' from base 'base': 3 entries, 1 shared object(s)")
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.join("meta/views/lab.layout")).unwrap(),
+            "fork base\n"
+        );
+        assert!(home.join("meta/lab.db").is_file());
+        // list_views reports the fork beside the physical trees (incl. its own).
+        let l = call(32, "list_views", json!({}));
+        let parsed: Value = serde_json::from_str(&text(&l)).unwrap();
+        assert_eq!(parsed["physical"], json!(["base", "lab"]));
+        assert_eq!(parsed["defined"][0]["name"], "lab");
+        assert_eq!(parsed["defined"][0]["kind"], "fork");
+        assert_eq!(parsed["defined"][0]["real_view"], "base");
+        // describe_view spells out the mount semantics and the own tree.
+        let d = call(33, "get_view", json!({"name": "lab"}));
+        let dv: Value = serde_json::from_str(&text(&d)).unwrap();
+        assert_eq!(dv["kind"], "fork");
+        assert_eq!(dv["own_tree"], "meta/lab.db");
+        assert!(dv["mount"].as_str().unwrap().contains("content read-only"));
+        // A fork is a tree identity, not a public name: aliasing it is refused.
+        let a = call(34, "alias_view", json!({"name": "pub", "real": "lab"}));
+        assert_eq!(a["result"]["isError"], true);
+        assert!(text(&a).contains("is a fork"));
+        // A GOVERNED base name cannot be forked: 'lens' resolves through a
+        // definition, and `base` without a definition still forks fine.
+        let dv2 = call(
+            35,
+            "define_derived_view",
+            json!({"name": "lens", "base": "base", "rules": "only /docs"}),
+        );
+        assert!(text(&dv2).contains("defined derived view 'lens' over base 'base'"));
+        let f2 = call(36, "fork_view", json!({"name": "lab2", "base": "lens"}));
+        assert_eq!(f2["result"]["isError"], true);
+        assert!(text(&f2).contains("is governed by a definition"));
+        // Re-forking an existing name is refused before any tree is copied.
+        let f3 = call(37, "fork_view", json!({"name": "lab", "base": "base"}));
+        assert_eq!(f3["result"]["isError"], true);
+        assert!(text(&f3).contains("already has a definition"));
+        // Removing the fork deletes its tree; the base tree stays.
+        let r = call(38, "remove_view", json!({"name": "lab"}));
+        assert!(text(&r).contains("removed fork view 'lab' of base 'base'"));
+        assert!(!home.join("meta/lab.db").exists());
+        assert!(home.join("meta/base.db").is_file());
     }
 
     #[test]
@@ -1805,7 +2169,9 @@ mod tests {
         // /photos/private/x.jpg.
         {
             let m = MetaEngine::open(&home.join("meta/team.db")).unwrap();
-            let docs = m.create_node(ROOT_INO, "docs", true, None, 0o0755, 0, 0).unwrap();
+            let docs = m
+                .create_node(ROOT_INO, "docs", true, None, 0o0755, 0, 0)
+                .unwrap();
             m.create_node(docs, "a.md", false, Some("k-docs-a"), 0o0644, 0, 0)
                 .unwrap();
             let photos = m
@@ -1815,6 +2181,8 @@ mod tests {
                 .create_node(photos, "private", true, None, 0o0755, 0, 0)
                 .unwrap();
             m.create_node(priv_, "x.jpg", false, Some("k-priv-x"), 0o0644, 0, 0)
+                .unwrap();
+            m.create_symlink(ROOT_INO, "latest", "/docs/a.md", 0, 0)
                 .unwrap();
         }
         let call = |id: i64, name: &str, args: Value| {
@@ -1826,7 +2194,10 @@ mod tests {
             .unwrap()
         };
         let text = |v: &Value| -> String {
-            v["result"]["content"][0]["text"].as_str().unwrap().to_string()
+            v["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_string()
         };
         let paths = |v: &Value| -> Vec<String> {
             serde_json::from_str::<Value>(&text(v)).unwrap()["entries"]
@@ -1860,8 +2231,8 @@ mod tests {
         let shown = paths(&lens);
         assert!(shown.contains(&"/photos".to_string()));
         assert!(!shown.contains(&"/photos/private".to_string())); // pruned by the rule
-        // (3) SIMULATE an uncommitted lens — preview the effect without writing
-        // any definition (no `safe2.layout` is created).
+                                                                  // (3) SIMULATE an uncommitted lens — preview the effect without writing
+                                                                  // any definition (no `safe2.layout` is created).
         let sim = call(
             23,
             "list_view_tree",
@@ -1878,13 +2249,33 @@ mod tests {
         let pg: Value = serde_json::from_str(&text(&g)).unwrap();
         assert_eq!(pg["kind"], "derived");
         assert_eq!(pg["base"], "team");
-        assert!(pg["definition"].as_str().unwrap().contains("hide /photos/private"));
+        assert!(pg["definition"]
+            .as_str()
+            .unwrap()
+            .contains("hide /photos/private"));
         // (5) a real listing under an alias resolves to the FULL real tree.
         call(25, "alias_view", json!({"name": "pub", "real": "team"}));
         let a = call(26, "list_view_tree", json!({"view": "pub", "depth": 10}));
         let pa: Value = serde_json::from_str(&text(&a)).unwrap();
         assert_eq!(pa["kind"], "alias");
         assert!(paths(&a).contains(&"/photos/private/x.jpg".to_string()));
+        // (6) `size` is the METADATA field, not a byte count — the tool contract
+        // now says so explicitly, and this pins it: a dir carries the stat
+        // placeholder 4096, a file 0, a symlink its target text length. A change
+        // here (e.g. a real-bytes walk) must update that self-description too.
+        let size_of = |p: &str, kind: &str| -> u64 {
+            parsed["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["path"] == p && e["kind"] == kind)
+                .unwrap_or_else(|| panic!("no {kind} entry '{p}' in {parsed}"))["size"]
+                .as_u64()
+                .unwrap()
+        };
+        assert_eq!(size_of("/docs", "dir"), 4096);
+        assert_eq!(size_of("/docs/a.md", "file"), 0);
+        assert_eq!(size_of("/latest", "link"), "/docs/a.md".len() as u64);
     }
 
     #[test]
@@ -1955,11 +2346,16 @@ mod tests {
         assert!(home.join("meta/views/docs.layout").is_file());
 
         let calls = store.recent_calls(50).unwrap();
-        let define = calls.iter().find(|c| c.tool == "define_derived_view").unwrap();
+        let define = calls
+            .iter()
+            .find(|c| c.tool == "define_derived_view")
+            .unwrap();
         assert!(define.ok);
         assert_eq!(define.key_label.as_deref(), Some("agent-a"));
         // the refused tools/list and the bad-key initialize are BOTH auditable.
-        assert!(calls.iter().any(|c| !c.ok && c.detail.contains("unauthorized")));
+        assert!(calls
+            .iter()
+            .any(|c| !c.ok && c.detail.contains("unauthorized")));
         assert!(calls
             .iter()
             .any(|c| c.method == "initialize" && !c.ok && c.detail.contains("unknown api key id")));
@@ -1993,8 +2389,11 @@ mod tests {
         // A physical view backed by a real engine tree, plus a derived definition.
         {
             let m = MetaEngine::open(&home.join("meta/team.db")).unwrap();
-            let docs = m.create_node(ROOT_INO, "docs", true, None, 0o0755, 0, 0).unwrap();
-            m.create_node(docs, "a.md", false, Some("k-a"), 0o0644, 0, 0).unwrap();
+            let docs = m
+                .create_node(ROOT_INO, "docs", true, None, 0o0755, 0, 0)
+                .unwrap();
+            m.create_node(docs, "a.md", false, Some("k-a"), 0o0644, 0, 0)
+                .unwrap();
         }
         std::fs::write(
             home.join("meta/views/release.layout"),
@@ -2002,7 +2401,11 @@ mod tests {
         )
         .unwrap();
 
-        let list = ask(&json!({"jsonrpc":"2.0","id":1,"method":"resources/list"}), &home).unwrap();
+        let list = ask(
+            &json!({"jsonrpc":"2.0","id":1,"method":"resources/list"}),
+            &home,
+        )
+        .unwrap();
         let uris: Vec<&str> = list["result"]["resources"]
             .as_array()
             .unwrap()
@@ -2013,10 +2416,18 @@ mod tests {
         assert!(uris.contains(&"grovefs://view/release/definition"));
         assert!(uris.contains(&"grovefs://view/release/tree"));
 
-        let tmpl =
-            ask(&json!({"jsonrpc":"2.0","id":2,"method":"resources/templates/list"}), &home)
-                .unwrap();
-        assert_eq!(tmpl["result"]["resourceTemplates"].as_array().unwrap().len(), 2);
+        let tmpl = ask(
+            &json!({"jsonrpc":"2.0","id":2,"method":"resources/templates/list"}),
+            &home,
+        )
+        .unwrap();
+        assert_eq!(
+            tmpl["result"]["resourceTemplates"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
 
         // The definition resource mirrors get_view (carries the verbatim rule).
         let def = ask(
@@ -2070,7 +2481,11 @@ mod tests {
         )
         .unwrap();
 
-        let pl = ask(&json!({"jsonrpc":"2.0","id":1,"method":"prompts/list"}), &home).unwrap();
+        let pl = ask(
+            &json!({"jsonrpc":"2.0","id":1,"method":"prompts/list"}),
+            &home,
+        )
+        .unwrap();
         let names: Vec<&str> = pl["result"]["prompts"]
             .as_array()
             .unwrap()
@@ -2085,8 +2500,14 @@ mod tests {
             &home,
         )
         .unwrap();
-        let msg = pg["result"]["messages"][0]["content"]["text"].as_str().unwrap();
-        assert!(msg.contains("'team'") && msg.contains("drop privates") && msg.contains("validate_definition"));
+        let msg = pg["result"]["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(
+            msg.contains("'team'")
+                && msg.contains("drop privates")
+                && msg.contains("validate_definition")
+        );
 
         // A missing required argument is a protocol error.
         let perr = ask(
@@ -2121,7 +2542,13 @@ mod tests {
             &home,
         )
         .unwrap();
-        assert_eq!(c2["result"]["completion"]["values"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            c2["result"]["completion"]["values"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
     }
 
     #[test]

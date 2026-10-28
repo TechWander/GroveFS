@@ -53,7 +53,11 @@ impl Rng {
 
 fn tmpdb(seed: u64) -> PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("grovefs_govprop_{}_{}.db", std::process::id(), seed));
+    p.push(format!(
+        "grovefs_govprop_{}_{}.db",
+        std::process::id(),
+        seed
+    ));
     let _ = std::fs::remove_file(&p);
     let _ = std::fs::remove_file(format!("{}-wal", p.display()));
     let _ = std::fs::remove_file(format!("{}-shm", p.display()));
