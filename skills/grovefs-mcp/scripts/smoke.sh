@@ -16,8 +16,13 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 CALL="$HERE/mcp_call.py"
 BIN=${GROVEFS_BIN:-}
 [ -n "$BIN" ] || { command -v grovefs >/dev/null 2>&1 && BIN=grovefs; }
-[ -n "$BIN" ] || BIN=./target/release/grovefs
-[ -x "$BIN" ] || { echo "no grovefs binary (set GROVEFS_BIN)"; exit 1; }
+if [ -z "$BIN" ]; then
+    # The skill lives at <repo>/skills/grovefs-mcp, but accept any nesting depth.
+    for cand in ../../target/release/grovefs ../../../target/release/grovefs ./target/release/grovefs; do
+        [ -x "$cand" ] && { BIN="$cand"; break; }
+    done
+fi
+[ -n "$BIN" ] || { echo "no grovefs binary (set GROVEFS_BIN)"; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "python3 required"; exit 1; }
 
 TMP="$(mktemp -d)"

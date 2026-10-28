@@ -226,7 +226,13 @@ rules), the derived view (the same lens rules but centrally defined and
 server-rendered, read-only), the alias (pure name governance with atomic
 rotation), and import (zero-copy onboarding). They compose: an imported tree
 can be a relocation source, a derived view can be layered over an alias, and a
-per-mount lens sits above any metadata backend.
+per-mount lens sits above any metadata backend. A fifth, complementary
+primitive---the fork view---provides an organisation sandbox that copies
+namespace rows while sharing bytes; it is presented separately because it
+deliberately lies outside the translation core. A sixth mechanism, per-view
+metadata export and import (Sec.~\ref{sec:portability}), is orthogonal in kind:
+it \emph{moves} a tree between stores instead of reshaping it, and it is
+possible at all because the row format carries no location.
 
 \section{Design Overview}
 \label{sec:design}
@@ -275,6 +281,29 @@ ordering. After a successful write the server pushes
 \texttt{inval\_entry} and \texttt{inval\_inode} events to the view's other
 subscribers, referencing source inodes, so a peer's change is visible on the
 next lookup without polling; a zero-cache strict mode is offered as a fallback.
+
+\paragraph{Access control.} Authority over a tree is separated from the
+governance layer that shapes it, and is exercised entirely on the open handshake
+of both planes (\texttt{meta-server} \texttt{M\_OPEN}, \texttt{data-server}
+\texttt{OP\_OPEN}). A shared cluster token admits a host to the whole store (an
+empty token is LAN-trusted); optionally a per-caller API key, required by
+\texttt{--require-api-key} and kept only as SHA-256 digests in a local
+control-plane SQLite registry, replaces that coarse gate with revocable,
+auditable credentials. Each key then carries two orthogonal access dimensions
+in place of any per-user permission table: \texttt{--view} binds it to a single
+physical view (checked after alias resolution, so a grant written for the real
+name still holds through a rotated alias), and \texttt{--ro} makes it read-only,
+every write-intent operation---advisory locks included---refused at the
+authoritative per-op gate even against a client that mounted writable. The
+outcome codes stay distinct from data faults: admission failure is
+\texttt{E\_AUTH}, a read-only key's write is \texttt{E\_NOTPERM} (\texttt{EPERM}
+at FUSE, content writes \texttt{EROFS}), and the standby's failover signal
+\texttt{E\_ROFS} is kept apart so a client fails over rather than reading it as
+a denial. Crucially the presenting \texttt{uid} never gates access: it is
+advisory (a TCP client can spoof it), recorded only as the lock/audit owner via
+\texttt{geteuid()} or an \texttt{--as-uid} override. Display lenses and derived
+views are customisation, not a security boundary; hard isolation is always the
+view plus its token or key.
 
 \paragraph{Orthogonality.} Placement, striping, replication/HA and concurrency
 are separate concerns the governance layer neither assumes nor forecloses; the
@@ -419,10 +448,40 @@ writable tree, while the governed real name ceases to be a mount entry point
 so the storage identity is not exposed and guessing it grants no access.
 When a public name leaks, \texttt{--retire} rotates it in one atomic step: the
 old name stops resolving, the real name remains refused throughout (no gap
-where it becomes mountable), and prior grants carry over because view ACL is
-evaluated on the real name, so a single authorisation covers the alias and the
-base together. Alias chains and derived-view targets are refused, and import
+where it becomes mountable), and prior grants carry over because a mount key's
+\texttt{--view} binding is evaluated on the resolved real name, so one credential
+covers the alias and the base together. Alias chains and derived-view targets are refused, and import
 rejects an alias as a target (an alias is not a storage identity).
+
+\subsection{Fork Views (organisation sandbox over shared bytes)}
+A further request cannot be met by a read-only projection: a consumer must
+\emph{organise} a tree---rename, regroup, prune---while contributing no new
+content and never endangering the base. \texttt{view fork --name \textless v\textgreater{} --base \textless b\textgreater{}}
+copies the base's directory entries into an independent per-view metadata
+database, preserving inode numbers and hard-link structure while copying no
+bytes; its definition is the single line \texttt{fork \textless b\textgreater{}}. The two trees
+then evolve independently: names added to the base afterwards are not injected
+into an existing fork. Mounting a fork permits structural mutation
+(empty-object creation, \texttt{mkdir}, \texttt{rename}, \texttt{unlink},
+\texttt{symlink}, \texttt{link} and attribute updates) and refuses every
+content write (\texttt{write}, \texttt{truncate}) with \texttt{EROFS}. The
+split is enforced at the client from the open handshake (a third status byte
+in \texttt{M\_OPEN}, beside the derived-read-only and paging flags), so it
+holds on both the local and the \texttt{meta-server} path; like the derived
+read-only contract it is a client-side gate, with the cluster token and
+revocable API keys remaining the hard boundary. Because a fork owns its tree,
+deleting a name inside it drops only that view's directory row, and a shared
+object is physically reclaimed only when a cross-view holder ledger shows that
+no view---base or fork---still names it; \texttt{view rm} on a fork removes
+its tree and rebuilds the ledger, leaving the base and its bytes untouched.
+Fork creation is deliberately outside the source-path-translation core: it
+duplicates \emph{namespace rows} (never bytes) into a separate store, so it is
+a snapshot primitive rather than a projection, and Lemma~\ref{lem:derived}
+is unaffected---a derived view still cannot be forked, and a fork cannot serve
+as a base. Guards: the base must be a local SQLite physical view with no
+definition of its own (PostgreSQL cannot be forked, as its authority does not
+live in a file), the fork name must differ from its base, and an alias may not
+target a fork (a fork is a tree identity, not a public name).
 
 \subsection{Zero-Copy Import (onboarding)}\label{sec:import}
 Pre-existing data already on disk is registered into a view with
@@ -436,6 +495,48 @@ skipped); deleting a name inside the view only unlinks the \texttt{blocks/}
 reference and never harms the source. An imported tree can itself be a
 relocation source or a derived-view base, composing the onboarding primitive
 with the visibility/shape ones.
+
+\subsection{Metadata Portability and Per-View Migration}\label{sec:portability}
+The primitives above reshape a namespace in place. Relocating a tree to another
+machine or another operating system is a different axis, and here the store
+design turns it into a file operation, because no metadata row denotes a
+location: a file's row holds a content \emph{key} (\texttt{data\_ref}) and the
+physical path of an object follows from that key alone
+(\texttt{blocks/\textless FNV-1a prefix\textgreater/\textless key\textgreater}), while the inode number is
+GroveFS's own, allocated inside the database. The row format stores no absolute
+path, device id, hostname or host inode, so there is nothing to invalidate on
+the trip and a view's tree travels as a namespace-sized file.
+\texttt{view export --view \textless v\textgreater{} --out F} writes line-delimited JSON---a header
+(format tag, version, tree kind, the definition text, node and distinct-blob
+counts) plus one row per node carrying id, parent, name, inode,
+\texttt{data\_ref}, symlink target, mode, owner and three timestamps---and
+\texttt{view import --view \textless v\textgreater{} --in F} rebuilds that tree as a physical view in
+another store. Identifiers are replayed rather than reallocated, so two names
+over one inode arrive as two names over one inode. Content is deliberately
+absent from the file and is carried by an ordinary \texttt{rsync -a -H} of
+\texttt{blocks/}; the cost of a migration is therefore set by the size of the
+namespace, not by the volume of data (measured in Sec.~\ref{sec:eval}). Export
+reads through the same engine a mount uses and is legal while the view is
+mounted, as a snapshot read over the row set; virtual names are refused, since
+an alias or a derived view owns no rows of its own.
+
+Import is atomic with respect to malformed input. The tree is built first in a
+scratch file beside the destination, every row, parent reference, root identity
+and header count is validated, the write-ahead log is merged into the file, and
+only then is it renamed into place; a corrupt export, a count mismatch or a
+rejected \texttt{--replace} therefore leaves the previously installed tree intact
+and leaves no scratch behind. An occupied definition slot must be released
+first, replacing an existing tree takes an explicit \texttt{--replace}, and the
+cross-view holder ledger is rebuilt on success. That rebuild is what allows a
+fork to be relocated with \texttt{--as-fork \textless b\textgreater{}}: the imported tree keeps the
+content-\texttt{EROFS} contract and continues to share the base's objects
+instead of silently becoming an independently writable copy. Two boundaries are
+part of the contract rather than implementation details: a live SQLite database
+must not be hot-copied, since committed rows may still sit in its WAL, so a
+deployment that cannot be paused snapshots with \texttt{.backup} or
+\texttt{VACUUM INTO}; and a PostgreSQL-backed view is relocated with
+PostgreSQL's own logical dump, as its authority is not a file
+(Sec.~\ref{sec:impl}).
 
 %% ================================================================== 5 (core)
 \section{Governance Invariants and Correctness}
@@ -518,8 +619,8 @@ An alias maps a public name $a$ one-to-one onto a physical view $V$ (its
 definition is a single line $\mathit{alias}\ V$). Mounting $a$ yields the full
 writable view of $V$; once governed, the real name $V$ is not a mount entry
 point, since both the local resolver and the metadata service refuse it.
-$\mathit{ACL}$ is evaluated on the real name, so one grant covers $V$ and
-every alias at once, and $\mathit{retire}(a\!\to\!a')$ rotates the public
+A mount key's \texttt{--view} binding is evaluated on the resolved real name, so
+one credential covers $V$ and every alias at once, and $\mathit{retire}(a\!\to\!a')$ rotates the public
 name atomically with prior grants carrying over.
 \end{definition}
 
@@ -713,7 +814,8 @@ Sec.~\ref{sec:eval}.
 %% ================================================================== 6-10 stub
 \section{Implementation}
 \label{sec:impl}
-GroveFS is \textasciitilde17k lines of Rust. The lens, remote service and
+GroveFS is \textasciitilde21.5k lines of Rust under \texttt{src/} (a further
+\textasciitilde2.8k in integration tests). The lens, remote service and
 storage backends are each a module behind the two trait seams
 (Figure~\ref{fig:arch}, sizes in Table~\ref{tab:loc}); we summarise the parts
 that matter to the correctness claims. A governed write resolves the display
@@ -757,7 +859,10 @@ fast mutex; reads fan out over a bounded pool (size four) of connections that,
 while opened read-write to satisfy WAL shared-memory requirements, are only ever
 used for \texttt{SELECT}. Advisory locks live in a leased table keyed on real
 inodes, renewed by a heartbeat and backed by a 15\,s lease for holders that die
-without releasing.
+without releasing. The same table is the source of the portable form used for
+migration (Sec.~\ref{sec:portability}): a whole-view row dump read through this
+engine, with identifiers replayed unchanged on the way back in so that hard-link
+structure survives the trip.
 
 \paragraph{PostgreSQL backend.} The metadata service can instead treat
 PostgreSQL as the authoritative store (schema-per-view, transactional
@@ -777,15 +882,22 @@ error to POSIX callers. Non-conflicting writes on distinct parents commit fully
 in parallel, and the hard-link reference-count read lives inside the DELETE
 transaction, so concurrent unlink of two sibling names cannot double-GC. In this mode the
 self-contained HA snapshot replication is intentionally disabled in favour of
-PostgreSQL's own replication, and the per-view ACL whitelist migrates into a
-shared \texttt{grovefs\_acl.view\_acl} table so that a single \texttt{pg\_dump}
-and one replication timeline cover the entire metadata plane.
+PostgreSQL's own replication: each view's tree becomes its own
+\texttt{grovefs\_v\_\textless hex\textgreater} schema and the cross-view holder
+ledger a shared \texttt{grovefs\_refs} schema, so a single \texttt{pg\_dump} and
+one replication timeline cover the entire authoritative metadata plane---while
+the API-key registry deliberately stays a local control-plane SQLite store
+(\texttt{api\_keys.db}) and does not migrate into PostgreSQL. Per-view
+export/import sits on the same boundary: it is a file-tree path, so a
+PostgreSQL-backed view moves with PostgreSQL's own logical dump rather than in
+the line-delimited form.
 
 \paragraph{Transport and resilience.} Remote mounts speak a custom fixed-header
 binary frame protocol over TCP (not NFS or gRPC) through a connection pool; the
 data path chunks large IO and can stripe across several data-servers. A client
 reconnects with bounded backoff, and the pools are drained and rebuilt after a
-server restart. Access is guarded by two-sided tokens; a standby signals
+server restart. Access is guarded by two-sided tokens on both planes and,
+optionally, a per-caller API key; a standby signals
 failover with a dedicated read-only status code kept distinct from a permission
 denial and from data errors.
 
@@ -793,16 +905,17 @@ denial and from data errors.
 as a server an AI agent can drive: \texttt{grovefs mcp} speaks line-delimited
 JSON-RPC~2.0 over stdio, implementing the common method surface of the
 Model Context Protocol (MCP) 2025-06-18 revision---lifecycle
-(\texttt{initialize}/\texttt{ping}), tools (\texttt{tools/list}/\texttt{tools/call}),
-resources (\texttt{resources/list}, \texttt{resources/templates/list},
-\texttt{resources/read}), prompts (\texttt{prompts/list}/\texttt{prompts/get}),
-argument completion (\texttt{completion/complete}), and logging
-(\texttt{logging/setLevel} answered by server-initiated
-\texttt{notifications/message} frames); id-less client notifications are
-accepted but never answered. The protocol is a hand-rolled dispatch loop, not a
+(\texttt{initialize}, \texttt{ping}), tools (\texttt{tools/}\allowbreak\texttt{list},
+\texttt{tools/}\allowbreak\texttt{call}), resources (\texttt{resources/list},
+\texttt{resources/templates/}\allowbreak\texttt{list}, \texttt{resources/read}),
+prompts (\texttt{prompts/}\allowbreak\texttt{list}, \texttt{prompts/}\allowbreak\texttt{get}),
+completion of arguments (\texttt{completion/}\allowbreak\texttt{complete}) and logging
+(\texttt{logging/}\allowbreak\texttt{setLevel}, answered by server-initiated
+\texttt{notifications/}\allowbreak\texttt{message} frames); id-less client
+notifications are accepted but never answered. The protocol is a hand-rolled dispatch loop, not a
 framework binding. Its decisive property is that it is \emph{not a second
 implementation}: every method reuses the same crate functions that back the
-\texttt{grovefs view} CLI (the six governance and two read-only introspection
+\texttt{grovefs view} CLI (the seven governance and two read-only introspection
 tools), and the resource, prompt and completion surfaces render through the very
 same view-definition and listing renderers, so an agent cannot perform any
 operation the CLI cannot, bypass any governance guard, or observe a listing that
@@ -824,8 +937,8 @@ reveal or change per-view state---is appended to an audit log attributed to the
 key. Only SHA-256 digests of keys are stored, and revocation marks a key
 ineffective at once while retaining its historical rows. This gate authenticates
 callers of the governance interface; it is orthogonal to, and does not weaken,
-the mount/data admission enforced by tokens and the per-view ACL (I1--I4 are
-untouched). Governance failures return inside the result (\texttt{isError}) per
+the mount/data admission enforced by the cluster token and the per-caller API
+key (its view binding and read-only flag; I1--I4 are untouched). Governance failures return inside the result (\texttt{isError}) per
 MCP convention; only protocol-layer faults use JSON-RPC error codes.
 
 \begin{figure}[t]
@@ -860,14 +973,15 @@ pushed to peers (I3--I4).}
 \toprule
 Module & Responsibility & Lines \\
 \midrule
-\texttt{fs\_impl.rs}   & FUSE callbacks, init negotiation & $\sim$1.1k \\
-\texttt{meta.rs}       & local view tree, hardlinks, GC, locks & $\sim$1.7k \\
-\texttt{layout.rs}     & lens / derived / alias rendering & $\sim$1.2k \\
-\texttt{remote/meta.rs}& authoritative service, notify, HA & $\sim$3.2k \\
-\texttt{pg\_store.rs}   & PostgreSQL provider, SSI write pool & $\sim$1.5k \\
-\texttt{mcp.rs}        & agent MCP surface, shared governance renderers & $\sim$2.1k \\
-\texttt{apikeys.rs}    & API-key store, auth gate, call audit & $\sim$0.35k \\
-\texttt{backend/*}     & local / remote / sharded objects & $\sim$1.2k \\
+\texttt{fs\_impl.rs}   & FUSE callbacks, init negotiation & $\sim$1.6k \\
+\texttt{meta.rs}       & local view tree, hardlinks, GC, locks, export/import & $\sim$3.5k \\
+\texttt{layout.rs}     & lens / derived / alias rendering & $\sim$1.4k \\
+\texttt{remote/meta.rs}& authoritative service, notify, HA & $\sim$3.8k \\
+\texttt{pg\_store.rs}   & PostgreSQL provider, SSI write pool & $\sim$1.6k \\
+\texttt{mcp.rs}        & agent MCP surface, shared governance renderers & $\sim$2.6k \\
+\texttt{apikeys.rs}    & API-key store, auth gate, call audit & $\sim$0.66k \\
+\texttt{main.rs}       & CLI: view governance, mount and server entry points & $\sim$2.5k \\
+\texttt{backend/*}     & local / remote / sharded objects & $\sim$1.8k \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -1006,7 +1120,7 @@ exercises all four primitives over one authoritative store for the non-landing
 requirement.
 
 \paragraph{Agent entrance is the same contract (executed).} The
-\texttt{mcp} suite (42 assertions) drives the JSON-RPC server as an MCP client
+\texttt{mcp} suite (48 assertions) drives the JSON-RPC server as an MCP client
 would---\texttt{initialize} (checking the advertised capability surface),
 \texttt{tools/list}, \texttt{tools/call}, \texttt{resources/*},
 \texttt{prompts/*}, \texttt{completion/complete}, and
@@ -1017,7 +1131,7 @@ for the same operation, that a view read as a resource or rendered through
 subtree pruned, relocated entries homed under their display parent), and that
 protocol faults behave correctly (id-less notifications never answered, a
 malformed frame returns \texttt{-32700} and the server keeps serving, an unknown
-view resource returns \texttt{-32002}). The \texttt{apikey} suite (21 assertions)
+view resource returns \texttt{-32002}). The \texttt{apikey} suite (26 assertions)
 exercises the gate end-to-end: an unauthenticated \texttt{tools/list} is refused
 with \texttt{-32001} while \texttt{initialize} still answers, a presented key
 admits the session and attributes each logged call, a wrong secret is refused,
@@ -1026,6 +1140,43 @@ is persisted. Both suites are wired into \texttt{run\_all.sh} and are pure
 control-plane checks (they mount nothing on the MCP path), evidencing that the
 agent surface introduces no capability or guard the CLI entrance does not
 already enforce.
+
+\paragraph{Fork views (executed).} The \texttt{fork} suite (55 assertions)
+exercises the organisation sandbox on both metadata paths: creation and its
+guards, the bare base view listed beside the fork, key queries filtered by
+view, structural writes admitted while content writes and truncations return
+\texttt{EROFS} locally and through the \texttt{meta-server}, delete isolation
+with ledger-driven reclamation, and \texttt{view rm} removing the fork's tree
+while the base stays intact.
+
+\paragraph{Per-view metadata migration (executed).} Two properties matter here:
+that the exported file carries no host-dependent field, and that a tree rebuilt
+elsewhere is the same tree. The \texttt{migrate} suite (74 assertions) exports a
+view \emph{while it is mounted}, asserts that the file names the portable format
+and its version and contains no source store path, hostname or \texttt{blocks/}
+location, then copies only \texttt{blocks/} into a store at a \emph{different
+absolute path} and imports the metadata there. Mounted at the new path, the
+listing matches the source, a two-name hard link still reports one inode, the
+\texttt{640} mode and the owner survive, the symlink resolves, and the imported
+base view is writable again. Guards are asserted on both sides---a virtual name
+and a missing tree refused on export, no silent overwrite without
+\texttt{--force}; an occupied definition slot, an unknown format tag, a future
+version, a dangling parent and a header/body count mismatch each refused on
+import---including that a rejected \texttt{--replace} leaves the previously
+installed tree fully readable, the atomic-install path also being covered by a
+unit test. \texttt{--as-fork} is checked to restore the content-\texttt{EROFS}
+contract while a delete inside the relocated fork still leaves the base's object
+alive in the ledger, and several base views created in one store are confirmed
+to evolve independently. A scale run of the same path (\texttt{perf\_migrate\_scale.sh},
+one host, default IO) relocates a view of 5{,}052 nodes holding 5{,}000 objects
+in 50 directories: export takes 0.19\,s and produces a 1.16\,MB file
+(1.16$\times$ the size of the view database, $\sim$230\,B per node), import into a
+fresh store takes 0.56\,s including the ledger rebuild, and mounting the result
+enumerates all 5{,}000 files in 0.23\,s with byte-identical content and preserved
+mode and owner. Migration cost is thus set by the namespace, not the data
+volume: the 83\,s spent registering those 5{,}000 files into the source view
+(the per-object work of Sec.~\ref{sec:import}) never appears anywhere on the
+export/import path.
 
 \begin{table}[t]
 \caption{Expressiveness and correctness of view-governance mechanisms. The
@@ -1209,8 +1360,15 @@ Creating directly inside a synthesised directory is refused (\texttt{EPERM})
 since no source entry backs it; alias chains and derived-view alias targets are
 prohibited to keep name governance unambiguous; and the self-contained HA
 snapshot replication is disabled under the PostgreSQL backend,
-which supplies its own replication. Residual windows in witness-based HA fencing
-are out of scope for the control-plane results reported here.
+which supplies its own replication. Per-view export/import covers the
+file-backed (SQLite) trees only, and targets a stopped store: an
+administrator moving a live cluster still sequences the data-plane half
+(\texttt{blocks/}, or the object store's own replication) by hand, and the
+placement topology has to be preserved---the number and order of \texttt{--root}
+disks and, for striped references, the number and order of data-servers---since
+those are properties of where bytes live, not of the row format. Residual
+windows in witness-based HA fencing are out of scope for the control-plane
+results reported here.
 
 \section{Conclusion}
 We presented GroveFS, a control-plane treatment of multi-tenant, read-mostly
@@ -1228,7 +1386,10 @@ them. A self-contained harness
 hand stacks violate I1/I2/I4 while GroveFS satisfies the same assertions; for
 the driving astronomy workload it replays the ``non-landing data'' scenario
 end-to-end: one imported archive whose bytes never land as a copy, a
-centrally-governed read-only release view, and a gapless alias rotation.
+centrally-governed read-only release view, and a gapless alias rotation. Because
+no metadata row denotes a location, the same namespace also moves between
+stores as a file whose size follows the tree rather than the data
+(\texttt{view export}/\texttt{import}, measured at 5{,}052 nodes).
 
 All results are control-plane. The embedded backend makes no
 throughput or scalability claim; on the PostgreSQL backend we adopt the
