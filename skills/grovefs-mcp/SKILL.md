@@ -10,10 +10,14 @@ store has and what their trees actually look like, then publish / rotate /
 remove view definitions (read-only lenses, writable public aliases, standalone
 forks).
 
-**This entrance is the control plane**: it only writes
-`<db-path>/meta/views/*.layout` (a fork additionally writes `meta/<name>.db`
-and rebuilds the `refs.db` ledger). It **never mounts and never reads object
-bytes**. Mounting and data I/O belong to the CLI/ops plane, not here.
+**This entrance is the control plane**, and its home follows the metadata
+backend: on embedded SQLite it writes `<db-path>/meta/views/*.layout` (a fork
+additionally writes `meta/<name>.db` and rebuilds the `refs.db` ledger); when
+the server runs with `--store postgres://…` definitions write to the PG table
+`grovefs_control.view_defs` instead and nothing control-plane lands on local
+disk (fork is not implemented on PG — it refuses). It **never mounts and never
+reads object bytes**. Mounting and data I/O belong to the CLI/ops plane, not
+here.
 
 ## When to use this skill
 
@@ -37,6 +41,7 @@ stdin and come out on stdout:
 ```bash
 grovefs mcp --db-path <DB_PATH>          # metadata root (contains meta/ and meta/views/); falls back to --home
 grovefs mcp --db-path <DB_PATH> --require-api-key   # add the gate for multiple callers (see "Authentication")
+grovefs mcp --db-path <DB_PATH> --store postgres://user:pw@host:5432/db  # PG control plane (definitions/keys/audit in grovefs_control; env GROVEFS_STORE also works)
 ```
 
 MCP client configuration (the generic `mcpServers` shape; Claude Desktop and
@@ -102,11 +107,14 @@ bash scripts/smoke.sh
 | `preview_rules` | ★`rules` | Validates verb syntax only; errors carry line numbers |
 | `validate_definition` | ★`name` ★`base` ★`rules` | Runs a publish through the **entire governance guard set** before anything is written, returning the exact refusal text |
 
-Neither read-only probe touches data bytes: `list_view_tree` opens the local
-`<db-path>/meta/<view>.db` read-only and renders it through the same `LayoutMeta`
-lens a mount uses; `get_view` only reads the definition file's text.
-**Remote / PostgreSQL-backed trees are not walked** (`list_view_tree` needs a
-local `meta/<view>.db`).
+Neither read-only probe touches data bytes: `list_view_tree` opens the view's
+tree read-only **through the backend the server is bound to** — the local
+`<db-path>/meta/<view>.db` under `--db-path`, or the `grovefs_v_<hex>` PG
+schema under `--store postgres://…` — and renders it through the same
+`LayoutMeta` lens a mount uses; `get_view` only reads the definition's text.
+A tree the served store cannot reach is refused with the exact wording
+`no metadata tree for view 'X' … list_view_tree walks this store's own
+backend; a remote tree not reachable from here is not`.
 Because the walk only reads metadata and never asks the data plane for object
 lengths, the `size` in a response is **not a file size** (dirs `4096`, files `0`,
 symlinks report their target's character length); mount and `stat` for real bytes.
@@ -147,6 +155,24 @@ would produce, and **writes nothing**. Step 8 closes the feedback loop — the w
 is only done when the shape it displays matches intent; otherwise go back to
 step 4.
 
+**The derived shape does NOT have to resemble the base tree.** Only the `<src>`
+side is bound to the base's real display paths (step 3); `<dst>` paths are a
+brand-new display tree — unrelated directory names, depths, and grouping are
+normal. Verified semantics of the two re-pathing verbs:
+
+- `map <src> <dst>` **moves** the entry: it disappears from `<src>` (its
+  original directories may remain as empty scaffolds) and is served at `<dst>`
+  with its real bytes.
+- `link <src> <dst>` **keeps** `<src>` and adds `<dst>` — the same entries under
+  an extra name.
+- To make the custom tree the WHOLE view, `only <new-root>` (e.g.
+  `map /seeds/docs/a.md /pub/alpha.md` + `only /pub` renders exactly
+  `/pub/alpha.md` and nothing of the base layout).
+
+What the lens cannot do is *invent content*: every rendered entry is some base
+entry re-pathed, mirrored, or pruned, plus synthesized scaffold dirs — a derived
+view never holds bytes the base doesn't have.
+
 Derived views always mount read-only (write through to the base view). A `map`
 `<dst>`'s parent directories are synthesized on demand (scaffolding), but you
 **cannot create or rename entries inside a purely synthetic directory**
@@ -164,6 +190,7 @@ Derived views always mount read-only (write through to the base view). A `map`
 | A second public name for the same real view | `real view '<real>' is already governed by alias '<old>' — one public name per real view; to rotate it gaplessly use … --retire` |
 | `retire` removing an alias of a different view | `--retire '<old>' currently aliases a different real view ('<r>'), not '<real>'` |
 | Forking a base that is not a local SQLite bare base | `no physical base tree … \`fork\` copies a LOCAL SQLite tree … A PostgreSQL-backed view cannot be forked` |
+| Forking through a `--store postgres://…` server even when the base schema exists | `fork is not implemented on the PostgreSQL backend yet (the tree copy needs a per-view snapshot path; PG-backed views are served through a meta-server or a mount)` |
 | Forking a base that is itself governed | `base '<base>' is governed by a definition (alias/derived/fork) — fork the physical base tree instead` |
 | Fork name == base name | `fork name must differ from its base` |
 | Forking a name that already has a definition | `view '<name>' already has a definition — remove it first (\`grovefs view rm --name <name>\`) before forking` |

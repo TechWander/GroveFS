@@ -107,10 +107,11 @@ byte-identical JSON string lives inside `text` (so a client must peel
 ## 6. Completion and logging
 
 - `completion/complete`: `{"argument":{"name":"base","value":"re"}}` → view names
-  from the local store matching the prefix (case-insensitive), as
+  from the served store matching the prefix (case-insensitive), as
   `{"completion":{"values":[…],"total":N,"hasMore":bool}}` (at most 100). Works only
-  for `name`/`base`/`view`/`real`; **queries local SQLite only**, never
-  remote/PG.
+  for `name`/`base`/`view`/`real`; queries the store's **own backend** — local
+  SQLite files, or PostgreSQL (`grovefs_control` + `grovefs_v_*`) when the server
+  runs with `--store postgres://…`; never a remote `meta-server`.
 - `logging/setLevel`: `{"level":"warning"}`. Once a threshold is set, the server
   appends `notifications/message` frames (logger `"grove-mcp"`) **after the
   answered call**, but **only at or above the threshold**: success is `info` +
@@ -123,15 +124,23 @@ byte-identical JSON string lives inside `text` (so a client must peel
   Severity ordering: `debug 10 < info 20 < notice 30 < warning 40 < error 50 <
   critical 60 < alert 70 < emergency 80`; unknown names count as `info`.
 
-## 7. What each writing tool leaves on disk (usable for out-of-band verification)
+## 7. What each writing tool leaves behind (usable for out-of-band verification)
+
+SQLite backend (default) — effects on disk:
 
 | Tool | On-disk effect |
 |---|---|
 | `define_derived_view` | overwrites `<db>/meta/views/<name>.layout` (first line `base <base>` + rule lines) |
-| `alias_view` | writes `<db>/meta/views/<name>.layout` (`base <real>`); with `retire`, **writes the new one before deleting the old** |
+| `alias_view` | writes `<db>/meta/views/<name>.layout` (`alias <real>`); with `retire`, **writes the new one before deleting the old** |
 | `fork_view` | new tree `<db>/meta/<name>.db` (plus `-wal`/`-shm`) + `<db>/meta/views/<name>.layout`, and updates the cross-view ledger `refs.db` |
 | `remove_view` | deletes the `.layout`; if the slot was a fork, also deletes its `meta/<name>.db*` and runs `rebuild_ledger` |
 | `preview_rules` / `validate_definition` / the three read-only probes | **write nothing** |
+
+Under `--store postgres://…` nothing control-plane lands on disk: the
+`.layout` writes above become rows in `grovefs_control.view_defs`
+(verify with `SELECT name, definition FROM grovefs_control.view_defs`), and
+`fork_view` is refused (`fork is not implemented on the PostgreSQL backend
+yet …`).
 
 ## 8. CLI cross-reference (same library functions, same refusal texts)
 
@@ -146,8 +155,9 @@ byte-identical JSON string lives inside `text` (so a client must peel
 **Four interface-only calls** (no same-named CLI subcommand; they are read-only
 probe / dry-run library functions in `grovefs::mcp`):
 `get_view`, `list_view_tree`, `preview_rules`, `validate_definition`. The
-approximate CLI equivalents: read `<db>/meta/views/<name>.layout` directly;
-temporarily `mount --layout FILE` to see a lens's shape; illegal rules fail fast
+approximate CLI equivalents: read `<db>/meta/views/<name>.layout` directly (or
+the `grovefs_control.view_defs` row under `--store`); temporarily `mount
+--layout FILE` to see a lens's shape; illegal rules fail fast
 at `view define` — whereas the interface reaches the same verdict **without
 touching disk**.
 
@@ -172,7 +182,7 @@ the CLI cannot, and bypass no guard**.
 | `-32001` right at startup | server ran with `--require-api-key`, client sent no `apiKey` in `initialize` | mint a key with `grovefs apikey create --label agent --for mcp` (plaintext printed once), put it in `initialize.params.apiKey` or export `GROVEFS_MCP_API_KEY` on the server |
 | Auth fails: `invalid api key id` / `invalid api key secret` / `has been revoked` | plaintext transcribed wrong, revoked, or id:secret pasted incorrectly | match the id via `grovefs apikey list`; re-mint if needed |
 | Auth fails though the key is valid | scope does not include the MCP plane | re-mint with `--for mcp` (or `--for any`); a `--for mount` key cannot open the governance interface |
-| `no local metadata tree for view 'X' … LOCAL SQLite store only` | `list_view_tree` only walks local `meta/X.db`; remote/PG-backed trees are not walked | use the CLI on the store machine, or keep a local metadata copy (`view import`) |
+| `no metadata tree for view 'X' … list_view_tree walks this store's own backend; a remote tree not reachable from here is not` | the view has no tree in the backend the MCP server is bound to (no local `meta/X.db`, and no `--store` was given for the PG schema) | run the server against the right backend (`--db-path` on the store machine, or `--store postgres://…`), or keep a local metadata copy (`view import`) |
 | `no physical base tree … PostgreSQL-backed view cannot be forked` | fork needs a local SQLite bare base | first `grovefs --home H init/view create --view B`, or use a derived view instead |
 | Wrote the `.layout` but the mount still shows the old shape | a bare local mount resolves its definition once at mount time | remount; mounts through `meta-server` reshape themselves within ≤2s |
 | `list_view_tree` answers `truncated:true` | hit the `depth`(6)/`max`(800) bounds | drill down with `path` in segments, or raise `depth`/`max` |
