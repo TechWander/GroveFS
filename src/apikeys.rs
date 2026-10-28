@@ -35,14 +35,20 @@
 //!   tool, success, a compact detail) — attribution and a replayable audit trail,
 //!   queryable with `grovefs apikey calls`.
 //!
-//! Storage is one local SQLite file at
-//! `<base>/meta/api_keys.db`. It is deliberately SQLite-only — the MCP server
-//! is metadata-only over a LOCAL store, so there is no PG path to keep in sync
-//! here; a `meta-server`-style HA deployment shares this file alongside the
-//! view trees.
-//! Mount gating reuses that one file per metadata root; a `data-server` on a
-//! node without the control plane's root reads a copy/colocated store named by
-//! `--keys-from <base>` (see the CLI help).
+//! Storage FOLLOWS the metadata backend — one system of record, never two:
+//! - under SQLite (the default) keys live in one local file,
+//!   `<base>/meta/api_keys.db`;
+//! - under PostgreSQL (`--store postgres://…`) the SAME two tables live in the
+//!   shared `grovefs_control` schema ([`crate::control`]) — a key minted or
+//!   revoked against the URI is authoritative for every meta-server, MCP
+//!   server and CLI pointing at it, with no per-node file to colocate.
+//! The backend is picked once at open time ([`ApiKeyStore::open`] for the
+//! local file, [`ApiKeyStore::open_pg`] for the URI; [`ApiKeyStore::open_for`]
+//! routes like the view backend). Both backends expose identical columns,
+//! semantics and refusal strings.
+//! Mount gating reuses one store per metadata root (or per URI); a
+//! `data-server` on a node without the control plane sets `--keys-from
+//! <base>` (see the CLI help).
 //!
 //! Honest boundary: a key answers WHO may connect and — via its optional
 //! `view` binding — WHICH single tree they may open (`None` = any view, a
@@ -57,6 +63,8 @@
 
 use rusqlite::{params, Connection};
 use std::path::Path;
+
+use crate::control::PgPool;
 
 /// A successfully authenticated key's identity (never the secret or hash).
 ///
@@ -175,34 +183,36 @@ fn gen_secret() -> String {
     )
 }
 
-/// The per-base API-key + call-log store (one SQLite file).
-pub struct ApiKeyStore {
-    conn: parking_lot::Mutex<Connection>,
+/// One row reader shared by both backends' map closures (column access lives
+/// in the per-backend `query`, this normalizes the error plumbing).
+fn cell<T>(row: &rusqlite::Row, i: usize) -> Result<Option<T>, rusqlite::Error>
+where
+    Option<T>: rusqlite::types::FromSql,
+{
+    row.get::<_, Option<T>>(i)
 }
 
-impl ApiKeyStore {
-    /// Open (and if necessary initialize) `<base>/meta/api_keys.db`. Creating
-    /// the tables is idempotent; an empty `api_keys` table means "no caller has
-    /// been issued a key yet" (which, under `--require-api-key`, locks out all
-    /// gated calls until the operator mints one).
-    pub fn open(base: &Path) -> rusqlite::Result<Self> {
-        let path = base.join("meta").join("api_keys.db");
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let conn = Connection::open(&path)?;
-        conn.execute_batch(
-            "PRAGMA busy_timeout=5000;
-             PRAGMA journal_mode=WAL;
-             CREATE TABLE IF NOT EXISTS api_keys (
+/// The per-base API-key + call-log store: one local SQLite file under the
+/// SQLite backend, the shared `grovefs_control` tables under PostgreSQL.
+pub struct ApiKeyStore {
+    backend: Backend,
+}
+
+/// The two backend spellings of the same key/audit schema. SQLite may keep
+/// the legacy `rowid`; PG gets a serial identity so `ORDER BY <identity> DESC`
+/// matches the file's `rowid DESC` audit ordering.
+const KEYS_DDL_SQLITE: &str = "CREATE TABLE IF NOT EXISTS api_keys (
                  id          TEXT PRIMARY KEY,
                  label       TEXT NOT NULL,
                  secret_hash TEXT NOT NULL,
                  created_at  TEXT NOT NULL,
                  last_used_at TEXT,
-                 revoked_at  TEXT
-             );
-             CREATE TABLE IF NOT EXISTS mcp_calls (
+                 revoked_at  TEXT,
+                 scope       TEXT NOT NULL DEFAULT 'any',
+                 view        TEXT,
+                 ro          INTEGER NOT NULL DEFAULT 0
+             );";
+const CALLS_DDL_SQLITE: &str = "CREATE TABLE IF NOT EXISTS mcp_calls (
                  ts        TEXT NOT NULL,
                  key_id    TEXT,
                  key_label TEXT,
@@ -210,8 +220,58 @@ impl ApiKeyStore {
                  tool      TEXT NOT NULL,
                  ok        INTEGER NOT NULL,
                  detail    TEXT NOT NULL
-             );",
-        )?;
+             );";
+
+const KEYS_DDL_PG: &str = "CREATE TABLE IF NOT EXISTS grovefs_control.api_keys (
+    seq          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    id           TEXT NOT NULL UNIQUE,
+    label        TEXT NOT NULL,
+    secret_hash  TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    last_used_at TEXT,
+    revoked_at   TEXT,
+    scope        TEXT NOT NULL DEFAULT 'any',
+    view_name    TEXT,
+    ro           BOOLEAN NOT NULL DEFAULT false
+)";
+const CALLS_DDL_PG: &str = "CREATE TABLE IF NOT EXISTS grovefs_control.mcp_calls (
+    seq       BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    ts        TEXT NOT NULL,
+    key_id    TEXT,
+    key_label TEXT,
+    method    TEXT NOT NULL,
+    tool      TEXT NOT NULL,
+    ok        BOOLEAN NOT NULL,
+    detail    TEXT NOT NULL
+)";
+
+/// Where this credential store physically lives.
+enum Backend {
+    Sqlite(parking_lot::Mutex<Connection>),
+    Pg(PgPool),
+}
+
+/// One row reader for both backends: fetch column `i` as `Option<String>`.
+fn cell_str(row: &postgres::Row, i: usize) -> Option<String> {
+    row.get::<_, Option<String>>(i)
+}
+
+impl ApiKeyStore {
+    /// Open the LOCAL SQLite store at `<base>/meta/api_keys.db` (see
+    /// [`ApiKeyStore::open_for`] for backend-routing).
+    pub fn open(base: &Path) -> Result<Self, String> {
+        let path = base.join("meta").join("api_keys.db");
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let conn = Connection::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        conn.execute_batch(&format!(
+            "PRAGMA busy_timeout=5000;
+             PRAGMA journal_mode=WAL;
+             {KEYS_DDL_SQLITE}
+             {CALLS_DDL_SQLITE}"
+        ))
+        .map_err(|e| e.to_string())?;
         // `scope` arrived with mount-plane admission, so an existing store
         // needs it added in place. Everything already minted predates the
         // split and is therefore unrestricted ('any'), which keeps a live MCP
@@ -227,7 +287,8 @@ impl ApiKeyStore {
             conn.execute(
                 "ALTER TABLE api_keys ADD COLUMN scope TEXT NOT NULL DEFAULT 'any'",
                 [],
-            )?;
+            )
+            .map_err(|e| e.to_string())?;
         }
         // `view`/`ro` arrived with the view-bound token model: a key can be
         // locked to one physical view (NULL = any) and flagged read-only. Every
@@ -241,7 +302,8 @@ impl ApiKeyStore {
             )
             .unwrap_or(0);
         if has_view == 0 {
-            conn.execute("ALTER TABLE api_keys ADD COLUMN view TEXT", [])?;
+            conn.execute("ALTER TABLE api_keys ADD COLUMN view TEXT", [])
+                .map_err(|e| e.to_string())?;
         }
         let has_ro: i64 = conn
             .query_row(
@@ -254,21 +316,97 @@ impl ApiKeyStore {
             conn.execute(
                 "ALTER TABLE api_keys ADD COLUMN ro INTEGER NOT NULL DEFAULT 0",
                 [],
-            )?;
+            )
+            .map_err(|e| e.to_string())?;
         }
         Ok(Self {
-            conn: parking_lot::Mutex::new(conn),
+            backend: Backend::Sqlite(parking_lot::Mutex::new(conn)),
         })
     }
 
+    /// Open the PostgreSQL control-plane store: the same two tables in the
+    /// shared `grovefs_control` schema (idempotent DDL, cross-process safe —
+    /// see [`PgPool::open`]). A PG deployment keeps ONE credential/audit
+    /// system of record: every meta-server, MCP server and CLI aimed at the
+    /// same URI authenticates against the same rows, and a revoke reaches all
+    /// of them within the re-check window.
+    pub fn open_pg(uri: &str) -> Result<Self, String> {
+        let pool = PgPool::open(uri, &[KEYS_DDL_PG, CALLS_DDL_PG])?;
+        Ok(Self {
+            backend: Backend::Pg(pool),
+        })
+    }
+
+    /// The store for a metadata-backend selection: a `postgres[ql]://` URI
+    /// routes to the PG control schema, anything else (including `None`) to
+    /// the local file under `base` — the same routing rule the view
+    /// definitions follow ([`crate::mcp::control_store_for`]).
+    pub fn open_for(base: &Path, store_uri: Option<&str>) -> Result<Self, String> {
+        match store_uri {
+            Some(u) if u.starts_with("postgres://") || u.starts_with("postgresql://") => {
+                Self::open_pg(u)
+            }
+            _ => Self::open(base),
+        }
+    }
+
+    /// One parameterized statement, backend-routed: the SQLite and PG spellings
+    /// of the same op are passed side by side (identical text where the
+    /// dialects agree). Parameters are aligned by position across both lists.
+    fn exec2(
+        &self,
+        sql_s: &str,
+        ps: &[&dyn rusqlite::ToSql],
+        sql_p: &str,
+        pp: &[&(dyn postgres::types::ToSql + Sync)],
+    ) -> Result<(), String> {
+        match &self.backend {
+            Backend::Sqlite(m) => m
+                .lock()
+                .execute(sql_s, ps)
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+            Backend::Pg(pool) => pool.execute(sql_p, pp).map(|_| ()),
+        }
+    }
+
+    /// One parameterized SELECT, backend-routed, with per-dialect row mappers.
+    fn query2<T, FS, FP>(
+        &self,
+        sql_s: &str,
+        ps: &[&dyn rusqlite::ToSql],
+        ms: FS,
+        sql_p: &str,
+        pp: &[&(dyn postgres::types::ToSql + Sync)],
+        mp: FP,
+    ) -> Result<Vec<T>, String>
+    where
+        FS: Fn(&rusqlite::Row) -> Result<T, rusqlite::Error>,
+        FP: Fn(&postgres::Row) -> T + Clone,
+    {
+        match &self.backend {
+            Backend::Sqlite(m) => {
+                let c = m.lock();
+                let mut stmt = c.prepare(sql_s).map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map(ps, ms)
+                    .map_err(|e| e.to_string())?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| e.to_string())?;
+                Ok(rows)
+            }
+            Backend::Pg(pool) => pool.query(sql_p, pp, mp),
+        }
+    }
+
     /// Mint a new unrestricted key for `label` (see [`Self::create_for`]).
-    pub fn create(&self, label: &str) -> rusqlite::Result<(String, String)> {
+    pub fn create(&self, label: &str) -> Result<(String, String), String> {
         self.create_for(label, Scope::Any)
     }
 
     /// Mint a new key for `label` limited to `scope` (unbound view, read-write).
     /// See [`Self::create_bound`] for the full view/ro knobs.
-    pub fn create_for(&self, label: &str, scope: Scope) -> rusqlite::Result<(String, String)> {
+    pub fn create_for(&self, label: &str, scope: Scope) -> Result<(String, String), String> {
         self.create_bound(label, scope, None, false)
     }
 
@@ -283,18 +421,19 @@ impl ApiKeyStore {
         scope: Scope,
         view: Option<&str>,
         ro: bool,
-    ) -> rusqlite::Result<(String, String)> {
+    ) -> Result<(String, String), String> {
         let id = uuid::Uuid::new_v4().simple().to_string();
         let secret = gen_secret();
         let hash = sha256_hex(&secret);
         let full_key = format!("{id}:{secret}");
-        {
-            let c = self.conn.lock();
-            c.execute(
-                "INSERT INTO api_keys (id, label, secret_hash, created_at, scope, view, ro) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![id, label, hash, now_iso(), scope.as_str(), view, ro as i64],
-            )?;
-        }
+        let ts = now_iso();
+        let sc = scope.as_str();
+        self.exec2(
+            "INSERT INTO api_keys (id, label, secret_hash, created_at, scope, view, ro) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, label, hash, ts, sc, view, ro as i64],
+            "INSERT INTO grovefs_control.api_keys (id, label, secret_hash, created_at, scope, view_name, ro) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            &[&id, &label, &hash, &ts, &sc, &view, &ro],
+        )?;
         Ok((id, full_key))
     }
 
@@ -327,16 +466,35 @@ impl ApiKeyStore {
         let (id, secret) = key
             .split_once(':')
             .ok_or_else(|| "malformed api key (expected '<id>:<secret>')".to_string())?;
-        let c = self.conn.lock();
-        let row: Option<(String, String, String, Option<String>, Option<String>, i64)> = c
-            .query_row(
-                "SELECT label, secret_hash, scope, revoked_at, view, ro FROM api_keys WHERE id = ?1",
-                params![id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
-            )
-            .ok();
-        let (label, stored_hash, scope, revoked, bound_view, ro) =
-            row.ok_or_else(|| "authentication failed: unknown api key id".to_string())?;
+        let mut rows = self.query2(
+            "SELECT label, secret_hash, scope, revoked_at, view, ro FROM api_keys WHERE id = ?1",
+            params![id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    cell::<String>(r, 3)?,
+                    cell::<String>(r, 4)?,
+                    r.get::<_, i64>(5)?,
+                ))
+            },
+            "SELECT label, secret_hash, scope, revoked_at, view_name, ro FROM grovefs_control.api_keys WHERE id = $1",
+            &[&id],
+            |r| {
+                (
+                    r.get::<_, String>(0),
+                    r.get::<_, String>(1),
+                    r.get::<_, String>(2),
+                    cell_str(r, 3),
+                    cell_str(r, 4),
+                    r.get::<_, bool>(5) as i64,
+                )
+            },
+        )?;
+        let (label, stored_hash, scope, revoked, bound_view, ro) = rows
+            .pop()
+            .ok_or_else(|| "authentication failed: unknown api key id".to_string())?;
         if revoked.is_some() {
             return Err("authentication failed: this api key has been revoked".to_string());
         }
@@ -351,11 +509,13 @@ impl ApiKeyStore {
                 want.as_str()
             ));
         }
-        c.execute(
+        let ts = now_iso();
+        self.exec2(
             "UPDATE api_keys SET last_used_at = ?1 WHERE id = ?2",
-            params![now_iso(), id],
-        )
-        .map_err(|e| e.to_string())?;
+            params![ts, id],
+            "UPDATE grovefs_control.api_keys SET last_used_at = $1 WHERE id = $2",
+            &[&ts, &id],
+        )?;
         Ok(AuthedKey {
             id: id.to_string(),
             label,
@@ -379,54 +539,79 @@ impl ApiKeyStore {
     /// window", not wall-clock. Unknown id, revoked row or a scope that no
     /// longer fits the entrance all report `false`.
     pub fn is_live(&self, id: &str, want: Scope) -> bool {
-        let c = self.conn.lock();
-        let row: Option<(String, Option<String>)> = c
-            .query_row(
+        let rows = self
+            .query2(
                 "SELECT scope, revoked_at FROM api_keys WHERE id = ?1",
                 params![id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get::<_, String>(0)?, cell::<String>(r, 1)?)),
+                "SELECT scope, revoked_at FROM grovefs_control.api_keys WHERE id = $1",
+                &[&id],
+                |r| (r.get::<_, String>(0), cell_str(r, 1)),
             )
-            .ok();
-        match row {
+            .unwrap_or_default();
+        match rows.first() {
             Some((scope, revoked)) => {
-                revoked.is_none() && Scope::parse(&scope).unwrap_or(Scope::Any).admits(want)
+                revoked.is_none() && Scope::parse(scope).unwrap_or(Scope::Any).admits(want)
             }
             None => false,
         }
     }
 
     /// Every key, newest first (secrets never leave the store).
-    pub fn list(&self) -> rusqlite::Result<Vec<KeyInfo>> {
-        let c = self.conn.lock();
-        let mut stmt = c.prepare(
+    pub fn list(&self) -> Result<Vec<KeyInfo>, String> {
+        let rows = self.query2(
             "SELECT id, label, scope, view, ro, created_at, last_used_at, revoked_at
              FROM api_keys ORDER BY created_at DESC",
+            &[],
+            |r| {
+                Ok(KeyInfo {
+                    id: r.get(0)?,
+                    label: r.get(1)?,
+                    scope: r.get(2)?,
+                    view: cell(r, 3)?,
+                    ro: r.get::<_, i64>(4)? != 0,
+                    created_at: r.get(5)?,
+                    last_used_at: cell(r, 6)?,
+                    revoked_at: cell(r, 7)?,
+                })
+            },
+            "SELECT id, label, scope, view_name, ro, created_at, last_used_at, revoked_at
+             FROM grovefs_control.api_keys ORDER BY created_at DESC, seq DESC",
+            &[],
+            |r| KeyInfo {
+                id: r.get(0),
+                label: r.get(1),
+                scope: r.get(2),
+                view: cell_str(r, 3),
+                ro: r.get(4),
+                created_at: r.get(5),
+                last_used_at: cell_str(r, 6),
+                revoked_at: cell_str(r, 7),
+            },
         )?;
-        let rows = stmt.query_map([], |r| {
-            Ok(KeyInfo {
-                id: r.get(0)?,
-                label: r.get(1)?,
-                scope: r.get(2)?,
-                view: r.get(3)?,
-                ro: r.get::<_, i64>(4)? != 0,
-                created_at: r.get(5)?,
-                last_used_at: r.get(6)?,
-                revoked_at: r.get(7)?,
-            })
-        })?;
-        Ok(rows.filter_map(|x| x.ok()).collect())
+        Ok(rows)
     }
 
     /// Revoke a key by id (idempotent: returns false if no ACTIVE row matched,
     /// so the caller can distinguish "revoked now" from "already revoked /
     /// never existed"). Revoked keys fail authentication but stay in the table
     /// so historical `mcp_calls` rows keep their attribution.
-    pub fn revoke(&self, id: &str) -> rusqlite::Result<bool> {
-        let c = self.conn.lock();
-        let n = c.execute(
-            "UPDATE api_keys SET revoked_at = ?1 WHERE id = ?2 AND revoked_at IS NULL",
-            params![now_iso(), id],
-        )?;
+    pub fn revoke(&self, id: &str) -> Result<bool, String> {
+        let ts = now_iso();
+        let n = match &self.backend {
+            Backend::Sqlite(m) => m
+                .lock()
+                .execute(
+                    "UPDATE api_keys SET revoked_at = ?1 WHERE id = ?2 AND revoked_at IS NULL",
+                    params![ts, id],
+                )
+                .map_err(|e| e.to_string())?,
+            Backend::Pg(pool) => pool
+                .execute(
+                    "UPDATE grovefs_control.api_keys SET revoked_at = $1 WHERE id = $2 AND revoked_at IS NULL",
+                    &[&ts, &id],
+                )? as usize,
+        };
         Ok(n > 0)
     }
 
@@ -444,45 +629,52 @@ impl ApiKeyStore {
         tool: &str,
         ok: bool,
         detail: &str,
-    ) -> rusqlite::Result<()> {
+    ) -> Result<(), String> {
         let key_id = key.map(|k| k.id.clone());
         let key_label = key.map(|k| k.label.clone());
-        let c = self.conn.lock();
-        c.execute(
+        let ts = now_iso();
+        self.exec2(
             "INSERT INTO mcp_calls (ts, key_id, key_label, method, tool, ok, detail)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                now_iso(),
-                key_id,
-                key_label,
-                method,
-                tool,
-                ok as i64,
-                detail
-            ],
-        )?;
-        Ok(())
+            params![ts, key_id, key_label, method, tool, ok as i64, detail],
+            "INSERT INTO grovefs_control.mcp_calls (ts, key_id, key_label, method, tool, ok, detail)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            &[&ts, &key_id, &key_label, &method, &tool, &ok, &detail],
+        )
     }
 
-    /// Most recent `limit` audit rows (newest first).
-    pub fn recent_calls(&self, limit: usize) -> rusqlite::Result<Vec<CallLog>> {
-        let c = self.conn.lock();
-        let mut stmt = c.prepare(
+    /// Most recent `limit` audit rows (newest first — insertion order, which
+    /// is the storage identity on both backends: SQLite `rowid`, PG `seq`).
+    pub fn recent_calls(&self, limit: usize) -> Result<Vec<CallLog>, String> {
+        let rows = self.query2(
             "SELECT ts, key_id, key_label, method, tool, ok, detail
              FROM mcp_calls ORDER BY rowid DESC LIMIT ?1",
+            params![limit as i64],
+            |r| {
+                Ok(CallLog {
+                    ts: r.get(0)?,
+                    key_id: cell(r, 1)?,
+                    key_label: cell(r, 2)?,
+                    method: r.get(3)?,
+                    tool: r.get(4)?,
+                    ok: r.get::<_, i64>(5)? == 1,
+                    detail: r.get(6)?,
+                })
+            },
+            "SELECT ts, key_id, key_label, method, tool, ok, detail
+             FROM grovefs_control.mcp_calls ORDER BY seq DESC LIMIT $1",
+            &[&(limit as i64)],
+            |r| CallLog {
+                ts: r.get(0),
+                key_id: cell_str(r, 1),
+                key_label: cell_str(r, 2),
+                method: r.get(3),
+                tool: r.get(4),
+                ok: r.get(5),
+                detail: r.get(6),
+            },
         )?;
-        let rows = stmt.query_map(params![limit as i64], |r| {
-            Ok(CallLog {
-                ts: r.get(0)?,
-                key_id: r.get(1)?,
-                key_label: r.get(2)?,
-                method: r.get(3)?,
-                tool: r.get(4)?,
-                ok: r.get::<_, i64>(5)? == 1,
-                detail: r.get(6)?,
-            })
-        })?;
-        Ok(rows.filter_map(|x| x.ok()).collect())
+        Ok(rows)
     }
 }
 
@@ -512,17 +704,21 @@ mod tests {
         let authed = s.authenticate(&key).unwrap();
         assert_eq!(authed.id, id);
         assert_eq!(authed.label, "claude-desktop");
-        // Only the hash is on disk — the plaintext secret is never recoverable.
-        let c = s.conn.lock();
-        let stored: String = c
-            .query_row(
-                "SELECT secret_hash FROM api_keys WHERE id=?1",
-                params![id],
-                |r| r.get(0),
-            )
-            .unwrap();
+        // Only the hash is on disk — the plaintext secret is never recoverable
+        // (the store hands out no secret column at all, which IS the proof).
+        let stored = match &s.backend {
+            Backend::Sqlite(m) => m
+                .lock()
+                .query_row(
+                    "SELECT secret_hash FROM api_keys WHERE id=?1",
+                    params![id],
+                    |r| r.get::<_, String>(0),
+                )
+                .unwrap(),
+            Backend::Pg(_) => unreachable!("unit store is the file backend"),
+        };
         assert_eq!(stored.len(), 64);
-        assert!(!stored.contains(&key.split_once(':').unwrap().1));
+        assert_ne!(stored, key.split_once(':').unwrap().1);
     }
 
     #[test]

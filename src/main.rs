@@ -79,6 +79,13 @@ or as an agent-facing governance service over MCP (`grovefs mcp`).
     grovefs mcp --help   # list the tools an agent can call
 
 Run `grovefs <command> --help` for a command's full options.
+
+  Long commands shrink: a KEY=VALUE file is auto-loaded into the environment
+  ($GROVEFS_CONFIG, else ~/.grovefs/grovefs.conf or ~/.config/grovefs/grovefs.conf),
+  and the repeat-heavy flags fall back to env — GROVEFS_META / GROVEFS_DATA /
+  GROVEFS_TOKEN for `mount` and the servers, GROVEFS_HOME, GROVEFS_DB_PATH,
+  GROVEFS_STATS, GROVEFS_API_KEY, GROVEFS_MCP_API_KEY. Precedence is always
+  flag > live env > config file; keep the file 600 if it holds secrets.
 "#
 )]
 struct Cli {
@@ -211,11 +218,13 @@ enum Cmd {
         /// behind one channel lock.
         #[arg(long, default_value_t = 4)]
         threads: usize,
-        /// Report a specific uid on the `M_OPEN` handshake (remote meta only),
-        /// instead of the process's real euid, so a shared `meta-server` with a
-        /// view whitelist can admit this mount under a chosen slot. Also drives
-        /// the local mount's read-gate check. Advisory: the client self-reports
-        /// its uid, and the token is the real gate against a malicious peer.
+        /// Report a specific uid on the `M_OPEN` handshake (and on the
+        /// invalidation subscription) instead of the process's real euid, so a
+        /// shared `meta-server` records lock arbitration and audit rows under a
+        /// chosen owner. Remote mounts only: a local `--home` mount has no
+        /// server to report to, and its access control is the OS's. Advisory:
+        /// the client self-reports its uid, and the token / API key is the real
+        /// gate against a malicious peer.
         #[arg(long)]
         as_uid: Option<u32>,
         /// Presentation overlay: a rules file that reshapes how THIS mount
@@ -314,6 +323,14 @@ enum Cmd {
         /// first `--root`.
         #[arg(long)]
         keys_from: Option<PathBuf>,
+        /// Key/audit backend for `--require-api-key`. Unset / `"sqlite"` reads
+        /// the local `<keys-from>/meta/api_keys.db`; a `postgres://…`
+        /// (`postgresql://…`) URI — or the `GROVEFS_STORE` env — reads the shared
+        /// `grovefs_control.api_keys` table, so a data-server on a PG deployment
+        /// gates mounts against the SAME registry its meta-server does with no
+        /// file to colocate (and `--keys-from` is then unused).
+        #[arg(long)]
+        store: Option<String>,
     },
     /// Run the central metadata service many `mount --meta` clients share.
     ///
@@ -424,6 +441,18 @@ enum Cmd {
         /// PostgreSQL's own streaming/logical replication for HA instead.
         #[arg(long)]
         store: Option<String>,
+        /// Refuse an `M_OPEN` whose view name does NOT already exist, instead of
+        /// lazily creating `<db-path>/meta/<view>.db` (or a PG schema) on first
+        /// open. Default off: the first mount of a name is also how a base view
+        /// is bootstrapped, but it means a typo silently becomes an empty tree.
+        /// With this on, an unknown name is refused with a readable reason (the
+        /// client prints it, not a bare EIO), nothing is written to disk, and
+        /// the refusal is recorded in the `grovefs apikey calls` audit log when
+        /// `--require-api-key` is active. Existing trees, derived views, forks
+        /// and aliases still mount. Create a new base view first (SQLite:
+        /// `grovefs --home <db-path> init --view <name>`), then mount it.
+        #[arg(long)]
+        strict_view: bool,
     },
     /// Unmount a mountpoint
     Umount {
@@ -458,6 +487,14 @@ enum Cmd {
         /// falls back to the global `--home` when omitted.
         #[arg(long)]
         db_path: Option<PathBuf>,
+        /// Control-plane backend. Unset / `"sqlite"` governs the local
+        /// `<db-path>/meta/views/*.layout` files; a `postgres://…`
+        /// (`postgresql://…` too) URI — or the `GROVEFS_STORE` env — governs the
+        /// shared `grovefs_control.view_defs` table instead, so definitions and
+        /// the meta-server's own resolver read/write ONE system of record. Must
+        /// match the `meta-server --store` this root is served by.
+        #[arg(long)]
+        store: Option<String>,
         #[command(subcommand)]
         action: ViewAction,
     },
@@ -519,6 +556,14 @@ NOTES
         /// tool call is appended to `<db-path>/meta/api_keys.db`'s audit log.
         #[arg(long)]
         require_api_key: bool,
+        /// Control-plane backend. Unset / `"sqlite"` governs the local
+        /// `<db-path>/meta/views/*.layout` files and `api_keys.db`; a
+        /// `postgres://…` (`postgresql://…`) URI — or the `GROVEFS_STORE` env —
+        /// binds the server to the shared `grovefs_control` schema (definitions,
+        /// keys and the call audit all in PG). A PG-bound server ignores a
+        /// per-call `db_path` override: one URI, one system of record.
+        #[arg(long)]
+        store: Option<String>,
     },
     /// Manage the MCP server's API keys and read its call-audit log.
     ///
@@ -534,6 +579,14 @@ NOTES
         /// back to the global `--home`.
         #[arg(long)]
         db_path: Option<PathBuf>,
+        /// Key/audit backend. Unset / `"sqlite"` uses the local
+        /// `<db-path>/meta/api_keys.db`; a `postgres://…` (`postgresql://…`)
+        /// URI — or the `GROVEFS_STORE` env — uses the shared
+        /// `grovefs_control.api_keys`/`mcp_calls` tables, so a key minted here
+        /// is authoritative for every meta-/data-server and MCP pointing at that
+        /// URI with no per-node file to colocate.
+        #[arg(long)]
+        store: Option<String>,
         #[command(subcommand)]
         action: ApikeyAction,
     },
@@ -808,6 +861,90 @@ enum RefsAction {
     Rebuild,
 }
 
+/// Auto-load a `KEY=VALUE` config file into the environment, WITHOUT clobbering
+/// variables that are already set — the precedence chain for every knob below
+/// is always flag > live env > config file > built-in default. Search order:
+/// `$GROVEFS_CONFIG` (explicit path) > `$HOME/.grovefs/grovefs.conf` >
+/// `$HOME/.config/grovefs/grovefs.conf`; the first existing file wins. Only
+/// `GROVEFS_`-prefixed keys are honored (the rest are ignored with a warning);
+/// recognized: GROVEFS_HOME, GROVEFS_META / GROVEFS_DATA / GROVEFS_TOKEN
+/// (mount defaults), GROVEFS_STATS, GROVEFS_API_KEY, GROVEFS_MCP_API_KEY, …
+/// The file is read once before clap parses, so the existing per-knob env
+/// fallbacks consume the values without any extra plumbing; the mount
+/// re-exec keeps them (the child inherits the environment). Secrets do belong
+/// in here only if the file itself is protected (`chmod 600`) — exactly the
+/// contract `GROVEFS_API_KEY` already carries as a plain environment variable.
+fn load_config_file() {
+    let path = std::env::var("GROVEFS_CONFIG")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME").ok().map(|h| {
+                let legacy = PathBuf::from(&h).join(".grovefs").join("grovefs.conf");
+                if legacy.is_file() {
+                    return legacy;
+                }
+                PathBuf::from(&h)
+                    .join(".config")
+                    .join("grovefs")
+                    .join("grovefs.conf")
+            })
+        });
+    let Some(path) = path else { return };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        // An explicit $GROVEFS_CONFIG that cannot be read is a misconfiguration
+        // worth a warning; a default location that does not exist is normal.
+        if std::env::var("GROVEFS_CONFIG").is_ok() {
+            eprintln!(
+                "warning: GROVEFS_CONFIG={} not readable; continuing with env/defaults",
+                path.display()
+            );
+        }
+        return;
+    };
+    for (lineno, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Optional `export ` prefix so a grovefs.conf doubles as a shell file.
+        let line = line.strip_prefix("export ").unwrap_or(line).trim();
+        let Some((key, value)) = line.split_once('=') else {
+            eprintln!(
+                "warning: {}:{}: not a KEY=VALUE line; ignored",
+                path.display(),
+                lineno + 1
+            );
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if !key.starts_with("GROVEFS_") {
+            eprintln!(
+                "warning: {}:{}: {} is not a GROVEFS_* knob; ignored",
+                path.display(),
+                lineno + 1,
+                key
+            );
+            continue;
+        }
+        // Quote-aware so values may contain spaces (paths, rule text).
+        let value = match value {
+            v if (v.starts_with('"') && v.ends_with('"') && v.len() >= 2)
+                || (v.starts_with('\'') && v.ends_with('\'') && v.len() >= 2) =>
+            {
+                v[1..v.len() - 1].to_string()
+            }
+            v => v.to_string(),
+        };
+        // Live environment always wins; the config file only fills defaults.
+        if std::env::var_os(key).is_none() {
+            std::env::set_var(key, value);
+        }
+    }
+}
+
 fn base_dir(home: &Option<PathBuf>) -> PathBuf {
     if let Some(h) = home {
         return h.clone();
@@ -822,6 +959,17 @@ fn base_dir(home: &Option<PathBuf>) -> PathBuf {
 
 fn meta_path(base: &Path, view: &str) -> PathBuf {
     base.join("meta").join(format!("{view}.db"))
+}
+
+/// Resolve the metadata backend URI for a CONTROL-plane command. The explicit
+/// `--store` flag wins; otherwise the `GROVEFS_STORE` env fills the default
+/// (same flag > env chain as `--token`/`--home`). `None` / a non-`postgres[ql]://`
+/// value means the local SQLite/file control plane; a `postgres[ql]://` URI
+/// routes api_keys and view definitions to the shared `grovefs_control` schema.
+/// This is what makes the control plane FOLLOW the metadata backend — one
+/// system of record, never a local file a PG deployment would silently ignore.
+fn resolve_store(explicit: Option<String>) -> Option<String> {
+    explicit.or_else(|| std::env::var("GROVEFS_STORE").ok())
 }
 
 /// Scan `<base>/meta/views/*.layout` once for PURE ALIAS definitions
@@ -853,6 +1001,7 @@ fn load_view_aliases(base: &Path) -> HashMap<String, String> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    load_config_file();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -906,6 +1055,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             foreground,
             log_file,
         } => {
+            // Cluster coordinates need not be retyped on every mount: each of
+            // the repeat-heavy flags falls back to its env knob when unset —
+            // the live env wins over the config file, an explicit flag wins
+            // over both (see `load_config_file`). The detached re-exec keeps
+            // these: the child inherits the resolved env below.
+            let data = data.or_else(|| std::env::var("GROVEFS_DATA").ok());
+            let meta = meta.or_else(|| std::env::var("GROVEFS_META").ok());
+            let token = token.or_else(|| std::env::var("GROVEFS_TOKEN").ok());
             // Default `mount` detaches: re-exec this exact command with
             // `--foreground` in a new session (stdio → log file when attached
             // to a terminal, inherited otherwise so redirecting scripts keep
@@ -1295,6 +1452,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             token,
             require_api_key,
             keys_from,
+            store,
         } => {
             // Comma-separated roots = several disks behind one data-server;
             // placement across them is automatic (see PlacementBackend).
@@ -1311,17 +1469,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for r in &roots {
                 std::fs::create_dir_all(r)?;
             }
+            // Same flag > env > file chain as the mount side.
+            let token = token.or_else(|| std::env::var("GROVEFS_TOKEN").ok());
             let backend = Arc::from(backend::open_local_roots(&roots)?);
             let srv = match token.as_deref() {
                 Some(t) if !t.is_empty() => remote::DataServer::with_token(&listen, backend, t),
                 _ => remote::DataServer::new(&listen, backend),
             };
-            // Per-caller credential gate. The store lives beside the data root
-            // by default (a colocated node), or names the metadata root whose
-            // `meta/api_keys.db` was synced/colocated here for a split one.
+            // Per-caller credential gate. The store FOLLOWS the metadata
+            // backend: a `--store postgres://…` (or `GROVEFS_STORE`) data-server
+            // gates mounts against the shared `grovefs_control` tables — the SAME
+            // registry its meta-server uses — with no local file to colocate; a
+            // SQLite node reads `<keys-from>/meta/api_keys.db` (defaulting to
+            // this node's first `--root`, or a synced copy for a split one).
             let srv = if require_api_key {
+                let store = resolve_store(store);
                 let kbase = keys_from.unwrap_or_else(|| roots[0].clone());
-                srv.with_api_keys(grovefs::apikeys::ApiKeyStore::open(&kbase)?)
+                srv.with_api_keys(grovefs::apikeys::ApiKeyStore::open_for(
+                    &kbase,
+                    store.as_deref(),
+                )?)
             } else {
                 srv
             };
@@ -1340,15 +1507,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             sync_repl,
             witness,
             store,
+            strict_view,
         } => {
             let role = if role.eq_ignore_ascii_case("standby") {
                 grovefs::remote::meta::Role::Standby
             } else {
                 grovefs::remote::meta::Role::Primary
             };
+            // Backend for BOTH the view trees and the control plane (view
+            // definitions + api_keys): `--store` > `GROVEFS_STORE` > SQLite.
+            let store = resolve_store(store);
             // `--db-path` is the explicit, self-describing form of the metadata
             // root; the global `--home` still works (back-compat) but loses if
-            // both are given.
+            // both are given. A `GROVEFS_DB_PATH` env default slots between them,
+            // and `GROVEFS_TOKEN` fills a missing `--token` (same flag > env >
+            // config-file chain as the mount side).
+            let token = token.or_else(|| std::env::var("GROVEFS_TOKEN").ok());
+            let db_path =
+                db_path.or_else(|| std::env::var("GROVEFS_DB_PATH").ok().map(PathBuf::from));
             let meta_base = db_path.unwrap_or_else(|| base.clone());
             let mut srv = match token.as_deref() {
                 Some(t) if !t.is_empty() => {
@@ -1357,9 +1533,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ => grovefs::remote::MetaServer::new(&listen, &meta_base),
             };
             // Same registry `grovefs mcp --db-path` and `grovefs apikey --db-path`
-            // use; key scopes decide which entrance each one may open.
+            // use; key scopes decide which entrance each one may open. Under a PG
+            // store the keys live in `grovefs_control.api_keys`, not a local file,
+            // so a minted/revoked key is authoritative across every node at the URI.
             if require_api_key {
-                srv = srv.with_api_keys(grovefs::apikeys::ApiKeyStore::open(&meta_base)?);
+                srv = srv.with_api_keys(grovefs::apikeys::ApiKeyStore::open_for(
+                    &meta_base,
+                    store.as_deref(),
+                )?);
             }
             srv = srv.with_ha(role, peer);
             if sync_repl {
@@ -1367,19 +1548,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             srv = srv.with_witness(witness);
             srv = srv.with_store(store);
+            srv = srv.with_strict_view(strict_view);
             srv.serve()?;
         }
         Cmd::Umount { mountpoint } => {
             run_fusermount(&["-u", &mountpoint.to_string_lossy()])?;
             println!("unmounted {}", mountpoint.display());
         }
-        Cmd::View { db_path, action } => {
-            // Derived-view definitions live with the authoritative meta root,
-            // exactly like api_keys.db: control-plane state, read by the meta-server
-            // at M_OPEN (or by a local mount from --home) — never replicated
-            // with the view trees themselves (copy the `views/` dir to a HA
-            // standby like any other config).
+        Cmd::View {
+            db_path,
+            store,
+            action,
+        } => {
+            // View definitions are CONTROL-PLACE state and FOLLOW the metadata
+            // backend: under SQLite they are `meta/views/*.layout` files beside
+            // `api_keys.db`; under a `--store postgres://…` they are the shared
+            // `grovefs_control.view_defs` rows the meta-server reads at M_OPEN.
+            // The governance ops below run against ONE `ControlStore` so the CLI
+            // and the MCP server can never drift per backend. Base-view
+            // creation and export are PHYSICAL-tree operations (a local db file)
+            // and stay file-based.
             let vbase = db_path.unwrap_or_else(|| base.clone());
+            let store = resolve_store(store);
+            let store_is_pg = store.as_deref().map_or(false, |u| {
+                u.starts_with("postgres://") || u.starts_with("postgresql://")
+            });
+            let ctrl = grovefs::mcp::control_store_for(&vbase, store.as_deref())?;
+            // A PG deployment has no local per-view db file: base trees are PG
+            // schemas created lazily on first open, and their bytes move through a
+            // mount — so the file-level physical ops below are refused rather than
+            // silently writing a local artifact the PG meta-server never reads.
+            let require_sqlite = |op: &str| -> Result<(), Box<dyn std::error::Error>> {
+                if store_is_pg {
+                    Err(format!(
+                        "{op} operates on a local SQLite view db; under `--store postgres://…` a base tree is a PG schema created on first mount and its bytes move through a mounted path — drop --store for a local store"
+                    )
+                    .into())
+                } else {
+                    Ok(())
+                }
+            };
             match action {
                 ViewAction::Create { view, manifest } => {
                     // Base (physical) view creation — the same authoritative db
@@ -1387,6 +1595,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // the "only base views GC for real" rule has an obvious
                     // entry point. Refuse a name already governed by a derived
                     // or alias definition (that slot is a lens/alias, not a tree).
+                    require_sqlite("`view create`")?;
                     if vbase
                         .join("meta")
                         .join("views")
@@ -1423,7 +1632,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // hand the same text inline.
                     let text = std::fs::read_to_string(&rules)
                         .map_err(|e| format!("cannot read rules file {}: {e}", rules.display()))?;
-                    for l in grovefs::mcp::define_view(&vbase, &name, &src_base, &text)? {
+                    for l in grovefs::mcp::define_view(&*ctrl, &name, &src_base, &text)? {
                         match l {
                             grovefs::mcp::OutLine::Info(s) => println!("{s}"),
                             grovefs::mcp::OutLine::Note(s) => eprintln!("{s}"),
@@ -1433,7 +1642,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ViewAction::Fork { name, base } => {
                     // Same shared implementation as the MCP `fork_view` tool
                     // (validation, tree seeding, ledger booking, definition slot).
-                    for l in grovefs::mcp::fork_view(&vbase, &name, &base)? {
+                    for l in grovefs::mcp::fork_view(&*ctrl, &name, &base)? {
                         match l {
                             grovefs::mcp::OutLine::Info(s) => println!("{s}"),
                             grovefs::mcp::OutLine::Note(s) => eprintln!("{s}"),
@@ -1441,7 +1650,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 ViewAction::List => {
-                    for l in grovefs::mcp::list_views_text(&vbase)? {
+                    for l in grovefs::mcp::list_views_text(&*ctrl)? {
                         match l {
                             grovefs::mcp::OutLine::Info(s) => println!("{s}"),
                             grovefs::mcp::OutLine::Note(s) => eprintln!("{s}"),
@@ -1457,7 +1666,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ViewAction::Alias { name, real, retire } => {
                     // Same shared implementation as the MCP `alias_view` tool
                     // (validation, gapless --retire rotation, notes).
-                    for l in grovefs::mcp::alias_view(&vbase, &name, &real, retire.as_deref())? {
+                    for l in grovefs::mcp::alias_view(&*ctrl, &name, &real, retire.as_deref())? {
                         match l {
                             grovefs::mcp::OutLine::Info(s) => println!("{s}"),
                             grovefs::mcp::OutLine::Note(s) => eprintln!("{s}"),
@@ -1465,7 +1674,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 ViewAction::Rm { name } => {
-                    for l in grovefs::mcp::remove_view(&vbase, &name)? {
+                    for l in grovefs::mcp::remove_view(&*ctrl, &name)? {
                         match l {
                             grovefs::mcp::OutLine::Info(s) => println!("{s}"),
                             grovefs::mcp::OutLine::Note(s) => eprintln!("{s}"),
@@ -1476,6 +1685,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if !grovefs::layout::valid_view_name(&view) {
                         return Err(format!("invalid view name '{view}'").into());
                     }
+                    require_sqlite("`view export`")?;
                     // A virtual name has no tree: exporting its definition file
                     // would silently produce an empty/nonexistent export, so
                     // point at the physical base instead.
@@ -1523,6 +1733,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if !grovefs::layout::valid_view_name(&view) {
                         return Err(format!("invalid view name '{view}'").into());
                     }
+                    require_sqlite("`view import`")?;
                     let meta_dir = vbase.join("meta");
                     let dir = meta_dir.join("views");
                     if dir.join(format!("{view}.layout")).is_file() {
@@ -1590,18 +1801,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Mcp {
             db_path,
             require_api_key,
+            store,
         } => {
             // The agent entrance onto the same governance API: an MCP client
             // spawns this over stdio; EOF on stdin shuts it down. Control
             // plane only — no mount, no data IO. `--require-api-key` gates
-            // tools/list + tools/call behind a `grovefs apikey` credential.
-            grovefs::mcp::serve(db_path.unwrap_or_else(|| base.clone()), require_api_key)?;
+            // tools/list + tools/call behind a `grovefs apikey` credential. The
+            // control plane FOLLOWS the metadata backend: `--store postgres://…`
+            // (or `GROVEFS_STORE`) binds definitions, keys and the call audit to
+            // the shared `grovefs_control` schema; unset governs the local files.
+            let store = resolve_store(store);
+            grovefs::mcp::serve(
+                db_path.unwrap_or_else(|| base.clone()),
+                store.as_deref(),
+                require_api_key,
+            )?;
         }
-        Cmd::Apikey { db_path, action } => {
-            // Keys + audit log live in the authoritative meta root —
-            // control-plane state, shared by `grovefs mcp` at this path.
+        Cmd::Apikey {
+            db_path,
+            store,
+            action,
+        } => {
+            // Keys + audit log are CONTROL-PLACE state and FOLLOW the metadata
+            // backend: a local `api_keys.db` under SQLite, the shared
+            // `grovefs_control.api_keys`/`mcp_calls` tables under a
+            // `--store postgres://…` — so one mint is authoritative for every
+            // server pointing at the URI, with no per-node file to colocate.
             let ak_base = db_path.unwrap_or_else(|| base.clone());
-            let keys = grovefs::apikeys::ApiKeyStore::open(&ak_base)?;
+            let store = resolve_store(store);
+            let keys = grovefs::apikeys::ApiKeyStore::open_for(&ak_base, store.as_deref())?;
             match action {
                 ApikeyAction::Create {
                     label,
@@ -1655,9 +1883,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 ApikeyAction::List { view } => {
                     let all = keys.list()?;
-                    let real = view
-                        .as_deref()
-                        .and_then(|v| load_view_aliases(&ak_base).get(v).cloned());
+                    // Resolve an alias name to its real view so keys bound to
+                    // the real name also show under `--view <alias>` — read from
+                    // the SAME control plane as the keys (PG rows or local files),
+                    // never a path the chosen backend would ignore.
+                    let real = match view.as_deref() {
+                        None => None,
+                        Some(v) => {
+                            let cs = grovefs::mcp::control_store_for(&ak_base, store.as_deref())
+                                .map_err(Box::<dyn std::error::Error>::from)?;
+                            cs.load_alias_map()
+                                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?
+                                .get(v)
+                                .cloned()
+                        }
+                    };
                     let rows: Vec<_> = all
                         .iter()
                         .filter(|r| match (&view, &real) {

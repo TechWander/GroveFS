@@ -7,6 +7,7 @@
 //! - [`backend`]      : pluggable object storage (local disk; remote via [`remote`])
 //! - [`meta`]         : per-view tree (isolation + custom hierarchy)
 //! - [`pg_store`]     : optional PostgreSQL metadata backend (drop-in for [`meta`])
+//! - [`control`]      : shared PostgreSQL plumbing for the CONTROL plane (keys/audit/definitions)
 //! - [`fs_impl`]      : the fuser `Filesystem` bridging POSIX calls to the above
 //! - [`remote`]       : TCP data transport (client backend + server), no NFS
 //! - [`apikeys`]      : API-key auth + call-audit log for the MCP governance server
@@ -15,6 +16,7 @@
 
 pub mod apikeys;
 pub mod backend;
+pub mod control;
 pub mod fs_impl;
 pub mod layout;
 pub mod mcp;
