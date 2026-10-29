@@ -15,6 +15,18 @@
 
 数据与视图**天然分离**:视图只是"目录树 + 指针",字节永远在 `blocks/`。
 
+### 0.1 术语对照(新手速查)
+
+| 文档里的说法 | 意思 |
+| --- | --- |
+| `--home` | 单机模式下存放 `blocks/`(数据)与 `meta/`(视图库)的总目录;服务端各用各的 `--db-path`/`--root`,客户端不用它 |
+| data-server / meta-server | 两个中心服务进程:前者管字节(对象存储),后者管目录树(元数据);客户端 `--data`/`--meta` 分别指过去 |
+| 基视图 / 派生视图 / 别名 / fork | 视图四形态:独立存储树(可写)/ 规则定义在服务端的只读显示透镜 / 换名的全树可写入口 / 只拷目录不拷字节的独立树(§3.4–§3.4.1) |
+| token / API key | token 是集群准入门(一串共享口令);API key 是逐调用方、可撤销、可绑定视图/只读的凭据(§3.5.1) |
+| 治理面 / 挂载面 | 治理面 = `grovefs mcp` 的视图定义管理接口;挂载面 = FUSE 客户端到 meta/data 的连接——两门独立,scope 互不相通(§6) |
+
+> 还没建立"FUSE/挂载/对象存储"心智模型的读者,网页版 docs.html 的「§0 零基础预备知识」(六个关键词、需要/不需要会什么、硬件最低要求)建议先读。
+
 ### 常用参数:先说它管什么,再看怎么写
 
 > 下面命令里 `--home`、`--db-path` 这类是**参数写法**(照抄用);它们各自管的东西以**实际含义**为准:
@@ -844,6 +856,23 @@ GROVEFS_STATS=1 $Y mount --view alice -m /mnt/alice
 
 > 诚实边界:上表是本机单进程 `--stats` 实测分布(存在 run-to-run 抖动,但 4.3× 的 create total 与 125ms→33ms 的尾刺收敛远超噪声,且机制可归因);这些是排障/调优观测,**不构成吞吐或可扩展性声明**。远程/PG 后端瓶颈是网络 RTT,须另用 `bench_remote.sh` 量测。
 
+### 8.3 调优回路与旋钮生效层(方法论)
+
+先找瓶颈再动旋钮;**每次只拧一个旋钮**,同负载对比 `--stats` 两窗数据再下结论。
+
+**旋钮按生效层分,拧错层=白拧**:
+
+| 生效层 | 旋钮 | 说明 |
+| --- | --- | --- |
+| 应用层(挂载进程自身) | `--threads N`(默认 4,每 worker 独立 `/dev/fuse` fd)、`--stats`/`--stats-interval`(纯观测零开销)、`--log-file` | 改 GroveFS 自己的并发与观测 |
+| FUSE 协商层(受内核钳制) | `max_write`/`readahead`、`--tune-cache`、`--strict` | 上限由内核 `FUSE_MAX_MAX_PAGES` 决定:老内核(如 5.4)申请 4MiB 也自然退化,不是 bug |
+| 后端能力层(服务端配置) | `--data A1,A2[,A3…]` 分节点、≥16MiB 自动条带、`--store postgres://…` | 改容量与并行度(§5.2、§6.2) |
+| 结构性(改代码) | `MetaProvider`/`StorageBackend` 换实现(§16.1) | 前层都不够用时才到这里 |
+
+**最小回路**:① 定位现象——挂 `--stats` 跑一段真实负载读报告:`[io]` 看 backend_total/pool_wait 占比,`[meta]` 看每操作 p50/p99 与 ops/s,`[counters]` 看并行切片与 readdir 预取计数;② 判瓶颈——backend_total/pool_wait 占大头=网络 RTT 或后端;`meta.create` p50 高且 ops/s 上不去=SQLite 单写者串行;`dup>0` 占比高=内核缓存没吃到(考虑 `--tune-cache`);③ 只拧一个旋钮,重启挂载生效(远程挂载 systemd `daemon-reload`+重启;本地挂载改 env/配置即可);④ 对比两窗,收益声称以同机同负载实测为准——手册里给的都是地板线,不是收益数字。
+
+**已有实测地板(本机回环,跨机器须重测)**:大块读写 FUSE 自身开销每 op 仅加 ~50–70µs(§8.2);后台 WAL checkpoint 改造后 `lookup` p50 39→17µs、`getattr` p50 66→36µs(§10);远程链路瓶颈是网络 RTT,须用 `bench_remote.sh` 另量。低于地板的数字说明量的不是机制本身——跨机器对比前先跑 `dd` 走 ext4 基线,把磁盘本底扣掉。
+
 ---
 
 ## 9. 常用运维
@@ -1121,7 +1150,9 @@ systemctl list-units 'grove-mount@*' --state=running
 findmnt -t fuse | grep grovefs
 
 # 中心容量(对象直存于 blocks 下 256 个桶子目录,直接 du 整目录即可)
+# 判异常要看斜率而不是看大小:每周同一天追一行带日期的读数
 du -sh /data/cluster/blocks; df -h /data/cluster
+echo "$(date +%F) $(du -sh /data/cluster/blocks | cut -f1)" >> /var/log/grovefs_capacity.log
 
 # 昨夜到现在有没有降级/冻结/提升事件
 journalctl -u grove-meta-server --since yesterday | grep -E 'meta HA|sync-repl|fenced|promotion'
@@ -1206,11 +1237,19 @@ HA 拓扑滚动升级(写不中断,切换瞬间除外):
 | 非 root 用户看不到挂载点/`allow_other` 不生效 | 查 `/etc/fuse.conf` 的 `user_allow_other`;查 fusermount SUID 位 | FUSE 惯例限制,与 GroveFS 无关 |
 | `--store postgres://…` 加了 `--peer` 启动即退 | 去掉 HA 参数 | PG 与自研快照 HA 互斥是设计决定(§6.2),高可用用 PG 流复制 |
 | 大文件没看到条带分块 | 确认文件 ≥16MiB 且 `--data` 给了逗号分隔多地址 | 小文件自然只落 chunk0,是设计不是 bug |
-| 挂载点磁盘写满 | 先扩 `blocks/` 所在盘 | 容量治理没有 magic:对象只增删不压缩,`du -sh` 监控(§12.1) |
+| 挂载点磁盘写满 | 先扩 `blocks/` 所在盘；事后用 §12.6 的三条判据查“是业务量还是没回收” | 容量治理没有 magic:对象只增删不压缩,长期靠 `du` 斜率 + 物理/逻辑比值定位 |
 
 ### 12.6 容量与回收的实话
 
 - `unlink`(最后一个链接消失)时后端据 key 尽力删除对象/全部分块,幂等;但 **CLI 没有提供孤儿对象扫描/回收命令**(未实现),长期运行的 `blocks/` 容量以 `du` 实测为准,不要假设能整目录清空重采。
+- 把 `du` 变成可判的三条：① **记斜率而不是记大小**（每周同一天追一行带日期读数，斜率对不上业务增量才叫异常）；② **除一遍逻辑量**——`blocks/` 是物理字节，挂载里看到的是逻辑字节，两者同量级才正常：
+
+  ```bash
+  find /mnt/da -type f -printf '%s\n' | awk '{t+=$1} END{printf "logical %.2f GiB\n", t/1073741824}'
+  ```
+
+  ③ **比值 > 1 只有两个成因**：该删的没删（去视图里确认文件真 unlink 了），或 import/fork 的共享字节还被别的视图持着（`grovefs view --db-path D list` 看还有谁在引用，归零才物理回收，§5.3）。
+- 最常见的第三种其实是事故：**绕过挂载直接 `rm meta/<view>.db` 不会触发后端删除**，对象会永远留在 `blocks/` 里（引用账本只会高估不会误删，所以它只占空间、不丢数据）；回收账本可用 `grovefs refs --db-path D rebuild` 归位。
 - SQLite 视图库的回收在引擎内部处理(锁表事务回收、hardlink refcount GC);PG 模式下交给 VACUUM。
 
 ### 12.7 变更后的回归验证
@@ -2246,6 +2285,52 @@ $G meta-server --listen 0.0.0.0:50110
 | 写 fork 内容返回 `EROFS` | fork 内容面只读 | 写基视图；结构整理继续在 fork 里做 |
 | 挂载后 2 秒内别的客户端看不到变化 | 不是 bug：TTL ≤2s；若一直不同步，查两地是否连的**同一个** meta | §4 的“两种一致性模式” |
 | `connection refused` / 握手超时 | 防火墙只开了其一，或 token 不一致 | §11.6、§11.7 的验收清单 |
+
+---
+
+## 16. 内部机制速览与扩展开发(改代码的读者)
+
+> 以下内容逐条从**源码与协议常量**取证,不是概念科普。使用手册其余章节只用 CLI/协议行为,不依赖本节。
+
+### 16.1 扩展点:三个 trait,一个装饰器
+
+- **`MetaProvider`**(`src/meta.rs`,21 方法):元数据层全部契约——`lookup`/`getattr`/`readdir`/`create_node`/`rename`/`lock_op`/`fence_handle`/`fetch_fence_epoch`…实现者五处:`MetaEngine`(本地 SQLite,每视图一库)、`PgEngine`(`src/pg_store.rs`,PG,每视图一 schema)、`MetaStore`(enum,运行期择 Sql/Pg,meta-server 服务端侧)、`RemoteMeta`(客户端)、`LayoutMeta`(治理装饰器)。PG 不是第六种树引擎语义:`MetaEngine::open_sqlite`/`open_pg` 同一方法面换存储内核——所以每个功能都自动"在 PG 上跑"。
+- **`StorageBackend`**(`src/backend/mod.rs`,10 方法):数据对象 IO——`new_key`/`create`/`read`/`write`/`len`/`fsync`/`truncate`/`remove`/`import_at`/`statvfs`。实现者:`LocalBackend`/`ShardedBackend`/`PlacementBackend`/`RemoteBackend`。256 桶分片与条带化都在这层后面,FUSE 层不知道对象躺在哪块盘。
+- **`LayoutMeta`**(`src/layout.rs`,治理装饰器):包住任意 `MetaProvider` 做"源路径↔显示路径"翻译,目录项不物化。`mount --layout`(客户端侧)与服务端派生视图两条入口汇到**同一个装饰器实现**——所见形状逐字节一致不是巧合,是同一份代码。
+
+### 16.2 线协议速查(自定义二进制帧 over TCP)
+
+定长头 + 变长体,全大端;**一连接一问一答**,并发靠客户端连接池与服务端每连接一线程——同步 trait 因此能被 fuser 工作线程直接驱动(`src/remote/proto.rs` 模块注释即设计契约):
+
+| 项 | 值 |
+| --- | --- |
+| MAGIC | `0x5948_4653` = ASCII **"YHFS"** |
+| MAX_FRAME | `1<<28` = **256 MiB**——超限直接断连,不拆包 |
+| 数据面操作码 | `OP_CREATE=1` … `OP_FENCE=10`(create/read/write/len/truncate/remove/import_at/statvfs/open/fence) |
+| 元数据面操作码 | `M_OPEN=16` … `M_READDIRP=37`(open/ping/lookup/getattr/…/readdirp 分页) |
+| 写意图前缀 | 五帧 `OP_WRITE/TRUNCATE/REMOVE/IMPORT_AT/FENCE` 体内带 `[u64 epoch]` 前缀,供 `--witness`/备节点门控陈旧节点的重放(§5.5) |
+
+### 16.3 接入新后端的最小路径
+
+1. 实现对应 trait(元数据换 `MetaProvider`、字节换 `StorageBackend`),方法语义对照 SQLite `MetaEngine` / `LocalBackend` 的注释;**PG 式"换内核不换方法面"**是推荐的解法——功能自动全量可用;
+2. 在工厂处挂类型:数据面参考 `backend::open_local`/`open_local_roots`(`src/backend/mod.rs`),元数据面参考 `MetaEngine::open_sqlite`/`open_pg`(`src/meta.rs`)的接法;
+3. 客户端侧如需新挂载类型,在 `main.rs` 的 mount 分发处接入;协议操作码尽量保持不变——帧布局与操作码定型于 `src/remote/proto.rs`,跨版本兼容靠它;
+4. 回归:把 `.build-bin/run_all.sh` 的对应套件换参重跑,判据以脚本输出为准(§10)。
+
+### 16.4 架构取舍与开发侧边界
+
+为什么这样设计(逐条对应 §4.1、§5、§5.5、§10、§15.9):
+
+- **单一权威序列化点**:一个视图的树只由一个 meta-server 进程写——消除多副本分叉,代价是该进程为性能与扩展瓶颈。接受,直到需求真实出现。
+- **治理在呈现层,不在存储层**:透镜/别名/fork 都不搬字节,只改目录树呈现,所以"同一份数据不同形状"零拷贝。
+- **token 与 key 分层**:token 管集群准入门,key 管逐调用方归属与撤销——泄露止损粒度不同,合并反而会逼小部署背上 key 运维。
+- **async 复制 RPO≈500ms / `--sync-repl` RPO=0 / `--witness` 真 fencing**:一致性档位显式交给部署者选,代价是 fencing 能力分层(无 witness 时备只防脑裂不封旧主)。
+- **条带 ≥16MiB 整块 round-robin**:够用且简单,避免元数据爆炸;不做任意粒度 erasure coding。
+- **advisory 锁租约式**:无等待超时、无续期任务,靠 lease + 死亡即时回收兜底——简单换语义边界。
+- **吞吐优先的耐久性档位**:SQLite 写连接 `wal_autocheckpoint=0` + 后台 checkpoint 线程把同步停顿移出写热路径(§10 实测 max 125ms→33ms);复制默认 async(RPO≈500ms),`--sync-repl` 显式换 RPO=0(代价一个控制通道 RTT + 一次 `VACUUM INTO` fsync,超时诚实降级不谎报,§5.5)——每一档都写明代价。
+- **PG 后端不支持 fork/`view export`/原生 HA**:物理 db 不存在,相关能力自然缺失——诚实边界(§15.9),不是 bug。
+
+开发参考:`src/`(主模块 10 个 + `remote/` + `backend/`)、协议常量集中于 `src/remote/proto.rs`、遥测在 `src/stats.rs`(报告分组与阶段名以代码为准)、全板回归入口 `.build-bin/run_all.sh`。本节内容在网页版 docs.html 「§18 内部机制与扩展开发 / §19 性能调优方法论」有对应的分层版。
 
 ---
 
