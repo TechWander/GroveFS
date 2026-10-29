@@ -63,7 +63,7 @@
 └─ 传输：自定义二进制帧 over TCP（定长头 + 变长体），连接池并发
 ```
 
-- **trait 接缝可插拔**：本地/远程/条带切换只是换实现。
+- **trait 接缝可插拔**：本地/远程/条带切换只是换实现；接口面、线协议常量与新后端接入路径速览见 USAGE §16（网页版 docs.html §18/§19 有分层版）。
 - **中心 MetaServer**：同一用户在多客户机共享**一份权威视图**，不再各存副本导致分叉。
 - **事件总线 + Notifier**：写成功后向订阅者推送失效，保证内容新鲜度。
 - **fuser 0.18 多线程**：每线程独立 `/dev/fuse` fd（`clone_fd`，Linux 4.5+），请求并发派发不串行。
@@ -742,7 +742,7 @@ grovefs --home /data/dst mount --view team -m /mnt/team   # 树、硬链接、�
 
 ## 部署与维护（手把手）
 
-完整的分阶段教程在 **[USAGE.md](USAGE.md) §11–§14**（网页版同步见 docs.html）：§11 从环境预检 → 构建安装 → 拓扑规划 → token → systemd 常驻（中心双服务 + 客户端模板挂载单元）→ 防火墙 → 8 步验收清单 → HA / PostgreSQL 变体；§12 给日常巡检（日志关键字→处置对照表）、备份恢复（单机 / SQLite+HA / PG 三流程）、滚动升级、故障速查表与变更后回归；§13 是一组**固定 IP 的完整案例实操**（存储机 192.168.1.10 存 /data、SQLite 后端，客户端读写挂 /mnt/da、只读挂 /mnt/db），手把手逐参数解释；§14 进阶回答“数据目录怎么定制/存量大数据怎么导入（首选 `grovefs import` 零拷贝登记，备选经挂载 rsync 灌入，硬链接多入口、拆 view、未实现清单）/不同客户端想要不同显示方式”。最短生产路径六步：
+完整的分阶段教程在 **[USAGE.md](USAGE.md) §11–§14**（网页版 [docs.html](docs.html) 同步覆盖，并按读者阶段重排为「零基础→专家」四档：新增零基础预备知识、内部机制与扩展开发、性能调优方法论三章，支持自动/浅色/深色阅读主题）：§11 从环境预检 → 构建安装 → 拓扑规划 → token → systemd 常驻（中心双服务 + 客户端模板挂载单元）→ 防火墙 → 8 步验收清单 → HA / PostgreSQL 变体；§12 给日常巡检（日志关键字→处置对照表）、备份恢复（单机 / SQLite+HA / PG 三流程）、滚动升级、故障速查表与变更后回归；§13 是一组**固定 IP 的完整案例实操**（存储机 192.168.1.10 存 /data、SQLite 后端，客户端读写挂 /mnt/da、只读挂 /mnt/db），手把手逐参数解释；§14 进阶回答“数据目录怎么定制/存量大数据怎么导入（首选 `grovefs import` 零拷贝登记，备选经挂载 rsync 灌入，硬链接多入口、拆 view、未实现清单）/不同客户端想要不同显示方式”。最短生产路径六步：
 
 ```bash
 # 1) 构建安装（每台节点同一个二进制）
@@ -888,7 +888,7 @@ Three layers, all trait-decoupled:
 └─ Transport: custom binary frames over TCP (fixed header + variable body), pooled
 ```
 
-- **Pluggable trait seams**: local/remote/striped are interchangeable.
+- **Pluggable trait seams**: local/remote/striped are interchangeable; the interface surfaces, wire-protocol constants and the new-backend on-ramp are summarized in USAGE §16 (tiered walkthrough in docs.html §18/§19).
 - **Central MetaServer**: one authoritative view per user shared across machines, so no diverging local copies.
 - **Event bus + Notifier**: pushes invalidations after writes for content freshness.
 - **fuser 0.18 multi-threading**: each worker gets its own `/dev/fuse` fd (`clone_fd`, Linux 4.5+), requests dispatch concurrently.
@@ -1482,7 +1482,7 @@ The two substantive differences from a token: ① refusal reasons travel byte-fo
 
 ## Deployment & operations (hands-on)
 
-The full step-by-step guide lives in **[USAGE.md](USAGE.md) §11–§14** (mirrored in docs.html): §11 walks through environment preflight → build & install → topology planning → shared token → systemd units (two central services + a templated client mount unit) → firewall → an 8-step acceptance checklist → HA / PostgreSQL variants; §12 covers routine inspection (log-keyword → action table), backup/restore (single-node / SQLite+HA / PG), rolling upgrades, a troubleshooting table and post-change regression; §13 is a **fixed-IP worked example** (storage server 192.168.1.10 with data in /data on the SQLite backend, one read-write client at /mnt/da and one read-only client at /mnt/db) explaining every flag hands-on; §14 answers “custom data directories, bulk import of existing data (zero-copy `grovefs import` first, streamed rsync through a mount as the alternative; hardlink aliasing, view splitting, and an explicit not-implemented list), and per-client display layouts”. The shortest production path in six steps:
+The full step-by-step guide lives in **[USAGE.md](USAGE.md) §11–§14** (mirrored in [docs.html](docs.html), re-sequenced into a four-tier zero-to-expert manual with new beginner-prerequisites, internals & extension-development, and performance-tuning methodology sections, plus an auto/light/dark reading-theme toggle): §11 walks through environment preflight → build & install → topology planning → shared token → systemd units (two central services + a templated client mount unit) → firewall → an 8-step acceptance checklist → HA / PostgreSQL variants; §12 covers routine inspection (log-keyword → action table), backup/restore (single-node / SQLite+HA / PG), rolling upgrades, a troubleshooting table and post-change regression; §13 is a **fixed-IP worked example** (storage server 192.168.1.10 with data in /data on the SQLite backend, one read-write client at /mnt/da and one read-only client at /mnt/db) explaining every flag hands-on; §14 answers “custom data directories, bulk import of existing data (zero-copy `grovefs import` first, streamed rsync through a mount as the alternative; hardlink aliasing, view splitting, and an explicit not-implemented list), and per-client display layouts”. The shortest production path in six steps:
 
 ```bash
 # 1) build & install the same binary on every node
