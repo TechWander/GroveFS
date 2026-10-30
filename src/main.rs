@@ -84,7 +84,8 @@ Run `grovefs <command> --help` for a command's full options.
   ($GROVEFS_CONFIG, else ~/.grovefs/grovefs.conf or ~/.config/grovefs/grovefs.conf),
   and the repeat-heavy flags fall back to env — GROVEFS_META / GROVEFS_DATA /
   GROVEFS_TOKEN for `mount` and the servers, GROVEFS_HOME, GROVEFS_DB_PATH,
-  GROVEFS_STATS, GROVEFS_API_KEY, GROVEFS_MCP_API_KEY. Precedence is always
+  GROVEFS_STATS, GROVEFS_API_KEY, GROVEFS_MCP_API_KEY, GROVEFS_BW_READ /
+  GROVEFS_BW_WRITE. Precedence is always
   flag > live env > config file; keep the file 600 if it holds secrets.
 "#
 )]
@@ -256,6 +257,23 @@ enum Cmd {
         /// size/mtime change; `--strict` overrides this to 0 (full bypass).
         #[arg(long, default_value_t = 2)]
         tune_cache: u64,
+        /// Cap this mount's CONTENT read throughput, e.g. `50M`, `1G` or a
+        /// plain byte count (1024-based). 0/unset = unlimited (the default).
+        /// A shared GCRA slot schedule in the FUSE read path hands bytes back
+        /// at exactly this rate (bytes are paced from the first op; a single
+        /// op larger than one second of budget may start up to 1 s early).
+        /// Content writes have their
+        /// own knob (`--bw-write`); metadata ops are never throttled. Falls
+        /// back to env `GROVEFS_BW_READ`. Honest boundary: a per-mount,
+        /// CLIENT-side shaper — a raw data-plane client that bypasses FUSE,
+        /// or N mounts of the same view, each get their own budget.
+        #[arg(long, value_parser = grovefs::bwlimit::parse_rate)]
+        bw_read: Option<u64>,
+        /// Cap this mount's CONTENT write throughput (same syntax; env
+        /// fallback `GROVEFS_BW_WRITE`). Inert on read-only mounts: their
+        /// writes are refused with EROFS before any budget is spent.
+        #[arg(long, value_parser = grovefs::bwlimit::parse_rate)]
+        bw_write: Option<u64>,
         /// Opt-in per-stage latency telemetry. When set, the mount records how
         /// long each phase of a read/write/metadata op takes (key resolve, data
         /// backend, remote RTT, striping fan-out, SQLite/PG query, SSI retry …)
@@ -982,6 +1000,21 @@ fn load_config_file() {
     }
 }
 
+/// `--bw-read`/`--bw-write` env fallback: an explicit flag wins; an
+/// unparsable env value is a hard error (silently ignoring a cap the
+/// operator believes is on would be worse than refusing to mount).
+fn resolve_bw(flag: Option<u64>, env_key: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    if let Some(v) = flag {
+        return Ok(v);
+    }
+    match std::env::var(env_key) {
+        Ok(s) if !s.trim().is_empty() => {
+            grovefs::bwlimit::parse_rate(&s).map_err(|e| format!("{env_key}: {e}").into())
+        }
+        _ => Ok(0),
+    }
+}
+
 fn base_dir(home: &Option<PathBuf>) -> PathBuf {
     if let Some(h) = home {
         return h.clone();
@@ -1086,6 +1119,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             layout,
             no_readdirplus,
             tune_cache,
+            bw_read,
+            bw_write,
             stats: stats_on,
             stats_file,
             stats_interval,
@@ -1100,6 +1135,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let data = data.or_else(|| std::env::var("GROVEFS_DATA").ok());
             let meta = meta.or_else(|| std::env::var("GROVEFS_META").ok());
             let token = token.or_else(|| std::env::var("GROVEFS_TOKEN").ok());
+            // Content rate caps: explicit flag > live env/config-file knob;
+            // an unparsable env value refuses the mount (see `resolve_bw`).
+            let bw_read = resolve_bw(bw_read, "GROVEFS_BW_READ")?;
+            let bw_write = resolve_bw(bw_write, "GROVEFS_BW_WRITE")?;
             // Default `mount` detaches: re-exec this exact command with
             // `--foreground` in a new session (stdio → log file when attached
             // to a terminal, inherited otherwise so redirecting scripts keep
@@ -1395,6 +1434,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 strict || o.iter().any(|s| s == "strict"),
                 !no_readdirplus,
                 tune_cache,
+                bw_read,
+                bw_write,
             );
 
             // Build the fuser 0.18 session Config. The old `--o` string surface is

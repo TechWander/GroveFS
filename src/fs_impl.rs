@@ -92,6 +92,12 @@ pub struct GroveFS {
     /// preserved by the default notify-invalidation push, and `--strict` pins
     /// this to 0, so this knob only ever widens caching for callers who opt in.
     cache_ttl: Duration,
+    /// GCRA shapers for CONTENT bytes of THIS mount (`--bw-read` /
+    /// `--bw-write`; rate 0 = off). One schedule per direction, shared by
+    /// every worker thread of the mount. Honest boundary: a client-side,
+    /// per-mount shaper — self-discipline, not isolation (see `crate::bwlimit`).
+    bw_read: crate::bwlimit::RateLimiter,
+    bw_write: crate::bwlimit::RateLimiter,
     /// Per-mount session id stamped on every lock this daemon grants, so a
     /// background heartbeat can renew exactly its own leases (`renew_locks`)
     /// and the authority can reap them on disconnect without touching peers.
@@ -133,6 +139,8 @@ impl GroveFS {
         strict: bool,
         readdirplus: bool,
         cache_ttl_secs: u64,
+        bw_read_bps: u64,
+        bw_write_bps: u64,
     ) -> Self {
         Self {
             meta,
@@ -144,6 +152,8 @@ impl GroveFS {
             strict,
             readdirplus,
             cache_ttl: Duration::from_secs(cache_ttl_secs),
+            bw_read: crate::bwlimit::RateLimiter::new(bw_read_bps),
+            bw_write: crate::bwlimit::RateLimiter::new(bw_write_bps),
             lock_sid: gen_sid(),
             lock_renew_started: std::sync::atomic::AtomicBool::new(false),
         }
@@ -836,6 +846,11 @@ impl fuser::Filesystem for GroveFS {
                 }
             }
         };
+        // Book this reply in the mount's shared read schedule BEFORE handing
+        // bytes back, so bytes leave at no more than the configured rate.
+        // Charged on the bytes actually returned — an EOF read costs nothing.
+        // A throttled worker sleeps; other workers keep dispatching.
+        self.bw_read.acquire(data.len() as u64);
         reply.data(&data);
     }
 
@@ -887,6 +902,10 @@ impl fuser::Filesystem for GroveFS {
                 }
             }
         };
+        // Charge this mount's write budget for the bytes actually persisted:
+        // the FUSE reply (and therefore the app's write/flush) is delayed by
+        // any deficit, which backpressures the writer instead of dropping data.
+        self.bw_write.acquire(n as u64);
         // Debounced mtime touch: a streaming writer fires one write
         // callback per 1MiB chunk, and each unhedged touch is a full
         // metadata write (a local tx, or — with --meta — a synchronous
