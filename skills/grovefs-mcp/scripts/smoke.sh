@@ -120,7 +120,7 @@ note "[4] governance guards answer with the CLI's own words"
 SAME="$(mcp call validate_definition "{\"name\":\"team\",\"base\":\"team\",\"rules\":\"hide $DOC\"}")"
 ok "name == base refused"           "$SAME" "derived view name must differ from its base"
 GHOST="$(mcp call list_view_tree '{"view":"ghost"}')"
-ok "unknown view refused honestly"  "$GHOST" "no local metadata tree for view 'ghost'"
+ok "unknown view refused honestly"  "$GHOST" "no metadata tree for view 'ghost'"
 GONE="$(mcp call remove_view '{"name":"team"}')"
 ok "a physical base is not a definition slot" "$GONE" "no view definition 'team'"
 
