@@ -2369,13 +2369,15 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
     // Live-credential re-check (`--require-api-key`): at most one store lookup
     // per `KEY_RECHECK` window for this session, so a revoke reaches an
     // ESTABLISHED mount, bounded by the re-check window rather than the next
-    // handshake.
+    // handshake. The same tick refreshes the key's CURRENT `ro` flag, so
+    // `apikey set-ro` hot-swaps this mount's write verdict without a reconnect.
     let mut next_key_check = Instant::now() + crate::apikeys::KEY_RECHECK;
     // A read-only key (`apikey create --ro`) is refused every write-intent op
     // here, server-side, so "read-only" holds even against a client that mounted
     // without `-o ro` (the ack flag above already nudges honest clients to a
-    // read-only mount, but this gate is the authoritative one).
-    let key_ro = authed.as_ref().map(|a| a.ro).unwrap_or(false);
+    // read-only mount, but this gate is the authoritative one). Mutable
+    // because the re-check tick above re-reads it from the store.
+    let mut key_ro = authed.as_ref().map(|a| a.ro).unwrap_or(false);
 
     loop {
         let (op, body) = match pending.take() {
@@ -2392,17 +2394,23 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
         };
         if let (Some(store), Some(a)) = (&rt.keys, &authed) {
             if Instant::now() >= next_key_check {
-                if !store.is_live(&a.id, crate::apikeys::Scope::Mount) {
-                    let why = "authentication failed: this api key has been revoked";
-                    let _ = store.log_call(
-                        Some(a),
-                        "meta",
-                        "M_OPEN",
-                        false,
-                        &format!("view='{view}': {why}"),
-                    );
-                    let _ = proto::send_response(&mut writer, E_AUTH, 0, why.as_bytes());
-                    return Ok(());
+                let live = store.live_state(&a.id, crate::apikeys::Scope::Mount);
+                match live {
+                    None => {
+                        let why = "authentication failed: this api key has been revoked";
+                        let _ = store.log_call(
+                            Some(a),
+                            "meta",
+                            "M_OPEN",
+                            false,
+                            &format!("view='{view}': {why}"),
+                        );
+                        let _ = proto::send_response(&mut writer, E_AUTH, 0, why.as_bytes());
+                        return Ok(());
+                    }
+                    // Still live: adopt the CURRENT ro flag (an `apikey set-ro`
+                    // lands here, on the same ≤1s tick that carries a revoke).
+                    Some(state) => key_ro = state.ro,
                 }
                 next_key_check = Instant::now() + crate::apikeys::KEY_RECHECK;
             }

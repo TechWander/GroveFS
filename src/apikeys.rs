@@ -54,7 +54,13 @@
 //! `view` binding — WHICH single tree they may open (`None` = any view, a
 //! system-level key). A key's `ro` flag is enforced server-side: the meta- and
 //! data-servers refuse every write-intent op from a read-only key, so "read-
-//! only" no longer depends on the client honouring `mount -o ro`. Both access
+//! only" no longer depends on the client honouring `mount -o ro`. The flag is
+//! not frozen at mint — `apikey set-ro` flips it in place, and the live-session
+//! re-check ([`ApiKeyStore::live_state`]) reads the CURRENT row each
+//! [`KEY_RECHECK`] window, so the write verdict hot-swaps on an established
+//! mount (the kernel-side `-o ro` an `--ro` handshake nudged an honest client
+//! into still needs a remount to lift, but the authoritative server gate
+//! refuses or admits the op either way). Both access
 //! axes — WHICH single tree a key may open (`view` binding) and whether it may
 //! write at all (`ro`) — live in the credential itself; the self-reported uid
 //! stays advisory, and the key is the real gate against a malicious peer. The
@@ -89,6 +95,16 @@ impl AuthedKey {
     pub fn binds_to(&self, view: &str) -> bool {
         self.view.as_deref().map_or(true, |v| v == view)
     }
+}
+
+/// The live-session re-check verdict for one authenticated id: still
+/// admitted, plus the key's CURRENT `ro` flag — so `apikey set-ro` reaches an
+/// established mount within the re-check window instead of only the next
+/// handshake.
+#[derive(Debug, Clone, Copy)]
+pub struct LiveState {
+    pub live: bool,
+    pub ro: bool,
 }
 
 /// Which entrance(s) a key may open. Stored as a lowercase string.
@@ -531,30 +547,83 @@ impl ApiKeyStore {
     /// `last_used_at` stamp: this runs on a periodic path, not an
     /// authentication event).
     ///
-    /// Deliberately op-driven rather than timer-driven: the re-check runs when a
-    /// request reaches the server, so a session that serves nothing at all is
+    /// Kept as the boolean shim over [`Self::live_state`] for callers that
+    /// only gate on liveness.
+    pub fn is_live(&self, id: &str, want: Scope) -> bool {
+        self.live_state(id, want).map(|s| s.live).unwrap_or(false)
+    }
+
+    /// The re-check result for a live session: still admitted, and the
+    /// key's CURRENT read-only flag. Same primary-key lookup as
+    /// [`Self::is_live`] plus the `ro` column, so `apikey set-ro` hot-swaps a
+    /// live mount's write verdict within the re-check window WITHOUT a
+    /// reconnect: the mount servers refresh their cached gate from this row
+    /// each `KEY_RECHECK` tick, not just the revoke verdict.
+    ///
+    /// Deliberately op-driven rather than timer-driven: the re-check runs when
+    /// a request reaches the server, so a session that serves nothing at all is
     /// never probed (an idle socket grants no access by itself). Reads answered
     /// purely from a client's kernel cache likewise land before the next
-    /// round-trip — the revoke bound is "first server round-trip after the
-    /// window", not wall-clock. Unknown id, revoked row or a scope that no
-    /// longer fits the entrance all report `false`.
-    pub fn is_live(&self, id: &str, want: Scope) -> bool {
+    /// round-trip — the bound is "first server round-trip after the window",
+    /// not wall-clock. Unknown id, revoked row or a scope that no longer fits
+    /// the entrance all report `None`.
+    pub fn live_state(&self, id: &str, want: Scope) -> Option<LiveState> {
         let rows = self
             .query2(
-                "SELECT scope, revoked_at FROM api_keys WHERE id = ?1",
+                "SELECT scope, revoked_at, ro FROM api_keys WHERE id = ?1",
                 params![id],
-                |r| Ok((r.get::<_, String>(0)?, cell::<String>(r, 1)?)),
-                "SELECT scope, revoked_at FROM grovefs_control.api_keys WHERE id = $1",
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        cell::<String>(r, 1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                },
+                "SELECT scope, revoked_at, ro FROM grovefs_control.api_keys WHERE id = $1",
                 &[&id],
-                |r| (r.get::<_, String>(0), cell_str(r, 1)),
+                |r| {
+                    (
+                        r.get::<_, String>(0),
+                        cell_str(r, 1),
+                        r.get::<_, bool>(2) as i64,
+                    )
+                },
             )
             .unwrap_or_default();
-        match rows.first() {
-            Some((scope, revoked)) => {
-                revoked.is_none() && Scope::parse(scope).unwrap_or(Scope::Any).admits(want)
-            }
-            None => false,
+        let (scope, revoked, ro) = rows.first()?.clone();
+        if revoked.is_some() || !Scope::parse(&scope).unwrap_or(Scope::Any).admits(want) {
+            return None;
         }
+        Some(LiveState {
+            live: true,
+            ro: ro != 0,
+        })
+    }
+
+    /// Flip the read-only flag of an ACTIVE key in place (`apikey set-ro`).
+    /// Returns false if no active row matched `id` — a revoked key is NOT
+    /// resurrected and never authenticates again, and silently flipping a
+    /// dead row would make `list` lie about what revoke did. The new value is
+    /// picked up by every live session on its next [`KEY_RECHECK`] tick
+    /// ([`Self::live_state`]); a session established AFTER this call reads
+    /// the flag at `authenticate_for` as usual.
+    pub fn set_ro(&self, id: &str, ro: bool) -> Result<bool, String> {
+        // Same rows-affected path shape as `revoke`: one conditional UPDATE
+        // whose count distinguishes "flipped now" from "no active row".
+        let n = match &self.backend {
+            Backend::Sqlite(m) => m
+                .lock()
+                .execute(
+                    "UPDATE api_keys SET ro = ?1 WHERE id = ?2 AND revoked_at IS NULL",
+                    params![ro as i64, id],
+                )
+                .map_err(|e| e.to_string())?,
+            Backend::Pg(pool) => pool.execute(
+                "UPDATE grovefs_control.api_keys SET ro = $1 WHERE id = $2 AND revoked_at IS NULL",
+                &[&ro, &id],
+            )? as usize,
+        };
+        Ok(n > 0)
     }
 
     /// Every key, newest first (secrets never leave the store).
@@ -802,6 +871,54 @@ mod tests {
             "revoke reaches live sessions"
         );
         assert!(!s.is_live("nosuchid", Scope::Mount));
+    }
+
+    /// `live_state` is `is_live` plus the CURRENT `ro` column: the mount
+    /// servers refresh their cached write gate from it every `KEY_RECHECK`
+    /// tick, so `set_ro` hot-swaps a live session without a reconnect.
+    #[test]
+    fn live_state_carries_the_current_ro_flag() {
+        let s = store();
+        let (id, _k) = s.create_bound("toggler", Scope::Mount, None, true).unwrap();
+        assert!(s.live_state(&id, Scope::Mount).unwrap().ro, "minted --ro");
+        assert!(s.set_ro(&id, false).unwrap());
+        assert!(
+            !s.live_state(&id, Scope::Mount).unwrap().ro,
+            "re-check sees the flip to rw"
+        );
+        // A new handshake reads the same value the re-check path reports.
+        assert!(!s.authenticate_mount(&_k).unwrap().ro);
+        assert!(s.set_ro(&id, true).unwrap());
+        assert!(
+            s.live_state(&id, Scope::Mount).unwrap().ro,
+            "and back to ro"
+        );
+        // Liveness semantics match `is_live` exactly (scope + revoke).
+        assert!(
+            s.live_state(&id, Scope::Mcp).is_none(),
+            "scope still gates re-check"
+        );
+        assert!(s.revoke(&id).unwrap());
+        assert!(
+            s.live_state(&id, Scope::Mount).is_none(),
+            "revoke reaches live sessions"
+        );
+    }
+
+    /// `set_ro` only touches an ACTIVE row: it reports false (and changes
+    /// nothing) for a revoked or unknown id — a revoke is never silently
+    /// reversed by a permission flip.
+    #[test]
+    fn set_ro_refuses_revoked_and_unknown_ids() {
+        let s = store();
+        let (id, _k) = s.create_bound("gone", Scope::Mount, None, false).unwrap();
+        assert!(!s.set_ro("nosuchid", true).unwrap());
+        assert!(s.revoke(&id).unwrap());
+        assert!(
+            !s.set_ro(&id, true).unwrap(),
+            "a revoked row is not flipped"
+        );
+        assert_eq!(s.list().unwrap()[0].ro, false, "ro stayed as it was");
     }
 
     /// A key can now carry a view binding and a read-only flag. An unbound key

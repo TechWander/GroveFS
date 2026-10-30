@@ -719,16 +719,36 @@ enum ViewAction {
     /// trees, structure writable / content read-only) and pure aliases
     /// (name → real view, writable).
     List,
-    /// Remove a view DEFINITION `--name` (derived, fork or alias — the file slot
-    /// is shared). For derived/alias the underlying data is untouched;
-    /// already-mounted clients keep their resolved lens until they remount
-    /// (or the server's cache is evicted by an HA/snapshot event). Removing an
-    /// alias also makes the real name mountable again for NEW mounts. For a
-    /// FORK this also deletes its independent metadata tree and rebuilds the
-    /// cross-view ledger — the base's names and any still-held bytes stay.
+    /// Remove a view. WITHOUT `--base`: remove the view DEFINITION `--name`
+    /// (derived, fork or alias — the file slot is shared). For derived/alias
+    /// the underlying data is untouched; already-mounted clients keep their
+    /// resolved lens until they remount (or the server's cache is evicted by an
+    /// HA/snapshot event). Removing an alias also makes the real name mountable
+    /// again for NEW mounts. For a FORK this also deletes its independent
+    /// metadata tree and rebuilds the cross-view ledger — the base's names and
+    /// any still-held bytes stay.
+    ///
+    /// WITH `--base`: remove an entire physical BASE view `--name` from a local
+    /// SQLite store — its metadata tree dies, the cross-view ledger is rebuilt
+    /// from the surviving trees, and every content blob no other view holds is
+    /// freed through the store's data root (`--data-root`, default `--home`;
+    /// point it at the root/data-server that actually stores the objects).
+    /// Guards: a governed name needs the plain `view rm` first, an actively
+    /// mounted `grovefs:<name>` is refused, a `--store postgres://…` deployment
+    /// is refused (its tree is a PG schema — drop the schema and let PG/data
+    /// servers own the bytes). Other machines' live mounts of the same
+    /// meta-server are not visible here — stop them first.
     Rm {
         #[arg(long)]
         name: String,
+        /// Also remove the PHYSICAL base tree and reclaim unreferenced bytes
+        /// (see the long help; default removes only a definition slot).
+        #[arg(long)]
+        base: bool,
+        /// Data root holding `blocks/` for `--base` byte reclaim (same option
+        /// name and fallback as `grovefs import --data-root`).
+        #[arg(long)]
+        data_root: Option<PathBuf>,
     },
     /// Create/replace a PURE ALIAS `--name` for physical `--real`: name
     /// governance (vs `define`'s shape governance). No rules, so the alias
@@ -843,6 +863,23 @@ enum ApikeyAction {
     Revoke {
         #[arg(long)]
         id: String,
+    },
+    /// Flip the read-only flag of an ACTIVE key IN PLACE (short id prefix
+    /// accepted, like `revoke`). Default sets it read-only; `--rw` restores
+    /// read-write. This moves only the server-side write verdict — it never
+    /// touches liveness or authentication — and a live mount picks the new
+    /// verdict up on its next re-check tick (≤1s), no reconnect, no remount
+    /// (the same key's reads keep flowing while it is `ro`). A revoked id is
+    /// refused: a revoke is permanent and set-ro never half-undoes it.
+    SetRo {
+        #[arg(long)]
+        id: String,
+        /// Flip to read-only (the default when neither `--ro` nor `--rw` is given).
+        #[arg(long)]
+        ro: bool,
+        /// Flip to read-write (mutually exclusive with `--ro`).
+        #[arg(long, conflicts_with = "ro")]
+        rw: bool,
     },
     /// Show the most recent `--limit` (default 20) MCP call-audit rows.
     Calls {
@@ -1673,13 +1710,120 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
-                ViewAction::Rm { name } => {
-                    for l in grovefs::mcp::remove_view(&*ctrl, &name)? {
-                        match l {
-                            grovefs::mcp::OutLine::Info(s) => println!("{s}"),
-                            grovefs::mcp::OutLine::Note(s) => eprintln!("{s}"),
+                ViewAction::Rm {
+                    name,
+                    base: remove_base,
+                    data_root,
+                } => {
+                    if !remove_base {
+                        // Definition slot removal (derived/alias/fork) — the
+                        // shared implementation behind the MCP `remove_view`
+                        // tool.
+                        for l in grovefs::mcp::remove_view(&*ctrl, &name)? {
+                            match l {
+                                grovefs::mcp::OutLine::Info(s) => println!("{s}"),
+                                grovefs::mcp::OutLine::Note(s) => eprintln!("{s}"),
+                            }
+                        }
+                        return Ok(());
+                    }
+                    // Whole BASE view removal: guards first, then tree + ledger,
+                    // then byte reclaim through the store's data root.
+                    require_sqlite("`view rm --base`")?;
+                    if ctrl.has_def(&name)? {
+                        return Err(format!(
+                            "'{name}' is governed by a view definition — remove it first with `grovefs view rm --name {name}` (without --base)"
+                        )
+                        .into());
+                    }
+                    // A base others' definitions still resolve through must not
+                    // vanish from under them: an alias/lens/fork referencing it
+                    // would dangle (its mount then lazily creates an empty tree).
+                    for (dname, text) in ctrl.list_defs()? {
+                        let dep = match grovefs::layout::LayoutRules::parse_def(&text) {
+                            Ok(grovefs::layout::ViewDef::Derived(b, _)) => b == name,
+                            Ok(grovefs::layout::ViewDef::Fork(b)) => b == name,
+                            Ok(grovefs::layout::ViewDef::Alias(r)) => r == name,
+                            Err(_) => false,
+                        };
+                        if dep {
+                            return Err(format!(
+                                "view '{dname}' is governed by a definition over base '{name}' — remove it first (`grovefs view rm --name {dname}`) before `view rm --name {name} --base`"
+                            )
+                            .into());
                         }
                     }
+                    if let Some(mp) = view_mounted_at(&name) {
+                        return Err(format!(
+                            "view '{name}' is mounted here at {mp} — unmount it first (`grovefs umount -m {mp}`); mounts on OTHER machines are not visible in this mount table, stop them too"
+                        )
+                        .into());
+                    }
+                    if !grovefs::layout::valid_view_name(&name) {
+                        return Err(format!("invalid view name '{name}'").into());
+                    }
+                    let rm = meta::remove_base_view(&vbase, &name)?;
+                    let droot = data_root.unwrap_or_else(|| vbase.clone());
+                    let backend = backend::open_local(&droot)?;
+                    let (mut freed, mut stayed, mut missing, mut failed) =
+                        (0usize, 0usize, 0usize, 0usize);
+                    for dr in &rm.blob_refs {
+                        if meta::ledger_holds(&vbase, dr).unwrap_or(true) {
+                            stayed += 1; // another view still names it
+                            continue;
+                        }
+                        // Striped keys (s<N>:<stripe>:<uuid>) live as chunks on
+                        // the data-servers a ShardedBackend knows — a plain local
+                        // root cannot free them; report honestly, never half-delete.
+                        if dr.starts_with("s") && dr.matches(':').count() >= 2 {
+                            failed += 1;
+                            eprintln!(
+                                "note: striped object {dr} not freed from a plain local root — reclaim it through a mount or the data-servers"
+                            );
+                            continue;
+                        }
+                        // `remove` is idempotent (Ok for a never-existing key),
+                        // so probe existence via `len` FIRST: a wrong
+                        // --data-root must report "not found here", never a
+                        // phantom free.
+                        if backend.len(dr).is_err() {
+                            missing += 1;
+                            continue;
+                        }
+                        match backend.remove(dr) {
+                            Ok(()) => freed += 1,
+                            Err(e) => {
+                                failed += 1;
+                                eprintln!("warning: cannot free blob {dr}: {e}");
+                            }
+                        }
+                    }
+                    println!(
+                        "removed base view '{name}': {} node(s) gone, {} blob reference(s) dropped, {} object(s) freed from {}, {} still held by other views{}{}",
+                        rm.nodes,
+                        rm.blob_refs.len(),
+                        freed,
+                        droot.join("blocks").display(),
+                        stayed,
+                        if missing > 0 {
+                            format!(", {missing} not found under that data root (wrong --data-root? they live on another store)")
+                        } else {
+                            String::new()
+                        },
+                        if failed > 0 {
+                            format!(", {failed} could not be freed (see warnings above)")
+                        } else {
+                            String::new()
+                        }
+                    );
+                    if missing > 0 {
+                        eprintln!(
+                            "note: {missing} unreferenced blob(s) were NOT deleted — re-run with --data-root pointing at the store that holds them (default: this metadata root)"
+                        );
+                    }
+                    eprintln!(
+                        "note: new mounts of '{name}' are refused or lazily create an EMPTY tree (lazy mode) — run `init --view {name}` / `view create` to start over; live mounts of the removed name on other machines keep their resolved handles until they remount"
+                    );
                 }
                 ViewAction::Export { view, out, force } => {
                     if !grovefs::layout::valid_view_name(&view) {
@@ -1994,6 +2138,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 println!("  a `grovefs mcp` session in flight keeps its identity until it reconnects.");
                             } else {
                                 println!("apikey: id='{}' became revoked concurrently", k.id);
+                            }
+                        }
+                        n => {
+                            return Err(format!(
+                                "ambiguous id prefix '{id}' matches {n} keys — use a longer prefix or the full id"
+                            )
+                            .into())
+                        }
+                    }
+                }
+                ApikeyAction::SetRo { id, rw, .. } => {
+                    // Default (neither flag) and `--ro` set read-only; `--rw`
+                    // sets read-write. `ro` conflicts with `rw` at parse time.
+                    let ro_now = !rw;
+                    // Same id resolution as `revoke`: exact, else a UNIQUE prefix.
+                    let all = keys.list()?;
+                    let resolved: Vec<_> = if let Some(e) = all.iter().find(|k| k.id == id) {
+                        vec![e]
+                    } else {
+                        all.iter()
+                            .filter(|k| k.id.starts_with(id.as_str()))
+                            .collect()
+                    };
+                    match resolved.len() {
+                        0 => {
+                            return Err(format!(
+                                "no api key with id '{id}' (see `grovefs apikey list`)"
+                            )
+                            .into())
+                        }
+                        1 => {
+                            let k = resolved[0];
+                            if k.revoked_at.is_some() {
+                                return Err(format!(
+                                    "apikey id='{}' is revoked — set-ro never resurrects a revoked key (mint a new one)",
+                                    k.id
+                                )
+                                .into());
+                            }
+                            if keys.set_ro(&k.id, ro_now)? {
+                                if ro_now {
+                                    println!("apikey: id='{}' (label '{}') is now ro (read-only)", k.id, k.label);
+                                    println!("  a LIVE mount presenting this key starts refusing writes on its next re-check window (≤1s) — no reconnect, no remount; its reads keep flowing.");
+                                } else {
+                                    println!("apikey: id='{}' (label '{}') is now rw (read-write)", k.id, k.label);
+                                    println!("  a LIVE mount presenting this key resumes admitting writes on its next re-check window (≤1s) — no reconnect, no remount.");
+                                }
+                            } else {
+                                return Err(
+                                    format!("apikey id='{}' became revoked concurrently", k.id).into()
+                                );
                             }
                         }
                         n => {
@@ -2592,6 +2787,32 @@ fn mounted_at(wants: &[String]) -> bool {
             None => false,
         }
     })
+}
+
+/// The first mountpoint on THIS machine whose FUSE source is `grovefs:<view>`
+/// (the FSName every mount sets), if any. Used by `view rm --base` to refuse
+/// deleting a tree out from under a live local mount. Mounts served by a remote
+/// meta-server on ANOTHER machine are not in this table — documented, not hidden.
+fn view_mounted_at(view: &str) -> Option<String> {
+    let Ok(content) = std::fs::read_to_string("/proc/mounts") else {
+        return None;
+    };
+    let tag = format!("grovefs:{view}");
+    for l in content.lines() {
+        let mut it = l.split_whitespace();
+        let (Some(dev), Some(mp)) = (it.next(), it.next()) else {
+            continue;
+        };
+        if dev == tag {
+            return Some(
+                mp.replace("\\040", " ")
+                    .replace("\\011", "\t")
+                    .replace("\\012", "\n")
+                    .replace("\\134", "\\"),
+            );
+        }
+    }
+    None
 }
 
 fn run_fusermount(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {

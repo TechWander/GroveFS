@@ -964,6 +964,101 @@ pub fn rebuild_ledger(base: &Path) -> rusqlite::Result<usize> {
     Ok(counted)
 }
 
+/// Stats for a whole-base-view removal: what the tree held and what died with it.
+#[derive(Debug)]
+pub struct BaseViewRemoval {
+    /// Node rows (names) that were in the tree.
+    pub nodes: i64,
+    /// DISTINCT blob references the tree held (striped `s<N>:<stripe>:<uuid>`
+    /// keys included — the caller decides what a given backend can free).
+    pub blob_refs: Vec<String>,
+}
+
+/// Remove a physical BASE view's metadata tree from a local store: collect its
+/// blob references first (the tree is the only ledger of what it held), delete
+/// `meta/<view>.db` (+ WAL/SHM), then rebuild the cross-view ledger from the
+/// surviving trees so the dead tree's holds are gone. Returns the refs the tree
+/// held — a blob stays alive iff the rebuilt ledger still lists it; freeing the
+/// unreferenced ones is the caller's job through a `StorageBackend` (the key→
+/// path layout is backend-owned and offline here we only know the store root).
+/// A name governed by a definition (derived/alias/fork slot) is refused: delete
+/// the definition with `view rm` first, so the shared file slot is never
+/// double-interpreted.
+pub fn remove_base_view(base: &Path, view: &str) -> Result<BaseViewRemoval, String> {
+    if !crate::layout::valid_view_name(view) {
+        return Err(format!("invalid view name '{view}'"));
+    }
+    let meta_dir = base.join("meta");
+    let db = meta_dir.join(format!("{view}.db"));
+    if !db.is_file() {
+        return Err(format!(
+            "no physical base tree {} — '{view}' is either a governed name (see `grovefs view rm` WITHOUT --base), a lazily-created view that was never mounted, or a tree this store does not hold",
+            db.display()
+        ));
+    }
+    if meta_dir
+        .join("views")
+        .join(format!("{view}.layout"))
+        .is_file()
+    {
+        return Err(format!(
+            "'{view}' is governed by a view definition — remove the definition first (`grovefs view rm --name {view}`) before removing a base tree of the same name"
+        ));
+    }
+    // Read the tree's blob set BEFORE deleting: once the db is gone there is no
+    // record of what it referenced (same reason `view export` must run while the
+    // tree exists).
+    let (nodes, blob_refs) = {
+        let conn = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| format!("cannot open {}: {e}", db.display()))?;
+        conn.execute_batch("PRAGMA busy_timeout=5000;")
+            .map_err(|e| format!("cannot lock {}: {e}", db.display()))?;
+        let nodes: i64 = conn
+            .query_row("SELECT COUNT(*) FROM node", [], |r| r.get(0))
+            .unwrap_or(0);
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT data_ref FROM node WHERE data_ref IS NOT NULL")
+            .map_err(|e| format!("cannot read blob references: {e}"))?;
+        let refs: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| format!("cannot read blob references: {e}"))?
+            .filter_map(|x| x.ok())
+            .collect();
+        (nodes, refs)
+    }; // read-only handle dropped before the delete
+    for ext in ["", "-wal", "-shm"] {
+        let p = meta_dir.join(format!("{view}.db{ext}"));
+        if p.exists() {
+            std::fs::remove_file(&p).map_err(|e| format!("cannot delete {}: {e}", p.display()))?;
+        }
+    }
+    // The dead tree's holds must die with it: rewrite the ledger from the
+    // surviving trees so a blob it shared with no other view reads holders 0.
+    rebuild_ledger(base)
+        .map_err(|e| format!("tree removed, but the ledger rebuild failed: {e}"))?;
+    Ok(BaseViewRemoval { nodes, blob_refs })
+}
+
+/// Does the freshly rebuilt ledger still hold `dr`? A ref absent from
+/// `holders` has no surviving view name → its blob may be freed (same
+/// exists-check idiom as [`other_view_holds`]). Public so the CLI (which owns
+/// the backend) can decide per ref after [`remove_base_view`].
+pub fn ledger_holds(base: &Path, dr: &str) -> rusqlite::Result<bool> {
+    let conn = Connection::open_with_flags(
+        base.join("meta").join(REFS_DB),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+    let found = conn
+        .query_row(
+            "SELECT 1 FROM holders WHERE data_ref=?1 LIMIT 1",
+            params![dr],
+            |_| Ok(()),
+        )
+        .is_ok();
+    Ok(found)
+}
+
 fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

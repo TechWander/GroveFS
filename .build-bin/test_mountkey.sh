@@ -259,6 +259,48 @@ if T sh -c "printf 'x' > .mktest/mnt_ro/projects/note.txt" 2>/dev/null; then
   bad "a read-only key overwrote existing content"
 else ok "a read-only key cannot overwrite existing content"; fi
 
+# ---------------------------------------------------------------------------
+echo "===== 12) set-ro: flip rw <-> ro IN PLACE, hot on the live mount ====="
+mkdir -p .mktest/mnt_tog
+# Start from a READ-WRITE key so the mount is fully writable at the OS level:
+# every refusal below can only come from the SERVER-side gate, which is what
+# `set-ro` moves. (A mount minted `--ro` is kernel read-only from the handshake;
+# that cap needs a remount and is NOT what this asserts.)
+CT=$($Y apikey --db-path "$BASE" create --label toggler --for mount --view alice 2>&1)
+ID_TOG=$(echo "$CT" | sed -n 's/^  id:    //p')
+KEY_TOG=$(echo "$CT" | sed -n 's/^  key:   //p')
+MLIVE .mktest/tog.log PID_TOG $Y --home .mktest/home mount --view alice --mountpoint .mktest/mnt_tog --meta $META --data $DATA --api-key "$KEY_TOG"
+T mkdir .mktest/mnt_tog/pre_rw && ok "baseline: the rw key's live mount writes" || bad "toggle mount not writable: $(cat .mktest/tog.log)"
+# rw -> ro over the CLI (a unique short id prefix, like revoke accepts).
+SROUT=$($Y apikey --db-path "$BASE" set-ro --id "${ID_TOG:0:8}" 2>&1)
+echo "$SROUT" | grep -q "is now ro (read-only)" && ok "set-ro flips rw->ro by id prefix" || bad "set-ro output: $SROUT"
+echo "$SROUT" | grep -qi "re-check window" && ok "set-ro states the hot-effect contract (live mounts, ≤1s, no reconnect)" || bad "set-ro output silent on the live contract: $SROUT"
+LIVE .mktest/mnt_tog && ok "the flip did NOT tear the mount down (a permission change, not an auth loss)" || bad "mount died on set-ro: $(cat .mktest/tog.log)"
+sleep 1.3                                   # past the 1s re-check window
+if T mkdir .mktest/mnt_tog/should_fail 2>/dev/null; then
+  bad "write admitted after set-ro -> ro (hot re-check not reading the flag)"
+else ok "writes refused on the SAME live mount within the re-check window (meta gate EPERM)"; fi
+if T sh -c "printf 'x' > .mktest/mnt_tog/pre_rw/f.txt" 2>/dev/null; then
+  bad "content write admitted after set-ro -> ro (data-plane gate not hot)"
+else ok "content writes refused too (data plane refreshes ro on its own tick)"; fi
+chk "$(T cat .mktest/mnt_tog/projects/note.txt)" "payload" "reads keep flowing while ro"
+# ro -> rw with --rw, same live mount, no reconnect.
+SROUT2=$($Y apikey --db-path "$BASE" set-ro --id "$ID_TOG" --rw 2>&1)
+echo "$SROUT2" | grep -q "is now rw (read-write)" && ok "set-ro --rw flips ro->rw in place" || bad "set-ro --rw output: $SROUT2"
+sleep 1.3
+T mkdir .mktest/mnt_tog/post_rw && ok "writes admitted again on the live mount — no reconnect, no remount" || bad "rw not restored hot: $(cat .mktest/tog.log)"
+# The rw COLUMN (field 6 of the list row) flipped, not just some "rw" text.
+ROWCOL=$($Y apikey --db-path "$BASE" list 2>&1 | grep -F "$ID_TOG" | awk '{print $6}')
+chk "$ROWCOL" "rw" "list reflects the flipped rw column"
+# The guard cases: unknown id, and a revoked row that set-ro must not resurrect.
+if $Y apikey --db-path "$BASE" set-ro --id nosuchkeyid --rw >/dev/null 2>&1; then
+  bad "set-ro of an unknown id should fail but exited 0"
+else ok "set-ro of an unknown id errors (non-zero)"; fi
+$Y apikey --db-path "$BASE" revoke --id "$ID_TOG" >/dev/null 2>&1
+if $Y apikey --db-path "$BASE" set-ro --id "$ID_TOG" --rw >/dev/null 2>&1; then
+  bad "set-ro flipped a REVOKED row (a revoke is permanent)"
+else ok "set-ro refuses a revoked id (never half-undoes a revoke)"; fi
+
 # ---- summary ----
 echo
 echo "SUMMARY: pass=$pass fail=$fail"

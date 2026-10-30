@@ -408,7 +408,9 @@ fn handle_conn(
     // Live-credential re-check: one store lookup per connection per
     // `KEY_RECHECK` window (a control-plane query, off the per-byte hot path),
     // so `grovefs apikey revoke` closes an ESTABLISHED data connection instead
-    // of only refusing the next mount. Only checked when traffic arrives: an
+    // of only refusing the next mount. The same tick refreshes the key's
+    // CURRENT `ro` flag, so `apikey set-ro` hot-swaps content-write verdicts
+    // without a reconnect. Only checked when traffic arrives: an
     // idle socket holds no access. The next client op sees the refusal and,
     // because its credential was accepted at setup, tears its mount down
     // cleanly (see [`super::signal_auth_loss`]).
@@ -419,7 +421,8 @@ fn handle_conn(
     // data plane can enforce is read-only — a hard cap that holds even if a
     // client mounted without `-o ro`. EROFS mirrors the fencing gate (a
     // read-only verdict, not an auth loss, so the client keeps its mount).
-    let key_ro = authed.as_ref().map(|a| a.ro).unwrap_or(false);
+    // Mutable because the re-check tick above re-reads it from the store.
+    let mut key_ro = authed.as_ref().map(|a| a.ro).unwrap_or(false);
 
     loop {
         let (op, body) = match proto::recv_request(&mut reader) {
@@ -434,11 +437,16 @@ fn handle_conn(
         };
         if let (Some(store), Some(a)) = (&keys, &authed) {
             if std::time::Instant::now() >= next_check {
-                if !store.is_live(&a.id, crate::apikeys::Scope::Mount) {
-                    let why = "authentication failed: this api key has been revoked";
-                    let _ = store.log_call(Some(a), "data", "OP_OPEN", false, why);
-                    let _ = proto::send_response(&mut writer, EACCES, 0, why.as_bytes());
-                    return Ok(());
+                match store.live_state(&a.id, crate::apikeys::Scope::Mount) {
+                    None => {
+                        let why = "authentication failed: this api key has been revoked";
+                        let _ = store.log_call(Some(a), "data", "OP_OPEN", false, why);
+                        let _ = proto::send_response(&mut writer, EACCES, 0, why.as_bytes());
+                        return Ok(());
+                    }
+                    // Still live: adopt the CURRENT ro flag (an `apikey set-ro`
+                    // lands here, on the same ≤1s tick that carries a revoke).
+                    Some(state) => key_ro = state.ro,
                 }
                 next_check = std::time::Instant::now() + crate::apikeys::KEY_RECHECK;
             }

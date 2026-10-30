@@ -70,7 +70,7 @@ SKIP_BENCH=${SKIP_BENCH:-0}
 LOGDIR=.build-bin/logs/$(date +%Y%m%d-%H%M%S)
 mkdir -p "$LOGDIR"
 
-CANON="build unit posix edge e2e remote errors resilience concurrent metasrv ha striping locks freshness disp_fresh layout fork migrate import govcheck govtime grovesci mcp apikey mountkey config pg pg_parallel control bench"
+CANON="build unit posix edge e2e remote errors resilience concurrent metasrv ha striping locks freshness disp_fresh layout fork viewrm migrate import govcheck govtime grovesci mcp apikey mountkey config pg pg_parallel control bench"
 if [ "$#" -gt 0 ]; then SEL="$*"; else SEL="$CANON"; fi
 [ "$SKIP_BENCH" = "1" ] && SEL=${SEL// bench/}
 
@@ -82,10 +82,10 @@ should(){ case " $SEL " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
 # ensure a fresh binary whenever a code suite is selected
 NEEDS_BUILD=0
-for s in $SEL; do case "$s" in unit|posix|edge|e2e|remote|errors|resilience|concurrent|metasrv|ha|striping|locks|freshness|disp_fresh|layout|fork|migrate|import|govcheck|govtime|grovesci|mcp|apikey|mountkey|config|pg|pg_parallel|bench) NEEDS_BUILD=1 ;; esac; done
+for s in $SEL; do case "$s" in unit|posix|edge|e2e|remote|errors|resilience|concurrent|metasrv|ha|striping|locks|freshness|disp_fresh|layout|fork|viewrm|migrate|import|govcheck|govtime|grovesci|mcp|apikey|mountkey|config|pg|pg_parallel|bench) NEEDS_BUILD=1 ;; esac; done
 if [ "$NEEDS_BUILD" = 1 ] && ! should build; then SEL="build $SEL"; fi
 
-MOUNTS=".test/mnt_alice .test/mnt_bob .test/mnt_r .ptest/mnt .etest/mnt .xtest/mnt .xtest/mnt_ro .rtest/mnt_a .rtest/mnt_b .ctest/m1 .ctest/m2 .msrv/mnt_a .msrv/mnt_b .msrv/mnt_bob .msrv/mnt_s1 .msrv/mnt_s2 .ltest/mnt_base .ltest/mnt_a .ltest/mnt_b .ltest/mnt_c .ltest/mnt_d .ltest/mnt_srv .ltest/mnt_srvbase .ltest/mnt_ld .ftest/mnt_base .ftest/mnt_lab .ftest/mnt_srv_lab .ftest/mnt_srv_base .migtest/mnt_src .migtest/mnt_dst .migtest/mnt_lab .migtest/mnt_alpha .migtest/mnt_beta .migtest/mnt_all .govcheck/mnt_base .govcheck/mnt_lens .govcheck/mnt_map .govtime/mnt_base .govtime/mnt_dv .govtime/mnt_al .grovesci/mnt_dr .grovesci/mnt_al .grovesci/mnt_refused .mcptest/mnt .mcptest/mnt_al .itest/mnt .itest/mnt_r .itest/mnt_v .bench/mnt .bt-t1/mnt .bt-t4/mnt .br/mnt .ha/mnt .ha/mnt_sb .striping/mnt .striping/mnt_legacy .sigtest/mnt .locks/m1 .locks/m2 .locks/ha/mnt .fresh/mnt_a .fresh/mnt_b .dfresh/mntA .dfresh/mntB .mktest/mnt_ok .mktest/mnt_any .mktest/mnt_env .mktest/mnt_denied .mktest/mnt_tok .mktest/mnt_dat .mktest/mnt_plain .mktest/mnt_ign .mktest/mnt_fo .cfgtest/mnt1 .cfgtest/mnt2 .cfgtest/mnt3 .cfgtest/mnt4 .cfgtest/mnt_seed .pgtest/mnt_a .pgtest/mnt_b .pgpar/mnt_a .pgpar/mnt_b .pgpar/mnt_c"
+MOUNTS=".test/mnt_alice .test/mnt_bob .test/mnt_r .ptest/mnt .etest/mnt .xtest/mnt .xtest/mnt_ro .rtest/mnt_a .rtest/mnt_b .ctest/m1 .ctest/m2 .msrv/mnt_a .msrv/mnt_b .msrv/mnt_bob .msrv/mnt_s1 .msrv/mnt_s2 .ltest/mnt_base .ltest/mnt_a .ltest/mnt_b .ltest/mnt_c .ltest/mnt_d .ltest/mnt_srv .ltest/mnt_srvbase .ltest/mnt_ld .ftest/mnt_base .ftest/mnt_lab .ftest/mnt_srv_lab .ftest/mnt_srv_base .migtest/mnt_src .migtest/mnt_dst .migtest/mnt_lab .migtest/mnt_alpha .migtest/mnt_beta .migtest/mnt_all .govcheck/mnt_base .govcheck/mnt_lens .govcheck/mnt_map .govtime/mnt_base .govtime/mnt_dv .govtime/mnt_al .grovesci/mnt_dr .grovesci/mnt_al .grovesci/mnt_refused .mcptest/mnt .mcptest/mnt_al .itest/mnt .itest/mnt_r .itest/mnt_v .bench/mnt .bt-t1/mnt .bt-t4/mnt .br/mnt .ha/mnt .ha/mnt_sb .striping/mnt .striping/mnt_legacy .sigtest/mnt .locks/m1 .locks/m2 .locks/ha/mnt .fresh/mnt_a .fresh/mnt_b .dfresh/mntA .dfresh/mntB .mktest/mnt_ok .mktest/mnt_any .mktest/mnt_env .mktest/mnt_denied .mktest/mnt_tok .mktest/mnt_dat .mktest/mnt_plain .mktest/mnt_ign .mktest/mnt_fo .cfgtest/mnt1 .cfgtest/mnt2 .cfgtest/mnt3 .cfgtest/mnt4 .cfgtest/mnt_seed .pgtest/mnt_a .pgtest/mnt_b .pgpar/mnt_a .pgpar/mnt_b .pgpar/mnt_c .vrtest/mnt .vrtest/mnt2 .vrtest/mntA"
 umount_all(){ for d in $MOUNTS; do fusermount -u "$d" 2>/dev/null || true; done; }
 umount_all
 trap umount_all EXIT
@@ -174,6 +174,7 @@ for s in $CANON; do
     disp_fresh) run_mountsuite disp_fresh .build-bin/test_disp_fresh.sh 240 ;;
     layout)   run_mountsuite layout .build-bin/test_layout.sh 240 ;;
     fork)     run_mountsuite fork   .build-bin/test_fork.sh   300 ;;
+    viewrm)   run_mountsuite viewrm  .build-bin/test_viewrm.sh 300 ;;
     migrate)  run_mountsuite migrate .build-bin/test_migrate.sh 300 ;;
     import)   run_mountsuite import   .build-bin/test_import.sh   240 ;;
     govcheck) run_mountsuite govcheck .build-bin/test_govcheck.sh 240 ;;

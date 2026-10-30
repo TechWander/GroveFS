@@ -170,5 +170,31 @@ if [ "$(fget .apitest/out_plain 2 '.result.tools|length')" = "9" ]; then
   ok "opt-in honored: without --require-api-key the tool surface stays open (logged, not gated)"
 else bad "plain server unexpectedly gated: $(cat .apitest/out_plain)"; fi
 
+# ---------------------------------------------------------------- CLI: set-ro
+echo "===== 7) set-ro flips ro <-> rw in place (CLI plumbing) ====="
+# Mint an `any`-scoped --ro key (this suite is the MCP plane; `--for mount` would
+# be refused by SCOPE, which is orthogonal to the ro flag set-ro moves).
+C4=$($Y apikey --db-path "$BASE" create --label toggler --ro 2>&1)
+ID4=$(echo "$C4" | sed -n 's/^  id:    //p')
+KEY4=$(echo "$C4" | sed -n 's/^  key:   //p')
+echo "$C4" | grep -q "^  rw:    ro (read-only)$" && ok "an --ro key (any scope) mints read-only" || bad "mint rw line: $C4"
+$Y apikey --db-path "$BASE" set-ro --id "$ID4" --rw 2>&1 | grep -q "is now rw (read-write)" \
+  && ok "set-ro --rw reports the flip to read-write" || bad "set-ro --rw output wrong"
+COL4=$($Y apikey --db-path "$BASE" list 2>&1 | grep -F "$ID4" | awk '{print $6}')
+[ "$COL4" = "rw" ] && ok "list's rw column now reads 'rw'" || bad "rw column: '$COL4'"
+# The flipped key still authenticates the MCP plane (set-ro never touches
+# liveness/scope; `ro` itself is a mount-plane dimension the MCP gate ignores).
+frames "$KEY4" tog > .apitest/in_tog
+T $Y mcp --db-path "$BASE" --require-api-key < .apitest/in_tog > .apitest/out_tog 2>/dev/null
+[ "$(fget .apitest/out_tog 2 '.result.tools|length')" = "9" ] \
+  && ok "the flipped key still authenticates (set-ro never breaks liveness)" || bad "flipped key lost auth: $(cat .apitest/out_tog)"
+$Y apikey --db-path "$BASE" set-ro --id "$ID4" --ro 2>&1 | grep -q "is now ro (read-only)" \
+  && ok "explicit --ro flips back to read-only" || bad "set-ro --ro output wrong"
+COL4B=$($Y apikey --db-path "$BASE" list 2>&1 | grep -F "$ID4" | awk '{print $6}')
+[ "$COL4B" = "ro" ] && ok "list's rw column reads 'ro' again" || bad "ro column: '$COL4B'"
+if $Y apikey --db-path "$BASE" set-ro --id "nosuchkeyid" >/dev/null 2>&1; then
+  bad "set-ro of an unknown id should fail but exited 0"
+else ok "set-ro of an unknown id errors (non-zero)"; fi
+
 echo "SUMMARY: pass=$pass fail=$fail"
 [ "$fail" -eq 0 ]
