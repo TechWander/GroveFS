@@ -83,13 +83,30 @@ bash scripts/smoke.sh
   back inside the result as
   `{"result":{"content":[{"type":"text","text":"…"}],"isError":true}}`, so an
   agent client shows the wording instead of crashing. The JSON-RPC layer is
-  reserved for protocol problems: malformed frame `-32700` (the server keeps
-  serving), unknown resource URI `-32002`, authentication failure `-32001`.
-- **Frames without an id (notifications) are never answered** — do not wait for
+  reserved for protocol problems, and each code tells you a different story:
+
+  | Code | When it fires (measured) |
+  |---|---|
+  | `-32700` | frame is not valid JSON — `invalid JSON-RPC frame: …`; **the server keeps serving** the later lines |
+  | `-32601` | method not implemented — `method not found: foo/bar` |
+  | `-32602` | bad *protocol* arguments: `resources/read` with no `uri`, `prompts/get` unknown/missing prompt, bad `completion/complete` argument |
+  | `-32603` | internal error, today only `resources/list` failing to read the store |
+  | `-32001` | authentication gate (see "Authentication") |
+  | `-32002` | resource URI unusable — malformed URI **or** the view's tree is not in the bound store |
+
+  A *missing tool argument* is deliberately **not** a protocol error: it comes
+  back as `isError` with `missing string argument 'name'`, like any refusal.
+- Frames without an id (notifications) are never answered — do not wait for
   a reply after sending one (`notifications/initialized`,
   `notifications/cancelled`).
 - Every tool accepts an optional `db_path` that overrides the server default,
-  so one process can serve several store roots.
+  so one process can serve several store roots — **except** `preview_rules`
+  (parser-only, no store) and except under a `--store postgres://…` server,
+  where the control plane is URI-bound and `db_path` is ignored (verified:
+  the reply's `store` still names the URI).
+- A PG-bound server answers against PG even with no local `meta/` directory at
+  all; a file-bound server never reaches a PG or remote tree (see the probe
+  refusal text below).
 - Missing arguments and unknown tools surface as `isError`, not as protocol
   errors.
 
@@ -97,9 +114,9 @@ bash scripts/smoke.sh
 
 | Tool | Arguments (★ required) | Purpose |
 |---|---|---|
-| `list_views` | `db_path` | Whole-store snapshot: physical views plus every definition slot (kind / real_view / rule counts / mount semantics) |
+| `list_views` | `db_path` | Whole-store snapshot as `{backend, store, physical[], defined[]}` — `backend` is `sqlite`/`postgres` and `store` names the control-plane root actually read (use it to confirm you are talking to the store you meant) |
 | `get_view` | ★`name` | Full record of one view, including the **verbatim `definition` rules** — read it before editing rules |
-| `list_view_tree` | `view` \| ★(`base`+`rules`), plus `path`/`depth`(6)/`max`(800) | Renders the listing a mount would actually show; can also preview an unpublished rule set **without touching disk**. `size` is a metadata field, not a byte count (dirs 4096 / files 0 / symlinks report the target length) |
+| `list_view_tree` | `view` \| ★(`base`+`rules`), plus `path`/`depth`(6)/`max`(800) | Renders the listing a mount would actually show; can also preview an unpublished rule set **without touching disk**. `view` resolves like a mount — a fork's own tree is walked as `kind:"fork"`. `size` is a metadata field, not a byte count (dirs 4096 / files 0 / symlinks report the target length) |
 | `define_derived_view` | ★`name` ★`base` ★`rules` | Publish/replace a **read-only** derived lens |
 | `alias_view` | ★`name` ★`real` \| `retire` | Publish a writable public alias; `retire` rotates names gaplessly (write new, then remove old) |
 | `fork_view` | ★`name` ★`base` | Seed an **independent metadata tree** (structure writable, content `EROFS`, bytes shared) |
@@ -113,8 +130,16 @@ tree read-only **through the backend the server is bound to** — the local
 schema under `--store postgres://…` — and renders it through the same
 `LayoutMeta` lens a mount uses; `get_view` only reads the definition's text.
 A tree the served store cannot reach is refused with the exact wording
-`no metadata tree for view 'X' … list_view_tree walks this store's own
-backend; a remote tree not reachable from here is not`.
+(verified against the current build):
+
+```
+no metadata tree for view 'X' (<db>/meta/X.db) — list_view_tree walks this
+store's own backend; a remote tree not reachable from here is not
+```
+
+… and the same probe is what the JSON-RPC layer answers as `-32002` when you
+reach it through `resources/read` instead of as a tool (a resource URI that
+cannot be served is treated as a protocol problem, not a governance refusal).
 Because the walk only reads metadata and never asks the data plane for object
 lengths, the `size` in a response is **not a file size** (dirs `4096`, files `0`,
 symlinks report their target's character length); mount and `stat` for real bytes.
@@ -180,40 +205,81 @@ Derived views always mount read-only (write through to the base view). A `map`
 
 ## What gets refused (exact texts, so you self-check instead of retry-guessing)
 
+Every string below is the byte-exact `isError` text measured from the current
+build. Match on the leading phrase, not on the whole sentence — the tail of some
+lines interpolates your own names/paths.
+
 | What you tried | The `isError` text you get back |
 |---|---|
+| Missing a required tool argument | `missing string argument '<key>'` |
+| Typoed a tool name | `unknown tool '<name>'` |
+| `list_view_tree` with only `base` | `'base' also needs inline 'rules' to simulate a lens (got base '<b>' alone)` |
+| `list_view_tree` with neither `view` nor `base`+`rules` | `provide 'view' (an existing view) or 'base' + 'rules' (a simulated lens)` |
+| `list_view_tree` on a name with no reachable tree | `no metadata tree for view '<X>' (<path>) — list_view_tree walks this store's own backend; …` |
+| `get_view` / `list_view_tree` on an unknown name | `no view '<name>' in <store> (not a definition nor a physical view tree) — \`list_views\` names what exists` |
+| Bad verb or ambiguous destination in rules | `bad layout rules: line <N>: …` |
 | Derived name == base name | `derived view name must differ from its base` |
 | Definition name collides with a physical db name | `'<name>' already names a physical view db — pick another name` |
-| Defining over an alias / fork name | `'<name>' is a pure alias — remove it first …` / `… is a fork …` |
-| Alias pointing at an alias | `alias target '<real>' is itself an alias (-> '<x>') — chains are not supported` |
-| Alias pointing at a derived view | `alias target '<real>' is a derived (virtual) view — aliases map onto a physical view only` |
-| A second public name for the same real view | `real view '<real>' is already governed by alias '<old>' — one public name per real view; to rotate it gaplessly use … --retire` |
-| `retire` removing an alias of a different view | `--retire '<old>' currently aliases a different real view ('<r>'), not '<real>'` |
-| Forking a base that is not a local SQLite bare base | `no physical base tree … \`fork\` copies a LOCAL SQLite tree … A PostgreSQL-backed view cannot be forked` |
+| Defining over an alias / fork name | `'<name>' is a pure alias — remove it first …` / `'<name>' is a fork (an independent metadata tree) — remove it first …` |
+| Alias target is itself an alias | `alias target '<real>' is itself an alias (-> '<x>') — chains are not supported; alias the physical view instead` |
+| Alias target is a derived view | `alias target '<real>' is a derived (virtual) view — aliases map onto a physical view only` |
+| Alias target is a fork | `alias target '<real>' is a fork (an independent metadata tree) — aliases map onto a physical view only; give the fork its own key binding …` |
+| A second public name for the same real view | `real view '<real>' is already governed by alias '<old>' — one public name per real view; to rotate it gaplessly use \`… --retire\`` |
+| `retire` naming something that is not an alias here | `--retire '<old>' is not a pure alias here (a derived view is separate — \`grovefs view list\` shows what '<old>' actually is)` |
+| `retire` removing an alias of a different view | `--retire '<old>' currently aliases a different real view ('<r>'), not '<real>' — rotation must retire the previous name of the same view` |
+| `retire` equal to the new name | `--retire must name a DIFFERENT (previous) alias, not the one being created` |
+| Forking a base with no local tree | `no physical base tree for '<base>' in <store> — \`fork\` copies a LOCAL SQLite tree; … A PostgreSQL-backed view cannot be forked (…)` |
 | Forking through a `--store postgres://…` server even when the base schema exists | `fork is not implemented on the PostgreSQL backend yet (the tree copy needs a per-view snapshot path; PG-backed views are served through a meta-server or a mount)` |
 | Forking a base that is itself governed | `base '<base>' is governed by a definition (alias/derived/fork) — fork the physical base tree instead` |
 | Fork name == base name | `fork name must differ from its base` |
 | Forking a name that already has a definition | `view '<name>' already has a definition — remove it first (\`grovefs view rm --name <name>\`) before forking` |
-| Deleting a physical base view name | `no view definition '<name>' under <db>/meta/views` (`remove_view` only manages definition slots) |
-| Name is not a safe path element | `invalid view name '<name>' (must be one safe path element)` |
+| `remove_view` on a name with no definition slot (incl. a physical base view) | `no view definition '<name>' in <store>` — the store is named as `… (local files)` or `… (PostgreSQL grovefs_control)`, **not** as a `<db>/meta/views` path |
+| Name is not a single safe path element (empty, `.`, `..`, containing `/`, `\\` or whitespace) | `invalid view name '<name>' (must be one safe path element)` for `define`/`validate`; `invalid alias name …` / `invalid fork name …` for those tools; `remove_view`, `get_view` and `list_view_tree` shorten it to `invalid view name '<name>'`, and a bad **base** reads `invalid base view name '<base>'` / `invalid real view name '<real>'` |
 
 ## Authentication and audit (when fronting the interface to many callers)
 
-- `grovefs mcp --require-api-key` gates **every method that reads or writes
-  governance state**: `tools/list`, `tools/call`, `resources/list`,
-  `resources/templates/list`, `resources/read`, `completion/complete`;
-  `initialize` / `ping` / `prompts/*` / `logging/*` **stay open** (so a client can
-  handshake, fetch the static playbooks, and control verbosity).
-- Credentials: `grovefs apikey --db-path <D> create --label L --for mcp` (the MCP
-  plane requires scope `mcp` or `any`; `--view`/`--ro` are **mount-plane**
-  dimensions). The plaintext is printed once; only the SHA-256 is stored.
+- `grovefs mcp --require-api-key` gates **exactly these six methods**: `tools/list`,
+  `tools/call`, `resources/list`, `resources/templates/list`, `resources/read`,
+  `completion/complete`. Measured open (never gated): `initialize`, `ping`,
+  `prompts/list`, **`prompts/get`** (so a playbook is readable pre-auth — it is
+  static text, not store state), `logging/setLevel`, and all notifications.
+- Credentials: `grovefs apikey --db-path <D> create --label L --for mcp`
+  (or `--for any`). The MCP entrance asks for scope `mcp`, so a `--for mount`
+  key is refused with `this api key is scoped to 'mount', not 'mcp'`.
+  `--view`/`--ro` are **mount-plane** dimensions (see the boundary below).
+  The plaintext is printed once; only the SHA-256 is stored.
 - Presentation: `params.apiKey = "<ID>:<SECRET>"` in `initialize`, or export
-  `GROVEFS_MCP_API_KEY` on the server side.
+  `GROVEFS_MCP_API_KEY` on the server side (verified: an env-preauthorized
+  session is admitted and its later calls are attributed to that key id).
 - Unauthenticated access to a gated method → JSON-RPC `-32001` with
   `authentication required: present a valid apiKey in the initialize params (or export GROVEFS_MCP_API_KEY for the server)`.
-- Every `tools/call` and `resources/read` (including failures, including
-  refused-unauthenticated) lands in the audit table: read it back with
-  `grovefs apikey calls`; after `apikey revoke` that key fails auth immediately.
+  **The client never learns *why* the key failed** — a bad id, a bad secret, a
+  revoked key and a wrong-scope key all look like the same `-32001`. The real
+  reason is written to the audit log as an `initialize` row
+  (`authentication failed: unknown api key id` / `invalid api key secret` /
+  `this api key has been revoked` / `this api key is scoped to 'mount', not 'mcp'`),
+  so debugging an auth problem is an operator job: `grovefs apikey calls`.
+- Audit: every `tools/call` and `resources/read` lands in the table, plus every
+  gated call refused for no key and every `initialize` attempt, success or
+  failure. Columns: `ts, key_id, key_label, method, tool, ok, detail`. `detail`
+  is secret-free and size-bounded — it keeps the identifying names
+  (`name=… base=… real=… view=… retire=… path=…`) and reduces `rules` to a line
+  count (`rules=2L`); `depth`/`max`/`db_path` are not recorded. A refused call
+  stores the refusal text (clipped to 200 chars) as its `detail`.
+- Revocation is immediate: after `apikey revoke` that key fails `initialize`
+  authentication on the next connection (verified → the gated methods return
+  `-32001` again and the audit gets `this api key has been revoked`).
+- On a `--store postgres://…` server the keys and the audit rows are the PG
+  tables `grovefs_control.api_keys` / `grovefs_control.mcp_calls` (mint with
+  `grovefs apikey --store <URI> create …`); no local `api_keys.db` is created —
+  verified. So a key minted anywhere gates every server pointed at that URI.
+- If the control-plane backend is unreachable the server **does not start**: it
+  exits with `Error: … "postgres connect error connecting to server"` (verified
+  against a dead URI) — so a "command immediately returns nothing" symptom is a
+  startup problem, not an auth problem. The key store itself is opened
+  best-effort: if only it fails while the control store is fine, every gated call
+  is still refused (`-32001`) but **no audit row can be written** — never read an
+  empty audit log as "nothing happened".
 
 ## Hard boundaries (do not try to work around them, and do not promise otherwise to the user)
 
@@ -227,6 +293,12 @@ Derived views always mount read-only (write through to the base view). A `map`
   wire protocol straight to the `data-server` bypasses it.
 - This interface never mounts, never reads data bytes, never creates physical
   views, and does not do `view export/import` (those are CLI).
+- **A key's `--ro` flag (and `apikey set-ro`) does NOT restrict this entrance.**
+  `ro` is enforced only on the mount plane (`meta-server`/`data-server` write
+  verdicts); the MCP server never reads it. Verified: an `--ro` key with scope
+  `mcp` published a derived view through `define_derived_view` successfully. So
+  there is no read-only MCP credential — gate the plane by *who* holds a key, and
+  reach for `ro`/`--view` only for mount credentials.
 - Hot-reload of an edited definition **only exists at the `meta-server`
   entrance**: live mounts reshape themselves within the cache TTL (≤2s) without
   remounting; a bare local mount (`--home` direct) resolves its definition once

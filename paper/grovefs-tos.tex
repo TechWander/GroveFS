@@ -1131,12 +1131,14 @@ for the same operation, that a view read as a resource or rendered through
 subtree pruned, relocated entries homed under their display parent), and that
 protocol faults behave correctly (id-less notifications never answered, a
 malformed frame returns \texttt{-32700} and the server keeps serving, an unknown
-view resource returns \texttt{-32002}). The \texttt{apikey} suite (26 assertions)
+view resource returns \texttt{-32002}). The \texttt{apikey} suite (33 assertions)
 exercises the gate end-to-end: an unauthenticated \texttt{tools/list} is refused
 with \texttt{-32001} while \texttt{initialize} still answers, a presented key
 admits the session and attributes each logged call, a wrong secret is refused,
 revocation takes effect immediately while retaining history, and only the digest
-is persisted. Both suites are wired into \texttt{run\_all.sh} and are pure
+is persisted; \texttt{set-ro} flips an active key's read-only flag
+in place (both directions; revoked and unknown ids refused) without touching
+authentication. Both suites are wired into \texttt{run\_all.sh} and are pure
 control-plane checks (they mount nothing on the MCP path), evidencing that the
 agent surface introduces no capability or guard the CLI entrance does not
 already enforce.

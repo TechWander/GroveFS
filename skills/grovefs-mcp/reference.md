@@ -60,6 +60,21 @@ Unauthenticated access to a gated method → `-32001` with
 the audit log also records a failure per the audit rules
 (`unauthorized: no valid api key`).
 
+Credential **scope** (`--for mcp` / `any`) is what gates this plane. Two other
+key attributes are enforced only on the mount plane and are NOT consulted by
+`grovefs mcp`:
+
+- `--ro` / `apikey set-ro`: an `--ro` key with scope `mcp` still calls
+  `define_derived_view` / `alias_view` / `fork_view` / `remove_view`
+  successfully — verified. There is no read-only MCP credential.
+- `--view V` binding: the MCP server never reads it. Bind a mount credential
+  to a view; do not expect the same key to lock an agent to a view through
+  this entrance.
+
+Re-authentication is a one-shot: `initialize` stamps the session, and later
+calls reuse it (unlike the FUSE path, which repolls the key store ~1 s). A
+revocation therefore takes effect on the *next* `initialize`, not mid-session.
+
 ## 3. Error codes
 
 | Code | Trigger | Typical text |
@@ -141,6 +156,14 @@ Under `--store postgres://…` nothing control-plane lands on disk: the
 (verify with `SELECT name, definition FROM grovefs_control.view_defs`), and
 `fork_view` is refused (`fork is not implemented on the PostgreSQL backend
 yet …`).
+
+A read-only probe never mints anything on PG either: `list_view_tree` on a
+view whose `grovefs_v_<hex>` schema does not exist is refused with the same
+`no metadata tree for view 'X' (… schema grovefs_v_…) — list_view_tree walks
+this store's own backend; …` wording, and `information_schema.schemata` gains
+no row. (Regression locked by `tests/mcp_probe_ro.rs`: an earlier build ran
+`ensure_schema()` inside the probe and silently created a phantom schema that
+then showed up in the next `list_views` as a physical view.)
 
 ## 8. CLI cross-reference (same library functions, same refusal texts)
 

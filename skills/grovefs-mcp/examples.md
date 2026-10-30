@@ -106,7 +106,7 @@ derived view name must differ from its base
 ... call list_view_tree '{"view":"ghost"}'
 ```
 ```
-no local metadata tree for view 'ghost' (.migtest/skill/store/meta/ghost.db) — list_view_tree introspects a LOCAL SQLite store only; a remote/PG-backed tree is not walked here
+no metadata tree for view 'ghost' (.migtest/skill/store/meta/ghost.db) — list_view_tree walks this store's own backend; a remote tree not reachable from here is not
 ```
 
 All three texts are identical to what `grovefs view …` prints (same library
@@ -165,7 +165,7 @@ You must peel `contents[0].text` first (that inner string is the JSON payload).
 ```
 ```
 [stderr] [setlevel] warning — later calls may push notifications/message
-[stderr] [push] notifications/message {"data": "tools/call failed: no local metadata tree for view 'ghost' (.migtest/skill/store/meta/ghost.db) \u2014 list_view_tree introspects a LOCAL SQLite store only; a remote/PG-backed tree is not walked here", "level": "warning", "logger": "grove-mcp"}
+[stderr] [push] notifications/message {"data": "tools/call failed: no metadata tree for view 'ghost' (.migtest/skill/store/meta/ghost.db) \u2014 list_view_tree walks this store's own backend; a remote tree not reachable from here is not", "level": "warning", "logger": "grove-mcp"}
 [stderr] the tool refused this call (isError) — not a protocol error
 ```
 
