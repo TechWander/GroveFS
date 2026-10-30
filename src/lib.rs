@@ -16,6 +16,7 @@
 
 pub mod apikeys;
 pub mod backend;
+pub mod bwlimit;
 pub mod control;
 pub mod fs_impl;
 pub mod layout;

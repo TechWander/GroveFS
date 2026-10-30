@@ -40,6 +40,7 @@
 /.mktest/
 /.cfgtest/
 /.vrtest/
+/.bwtest/
 
 # .build-bin tracks the test/bench scripts and the pkg-config wrapper,
 # but never its run output or captured logs.
