@@ -47,6 +47,7 @@
 | **目录列举提速的回退开关** — 关掉 READDIRPLUS（随目录项一并带回属性），退回普通 READDIR + 逐条 `LOOKUP`，仅供 A/B 与兼容排障（只有 provider 能在自己存储里分页的挂载才协商 READDIRPLUS：本地 `--home` 的 SQLite/PG，以及对接能分页的 `meta-server` 的远端挂载；派生/透镜视图与老服务端本来就不协商） | `--no-readdirplus` |
 | **分阶段延迟遥测** — opt-in 记录读/写/元数据各阶段耗时(离线聚合 p50/p90/p99/max 排障定位瓶颈；退出打印 + 周期落盘 + 隐藏节点 `.grove-stats`；非吞吐声明) | `--stats` / `--stats-file <路径>` / `--stats-interval <秒>` / `GROVEFS_STATS=1`(详见 §8.1) |
 | **读缓存 TTL 调优** — 放大内核 attr/dentry 缓存 TTL(默认 2s),对读多/不可变树削减重复 LOOKUP/GETATTR;跨端新鲜度仍靠默认失效推送 + 新内核 `AUTO_INVAL_DATA` 兜底,`--strict` 强制归 0 | `--tune-cache <秒>`(详见 §8.2) |
+| **挂载级内容带宽整形** — 给本次挂载的内容读/写各上一道 GCRA 令牌槽(按字节铺开互不重叠的时间槽,长跑速率精确等于上限,超额只睡眠不丢字节;写侧延迟即背压),`0`=不限 | `--bw-read <速率>` / `--bw-write <速率>`(如 `50M`;env `GROVEFS_BW_READ`/`GROVEFS_BW_WRITE`;详见 §8.2) |
 
 ### 关于 `--view` 与路径容量
 
@@ -363,6 +364,25 @@ e2e 见 `migrate` 套件(74 条断言:挂载中导出/宿主无关性/虚拟名�
 
 **规模实测**(单机、默认 IO,`bash .build-bin/perf_migrate_scale.sh` 可复跑):迁移一棵 5052 节点、5000 个对象的视图——`export` 0.19s 产出 1.16 MB JSONL(是视图库的 1.16 倍,约 230 B/节点);`import` 到新存储路径 0.56s(含账本重建);挂载后 0.23s 枚举完 5000 个文件,内容逐字节一致、权限与属主保留。同一批文件当初注册进源视图(零拷贝导入)花了 83s——那部分逐对象的存储开销完全不在导出/导入路径上。**迁移代价由命名空间大小决定,不由数据量决定**;字节另走 `rsync -a -H blocks/`。
 
+### 3.4.3 删整个基视图:连字节一起回收(`grovefs view rm --base`)
+
+不带 `--base` 的 `view rm` 只删**定义槽**(派生/别名/fork),从不动数据;要连一棵**物理基视图**从头到尾删掉——元数据树消失、跨视图账本重建、**无任何其他视图仍持有的内容字节从 `blocks/` 被回收**——用 `--base` 把这件事显式说出来(避免误删):
+
+| 命令 | 效果 |
+| --- | --- |
+| `grovefs view --db-path D rm --name V --base [--data-root R]` | 删 `D/meta/V.db`(+WAL/SHM)→ `refs rebuild` 按现存树重算 holder → 对 V 树里**无其它视图持有**的 blob 逐个 `backend.remove`;`--data-root` 指向真正存放 `blocks/` 的根(默认元数据根 `D`,与 `import --data-root` 同一约定,用于 meta-server/data-server 分家部署);回显如实给出 freed/held/not-found/failed 计数 |
+
+```
+$ grovefs view --db-path .home rm --name alice --base
+removed base view 'alice': 2 node(s) gone, 2 blob reference(s) dropped, 2 object(s) freed from .home/blocks, 0 still held by other views
+```
+
+**四重守卫**(任一命中即拒,树分毫不删):① 该名字被定义治理(是派生/别名/fork 的定义槽)——先跑不带 `--base` 的 `view rm` 删定义;② 仍有别名/透镜/fork **定义**经此基解析(否则删基会让那棵挂载悬空、懒建空树),报 `view 'lens1' is governed by a definition over base 'alice' — remove it first`;③ 本机 `/proc/mounts` 里有 `grovefs:<V>` 活挂载,报 `view 'alice' is mounted here at …  — unmount it first`(**其他机器**对同一 meta-server 的挂载本机看不到,须自行先停);④ `--store postgres://…` 部署直接拒(基树是 PG schema,字节由 PG/data-server 自持,走 `DROP SCHEMA … CASCADE`)。
+
+**最后一个命名者死才释放**:fork 的 blob 引用来自基视图自己的 key、账本 hold>1,删基时那些仍被 fork 命名的字节**一个都不能动**;只有当基与所有依赖定义都消失、账本再无持有者时字节才真正回收。条带 key `s<N>:<stripe>:<uuid>` 活在 data-server 上,普通本地根无法回收——诚实计入 failed 并跳过,绝不半删。**MCP 边界**:`remove_view` 是控制面 only(等价不带 `--base` 的 `view rm`),删整基视图只经 CLI——接口从不碰数据字节。
+
+e2e 见 `viewrm` 套件(40 条断言:种树/挂载守卫/多重守卫/共享字节删失/最后命名者死后回收/分家根 `--data-root`/删后重挂空树语义)。
+
 ### 3.5 智能体定制数据列表:MCP 接口(`grovefs mcp`)
 
 视图治理(§3.2/§3.4/§3.4.1)同时是一套 **MCP(Model Context Protocol)工具**。`grovefs mcp` 在 stdio 上说换行分隔的 JSON-RPC 2.0(实现 2025-06-18 协议的常用方法面:生命周期 `initialize`/`ping`、工具 `tools/list`/`tools/call`、资源 `resources/list`/`resources/templates/list`/`resources/read`、提示 `prompts/list`/`prompts/get`、补全 `completion/complete`、日志 `logging/setLevel` 与服务端 `notifications/message`;客户端通知一律静默不作答),任何 MCP 客户端(Claude Desktop、IDE 智能体等)把它当子进程拉起,智能体即可**通过接口自动定制数据列表**:查视图、**列出某视图真实呈现的目录清单**(派生视图经其透镜渲染,还能不落盘地预览一副待发布规则会长成啥样)、用内联规则文本发布只读派生透镜(四动词同 `--layout`,规则以文本随行、不落文件)、轮换公开名、删定义、**发布前把整副定义走完全部治理守卫做干跑校验(不写盘)**。与 `grovefs view` 子命令共用同一套库函数(`grovefs::mcp`)——校验、拒绝文案、落盘动作逐字节相同,一个契约、两个入口,智能体做不出 CLI 做不出的事,也绕不过任何守卫。**探查只读**:`list_view_tree`/`get_view` 以只读方式打开本地 `<db-path>/meta/<view>.db`、经与挂载同一副 `LayoutMeta` 透镜渲染目录清单(不挂载、不读对象字节;远端/PG 后端的树不在此遍历);回包里的 `size` 是元数据字段而非字节数(目录 `4096`、文件 `0`、软链为 target 长度),需真实字节请挂载后 `stat`。**控制面 only**:不挂载、不写数据。默认信任能启动此进程的调用方(= 已持有存储根的操作系统级权限),跨网鉴权仍由服务端 token / API key 负责;当它被 front 给多个不同调用方时,可用 `grovefs mcp --require-api-key` **可选地**为接口上 API key 门(见 §3.5.1)。下面全部回显取自真实运行:
@@ -587,7 +607,7 @@ $Y mount --view alice \
 >
 > **正交的另一把锁是把 key 绑到视图**：`apikey create --view team` 的 key 去挂别的名字，在**绑定检查**处就被拒（比存在性检查更早），实测 `permission denied: this api key is bound to view 'team', not 'ghost3'`，同样不建树。分工：`--strict-view` 管「这个名字在不在」，绑定 key 管「这个调用方能开哪一棵」。
 >
-> 清理误建的空树（先 `umount` 所有该名字的挂载）：SQLite 后端 `rm -f meta/<name>.db meta/<name>.db-wal meta/<name>.db-shm` 后 `grovefs refs --db-path D rebuild`；PG 后端 `DROP SCHEMA "grovefs_v_<hex>" CASCADE`（§15.8）。裸基视图没有定义文件，`grovefs view rm` 对它们不适用。
+> 清理误建的空树（先 `umount` 所有该名字的挂载）：裸基视图（无定义的物理树）用 `grovefs view --db-path D rm --name <base> --base` 一条命令删——它删 `meta/<base>.db`(+WAL/SHM)、`refs rebuild` 重算账本、并回收无其他视图持有的字节（§3.4.3）。手工等价路径：`rm -f meta/<name>.db meta/<name>.db-wal meta/<name>.db-shm` 后 `grovefs refs --db-path D rebuild`；PG 后端 `DROP SCHEMA "grovefs_v_<hex>" CASCADE`（§15.8，`--base` 在 PG 部署直接拒绝，字节由 data-server/PG 自持）。
 
 ### 4.1 多机共享到底需要 PG 吗？——上手选型
 
@@ -860,6 +880,8 @@ GROVEFS_STATS=1 $Y mount --view alice -m /mnt/alice
 | `db.sqlite_read` p50 | 44 | **21** |
 
 **读缓存 TTL(P1)**:`--tune-cache <秒>` 把内核 attr/dentry 缓存 TTL 从默认 2s 放大,削减对同一目录/文件的重复 `LOOKUP`/`GETATTR` 往返——适合读多或不可变树(如天文“数据不落地”的一次性流读)。安全边界:跨端新鲜度**仍由默认 `notify` 实时失效推送保证**,且新内核(≥3.15)协商到 `AUTO_INVAL_DATA` 后,size/mtime 变化会顺带丢弃对端陈旧页数据;`--strict` 恒把 TTL 钉为 0(完全旁路)。`run_all.sh` 的 `freshness`/`disp_fresh` 套件默认 TTL 未变下持续证明 <500ms 对端可见。
+
+**内容带宽整形(P1)**:`--bw-read <速率>` / `--bw-write <速率>` 给本次挂载的内容读、写各上一道客户端 GCRA 令牌槽——按实际交付字节铺开互不重叠的时间槽(读在回复前、写在落盘后),长跑速率精确等于上限,单个大于 1 秒额度的 op 最多提前 1 秒放行;超额 op 只睡到自己的时间槽,绝不丢字节也不截断,写侧延迟天然形成背压。语法:纯字节数或 `K`/`M`/`G` 后缀(1024 进制,如 `500000`、`50M`、`1G`),`0`/缺省=不限(热路径只多一次 `rate == 0` 分支)。回退:flag > `GROVEFS_BW_READ`/`GROVEFS_BW_WRITE` > 配置文件;非法速率在参数解析处即拒(静默忽略一个操作员以为已生效的上限更糟)。观测:`--stats` 报告的 `bytes read`/`bytes written` 计数可核对实际吞吐(整形开启时 `op_total` 含蓄意等待,`backend_total` 不含);回归 `bwlimit` 套件用 24MiB@8MiB/s 的下限断言钉住生效。**诚实边界**:这是客户端自限速而非隔离——绕开 FUSE 直连 data-server、或同一视图的多个挂载各自拿满额度;服务端无法把内容寻址的字节归到某棵视图上,故它永远不是集群级配额。元数据 op 不整形。
 
 **大块 IO(P2,内核自适应)**:`max_write`/`max_readahead` 申请 4MiB,由 fuser 与内核按 `FUSE_MAX_MAX_PAGES` 各自截断——老内核(如 5.4)自动降到页上限,6.x+ 给到更大块=更少往返;`PARALLEL_DIROPS`(并发目录 op)与 `WRITEBACK_CACHE`(批量合并写)早已协商。大块读写已逼近底层文件系统地板,实测 FUSE 每 op 仅加 ~50–70µs。
 
@@ -2356,6 +2378,7 @@ $G meta-server --listen 0.0.0.0:50110
 | 导出/导入单视图元数据 | `grovefs view --db-path D export --view V --out F [--force]`(宿主无关 JSONL,不含字节) / `grovefs view --db-path D import --view V --in F [--replace] [--as-fork B]`(原子替换,字节另拷 `blocks/`,§3.4.2) |
 | 泄露后轮换公开名 | `grovefs view --db-path D alias --name A2 --real R --retire A`(先写后删零窗口:`A` 失效、`R` 全程不可直挂,§3.4) |
 | 列出/删除视图定义 | `grovefs view --db-path D list`(定义槽 + 裸基视图) / `grovefs view --db-path D rm --name V`(派生/别名只删定义不动数据;fork 连自己的 `meta/V.db` 一并删除并重建账本) |
+| 删整个基视图(连字节回收) | `grovefs view --db-path D rm --name V --base [--data-root R]`(删 `meta/V.db`+WAL/SHM、`refs rebuild` 重建账本、回收无其他视图持有的字节;受治名/依赖定义/本机活挂载/PG 部署均拒绝,§3.4.3) |
 | 导入存量目录 | `grovefs import --view V --source DIR [--prefix P] [--data-root R] [--dry-run]`(同盘硬链接零拷贝,重跑增量;在存储机执行,§3.3) |
 | 卸载 | `grovefs umount -m MP` |
 | 数据服务 | `grovefs data-server --listen IP:PORT --root DIR [--token T] [--require-api-key [--keys-from D]]` |
