@@ -182,7 +182,8 @@ pub trait ControlStore: Send + Sync {
     /// no-op while the fork feature is not implemented on this backend.
     fn drop_fork_tree(&self, name: &str) -> Result<(), String>;
     /// Open one view's tree READ-ONLY for the metadata-only introspection
-    /// tools (a missing tree is reported, never silently empty).
+    /// tools (a missing tree is reported, never silently empty). A probe never
+    /// creates anything on either backend.
     fn open_ro_view(&self, view: &str) -> Result<Arc<dyn MetaProvider>, String>;
     /// Whether a governance op should note that `view` has no local tree yet
     /// (lazy creation under a meta-server, or PG). File stores check the db
@@ -519,6 +520,19 @@ impl ControlStore for PgControlStore {
     }
 
     fn open_ro_view(&self, view: &str) -> Result<Arc<dyn MetaProvider>, String> {
+        // A read-only probe must not create anything. `PgEngine::open` seeds the
+        // view's schema (DDL) because a MOUNT creates a view lazily on first
+        // use, but that would let `list_view_tree` mint a phantom physical view
+        // out of a typo — the very thing the file-store branch below refuses.
+        // So check for the schema first and refuse honestly if it is not there;
+        // the lazy-creation contract stays with the mount path, not the probe.
+        if !self.has_physical(view)? {
+            return Err(format!(
+                "no metadata tree for view '{view}' ({} schema {}) — list_view_tree walks this store's own backend; a remote tree not reachable from here is not",
+                self.pool.uri(),
+                schema_name_for(view)
+            ));
+        }
         crate::pg_store::PgEngine::open(self.pool.uri(), view, true)
             .map(|p| -> Arc<dyn MetaProvider> { Arc::new(p) })
             .map_err(|e| format!("cannot open view '{view}' from {}: {e}", self.pool.uri()))
@@ -1493,7 +1507,7 @@ pub fn tool_defs() -> Value {
     json!([
         {
             "name": "list_views",
-            "description": "List every view in the store: physical view trees (storage identities, mountable read-write) and governed definitions — derived views (read-only shaped lenses over a base view), pure aliases (writable public names for a real view; while an alias exists its real name is not a mount entry point) and forks (independent metadata trees seeded from a physical view: structure writable, content read-only, deletes touch only the fork). Answers as JSON: {physical:[...], defined:[{name,kind,real_view,hide,only,reloc}]}.",
+            "description": "List every view in the store: physical view trees (storage identities, mountable read-write) and governed definitions — derived views (read-only shaped lenses over a base view), pure aliases (writable public names for a real view; while an alias exists its real name is not a mount entry point) and forks (independent metadata trees seeded from a physical view: structure writable, content read-only, deletes touch only the fork). Answers as JSON: {backend, store, physical:[...], defined:[{name,kind,real_view,hide,only,reloc,mount,line}]} — `backend` is sqlite or postgres and `store` names the control-plane root the call read.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1581,7 +1595,7 @@ pub fn tool_defs() -> Value {
         },
         {
             "name": "list_view_tree",
-            "description": "DISCOVERY + SHAPE PREVIEW: render the directory listing a mount would actually show, read from the view's LOCAL metadata (no mount, no data IO). Give `view` (physical, derived — rendered through its real lens including synthesized dirs, or alias — the full real tree) to inspect an existing listing, OR `base` + inline `rules` to preview an UNPUBLISHED lens before committing it. Returns JSON {kind, rendered_from, root_path, dir_count, file_count, truncated, entries:[{path,kind,size}]} where each `path` is an absolute DISPLAY path — exactly the string to reuse in a hide/only/map rule. Use this to learn which paths exist instead of guessing. `size` is the metadata field, NOT a byte count: dirs report 4096, files 0, symlinks their target length (the walk never asks the data backend) — stat through a mount for real sizes. Trees are walked through the bound control store's own backend: a file store needs a local meta/<view>.db (a remote tree is not walked), while a PG-bound store reads the view's Postgres schema directly.",
+            "description": "DISCOVERY + SHAPE PREVIEW: render the directory listing a mount would actually show, read from the bound store's metadata (no mount, no data IO). Give `view` (physical, derived — rendered through its real lens including synthesized dirs, alias — the full real tree, or fork — the fork's OWN tree) to inspect an existing listing, OR `base` + inline `rules` to preview an UNPUBLISHED lens before committing it. Returns JSON {kind, rendered_from, root_path, dir_count, file_count, truncated, entries:[{path,kind,size}]} where each `path` is an absolute DISPLAY path — exactly the string to reuse in a hide/only/map rule. Use this to learn which paths exist instead of guessing. `size` is the metadata field, NOT a byte count: dirs report 4096, files 0, symlinks their target length (the walk never asks the data backend) — stat through a mount for real sizes. Trees are walked through the bound control store's own backend: a file store needs a local meta/<view>.db (a remote tree is not walked), while a PG-bound store reads the view's Postgres schema directly.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
