@@ -36,6 +36,10 @@ TOK=S3CR3T-TOKEN
 rm -rf .mktest
 mkdir -p .mktest/central/data .mktest/central/meta .mktest/home
 for d in ok any env denied tok dat plain ign fo; do mkdir -p ".mktest/mnt_$d"; done
+# Strict view gate is the default: the view the mounts open must exist before
+# any handshake (creating it here also keeps the refusal cases about keys, not
+# about a missing tree).
+$Y view --db-path "$BASE" create --view alice > .mktest/create.log 2>&1
 
 wait_port(){ local a=$1; for _ in $(seq 1 100); do (echo >/dev/tcp/${a%%:*}/${a##*:}) 2>/dev/null && return 0; sleep 0.05; done; return 1; }
 

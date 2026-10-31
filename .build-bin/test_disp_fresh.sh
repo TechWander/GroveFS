@@ -34,6 +34,9 @@ MP=$!
 wait_port $DATA && wait_port $META || { echo "servers failed to start"; exit 1; }
 
 # ---- seed the base view 'alice' with /data/raw as a real dir ----
+# Strict view gate is the default: create the base view explicitly first (the
+# derived definition below also requires its base tree to exist).
+$Y view --db-path .dfresh/central create --view alice > .dfresh/create.log 2>&1
 $Y --home .dfresh/mA mount --view alice --mountpoint .dfresh/mntA --meta $META --data $DATA --foreground > .dfresh/a.log 2>&1 &
 AP=$!
 sleep 1

@@ -117,6 +117,9 @@ MSP=$!
 $Y data-server --listen 127.0.0.1:50721 --root .vrtest/dataA --token vrmtok > .vrtest/dsrv.log 2>&1 &
 DSP=$!
 sleep 1.5
+# Strict view gate: the remote base view is created explicitly (a mount no
+# longer materializes it).
+$Y view --db-path .vrtest/metaA create --view rview > .vrtest/create1.log 2>&1
 $Y mount --view rview -m .vrtest/mntA --meta 127.0.0.1:50711 --data 127.0.0.1:50721 --token vrmtok > .vrtest/rm_m.log 2>&1
 sleep 1.5
 echo remote-bytes > .vrtest/mntA/r.txt && sync
@@ -143,6 +146,7 @@ MSP=$!
 $Y data-server --listen 127.0.0.1:50721 --root .vrtest/dataA --token vrmtok > .vrtest/dsrv2.log 2>&1 &
 DSP=$!
 sleep 1.5
+$Y view --db-path .vrtest/metaA create --view rview2 > .vrtest/create2.log 2>&1
 $Y mount --view rview2 -m .vrtest/mntA --meta 127.0.0.1:50711 --data 127.0.0.1:50721 --token vrmtok > /dev/null 2>&1
 sleep 1.5
 echo remote-bytes2 > .vrtest/mntA/r2.txt && sync
@@ -159,16 +163,25 @@ $Y view --db-path .vrtest/metaA refs rebuild > /dev/null 2>&1
 rm -f "$R1" 2>/dev/null; true
 [ ! -e .vrtest/metaA/meta/rview2.db ] && ok "metaA tree gone" || bad "metaA tree left"
 
-echo "===== 7) post-removal mount semantics ====="
+echo "===== 7) post-removal mount semantics: the name is GONE, and stays gone ====="
 $Y meta-server --db-path .vrtest/metaA --listen 127.0.0.1:50711 --token vrmtok > .vrtest/msrv3.log 2>&1 &
 MSP=$!
 $Y data-server --listen 127.0.0.1:50721 --root .vrtest/dataA --token vrmtok > .vrtest/dsrv3.log 2>&1 &
 DSP=$!
 sleep 1.5
-$Y mount --view rview2 -m .vrtest/mntA --meta 127.0.0.1:50711 --data 127.0.0.1:50721 --token vrmtok > .vrtest/rem.log 2>&1 \
-  && ok "lazy mode remounts the removed name as a fresh empty tree" || bad "remount: $(cat .vrtest/rem.log)"
+# Strict view gate (the default): a removed name is NOT resurrected by a mount,
+# so the old bytes cannot come back as a fresh empty tree either.
+if T $Y mount --view rview2 -m .vrtest/mntA --meta 127.0.0.1:50711 --data 127.0.0.1:50721 --token vrmtok > .vrtest/rem.log 2>&1; then
+  bad "remount of a removed base name succeeded (strict gate should refuse)"
+else
+  ok "strict mode refuses to resurrect a removed base name"
+fi
+grep -q "does not exist on this meta-server" .vrtest/rem.log \
+  && ok "refusal names the missing view (not a bare EIO)" || bad "remount reason: $(cat .vrtest/rem.log)"
 sleep 1.2
-[ -z "$(T ls .vrtest/mntA 2>/dev/null)" ] && ok "remounted tree is empty (old bytes are gone for good)" || bad "ghost entries: $(ls .vrtest/mntA)"
+[ ! -e .vrtest/metaA/meta/rview2.db ] && ok "no empty tree was left behind by the refused mount" \
+  || bad "refused mount still materialized .vrtest/metaA/meta/rview2.db"
+[ -z "$(T ls .vrtest/mntA 2>/dev/null)" ] && ok "nothing mounted, no ghost entries" || bad "ghost entries: $(ls .vrtest/mntA)"
 $Y umount -m .vrtest/mntA > /dev/null 2>&1
 kill $MSP $DSP 2>/dev/null; wait $MSP $DSP 2>/dev/null
 

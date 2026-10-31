@@ -78,6 +78,8 @@ DP=$!
 $Y meta-server --db-path .blk/centralmeta --listen $META_A > .blk/meta.log 2>&1 &
 AMP=$!
 wait_port $DATA; wait_port $META_A
+# Strict view gate is the default: create the view on the central meta root.
+$Y view --db-path .blk/centralmeta create --view alice > .blk/create.log 2>&1
 $Y --home .blk/chome mount --view alice --mountpoint .blk/mnt_meta --meta "$META_A" --data $DATA --foreground > .blk/mnt_meta.log 2>&1 &
 MPM=$!
 sleep 2

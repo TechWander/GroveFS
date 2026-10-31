@@ -42,6 +42,10 @@ wait_port $DATA || true
 wait_port $META_A || true
 wait_port $META_B || true
 
+# Strict view gate: the view is created EXPLICITLY on the primary (the standby
+# learns it through replication — that is exactly what section 2 asserts).
+$Y view --db-path .ha/a create --view alice > .ha/create.log 2>&1
+
 # ---- client mounts ----
 # main client: failover list primary,standby
 $Y --home .ha/chome mount --view alice --mountpoint .ha/mnt --meta "$META_A,$META_B" --data $DATA --foreground > .ha/c.log 2>&1 &
@@ -132,6 +136,8 @@ SAP=$!
 $Y meta-server --db-path .ha/sync_b --listen $SYNC_B --role standby --peer $SYNC_A > .ha/sync_b.log 2>&1 &
 SBP=$!
 wait_port $SYNC_D; wait_port $SYNC_A; wait_port $SYNC_B
+# Strict view gate: create the view on the sync primary before the first mount.
+$Y view --db-path .ha/sync_a create --view alice > .ha/sync_create.log 2>&1
 # Confirm the server logged sync-repl activation.
 grep -q 'synchronous replication ON' .ha/sync_a.log \
   && ok "--sync-repl logged activation" || bad "--sync-repl not activated"
@@ -190,6 +196,8 @@ PAP=$!
 $Y meta-server --db-path .ha/part_b --listen $PART_B --role standby --peer $PART_A > .ha/part_b.log 2>&1 &
 PBP=$!
 wait_port $PART_D; wait_port $PART_A; wait_port $PART_B
+# Strict view gate: create the view on the partition-test primary.
+$Y view --db-path .ha/part_a create --view alice > .ha/part_create.log 2>&1
 
 $Y --home .ha/part_chome mount --view alice --mountpoint .ha/part_mnt --meta $PART_A --data $PART_D --foreground > .ha/part_mnt.log 2>&1 &
 PCP=$!

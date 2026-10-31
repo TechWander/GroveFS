@@ -98,7 +98,10 @@ if [ -e "$BASEHOME/meta/api_keys.db" ]; then bad "LEAK: a local api_keys.db was 
 echo "===== 3) a meta-server on PG serves a derived lens DEFINED IN PG ====="
 DATA=127.0.0.1:50124; META=127.0.0.1:50125
 $Y data-server --listen $DATA --root .cttest/data > .cttest/data.log 2>&1 & DP=$!
-$Y meta-server --listen $META --home "$BASEHOME" --store "$PGURI" > .cttest/meta.log 2>&1 & MP=$!
+# TODO(strict-view): switch to `grovefs view --store postgres://… create --view
+# <name>` once the PG create entry exists; until then PG base schemas still come
+# from the first mount, so the escape hatch is explicit here.
+GROVEFS_ALLOW_LAZY_VIEW=1 $Y meta-server --listen $META --home "$BASEHOME" --store "$PGURI" > .cttest/meta.log 2>&1 & MP=$!
 wait_port $DATA || { echo "  (data-server failed)"; cat .cttest/data.log; }
 wait_port $META || { echo "  (meta-server failed)"; cat .cttest/meta.log; }
 
@@ -130,7 +133,7 @@ fusermount -u "$L2" 2>/dev/null; wait $RAP 2>/dev/null; RAP=0
 
 echo "===== 5) mount admission gated by the PG-stored key ====="
 kill $MP 2>/dev/null; wait $MP 2>/dev/null; MP=0
-$Y meta-server --listen 127.0.0.1:50126 --home "$BASEHOME" --store "$PGURI" --require-api-key > .cttest/meta_keyed.log 2>&1 & MP2=$!
+GROVEFS_ALLOW_LAZY_VIEW=1 $Y meta-server --listen 127.0.0.1:50126 --home "$BASEHOME" --store "$PGURI" --require-api-key > .cttest/meta_keyed.log 2>&1 & MP2=$!
 wait_port 127.0.0.1:50126 || { echo "  (keyed meta-server failed)"; cat .cttest/meta_keyed.log; }
 FULLKEY=$(printf '%s' "$AKOUT" | sed -n "s/.*key:[[:space:]]*\([0-9a-f:]*\).*/\1/p" | head -1)
 mkdir -p /tmp/never.$TS

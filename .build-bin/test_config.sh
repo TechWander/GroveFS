@@ -177,6 +177,10 @@ echo "===== 6) servers read their own defaults from the file ====="
 # the mount side needs neither --token nor the token env — its token also comes
 # from the file (c_mount.conf), and a WRONG one would fail the mount.
 mnt_srv=.cfgtest/mnt2
+# Strict view gate: create the view before any mount. Seeding it in srv_db
+# (the dir the config file names) also makes the successful mount below proof
+# that the file's GROVEFS_DB_PATH was consumed by the server.
+$Y view --db-path .cfgtest/srv_db create --view srvview > .cfgtest/srv_seed.log 2>&1
 GROVEFS_CONFIG=$PWD/.cfgtest/c_srv.conf \
   $Y meta-server --listen 127.0.0.1:50084 > .cfgtest/meta_srv2.log 2>&1 & srv $!
 wait_port 127.0.0.1:50084 || bad "file-configured meta-server not up"
@@ -184,7 +188,7 @@ GROVEFS_CONFIG=$PWD/.cfgtest/c_mount.conf \
   $Y --home .cfgtest/homeA mount --view srvview --mountpoint $mnt_srv --meta 127.0.0.1:50084 --foreground > .cfgtest/m5.log 2>&1 & srv $!
 m5=0; for _ in $(seq 1 60); do ismnt $mnt_srv && { m5=1; break; }; sleep 0.25; done
 [ "$m5" = 1 ] && ok "mount authenticates with a file-served token against a file-configured server" || bad "$mnt_srv not mounted (m5)"
-[ -f .cfgtest/srv_db/meta/srvview.db ] && ok "GROVEFS_DB_PATH from the file steered meta-server (db landed in srv_db)" || { bad "srv_db/meta/srvview.db missing — file db-path not consumed by meta-server"; cat .cfgtest/meta_srv2.log .cfgtest/m5.log; }
+[ -f .cfgtest/srv_db/meta/srvview.db ] && ok "GROVEFS_DB_PATH from the file steered meta-server (the mount resolved its tree in srv_db)" || { bad "srv_db/meta/srvview.db missing — file db-path not consumed by meta-server"; cat .cfgtest/meta_srv2.log .cfgtest/m5.log; }
 
 echo
 echo "SUMMARY: pass=$pass fail=$fail"

@@ -32,6 +32,10 @@ if wait_port $META; then MP_OK=1; else MP_OK=0; fi
 [ "$MP_OK" = 1 ] || { echo "servers failed to start"; cat .msrv/data.log .msrv/meta.log; }
 
 # ---- three client mounts, each with its own --home (no local authority) ----
+# Views are created EXPLICITLY: the strict gate is the default, so mounting a
+# fresh name would be refused (nothing is lazily materialized server-side).
+$Y view --db-path .msrv/central create --view alice > .msrv/create.log 2>&1
+$Y view --db-path .msrv/central create --view bob  >> .msrv/create.log 2>&1
 $Y --home .msrv/m1 mount --view alice --mountpoint .msrv/mnt_a --meta $META --data $DATA --foreground > .msrv/a.log 2>&1 &
 AP=$!
 $Y --home .msrv/m2 mount --view alice --mountpoint .msrv/mnt_b --meta $META --data $DATA --foreground > .msrv/b.log 2>&1 &
@@ -55,8 +59,8 @@ T(){ timeout 8 "$@"; }
 
 echo "===== 1) server started cleanly ====="
 [ -s .msrv/meta.log ] && grep -q 'meta-server listening' .msrv/meta.log && ok "meta-server up" || bad "meta-server not logging"
-# a brand-new user gets an authoritative DB created server-side, on demand
-[ -f .msrv/central/meta/alice.db ] && ok "central holds alice's authoritative view db" || bad "central alice.db missing"
+# views are created explicitly above, so the central db exists BEFORE any mount
+test -f .msrv/central/meta/alice.db && ok "central holds alice's authoritative view db" || bad "central alice.db missing"
 
 echo "===== 2) clients keep NO local copy of the view (proves --meta is central) ====="
 [ ! -f .msrv/m1/meta/alice.db ] && ok "client m1 has no local view db" || bad "client m1 wrongly created a local copy"

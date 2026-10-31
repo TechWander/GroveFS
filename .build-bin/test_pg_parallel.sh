@@ -49,7 +49,10 @@ T(){ timeout 12 "$@"; }
 echo "===== 1) start data-server + PG-backed meta-server ====="
 $Y data-server --listen $DATA --root .pgpar/central/data > .pgpar/data.log 2>&1 &
 DP=$!
-$Y meta-server --listen $META --home .pgpar/home --store "$PGURI" > .pgpar/meta.log 2>&1 &
+# TODO(strict-view): switch to `grovefs view --store postgres://… create --view
+# <name>` once the PG create entry exists; PG base schemas still come from the
+# first mount, so the escape hatch is explicit here.
+GROVEFS_ALLOW_LAZY_VIEW=1 $Y meta-server --listen $META --home .pgpar/home --store "$PGURI" > .pgpar/meta.log 2>&1 &
 MP=$!
 wait_port $DATA || { bad "data-server did not bind"; exit 1; }
 wait_port $META || { bad "meta-server did not bind"; cat .pgpar/meta.log; exit 1; }

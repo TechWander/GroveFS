@@ -233,12 +233,15 @@ $Y meta-server --db-path .locks/ha/b --listen $META_B --role standby --peer $MET
 BP=$!
 wait_port $DATA && wait_port $META_A && wait_port $META_B || bad "HA ports did not come up"
 
+# Strict view gate: create the view on the primary (the standby replicates it).
+$Y view --db-path .locks/ha/a create --view alice > .locks/ha/create.log 2>&1
+
 # Client mounts via failover list against the HA pair.
 $Y --home .locks/ha/chome mount --view alice --mountpoint .locks/ha/mnt --meta "$META_A,$META_B" --data $DATA --foreground > .locks/ha/mnt.log 2>&1 &
 CP=$!
 sleep 2
-# HA client's alice view is created on-demand server-side, so it only has /
-# (no seed/). Make the file we lock at the mount root.
+# The explicitly created view is empty, so it only has / (no seed/). Make the
+# file we lock at the mount root.
 MF=.locks/ha/mnt/ha_lock.bin
 : > "$MF"
 # Holder keeps a write lock on the primary so the row is definitely present at

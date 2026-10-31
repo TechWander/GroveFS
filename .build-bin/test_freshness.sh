@@ -38,6 +38,8 @@ MP=$!
 wait_port $DATA && wait_port $META || { echo "servers failed"; exit 1; }
 
 # ---- two NON-STRICT client mounts of the same user ----
+# Strict view gate is the default: create the base view explicitly first.
+$Y view --db-path .fresh/central create --view alice > .fresh/create.log 2>&1
 $Y --home .fresh/m1 mount --view alice --mountpoint .fresh/mnt_a --meta $META --data $DATA --foreground > .fresh/a.log 2>&1 &
 AP=$!
 $Y --home .fresh/m2 mount --view alice --mountpoint .fresh/mnt_b --meta $META --data $DATA --foreground > .fresh/b.log 2>&1 &

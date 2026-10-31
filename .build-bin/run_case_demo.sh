@@ -21,6 +21,8 @@ echo '### [存储机] $ ls /data ; find /data/blocks -type f | wc -l'
 ls $S/data; find $S/data/blocks -type f | wc -l
 echo
 echo '### [客户端A] $ grovefs ... mount ... -m /mnt/da (前台,远程挂载不需要 --home)'
+# Strict view gate: the view is created explicitly before the first mount.
+./bin/grovefs view --db-path $S/data create --view share >$S/create.log 2>&1
 nohup ./bin/grovefs mount --view share --data 127.0.0.1:50100 --meta 127.0.0.1:50110 --token "$TOK" -m $S/mnt_da --foreground >$S/mntA.log 2>&1 &
 sleep 1.2
 echo "--- A 挂载进程回显 ---"; cat $S/mntA.log

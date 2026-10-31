@@ -72,7 +72,10 @@ grep -qi "cannot be combined\|incompatible" .pgtest/refuse.log \
 echo "===== 2) start data-server and PG-backed meta-server ====="
 $Y data-server --listen $DATA --root .pgtest/central/data > .pgtest/data.log 2>&1 &
 DP=$!
-$Y meta-server --listen $META --home .pgtest/home --store "$PGURI" > .pgtest/meta.log 2>&1 &
+# TODO(strict-view): switch to `grovefs view --store postgres://… create --view
+# <name>` once the PG create entry exists; PG base schemas still come from the
+# first mount, so the escape hatch is explicit here.
+GROVEFS_ALLOW_LAZY_VIEW=1 $Y meta-server --listen $META --home .pgtest/home --store "$PGURI" > .pgtest/meta.log 2>&1 &
 MP=$!
 wait_port $DATA || { echo "data-server failed"; cat .pgtest/data.log; }
 wait_port $META || { echo "meta-server failed"; cat .pgtest/meta.log; }
