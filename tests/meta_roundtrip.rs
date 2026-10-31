@@ -303,7 +303,7 @@ fn mount_of_unknown_view_auto_creates_the_db() {
     assert!(base.join("meta/bob.db").exists());
 }
 
-/// `--strict-view` inverts that default: an `M_OPEN` naming a view that does not
+/// The strict view gate (the DEFAULT): an `M_OPEN` naming a view that does not
 /// exist is REFUSED with a readable reason and leaves NO `<view>.db` behind,
 /// while an existing tree (and a governed definition) still opens normally.
 #[test]
@@ -339,8 +339,12 @@ fn strict_view_refuses_unknown_view_without_creating_it() {
     }
     let msg = refusal.unwrap_or_else(|| panic!("no strict refusal from {addr}; last: {last}"));
     assert!(
-        msg.contains("--strict-view"),
-        "reason must name the mode: {msg}"
+        msg.contains("views are created explicitly"),
+        "reason must say views are explicit: {msg}"
+    );
+    assert!(
+        msg.contains("create --view <name>"),
+        "reason must name the way to create it: {msg}"
     );
     assert!(
         !base.join("meta/ghost.db").exists(),

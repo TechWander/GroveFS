@@ -1276,9 +1276,21 @@ pub struct MetaServer {
     store: StoreKind,
     /// `--strict-view`: refuse an `M_OPEN` naming a view that does not already
     /// exist, instead of letting [`store_for`] lazily create `meta/<view>.db`
-    /// (or a PG schema) on first open. Off by default — a first mount is also
-    /// how a base view is bootstrapped, so the permissive mode stays.
+    /// (or a PG schema) on first open. ON BY DEFAULT: every base view is created
+    /// explicitly (`view create` / `init` / `view import`), and a typo should be
+    /// an error rather than a silent empty tree. `GROVEFS_ALLOW_LAZY_VIEW=1`
+    /// restores the old permissive behavior for throwaway clusters and legacy
+    /// scripts; an explicit `--strict-view` always wins.
     strict_view: bool,
+}
+
+/// `GROVEFS_ALLOW_LAZY_VIEW=1|true` opts out of the default strict gate and
+/// restores lazy creation of empty view trees. An escape hatch only — the
+/// default refuses an unknown name instead of materializing `meta/<view>.db`.
+fn allow_lazy_view_env() -> bool {
+    std::env::var("GROVEFS_ALLOW_LAZY_VIEW")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 /// Upper bound on the primary's wait for a standby ACK under `--sync-repl`.
@@ -1301,7 +1313,7 @@ impl MetaServer {
             sync_repl: false,
             witness: None,
             store: StoreKind::Sqlite,
-            strict_view: false,
+            strict_view: true,
         }
     }
 
@@ -1319,7 +1331,7 @@ impl MetaServer {
             sync_repl: false,
             witness: None,
             store: StoreKind::Sqlite,
-            strict_view: false,
+            strict_view: true,
         }
     }
 
@@ -1350,8 +1362,21 @@ impl MetaServer {
     /// deleted out-of-band under a LIVE mount is recreated by that mount's next
     /// op — same as permissive mode. Strict mode governs who may OPEN a name,
     /// not what an already-admitted session does.
+    /// `--strict-view` is the DEFAULT: a name that is neither an existing tree
+    /// nor a governed definition is refused at `M_OPEN` (see `view_exists`).
+    /// `GROVEFS_ALLOW_LAZY_VIEW=1` opts back into lazy creation; an explicit
+    /// `--strict-view` still wins over the env escape hatch.
     pub fn with_strict_view(mut self, yes: bool) -> Self {
-        self.strict_view = yes;
+        self.strict_view = yes || !allow_lazy_view_env();
+        self
+    }
+
+    /// Explicit opt-out of the strict gate (`--allow-lazy-view`): an unknown
+    /// view name is materialized as an EMPTY tree on its first `M_OPEN`, exactly
+    /// like the old default. The caller decides precedence — an explicit
+    /// `--strict-view` should skip this call rather than be overridden by it.
+    pub fn with_lazy_view(mut self) -> Self {
+        self.strict_view = false;
         self
     }
 
@@ -1471,10 +1496,12 @@ impl MetaServer {
             println!("meta-server: api-key auth REQUIRED (present `mount --api-key`, minted by `grovefs apikey create --for mount|any`); a revoke closes live mounts on their next op");
         }
         if self.strict_view {
-            // State the mode explicitly: with it on, a new base view must be
-            // created first (`init --view` / `view import`), and a typo is
-            // refused instead of silently becoming an empty tree.
-            println!("meta-server: STRICT VIEW mode (--strict-view): M_OPEN refuses a name with no existing tree or definition; create it first (`grovefs --home <db-path> init --view <name>`), no empty tree is auto-created");
+            // State the mode explicitly: a new base view must be created first
+            // (`view create` / `init` / `view import`), and a typo is refused
+            // instead of silently becoming an empty tree.
+            println!("meta-server: STRICT VIEW mode (default): M_OPEN refuses a name with no existing tree or definition; create it first (`grovefs view create --view <name>`, or `--home <dir> init --view <name>`), no empty tree is auto-created");
+        } else {
+            println!("meta-server: LAZY VIEW mode (GROVEFS_ALLOW_LAZY_VIEW): an unknown view name is auto-created as an EMPTY tree on first mount — a typo becomes a silent empty view");
         }
         // HA coordination is live only when a peer was configured or we start as
         // a standby; otherwise `ha = None` preserves single-node semantics.
@@ -1822,6 +1849,17 @@ fn view_provider(rt: &MetaRuntime, view: &str) -> io::Result<Arc<dyn MetaProvide
                 return Err(io::Error::other(
                     "derived view cannot build on another derived view",
                 ));
+            }
+            // Strict mode forbids creating the base as a side effect of mounting
+            // the lens: a published definition whose base was never created is a
+            // provisioning mistake, and `store_for` below would otherwise leave
+            // an empty `meta/<base>.db` (or PG schema) behind exactly like the
+            // permissive `M_OPEN` path it replaced.
+            if rt.strict_view && !control.has_physical(&b).map_err(io::Error::other)? {
+                return Err(io::Error::other(format!(
+                    "derived view '{view}': its base '{b}' has no physical tree in {} — create the base first (`grovefs view create --view {b}`), then mount `{view}` again",
+                    control.describe()
+                )));
             }
             if control.has_physical(view).map_err(io::Error::other)? {
                 // a physical tree named `view` exists — the name would be ambiguous
@@ -2261,9 +2299,9 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
             Ok(true) => String::new(),
             Ok(false) => {
                 let hint = if rt.control.backend() == "postgres" {
-                    "under a PG store a base tree is a schema, so there is no offline `init` for it: mount the name once with strict mode off, or restore the schema from a dump, then mount again"
+                    "a PG base view is a schema: create it first with `grovefs view --store postgres://… --db-path <db-path> create --view <name>`, or restore the schema from a dump"
                 } else {
-                    "create it first: `grovefs --home <db-path> init --view <name>` (or seed it with `grovefs view --db-path <db-path> import`)"
+                    "create it first: `grovefs view --db-path <db-path> create --view <name>` (or `grovefs --home <db-path> init --view <name>`, or seed it with `grovefs view import`)"
                 };
                 // `view` is the POST-ALIAS real name; name the alias the caller
                 // actually mounted too, so "pub does not exist" never reads as
@@ -2275,7 +2313,7 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
                     backend.to_string()
                 };
                 format!(
-                    "view '{view}' does not exist on this meta-server ({where_}): no tree and no definition — strict mode (--strict-view) refuses unknown names instead of creating an empty tree; {hint}"
+                    "view '{view}' does not exist on this meta-server ({where_}): no tree and no definition — views are created explicitly, so unknown names are refused instead of becoming an empty tree; {hint}"
                 )
             }
             Err(e) => format!("view '{view}': cannot verify existence: {e}"),

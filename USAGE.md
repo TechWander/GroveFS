@@ -160,7 +160,10 @@ $Y --home $BASE init --view alice --manifest ./seed.txt
 > 这一节只回答三件事:**四种视图分别是什么、每条命令会生成哪些文件/表、参数怎么填**。
 > §3.1–§3.4.1 是操作细节;第一次接触建议先读完这一节,再照 §3.2/§3.4 的例子做。
 
-**先纠正一个最常见的误解:写入数据不等于创建基视图。** 往挂载点里 `mkdir`/`echo` 只是往**已经存在**的树里加节点;本地挂载发现 `meta/<名字>.db` 不存在时会按名**懒创建一棵空树**(服务端可用 `--strict-view` 关掉),但这是“挂载时建树”,不是“写数据建树”。建基视图的常见入口是 `init --view` / `view create --view`(后者会先检查名字没有被派生/别名/fork 占用),以及 `import --view V --source DIR` / `view import`(目标不存在时建树)。除此之外的写操作不会建树。
+> **发布状态(必读)**:服务端 `meta-server` 的严格门**已默认开启**;本地 `--home` 挂载的同一道闸与 CLI 参数 `--allow-lazy-view` 正在同步上线——在此之前,本地挂载仍会懒建空库(远程挂载已经一律走服务端门禁)。急用时以 env `GROVEFS_ALLOW_LAZY_VIEW=1` 作为放行开关。
+> 本节按**目标行为**描述:本地与服务端一致。
+
+**先纠正一个最常见的误解:写入数据不等于创建基视图。** 往挂载点里 `mkdir`/`echo` 只是往**已经存在**的树里加节点;本地挂载发现 `meta/<名字>.db` 不存在时**默认直接拒绝**,服务端同样默认拒绝。建基视图的入口是 `init --view` / `view create --view`(后者会先检查名字没有被派生/别名/fork 占用),以及 `import --view V --source DIR` / `view import`(目标不存在时建树)。只有在挂载/启动服务时显式加 `--allow-lazy-view`(或 env `GROVEFS_ALLOW_LAZY_VIEW=1`)才会退回旧的“挂载时懒创建空树”行为——那是应急口子,不是正规入口。
 
 #### 1. 一句话类比
 
@@ -188,6 +191,14 @@ $Y --home $BASE init --view alice --manifest ./seed.txt
 
 > “能不能写内容”是硬契约:派生挂载在客户端就是只读挂载;fork 的结构操作放行,`write`/`truncate` 由客户端回 `EROFS`。服务端对派生名的写意图另有 `EPERM` 门禁,绕过客户端也写不进去。**派生/别名/fork 都不是安全边界**——能挂基名的人仍看到全树;硬隔离用独立视图 + token/API key(§6)。
 
+#### 2.1 三个常见追问(别把“滤镜”当成“复制”)
+
+| 追问 | 答案 | 从哪里能看出来 |
+| --- | --- | --- |
+| 派生视图是不是把基视图**复制**了一份,只是对用户只读？ | **不是复制。** 派生只落一份 `.layout` 文本(`base B` + 规则),不复制任何目录项、不复制字节。每次读目录时,服务端/本地才按规则在基树上**实时算出**显示形状。 | `view define` 不建 `meta/D.db`;目录里只有 `meta/views/D.layout`;`view list` 打的是 `view 'D' -> base 'B': 1 hide, 1 only, 1 reloc rule(s) (read-only)` 而不是“一棵树”;改规则后经服务端 ≤2s 换形。代价是目录也不能改、内容写 `EROFS`——因为它本来就没有自己的目录项可改。 |
+| 别名是不是就是基视图,只是换了个名字？ | **是。** 别名没有自己的元数据;解析时把名字换成真实视图 `R`,之后读目录、建目录、写文件、删文件全部落在 `R` 的**同一棵树、同一份字节**上。 | 别名只占 `meta/views/A.layout` 一行 `alias R`,没有 `meta/A.db`;`view alias` 后写 `A/` 里的文件,在 `R/` 里立刻看得到(同一个 inode)。唯一区别是**名字治理**:别名存在期间 `mount --view R` 被拒,一个真实视图同时只能有一个别名(`--retire` 轮换)。 |
+| fork 是不是一份完整元数据,能改目录但删不掉底层数据？ | **前半句对;后半句要分清“删名字”与“删字节”。** fork 复制基树的 `node` 行(目录项,含 inode/硬链接关系),所以有自己完整、可改的目录树;内容写 `EROFS`。在 fork 里删名字只摘 fork 自己的目录项,基树不动;字节是否回收看 `refs.db` 账本——没有任何视图再持有该对象时才真正删除。 | `view fork` 会新建 `meta/F.db` 并在 `refs.db` 记账;`rm --name F` 删的是 fork 自己的树 + 定义,基树与仍被持有的字节不动;基树后来新增的文件不会自动出现在 fork。 |
+
 #### 3. 每条命令会生成/改动什么
 
 > 路径以 SQLite 存储根 `D` 为例。PG 后端没有本地 `.db`/`.layout` 文件,对应物见本节末尾。
@@ -196,19 +207,19 @@ $Y --home $BASE init --view alice --manifest ./seed.txt
 | --- | --- | --- |
 | `grovefs view --db-path D create --view V [--manifest F]` | 新建 `D/meta/V.db`(内含 `node`/`ctrl`/`locks` 三张表);`--manifest` 再往树里写目录/空文件节点 | 不改其它视图 |
 | `grovefs --home D init --view V [--manifest F]` | 同上(等价入口;不检查名字是否已有定义) | 同上 |
-| `grovefs --home D mount --view V`(本地,无定义) | 若 `D/meta/V.db` 不存在,**懒创建空树**;挂载本身不落盘 | 不改已有树 |
+| `grovefs --home D mount --view V`(本地,无定义) | 若 `D/meta/V.db` 不存在则**默认拒绝**,提示先 `view create`;加 `--allow-lazy-view` 才懒建空树。挂载本身不落盘 | 不改已有树 |
 | `grovefs view --db-path D define --name X --base B --rules F` | 写/覆盖 `D/meta/views/X.layout`,正文含 `base B` 一行,其余行是规则 | 不建 `X.db`,不复制/移动任何内容 |
 | `grovefs view --db-path D alias --name A --real R [--retire OLD]` | 写/覆盖 `D/meta/views/A.layout`(仅一行 `alias R`);`--retire` 再删旧别名定义 | 不建 `A.db`;`R` 的数据不动 |
 | `grovefs view --db-path D fork --name X --base B` | 新建 `D/meta/X.db`(复制 B 的 `node` 行,保留 inode/硬链接);写 `D/meta/views/X.layout`(仅一行 `fork B`);在 `D/meta/refs.db` 登记共享字节 | 不复制字节;不改 B 的树 |
 | `grovefs view --db-path D rm --name X` | 删 `D/meta/views/X.layout`;若 X 是 fork,再删 `D/meta/X.db`(+WAL/SHM)并重建 `refs.db` | 派生/别名不动数据;fork 不动基树与仍被持有的字节 |
 | `grovefs view --db-path D rm --name V --base` | 删 `D/meta/V.db`(+WAL/SHM),重建 `refs.db`,从 `--data-root`(默认 `D`)回收**无人再持有**的对象 | 别的视图仍持有的字节保留 |
-| `grovefs mount --view V --layout F` | 规则文件本身不落盘;若本地 `meta/V.db` 不存在,仍会懒创建空基树 | 不改服务端状态;只影响本次挂载 |
+| `grovefs mount --view V --layout F` | 规则文件本身不落盘;若本地 `meta/V.db` 不存在则默认拒绝(与不带 `--layout` 一致),仅 `--allow-lazy-view` 才懒建空基树 | 不改服务端状态;只影响本次挂载 |
 | `grovefs view export/import` | 导出:一个 JSONL 文件;导入:新建 `D/meta/V.db` | 不搬字节(字节要另拷 `blocks/`) |
 
 几条容易忽略的规则:
 
 - **定义只是文本槽**:`view define/alias/fork` 写的是 `meta/views/<名字>.layout`,只有 fork 会额外新建一棵 `meta/<名字>.db`。
-- **定义可以先于基树存在**:`view define` 允许 base 还没建(会提示),但**挂载时**服务端会强制 base 必须是物理树;本地 `--home` 直接按名开库,不存在会懒建空树。建议顺序仍是“先 `view create` 基视图,再 define”。
+- **定义可以先于基树存在**:`view define` 允许 base 还没建(会提示),但**挂载时**服务端与本地(默认严格)都会强制 base 必须已创建,否则派生名拒挂。建议顺序仍是“先 `view create` 基视图,再 define”。
 - **删定义不热作用**:`view rm --name` 后,新挂载立即看不到定义;已经挂着的派生/别名连接会保持旧解析,直到重挂(或服务端缓存被 HA/快照事件清掉)。
 - **删基视图有四道守卫**:名字本身不能还被定义治理;不能有别的派生/别名/fork 指向它;本机不能还挂着;PG 后端不支持 `view rm --base`。
 
@@ -263,7 +274,9 @@ fork team
 | `meta/refs.db` | 共享表 `grovefs_refs.holders` |
 | `meta/api_keys.db` | `grovefs_control.api_keys` + `mcp_calls` |
 
-PG 下 `view define/alias/rm --name` 照常可用(写 `view_defs`);`view create`/`view fork`/`view rm --base` 基于本地文件树,会拒绝——基树由首次挂载在 PG 里建 schema。
+PG 下 `view define/alias/rm --name` 照常可用(写 `view_defs`);`view create --store postgres://…` 会显式建出该视图的 schema(`grovefs_v_<hex>`),`view fork`/`view rm --base` 仍基于本地文件树、会拒绝。
+
+> **PG 建库入口的过渡说明**:`view create --store` 是“默认严格”配套的显式入口。若你手上的构建还没有它(老版本二进制),在 PG 下的等价做法是给 `meta-server` 加 `GROVEFS_ALLOW_LAZY_VIEW=1`,让首次挂载建出 schema;建好后即可去掉这个环境变量——已存在的 schema 在严格模式下照常挂载。
 
 #### 5. 参数怎么填
 
@@ -281,7 +294,8 @@ PG 下 `view define/alias/rm --name` 照常可用(写 `view_defs`);`view create`
 | `--manifest F` | `init`/`view create` | 种子清单(`mkdir`/`touch` 行),建树时预铺骨架 |
 | `--data-root D` | `view rm --base`/`import` | `blocks/` 所在根;删基视图时从这里回收字节 |
 | `--layout F` | `mount` | 本次挂载的本地规则文件;只影响这个挂载,可写;本地 `--home` 下与派生名同用时显式文件优先,不叠两层透镜 |
-| `--strict-view` | `meta-server` | 拒绝未知视图名的 `M_OPEN`,关闭“拼错名字就懒建空树”的默认行为 |
+| `--strict-view` | `meta-server` | 严格门:**现在是默认**;显式写出仅作声明,并可压过 env 回退 |
+| `--allow-lazy-view` | `mount` / `meta-server` | 退回旧的懒创建:未知视图名在首次挂载时自动建空树(env `GROVEFS_ALLOW_LAZY_VIEW=1` 等效) |
 
 **规则文件(`--rules` / `--layout`)的四个动词**
 
@@ -304,20 +318,20 @@ PG 下 `view define/alias/rm --name` 照常可用(写 `view_defs`);`view create`
 2. 是 `fork B` 一行 → 打开 `X` 自己的 `meta/X.db`(建 fork 时复制的那棵),与 `B` 此后的变化无关。
 3. 是 `base B` + 规则行 → 打开 `meta/B.db`,把后面的规则套成只读透镜。
 4. 没有 `X.layout` → `X` 自己就是基视图,直接打开 `meta/X.db`。
-5. `meta/X.db` 不存在 → 本地/默认服务端会**懒创建空树**;`meta-server --strict-view` 会改为拒绝(推荐生产开启,防止拼错名字长出空树)。
+5. `meta/X.db` 不存在 → **默认拒绝**(本地与服务端一致),提示先 `view create`;只有 `--allow-lazy-view` / `GROVEFS_ALLOW_LAZY_VIEW=1` 才懒创建空树。
 
-> 服务端解析 `<db-path>/meta/views/`,客户端 `--home` 解析 `<home>/meta/views/`;两边都只做**单跳**:别名不能再指向别名,有定义的名字不能当 fork 的基。**服务端**挂载时还会拒绝“派生套派生”;本地 `--home` 直接按 base 名开 `meta/<base>.db`,名字不存在会懒建空树——所以本地写规则前先确认 base 是真基视图。
+> 服务端解析 `<db-path>/meta/views/`,客户端 `--home` 解析 `<home>/meta/views/`;两边都只做**单跳**:别名不能再指向别名,有定义的名字不能当 fork 的基。**服务端**挂载时还会拒绝“派生套派生”,并且派生挂载时 base 必须已存在(默认严格);本地 `--home` 同样要求 base 树已创建,否则拒绝。
 
 #### 7. 最容易踩的坑
 
-1. **写数据不会创建基视图。** 新建树用 `init`/`view create`;挂载缺库时的懒创建只是方便,不是正规入口。
+1. **写数据不会创建基视图。** 新建树只能用 `init`/`view create`/`import`;挂载缺库现在默认直接拒绝,不再懒创建。
 2. **派生视图只读,而且不是权限边界。** 能挂基名的人仍能看到全树;要隔离用独立视图 + token/API key,不要靠“藏几个目录”。
 3. **别名会把真实名锁住。** 别名存在期间,`mount --view R` 会被拒;新挂载用别名。删别名后真实名恢复可挂(仅新挂载)。一个真实视图同时只能有一个别名,轮换用 `--retire` 一条命令完成。
 4. **fork 只复制目录,不复制字节。** 内容写 `EROFS`;删 fork 不影响基树;基树后来新增的文件不会自动出现在 fork;PG 后端暂不支持 fork。
-5. **`--layout` 与 `meta/views/*.layout` 是两回事。** 前者只影响本次挂载、可写;后者是服务端命名定义、只读。本地同时给 `--view 派生名 --layout F` 时,显式 `--layout` 优先、已发布定义被绕过(还可能懒建同名空树);两者建议二选一。
+5. **`--layout` 与 `meta/views/*.layout` 是两回事。** 前者只影响本次挂载、可写;后者是服务端命名定义、只读。本地同时给 `--view 派生名 --layout F` 时,显式 `--layout` 优先、已发布定义被绕过;若目标视图根本没创建,默认会直接报错(除非 `--allow-lazy-view`)。两者建议二选一。
 6. **只有账本归零才真正回收字节。** 删派生/别名只删定义;删 fork 只删自己的树;在任意视图里删名字,都要等 `refs.db` 里没有其它视图持有才释放对象。
 7. **`view define` 可以先于基树存在。** 它会提示 base tree missing;挂载时才强制。先 `view create` 再 define,能少一次排错。
-8. **拼错视图名会懒建空树。** 生产环境给 `meta-server` 开 `--strict-view`,让错误的 `--view` 直接拒挂,而不是静默长出一棵空树。
+8. **拼错视图名现在会直接报错,不会长空树。** 本地与服务端默认都拒绝未创建的视图名。只有显式 `--allow-lazy-view`(或 env `GROVEFS_ALLOW_LAZY_VIEW=1`)才退回懒创建——那正是“拼错就长空树”的旧行为。
 
 **报错对照**:`EROFS` = 只读文件系统(派生挂载、fork 内容写);`EPERM` = 操作不允许(向合成目录新建、服务端派生写门禁)。
 
@@ -601,7 +615,7 @@ $ grovefs view --db-path .home rm --name alice --base
 removed base view 'alice': 2 node(s) gone, 2 blob reference(s) dropped, 2 object(s) freed from .home/blocks, 0 still held by other views
 ```
 
-**四重守卫**(任一命中即拒,树分毫不删):① 该名字被定义治理(是派生/别名/fork 的定义槽)——先跑不带 `--base` 的 `view rm` 删定义;② 仍有别名/透镜/fork **定义**经此基解析(否则删基会让那棵挂载悬空、懒建空树),报 `view 'lens1' is governed by a definition over base 'alice' — remove it first`;③ 本机 `/proc/mounts` 里有 `grovefs:<V>` 活挂载,报 `view 'alice' is mounted here at …  — unmount it first`(**其他机器**对同一 meta-server 的挂载本机看不到,须自行先停);④ `--store postgres://…` 部署直接拒(基树是 PG schema,字节由 PG/data-server 自持,走 `DROP SCHEMA … CASCADE`)。
+**四重守卫**(任一命中即拒,树分毫不删):① 该名字被定义治理(是派生/别名/fork 的定义槽)——先跑不带 `--base` 的 `view rm` 删定义;② 仍有别名/透镜/fork **定义**经此基解析(否则删基会让那棵挂载悬空),报 `view 'lens1' is governed by a definition over base 'alice' — remove it first`;③ 本机 `/proc/mounts` 里有 `grovefs:<V>` 活挂载,报 `view 'alice' is mounted here at …  — unmount it first`(**其他机器**对同一 meta-server 的挂载本机看不到,须自行先停);④ `--store postgres://…` 部署直接拒(基树是 PG schema,字节由 PG/data-server 自持,走 `DROP SCHEMA … CASCADE`)。
 
 **最后一个命名者死才释放**:fork 的 blob 引用来自基视图自己的 key、账本 hold>1,删基时那些仍被 fork 命名的字节**一个都不能动**;只有当基与所有依赖定义都消失、账本再无持有者时字节才真正回收。条带 key `s<N>:<stripe>:<uuid>` 活在 data-server 上,普通本地根无法回收——诚实计入 failed 并跳过,绝不半删。**MCP 边界**:`remove_view` 是控制面 only(等价不带 `--base` 的 `view rm`),删整基视图只经 CLI——接口从不碰数据字节。
 
@@ -798,7 +812,9 @@ $Y data-server --listen 0.0.0.0:50100 --root /data/cluster
 
 # 元数据服务:托管每用户权威视图(多客户机共享同一棵,不再各存各的副本)
 $Y meta-server --db-path /data/cluster --listen 0.0.0.0:50110
-#   --db-path 就是元数据根:每个 view 首次被打开时,按需在其 meta/ 下建权威库
+#   --db-path 就是元数据根:视图库在其 meta/ 下。名字不再懒创建——先显式建树:
+$Y view --db-path /data/cluster create --view alice
+#   (不建就挂会被 M_OPEN 拒:view 'alice' does not exist on this meta-server …)
 
 # ===== 每台客户机(远程挂载不需要 --home,本地什么都不落) =====
 $Y mount --view alice \
@@ -809,27 +825,27 @@ $Y mount --view alice \
 - `--meta <host:port>`:视图树由中心 meta-server 提供,**多台客户机挂同一用户 = 共享同一棵权威树**。
 - 客户机本地**不留视图副本、也不落盘**：给了 `--data`/`--meta` 的远程挂载**不需要 `--home`**（传了也不写任何东西）——权威数据在 meta-server，字节在 data-server，访问控制全部发生在服务端 `M_OPEN`/逐 op,客户端不查本地库。
 
-> **视图名不存在时有两种模式，由 meta-server 的 `--strict-view` 选择（默认关闭）。**
+> **视图名不存在时默认拒绝(严格模式);只有 `--allow-lazy-view` 才回到懒创建。**
 >
-> **默认（懒创建）**：两个后端都这样——SQLite 在第一次 `M_OPEN` 时建出 `meta/<view>.db`（连带 `refs.db`），PG 建 `grovefs_v_<hex>` 空 schema，然后客户端**挂载成功**、看到空目录（实测：`mounted view 'ghost' … 目录内容: []`，`meta/ghost.db` 随即出现）。好处是第一次挂载就是建库，不必先跑 `init`；代价是**拼错一个字母不会报错，只会凭空多一棵空树**。
->
-> **`--strict-view`（严格：没有就拒绝）**：名字必须已经存在——一棵物理树，或一条治理定义（派生/别名/fork）——否则 `M_OPEN` 直接拒绝，且**什么都不写**。拒因走**带 payload 的 `E_DB`**（不是空包），所以客户端打印的是原因而不是裸 `Input/output error`，服务端日志里也有同一句（实测原文，SQLite）：
+> **默认(严格)**:名字必须已经存在——一棵物理树,或一条治理定义(派生/别名/fork)——否则 `M_OPEN` 直接拒绝,且**什么都不写**。拒因走**带 payload 的 `E_DB`**(不是空包),所以客户端打印的是原因而不是裸 `Input/output error`,服务端日志里也有同一句(实测原文,SQLite):
 >
 > ```text
-> meta-server: STRICT VIEW mode (--strict-view): M_OPEN refuses a name with no existing tree or definition; …
+> meta-server: STRICT VIEW mode (default): M_OPEN refuses a name with no existing tree or definition; …
 > $ grovefs mount --view typo1 --meta 10.0.0.5:50110 --data 10.0.0.5:50100 -m /mnt/t
 > Error: … "view 'typo1' does not exist on this meta-server (sqlite): no tree and no definition —
->   strict mode (--strict-view) refuses unknown names instead of creating an empty tree;
->   create it first: `grovefs --home <db-path> init --view <name>` …"
+>   views are created explicitly, so unknown names are refused instead of becoming an empty tree;
+>   create it first: `grovefs view --db-path <db-path> create --view <name>` …"
 > meta: M_OPEN view='typo1' refused (strict): …                 # 服务端日志
 > $ ls /data/cluster/meta | grep typo1                          # 空:没有 typo1.db,也没有 -wal/-shm
 > ```
 >
-> 开了 `--require-api-key` 时这条拒绝同时进审计（`grovefs apikey calls`）：`… M_OPEN no view='typo1': strict-view: …`。已存在的基视图、派生视图、纯别名、fork 在严格模式下照挂（四种都实测过）；PG 后端探的是 PG schema 本身（`information_schema.schemata`），所以拒绝时**不会建 schema**，而先在不严格模式建好的 schema 在严格模式下仍能挂。
+> **`--allow-lazy-view`(或 env `GROVEFS_ALLOW_LAZY_VIEW=1`)**:退回旧行为——SQLite 在第一次 `M_OPEN` 时建出 `meta/<view>.db`(连带 `refs.db`),PG 建 `grovefs_v_<hex>` 空 schema,客户端**挂载成功**、看到空目录。拼错一个字母不会报错,只会凭空多一棵空树——只建议在一次性集群/迁移引导时用。
 >
-> **建新视图的顺序变了**：严格模式下必须先建后挂。SQLite：`grovefs --home <db-path> init --view <name>`（或 `view import` 播种）；PG 没有离线 `init`——先用一次不严格挂载建出空 schema（或从 `pg_dump` 恢复），再开严格模式。
+> 开了 `--require-api-key` 时这条拒绝同时进审计(`grovefs apikey calls`):`… M_OPEN view='typo1' refused (strict): …`。已存在的基视图、派生视图、纯别名、fork 在严格模式下照挂;PG 后端探的是 PG schema 本身(`information_schema.schemata`),所以拒绝时**不会建 schema**。
 >
-> **正交的另一把锁是把 key 绑到视图**：`apikey create --view team` 的 key 去挂别的名字，在**绑定检查**处就被拒（比存在性检查更早），实测 `permission denied: this api key is bound to view 'team', not 'ghost3'`，同样不建树。分工：`--strict-view` 管「这个名字在不在」，绑定 key 管「这个调用方能开哪一棵」。
+> **建新视图一律先建后挂**:SQLite `grovefs view --db-path <db-path> create --view <name>`(或 `--home <db-path> init --view`、`view import` 播种);PG `grovefs view --store postgres://… --db-path <db-path> create --view <name>` 显式建 schema(或从 `pg_dump` 恢复)。
+>
+> **正交的另一把锁是把 key 绑到视图**：`apikey create --view team` 的 key 去挂别的名字，在**绑定检查**处就被拒（比存在性检查更早），实测 `permission denied: this api key is bound to view 'team', not 'ghost3'`，同样不建树。分工：存在性检查(默认严格)管「这个名字在不在」，绑定 key 管「这个调用方能开哪一棵」。
 >
 > 清理误建的空树（先 `umount` 所有该名字的挂载）：裸基视图（无定义的物理树）用 `grovefs view --db-path D rm --name <base> --base` 一条命令删——它删 `meta/<base>.db`(+WAL/SHM)、`refs rebuild` 重算账本、并回收无其他视图持有的字节（§3.4.3）。手工等价路径：`rm -f meta/<name>.db meta/<name>.db-wal meta/<name>.db-shm` 后 `grovefs refs --db-path D rebuild`；PG 后端 `DROP SCHEMA "grovefs_v_<hex>" CASCADE`（§15.8，`--base` 在 PG 部署直接拒绝，字节由 data-server/PG 自持）。
 
@@ -1326,9 +1342,11 @@ systemctl is-active grove-data-server grove-meta-server && ss -lntp | grep -E '5
 # 2) 视图已挂上、打了 grovefs 标签
 findmnt -T /mnt/alice          # 期望:FUSE / grovefs:alice
 
-# 3) 新视图开箱即用:直接挂一个从未 init 过的 view,中心会在
-#    /data/cluster/meta/ 下按需建权威库(远程模式无需预先 init;--manifest
-#    预建层级只在本地模式用,见 §3)
+# 3) 新视图需先显式创建:名字不在时 M_OPEN 直接拒绝(严格默认),
+#    不再是“首挂按需建库”。建完再挂:
+#    grovefs view --db-path /data/cluster create --view carol
+#    预建层级(--manifest)只在本地模式用,见 §3
+sudo grovefs view --db-path /data/cluster create --view carol
 sudo systemctl start grove-mount@carol && ls /mnt/carol
 
 # 4) 跨客户端实时可见(两台客户机挂同一 --view,核心卖点)
@@ -1665,7 +1683,10 @@ WantedBy=multi-user.target
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now grove-data-server grove-meta-server   # enable=开机自起,now=立刻起
+sudo systemctl enable --now grove-data-server grove-meta-server   # enable=开机 自起,now=立刻起
+
+# 建应用要挂的视图:默认严格模式,名字不存在就挂会被 M_OPEN 拒
+sudo grovefs view --db-path /data create --view share
 ```
 
 **unit 里每个设置的意义**:`EnvironmentFile` 让 token 不进 unit 文件也不进 ps 命令行(命令行传口令会被 `ps aux` 同机任何用户看到);`Type` 不写即 simple——两个 server 本就是前台阻塞式,systemd 直接盯进程存活;`Restart=on-failure` 崩溃自动拉起(OOM/段错误等非零退出),配合 §12.1 的日志巡检看有没有反复拉起;`After=local-fs.target` 保证 /data 所在盘挂载完成后才起服务。
@@ -1705,7 +1726,7 @@ echo hello-$(date +%s) | sudo tee /mnt/da/probe.txt && sudo ls -l /mnt/da
 | 参数 | 本案例取值 | 意义 |
 | --- | --- | --- |
 | `--home`(客户机**不需要传**) | — | 远程挂载不在本地落盘任何数据,此参数与数据面/元数据面都无关——只有本地模式(`init`/无 `--meta` 的 `mount`)才用它定位权威库;访问元数据根的命令(`meta-server`/`apikey`)各自用 `--db-path` 命名,`--home` 仅作回退 |
-| `--view` | `share` | 选树标签:挂哪棵权威视图。与 Linux 用户名无关(§2);A/B 用同一个名字才会共享同一棵树。`share` 首次挂载时中心自动建 `/data/meta/share.db`,**无需预先 init** |
+| `--view` | `share` | 选树标签:挂哪棵权威视图。与 Linux 用户名无 关(§2);A/B 用同一个名字才会共享同一棵树。`share` 必须先在中心 `grovefs view --db-path /data create --view share` 建好(默认严格门,不建就挂即拒) |
 | `--data` | `192.168.1.10:50100` | 数据面地址:文件字节走自定义 TCP 帧到这个 `data-server`,不碰本机盘(非 NFS)。逗号分隔多地址才启用跨机条带,单地址无条带 |
 | `--meta` | `192.168.1.10:50110` | 元数据面地址:目录树由中心 `meta-server` 提供——这是“多机共享一棵树”的根;同时它也订阅失效推送(谁写了什么,这台机下次访问即时重取)。逗号分隔多个 = 故障转移列表(§11.8) |
 | `--token` | grovefs.env 那串 | 同时递给数据面 `OP_OPEN` 与元数据面 `M_OPEN` 两处握手;不匹配 = 挂载命令直接报权限错,fail-fast |
@@ -1874,6 +1895,7 @@ ssh 192.168.1.12 'sudo systemctl stop grove-mount && findmnt -T /mnt/db | grep -
 | --- | --- | --- |
 | 存储机 | `grovefs data-server --listen 0.0.0.0:50100 --root /data --token $TOK` | 字节存储面:`--listen` 接全网卡、`--root` 基目录(自动建其下 `blocks/`)、`--token` 数据面口令 |
 | 存储机 | `grovefs meta-server --db-path /data --listen 0.0.0.0:50110 --token $TOK` | 元数据面(默认 SQLite):`--db-path` 指元数据根(视图库在其 `meta/` 下)、不传 `--store`=SQLite、不传 `--role/--peer`=单节点 |
+| 存储机 | `grovefs view --db-path /data create --view share` | 显式建基视图:`share` 不建就挂会在 `M_OPEN` 被拒(严格默认);库落在 `/data/meta/share.db` |
 | 客户端A | `grovefs mount --view share --data 192.168.1.10:50100 --meta 192.168.1.10:50110 --token $TOK --as-uid 1001 -m /mnt/da` | 读写挂载:`--view` 选树、`-m` 必填不可当位置参数、不写 `--strict` 靠默认推送保新鲜 |
 | 客户端B | 同 A 改 `--ro --as-uid 1002 -m /mnt/db` | 只读挂载:`--ro` 拦本机正常写路径;配合中心对该客户端的 `--ro` key = 服务端硬只读 |
 | 存储机 | `grovefs apikey --db-path /data create --for mount --view share [--ro]` | 视图绑定 / 只读 key:key 只能开 `share` 视图(开别的 `M_OPEN` 处 `E_AUTH` 拒);`--ro` 令每个写意图 op 服务端拒(`E_NOTPERM`→`EPERM`)、`revoke` 即时生效 |
@@ -1903,6 +1925,10 @@ $ ls /tmp/grove_case/data/blocks | head -3     # 启动时已建好 256 个桶(�
 02
 $ find /tmp/grove_case/data/blocks -type f | wc -l
 0                                                # 还没写文件,桶里没对象是对的
+$ ./grovefs view --db-path /tmp/grove_case/data create --view share
+created BASE view 'share' at /tmp/grove_case/data/meta/share.db
+  deletes in a base view free the underlying object once no other view references it;
+  reshape it with `view define` or publish it under a name with `view alias`.
 ```
 
 **② 客户端 A:读写挂载 + 写文件**
@@ -2168,7 +2194,7 @@ $G mount --view team -m /mnt/team_ro \
 
 验收：A 机 `echo x > /mnt/team/t.txt`，B 机 `ls /mnt/team_ro` 在 2 秒内看到（TTL 默认 ≤2s，无需重挂）。要**服务端硬只读**而不只是本机 `--ro`，看 §15.11。
 
-> 生产建议给 meta-server 加 **`--strict-view`**：视图名必须先 `init` / `view import` 出来才允许挂载，拼错的名字收到可读拒绝而不会静默长出一棵空树（两种模式的对照见 §4）。
+> **默认就是严格模式**:视图名必须先 `view create` / `init` / `view import` 出来才允许挂载,拼错的名字收到可读拒绝而不会静默长出一棵空树(需要旧行为时显式给 `--allow-lazy-view` / env `GROVEFS_ALLOW_LAZY_VIEW=1`;两种模式的对照见 §4)。
 
 ### 15.3 场景：先用 PG 后端跑通（单机验证，比 §15.2 只多一个参数）
 
@@ -2528,9 +2554,9 @@ $G meta-server --listen 0.0.0.0:50110
 
 | 你看到 | 真实原因 | 去哪儿处理 |
 | --- | --- | --- |
-| 客户端 `Input/output error` + `background mount exited (exit status: 1)` | 服务端在 `M_OPEN` 里**解析不出**这棵视图（PG 下名字超 25 字节、元数据库损坏等）。注意：**名字不存在不属于这一类**，那会被懒创建成空树 | 看 meta-server 日志的最后一条 `M_OPEN view='…' resolve failed: …`；key 类拒绝不走 EIO，会直接回可读原因 |
-| `Error: … "view 'x' does not exist on this meta-server (sqlite/postgres): … strict mode (--strict-view) …"` | 服务端开了 `--strict-view`，而这个视图名还没有树/定义 | §4：先建后挂（SQLite `init --view x` / `view import`；PG 先用不严格模式挂一次）；或去掉 `--strict-view` 回到懒创建 |
-| 挂载**成功**了，但目录是空的 | 视图名拼错了，或这确实是一棵刚被懒创建的新树（SQLite 后端已建 `meta/<name>.db`，PG 已建空 schema） | 同上 §4 的两种模式：想让它直接拒绝就加 `--strict-view`；清理走 §15.8 或 `refs --db-path D rebuild`；也可改用绑定视图的 key（§15.11） |
+| 客户端 `Input/output error` + `background mount exited (exit status: 1)` | 服务端在 `M_OPEN` 里**解析不出**这棵视图（PG 下名字超 25 字节、元数据库损坏等）。注意：**名字不存在不属于这一类**，那会在握手处收到可读拒绝，不建树 | 看 meta-server 日志的最后一条 `M_OPEN view='…' resolve failed: …`；key 类拒绝不走 EIO，会直接回可读原因 |
+| `Error: … "view 'x' does not exist on this meta-server (sqlite/postgres): … views are created explicitly …"` | 这是默认行为：视图名还没有树/定义，服务端拒绝懒创建 | §4：先建后挂（SQLite `view create --view x` / `init` / `view import`；PG `view create --store postgres://… --view x`）；确实需要懒创建才加 `--allow-lazy-view` |
+| 挂载**成功**了，但目录是空的 | 只有在 `--allow-lazy-view` / `GROVEFS_ALLOW_LAZY_VIEW=1` 下才会出现：视图名拼错，服务端静默建了一棵空树（SQLite 已建 `meta/<name>.db`，PG 已建空 schema） | 去掉懒创建开关、改用显式创建；清理走 §15.8 或 `refs --db-path D rebuild`；也可改用绑定视图的 key（§15.11） |
 | `no physical base tree … cannot be forked` | 在 PG 后端下跑 `view fork` | §15.13 换派生视图/别名 |
 | `no view definition '<v>' under …/views` | 在 PG 下用 CLI 删视图 | §15.8 手工 `DROP SCHEMA` |
 | `no metadata tree … lives in Postgres` | 在 PG 下跑 `view export` | 用 `pg_dump -n`（§15.7） |
