@@ -85,8 +85,8 @@ Run `grovefs <command> --help` for a command's full options.
   and the repeat-heavy flags fall back to env — GROVEFS_META / GROVEFS_DATA /
   GROVEFS_TOKEN for `mount` and the servers, GROVEFS_HOME, GROVEFS_DB_PATH,
   GROVEFS_STATS, GROVEFS_API_KEY, GROVEFS_MCP_API_KEY, GROVEFS_BW_READ /
-  GROVEFS_BW_WRITE. Precedence is always
-  flag > live env > config file; keep the file 600 if it holds secrets.
+  GROVEFS_BW_WRITE. Precedence is always flag > live env > config file;
+  keep the file 600 if it holds secrets.
 "#
 )]
 struct Cli {
@@ -262,11 +262,11 @@ enum Cmd {
         /// A shared GCRA slot schedule in the FUSE read path hands bytes back
         /// at exactly this rate (bytes are paced from the first op; a single
         /// op larger than one second of budget may start up to 1 s early).
-        /// Content writes have their
-        /// own knob (`--bw-write`); metadata ops are never throttled. Falls
-        /// back to env `GROVEFS_BW_READ`. Honest boundary: a per-mount,
-        /// CLIENT-side shaper — a raw data-plane client that bypasses FUSE,
-        /// or N mounts of the same view, each get their own budget.
+        /// Content writes have their own knob (`--bw-write`); metadata ops
+        /// are never throttled. Falls back to env `GROVEFS_BW_READ`. Honest
+        /// boundary: a per-mount, CLIENT-side shaper — a raw data-plane
+        /// client that bypasses FUSE, or N mounts of the same view, each get
+        /// their own budget.
         #[arg(long, value_parser = grovefs::bwlimit::parse_rate)]
         bw_read: Option<u64>,
         /// Cap this mount's CONTENT write throughput (same syntax; env
