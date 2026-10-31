@@ -21,7 +21,7 @@
 | --- | --- |
 | `--home` | 单机模式下存放 `blocks/`(数据)与 `meta/`(视图库)的总目录;服务端各用各的 `--db-path`/`--root`,客户端不用它 |
 | data-server / meta-server | 两个中心服务进程:前者管字节(对象存储),后者管目录树(元数据);客户端 `--data`/`--meta` 分别指过去 |
-| 基视图 / 派生视图 / 别名 / fork | 视图四形态:独立存储树(可写)/ 规则定义在服务端的只读显示透镜 / 换名的全树可写入口 / 只拷目录不拷字节的独立树(§3.4–§3.4.1) |
+| 基视图 / 派生视图 / 别名 / fork | 视图四形态:独立存储树(可写)/ 规则定义在服务端的只读显示透镜 / 换名的全树可写入口 / 只拷目录不拷字节的独立树(小白先看 §3.0 的类比与对照表;操作细节 §3.4–§3.4.1) |
 | token / API key | token 是集群准入门(一串共享口令);API key 是逐调用方、可撤销、可绑定视图/只读的凭据(§3.5.1) |
 | 治理面 / 挂载面 | 治理面 = `grovefs mcp` 的视图定义管理接口;挂载面 = FUSE 客户端到 meta/data 的连接——两门独立,scope 互不相通(§6) |
 
@@ -137,7 +137,7 @@ fusermount -u /mnt/alice                          # 等价
 
 ---
 
-## 3. 用 manifest 预建自定义层级
+## 3. 视图定制与治理:manifest、透镜、派生、别名、fork
 
 `init --manifest` 可在创建视图时一次性铺好目录骨架。manifest 每行只支持两种指令:
 
@@ -154,6 +154,230 @@ $Y --home $BASE init --view alice --manifest ./seed.txt
 ```
 
 挂载后即可看到预建的层级。已存在的 mkdir/touch 是幂等的(重复执行不报错)。
+
+### 3.0 四种视图一张表看懂(小白版)
+
+> 这一节只回答三件事:**四种视图分别是什么、每条命令会生成哪些文件/表、参数怎么填**。
+> §3.1–§3.4.1 是操作细节;第一次接触建议先读完这一节,再照 §3.2/§3.4 的例子做。
+
+**先纠正一个最常见的误解:写入数据不等于创建基视图。** 往挂载点里 `mkdir`/`echo` 只是往**已经存在**的树里加节点;本地挂载发现 `meta/<名字>.db` 不存在时会按名**懒创建一棵空树**(服务端可用 `--strict-view` 关掉),但这是“挂载时建树”,不是“写数据建树”。建基视图的常见入口是 `init --view` / `view create --view`(后者会先检查名字没有被派生/别名/fork 占用),以及 `import --view V --source DIR` / `view import`(目标不存在时建树)。除此之外的写操作不会建树。
+
+#### 1. 一句话类比
+
+| 形态 | 类比 | 一句话记住 |
+| --- | --- | --- |
+| **基视图**(base) | 仓库正本 | 数据归属的正本;能写内容、删名会回收字节 |
+| **派生视图**(derived) | 正本上的只读滤镜 | 规则存在控制面(本地 `meta/views/` 或 PG),挂出来只读;数据仍是基视图那份 |
+| **纯别名**(alias) | 门牌号 | 给正本换一个公开名字,挂出来就是正本,全树可写 |
+| **fork** | 复印的目录册 | 目录项复制一份、可随意整理;字节仍共用,内容写不进去 |
+
+#### 2. 四种形态一张表
+
+| | 基视图 | 派生视图 | 纯别名 | fork |
+| --- | --- | --- | --- | --- |
+| **本质** | 一棵真实物理树 | 基树 + 规则(不建树) | 名字 → 真实视图(不建树) | 一棵独立物理树(目录项从基树复制) |
+| **创建命令** | `init --view V` / `view create --view V` | `view define --name D --base B --rules F` | `view alias --name A --real R` | `view fork --name F --base B` |
+| **新增文件** | `meta/V.db` | `meta/views/D.layout` | `meta/views/A.layout` | `meta/F.db` + `meta/views/F.layout` |
+| **挂载后能改目录** | 能 | 不能(只读) | 能 | 能 |
+| **挂载后能写内容** | 能 | 不能(`EROFS`) | 能 | 不能(`EROFS`) |
+| **删一个名字时** | 摘基树的名字;账本归零才释放字节 | 派生挂载只读,删不了(走基) | 等同在真实视图上删;账本归零才释放 | 只摘 fork 自己的名字;基树不动;账本归零才释放 |
+| **删除整个视图时** | `view rm --base`:删树 + 回收无人持有字节 | `view rm --name`:只删定义 | `view rm --name`:只删定义,真名恢复可挂 | `view rm --name`:删定义 + 自己的树 + 重建账本 |
+| **典型用途** | 真正存数据 | 团队共享一份只读形状 | 隐藏存储真名/换公开名 | 在基数据上做可整理的独立分支 |
+
+**选型一句话**:要存/改内容 → 基视图;只想只读地改形状 → 派生;只想换公开名 → 别名;想独立整理目录但不上传 → fork。
+
+> “能不能写内容”是硬契约:派生挂载在客户端就是只读挂载;fork 的结构操作放行,`write`/`truncate` 由客户端回 `EROFS`。服务端对派生名的写意图另有 `EPERM` 门禁,绕过客户端也写不进去。**派生/别名/fork 都不是安全边界**——能挂基名的人仍看到全树;硬隔离用独立视图 + token/API key(§6)。
+
+#### 3. 每条命令会生成/改动什么
+
+> 路径以 SQLite 存储根 `D` 为例。PG 后端没有本地 `.db`/`.layout` 文件,对应物见本节末尾。
+
+| 命令 | 生成/改动 | 不动什么 |
+| --- | --- | --- |
+| `grovefs view --db-path D create --view V [--manifest F]` | 新建 `D/meta/V.db`(内含 `node`/`ctrl`/`locks` 三张表);`--manifest` 再往树里写目录/空文件节点 | 不改其它视图 |
+| `grovefs --home D init --view V [--manifest F]` | 同上(等价入口;不检查名字是否已有定义) | 同上 |
+| `grovefs --home D mount --view V`(本地,无定义) | 若 `D/meta/V.db` 不存在,**懒创建空树**;挂载本身不落盘 | 不改已有树 |
+| `grovefs view --db-path D define --name X --base B --rules F` | 写/覆盖 `D/meta/views/X.layout`,正文含 `base B` 一行,其余行是规则 | 不建 `X.db`,不复制/移动任何内容 |
+| `grovefs view --db-path D alias --name A --real R [--retire OLD]` | 写/覆盖 `D/meta/views/A.layout`(仅一行 `alias R`);`--retire` 再删旧别名定义 | 不建 `A.db`;`R` 的数据不动 |
+| `grovefs view --db-path D fork --name X --base B` | 新建 `D/meta/X.db`(复制 B 的 `node` 行,保留 inode/硬链接);写 `D/meta/views/X.layout`(仅一行 `fork B`);在 `D/meta/refs.db` 登记共享字节 | 不复制字节;不改 B 的树 |
+| `grovefs view --db-path D rm --name X` | 删 `D/meta/views/X.layout`;若 X 是 fork,再删 `D/meta/X.db`(+WAL/SHM)并重建 `refs.db` | 派生/别名不动数据;fork 不动基树与仍被持有的字节 |
+| `grovefs view --db-path D rm --name V --base` | 删 `D/meta/V.db`(+WAL/SHM),重建 `refs.db`,从 `--data-root`(默认 `D`)回收**无人再持有**的对象 | 别的视图仍持有的字节保留 |
+| `grovefs mount --view V --layout F` | 规则文件本身不落盘;若本地 `meta/V.db` 不存在,仍会懒创建空基树 | 不改服务端状态;只影响本次挂载 |
+| `grovefs view export/import` | 导出:一个 JSONL 文件;导入:新建 `D/meta/V.db` | 不搬字节(字节要另拷 `blocks/`) |
+
+几条容易忽略的规则:
+
+- **定义只是文本槽**:`view define/alias/fork` 写的是 `meta/views/<名字>.layout`,只有 fork 会额外新建一棵 `meta/<名字>.db`。
+- **定义可以先于基树存在**:`view define` 允许 base 还没建(会提示),但**挂载时**服务端会强制 base 必须是物理树;本地 `--home` 直接按名开库,不存在会懒建空树。建议顺序仍是“先 `view create` 基视图,再 define”。
+- **删定义不热作用**:`view rm --name` 后,新挂载立即看不到定义;已经挂着的派生/别名连接会保持旧解析,直到重挂(或服务端缓存被 HA/快照事件清掉)。
+- **删基视图有四道守卫**:名字本身不能还被定义治理;不能有别的派生/别名/fork 指向它;本机不能还挂着;PG 后端不支持 `view rm --base`。
+
+#### 4. 落盘结果:文件与表
+
+一次 `view create` + `view define` + `view alias` + `view fork` 之后,存储根大致长这样:
+
+```text
+D/
+├─ blocks/<2hex>/<key>         # 所有视图共享的文件字节(内容寻址)
+└─ meta/
+   ├─ team.db                  # 基视图 team: node + ctrl + locks
+   ├─ lab.db                   # fork lab: 自己的 node + ctrl + locks
+   ├─ refs.db                  # 跨视图持有账本:谁还在引用哪个 key
+   ├─ views/
+   │  ├─ docsonly.layout       # base team + only /docs
+   │  ├─ public.layout         # alias team
+   │  └─ lab.layout            # fork team
+   └─ api_keys.db              # 可选:API key/审计(SQLite 控制面)
+```
+
+三个 `.layout` 的正文分别长这样(纯文本,不是 SQLite 库):
+
+```text
+# meta/views/docsonly.layout
+base team
+only /docs
+
+# meta/views/public.layout
+alias team
+
+# meta/views/lab.layout
+fork team
+```
+
+| 落盘物 | 是什么 | 谁生成/维护 |
+| --- | --- | --- |
+| `meta/<view>.db` | SQLite 库;`node` 表就是目录树(每行一个名字),`ctrl` 计数器,`locks` 锁租约 | `init`/`view create`/懒挂载/`view fork`/`view import` |
+| `meta/views/<name>.layout` | **纯文本**定义,不是数据库;三种互斥形态:`base B`+规则 / `alias R` / `fork B` | `view define`/`alias`/`fork`;`view rm` 删除 |
+| `meta/refs.db` | 共享字节账本;删名字时判断“是否还有别的视图持有” | 每次增删自动记账;`refs rebuild` 可重算 |
+| `blocks/<2hex>/<key>` | 文件真实字节;所有视图只存 key | 写入/导入时生成;回收时删除 |
+| `meta/api_keys.db` | 可选控制面:key 摘要与调用审计 | `apikey` 命令 / `mcp --require-api-key` |
+
+`node` 表一行包含:`id`、`ino`、`parent_id`、`name`、`is_dir`、`data_ref`(指向 blocks 的 key)、`link_target`、`mode/uid/gid`、`mtime/atime/ctime`,并对 `(parent_id, name)` 唯一。`ctrl` 是 `(k, v)` 计数器;`locks` 是 POSIX/BSD 锁租约。`refs.db` 只有一张 `holders(data_ref TEXT PRIMARY KEY, holders INTEGER)`,记每个对象被多少个视图持有。`api_keys.db`(可选)含 `api_keys` 与 `mcp_calls` 两张表(凭据摘要/审计)。**视图之间的差别不在表结构,而在“这个名字有没有自己的 `.db`”**。
+
+**PG 后端(`--store postgres://…`)的对应关系**
+
+| SQLite 落盘物 | PG 对应物 |
+| --- | --- |
+| `meta/<view>.db` | 一个 schema `grovefs_v_<hex(view)>`(内含同构 `node`/`ctrl`/`locks`) |
+| `meta/views/<name>.layout` | `grovefs_control.view_defs` 表的一行 |
+| `meta/refs.db` | 共享表 `grovefs_refs.holders` |
+| `meta/api_keys.db` | `grovefs_control.api_keys` + `mcp_calls` |
+
+PG 下 `view define/alias/rm --name` 照常可用(写 `view_defs`);`view create`/`view fork`/`view rm --base` 基于本地文件树,会拒绝——基树由首次挂载在 PG 里建 schema。
+
+#### 5. 参数怎么填
+
+| 参数 | 用在哪 | 含义 |
+| --- | --- | --- |
+| `--db-path D` | `view`/`apikey`/`mcp`/`refs`/`import`,以及 `meta-server` | 元数据根:下面有 `meta/`;与 `meta-server --db-path` 指向同一个目录 |
+| `--home D` | `grovefs` 的全局参数(放在子命令前) | 单机模式的本地根;未显式给 `--db-path` 时回退到它 |
+| `--store postgres://…` | `view`/`apikey`/`mcp`/`meta-server` | 控制面改走 PG:`view_defs`/`api_keys`/`mcp_calls`;本地不落 `.layout` |
+| `--view V` | `init`/`mount`/`view create` | 要建/挂的视图名(一个安全路径元素) |
+| `--name X` | `view define/fork/alias/rm` | 新定义的名字(派生名/fork 名/别名/要删的名字) |
+| `--base B` | `view define/fork` | 被引用的**物理基视图**名 |
+| `--real R` | `view alias` | 别名指向的真实物理视图名 |
+| `--retire OLD` | `view alias` | 原子轮换:创建新别名后删除同一真实视图的旧别名 |
+| `--rules F` | `view define` | 规则文件路径(纯文本,一行一个动词) |
+| `--manifest F` | `init`/`view create` | 种子清单(`mkdir`/`touch` 行),建树时预铺骨架 |
+| `--data-root D` | `view rm --base`/`import` | `blocks/` 所在根;删基视图时从这里回收字节 |
+| `--layout F` | `mount` | 本次挂载的本地规则文件;只影响这个挂载,可写;本地 `--home` 下与派生名同用时显式文件优先,不叠两层透镜 |
+| `--strict-view` | `meta-server` | 拒绝未知视图名的 `M_OPEN`,关闭“拼错名字就懒建空树”的默认行为 |
+
+**规则文件(`--rules` / `--layout`)的四个动词**
+
+| 写法 | 参数 | 效果 | 初学者注意 |
+| --- | --- | --- | --- |
+| `hide /a/b` | 一个源路径 | 这棵子树在本视图完全看不到 | 只影响显示;源数据还在 |
+| `only /a` | 一个源路径,一行一个 | 只显示这些子树;沿途祖先目录自动放行 | 需要多个就写多行;白名单外不可写 |
+| `map /a/b /x/y` | 源路径 + 目标路径 | 条目从源位置消失,出现在目标位置;中间目录自动合成 | 源位置是基树里的真实路径;合成目录不能往里新建 |
+| `link /a/b /x/y` | 源路径 + 目标路径 | 两处都可见,同一个 inode | 不复制字节;删任意一处只摘该名字 |
+
+- 所有路径都是**视图内绝对路径**(以 `/` 开头),`<src>` 通常必须是**基视图里真实存在的路径**;`<dst>` 可以是你发明的新路径。
+- 规则一行一条,`#` 开头是注释,空行忽略;同一个 `<dst>` 不能出现在两条 `map`/`link` 里。
+- 解析阶段**不校验源路径是否存在**:写错通常不会报错,只是那块内容不出现。写规则前先查基树——挂载后 `find`,或 MCP `list_view_tree`;不要照源目录猜(`import` 会加前缀)。
+
+#### 6. `mount --view X` 到底选了哪棵树
+
+按顺序判断,命中即停:
+
+1. `meta/views/X.layout` 是 `alias R` 一行 → 换成真实视图 `R`,后续按 `R` 解析;`X` 不是独立树,`R` 从此不能按真名新挂。
+2. 是 `fork B` 一行 → 打开 `X` 自己的 `meta/X.db`(建 fork 时复制的那棵),与 `B` 此后的变化无关。
+3. 是 `base B` + 规则行 → 打开 `meta/B.db`,把后面的规则套成只读透镜。
+4. 没有 `X.layout` → `X` 自己就是基视图,直接打开 `meta/X.db`。
+5. `meta/X.db` 不存在 → 本地/默认服务端会**懒创建空树**;`meta-server --strict-view` 会改为拒绝(推荐生产开启,防止拼错名字长出空树)。
+
+> 服务端解析 `<db-path>/meta/views/`,客户端 `--home` 解析 `<home>/meta/views/`;两边都只做**单跳**:别名不能再指向别名,有定义的名字不能当 fork 的基。**服务端**挂载时还会拒绝“派生套派生”;本地 `--home` 直接按 base 名开 `meta/<base>.db`,名字不存在会懒建空树——所以本地写规则前先确认 base 是真基视图。
+
+#### 7. 最容易踩的坑
+
+1. **写数据不会创建基视图。** 新建树用 `init`/`view create`;挂载缺库时的懒创建只是方便,不是正规入口。
+2. **派生视图只读,而且不是权限边界。** 能挂基名的人仍能看到全树;要隔离用独立视图 + token/API key,不要靠“藏几个目录”。
+3. **别名会把真实名锁住。** 别名存在期间,`mount --view R` 会被拒;新挂载用别名。删别名后真实名恢复可挂(仅新挂载)。一个真实视图同时只能有一个别名,轮换用 `--retire` 一条命令完成。
+4. **fork 只复制目录,不复制字节。** 内容写 `EROFS`;删 fork 不影响基树;基树后来新增的文件不会自动出现在 fork;PG 后端暂不支持 fork。
+5. **`--layout` 与 `meta/views/*.layout` 是两回事。** 前者只影响本次挂载、可写;后者是服务端命名定义、只读。本地同时给 `--view 派生名 --layout F` 时,显式 `--layout` 优先、已发布定义被绕过(还可能懒建同名空树);两者建议二选一。
+6. **只有账本归零才真正回收字节。** 删派生/别名只删定义;删 fork 只删自己的树;在任意视图里删名字,都要等 `refs.db` 里没有其它视图持有才释放对象。
+7. **`view define` 可以先于基树存在。** 它会提示 base tree missing;挂载时才强制。先 `view create` 再 define,能少一次排错。
+8. **拼错视图名会懒建空树。** 生产环境给 `meta-server` 开 `--strict-view`,让错误的 `--view` 直接拒挂,而不是静默长出一棵空树。
+
+**报错对照**:`EROFS` = 只读文件系统(派生挂载、fork 内容写);`EPERM` = 操作不允许(向合成目录新建、服务端派生写门禁)。
+
+#### 8. 从零走一遍(照抄即可)
+
+```bash
+Y=./target/release/grovefs
+D=/data/myfs
+
+# ① 建基视图(真正存数据的那棵)
+$Y view --db-path $D create --view team
+$Y --home $D mount --view team -m /mnt/team &
+mkdir -p /mnt/team/docs /mnt/team/raw
+echo "hello" > /mnt/team/docs/a.md
+
+# ② 派生:只读,只显示 /docs
+cat > docsonly.rules <<'EOF'
+only /docs
+EOF
+$Y view --db-path $D define --name docsonly --base team --rules docsonly.rules
+$Y --home $D mount --view docsonly -m /mnt/docsonly &
+ls /mnt/docsonly                  # docs
+echo x > /mnt/docsonly/docs/b.md  # Read-only file system
+
+# ③ fork:独立目录树,结构可改、内容只读
+$Y view --db-path $D fork --name lab --base team
+$Y --home $D mount --view lab -m /mnt/lab &
+mkdir /mnt/lab/review                        # 可以
+mv /mnt/lab/docs/a.md /mnt/lab/review/a.md    # 可以
+echo x > /mnt/lab/new.md                      # Read-only file system
+
+# ④ 别名:公开名,全树可写;此后 team 不能再按真名新挂
+$Y view --db-path $D alias --name public --real team
+$Y --home $D mount --view public -m /mnt/public &
+echo hi > /mnt/public/docs/c.md               # 可以,写的就是 team
+
+# ⑤ 看清单与落盘
+$Y view --db-path $D list
+ls $D/meta $D/meta/views
+```
+
+`view list` 的输出形如(顺序可能不同):
+
+```text
+view 'docsonly' -> base 'team': 0 hide, 1 only, 0 reloc rule(s) (read-only)
+fork 'lab' of base 'team' (independent tree: structure writable, content refused EROFS; deletes touch only this view)
+alias 'public' -> real view 'team' (full tree, writable; 'team' not mountable by its own name)
+base view 'team' -> own tree meta/team.db (read-write; deletes free a shared object only when no view holds it)
+```
+
+> 注意:别名存在期间,`base view 'team'` 仍会出现在清单里,但新挂载必须用 `public`;删别名后 `team` 才恢复可挂。
+
+清理顺序(先删定义,再删基树):
+
+```bash
+$Y view --db-path $D rm --name docsonly       # 只删定义;team 的数据不动
+$Y view --db-path $D rm --name lab            # 删 fork 自己的树;team 与共享字节不动
+$Y view --db-path $D rm --name public         # 删别名;team 恢复可挂(仅新挂载)
+$Y view --db-path $D rm --name team --base --data-root $D   # 连树带无人持有的字节一起回收
+```
 
 ### 3.1 每客户端显示定制:`mount --layout`(同一份数据,不同形状)
 
@@ -187,7 +411,7 @@ mkdir: 无法创建目录 “/mnt/alice/team”: 文件已存在
 
 ### 3.2 服务端派生视图:形状集中定义在服务端(`grovefs view`)
 
-§3.1 的透镜规则由各客户端自备;想把同一套形状**命名后存到服务端**(团队共享一个显示契约、按名授权),用派生视图:`grovefs view define` 把规则写进 meta 根的 `<db-path>/meta/views/<name>.layout`(首行 `base <物理视图>`,余行就是 §3.1 的四个动词;`view --store postgres://…` 时写进 PG 的 `grovefs_control.view_defs` 表,本地不落文件),客户端只需 `mount --view <派生名>`,**不需带本地规则文件**。派生(虚拟)视图**一律只读挂载**——形状集中治理、只分发不修改,写入只属于原(基名)视图;要可写的自定义形状用 §3.1 客户端自备的 `--layout` 透镜。同一个 `views/` 目录还放另外两种定义——**纯别名**(治理"叫什么",§3.4,`grovefs view alias`)与 **fork 视图**(独立元数据树:结构可写、内容只读,§3.4.1,`grovefs view fork`):
+§3.1 的透镜规则由各客户端自备;想把同一套形状**命名后存到服务端**(团队共享一个显示契约、按名授权),用派生视图:`grovefs view define` 把规则写进 meta 根的 `<db-path>/meta/views/<name>.layout`(由 `base <物理视图>` 一行 + 余下的规则行组成,就是 §3.1 的四个动词;`view --store postgres://…` 时写进 PG 的 `grovefs_control.view_defs` 表,本地不落文件),客户端只需 `mount --view <派生名>`,**不需带本地规则文件**。派生(虚拟)视图**一律只读挂载**——形状集中治理、只分发不修改,写入只属于原(基名)视图;要可写的自定义形状用 §3.1 客户端自备的 `--layout` 透镜。同一个 `views/` 目录还放另外两种定义——**纯别名**(治理"叫什么",§3.4,`grovefs view alias`)与 **fork 视图**(独立元数据树:结构可写、内容只读,§3.4.1,`grovefs view fork`):
 
 | 命令 | 参数释义 | 效果 |
 | --- | --- | --- |
@@ -655,14 +879,14 @@ $Y mount --view alice \
    │     ctrl               计数器(inode 分配等)
    │     locks              POSIX/BSD 锁表(租约到期自动回收,release 是持有者终止信号)
    ├─ refs.db               跨视图共享对象持有者账本(GC 判「最后一个名字」的唯一依据)
-   ├─ views/*.layout        派生/别名/fork 定义(派生=首行 `base <B>`+规则行;别名=单行 `alias <R>`;fork=单行 `fork <B>`)
+   ├─ views/*.layout        派生/别名/fork 定义(派生=`base <B>` 行+规则行;别名=单行 `alias <R>`;fork=单行 `fork <B>`(三种行可写在文件任意位置,注释/空行跳过))
    └─ api_keys.db           API key SHA-256 摘要 + 调用审计(SQLite 后端的控制面;PG 后端进 grovefs_control)
 ```
 
 - **名字解析链**:`mount --view X` → `M_OPEN(X)` → 服务端查 `meta/views/X.layout`:
-  首行 `base <B>`(派生) → 打开物理树 `meta/<B>.db`,把规则行套成 `LayoutMeta` 透镜,只读挂载;
-  首行 `alias <R>` → 不套规则,名字直接落到真实树 `meta/<R>.db`,全树可写、真实名拒挂;
-  首行 `fork <B>` → 直接打开它自己的 `meta/X.db`(独立树);
+  含 `base <B>` 行(派生) → 打开物理树 `meta/<B>.db`,把规则行套成 `LayoutMeta` 透镜,只读挂载;
+  含 `alias <R>` 行 → 不套规则,名字直接落到真实树 `meta/<R>.db`,全树可写、真实名拒挂;
+  含 `fork <B>` 行 → 直接打开它自己的 `meta/X.db`(独立树);
   无定义 → X 就是物理视图,直开 `meta/X.db`。客户端本地不需要任何规则文件。
 - **同一棵树的两种后端**:SQLite(默认,一 view 一 `.db`)与 PG(`meta-server --store postgres://…`,
   一 view 一 schema `grovefs_v_<hex(view)>`,账本为共享表 `grovefs_refs.holders`)是**二选一**替代关系;
@@ -670,7 +894,7 @@ $Y mount --view alice \
   CLI `view`/`apikey`/`mcp`/`data-server` 用 `--store`(或 env `GROVEFS_STORE`)接同一份系统记录。
 - **备份闭环**:`blocks/` + `meta/*.db` + `meta/refs.db`(可用 `grovefs refs --db-path D rebuild` 重算)
   + `meta/views/*.layout` + (按需)`meta/api_keys.db`——PG 后端下一个 `pg_dump` 同时覆盖 `grovefs_v_*` 与 `grovefs_control`,本地只剩 `blocks/` + env 要备——§5.4 给完整清单与停服/热备份两种做法。
-- **定制↔存储的对应**:§5.0 的 `.layout` 就是「如何定制视图」的落盘形态(规则四动词见 README
+- **定制↔存储的对应**:四种形态的完整对照(命令→生成文件/表、参数、常见坑)见 §3.0;§5.0 的 `.layout` 就是「如何定制视图」的落盘形态(规则四动词见 README
   「视图三问」与 §3.1/§3.2);fork 是唯一会新建物理树的定制方式(`view fork` 拷 `node` 行、字节共享入账本)。
 
 ### 5.1 物理布局

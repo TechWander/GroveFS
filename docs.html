@@ -249,7 +249,11 @@
   <h2>零基础起步<span class="goal">目标：看懂它是什么</span></h2>
   <ol>
     <li><a href="#preq">§0 预备知识</a></li>
-    <li><a href="#intro">§1 是什么 / 核心概念</a></li>
+    <li><a href="#intro">§1 是什么 / 核心概念</a>
+      <ol class="sub">
+        <li><a href="#four-kinds">四种视图先分清</a></li>
+      </ol>
+    </li>
   </ol>
 
   <h2>快速部署<span class="goal">目标：跑通并上生产</span></h2>
@@ -401,6 +405,184 @@
       <p>树内可以 <code>mkdir</code>/<code>touch</code> 任意多个文件与目录、任意深度，与自家 home 无差异；<code>--manifest</code> 只是预建骨架的入口，不是路径数量上限。</p>
       <p>鉴权不来自 Linux 身份，而来自<b>能访问存储根</b> + <b>服务端准入</b>（可选 <code>--token</code>，或可撤销的 <code>--require-api-key</code> + <code>mount --api-key</code>）。</p>
     </details>
+    <h3 id="four-kinds">四种视图：先分清「正本 / 滤镜 / 门牌 / 复印册」</h3>
+    <p class="lead">写入数据<b>不会</b>创建基视图——写只是往已经存在的树里加节点。基视图由 <code>init --view</code> / <code>view create --view</code> 显式创建（<code>import</code> 目标不存在时也会建树）；本地挂载缺库时会懒创建空树，生产建议给 <code>meta-server</code> 开 <code>--strict-view</code>。下面把四种形态、每条命令的落盘产物、参数和常见坑一次讲清。</p>
+    <div class="grid">
+      <div class="card"><h4>基视图 = 正本</h4><p>真实物理树 <code>meta/&lt;V&gt;.db</code>；数据归属的正本，能写内容、删名会真正回收字节。</p></div>
+      <div class="card"><h4>派生 = 只读滤镜</h4><p>不建树，只写 <code>meta/views/&lt;D&gt;.layout</code>（<code>base B</code> + 规则）；挂载只读，写回基视图。</p></div>
+      <div class="card"><h4>别名 = 门牌号</h4><p>不建树，只写一行 <code>alias R</code>；挂载就是 R，全树可写，R 的真名暂时不能直挂。</p></div>
+      <div class="card"><h4>fork = 复印册</h4><p>复制目录项到 <code>meta/&lt;F&gt;.db</code>；结构可改、内容只读，字节与基视图共用。</p></div>
+    </div>
+    <h4>1. 四种形态一张表</h4>
+    <table>
+      <thead><tr><th></th><th>基视图</th><th>派生视图</th><th>纯别名</th><th>fork</th></tr></thead>
+      <tbody>
+        <tr><td><b>本质</b></td><td>一棵真实物理树</td><td>基树 + 规则（不建树）</td><td>名字 → 真实视图（不建树）</td><td>一棵独立物理树（目录项从基树复制）</td></tr>
+        <tr><td><b>创建命令</b></td><td><code>init --view V</code> / <code>view create --view V</code></td><td><code>view define --name D --base B --rules F</code></td><td><code>view alias --name A --real R</code></td><td><code>view fork --name F --base B</code></td></tr>
+        <tr><td><b>新增文件</b></td><td><code>meta/V.db</code></td><td><code>meta/views/D.layout</code></td><td><code>meta/views/A.layout</code></td><td><code>meta/F.db</code> + <code>meta/views/F.layout</code></td></tr>
+        <tr><td><b>改目录</b></td><td>可写</td><td>只读</td><td>可写</td><td>可写</td></tr>
+        <tr><td><b>写内容</b></td><td>可写</td><td><code>EROFS</code></td><td>可写</td><td><code>EROFS</code></td></tr>
+        <tr><td><b>删一个名字</b></td><td>摘基树的名字；账本归零才释放字节</td><td>删不了（走基）</td><td>等同在真实视图上删</td><td>只摘 fork 自己的名字；基树不动</td></tr>
+        <tr><td><b>删除整个视图</b></td><td><code>view rm --base</code>：删树 + 回收无人持有字节</td><td><code>view rm --name</code>：只删定义</td><td><code>view rm --name</code>：只删定义，真名恢复</td><td><code>view rm --name</code>：删定义 + 自己的树 + 重建账本</td></tr>
+      </tbody>
+    </table>
+    <p><b>选型一句话：</b>要存/改内容 → 基视图；只想只读地改形状 → 派生；只想换公开名 → 别名；想独立整理目录但不上传 → fork。</p>
+    <div class="note"><b>三条硬规则：</b>① 派生挂载只读，<code>write</code>/<code>truncate</code> 回 <code>EROFS</code>；fork 结构操作放行、内容写回 <code>EROFS</code>。② 只有全局账本 <code>refs.db</code> 归零，对象才真正回收。③ 派生/别名/fork 都<b>不是安全边界</b>——能挂基名的人仍看到全树；硬隔离用独立视图 + token / API key。</div>
+    <h4>2. 每条命令生成/改动什么</h4>
+    <table>
+      <thead><tr><th>命令</th><th>落盘产物</th><th>不动什么</th></tr></thead>
+      <tbody>
+        <tr><td><code>view create --view V [--manifest F]</code></td><td><code>D/meta/V.db</code>（<code>node</code>/<code>ctrl</code>/<code>locks</code>）；manifest 再写骨架</td><td>其它视图</td></tr>
+        <tr><td><code>init --view V [--manifest F]</code></td><td>同上（不检查名字是否已有定义）</td><td>其它视图</td></tr>
+        <tr><td><code>mount --view V</code>（本地，无定义）</td><td>缺 <code>D/meta/V.db</code> 时懒建空树；挂载本身不落盘</td><td>已有树</td></tr>
+        <tr><td><code>view define --name X --base B --rules F</code></td><td><code>D/meta/views/X.layout</code>（首行 <code>base B</code> + 规则）</td><td>不建 <code>X.db</code>，不搬数据</td></tr>
+        <tr><td><code>view alias --name A --real R [--retire OLD]</code></td><td><code>D/meta/views/A.layout</code>（一行 <code>alias R</code>）；删旧别名定义</td><td><code>R</code> 的数据</td></tr>
+        <tr><td><code>view fork --name X --base B</code></td><td><code>D/meta/X.db</code>（复制 <code>node</code> 行）+ <code>D/meta/views/X.layout</code>（<code>fork B</code>）+ <code>refs.db</code> 记账</td><td>不复制字节，不改 B</td></tr>
+        <tr><td><code>view rm --name X</code></td><td>删定义；fork 再删 <code>D/meta/X.db</code> + WAL/SHM 并重建账本</td><td>派生/别名不动数据</td></tr>
+        <tr><td><code>view rm --name V --base</code></td><td>删 <code>D/meta/V.db</code> + WAL/SHM；重建账本；从 <code>--data-root</code> 回收无人持有对象</td><td>仍被持有的字节</td></tr>
+        <tr><td><code>mount --view V --layout F</code></td><td>规则文件不落盘；缺库仍懒建空树</td><td>服务端状态</td></tr>
+        <tr><td><code>view export / import</code></td><td>JSONL / 新 <code>D/meta/V.db</code></td><td>字节（另拷 <code>blocks/</code>）</td></tr>
+      </tbody>
+    </table>
+    <h4>3. 落盘结果：文件与表</h4>
+    <pre class="tree">D/
+├─ <span class="k">blocks/&lt;2hex&gt;/&lt;key&gt;</span>   <span class="c">所有视图共享的文件字节（内容寻址）</span>
+└─ <span class="k">meta/</span>
+   ├─ <span class="k">team.db</span>              <span class="c">基视图 team：node + ctrl + locks</span>
+   ├─ <span class="k">lab.db</span>               <span class="c">fork lab：自己的 node + ctrl + locks</span>
+   ├─ <span class="k">refs.db</span>              <span class="c">跨视图持有账本（GC 依据）</span>
+   ├─ <span class="k">views/</span>
+   │  ├─ <span class="k">docsonly.layout</span>    <span class="c">base team + only /docs</span>
+   │  ├─ <span class="k">public.layout</span>      <span class="c">alias team</span>
+   │  └─ <span class="k">lab.layout</span>         <span class="c">fork team</span>
+   └─ <span class="k">api_keys.db</span>          <span class="c">可选：key 摘要与审计（SQLite 控制面）</span></pre>
+    <p>三个 <code>.layout</code> 的正文分别长这样（纯文本，不是 SQLite 库）：</p>
+    <pre><code><span class="cmt"># meta/views/docsonly.layout</span>
+base team
+only /docs
+
+<span class="cmt"># meta/views/public.layout</span>
+alias team
+
+<span class="cmt"># meta/views/lab.layout</span>
+fork team</code></pre>
+    <table>
+      <thead><tr><th>落盘物</th><th>是什么</th><th>谁生成/维护</th></tr></thead>
+      <tbody>
+        <tr><td><code>meta/&lt;view&gt;.db</code></td><td>SQLite 库；<code>node</code> 表就是目录树（每行一个名字），<code>ctrl</code> 计数器，<code>locks</code> 锁租约</td><td><code>init</code> / <code>view create</code> / 懒挂载 / <code>view fork</code> / <code>view import</code></td></tr>
+        <tr><td><code>meta/views/&lt;name&gt;.layout</code></td><td><b>纯文本</b>定义，不是数据库；三种互斥形态：<code>base B</code> + 规则 / <code>alias R</code> / <code>fork B</code></td><td><code>view define</code> / <code>alias</code> / <code>fork</code>；<code>view rm</code> 删除</td></tr>
+        <tr><td><code>meta/refs.db</code></td><td>共享字节账本；删名字时判断「是否还有别的视图持有」</td><td>每次增删自动记账；<code>refs rebuild</code> 可重算</td></tr>
+        <tr><td><code>blocks/&lt;2hex&gt;/&lt;key&gt;</code></td><td>文件真实字节；所有视图只存 key</td><td>写入/导入时生成；回收时删除</td></tr>
+        <tr><td><code>meta/api_keys.db</code></td><td>可选控制面：key 摘要与调用审计</td><td><code>apikey</code> / <code>mcp --require-api-key</code></td></tr>
+      </tbody>
+    </table>
+    <p><code>node</code> 表一行包含：<code>id</code>、<code>ino</code>、<code>parent_id</code>、<code>name</code>、<code>is_dir</code>、<code>data_ref</code>（指向 blocks 的 key）、<code>link_target</code>、<code>mode/uid/gid</code>、<code>mtime/atime/ctime</code>，并对 <code>(parent_id, name)</code> 唯一。<code>ctrl</code> 是 <code>(k, v)</code> 计数器；<code>locks</code> 是锁租约；<code>refs.db</code> 只有一张 <code>holders(data_ref TEXT PRIMARY KEY, holders INTEGER)</code>，记每个对象当前被多少个视图持有；<code>api_keys.db</code> 含 <code>api_keys</code> 与 <code>mcp_calls</code> 两张表。<b>视图之间的差别不在表结构，而在「这个名字有没有自己的 <code>.db</code>」</b>。</p>
+    <details>
+      <summary>PG 后端（<code>--store postgres://…</code>）怎么对应？</summary>
+      <table>
+        <thead><tr><th>SQLite 落盘物</th><th>PG 对应物</th></tr></thead>
+        <tbody>
+          <tr><td><code>meta/&lt;view&gt;.db</code></td><td>一个 schema <code>grovefs_v_&lt;hex(view)&gt;</code>（同构 <code>node</code>/<code>ctrl</code>/<code>locks</code>）</td></tr>
+          <tr><td><code>meta/views/&lt;name&gt;.layout</code></td><td><code>grovefs_control.view_defs</code> 表的一行</td></tr>
+          <tr><td><code>meta/refs.db</code></td><td>共享表 <code>grovefs_refs.holders</code></td></tr>
+          <tr><td><code>meta/api_keys.db</code></td><td><code>grovefs_control.api_keys</code> + <code>mcp_calls</code></td></tr>
+        </tbody>
+      </table>
+      <p>PG 下 <code>view define / alias / rm --name</code> 照常可用（写 <code>view_defs</code>）；<code>view create</code> / <code>view fork</code> / <code>view rm --base</code> 基于本地文件树，会拒绝——基树由首次挂载在 PG 里建 schema。</p>
+    </details>
+    <h4>4. 参数怎么填</h4>
+    <table>
+      <thead><tr><th>参数</th><th>用在哪</th><th>含义</th></tr></thead>
+      <tbody>
+        <tr><td><code>--db-path D</code></td><td><code>view</code>/<code>apikey</code>/<code>mcp</code>/<code>refs</code>/<code>import</code>、<code>meta-server</code></td><td>元数据根：下面有 <code>meta/</code>；与 <code>meta-server --db-path</code> 同一个目录</td></tr>
+        <tr><td><code>--home D</code></td><td><code>grovefs</code> 全局参数（放在子命令前）</td><td>单机本地根；未给 <code>--db-path</code> 时回退到它</td></tr>
+        <tr><td><code>--store postgres://…</code></td><td><code>view</code>/<code>apikey</code>/<code>mcp</code>/<code>meta-server</code></td><td>控制面走 PG：<code>view_defs</code>/<code>api_keys</code>/<code>mcp_calls</code>；本地不落 <code>.layout</code></td></tr>
+        <tr><td><code>--view V</code></td><td><code>init</code>/<code>mount</code>/<code>view create</code></td><td>要建/挂的视图名（一个安全路径元素）</td></tr>
+        <tr><td><code>--name X</code></td><td><code>view define/fork/alias/rm</code></td><td>新定义的名字（派生名/fork 名/别名/要删的名字）</td></tr>
+        <tr><td><code>--base B</code></td><td><code>view define/fork</code></td><td>被引用的<b>物理基视图</b>名</td></tr>
+        <tr><td><code>--real R</code></td><td><code>view alias</code></td><td>别名指向的真实物理视图名</td></tr>
+        <tr><td><code>--retire OLD</code></td><td><code>view alias</code></td><td>原子轮换：创建新别名后删除同一真实视图的旧别名</td></tr>
+        <tr><td><code>--rules F</code></td><td><code>view define</code></td><td>规则文件路径（纯文本，一行一个动词）</td></tr>
+        <tr><td><code>--manifest F</code></td><td><code>init</code>/<code>view create</code></td><td>种子清单（<code>mkdir</code>/<code>touch</code> 行），建树时预铺骨架</td></tr>
+        <tr><td><code>--data-root D</code></td><td><code>view rm --base</code>/<code>import</code></td><td><code>blocks/</code> 所在根；删基视图时从这里回收字节</td></tr>
+        <tr><td><code>--layout F</code></td><td><code>mount</code></td><td>本次挂载的本地规则文件；只影响这个挂载，可写；本地 <code>--home</code> 下与派生名同用时显式文件优先，不叠两层透镜</td></tr>
+        <tr><td><code>--strict-view</code></td><td><code>meta-server</code></td><td>拒绝未知视图名的 <code>M_OPEN</code>，关闭「拼错名字就懒建空树」</td></tr>
+      </tbody>
+    </table>
+    <h4>5. 规则文件的四个动词</h4>
+    <table>
+      <thead><tr><th>写法</th><th>效果</th><th>初学者注意</th></tr></thead>
+      <tbody>
+        <tr><td><code>hide /a/b</code></td><td>这棵子树在本视图完全看不到</td><td>只影响显示；源数据还在</td></tr>
+        <tr><td><code>only /a</code></td><td>只显示这些子树；沿途祖先目录自动放行</td><td>需要多个就写多行；白名单外不可写</td></tr>
+        <tr><td><code>map /a/b /x/y</code></td><td>条目从源位置消失，出现在目标位置；中间目录自动合成</td><td>源位置是基树真实路径；合成目录不能往里新建</td></tr>
+        <tr><td><code>link /a/b /x/y</code></td><td>两处都可见，同一个 inode</td><td>不复制字节；删任意一处只摘该名字</td></tr>
+      </tbody>
+    </table>
+    <p>所有路径都是<b>视图内绝对路径</b>（以 <code>/</code> 开头），<code>&lt;src&gt;</code> 通常必须是基视图里真实存在的路径，<code>&lt;dst&gt;</code> 可以自己发明；同一个 <code>&lt;dst&gt;</code> 不能出现在两条 <code>map</code>/<code>link</code> 里。解析阶段<b>不校验源路径是否存在</b>：写错通常不报错，只是那块内容不出现——先挂基视图 <code>find</code>，或 MCP <code>list_view_tree</code> 查清楚再写。</p>
+    <h4>6. <code>mount --view X</code> 到底选了哪棵树</h4>
+    <ol>
+      <li><code>meta/views/X.layout</code> 是 <code>alias R</code> 一行 → 换成真实视图 <code>R</code>；<code>X</code> 不是独立树，<code>R</code> 从此不能按真名新挂。</li>
+      <li>是 <code>fork B</code> 一行 → 打开 <code>X</code> 自己的 <code>meta/X.db</code>（建 fork 时复制的那棵），与 <code>B</code> 此后的变化无关。</li>
+      <li>是 <code>base B</code> + 规则行 → 打开 <code>meta/B.db</code>，把后面的规则套成只读透镜。</li>
+      <li>没有 <code>X.layout</code> → <code>X</code> 自己就是基视图，直接打开 <code>meta/X.db</code>。</li>
+      <li><code>meta/X.db</code> 不存在 → 本地/默认服务端懒创建空树；<code>--strict-view</code> 改为拒绝。</li>
+    </ol>
+    <p>服务端解析 <code>&lt;db-path&gt;/meta/views/</code>，客户端 <code>--home</code> 解析 <code>&lt;home&gt;/meta/views/</code>；两边都只做<b>单跳</b>：别名不能再指向别名，有定义的名字不能当 fork 的基。<b>服务端</b>挂载时还会拒绝「派生套派生」；本地 <code>--home</code> 直接按 base 名开 <code>meta/&lt;base&gt;.db</code>，名字不存在会懒建空树——所以本地写规则前先确认 base 是真基视图。</p>
+    <details>
+      <summary>最容易踩的 8 个坑（点开）</summary>
+      <ol>
+        <li><b>写数据不会创建基视图。</b>新建树用 <code>init</code>/<code>view create</code>；挂载缺库时的懒创建只是方便，不是正规入口。</li>
+        <li><b>派生视图只读，而且不是权限边界。</b>能挂基名的人仍看到全树；要隔离用独立视图 + token/API key。</li>
+        <li><b>别名会把真实名锁住。</b>别名存在期间 <code>mount --view R</code> 被拒；删别名后真实名恢复（仅新挂载）。一个真实视图同时只能有一个别名，轮换用 <code>--retire</code> 一条命令完成。</li>
+        <li><b>fork 只复制目录，不复制字节。</b>内容写 <code>EROFS</code>；删 fork 不影响基树；基树后来新增的文件不会自动出现在 fork；PG 后端暂不支持 fork。</li>
+        <li><b><code>--layout</code> 与 <code>meta/views/*.layout</code> 是两回事。</b>前者只影响本次挂载、可写；后者是服务端命名定义、只读。本地同时给 <code>--view 派生名 --layout F</code> 时，显式 <code>--layout</code> 优先、已发布定义被绕过（还可能懒建同名空树）；建议二选一。</li>
+        <li><b>只有账本归零才真正回收字节。</b>删派生/别名只删定义；删 fork 只删自己的树；在任意视图里删名字，都要等 <code>refs.db</code> 没有其它持有者才释放对象。</li>
+        <li><b><code>view define</code> 可以先于基树存在。</b>它会提示 base tree missing，挂载时才强制；先 <code>view create</code> 再 define，少一次排错。</li>
+        <li><b>拼错视图名会懒建空树。</b>生产给 <code>meta-server</code> 开 <code>--strict-view</code>，让错误的 <code>--view</code> 直接拒挂。</li>
+      </ol>
+    </details>
+    <p><b>报错对照：</b><code>EROFS</code> = 只读文件系统（派生挂载、fork 内容写）；<code>EPERM</code> = 操作不允许（向合成目录新建、服务端派生写门禁）。</p>
+    <h4>7. 从零走一遍</h4>
+    <pre><code><span class="cmt"># ① 建基视图（正本）</span>
+Y=./target/release/grovefs
+D=/data/myfs
+$Y view --db-path $D create --view team
+$Y --home $D mount --view team -m /mnt/team &amp;
+mkdir -p /mnt/team/docs /mnt/team/raw
+echo "hello" &gt; /mnt/team/docs/a.md
+
+<span class="cmt"># ② 派生：只读，只显示 /docs</span>
+cat &gt; docsonly.rules &lt;&lt;'EOF'
+only /docs
+EOF
+$Y view --db-path $D define --name docsonly --base team --rules docsonly.rules
+$Y --home $D mount --view docsonly -m /mnt/docsonly &amp;
+ls /mnt/docsonly                  <span class="cmt"># docs</span>
+echo x &gt; /mnt/docsonly/docs/b.md  <span class="cmt"># Read-only file system</span>
+
+<span class="cmt"># ③ fork：独立目录树，结构可改、内容只读</span>
+$Y view --db-path $D fork --name lab --base team
+$Y --home $D mount --view lab -m /mnt/lab &amp;
+mkdir /mnt/lab/review                        <span class="cmt"># 可以</span>
+mv /mnt/lab/docs/a.md /mnt/lab/review/a.md    <span class="cmt"># 可以</span>
+echo x &gt; /mnt/lab/new.md                      <span class="cmt"># Read-only file system</span>
+
+<span class="cmt"># ④ 别名：公开名，全树可写；此后 team 不能再按真名新挂</span>
+$Y view --db-path $D alias --name public --real team
+$Y --home $D mount --view public -m /mnt/public &amp;
+echo hi &gt; /mnt/public/docs/c.md               <span class="cmt"># 可以，写的就是 team</span>
+
+<span class="cmt"># ⑤ 看清单与落盘</span>
+$Y view --db-path $D list
+ls $D/meta $D/meta/views</code></pre>
+    <p class="cmt">注意：别名存在期间 <code>base view 'team'</code> 仍会列出，但新挂载必须用 <code>public</code>；删别名后 <code>team</code> 才恢复可挂。</p>
+    <p>清理顺序（先删定义，再删基树）：</p>
+    <pre><code>$Y view --db-path $D rm --name docsonly       <span class="cmt"># 只删定义；team 的数据不动</span>
+$Y view --db-path $D rm --name lab            <span class="cmt"># 删 fork 自己的树；team 与共享字节不动</span>
+$Y view --db-path $D rm --name public         <span class="cmt"># 删别名；team 恢复可挂（仅新挂载）</span>
+$Y view --db-path $D rm --name team --base --data-root $D   <span class="cmt"># 连树带无人持有的字节一起回收</span></code></pre>
+    <p class="cmt">完整逐项解释与 <code>view list</code> 输出样例见 USAGE §3.0；操作细节见 §15.5–§15.8.1。</p>
     <h3>常用参数：先说它管什么，再看怎么写</h3>
     <p class="lead">下面命令里 <code>--home</code>、<code>--db-path</code> 这类是参数写法（照抄用）；它们各自管的东西以实际含义为准。</p>
     <table>
@@ -1650,7 +1832,7 @@ B umount ok</i></pre>
     <p class="lead">两个高频问题:① 服务端盘很多/数据量大,数据目录怎么定置、存量数据怎么进来;② 同一批数据,不同客户端能不能看到不同组织形状。</p>
 
     <h3 id="three-questions">15.0 视图三问速览:怎么定制 / 元数据存哪 / 权限怎么管</h3>
-    <p class="lead">三大主题的一屏地图,每条指向本节的详章——新人部署前先读这一屏。</p>
+    <p class="lead">三大主题的一屏地图,每条指向本节的详章——新人部署前先读这一屏;零基础先看 <a href="#four-kinds">§1 四种视图</a>。</p>
 
     <h4>① 如何定制视图:规则透镜,只改呈现不搬字节</h4>
     <p>定制的唯一素材是<b>基视图的真实显示路径</b>(先查再写:挂载后 <code>find</code>,或 MCP <code>list_view_tree</code> 不挂载只读元数据渲染;不要照源目录结构猜——<code>import</code> 会把源目录整体挂进 <code>/seeds</code> 类前缀下)。规则一行一个动词(<code>#</code> 注释):<code>hide &lt;src&gt;</code> 剪子树、<code>only &lt;src&gt;</code> 白名单、<code>map &lt;src&gt; &lt;dst&gt;</code> 把条目<b>搬</b>到虚拟显示路径(父目录自动合成)、<code>link &lt;src&gt; &lt;dst&gt;</code> 同一批条目<b>再加</b>一个名字。四个入口共用同一副 <code>LayoutMeta</code> 透镜,只差规则从哪来:</p>
