@@ -14,17 +14,25 @@
 //! - [`layout`]       : per-mount presentation overlay (same tree, different lens)
 //! - [`mcp`]          : MCP server exposing the view-governance tools to AI agents
 
+// Server-side / control-plane modules: a `remote-only` client build (see the
+// sibling `grovefs-win` crate) drops all of them — they mutually reference the
+// on-disk engines and pull `rusqlite` + `postgres`/`tokio` with them.
+#[cfg(feature = "native")]
 pub mod apikeys;
 pub mod backend;
+#[cfg(feature = "native")]
 pub mod bwlimit;
+#[cfg(feature = "native")]
 pub mod control;
 #[cfg(feature = "native")]
 pub mod du;
 #[cfg(feature = "native")]
 pub mod fs_impl;
 pub mod layout;
+#[cfg(feature = "native")]
 pub mod mcp;
 pub mod meta;
+#[cfg(feature = "native")]
 pub mod pg_store;
 pub mod platform;
 pub mod remote;
