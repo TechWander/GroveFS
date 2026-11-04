@@ -22,9 +22,10 @@ path = "src/lib.rs"
 # Full build: FUSE mount path + cluster server + local/POSIX storage backend.
 default = ["native"]
 # Everything that needs `fuser` (kernel FUSE bridge) or POSIX `libc` calls
-# (pread/pwrite/fsync, getuid, kill). On by default; disabled for the
-# client-only Windows build.
-native = ["dep:fuser", "dep:libc"]
+# (pread/pwrite/fsync, getuid, kill), or an on-disk metadata engine
+# (`rusqlite`/`postgres`). On by default; disabled for the client-only Windows
+# build, which drops the whole server-side/control-plane subtree.
+native = ["dep:fuser", "dep:libc", "dep:rusqlite", "dep:postgres"]
 # Ergonomic alias for the Windows / headless client build: depend on the
 # remote MetaProvider + StorageBackend + wire protocol only, no fuser/libc.
 # Combine with `--no-default-features` so `native` (and thus fuser/libc) is
@@ -39,8 +40,8 @@ remote-only = []
 # `init` (KernelConfig::add_capabilities with InitFlags). OPTIONAL: only the
 # `native` mount/server path needs it, so the client-only build drops it.
 fuser = { version = "0.18", optional = true }
-# Embedded metadata engine: view tree + inode mapping. bundled = compile SQLite from source, no system dep
-rusqlite = { version = "0.31", features = ["bundled"] }
+# Embedded metadata engine: view tree + inode mapping. bundled = compile SQLite from source, no system dep. OPTIONAL: only the on-disk `native` engine (src/meta/engine.rs + the meta-server) links it; the `remote-only` client build drops it — and with it the bundled-SQLite C compilation.
+rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 # libc for pread/pwrite/fsync (true positional IO, no seek races) and POSIX
 # ids/signals. OPTIONAL: the client-only build uses `src/platform.rs` shims
 # instead, so this is only pulled in under `native`.
@@ -61,7 +62,9 @@ dirs = "5"
 # Optional PostgreSQL metadata backend (`meta-server --store postgres://...`).
 # Pure-Rust (tokio-postgres under the hood, no libpq needed); TLS features off
 # because the backend is reached over a trusted LAN via plain NoTls connections.
-postgres = { version = "0.19", default-features = false }
+# OPTIONAL: the server-side/control-plane subtree only, never the `remote-only`
+# client, so tokio is dropped from the Windows build's graph.
+postgres = { version = "0.19", default-features = false, optional = true }
 # Opt-in per-stage latency telemetry (src/stats.rs): high-dynamic-range histograms
 # for offline bottleneck diagnosis. Pure-Rust, zero deps. Only touched when
 # `--stats` / `GROVEFS_STATS=1` is on; the disabled path costs one atomic load.
