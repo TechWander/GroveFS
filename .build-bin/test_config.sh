@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # CONFIG-FILE & ENV-FALLBACK e2e: the "long commands shrink" surface.
 #   (1) a KEY=VALUE file is auto-loaded into the env ($GROVEFS_CONFIG >
-#       ~/.grovefs/grovefs.conf > ~/.config/grovefs/grovefs.conf) without
+#       ~/.config/grovefs/grovefs.conf) without
 #       clobbering live env — the chain is flag > env > file > default;
 #   (2) the repeat-heavy knobs resolve from it: GROVEFS_HOME (init/mount),
 #       GROVEFS_META / GROVEFS_DATA / GROVEFS_TOKEN (mount + servers),
@@ -19,8 +19,8 @@ export LC_ALL=C LANG=C
 export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
 Y=./target/release/grovefs
 
-META=127.0.0.1:50082
-DATA=127.0.0.1:50083
+META=127.0.0.1:15082
+DATA=127.0.0.1:15083
 TOK=cfgsecret
 rm -rf .cfgtest
 mkdir -p .cfgtest/homeA .cfgtest/homeB .cfgtest/homeC .cfgtest/default_home \
@@ -182,10 +182,10 @@ mnt_srv=.cfgtest/mnt2
 # that the file's GROVEFS_DB_PATH was consumed by the server.
 $Y view --db-path .cfgtest/srv_db create --view srvview > .cfgtest/srv_seed.log 2>&1
 GROVEFS_CONFIG=$PWD/.cfgtest/c_srv.conf \
-  $Y meta-server --listen 127.0.0.1:50084 > .cfgtest/meta_srv2.log 2>&1 & srv $!
-wait_port 127.0.0.1:50084 || bad "file-configured meta-server not up"
+  $Y meta-server --listen 127.0.0.1:15084 > .cfgtest/meta_srv2.log 2>&1 & srv $!
+wait_port 127.0.0.1:15084 || bad "file-configured meta-server not up"
 GROVEFS_CONFIG=$PWD/.cfgtest/c_mount.conf \
-  $Y --home .cfgtest/homeA mount --view srvview --mountpoint $mnt_srv --meta 127.0.0.1:50084 --foreground > .cfgtest/m5.log 2>&1 & srv $!
+  $Y --home .cfgtest/homeA mount --view srvview --mountpoint $mnt_srv --meta 127.0.0.1:15084 --foreground > .cfgtest/m5.log 2>&1 & srv $!
 m5=0; for _ in $(seq 1 60); do ismnt $mnt_srv && { m5=1; break; }; sleep 0.25; done
 [ "$m5" = 1 ] && ok "mount authenticates with a file-served token against a file-configured server" || bad "$mnt_srv not mounted (m5)"
 [ -f .cfgtest/srv_db/meta/srvview.db ] && ok "GROVEFS_DB_PATH from the file steered meta-server (the mount resolved its tree in srv_db)" || { bad "srv_db/meta/srvview.db missing — file db-path not consumed by meta-server"; cat .cfgtest/meta_srv2.log .cfgtest/m5.log; }

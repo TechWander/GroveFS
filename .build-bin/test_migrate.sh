@@ -171,8 +171,8 @@ $Y view --db-path .migtest/dst import --view bad2 --in .migtest/bad.jsonl > .mig
   && ok "future format version refused" || bad "version guard: $(cat .migtest/i5.log)"
 printf '%s\n%s\n%s\n' \
   '{"format":"grovefs-view-metadata","version":1,"nodes":2}' \
-  '{"id":1,"parent_id":null,"name":"/","is_dir":1}' \
-  '{"id":2,"parent_id":99,"name":"f","is_dir":0}' > .migtest/bad.jsonl
+  '{"id":1,"ino":1,"parent_id":null,"name":"/","is_dir":1}' \
+  '{"id":2,"ino":2,"parent_id":99,"name":"f","is_dir":0}' > .migtest/bad.jsonl
 $Y view --db-path .migtest/dst import --view bad3 --in .migtest/bad.jsonl > .migtest/i6.log 2>&1
 [ $? -ne 0 ] && grep -q "missing or non-directory parent" .migtest/i6.log \
   && ok "dangling parent refused before the target is touched" || bad "dangling guard: $(cat .migtest/i6.log)"

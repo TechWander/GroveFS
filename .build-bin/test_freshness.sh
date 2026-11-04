@@ -24,30 +24,36 @@ export LC_ALL=C LANG=C
 export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
 Y=./target/release/grovefs
 
-META=127.0.0.1:50156
-DATA=127.0.0.1:50157
+META=127.0.0.1:15210
+DATA=127.0.0.1:15211
 rm -rf .fresh; mkdir -p .fresh/central .fresh/m1 .fresh/m2
 
 wait_port(){ local a=$1; for _ in $(seq 1 100); do (echo >/dev/tcp/${a%%:*}/${a##*:}) 2>/dev/null && return 0; sleep 0.05; done; return 1; }
+
+# Installed BEFORE anything starts: a failed start must still reap its children.
+cleanup(){
+  fusermount -u .fresh/mnt_a 2>/dev/null
+  fusermount -u .fresh/mnt_b 2>/dev/null
+  for p in "${AP:-}" "${BP:-}" "${DP:-}" "${MP:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
+  return 0
+}
+trap cleanup EXIT
 
 # ---- central services ----
 $Y data-server --listen $DATA --root .fresh/central/data > .fresh/data.log 2>&1 &
 DP=$!
 $Y meta-server --db-path .fresh/central --listen $META > .fresh/meta.log 2>&1 &
 MP=$!
-wait_port $DATA && wait_port $META || { echo "servers failed"; exit 1; }
+wait_port $DATA && wait_port $META || { echo "servers failed"; tail -3 .fresh/data.log .fresh/meta.log; exit 1; }
 
 # ---- two NON-STRICT client mounts of the same user ----
-# Strict view gate is the default: create the base view explicitly first.
+# Views are explicit: create the base view first.
 $Y view --db-path .fresh/central create --view alice > .fresh/create.log 2>&1
 $Y --home .fresh/m1 mount --view alice --mountpoint .fresh/mnt_a --meta $META --data $DATA --foreground > .fresh/a.log 2>&1 &
 AP=$!
 $Y --home .fresh/m2 mount --view alice --mountpoint .fresh/mnt_b --meta $META --data $DATA --foreground > .fresh/b.log 2>&1 &
 BP=$!
 sleep 2
-
-cleanup(){ fusermount -u .fresh/mnt_a 2>/dev/null; fusermount -u .fresh/mnt_b 2>/dev/null; kill $AP $BP $DP $MP 2>/dev/null; }
-trap cleanup EXIT
 
 A=.fresh/mnt_a
 B=.fresh/mnt_b

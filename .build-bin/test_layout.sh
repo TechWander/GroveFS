@@ -117,7 +117,7 @@ $Y mount --view team --mountpoint .ltest/mnt_e --layout .ltest/bad.layout --fore
 grep -q "unknown layout verb" .ltest/e.log && ok "invalid rules rejected at mount time" || bad "invalid rules not rejected"
 
 echo "===== 9) server-side derived views: --view <name>, no client rules file ====="
-META=127.0.0.1:50162; DATA=127.0.0.1:50163
+META=127.0.0.1:15162; DATA=127.0.0.1:15163
 wait_port(){ local a=$1; for _ in $(seq 1 100); do (echo >/dev/tcp/${a%%:*}/${a##*:}) 2>/dev/null && return 0; sleep 0.05; done; return 1; }
 $Y meta-server --db-path .ltest/home --listen $META > .ltest/meta_srv.log 2>&1 &
 MSP=$!
@@ -267,8 +267,8 @@ $Y mount --view pub -m .ltest/mnt_old --foreground > .ltest/rot_old.log 2>&1 &
 OLDP=$!; sleep 1.5
 [ ! -d .ltest/mnt_old/docs ] && ok "leaked old alias no longer resolves to the real tree" || bad "old alias still exposes team"
 fusermount -u .ltest/mnt_old 2>/dev/null; kill $OLDP 2>/dev/null; wait $OLDP 2>/dev/null; rm -rf .ltest/mnt_old
-# the retired mount lazily created an empty 'pub.db' namespace — drop it so the
-# name is free again (a retired public name never reaches the real tree anyway)
+# the retired name stays gone: a mount hits no tree and no definition, so no
+# empty 'pub.db' namespace is ever created (nothing to clean up here)
 rm -f .ltest/home/meta/pub.db
 # the NEW name is the live entry: full tree
 mkdir -p .ltest/mnt_new
@@ -287,7 +287,7 @@ $Y view --db-path .ltest/home alias --name pub --real team --retire pubnew > .lt
   && ok "rotate back to pub for the remote section" || bad "rotate back: $(cat .ltest/rot2.log)"
 
 echo "===== 11) pure alias over a meta-server: real name refused, alias writable ====="
-META2=127.0.0.1:50164; DATA2=127.0.0.1:50165
+META2=127.0.0.1:15164; DATA2=127.0.0.1:15165
 $Y meta-server --db-path .ltest/home --listen $META2 > .ltest/meta_srv2.log 2>&1 &
 MSP2=$!
 $Y data-server --listen $DATA2 --root .ltest/home > .ltest/data_srv2.log 2>&1 &

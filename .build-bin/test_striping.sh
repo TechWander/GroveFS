@@ -17,8 +17,8 @@ cd /data/xy/grovefs
 export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
 Y=./target/release/grovefs
 # two data servers, distinct roots — the striping targets.
-A=127.0.0.1:50121
-B=127.0.0.1:50122
+A=127.0.0.1:15121
+B=127.0.0.1:15122
 STRIPE=$((16*1024*1024))   # 16MiB, matches backend::sharded::STRIPE_BYTES
 
 rm -rf .striping; mkdir -p .striping/home .striping/sA .striping/sB .striping/mnt .striping/mnt_legacy

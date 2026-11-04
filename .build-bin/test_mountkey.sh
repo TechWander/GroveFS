@@ -27,11 +27,11 @@ Y=./target/release/grovefs
 
 BASE=$PWD/.mktest/central
 # key-gated pair / token+key pair / data-plane-only gate / fully ungated pair
-META=127.0.0.1:50200;  DATA=127.0.0.1:50201
-METAT=127.0.0.1:50203; DATAT=127.0.0.1:50204
-METAD=127.0.0.1:50205; DATAD=127.0.0.1:50206
-METAP=127.0.0.1:50207; DATAP=127.0.0.1:50208
-DEAD=127.0.0.1:50299                 # never bound: forces the failover path
+META=127.0.0.1:15200;  DATA=127.0.0.1:15201
+METAT=127.0.0.1:15203; DATAT=127.0.0.1:15204
+METAD=127.0.0.1:15205; DATAD=127.0.0.1:15206
+METAP=127.0.0.1:15207; DATAP=127.0.0.1:15208
+DEAD=127.0.0.1:15299                 # never bound: forces the failover path
 TOK=S3CR3T-TOKEN
 rm -rf .mktest
 mkdir -p .mktest/central/data .mktest/central/meta .mktest/home

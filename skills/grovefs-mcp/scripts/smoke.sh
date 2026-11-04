@@ -77,7 +77,7 @@ note "$( $BIN --home "$STORE" import --view team --source "$SEEDS" | tail -1 )"
 
 note "[1] handshake + tool surface"
 TOOLS="$(mcp list)"
-ok "nine tools advertised"          "$TOOLS" "(9 tools)"
+ok "ten tools advertised"           "$TOOLS" "(10 tools)"
 ok "shape preview tool present"     "$TOOLS" "list_view_tree"
 ok "pre-publish dry run present"    "$TOOLS" "validate_definition"
 
@@ -144,6 +144,18 @@ code "get_view on a fork reports its own tree" 0 \
     python3 "$CALL" --bin "$BIN" --quiet --db-path "$STORE" call get_view '{"name":"lab"}'
 ok "fork owns meta/lab.db"          "$( $BIN --home "$STORE" view list )" "lab"
 
+note "[6b] empty fork + graft (a curated, renamed subset in one batch plan)"
+# `seed:false` records the fork but copies nothing; the plan is the same text a
+# program would pipe (`<src>TAB<dst>` per line), so no temp file is required.
+EF="$(mcp call fork_view '{"name":"pick","base":"team","seed":false}')"
+ok "empty fork copies nothing"      "$EF" "as an EMPTY tree: root only"
+GR="$(mcp call graft_view "{\"name\":\"pick\",\"src\":\"team\",\"map\":\"$DOC\tby_kind/notes.md\"}")"
+ok "plan places and renames"        "$GR" "grafted 2 entries (1 directory) from 'team' into 'pick' at /"
+ok "bytes are shared, not copied"   "$GR" "1 shared object(s), 0 skipped"
+PICK="$(mcp call list_view_tree '{"view":"pick"}')"
+ok "renamed entry is served"        "$PICK" "/by_kind/notes.md"
+no "nothing else was grafted"       "$PICK" "/photos"
+
 note "[7] the same governance as resources / prompts / completion"
 RES="$(mcp resources)"
 ok "view tree exposed as resource"  "$RES" "grovefs://view/team/tree"
@@ -167,6 +179,8 @@ no "a successful call stays quiet"  "$(cat "$TMP/notes2")" "[push] notifications
 note "[9] cleanup (removing a fork deletes its own tree, bytes stay held)"
 RMF="$(mcp call remove_view '{"name":"lab"}')"
 ok "fork removed with its tree"     "$RMF" "removed fork view 'lab'"
+RMP="$(mcp call remove_view '{"name":"pick"}')"
+ok "grafted fork removed as well"   "$RMP" "removed fork view 'pick'"
 RMD="$(mcp call remove_view '{"name":"release"}')"
 ok "definition removed, data intact" "$RMD" "removed view definition 'release'"
 RMA="$(mcp call remove_view '{"name":"team-public2"}')"

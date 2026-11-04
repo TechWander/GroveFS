@@ -299,8 +299,7 @@ impl DataServer {
 }
 
 /// Accept loop over an already-bound listener (spawns a thread per connection),
-/// no access token. Kept for backward compatibility with callers/tests that
-/// start a plain server.
+/// no access token — the no-auth variant used by tests and single-host setups.
 pub fn serve_on(listener: TcpListener, backend: Arc<dyn StorageBackend>) {
     serve_auth_keys(
         listener,
@@ -529,6 +528,27 @@ fn dispatch(backend: &dyn StorageBackend, op: u8, body: &[u8]) -> (i32, u64, Vec
             Err(e) => (errno(&e), 0, Vec::new()),
         };
     }
+    // Batch stat reads N keys from the body itself, so handle before the
+    // shared single-key parse (same pattern as OP_STATFS above).
+    if op == proto::OP_BATCH_LEN {
+        let mut bi = 0usize;
+        let count = match proto::read_u32(body, &mut bi) {
+            Ok(n) => n as usize,
+            Err(_) => return (EIO, 0, Vec::new()),
+        };
+        let mut data = Vec::with_capacity(count * 8);
+        for _ in 0..count {
+            let k = match proto::get_key(body, &mut bi) {
+                Ok(k) => k,
+                Err(_) => return (EIO, 0, Vec::new()),
+            };
+            let sz = backend.len(&k).unwrap_or(0);
+            data.extend_from_slice(&sz.to_be_bytes());
+        }
+        let total: u64 = data.chunks_exact(8).map(|c| u64::from_be_bytes(c.try_into().unwrap())).sum();
+        return (0, total, data);
+    }
+
     let mut i = 0usize;
     let key = match proto::get_key(body, &mut i) {
         Ok(k) => k,

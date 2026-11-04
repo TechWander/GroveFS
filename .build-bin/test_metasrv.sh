@@ -14,8 +14,8 @@ export LC_ALL=C LANG=C
 export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
 Y=./target/release/grovefs
 
-META=127.0.0.1:50094
-DATA=127.0.0.1:50095
+META=127.0.0.1:15094
+DATA=127.0.0.1:15095
 rm -rf .msrv; mkdir -p .msrv/central .msrv/m1 .msrv/m2 .msrv/m3 .msrv/m4 .msrv/m5 \
     .msrv/mnt_a .msrv/mnt_b .msrv/mnt_bob .msrv/mnt_s1 .msrv/mnt_s2
 
@@ -32,8 +32,8 @@ if wait_port $META; then MP_OK=1; else MP_OK=0; fi
 [ "$MP_OK" = 1 ] || { echo "servers failed to start"; cat .msrv/data.log .msrv/meta.log; }
 
 # ---- three client mounts, each with its own --home (no local authority) ----
-# Views are created EXPLICITLY: the strict gate is the default, so mounting a
-# fresh name would be refused (nothing is lazily materialized server-side).
+# Views are created EXPLICITLY: `M_OPEN` refuses a name with no tree or
+# definition, so mounting a fresh name would fail (nothing is materialized).
 $Y view --db-path .msrv/central create --view alice > .msrv/create.log 2>&1
 $Y view --db-path .msrv/central create --view bob  >> .msrv/create.log 2>&1
 $Y --home .msrv/m1 mount --view alice --mountpoint .msrv/mnt_a --meta $META --data $DATA --foreground > .msrv/a.log 2>&1 &

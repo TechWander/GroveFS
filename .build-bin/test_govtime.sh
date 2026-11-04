@@ -54,7 +54,7 @@ only /docs
 only /photos
 EOF
 
-META=127.0.0.1:50172; DATA=127.0.0.1:50173
+META=127.0.0.1:15172; DATA=127.0.0.1:15173
 $Y meta-server --db-path "$GROVEFS_HOME" --listen $META > .govtime/meta.log 2>&1 &
 MSP=$!
 $Y data-server --listen $DATA --root "$GROVEFS_HOME" > .govtime/data.log 2>&1 &

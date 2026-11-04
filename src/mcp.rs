@@ -2,16 +2,18 @@
 //! data listings through the same governance API the `grovefs view` CLI drives.
 //!
 //! Two halves live here:
-//! - **Shared view-governance ops** ([`define_view`], [`fork_view`], [`alias_view`],
-//!   [`list_views`], [`remove_view`], [`preview_rules`]): every validation and
+//! - **Shared view-governance ops** ([`define_view`], [`fork_view`], [`graft_view`],
+//!   [`alias_view`], [`list_views`], [`remove_view`], [`preview_rules`]): every validation and
 //!   file mutation of `grovefs view …` in one place, so the CLI and the MCP
 //!   server cannot drift (one contract, two entrances).
 //! - **A dependency-light MCP server over stdio** ([`serve`]): newline-delimited
 //!   JSON-RPC 2.0 implementing the `initialize` / `tools/list` / `tools/call`
-//!   core of the 2025-06-18 protocol revision, with nine tools: seven governance
+//!   core of the 2025-06-18 protocol revision, with ten tools: eight governance
 //!   writes/validations mapping 1:1 to the ops above (`validate_definition` runs
 //!   the FULL publish guard set as a no-write dry run, beyond `preview_rules`'
-//!   verb-syntax check; [`fork_view`] seeds an independent tree) plus two read-only
+//!   verb-syntax check; [`fork_view`] seeds an independent tree — or, with
+//!   `seed: false`, a root-only one — and [`graft_view`] fills it with a
+//!   curated, renamable subset) plus two read-only
 //!   introspection tools ([`view_tree`], [`describe_view`]) that let an agent
 //!   discover the real paths a listing shows (rendering an existing view through
 //!   its own lens, or simulating an unpublished `base` + `rules` pair) and read
@@ -139,7 +141,7 @@ pub trait ControlStore: Send + Sync {
     fn remove_def(&self, name: &str) -> Result<bool, String>;
     /// A cheap content identity for hot-reload: a cached lens records it and
     /// re-reads the definition once it differs (file mtime, or the row's
-    /// `xmax` write ticket). `None` = no definition right now.
+    /// `xmin` write version). `None` = no definition right now.
     fn stamp(&self, name: &str) -> Option<String>;
     /// Has `name`'s definition changed since the cached stamp `seen`? File
     /// stores answer from a `stat`; the PG store runs one single-row SELECT
@@ -172,8 +174,26 @@ pub trait ControlStore: Send + Sync {
     /// therefore refuse to serve a fork whose tree vanished)?
     fn has_fork_tree(&self, name: &str) -> Result<bool, String>;
     /// Seed an independent tree for a fork of `base` (SQLite copy; PG
-    /// not-implemented refusal naming the exact reason).
-    fn create_fork_tree(&self, base: &str, name: &str) -> Result<crate::meta::ForkStats, String>;
+    /// not-implemented refusal naming the exact reason). `seed == false`
+    /// creates the fork's OWN empty tree (schema + root) for [`Self::graft_tree`]
+    /// to fill with a curated subset.
+    fn create_fork_tree(
+        &self,
+        base: &str,
+        name: &str,
+        seed: bool,
+    ) -> Result<crate::meta::ForkStats, String>;
+    /// Graft a curated subset of `src`'s names into `dst`'s own tree, renaming
+    /// each entry to its destination basename (SQLite only — a PG store refuses
+    /// it for the same reason it refuses a fork: no per-view snapshot path).
+    fn graft_tree(
+        &self,
+        dst: &str,
+        src: &str,
+        items: &[crate::meta::GraftItem],
+        dest: &str,
+        skip_existing: bool,
+    ) -> Result<crate::meta::GraftStats, String>;
     /// Roll a freshly seeded fork tree back after its definition slot failed
     /// to be recorded (best effort, like the file path's unlink).
     fn destroy_fork_tree(&self, name: &str);
@@ -185,9 +205,9 @@ pub trait ControlStore: Send + Sync {
     /// tools (a missing tree is reported, never silently empty). A probe never
     /// creates anything on either backend.
     fn open_ro_view(&self, view: &str) -> Result<Arc<dyn MetaProvider>, String>;
-    /// Whether a governance op should note that `view` has no local tree yet
-    /// (lazy creation under a meta-server, or PG). File stores check the db
-    /// file; the PG store never warns (schemas are created on first use).
+    /// Whether a governance op should note that `view` has no local tree yet.
+    /// File stores check the db file; the PG store never warns (a missing
+    /// schema is reported by the op that needs it, not by a pre-flight note).
     fn base_tree_missing_note(&self, view: &str) -> Result<Option<String>, String>;
 }
 
@@ -318,8 +338,24 @@ impl ControlStore for FileControlStore {
         Ok(self.db(name).is_file())
     }
 
-    fn create_fork_tree(&self, base: &str, name: &str) -> Result<crate::meta::ForkStats, String> {
-        crate::meta::fork_view(&self.base, base, name)
+    fn create_fork_tree(
+        &self,
+        base: &str,
+        name: &str,
+        seed: bool,
+    ) -> Result<crate::meta::ForkStats, String> {
+        crate::meta::fork_view_with(&self.base, base, name, seed)
+    }
+
+    fn graft_tree(
+        &self,
+        dst: &str,
+        src: &str,
+        items: &[crate::meta::GraftItem],
+        dest: &str,
+        skip_existing: bool,
+    ) -> Result<crate::meta::GraftStats, String> {
+        crate::meta::graft_view(&self.base, dst, src, items, dest, skip_existing)
     }
 
     fn destroy_fork_tree(&self, name: &str) {
@@ -369,7 +405,7 @@ impl ControlStore for FileControlStore {
             None
         } else {
             Some(format!(
-                "note: no local <db-path>/meta/{view}.db yet — fine under PG or lazy creation, otherwise run `grovefs --home ... init --view {view}` first"
+                "note: no local <db-path>/meta/{view}.db yet — create it with `grovefs --home ... init --view {view}` (or `view create`) first"
             ))
         })
     }
@@ -401,9 +437,10 @@ impl PgControlStore {
         })
     }
 
-    /// `updated_at` is kept for operators; the hot-reload ticket is `xmax`
-    /// (the row's write version), which changes on every UPDATE and never on
-    /// an equal-content re-read — exactly the file store's mtime role.
+    /// `updated_at` is kept for operators; the hot-reload ticket is `xmin`
+    /// (the row's write version, read as `xmin::text`), which changes on every
+    /// UPDATE and never on an equal-content re-read — exactly the file store's
+    /// mtime role.
     fn stamp_query(&self, name: &str) -> Option<String> {
         let rows = self
             .pool
@@ -504,9 +541,28 @@ impl ControlStore for PgControlStore {
         Ok(true)
     }
 
-    fn create_fork_tree(&self, _base: &str, _name: &str) -> Result<crate::meta::ForkStats, String> {
+    fn create_fork_tree(
+        &self,
+        _base: &str,
+        _name: &str,
+        _seed: bool,
+    ) -> Result<crate::meta::ForkStats, String> {
         Err(
             "fork is not implemented on the PostgreSQL backend yet (the tree copy needs a per-view snapshot path; PG-backed views are served through a meta-server or a mount)"
+                .to_string(),
+        )
+    }
+
+    fn graft_tree(
+        &self,
+        _dst: &str,
+        _src: &str,
+        _items: &[crate::meta::GraftItem],
+        _dest: &str,
+        _skip_existing: bool,
+    ) -> Result<crate::meta::GraftStats, String> {
+        Err(
+            "graft is not implemented on the PostgreSQL backend yet (it copies rows between per-view trees, which only the file store keeps as separate databases)"
                 .to_string(),
         )
     }
@@ -521,11 +577,10 @@ impl ControlStore for PgControlStore {
 
     fn open_ro_view(&self, view: &str) -> Result<Arc<dyn MetaProvider>, String> {
         // A read-only probe must not create anything. `PgEngine::open` seeds the
-        // view's schema (DDL) because a MOUNT creates a view lazily on first
-        // use, but that would let `list_view_tree` mint a phantom physical view
-        // out of a typo — the very thing the file-store branch below refuses.
-        // So check for the schema first and refuse honestly if it is not there;
-        // the lazy-creation contract stays with the mount path, not the probe.
+        // view's schema (DDL), so calling it optimistically would let
+        // `list_view_tree` mint a phantom physical view out of a typo — the very
+        // thing the file-store branch above refuses. So check for the schema
+        // first and refuse honestly if it is not there.
         if !self.has_physical(view)? {
             return Err(format!(
                 "no metadata tree for view '{view}' ({} schema {}) — list_view_tree walks this store's own backend; a remote tree not reachable from here is not",
@@ -539,8 +594,8 @@ impl ControlStore for PgControlStore {
     }
 
     fn base_tree_missing_note(&self, _view: &str) -> Result<Option<String>, String> {
-        // Under PG the tree is a schema created lazily by the meta-server; a
-        // CLI/MCP process has no local db file to miss, so never warn.
+        // Under PG the tree is a schema, not a local db file; a CLI/MCP process
+        // has nothing local to miss, so never warn.
         Ok(None)
     }
 }
@@ -870,6 +925,19 @@ pub fn alias_view(
 /// base tree is not a local SQLite db (PostgreSQL-backed views cannot be
 /// forked yet — the authoritative tree lives in Postgres, not in a file).
 pub fn fork_view(store: &dyn ControlStore, name: &str, base: &str) -> Result<Vec<OutLine>, String> {
+    fork_view_seeded(store, name, base, true)
+}
+
+/// [`fork_view`] with the seeding choice spelled out: `seed == false` records
+/// the same `fork <base>` definition but leaves the tree EMPTY (root only), to
+/// be filled by [`graft_view`]. A fork's mount semantics do not depend on how
+/// many names it started with.
+pub fn fork_view_seeded(
+    store: &dyn ControlStore,
+    name: &str,
+    base: &str,
+    seed: bool,
+) -> Result<Vec<OutLine>, String> {
     if !valid_view_name(name) {
         return Err(format!(
             "invalid fork name '{name}' (must be one safe path element)"
@@ -902,13 +970,28 @@ pub fn fork_view(store: &dyn ControlStore, name: &str, base: &str) -> Result<Vec
             store.describe()
         ));
     }
-    let stats = store.create_fork_tree(base, name)?;
+    let stats = store.create_fork_tree(base, name, seed)?;
     // Record the definition only AFTER the tree exists, so a crash never leaves
     // a name that resolves to a missing tree. A failed write rolls the fresh
     // tree back (best effort) rather than leaving an unreferenced tree behind.
     if let Err(e) = store.put_def(name, &format!("fork {base}\n")) {
         store.destroy_fork_tree(name);
         return Err(format!("cannot record fork definition for '{name}': {e}"));
+    }
+    if !seed {
+        // An EMPTY fork: root only. The natural next step is `view graft`, so
+        // say so instead of claiming "0 shared objects" as if it had copied.
+        return Ok(vec![
+            OutLine::Info(format!(
+                "forked view '{name}' from base '{base}' as an EMPTY tree: root only, nothing copied"
+            )),
+            OutLine::Note(format!(
+                "note: place the subset you want with `grovefs view graft --name {name} --src {base} --map plan.tsv` (or the `graft_view` tool, same implementation) — a directory source brings its subtree; each destination basename is the rename"
+            )),
+            OutLine::Note(format!(
+                "note: '{name}' has the same fork semantics — structure writable, content writes (write/truncate) refused with EROFS, bytes shared through the cross-view ledger"
+            )),
+        ]);
     }
     Ok(vec![
         OutLine::Info(format!(
@@ -922,6 +1005,107 @@ pub fn fork_view(store: &dyn ControlStore, name: &str, base: &str) -> Result<Vec
             "note: content bytes are SHARED with '{base}' (cross-view ledger): the object is freed only when no view holds a name for it anymore"
         )),
     ])
+}
+
+/// The tree a graft may land in or read out of: a base view or a fork (both own
+/// a node table). Lens/alias names render or forward another tree, so they are
+/// refused by role with the name of the tree that actually holds the nodes.
+fn own_tree(store: &dyn ControlStore, name: &str, role: &str) -> Result<Option<ViewDef>, String> {
+    match store.get_def(name)? {
+        Some(def) => match def {
+            fork @ ViewDef::Fork(_) => Ok(Some(fork)),
+            ViewDef::Alias(real) => Err(format!(
+                "{role} '{name}' is an alias of '{real}' — use '{real}' (an alias has no tree of its own)"
+            )),
+            ViewDef::Derived(_, _) => Err(format!(
+                "{role} '{name}' is a derived lens: it renders another tree read-only and owns no nodes — use a base view or a fork"
+            )),
+        },
+        None => {
+            if store.has_physical(name)? {
+                Ok(None)
+            } else {
+                Err(format!(
+                    "no tree for {role} '{name}' in {} — create it first (`grovefs view create --view {name}` for a base view, or `grovefs view fork --name {name} --base <base> --empty` / `fork_view` with `seed:false` for an empty fork)",
+                    store.describe()
+                ))
+            }
+        }
+    }
+}
+
+/// Graft a curated subset of `src`'s tree into `name` (a base view or a fork).
+/// `src == None` means "the fork's recorded base", which is the common case and
+/// keeps a curation script free of the base's name. `plan` is the plan text
+/// itself (one `<src>[TAB<dst>]` per line), so a CLI caller can pipe a file or
+/// stdin straight through and an MCP caller can hand it inline.
+pub fn graft_view(
+    store: &dyn ControlStore,
+    name: &str,
+    src: Option<&str>,
+    plan: &str,
+    dest: &str,
+    skip_existing: bool,
+) -> Result<Vec<OutLine>, String> {
+    if !valid_view_name(name) {
+        return Err(format!(
+            "invalid destination name '{name}' (must be one safe path element)"
+        ));
+    }
+    let dst_def = own_tree(store, name, "graft destination")?;
+    let src_name = match src {
+        Some(s) => s.to_string(),
+        None => match &dst_def {
+            Some(ViewDef::Fork(b)) => b.clone(),
+            _ => {
+                return Err(format!(
+                    "'{name}' is a base view — pass --src to name the view its entries come from"
+                ))
+            }
+        },
+    };
+    if !valid_view_name(&src_name) {
+        return Err(format!("invalid source view name '{src_name}'"));
+    }
+    if src_name == name {
+        return Err("a view cannot graft from its own tree — pick another source".into());
+    }
+    own_tree(store, &src_name, "graft source")?;
+    let items = crate::meta::parse_graft_plan(plan)?;
+    if items.is_empty() {
+        return Err(
+            "empty graft plan — one '<src>' or '<src>TAB<dst>' line per entry (blank lines and '#' comments are ignored)"
+                .to_string(),
+        );
+    }
+    let st = store.graft_tree(name, &src_name, &items, dest, skip_existing)?;
+    let where_to = if dest.trim().is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", dest.trim().trim_matches('/'))
+    };
+    let mut out = vec![
+        OutLine::Info(format!(
+            "grafted {} entr{} ({} director{}) from '{src_name}' into '{name}' at {where_to}: {} shared object(s), {} skipped",
+            st.nodes,
+            if st.nodes == 1 { "y" } else { "ies" },
+            st.dirs,
+            if st.dirs == 1 { "y" } else { "ies" },
+            st.blobs,
+            st.skipped
+        )),
+        OutLine::Note(
+            "note: bytes were not copied — every grafted name holds the same object as its source; the object is freed only when no view names it anymore"
+                .to_string(),
+        ),
+    ];
+    // Only a fork refuses content writes; a base destination keeps its own
+    // writability, so claiming EROFS there would be false.
+    out.push(OutLine::Note(match &dst_def {
+        Some(ViewDef::Fork(_)) => "note: content stays read-only in a fork (EROFS); re-running the same plan with --skip-existing merges into what is already there".to_string(),
+        _ => "note: the destination is a base view — content stays writable there; re-running the same plan with --skip-existing merges into what is already there".to_string(),
+    }));
+    Ok(out)
 }
 
 /// One human-readable line per definition, byte-identical to `grovefs view list`.
@@ -1545,15 +1729,32 @@ pub fn tool_defs() -> Value {
         },
         {
             "name": "fork_view",
-            "description": "Create a FORK: an INDEPENDENT metadata tree named `name`, seeded as a point-in-time copy of the physical view `base` (`<db-path>/meta/<name>.db`). Content bytes are SHARED through the cross-view ledger (no copies), so the fork costs metadata only. Structure (mkdir/rename/unlink/symlink/link) is WRITABLE; content writes (write/truncate) are refused with EROFS client-side. Deleting a name in the fork removes only the fork's own metadata — the base tree is untouched, and a shared object is freed only when no view holds a name for it. Requires a local SQLite base tree (a PostgreSQL-bound control store refuses forks — its trees are PG schemas, not files).",
+            "description": "Create a FORK: an INDEPENDENT metadata tree named `name`, seeded as a point-in-time copy of the physical view `base` (`<db-path>/meta/<name>.db`). Content bytes are SHARED through the cross-view ledger (no copies), so the fork costs metadata only. Structure (mkdir/rename/unlink/symlink/link) is WRITABLE; content writes (write/truncate) are refused with EROFS client-side. Deleting a name in the fork removes only the fork's own metadata — the base tree is untouched, and a shared object is freed only when no view holds a name for it. With `seed: false` the fork's tree starts EMPTY (root only) so a curated subset can be placed with `graft_view`. Requires a local SQLite base tree (a PostgreSQL-bound control store refuses forks — its trees are PG schemas, not files).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "name": str_prop("Fork view name (one safe path element, must differ from base)"),
                     "base": str_prop("Physical base view whose tree seeds the fork"),
+                    "seed": json!({"type":"boolean","description":"Copy the base's names into the fork (default true). false creates an EMPTY fork tree (root only) to fill with graft_view — nothing is copied, so a curated subset costs nothing extra."}),
                     "db_path": str_prop("Metadata root; defaults to the server's --db-path/--home (ignored under a PG-bound server — one URI-bound control plane serves every slot)")
                 },
                 "required": ["name", "base"]
+            }
+        },
+        {
+            "name": "graft_view",
+            "description": "Copy a CURATED SUBSET of one view's names into `name` (a base view or a fork), renaming as it goes. `map` is a plan, one line per entry: `<src>` or `<src>TAB<dst>`, paths relative to each view's root; blank lines and `#` comments are ignored. A directory source brings its whole subtree (original names); a file/symlink brings just itself; the destination basename is the rename (this is how UUID-named objects become a human-shaped tree). Missing destination directories are created (0755), all entries land in ONE transaction (a bad line writes nothing), and bytes are SHARED via the cross-view ledger — a graft moves metadata, never content. Typical flow: fork_view with `seed: false`, then graft_view the subset you want. `src` defaults to the fork's recorded base.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": str_prop("Destination view: a BASE view or a fork (a lens/alias owns no tree and is refused)"),
+                    "src": str_prop("Source view whose names are copied (default: the fork's recorded base)"),
+                    "map": str_prop("Graft plan text: one '<src>' or '<src>TAB<dst>' per line, '#' comments allowed"),
+                    "dest": str_prop("Directory inside `name` to place everything under (default '/')"),
+                    "skip_existing": json!({"type":"boolean","description":"Leave a conflicting destination entry alone and keep going (merge into an existing directory; skip colliding files). Default false = any conflict refuses the whole plan."}),
+                    "db_path": str_prop("Metadata root; defaults to the server's --db-path/--home (ignored under a PG-bound server — one URI-bound control plane serves every slot)")
+                },
+                "required": ["name", "map"]
             }
         },
         {
@@ -1724,7 +1925,28 @@ pub fn call_tool(name: &str, args: &Value, default_store: &Arc<dyn ControlStore>
                 Ok(v) => v,
                 Err(e) => return e,
             };
-            match fork_view(store, &vname, &vbase) {
+            let seed = args.get("seed").and_then(|v| v.as_bool()).unwrap_or(true);
+            match fork_view_seeded(store, &vname, &vbase, seed) {
+                Ok(lines) => ok_lines(lines),
+                Err(e) => err(e),
+            }
+        }
+        "graft_view" => {
+            let vname = match s("name") {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            let plan = match s("map") {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            let vsrc = args.get("src").and_then(|v| v.as_str());
+            let dest = args.get("dest").and_then(|v| v.as_str()).unwrap_or("");
+            let skip = args
+                .get("skip_existing")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            match graft_view(store, &vname, vsrc, &plan, dest, skip) {
                 Ok(lines) => ok_lines(lines),
                 Err(e) => err(e),
             }
@@ -1882,7 +2104,7 @@ pub fn handle_request(
                     "title": "GroveFS view governance",
                     "version": env!("CARGO_PKG_VERSION"),
                 },
-                "instructions": "Customize data listings by governing SERVER-SIDE views over one store. If the server was started with `--require-api-key`, pass your credential as `apiKey` (a `grovefs apikey create` key, format '<id>:<secret>') in the initialize params — the state-touching methods (tools/list, tools/call, resources/list, resources/read, completion/complete) are refused until it authenticates, and every call is logged against your key. Discover: list_views (all slots) and get_view (one slot's exact rules). Explore/preview shape: list_view_tree renders a view's real directory listing — or a base+rules lens SIMULATED before you commit it — so you use exact display paths instead of guessing. Reshape: define_derived_view (hide/only/map/link rules, read-only lenses hot-reloaded into live meta-server mounts), alias_view (public writable names), remove_view. Validate before publishing: preview_rules (dry-run a rules text's verb syntax) and validate_definition (dry-run a whole name+base+rules against every governance guard, writing nothing). Beyond tools, the same governance is exposed as MCP RESOURCES (grovefs://view/<name>/definition and /tree, read via resources/read), PROMPTS (reshape-view and rotate-alias playbooks via prompts/get), and COMPLETION (completion/complete fills a view-name argument from the store); set a threshold with logging/setLevel to receive notifications/message frames per call. Rule paths are absolute view-tree paths; a base line inside rules is rejected. The control plane follows the server's metadata backend: a file server reads/writes <db-path>/meta (a per-call `db_path` may re-point it), a PG-bound server (`--store postgres://…`) reads/writes grovefs_control and `db_path` is ignored. Introspection is metadata-only over the bound store: it never mounts and reads no data bytes, so a rendered tree reports the metadata `size` field rather than byte counts (dirs 4096, files 0, symlinks their target length) — stat through a mount if you need real sizes.",
+                "instructions": "Customize data listings by governing SERVER-SIDE views over one store. If the server was started with `--require-api-key`, pass your credential as `apiKey` (a `grovefs apikey create` key, format '<id>:<secret>') in the initialize params — the state-touching methods (tools/list, tools/call, resources/list, resources/read, completion/complete) are refused until it authenticates, and every call is logged against your key. Discover: list_views (all slots) and get_view (one slot's exact rules). Explore/preview shape: list_view_tree renders a view's real directory listing — or a base+rules lens SIMULATED before you commit it — so you use exact display paths instead of guessing. Reshape: define_derived_view (hide/only/map/link rules, read-only lenses hot-reloaded into live meta-server mounts), alias_view (public writable names), remove_view. Curate: fork_view copies a base's names into an INDEPENDENT tree (structure writable, content refused EROFS, bytes shared), and with `seed:false` it starts EMPTY so graft_view can place just the chosen subset — a plan of `<src>` or `<src>TAB<dst>` lines (a directory source brings its subtree, each destination basename is the rename, missing parents are created, the whole plan commits in one transaction, nothing is ever copied). Validate before publishing: preview_rules (dry-run a rules text's verb syntax) and validate_definition (dry-run a whole name+base+rules against every governance guard, writing nothing). Beyond tools, the same governance is exposed as MCP RESOURCES (grovefs://view/<name>/definition and /tree, read via resources/read), PROMPTS (reshape-view and rotate-alias playbooks via prompts/get), and COMPLETION (completion/complete fills a view-name argument from the store); set a threshold with logging/setLevel to receive notifications/message frames per call. Rule paths are absolute view-tree paths; a base line inside rules is rejected. The control plane follows the server's metadata backend: a file server reads/writes <db-path>/meta (a per-call `db_path` may re-point it), a PG-bound server (`--store postgres://…`) reads/writes grovefs_control and `db_path` is ignored. Introspection is metadata-only over the bound store: it never mounts and reads no data bytes, so a rendered tree reports the metadata `size` field rather than byte counts (dirs 4096, files 0, symlinks their target length) — stat through a mount if you need real sizes.",
             })
         }
         "ping" => json!({}),
@@ -2372,6 +2594,7 @@ mod tests {
                 "define_derived_view",
                 "alias_view",
                 "fork_view",
+                "graft_view",
                 "remove_view",
                 "preview_rules",
                 "validate_definition",
@@ -2479,6 +2702,75 @@ mod tests {
         let gone = call(18, "remove_view", json!({"name": "docsonly"}));
         assert_eq!(gone["result"]["isError"], true);
         assert!(text(&gone).starts_with("no view definition 'docsonly' in"));
+    }
+
+    /// The fork→graft flow an agent is meant to use: an EMPTY fork, then a
+    /// curated plan that renames as it places — `src` defaulting to the fork's
+    /// recorded base, so a curation script never names the base again.
+    #[test]
+    fn graft_tool_fills_an_empty_fork_and_refuses_lens_targets() {
+        let home = db();
+        let store = fstore(&home);
+        std::fs::create_dir_all(home.join("meta")).unwrap();
+        {
+            let e = crate::meta::MetaEngine::open(&home.join("meta/base.db")).unwrap();
+            let docs = e
+                .create_node(crate::meta::ROOT_INO, "docs", true, None, 0o755, 1000, 1000)
+                .unwrap();
+            e.create_node(docs, "uuid-1", false, Some("blob-1"), 0o644, 1000, 1000)
+                .unwrap();
+        }
+        let call = |id, name: &str, args: Value| {
+            ask(
+                &json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+                        "params":{"name":name,"arguments":args}}),
+                &store,
+            )
+            .unwrap()
+        };
+        let text = |v: &Value| -> String {
+            v["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        // Default seed=true copies; seed=false leaves a bare root.
+        let empty = call(40, "fork_view", json!({"name": "lab", "base": "base", "seed": false}));
+        let t = text(&empty);
+        assert!(t.contains("as an EMPTY tree: root only"), "{t}");
+        assert!(t.contains("view graft --name lab --src base --map plan.tsv"), "{t}");
+        // The plan renames into a directory the graft creates; src defaults to
+        // the fork's recorded base.
+        let g = call(
+            41,
+            "graft_view",
+            json!({"name": "lab", "map": "docs/uuid-1\tby_target/M31_2025.fits"}),
+        );
+        let t = text(&g);
+        assert!(t.contains("grafted 2 entries (1 directory) from 'base' into 'lab' at /"), "{t}");
+        assert!(t.contains("1 shared object(s)"), "{t}");
+        let lab = crate::meta::MetaEngine::open(&home.join("meta/lab.db")).unwrap();
+        let by = lab.lookup(crate::meta::ROOT_INO, "by_target").unwrap();
+        let f = lab.lookup(by.id, "M31_2025.fits").expect("renamed entry placed");
+        assert_eq!(f.data_ref.as_deref(), Some("blob-1"));
+        // A lens renders another tree: it owns no nodes, so it cannot host a graft.
+        let d = call(
+            42,
+            "define_derived_view",
+            json!({"name": "lens", "base": "base", "rules": "only /docs"}),
+        );
+        assert!(!d["result"]["isError"].as_bool().unwrap_or(false));
+        let lens = call(43, "graft_view", json!({"name": "lens", "map": "docs/uuid-1"}));
+        assert_eq!(lens["result"]["isError"], true);
+        assert!(text(&lens).contains("derived lens"), "{}", text(&lens));
+        // A base view has no recorded base: --src is required, and said so.
+        let nosrc = call(44, "graft_view", json!({"name": "base", "map": "docs/uuid-1"}));
+        assert_eq!(nosrc["result"]["isError"], true);
+        assert!(text(&nosrc).contains("pass --src"), "{}", text(&nosrc));
+        // A plan that tries to walk out of the view is refused line-accurately.
+        let esc = call(45, "graft_view", json!({"name": "lab", "map": "../etc/passwd"}));
+        assert_eq!(esc["result"]["isError"], true);
+        assert!(text(&esc).contains("line 1") && text(&esc).contains(".."), "{}", text(&esc));
     }
 
     /// A fork is created, listed, described, protected from aliasing and

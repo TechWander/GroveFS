@@ -1,6 +1,6 @@
 ---
 name: grovefs-mcp
-description: Drive GroveFS view governance through the `grovefs mcp` stdio JSON-RPC server (9 tools: list_views, get_view, list_view_tree, define_derived_view, alias_view, fork_view, remove_view, preview_rules, validate_definition). Use when a task mentions grovefs, views, derived lenses, aliases, forks, mount --view, layout rules (hide/only/map/link), reshaping a data listing, or API-key gating of the GroveFS MCP entrance. Covers handshake, framing, exact refusal texts, verification loops, and hard boundaries (control plane only — never mounts, never reads data bytes).
+description: Drive GroveFS view governance through the `grovefs mcp` stdio JSON-RPC server (10 tools: list_views, get_view, list_view_tree, define_derived_view, alias_view, fork_view, graft_view, remove_view, preview_rules, validate_definition). Use when a task mentions grovefs, views, derived lenses, aliases, forks, mount --view, layout rules (hide/only/map/link), reshaping a data listing, or API-key gating of the GroveFS MCP entrance. Covers handshake, framing, exact refusal texts, verification loops, and hard boundaries (control plane only — never mounts, never reads data bytes).
 ---
 
 # GroveFS View Governance (MCP Entrance)
@@ -110,7 +110,7 @@ bash scripts/smoke.sh
 - Missing arguments and unknown tools surface as `isError`, not as protocol
   errors.
 
-## The nine tools
+## The ten tools
 
 | Tool | Arguments (★ required) | Purpose |
 |---|---|---|
@@ -119,7 +119,8 @@ bash scripts/smoke.sh
 | `list_view_tree` | `view` \| ★(`base`+`rules`), plus `path`/`depth`(6)/`max`(800) | Renders the listing a mount would actually show; can also preview an unpublished rule set **without touching disk**. `view` resolves like a mount — a fork's own tree is walked as `kind:"fork"`. `size` is a metadata field, not a byte count (dirs 4096 / files 0 / symlinks report the target length) |
 | `define_derived_view` | ★`name` ★`base` ★`rules` | Publish/replace a **read-only** derived lens |
 | `alias_view` | ★`name` ★`real` \| `retire` | Publish a writable public alias; `retire` rotates names gaplessly (write new, then remove old) |
-| `fork_view` | ★`name` ★`base` | Seed an **independent metadata tree** (structure writable, content `EROFS`, bytes shared) |
+| `fork_view` | ★`name` ★`base` \| `seed` | Seed an **independent metadata tree** (structure writable, content `EROFS`, bytes shared). `seed:false` creates the tree EMPTY (root only) to be filled by `graft_view` |
+| `graft_view` | ★`name` ★`map` \| `src`/`dest`/`skip_existing` | Copy a **curated subset** of one view's names into `name` — `name` may be a **fork OR a bare base view** (any tree that owns its `node` table; a derived lens or an alias is refused by role). `map` is plan text, one entry per line (blank lines and whole-line `#` comments ignored): `<src>` alone keeps that entry's **full relative path** in the destination (NOT its basename — the parent dirs are recreated), `<src>TAB<dst>` lands exactly at `dst` (that TAB is the only way to rename), and `dest` prefixes **every** line, TAB lines included. A trailing `#` is part of the name, not a comment. A directory source brings its whole subtree; missing destination dirs are created (0755); the reply's `entries` count includes auto-created parents; the whole plan lands in ONE transaction (any conflict refuses all of it unless `skip_existing`); bytes are shared (ledger hold per blob). `src` defaults to the fork's recorded base and is **required** when `name` is a base view |
 | `remove_view` | ★`name` | Delete a definition slot (derived/alias/shared); deleting a fork drops its own tree too |
 | `preview_rules` | ★`rules` | Validates verb syntax only; errors carry line numbers |
 | `validate_definition` | ★`name` ★`base` ★`rules` | Runs a publish through the **entire governance guard set** before anything is written, returning the exact refusal text |
@@ -194,6 +195,32 @@ normal. Verified semantics of the two re-pathing verbs:
   `map /seeds/docs/a.md /pub/alpha.md` + `only /pub` renders exactly
   `/pub/alpha.md` and nothing of the base layout).
 
+Measured against the current build (base tree `/a/1.txt`, `/a/sub/2.txt`,
+`/b/3.txt`), the non-obvious ones:
+
+- `only` filters **source-side coordinates only**. A `map`/`link` `<dst>` and its
+  synthesized parents survive even when they lie outside the `only` subtree, and a
+  `link`ed entry keeps its original `<src>` position as well — `only /b` +
+  `link /a /c` still shows all of `/a` and `/c`.
+- `hide` is evaluated FIRST and also takes SOURCE coordinates, so `hide <dst>` is a
+  no-op. `hide` beats `only`: `only /a` + `hide /a/sub` renders `/a` and `/a/1.txt`
+  and nothing under `/a/sub`.
+- `hide <src>` together with `map`/`link <src> …` leaves the destination present but
+  EMPTY — the leaf name is served, the pruned subtree is not (`hide /a` +
+  `map /a /x/a` renders `/x` and `/x/a`, no children).
+- `link` is **not** a hard link: both display names come from the SAME source row,
+  so removing or renaming at either name is reflected at both. A real `ln` through a
+  mount instead adds a second row pointing at the same inode.
+- Nested rules use nested coordinates correctly: a rule's `<src>` is the source
+  path, a second `map`'s `<src>` may be the FIRST `<dst>` (display tree), and
+  `<dst>` must be unique across rules (a clash is refused at parse time).
+- Through a WRITABLE (`--layout`) lens: writing inside `only` works, creating inside
+  a pass-through ancestor outside `only` is `EPERM`, creating inside a purely
+  synthetic directory is `EPERM` — but a subtree relocated in by `map`/`link` IS
+  writable even when its source path is outside `only`.
+- Rules match PATH TEXT, not inodes: rename a source entry and every rule naming
+  the old path silently addresses nothing.
+
 What the lens cannot do is *invent content*: every rendered entry is some base
 entry re-pathed, mirrored, or pruned, plus synthesized scaffold dirs — a derived
 view never holds bytes the base doesn't have.
@@ -233,8 +260,19 @@ lines interpolates your own names/paths.
 | Forking a base that is itself governed | `base '<base>' is governed by a definition (alias/derived/fork) — fork the physical base tree instead` |
 | Fork name == base name | `fork name must differ from its base` |
 | Forking a name that already has a definition | `view '<name>' already has a definition — remove it first (\`grovefs view rm --name <name>\`) before forking` |
+| `fork_view` with `seed:false` (succeeds, and tells you the next step) | `forked view 'lab' from base 'team' as an EMPTY tree: root only, nothing copied` + `note: place the subset you want with \`grovefs view graft --name lab --src team --map plan.tsv\` (or the \`graft_view\` tool, same implementation) …` |
+| A successful `graft_view` (renames + one directory subtree) | `grafted 3 entries (1 directory) from 'team' into 'lab' at /: 2 shared object(s), 0 skipped` — names moved, bytes shared |
+| `graft_view` whose destination has no tree of its own | `no tree for graft destination 'zz' in <store> — create it first (\`grovefs view create --view zz\` for a base view, or \`fork_view\` with \`seed:false\` for an empty fork …)` |
+| `graft_view` into/out of a derived lens | `graft destination 'lens1' is a derived lens: it renders another tree read-only and owns no nodes — use a base view or a fork` (same text with `graft source …` when the SOURCE is the lens) |
+| `graft_view` into/out of an alias | `graft destination 'pub' is an alias of 'team' — use 'team' (an alias has no tree of its own)` (same pattern for the source role) |
+| `graft_view` onto a base view without saying where entries come from | `'team' is a base view — pass --src to name the view its entries come from` |
+| `graft_view` with `src` equal to `name` | `a view cannot graft from its own tree — pick another source` |
+| A plan that is only blank lines / comments | `empty graft plan — one '<src>' or '<src>TAB<dst>' line per entry (blank lines and '#' comments are ignored)` |
+| A plan path containing `..` | `line 1: path '../esc' must not contain '..'` |
+| A plan line naming the root itself (`/`) | `line 1: empty path — the root itself cannot be grafted, name an entry inside it` |
+| A destination name already taken (whole plan rolls back) | `'M31_2025.fits' already exists in the destination — rename it in the plan or pass --skip-existing` |
 | `remove_view` on a name with no definition slot (incl. a physical base view) | `no view definition '<name>' in <store>` — the store is named as `… (local files)` or `… (PostgreSQL grovefs_control)`, **not** as a `<db>/meta/views` path |
-| Name is not a single safe path element (empty, `.`, `..`, containing `/`, `\\` or whitespace) | `invalid view name '<name>' (must be one safe path element)` for `define`/`validate`; `invalid alias name …` / `invalid fork name …` for those tools; `remove_view`, `get_view` and `list_view_tree` shorten it to `invalid view name '<name>'`, and a bad **base** reads `invalid base view name '<base>'` / `invalid real view name '<real>'` |
+| Name is not a single safe path element (empty, `.`, `..`, containing `/`, `\\` or whitespace) | `invalid view name '<name>' (must be one safe path element)` for `define`/`validate`; `invalid alias name …` / `invalid fork name …` / `invalid destination name …` (and `invalid source view name …`) for those tools; `remove_view`, `get_view` and `list_view_tree` shorten it to `invalid view name '<name>'`, and a bad **base** reads `invalid base view name '<base>'` / `invalid real view name '<real>'` |
 
 ## Authentication and audit (when fronting the interface to many callers)
 

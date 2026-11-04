@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # PostgreSQL metadata backend end-to-end over real FUSE mounts against a
 # central meta-server started with `--store postgres://…`. Proves:
-#   - the meta-server boots and mounts a client against PG (lazy `engine_for`
-#     connects and installs the `grovefs_v_<hex(view)>` schema on first op);
+#   - the meta-server boots and mounts a client against PG (the view's
+#     `grovefs_v_<hex(view)>` schema is provisioned explicitly by
+#     `view create --store`, never by a mount);
 #   - CRUD (mkdir/touch/cat/ls), rename, hardlink and symlink all round-trip
 #     through the PG-backed MetaProvider;
 #   - two clients on the same view converge on one authoritative PG tree
@@ -18,8 +19,8 @@ export LC_ALL=C LANG=C
 export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
 Y=./target/release/grovefs
 
-PGHOST=127.0.0.1
-PGPORT=5432
+PGHOST=${PGHOST:-127.0.0.1}
+PGPORT=${PGPORT:-5432}
 PGURI="postgres://grove:grovepw@${PGHOST}:${PGPORT}/grovefs"
 
 # ---- PG reachability probe (skip cleanly if absent) ----
@@ -32,8 +33,8 @@ if ! (exec 3<>/dev/tcp/${PGHOST}/${PGPORT}) 2>/dev/null; then
 fi
 exec 3<&- 2>/dev/null; exec 3<&- 2>/dev/null || true
 
-META=127.0.0.1:50096
-DATA=127.0.0.1:50097
+META=127.0.0.1:15096
+DATA=127.0.0.1:15097
 VIEW="pg$(date +%s)"   # unique per run: fresh grovefs_v_<hex> schema, no bleed
 rm -rf .pgtest; mkdir -p .pgtest/central/data .pgtest/home .pgtest/m1 .pgtest/m2 .pgtest/mnt_a .pgtest/mnt_b
 
@@ -59,7 +60,7 @@ psql_in_docker(){
 }
 
 echo "===== 1) refuse --role standby + --store postgres://… at serve() time ====="
-$Y meta-server --listen 127.0.0.1:50055 --home .pgtest/refuse \
+$Y meta-server --listen 127.0.0.1:15055 --home .pgtest/refuse \
     --role standby --peer 127.0.0.1:1 \
     --store "$PGURI" > .pgtest/refuse.log 2>&1
 RRC=$?
@@ -72,10 +73,10 @@ grep -qi "cannot be combined\|incompatible" .pgtest/refuse.log \
 echo "===== 2) start data-server and PG-backed meta-server ====="
 $Y data-server --listen $DATA --root .pgtest/central/data > .pgtest/data.log 2>&1 &
 DP=$!
-# TODO(strict-view): switch to `grovefs view --store postgres://… create --view
-# <name>` once the PG create entry exists; PG base schemas still come from the
-# first mount, so the escape hatch is explicit here.
-GROVEFS_ALLOW_LAZY_VIEW=1 $Y meta-server --listen $META --home .pgtest/home --store "$PGURI" > .pgtest/meta.log 2>&1 &
+# Views are explicit: provision the PG schema up front, before any mount.
+$Y view --store "$PGURI" --db-path .pgtest/home create --view "$VIEW" > .pgtest/create.log 2>&1 \
+    || { echo "FAIL: view create --store failed"; cat .pgtest/create.log; exit 1; }
+$Y meta-server --listen $META --home .pgtest/home --store "$PGURI" > .pgtest/meta.log 2>&1 &
 MP=$!
 wait_port $DATA || { echo "data-server failed"; cat .pgtest/data.log; }
 wait_port $META || { echo "meta-server failed"; cat .pgtest/meta.log; }
@@ -84,7 +85,7 @@ cleanup(){ for d in .pgtest/mnt_a .pgtest/mnt_b; do fusermount -u "$d" 2>/dev/nu
 RAP=0; RBP=0
 trap cleanup EXIT
 
-echo "===== 3) mount A: first op creates the grovefs_v_<hex> schema in PG ====="
+echo "===== 3) mount A against the pre-created grovefs_v_<hex> schema ====="
 $Y --home .pgtest/m1 mount --view "$VIEW" --mountpoint .pgtest/mnt_a --meta $META --data $DATA --foreground > .pgtest/mnt_a.log 2>&1 &
 RAP=$!
 sleep 1.5

@@ -6,7 +6,7 @@ set -u
 cd /data/xy/grovefs
 export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
 Y=./target/release/grovefs
-ADDR=127.0.0.1:50099
+ADDR=127.0.0.1:15099
 
 rm -rf .test; mkdir -p .test/rhome .test/rsrv .test/mnt_r
 export GROVEFS_HOME=$PWD/.test/rhome      # meta (view DBs) live client-side

@@ -3,6 +3,9 @@
 # Covers everything the feature promises, on both metadata paths:
 #   - `view fork` creation, definition slot (`fork <base>`), guards
 #     (duplicate name, name==base, governed base, missing/PG base);
+#   - curated forks through the CLI entrance: `--empty` (root-only tree) then
+#     `view graft` with a plan on stdin (rename, directory subtree, whole-plan
+#     refusal on a collision, `--skip-existing`), plus the base-view `--src` guard;
 #   - `view list` surfacing the fork beside the BARE base view it came from;
 #   - `apikey list --view` filtering keys by the view they can open;
 #   - LOCAL mount: structure writable (mkdir/rename/unlink/link/symlink/touch),
@@ -65,6 +68,44 @@ grep -q "fork 'lab' of base 'team'" .ftest/list.log \
   && ok "view list explains the fork's mount semantics" || bad "fork line missing: $(cat .ftest/list.log)"
 grep -q "base view 'team' -> own tree meta/team.db" .ftest/list.log \
   && ok "view list also names the BARE base view" || bad "bare base line missing: $(cat .ftest/list.log)"
+
+echo "===== 1b) curated fork: --empty + graft, one transaction, no bytes ====="
+$Y view --db-path .ftest/home fork --name cur --base team --empty > .ftest/cur.log 2>&1 \
+  && ok "view fork --empty" || bad "empty fork failed: $(cat .ftest/cur.log)"
+grep -q "as an EMPTY tree: root only" .ftest/cur.log \
+  && ok "empty fork reports a root-only tree" || bad "empty fork output: $(cat .ftest/cur.log)"
+[ "$(cat .ftest/home/meta/views/cur.layout 2>/dev/null)" = "fork team" ] \
+  && ok "an empty fork records the same 'fork team' definition" || bad "cur.layout wrong"
+$Y view --db-path .ftest/home export --view cur --out .ftest/cur0.jsonl > /dev/null 2>&1
+grep -q '"nodes":1' .ftest/cur0.jsonl \
+  && ok "empty fork exports exactly one row (the root)" || bad "empty fork not empty: $(head -1 .ftest/cur0.jsonl)"
+cat > .ftest/graft.tsv <<'EOF'
+docs/2026/a.md	reports/2026-annual.md
+data/raw	tables/raw
+EOF
+$Y view --db-path .ftest/home graft --name cur --src team --map - < .ftest/graft.tsv > .ftest/graft.log 2>&1 \
+  && ok "view graft --map - (plan piped on stdin)" || bad "graft failed: $(cat .ftest/graft.log)"
+grep -q "^grafted .* from 'team' into 'cur'" .ftest/graft.log \
+  && ok "graft reports entries, source and destination" || bad "graft output: $(cat .ftest/graft.log)"
+$Y view --db-path .ftest/home export --view cur --out .ftest/cur1.jsonl --force > /dev/null 2>&1
+grep -q '"name":"reports"' .ftest/cur1.jsonl \
+  && ok "a missing destination directory is created" || bad "reports dir missing: $(head -1 .ftest/cur1.jsonl)"
+grep -q '"name":"2026-annual.md"' .ftest/cur1.jsonl \
+  && ok "the grafted entry landed under its NEW name" || bad "rename did not land"
+grep -q '"name":"raw"' .ftest/cur1.jsonl \
+  && ok "a directory source brought its subtree" || bad "subtree missing"
+$Y view --db-path .ftest/home graft --name cur --src team --map .ftest/graft.tsv > .ftest/graft2.log 2>&1 \
+  && bad "re-grafting the same plan was accepted" || ok "a colliding name refuses the WHOLE plan"
+grep -q "already exists in the destination" .ftest/graft2.log \
+  && ok "the refusal names the collision and the way out" || bad "collision text: $(cat .ftest/graft2.log)"
+$Y view --db-path .ftest/home graft --name cur --src team --map .ftest/graft.tsv --skip-existing > .ftest/graft3.log 2>&1 \
+  && ok "--skip-existing merges instead of refusing" || bad "skip-existing failed: $(cat .ftest/graft3.log)"
+grep -qE "grafted 0 entries .*, [0-9]+ skipped" .ftest/graft3.log \
+  && ok "nothing new landed; collisions counted as skipped" || bad "skip count: $(cat .ftest/graft3.log)"
+$Y view --db-path .ftest/home graft --name team --map .ftest/graft.tsv > .ftest/graft4.log 2>&1 \
+  && bad "a base view accepted a graft without --src" || ok "grafting into a base view without --src refused"
+grep -q "is a base view — pass --src" .ftest/graft4.log \
+  && ok "the refusal explains how to name the source" || bad "base-target text: $(cat .ftest/graft4.log)"
 
 echo "===== 2) guards: duplicates, self-fork, governed/missing bases, alias target ====="
 $Y view --db-path .ftest/home fork --name lab --base team > .ftest/g1.log 2>&1
@@ -139,7 +180,7 @@ chk "$(T cat $B/photos/private/x.jpg)" "priv" "base name still reads x.jpg (fork
   && ok "fork-created names never appear in the base" || bad "fork writes leaked into the base tree"
 
 echo "===== 6) REMOTE fork mount: same split through the governance server ====="
-META=127.0.0.1:50362; DATA=127.0.0.1:50363
+META=127.0.0.1:15362; DATA=127.0.0.1:15363
 wait_port(){ local a=$1; for _ in $(seq 1 100); do (echo >/dev/tcp/${a%%:*}/${a##*:}) 2>/dev/null && return 0; sleep 0.05; done; return 1; }
 $Y meta-server --db-path .ftest/home --listen $META > .ftest/meta_srv.log 2>&1 &
 MSP=$!

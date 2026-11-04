@@ -18,10 +18,14 @@ pub mod apikeys;
 pub mod backend;
 pub mod bwlimit;
 pub mod control;
+#[cfg(feature = "native")]
+pub mod du;
+#[cfg(feature = "native")]
 pub mod fs_impl;
 pub mod layout;
 pub mod mcp;
 pub mod meta;
 pub mod pg_store;
+pub mod platform;
 pub mod remote;
 pub mod stats;

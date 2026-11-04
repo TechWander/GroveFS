@@ -26,8 +26,8 @@ export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
 Y=./target/release/grovefs
 
 N=${N:-500}
-META_A=127.0.0.1:50126
-DATA=127.0.0.1:50127
+META_A=127.0.0.1:15126
+DATA=127.0.0.1:15127
 
 rm -rf .blk; mkdir -p .blk/home .blk/mnt .blk/central/data .blk/centralmeta .blk/chome .blk/mnt_meta
 export GROVEFS_HOME=$PWD/.blk/home
@@ -86,7 +86,7 @@ sleep 2
 MF=.blk/mnt_meta/bench.lk
 : > "$MF"   # ensure it exists in the fresh on-demand view
 
-echo "-- B) meta-server (--meta 127.0.0.1:50126, loopback TCP) --"
+echo "-- B) meta-server (--meta 127.0.0.1:15126, loopback TCP) --"
 baseline "$MF" "open+close only"
 bench    "$MF" "flock -x cycle"
 

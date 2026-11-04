@@ -122,6 +122,12 @@ run_unit(){
 run_mountsuite(){ # $1=key $2=script $3=timeout
   local key="$1" script="$2" to="$3" log="$LOGDIR/$1.log" rc sum
   echo "### $key — bash $script (<= ${to}s)"
+  # Each suite owns its servers, but a suite that died early can leak one; a
+  # stale listener would then turn the NEXT suite into a spurious AddrInUse
+  # failure (green code, red board). Reap leaked test servers before every run.
+  pkill -f '\./target/release/grovefs meta-server' 2>/dev/null || true
+  pkill -f '\./target/release/grovefs data-server' 2>/dev/null || true
+  sleep 0.2
   if timeout "$to" bash "$script" >"$log" 2>&1; then rc=0; else rc=$?; fi
   sum=$(grep -E 'SUMMARY: pass=' "$log" | tail -1)
   if [ "$rc" -eq 0 ]; then

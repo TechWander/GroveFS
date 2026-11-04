@@ -8,10 +8,10 @@ echo '### [存储机] $ grep -o "=.*" /etc/grovefs/grovefs.env | cut -d= -f2'
 TOK=$(grep -o '=.*' $S/etc/grovefs.env | cut -d= -f2)
 echo "$TOK"
 echo '### [存储机] $ grovefs data-server ...(前台)'
-nohup ./bin/grovefs data-server --listen 127.0.0.1:50100 --root $S/data --token "$TOK" >$S/ds.log 2>&1 &
+nohup ./bin/grovefs data-server --listen 127.0.0.1:15100 --root $S/data --token "$TOK" >$S/ds.log 2>&1 &
 sleep 0.7
 echo '### [存储机] $ grovefs meta-server --db-path /data ...(前台)'
-nohup ./bin/grovefs meta-server --db-path $S/data --listen 127.0.0.1:50110 --token "$TOK" >$S/ms.log 2>&1 &
+nohup ./bin/grovefs meta-server --db-path $S/data --listen 127.0.0.1:15110 --token "$TOK" >$S/ms.log 2>&1 &
 sleep 1.0
 echo "--- data-server 终端回显 ---"; cat $S/ds.log
 echo "--- meta-server 终端回显 ---"; cat $S/ms.log
@@ -23,7 +23,7 @@ echo
 echo '### [客户端A] $ grovefs ... mount ... -m /mnt/da (前台,远程挂载不需要 --home)'
 # Strict view gate: the view is created explicitly before the first mount.
 ./bin/grovefs view --db-path $S/data create --view share >$S/create.log 2>&1
-nohup ./bin/grovefs mount --view share --data 127.0.0.1:50100 --meta 127.0.0.1:50110 --token "$TOK" -m $S/mnt_da --foreground >$S/mntA.log 2>&1 &
+nohup ./bin/grovefs mount --view share --data 127.0.0.1:15100 --meta 127.0.0.1:15110 --token "$TOK" -m $S/mnt_da --foreground >$S/mntA.log 2>&1 &
 sleep 1.2
 echo "--- A 挂载进程回显 ---"; cat $S/mntA.log
 echo '### [客户端A] $ findmnt -T /mnt/da'
@@ -39,7 +39,7 @@ echo "### [存储机] 写完 blocks 对象数: $(find $S/data/blocks -type f | w
 find $S/data/blocks -type f | head -4; ls $S/data/meta
 echo
 echo '### [客户端B] $ grovefs ... --ro -m /mnt/db (前台)'
-nohup ./bin/grovefs mount --view share --data 127.0.0.1:50100 --meta 127.0.0.1:50110 --token "$TOK" --ro -m $S/mnt_db --foreground >$S/mntB.log 2>&1 &
+nohup ./bin/grovefs mount --view share --data 127.0.0.1:15100 --meta 127.0.0.1:15110 --token "$TOK" --ro -m $S/mnt_db --foreground >$S/mntB.log 2>&1 &
 sleep 1.2
 echo "--- B 挂载进程回显 ---"; cat $S/mntB.log
 echo '### [客户端B] $ findmnt -T /mnt/db'

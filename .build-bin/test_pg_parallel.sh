@@ -20,8 +20,8 @@ export LC_ALL=C LANG=C
 export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
 Y=./target/release/grovefs
 
-PGHOST=127.0.0.1
-PGPORT=5432
+PGHOST=${PGHOST:-127.0.0.1}
+PGPORT=${PGPORT:-5432}
 PGURI="postgres://grove:grovepw@${PGHOST}:${PGPORT}/grovefs"
 
 # ---- PG reachability probe (skip cleanly if absent) ----
@@ -32,8 +32,8 @@ if ! (exec 3<>/dev/tcp/${PGHOST}/${PGPORT}) 2>/dev/null; then
 fi
 exec 3<&- 2>/dev/null; exec 3<&- 2>/dev/null || true
 
-META=127.0.0.1:50180
-DATA=127.0.0.1:50181
+META=127.0.0.1:15240
+DATA=127.0.0.1:15241
 VIEW="pgp$(date +%s)"
 rm -rf .pgpar; mkdir -p .pgpar/central/data .pgpar/home .pgpar/m1 .pgpar/m2 .pgpar/m3 \
      .pgpar/mnt_a .pgpar/mnt_b .pgpar/mnt_c
@@ -49,10 +49,10 @@ T(){ timeout 12 "$@"; }
 echo "===== 1) start data-server + PG-backed meta-server ====="
 $Y data-server --listen $DATA --root .pgpar/central/data > .pgpar/data.log 2>&1 &
 DP=$!
-# TODO(strict-view): switch to `grovefs view --store postgres://… create --view
-# <name>` once the PG create entry exists; PG base schemas still come from the
-# first mount, so the escape hatch is explicit here.
-GROVEFS_ALLOW_LAZY_VIEW=1 $Y meta-server --listen $META --home .pgpar/home --store "$PGURI" > .pgpar/meta.log 2>&1 &
+# Views are explicit: provision the PG schema up front, before any mount.
+$Y view --store "$PGURI" --db-path .pgpar/home create --view "$VIEW" > .pgpar/create.log 2>&1 \
+    || { bad "view create --store failed"; cat .pgpar/create.log; exit 1; }
+$Y meta-server --listen $META --home .pgpar/home --store "$PGURI" > .pgpar/meta.log 2>&1 &
 MP=$!
 wait_port $DATA || { bad "data-server did not bind"; exit 1; }
 wait_port $META || { bad "meta-server did not bind"; cat .pgpar/meta.log; exit 1; }
@@ -191,9 +191,13 @@ done
 # Schema name matches `pg_store::schema_for`: `grovefs_v_` + lower-hex of the
 # view name's UTF-8 bytes (injection-safe & case-stable for PG identifiers).
 VIEW_HEX=$(printf '%s' "$VIEW" | od -An -tx1 | tr -d ' \n')
-hot_rows=$(PGPASSWORD=grovepw psql -h $PGHOST -p $PGPORT -U grovefs -d grovefs -tAX \
-    -c "SELECT COUNT(*) FROM grovefs_v_${VIEW_HEX}.node WHERE name='hot' AND parent_id=1" 2>/dev/null || echo ERR)
-chk "$hot_rows" "1" "PG权威表 view='$VIEW' 下 'hot' 行数 = 1 (SSI 拦截在 DB 层而非仅 FUSE dentry)"
+if command -v psql >/dev/null 2>&1; then
+    hot_rows=$(PGPASSWORD=grovepw psql -h "$PGHOST" -p "$PGPORT" -U grove -d grovefs -tAX \
+        -c "SELECT COUNT(*) FROM grovefs_v_${VIEW_HEX}.node WHERE name='hot' AND parent_id=1" 2>/dev/null)
+    chk "$hot_rows" "1" "PG权威表 view='$VIEW' 下 'hot' 行数 = 1 (SSI 拦截在 DB 层而非仅 FUSE dentry)"
+else
+    echo "  INFO: 本地无 psql 客户端 — 跳过服务端行数断言"
+fi
 
 echo "===== 7) concurrent unlink of two hardlink names -> exactly one GC ====="
 # Setup: create file + hardlink name on A, wait for cross-view convergence.

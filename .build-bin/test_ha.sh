@@ -24,9 +24,9 @@ export LC_ALL=C LANG=C
 export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
 Y=./target/release/grovefs
 
-META_A=127.0.0.1:50106   # primary
-META_B=127.0.0.1:50107   # standby
-DATA=127.0.0.1:50108
+META_A=127.0.0.1:15106   # primary
+META_B=127.0.0.1:15107   # standby
+DATA=127.0.0.1:15108
 rm -rf .ha; mkdir -p .ha/a .ha/b .ha/data .ha/chome .ha/sbhome .ha/mnt .ha/mnt_sb
 
 wait_port(){ local a=$1; for _ in $(seq 1 100); do (echo >/dev/tcp/${a%%:*}/${a##*:}) 2>/dev/null && return 0; sleep 0.05; done; return 1; }
@@ -123,9 +123,9 @@ grep -q 'demoted to standby' .ha/a2.log && ok "restarted old primary demoted its
 echo "===== 7) --sync-repl: RPO=0 for mutating ops ====="
 # Bring up a SECOND HA pair dedicated to the sync-repl test (independent ports
 # so the old pair's state doesn't interfere).
-SYNC_A=127.0.0.1:50136
-SYNC_B=127.0.0.1:50137
-SYNC_D=127.0.0.1:50138
+SYNC_A=127.0.0.1:15136
+SYNC_B=127.0.0.1:15137
+SYNC_D=127.0.0.1:15138
 rm -rf .ha/sync_a .ha/sync_b .ha/sync_data .ha/sync_chome .ha/sync_mnt
 mkdir -p .ha/sync_a .ha/sync_b .ha/sync_data .ha/sync_chome .ha/sync_mnt
 
@@ -136,7 +136,7 @@ SAP=$!
 $Y meta-server --db-path .ha/sync_b --listen $SYNC_B --role standby --peer $SYNC_A > .ha/sync_b.log 2>&1 &
 SBP=$!
 wait_port $SYNC_D; wait_port $SYNC_A; wait_port $SYNC_B
-# Strict view gate: create the view on the sync primary before the first mount.
+# Views are explicit: create the view on the sync primary before the first mount.
 $Y view --db-path .ha/sync_a create --view alice > .ha/sync_create.log 2>&1
 # Confirm the server logged sync-repl activation.
 grep -q 'synchronous replication ON' .ha/sync_a.log \
@@ -183,9 +183,9 @@ kill $SBP $SDP 2>/dev/null || true
 echo "===== 8) --sync-repl partition degradation: primary does not hang ====="
 # Start another pair, kill the standby, then verify a write to primary returns
 # (degraded to async) within the ACK timeout, not a permanent hang.
-PART_A=127.0.0.1:50146
-PART_B=127.0.0.1:50147
-PART_D=127.0.0.1:50148
+PART_A=127.0.0.1:15146
+PART_B=127.0.0.1:15147
+PART_D=127.0.0.1:15148
 rm -rf .ha/part_a .ha/part_b .ha/part_data .ha/part_chome .ha/part_mnt
 mkdir -p .ha/part_a .ha/part_b .ha/part_data .ha/part_chome .ha/part_mnt
 
@@ -230,9 +230,9 @@ echo "===== 9) --witness fencing: a stale primary is fenced by the third arbiter
 # the promoted node's higher epoch, the restarted primary must boot straight into
 # STANDBY — the witness-fencing startup path ("starting as standby (witness epoch
 # ..)"), which fires independently of whether it can reach its peer.
-W_A=127.0.0.1:50156
-W_B=127.0.0.1:50157
-W_D=127.0.0.1:50158
+W_A=127.0.0.1:15156
+W_B=127.0.0.1:15157
+W_D=127.0.0.1:15158
 rm -rf .ha/w_a .ha/w_b .ha/w_data; mkdir -p .ha/w_a .ha/w_b .ha/w_data
 
 $Y data-server --listen $W_D --root .ha/w_data > .ha/w_data.log 2>&1 &
@@ -275,6 +275,7 @@ grep -q 'starting as standby (a quorum' .ha/w_a2.log \
   || bad "witness did not fence the stale primary (log: $(tr '\n' ' ' < .ha/w_a2.log))"
 
 kill $WA2 $WB $WD 2>/dev/null || true
+wait $WA2 $WB $WD 2>/dev/null || true   # reap before the next section reuses a port
 
 # ---------------------------------------------------------------------------
 echo "===== 10) --witness FAIL-SAFE: arbiter loss freezes writes, no blind split-brain ====="
@@ -288,9 +289,9 @@ echo "===== 10) --witness FAIL-SAFE: arbiter loss freezes writes, no blind split
 #       the same epoch, so their candidate claims collide, and the prev-returning
 #       CAS must let the first claimer win and fence the tie. This is the double-
 #       write window actually CLOSED, not merely bounded.
-F_A=127.0.0.1:50166
-F_B=127.0.0.1:50167
-F_D=127.0.0.1:50168
+F_A=127.0.0.1:15166
+F_B=127.0.0.1:15167
+F_D=127.0.0.1:15168
 rm -rf .ha/f_a .ha/f_b .ha/f_data; mkdir -p .ha/f_a .ha/f_b .ha/f_data
 
 $Y data-server --listen $F_D --root .ha/f_data > .ha/f_data.log 2>&1 &
@@ -354,12 +355,12 @@ echo "===== 11) --witness QUORUM: tolerate a minority arbiter loss, fail safe on
 #   (c) kill a SECOND arbiter (only 1/3 left, below quorum): the primary can no
 #       longer *prove* exclusive authority, so after the grace it fail-safe
 #       self-demotes, and the standby fail-safe refuses blind promotion.
-Q_A=127.0.0.1:50176
-Q_B=127.0.0.1:50177
-Q_D1=127.0.0.1:50178
-Q_D2=127.0.0.1:50179
-Q_D3=127.0.0.1:50180
-Q_DC=127.0.0.1:50181   # the client's CONTENT store: separate from the fencing quorum
+Q_A=127.0.0.1:15176
+Q_B=127.0.0.1:15177
+Q_D1=127.0.0.1:15178
+Q_D2=127.0.0.1:15179
+Q_D3=127.0.0.1:15180
+Q_DC=127.0.0.1:15181   # the client's CONTENT store: separate from the fencing quorum
 rm -rf .ha/q_a .ha/q_b .ha/q_d1 .ha/q_d2 .ha/q_d3 .ha/q_dc
 mkdir -p .ha/q_a .ha/q_b .ha/q_d1 .ha/q_d2 .ha/q_d3 .ha/q_dc
 $Y data-server --listen $Q_D1 --root .ha/q_d1 > .ha/q_d1.log 2>&1 & QD1=$!
@@ -419,17 +420,17 @@ kill $QC $QA $QB $QD3 $QDC 2>/dev/null || true
 # indistinguishable from a real partition. serve() must warn at startup, and a
 # well-formed ODD list must stay quiet (no false alarms).
 mkdir -p .ha/vm
-$Y meta-server --db-path .ha/vm --listen 127.0.0.1:50190 --witness "127.0.0.1" > .ha/v_bad.log 2>&1 & VM1=$!
+$Y meta-server --db-path .ha/vm --listen 127.0.0.1:15220 --witness "127.0.0.1" > .ha/v_bad.log 2>&1 & VM1=$!
 sleep 0.6; kill $VM1 2>/dev/null; wait $VM1 2>/dev/null || true
 grep -q 'are not host:port' .ha/v_bad.log \
   && ok "malformed --witness entry warned fail-loud (not mistaken for a partition)" \
   || bad "malformed --witness entry produced no warning (log: $(tr '\n' ' ' < .ha/v_bad.log))"
-$Y meta-server --db-path .ha/vm --listen 127.0.0.1:50191 --witness "127.0.0.1:50192,127.0.0.1:50193" > .ha/v_even.log 2>&1 & VM2=$!
+$Y meta-server --db-path .ha/vm --listen 127.0.0.1:15221 --witness "127.0.0.1:15192,127.0.0.1:15193" > .ha/v_even.log 2>&1 & VM2=$!
 sleep 0.6; kill $VM2 2>/dev/null; wait $VM2 2>/dev/null || true
 grep -q '(even) arbiters' .ha/v_even.log \
   && ok "even-N --witness list warned with an odd-count recommendation" \
   || bad "even-N --witness list produced no warning (log: $(tr '\n' ' ' < .ha/v_even.log))"
-$Y meta-server --db-path .ha/vm --listen 127.0.0.1:50194 --witness "127.0.0.1:50195,127.0.0.1:50196,127.0.0.1:50197" > .ha/v_ok.log 2>&1 & VM3=$!
+$Y meta-server --db-path .ha/vm --listen 127.0.0.1:15222 --witness "127.0.0.1:15195,127.0.0.1:15196,127.0.0.1:15197" > .ha/v_ok.log 2>&1 & VM3=$!
 sleep 0.6; kill $VM3 2>/dev/null; wait $VM3 2>/dev/null || true
 { grep -q 'are not host:port' .ha/v_ok.log || grep -q '(even) arbiters' .ha/v_ok.log; } \
   && bad "healthy odd-N witness list emitted a spurious warning" \

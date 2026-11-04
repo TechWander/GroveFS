@@ -7,9 +7,7 @@
 use std::net::TcpListener;
 
 use grovefs::meta::{MetaProvider, MetaStore, NodeKind, ROOT_INO};
-use grovefs::remote::meta::{
-    open_event_stream, serve_on_meta, serve_on_meta_auth, serve_on_meta_strict, RemoteMeta,
-};
+use grovefs::remote::meta::{open_event_stream, serve_on_meta, serve_on_meta_auth, RemoteMeta};
 use grovefs::remote::proto;
 
 fn spawn_meta_server() -> (String, tempfile::TempDir) {
@@ -18,6 +16,12 @@ fn spawn_meta_server() -> (String, tempfile::TempDir) {
         .tempdir()
         .unwrap();
     let base = dir.path().to_path_buf();
+    // Views are created EXPLICITLY — an `M_OPEN` never materializes one — so the
+    // fixtures these tests mount are provisioned up front, exactly the way a
+    // deployment does with `view create` / `init`.
+    for view in ["alice", "bob", "shared", "carol"] {
+        drop(MetaStore::open_sqlite(&base, view, false).unwrap());
+    }
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     std::thread::spawn(move || serve_on_meta(listener, base));
@@ -162,6 +166,7 @@ fn spawn_meta_server_auth(token: &str) -> (String, tempfile::TempDir) {
         .tempdir()
         .unwrap();
     let base = dir.path().to_path_buf();
+    drop(MetaStore::open_sqlite(&base, "alice", false).unwrap());
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let token = token.to_string();
@@ -270,62 +275,26 @@ fn meta_event_bus_pushes_invalidations() {
     }
 }
 
-/// S3 zero-provisioning contract: mounting a view the server has never seen
-/// auto-creates its authoritative DB on the M_OPEN handshake — deployments do
-/// not run `init` per user up front. The created tree is immediately writable
-/// and isolated (a second unknown view gets its own fresh root).
+/// Views are created EXPLICITLY: an `M_OPEN` naming a view that does not exist
+/// is REFUSED with a readable reason and leaves NO `<view>.db` behind, while an
+/// existing tree still opens and serves normally.
 #[test]
-fn mount_of_unknown_view_auto_creates_the_db() {
+fn mount_of_unknown_view_is_refused_without_creating_it() {
     let (addr, d) = spawn_meta_server();
     let base = d.path().to_path_buf();
     assert!(
-        !base.join("meta/alice.db").exists(),
+        !base.join("meta/ghost.db").exists(),
         "precondition: no such view yet"
     );
 
-    let m = connect(&addr, "alice"); // handshake alone
-    assert!(
-        base.join("meta/alice.db").exists(),
-        "M_OPEN for an unknown view must lazily create <base>/meta/<view>.db"
-    );
-
-    // The fresh view is a real, writable, isolated tree.
-    let dir = m
-        .create_node(ROOT_INO, "from-first-write", true, None, 0o755, UID, GID)
-        .unwrap();
-    assert_eq!(m.lookup(ROOT_INO, "from-first-write").unwrap().id, dir);
-
-    let m2 = connect(&addr, "bob");
-    assert!(
-        m2.lookup(ROOT_INO, "from-first-write").is_none(),
-        "views stay isolated"
-    );
-    assert!(base.join("meta/bob.db").exists());
-}
-
-/// The strict view gate (the DEFAULT): an `M_OPEN` naming a view that does not
-/// exist is REFUSED with a readable reason and leaves NO `<view>.db` behind,
-/// while an existing tree (and a governed definition) still opens normally.
-#[test]
-fn strict_view_refuses_unknown_view_without_creating_it() {
-    let dir = tempfile::Builder::new()
-        .prefix("grovefs_msrv_strict_")
-        .tempdir()
-        .unwrap();
-    let base = dir.path().to_path_buf();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    let srv_base = base.clone();
-    std::thread::spawn(move || serve_on_meta_strict(listener, srv_base, "", true));
-
-    // Unknown name: refused. Retry only while the listener is still coming up —
-    // the refusal we assert on is the server's own message, not a connection
-    // error being mistaken for it.
+    // Retry only while the listener is still coming up — the refusal we assert
+    // on is the server's own message, not a connection error being mistaken for
+    // it.
     let mut last = String::new();
     let mut refusal = None;
     for _ in 0..100 {
         match RemoteMeta::new(&addr, "ghost") {
-            Ok(_) => panic!("strict server must refuse a view that does not exist"),
+            Ok(_) => panic!("server must refuse a view that does not exist"),
             Err(e) => {
                 let msg = e.to_string();
                 if msg.contains("does not exist") {
@@ -337,7 +306,7 @@ fn strict_view_refuses_unknown_view_without_creating_it() {
             }
         }
     }
-    let msg = refusal.unwrap_or_else(|| panic!("no strict refusal from {addr}; last: {last}"));
+    let msg = refusal.unwrap_or_else(|| panic!("no refusal from {addr}; last: {last}"));
     assert!(
         msg.contains("views are created explicitly"),
         "reason must say views are explicit: {msg}"
@@ -348,20 +317,11 @@ fn strict_view_refuses_unknown_view_without_creating_it() {
     );
     assert!(
         !base.join("meta/ghost.db").exists(),
-        "strict mode must NOT lazily create the unknown view's db"
+        "an M_OPEN must NOT create the unknown view's db"
     );
 
     // An existing physical tree still opens and serves.
-    drop(MetaStore::open_sqlite(&base, "team", false).unwrap());
-    let m = (0..100)
-        .find_map(|_| match RemoteMeta::new(&addr, "team") {
-            Ok(c) => Some(c),
-            Err(_) => {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-                None
-            }
-        })
-        .expect("an existing view must still mount under --strict-view");
+    let m = connect(&addr, "alice");
     m.create_node(ROOT_INO, "ok", true, None, 0o755, UID, GID)
         .unwrap();
     assert!(m.lookup(ROOT_INO, "ok").is_some());

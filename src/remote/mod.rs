@@ -17,10 +17,14 @@
 pub mod client;
 pub mod meta;
 pub mod proto;
+#[cfg(feature = "native")]
 pub mod server;
 
 pub use client::RemoteBackend;
-pub use meta::{open_event_stream, spawn_invalidation_listener, MetaServer, RemoteMeta};
+pub use meta::RemoteMeta;
+#[cfg(feature = "native")]
+pub use meta::{open_event_stream, spawn_invalidation_listener, MetaServer};
+#[cfg(feature = "native")]
 pub use server::DataServer;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -56,9 +60,5 @@ pub fn signal_auth_loss(reason: &str) {
     if !LOGGED.swap(true, Ordering::SeqCst) {
         eprintln!("grovefs: access refused by the server ({reason}) — unmounting this view");
     }
-    // Safe even if the watcher is gone: the signal only ends a process that had
-    // already decided it cannot serve this view.
-    unsafe {
-        libc::kill(std::process::id() as libc::pid_t, libc::SIGTERM);
-    }
+    crate::platform::kill_self_sigterm();
 }

@@ -89,7 +89,7 @@ T ls $M/legacy/docs | grep -q fresh.txt && ok "incremental pick-up visible on th
 [ -e "$M/legacy/docs/pipe.fifo" ] && bad "fifo leaked into the view" || ok "special file not imported (skipped as documented)"
 
 echo "===== 6) server topology: import + meta-server + derived view over imported bytes ====="
-META=127.0.0.1:50164; DATA=127.0.0.1:50165
+META=127.0.0.1:15230; DATA=127.0.0.1:15231
 wait_port(){ local a=$1; for _ in $(seq 1 100); do (echo >/dev/tcp/${a%%:*}/${a##*:}) 2>/dev/null && return 0; sleep 0.05; done; return 1; }
 $Y meta-server --db-path .itest/home --listen $META > .itest/meta_srv.log 2>&1 &
 MSP=$!

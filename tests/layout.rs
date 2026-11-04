@@ -313,3 +313,51 @@ fn display_targets_empty_without_reloc() {
         "hide doesn't relocate"
     );
 }
+
+/// The lens materializes each shaped listing so the kernel's many READDIR
+/// buffers of one directory cost one rule pass (see `LayoutMeta::listing`).
+/// That cache is invisible to a peer: a mutation of the base tree arrives as a
+/// push event, never as an operation through this lens, so nothing would ever
+/// flush it and the display coordinate would sit stale for the whole TTL —
+/// exactly the window `display_targets` exists to close. The invalidation path
+/// therefore has to call `flush_listing` beside every kernel invalidation it
+/// issues; this pins that half of the contract at the provider interface.
+#[test]
+fn flush_listing_drops_the_materialized_shape() {
+    let eng = seed_tree("flush1");
+    let l = lens_over(eng.clone(), "link /shared/lib /team/lib\n");
+    let shared_ino = eng.lookup(ROOT_INO, "shared").unwrap().id;
+    let team = l.lookup(ROOT_INO, "team").expect("synthesized /team").id;
+
+    // Warm the lens's own materialization through the paged path FUSE uses.
+    assert_eq!(names(&l.readdir_page(team, 0, 10)), vec!["lib".to_string()]);
+
+    // A peer removes the source entry BEHIND the lens: no operation went
+    // through it, so its cached rows survive (this is the staleness the push
+    // path must clear, and it is why the assertion below is not vacuous).
+    eng.unlink(shared_ino, "lib").unwrap();
+    assert_eq!(
+        names(&l.readdir_page(team, 0, 10)),
+        vec!["lib".to_string()],
+        "the listing is cached — flush_listing, not the TTL, is what must fix it"
+    );
+
+    // Flushing the coordinate the event invalidates makes the next read honest.
+    l.flush_listing(team);
+    assert!(
+        names(&l.readdir_page(team, 0, 10)).is_empty(),
+        "flush_listing must drop the materialized rows for that directory"
+    );
+    // And the flush is scoped, not a whole-lens reset: an untouched directory
+    // keeps serving its materialized listing.
+    let photos = eng.lookup(ROOT_INO, "photos").unwrap().id;
+    assert_eq!(
+        names(&l.readdir_page(photos, 0, 10)),
+        vec!["private".to_string(), "public".to_string()]
+    );
+    l.flush_listing(team);
+    assert_eq!(
+        names(&l.readdir_page(photos, 0, 10)),
+        vec!["private".to_string(), "public".to_string()]
+    );
+}

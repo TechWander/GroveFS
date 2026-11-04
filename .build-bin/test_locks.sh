@@ -219,9 +219,9 @@ if python3 .locks/ask.py "$M2/seed/f2.bin" >/dev/null 2>&1; then ok "lock releas
 
 # ---------------------------------------------------------------------------
 echo "===== 5) HA: locks table replicates to standby via existing backup channel ====="
-META_A=127.0.0.1:50116
-META_B=127.0.0.1:50117
-DATA=127.0.0.1:50118
+META_A=127.0.0.1:15116
+META_B=127.0.0.1:15117
+DATA=127.0.0.1:15118
 rm -rf .locks/ha; mkdir -p .locks/ha/a .locks/ha/b .locks/ha/data .locks/ha/chome .locks/ha/mnt
 wait_port(){ local a=$1; for _ in $(seq 1 100); do (echo >/dev/tcp/${a%%:*}/${a##*:}) 2>/dev/null && return 0; sleep 0.05; done; return 1; }
 

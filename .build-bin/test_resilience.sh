@@ -16,7 +16,7 @@ set -u
 cd /data/xy/grovefs
 export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
 Y=./target/release/grovefs
-ADDR=127.0.0.1:50098
+ADDR=127.0.0.1:15098
 HOST=${ADDR%:*}; PORT=${ADDR#*:}
 
 rm -rf .rtest; mkdir -p .rtest/home .rtest/rsrv .rtest/mnt_a .rtest/mnt_b

@@ -62,10 +62,16 @@ else bad "initialize answer wrong: $(resp 1 || echo NO-RESPONSE)"; fi
 if have 1 '.result.capabilities|(has("tools") and has("resources") and has("prompts") and has("completions") and has("logging"))'; then
   ok "initialize advertises the full capability surface (tools/resources/prompts/completions/logging)"
 else bad "capabilities: $(resp 1 || echo NO-RESPONSE)"; fi
+# The handshake instructions are the only map an agent reads before it discovers
+# tools, so every exposed tool has to appear in them — this caught fork_view and
+# graft_view going unadvertised once the curation pair landed.
+if have 1 '.result.instructions as $i | ["list_views","get_view","list_view_tree","define_derived_view","alias_view","fork_view","graft_view","remove_view","preview_rules","validate_definition"] | all(. as $t | ($i|contains($t)))'; then
+  ok "agent instructions name all ten tools (nothing discoverable only via tools/list)"
+else bad "instructions coverage: $(resp 1 || echo NO-RESPONSE)"; fi
 say '{"jsonrpc":"2.0","method":"notifications/initialized"}'
 say '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
-if have 2 '[.result.tools[].name]|sort==["alias_view","define_derived_view","fork_view","get_view","list_view_tree","list_views","preview_rules","remove_view","validate_definition"]'; then
-  ok "tools/list advertises exactly the nine governance + introspection tools"
+if have 2 '[.result.tools[].name]|sort==["alias_view","define_derived_view","fork_view","get_view","graft_view","list_view_tree","list_views","preview_rules","remove_view","validate_definition"]'; then
+  ok "tools/list advertises exactly the ten governance + introspection tools"
 else bad "tools/list: $(resp 2 || echo NO-RESPONSE)"; fi
 # The notification must NOT have produced a response frame (id-less = no answer).
 if jq -e 'select(has("id")|not)' "$MCPOUT" >/dev/null 2>&1; then
@@ -235,6 +241,76 @@ if have 64 '.result.content[0].text|test("removed fork view .lab. of base .team.
   [ ! -f "$BASE/meta/lab.db" ] && [ -f "$BASE/meta/team.db" ] \
     && ok "remove_view deleted the fork tree only (base tree intact)" || bad "fork rm left the wrong files"
 else bad "fork rm: $(resp 64 || echo NO-RESPONSE)"; fi
+
+# The CURATED form: an EMPTY fork (`seed:false`) plus a batch plan that places a
+# renamed subset — the same tool pair a curation script drives, no temp files.
+say '{"jsonrpc":"2.0","id":65,"method":"tools/call","params":{"name":"fork_view","arguments":{"name":"pick","base":"team","seed":false}}}'
+if have 65 '.result.content[0].text|test("as an EMPTY tree: root only")'; then
+  ok "fork_view seed:false leaves a root-only tree (nothing copied)"
+else bad "empty fork: $(resp 65 || echo NO-RESPONSE)"; fi
+say '{"jsonrpc":"2.0","id":66,"method":"tools/call","params":{"name":"graft_view","arguments":{"name":"pick","src":"team","map":"docs/a.md\tby_kind/notes.md"}}}'
+if have 66 '.result.content[0].text|test("grafted 2 entries .1 directory. from .team. into .pick.")'; then
+  ok "graft_view placed and renamed the subset (dir created, bytes shared)"
+else bad "graft_view: $(resp 66 || echo NO-RESPONSE)"; fi
+say '{"jsonrpc":"2.0","id":67,"method":"tools/call","params":{"name":"list_view_tree","arguments":{"view":"pick"}}}'
+if resp 67 | jq -r '.result.content[0].text' 2>/dev/null | jq -e '[.entries[].path]|index("/by_kind/notes.md")' >/dev/null 2>&1; then
+  ok "the grafted fork serves the renamed path (still content read-only)"
+else bad "pick tree: $(resp 67 || echo NO-RESPONSE)"; fi
+# The graft guard rail, verbatim: every refusal text an agent can hit on this
+# tool pair, pinned byte-for-byte because SKILL.md quotes them as self-checks.
+say '{"jsonrpc":"2.0","id":69,"method":"tools/call","params":{"name":"graft_view","arguments":{"name":"pick","src":"pick","map":"docs/a.md"}}}'
+if have 69 '.result.isError==true and (.result.content[0].text|test("cannot graft from its own tree"))'; then
+  ok "graft_view refuses to graft a view out of itself"
+else bad "self-graft: $(resp 69 || echo NO-RESPONSE)"; fi
+say '{"jsonrpc":"2.0","id":70,"method":"tools/call","params":{"name":"graft_view","arguments":{"name":"pick","map":"# only a comment\n"}}}'
+if have 70 '.result.isError==true and (.result.content[0].text|test("empty graft plan"))'; then
+  ok "graft_view refuses an all-comment plan instead of silently doing nothing"
+else bad "empty plan: $(resp 70 || echo NO-RESPONSE)"; fi
+say '{"jsonrpc":"2.0","id":71,"method":"tools/call","params":{"name":"graft_view","arguments":{"name":"pick","map":"docs/a.md\t../esc"}}}'
+if have 71 '.result.isError==true and (.result.content[0].text|test("line 1:.*must not"))'; then
+  ok "a plan destination cannot escape the tree with .. (error carries the line number)"
+else bad "dotdot dst: $(resp 71 || echo NO-RESPONSE)"; fi
+say '{"jsonrpc":"2.0","id":72,"method":"tools/call","params":{"name":"graft_view","arguments":{"name":"pick","map":"/"}}}'
+if have 72 '.result.isError==true and (.result.content[0].text|test("the root itself cannot be grafted"))'; then
+  ok "graft_view refuses naming the root itself as a plan source"
+else bad "root src: $(resp 72 || echo NO-RESPONSE)"; fi
+say '{"jsonrpc":"2.0","id":73,"method":"tools/call","params":{"name":"graft_view","arguments":{"name":"team","map":"docs/a.md"}}}'
+if have 73 '.result.isError==true and (.result.content[0].text|test("is a base view"))'; then
+  ok "grafting into a base view demands an explicit --src (no silent source)"
+else bad "base target: $(resp 73 || echo NO-RESPONSE)"; fi
+say '{"jsonrpc":"2.0","id":74,"method":"tools/call","params":{"name":"graft_view","arguments":{"name":"release","src":"team","map":"docs/a.md"}}}'
+if have 74 '.result.isError==true and (.result.content[0].text|test("graft destination .release. is a derived lens"))'; then
+  ok "a derived lens cannot be a graft destination (it owns no nodes)"
+else bad "lens dst: $(resp 74 || echo NO-RESPONSE)"; fi
+say '{"jsonrpc":"2.0","id":75,"method":"tools/call","params":{"name":"graft_view","arguments":{"name":"pick","src":"teamB","map":"docs/a.md"}}}'
+if have 75 '.result.isError==true and (.result.content[0].text|test("graft source .teamB. is an alias of .team."))'; then
+  ok "a pure alias cannot be a graft source either (role-specific wording)"
+else bad "alias src: $(resp 75 || echo NO-RESPONSE)"; fi
+say '{"jsonrpc":"2.0","id":76,"method":"tools/call","params":{"name":"graft_view","arguments":{"name":"zzz","map":"docs/a.md"}}}'
+if have 76 '.result.isError==true and (.result.content[0].text|test("no tree for graft destination .zzz."))'; then
+  ok "grafting into a name with no tree is refused with the create-it-first hint"
+else bad "no tree: $(resp 76 || echo NO-RESPONSE)"; fi
+say '{"jsonrpc":"2.0","id":77,"method":"tools/call","params":{"name":"graft_view","arguments":{"name":"a/b","map":"docs/a.md"}}}'
+if have 77 '.result.isError==true and (.result.content[0].text|test("invalid destination name"))'; then
+  ok "a graft destination must be one safe path element"
+else bad "bad dst name: $(resp 77 || echo NO-RESPONSE)"; fi
+say '{"jsonrpc":"2.0","id":78,"method":"tools/call","params":{"name":"graft_view","arguments":{"name":"pick","map":"docs/a.md\tby_kind/notes.md"}}}'
+if have 78 '.result.isError==true and (.result.content[0].text|test("already exists in the destination"))'; then
+  ok "a taken destination name fails the whole plan (all-or-nothing)"
+else bad "clash: $(resp 78 || echo NO-RESPONSE)"; fi
+say '{"jsonrpc":"2.0","id":79,"method":"tools/call","params":{"name":"graft_view","arguments":{"name":"pick","map":"docs/a.md\tby_kind/notes.md\ndocs/a.md\tsecond.md","skip_existing":true}}}'
+if have 79 '.result.content[0].text|test("grafted 1 entry") and test("1 skipped")'; then
+  ok "skip_existing merges around the clash instead of rolling the plan back"
+else bad "skip_existing: $(resp 79 || echo NO-RESPONSE)"; fi
+say '{"jsonrpc":"2.0","id":80,"method":"tools/call","params":{"name":"list_view_tree","arguments":{"view":"pick"}}}'
+if resp 80 | jq -r '.result.content[0].text' 2>/dev/null | jq -e '[.entries[].path]|index("/second.md")' >/dev/null 2>&1; then
+  ok "the entry that did not clash still landed (/second.md)"
+else bad "second.md: $(resp 80 || echo NO-RESPONSE)"; fi
+
+say '{"jsonrpc":"2.0","id":68,"method":"tools/call","params":{"name":"remove_view","arguments":{"name":"pick"}}}'
+if have 68 '.result.content[0].text|test("removed fork view .pick.")'; then
+  ok "the grafted fork drops like any fork"
+else bad "pick rm: $(resp 68 || echo NO-RESPONSE)"; fi
 
 # One contract, two entrances: the CLI sees the agent's state verbatim.
 $Y view --db-path "$BASE" list > .mcptest/cli_list.log 2>&1

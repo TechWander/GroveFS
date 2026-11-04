@@ -23,7 +23,7 @@
 //! link: they name the same inode and therefore the same data object, the same
 //! size and the same timestamps. Fresh files/dirs get `ino == row id`.
 
-use rusqlite::{params, Connection, OpenFlags, TransactionBehavior};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -193,9 +193,8 @@ impl NodeInfo {
 // Staleness boundary: a view db deleted out-of-band (`rm <view>.db`, a fresh
 // `--home`) never decrements its holders — the ledger over-counts, blobs are
 // kept too long, and `grovefs refs rebuild` rewrites the ledger from the trees
-// that actually exist. An absent/never-written `refs.db` behaves exactly like
-// the pre-ledger single-view world (no other view known -> free on last name),
-// so existing stores and suites are unchanged until they share a key.
+// that actually exist. A key with no ledger row is simply private to one view
+// (no other view known -> free on last name).
 
 /// The shared ledger file beside the view trees (`<meta dir>/refs.db`).
 pub const REFS_DB: &str = "refs.db";
@@ -242,8 +241,8 @@ fn attach_refs_ledger(conn: &Connection, path: &Path) -> rusqlite::Result<()> {
 }
 
 /// Does another view's tree already hold a name for `dr`? Read through the
-/// attached ledger (an unattached/missing schema answers `false` — the
-/// pre-ledger behaviour). `tx` is any rusqlite transaction on the engine
+/// attached ledger (an unattached schema answers `false`, i.e. only this view
+/// holds the key). `tx` is any rusqlite transaction on the engine
 /// connection, so the read shares the txn's snapshot with its DELETE.
 pub fn other_view_holds(tx: &rusqlite::Transaction<'_>, dr: &str) -> bool {
     tx.query_row(
@@ -271,7 +270,7 @@ pub fn ledger_add(tx: &rusqlite::Transaction<'_>, dr: &str) -> rusqlite::Result<
 /// removed, inside the same tx as the node DELETE). Returns `Some(dr)` when the
 /// blob is now physically freeable — no view holds it anymore — and `None` when
 /// another view still does (the caller GCs only on `Some`). A missing row is
-/// treated as "no other holder", matching the pre-ledger single-view semantics.
+/// treated as "no other holder": nothing was ever booked for this key.
 pub fn ledger_remove(tx: &rusqlite::Transaction<'_>, dr: &str) -> Option<String> {
     let n = tx
         .execute(
@@ -296,10 +295,9 @@ pub fn ledger_remove(tx: &rusqlite::Transaction<'_>, dr: &str) -> Option<String>
         }
         None
     } else {
-        // No ledger row: this view was never booked against a shared key (or
-        // the ledger predates the tree). The same-view refcount already read 0
-        // at this call site, so freeing here is what the pre-ledger engine did
-        // for every private object — keep that behaviour exactly.
+        // No ledger row: this view was never booked against a shared key. The
+        // same-view refcount already read 0 at this call site, so freeing is
+        // the safe answer for a key no other view knows about.
         Some(dr.to_string())
     }
 }
@@ -329,6 +327,20 @@ pub struct ForkStats {
 /// transaction that also books the ledger, so a crash leaves either no fork or a
 /// fully seeded one.
 pub fn fork_view(base: &Path, base_view: &str, name: &str) -> Result<ForkStats, String> {
+    fork_view_with(base, base_view, name, true)
+}
+
+/// [`fork_view`] with an explicit seeding choice. `seed == false` creates the
+/// fork's OWN tree at `meta/<name>.db` (schema + root only) and copies no rows,
+/// so the caller can place a curated subset later with [`ForkGraft`]. The
+/// definition still says `fork <base>`, so mount semantics are identical
+/// (structure writable, content EROFS) and deletes stay local to the fork.
+pub fn fork_view_with(
+    base: &Path,
+    base_view: &str,
+    name: &str,
+    seed: bool,
+) -> Result<ForkStats, String> {
     let meta_dir = base.join("meta");
     let src_path = meta_dir.join(format!("{base_view}.db"));
     let dst_path = meta_dir.join(format!("{name}.db"));
@@ -341,8 +353,15 @@ pub fn fork_view(base: &Path, base_view: &str, name: &str) -> Result<ForkStats, 
     if dst_path.exists() {
         return Err(format!("fork target {} already exists", dst_path.display()));
     }
-    // Snapshot the source rows first. `ino` is normalized at copy time: a
-    // legacy row (pre-`ino` column) must land with a usable inode number.
+    if !seed {
+        // Nothing to copy: opening the engine seeds the schema and the root row
+        // (id/ino 1, 0755, owner of this process), exactly like `view create`.
+        let _ = MetaEngine::open(&dst_path)
+            .map_err(|e| format!("cannot create fork tree {}: {e}", dst_path.display()))?;
+        return Ok(ForkStats { nodes: 1, blobs: 0 });
+    }
+    // Snapshot the source rows first, inode numbers included: names that
+    // shared an inode in the source stay hard links in the fork.
     struct Row {
         id: i64,
         parent_id: Option<i64>,
@@ -356,7 +375,7 @@ pub fn fork_view(base: &Path, base_view: &str, name: &str) -> Result<ForkStats, 
         mtime: i64,
         atime: i64,
         ctime: i64,
-        ino: Option<i64>,
+        ino: i64,
     }
     let src = Connection::open_with_flags(&src_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|e| format!("cannot open base tree {}: {e}", src_path.display()))?;
@@ -414,7 +433,6 @@ pub fn fork_view(base: &Path, base_view: &str, name: &str) -> Result<ForkStats, 
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             )?;
             for r in &rows {
-                let ino = r.ino.unwrap_or(r.id);
                 ins.execute(params![
                     r.id,
                     r.parent_id,
@@ -428,25 +446,13 @@ pub fn fork_view(base: &Path, base_view: &str, name: &str) -> Result<ForkStats, 
                     r.mtime,
                     r.atime,
                     r.ctime,
-                    ino
+                    r.ino
                 ])?;
             }
         }
-        // Book the fork's hold on every distinct blob. If the BASE view was
-        // never booked (a store predating the ledger, never rebuilt), book it
-        // too — otherwise the base's last-name delete would see holders==1,
-        // drop it to 0, and free a blob the fork still names.
+        // Book the fork's own hold on every distinct blob (the base view
+        // already holds its row — every engine books on the 0->1 name count).
         for dr in &blobs {
-            let booked = tx
-                .query_row(
-                    &format!("SELECT 1 FROM {REFS_SCHEMA}.holders WHERE data_ref=?1 LIMIT 1"),
-                    params![dr],
-                    |_| Ok(()),
-                )
-                .is_ok();
-            if !booked {
-                ledger_add(&tx, dr)?;
-            }
             ledger_add(&tx, dr)?;
         }
         tx.commit()?;
@@ -457,6 +463,465 @@ pub fn fork_view(base: &Path, base_view: &str, name: &str) -> Result<ForkStats, 
         nodes,
         blobs: nblobs,
     })
+}
+
+/// One line of a graft plan: pull `src` — a path relative to the SOURCE view's
+/// root — into the destination tree at `dst` (relative to the plan's `dest`
+/// prefix, or to the destination root when that prefix is empty).
+///
+/// A directory `src` brings its whole subtree with it (original names kept); a
+/// file or a symlink brings just itself. Because `dst` names the destination
+/// entry, **renaming is just a different basename**: this is how UUID-named
+/// objects become a human-shaped tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraftItem {
+    pub src: String,
+    pub dst: String,
+}
+
+/// Outcome of [`graft_view`]: rows added, how many of those are directories,
+/// distinct blobs the destination now co-holds, and entries left alone by the
+/// `skip_existing` merge rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GraftStats {
+    pub nodes: i64,
+    pub dirs: i64,
+    pub blobs: i64,
+    pub skipped: i64,
+}
+
+/// Normalize one plan path: strip leading/trailing slashes and `.`
+/// components, refuse `..` outright. A plan is DATA handed over by another
+/// program, never a shell word, so it must not be able to walk out of the view.
+fn normalize_plan_path(p: &str) -> Result<String, String> {
+    if p.contains('\0') {
+        return Err("path contains a NUL byte".to_string());
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for c in p.split('/') {
+        if c.is_empty() || c == "." {
+            continue;
+        }
+        if c == ".." {
+            return Err(format!("path '{p}' must not contain '..'"));
+        }
+        parts.push(c);
+    }
+    if parts.is_empty() {
+        return Err(
+            "empty path — the root itself cannot be grafted, name an entry inside it".to_string(),
+        );
+    }
+    Ok(parts.join("/"))
+}
+
+/// Parse a graft plan: one entry per line, `<src>` or `<src>TAB<dst>`, with
+/// blank lines and `#` comments ignored. Only the FIRST tab splits, so names
+/// may contain spaces; a relative `src` with a leading `/` is accepted. An
+/// entry without `dst` keeps its path (that is the bulk form: pipe a plain list
+/// of source paths and nothing gets renamed).
+pub fn parse_graft_plan(text: &str) -> Result<Vec<GraftItem>, String> {
+    let mut out: Vec<GraftItem> = Vec::new();
+    for (i, raw) in text.lines().enumerate() {
+        let lineno = i + 1;
+        let line = raw.trim_end_matches('\r');
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        let (src, dst) = match line.find('\t') {
+            Some(k) => (&line[..k], &line[k + 1..]),
+            None => (line, ""),
+        };
+        // Trim the fields (never the inside): plans are often aligned with
+        // spaces, and a CRLF tail would otherwise become part of a name.
+        let src = normalize_plan_path(src.trim()).map_err(|e| format!("line {lineno}: {e}"))?;
+        let dst = if dst.trim().is_empty() {
+            src.clone()
+        } else {
+            normalize_plan_path(dst.trim()).map_err(|e| format!("line {lineno}: {e}"))?
+        };
+        out.push(GraftItem { src, dst });
+    }
+    Ok(out)
+}
+
+/// One node row of a tree being read for a graft (the destination is only ever
+/// written, never bulk-read).
+struct GraftRow {
+    id: i64,
+    parent_id: Option<i64>,
+    name: String,
+    is_dir: i64,
+    data_ref: Option<String>,
+    link_target: Option<String>,
+    mode: i64,
+    uid: i64,
+    gid: i64,
+    mtime: i64,
+    atime: i64,
+    ctime: i64,
+    ino: i64,
+}
+
+fn read_graft_rows(path: &Path) -> Result<Vec<GraftRow>, String> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| format!("cannot open source tree {}: {e}", path.display()))?;
+    let _ = conn.execute_batch("PRAGMA busy_timeout=5000;");
+    let mut stmt = conn
+        .prepare(
+            "SELECT id,parent_id,name,is_dir,data_ref,link_target,mode,uid,gid,mtime,atime,ctime,ino
+             FROM node ORDER BY id",
+        )
+        .map_err(|e| format!("cannot read source tree {}: {e}", path.display()))?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(GraftRow {
+                id: r.get(0)?,
+                parent_id: r.get(1)?,
+                name: r.get(2)?,
+                is_dir: r.get(3)?,
+                data_ref: r.get(4)?,
+                link_target: r.get(5)?,
+                mode: r.get(6)?,
+                uid: r.get(7)?,
+                gid: r.get(8)?,
+                mtime: r.get(9)?,
+                atime: r.get(10)?,
+                ctime: r.get(11)?,
+                ino: r.get(12)?,
+            })
+        })
+        .map_err(|e| format!("cannot read source tree {}: {e}", path.display()))?
+        .filter_map(|x| x.ok())
+        .collect();
+    Ok(rows)
+}
+
+fn graft_children(rows: &[GraftRow]) -> HashMap<i64, Vec<usize>> {
+    let mut m: HashMap<i64, Vec<usize>> = HashMap::new();
+    for (i, r) in rows.iter().enumerate() {
+        if let Some(p) = r.parent_id {
+            m.entry(p).or_default().push(i);
+        }
+    }
+    m
+}
+
+/// Resolve a plan path (`a/b/c`) against the source rows. `None` means the
+/// path does not exist in that tree — the caller names the view in the error.
+fn graft_resolve(
+    rows: &[GraftRow],
+    children: &HashMap<i64, Vec<usize>>,
+    root: i64,
+    path: &str,
+) -> Option<usize> {
+    let mut parent = root;
+    let mut cur: Option<usize> = None;
+    for comp in path.split('/') {
+        let idx = *children
+            .get(&parent)?
+            .iter()
+            .find(|&&k| rows[k].name == comp)?;
+        parent = rows[idx].id;
+        cur = Some(idx);
+    }
+    cur
+}
+
+/// Mutable state carried through one graft transaction: the id/ino allocator,
+/// the merge rule, the running totals and the blobs that need booking.
+struct GraftCtx {
+    next: i64,
+    skip_existing: bool,
+    stats: GraftStats,
+    blobs: HashSet<String>,
+    /// source `ino` -> destination `ino`: names that shared an inode in the
+    /// source stay hard links of each other in the destination.
+    inos: HashMap<i64, i64>,
+}
+
+const GRAFT_INSERT: &str = "INSERT INTO node
+     (id,parent_id,name,is_dir,data_ref,link_target,mode,uid,gid,mtime,atime,ctime,ino)
+     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)";
+
+/// `mkdir -p` inside the destination tree: walk `path` from the root, creating
+/// any missing directory. Returns the directory's row id.
+fn graft_ensure_dir(
+    tx: &rusqlite::Transaction<'_>,
+    path: &str,
+    ctx: &mut GraftCtx,
+) -> Result<i64, String> {
+    let mut cur = ROOT_INO;
+    if path.is_empty() {
+        return Ok(cur);
+    }
+    for comp in path.split('/') {
+        let found: Option<(i64, i64)> = tx
+            .query_row(
+                "SELECT id,is_dir FROM node WHERE parent_id=?1 AND name=?2",
+                params![cur, comp],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| format!("cannot read the destination tree: {e}"))?;
+        match found {
+            Some((id, is_dir)) if is_dir != 0 => cur = id,
+            Some(_) => {
+                return Err(format!(
+                    "'{comp}' in the destination path is a file, not a directory"
+                ))
+            }
+            None => {
+                let id = ctx.next;
+                ctx.next += 1;
+                let t = now();
+                tx.execute(
+                    GRAFT_INSERT,
+                    params![
+                        id,
+                        cur,
+                        comp,
+                        1,
+                        None::<String>,
+                        None::<String>,
+                        0o0755,
+                        crate::platform::getuid() as i64,
+                        crate::platform::getgid() as i64,
+                        t,
+                        t,
+                        t,
+                        id
+                    ],
+                )
+                .map_err(|e| format!("cannot create directory '{comp}' in the destination: {e}"))?;
+                ctx.stats.nodes += 1;
+                ctx.stats.dirs += 1;
+                cur = id;
+            }
+        }
+    }
+    Ok(cur)
+}
+
+/// Copy one source entry (and, for a directory, its whole subtree) under
+/// `parent` as `name`. Rows get fresh ids/ino numbers in the destination; the
+/// source's bytes are referenced, never copied.
+#[allow(clippy::too_many_arguments)]
+fn graft_copy(
+    tx: &rusqlite::Transaction<'_>,
+    ins: &mut rusqlite::Statement<'_>,
+    rows: &[GraftRow],
+    children: &HashMap<i64, Vec<usize>>,
+    idx: usize,
+    parent: i64,
+    name: &str,
+    ctx: &mut GraftCtx,
+) -> Result<(), String> {
+    let r = &rows[idx];
+    let existing: Option<(i64, i64)> = tx
+        .query_row(
+            "SELECT id,is_dir FROM node WHERE parent_id=?1 AND name=?2",
+            params![parent, name],
+            |x| Ok((x.get(0)?, x.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| format!("cannot read the destination tree: {e}"))?;
+    let dir_id = match existing {
+        None => {
+            let id = ctx.next;
+            ctx.next += 1;
+            let ino = *ctx.inos.entry(r.ino).or_insert(id);
+            ins.execute(params![
+                id,
+                parent,
+                name,
+                r.is_dir,
+                r.data_ref,
+                r.link_target,
+                r.mode,
+                r.uid,
+                r.gid,
+                r.mtime,
+                r.atime,
+                r.ctime,
+                ino
+            ])
+            .map_err(|e| format!("cannot graft '{name}': {e}"))?;
+            ctx.stats.nodes += 1;
+            if r.is_dir != 0 {
+                ctx.stats.dirs += 1;
+            }
+            if let Some(dr) = &r.data_ref {
+                ctx.blobs.insert(dr.clone());
+            }
+            if r.is_dir == 0 {
+                return Ok(());
+            }
+            id
+        }
+        Some((id, is_dir)) => {
+            if !ctx.skip_existing {
+                return Err(format!(
+                    "'{name}' already exists in the destination — rename it in the plan or pass --skip-existing"
+                ));
+            }
+            if is_dir == 0 || r.is_dir == 0 {
+                ctx.stats.skipped += 1;
+                return Ok(());
+            }
+            // Both are directories: keep the one already there and merge the
+            // missing children into it (re-running a curation script must not
+            // fail on the skeleton it made last time).
+            id
+        }
+    };
+    if let Some(kids) = children.get(&r.id) {
+        for k in kids {
+            let child_name = rows[*k].name.clone();
+            graft_copy(tx, ins, rows, children, *k, dir_id, &child_name, ctx)?;
+        }
+    }
+    Ok(())
+}
+
+/// Graft a curated subset of `src_view`'s tree into the tree of `dst_view`: for
+/// every [`GraftItem`], copy that entry (a directory brings its subtree) to
+/// `dest/<dst>`, renaming it to the destination basename. Bytes are shared —
+/// every distinct `data_ref` is booked in the cross-view ledger exactly like a
+/// fork's, so the destination never owns a delete the source does not know
+/// about and the object is freed only when no view names it.
+///
+/// All-or-nothing: the source is read through a separate read-only snapshot and
+/// the whole plan lands in ONE `IMMEDIATE` transaction, so a bad line writes
+/// nothing. Missing parent directories under `dest` are created (0755).
+/// `skip_existing` turns a conflict into "leave what is there and keep going",
+/// merging into an existing directory and skipping colliding files.
+pub fn graft_view(
+    base: &Path,
+    dst_view: &str,
+    src_view: &str,
+    items: &[GraftItem],
+    dest: &str,
+    skip_existing: bool,
+) -> Result<GraftStats, String> {
+    if items.is_empty() {
+        return Err("empty graft plan — nothing to copy".to_string());
+    }
+    let meta_dir = base.join("meta");
+    let src_path = meta_dir.join(format!("{src_view}.db"));
+    let dst_path = meta_dir.join(format!("{dst_view}.db"));
+    if !src_path.is_file() {
+        return Err(format!(
+            "no source tree {} — a graft copies names out of a LOCAL SQLite view",
+            src_path.display()
+        ));
+    }
+    if !dst_path.is_file() {
+        return Err(format!(
+            "no destination tree {} — a graft lands in a BASE view or a fork (a lens/alias has no tree of its own)",
+            dst_path.display()
+        ));
+    }
+    let dest_prefix = if dest.trim().is_empty() {
+        String::new()
+    } else {
+        normalize_plan_path(dest)?
+    };
+    let rows = read_graft_rows(&src_path)?;
+    let root = rows
+        .iter()
+        .find(|r| r.parent_id.is_none())
+        .map(|r| r.id)
+        .ok_or_else(|| {
+            format!(
+                "source tree {} has no root row — refusing to graft from an empty store",
+                src_path.display()
+            )
+        })?;
+    let children = graft_children(&rows);
+    // Resolve every source path BEFORE writing anything, so a typo on line 900
+    // of a 100k-line plan cannot leave a half-grafted tree behind.
+    let mut plan: Vec<(usize, String)> = Vec::with_capacity(items.len());
+    for it in items {
+        let idx = graft_resolve(&rows, &children, root, &it.src)
+            .ok_or_else(|| format!("'{}' does not exist in view '{src_view}'", it.src))?;
+        let full = if dest_prefix.is_empty() {
+            it.dst.clone()
+        } else {
+            format!("{dest_prefix}/{}", it.dst)
+        };
+        plan.push((idx, full));
+    }
+    let eng = MetaEngine::open(&dst_path)
+        .map_err(|e| format!("cannot open destination tree {}: {e}", dst_path.display()))?;
+    let mut ctx = GraftCtx {
+        next: 0,
+        skip_existing,
+        stats: GraftStats::default(),
+        blobs: HashSet::new(),
+        inos: HashMap::new(),
+    };
+    with_ledger_serial(|| -> Result<(), String> {
+        let mut conn = eng.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| format!("cannot start the graft transaction: {e}"))?;
+        // Fresh ids/ino numbers start ABOVE both existing id space and existing
+        // inode numbers, so a graft never collides with rows copied by an
+        // earlier fork (whose inos came from another tree).
+        let max_id: i64 = tx
+            .query_row("SELECT IFNULL(MAX(id),0) FROM node", [], |r| r.get(0))
+            .map_err(|e| format!("cannot size the destination tree: {e}"))?;
+        let max_ino: i64 = tx
+            .query_row("SELECT IFNULL(MAX(ino),0) FROM node", [], |r| r.get(0))
+            .map_err(|e| format!("cannot size the destination tree: {e}"))?;
+        ctx.next = max_id.max(max_ino) + 1;
+        {
+            let mut ins = tx
+                .prepare(GRAFT_INSERT)
+                .map_err(|e| format!("cannot prepare the destination tree: {e}"))?;
+            for (idx, full) in &plan {
+                let (parent_path, name) = match full.rfind('/') {
+                    Some(k) => (&full[..k], &full[k + 1..]),
+                    None => ("", full.as_str()),
+                };
+                let parent = graft_ensure_dir(&tx, parent_path, &mut ctx)?;
+                graft_copy(
+                    &tx,
+                    &mut ins,
+                    &rows,
+                    &children,
+                    *idx,
+                    parent,
+                    name,
+                    &mut ctx,
+                )?;
+            }
+        }
+        // Book the destination's hold on every blob it now names; if the SOURCE
+        // view was never booked (a store predating the ledger and never
+        // rebuilt), book it first — otherwise its last-name delete would free a
+        // blob this graft still names.
+        for dr in &ctx.blobs {
+            let booked = tx
+                .query_row(
+                    &format!("SELECT 1 FROM {REFS_SCHEMA}.holders WHERE data_ref=?1 LIMIT 1"),
+                    params![dr],
+                    |_| Ok(()),
+                )
+                .is_ok();
+            if !booked {
+                ledger_add(&tx, dr).map_err(|e| format!("cannot book '{dr}' in the ledger: {e}"))?;
+            }
+            ledger_add(&tx, dr).map_err(|e| format!("cannot book '{dr}' in the ledger: {e}"))?;
+        }
+        tx.commit()
+            .map_err(|e| format!("cannot commit the graft into {}: {e}", dst_path.display()))?;
+        Ok(())
+    })?;
+    ctx.stats.blobs = ctx.blobs.len() as i64;
+    eng.drop_cursors();
+    Ok(ctx.stats)
 }
 
 /// Portable METADATA export: the node rows of one view, one JSON object per
@@ -489,7 +954,7 @@ fn node_row_json(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
         "mtime": r.get::<_, i64>(9)?,
         "atime": r.get::<_, i64>(10)?,
         "ctime": r.get::<_, i64>(11)?,
-        "ino": r.get::<_, Option<i64>>(12)?,
+        "ino": r.get::<_, i64>(12)?,
     }))
 }
 
@@ -762,7 +1227,9 @@ pub fn import_view(
                     let mtime = v["mtime"].as_i64().unwrap_or(t);
                     let atime = v["atime"].as_i64().unwrap_or(mtime);
                     let ctime = v["ctime"].as_i64().unwrap_or(mtime);
-                    let ino = v["ino"].as_i64().unwrap_or(id);
+                    let ino = v["ino"].as_i64().ok_or_else(|| {
+                        format!("{}:{lineno}: missing integer \"ino\"", input.display())
+                    })?;
                     ins.execute(params![
                         id,
                         parent_id,
@@ -992,7 +1459,7 @@ pub fn remove_base_view(base: &Path, view: &str) -> Result<BaseViewRemoval, Stri
     let db = meta_dir.join(format!("{view}.db"));
     if !db.is_file() {
         return Err(format!(
-            "no physical base tree {} — '{view}' is either a governed name (see `grovefs view rm` WITHOUT --base), a lazily-created view that was never mounted, or a tree this store does not hold",
+            "no physical base tree {} — '{view}' is either a governed name (see `grovefs view rm` WITHOUT --base), a name this store never had a tree for, or a tree this store does not hold",
             db.display()
         ));
     }
@@ -1089,6 +1556,13 @@ pub struct MetaEngine {
     /// exits within one interval. The thread holds only an `Arc` clone of this
     /// controller — never of `MetaEngine` — so there is no reference cycle.
     ckpt: Option<Arc<CheckpointCtl>>,
+    /// Keyset cursors for sequential READDIR paging: `(parent, next offset)` ->
+    /// the last name the previous page returned. The next page then runs
+    /// `name > last` instead of `LIMIT/OFFSET`, whose OFFSET re-walks every row
+    /// it skips and turns a sequential walk of a big directory into O(n^2).
+    /// Any name mutation clears the map; a miss falls back to the OFFSET query,
+    /// so `seekdir` and out-of-order resumes stay correct.
+    cursors: parking_lot::Mutex<HashMap<(i64, usize), String>>,
 }
 
 /// Shutdown signal for the per-view WAL-checkpoint background thread: a boolean
@@ -1118,6 +1592,19 @@ const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
 /// Number of pooled read connections opened per view engine for concurrent
 /// metadata reads.
 pub const READ_POOL_SIZE: usize = 4;
+/// Ceiling on the keyset cursors kept for READDIR paging. One checkpoint per
+/// [`READDIR_CURSOR_STRIDE`] rows per open directory; a walk of ten million
+/// entries needs ~300k, so this only trips under pathological seekdir churn,
+/// where clearing is harmless (the next page just falls back to OFFSET once).
+const READDIR_CURSOR_CAP: usize = 65_536;
+/// Granularity of the READDIR resume checkpoints. The kernel resumes a listing
+/// at the entry after the last one its reply buffer accepted — an offset that
+/// almost never coincides with one of our own page boundaries (a 4 KiB reply
+/// holds a few hundred entries, our fetch ladder 32..1024). Recording a cursor
+/// only at page ends therefore left one OFFSET re-scan per reply; recording it
+/// every STRIDE rows lets any resume be served by a keyset seek plus at most
+/// STRIDE-1 rows skipped in memory.
+const READDIR_CURSOR_STRIDE: usize = 32;
 
 /// Borrows one read-pool connection; returns it on drop (bounded). Derefs to
 /// `Connection` so callers use it exactly like the writer guard.
@@ -1232,6 +1719,7 @@ impl MetaEngine {
                 read_pool: parking_lot::Mutex::new(Vec::new()),
                 path: path.to_path_buf(),
                 ckpt: None,
+                cursors: parking_lot::Mutex::new(HashMap::new()),
             });
         }
         conn.execute_batch(
@@ -1253,10 +1741,21 @@ impl MetaEngine {
                  mtime        INTEGER NOT NULL,
                  atime        INTEGER NOT NULL,
                  ctime        INTEGER NOT NULL,
+                 ino          INTEGER,
                  UNIQUE(parent_id, name)
              );
              CREATE INDEX IF NOT EXISTS idx_node_parent ON node(parent_id);
+             -- Directory nlink (2 + subdirs) is a COUNT over the parent's rows
+             -- filtered by is_dir; with only idx_node_parent SQLite walks every
+             -- child row to test is_dir (9.6ms for 100k children -> once per
+             -- READDIRPLUS buffer). Carrying is_dir in the key makes it an
+             -- index-only scan (0.02ms).
+             CREATE INDEX IF NOT EXISTS idx_node_parent_kind ON node(parent_id, is_dir);
              CREATE INDEX IF NOT EXISTS idx_node_dataref ON node(data_ref);
+             -- FUSE `getattr` and every setattr-path UPDATE key on `ino`, not
+             -- the rowid `id`; without this index each is a full table scan.
+             -- This is the single hottest metadata read.
+             CREATE INDEX IF NOT EXISTS idx_node_ino ON node(ino);
              CREATE TABLE IF NOT EXISTS ctrl (k TEXT PRIMARY KEY, v INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS locks (
                  id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1274,22 +1773,6 @@ impl MetaEngine {
              CREATE INDEX IF NOT EXISTS idx_locks_sid    ON locks(sid);
              CREATE INDEX IF NOT EXISTS idx_locks_expire ON locks(expires_at);",
         )?;
-        // Migration: older DBs may predate link_target / ino / locks.sid. Ignore
-        // "duplicate column"; existing lock rows get sid=0 (never renewed, so
-        // they simply age out on the lease — harmless at upgrade time).
-        let _ = conn.execute(
-            "ALTER TABLE locks ADD COLUMN sid INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-        let _ = conn.execute("ALTER TABLE node ADD COLUMN link_target TEXT", []);
-        let _ = conn.execute("ALTER TABLE node ADD COLUMN ino INTEGER", []);
-        // Backfill ino for rows inserted before the column existed: one inode per name.
-        let _ = conn.execute("UPDATE node SET ino=id WHERE ino IS NULL", []);
-        // Index the inode column AFTER the migration above (so the column is
-        // guaranteed to exist even on a pre-upgrade DB). FUSE `getattr` and every
-        // setattr-path UPDATE key on `ino`, not the rowid `id`; without this index
-        // each is a full table scan. This is the single hottest metadata read.
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_node_ino ON node(ino)", [])?;
         // Attach the shared cross-view holder ledger (sibling refs.db) so every
         // IMMEDIATE tx below takes its write lock FIRST (uniform global lock
         // order, no cycles) and books adds/removes inside the same commit as
@@ -1308,7 +1791,7 @@ impl MetaEngine {
             conn.execute(
                 "INSERT INTO node (id,parent_id,name,is_dir,data_ref,link_target,mode,uid,gid,mtime,atime,ctime,ino)
                  VALUES (?1,NULL,'/',1,NULL,NULL,?2,?3,?4,?5,?5,?5,?1)",
-                params![ROOT_INO, 0o0755u32, unsafe { libc::getuid() }, unsafe { libc::getgid() }, t],
+                params![ROOT_INO, 0o0755u32, crate::platform::getuid(), crate::platform::getgid(), t],
             )?;
         }
         let mut pool = Vec::new();
@@ -1328,6 +1811,7 @@ impl MetaEngine {
             read_pool: parking_lot::Mutex::new(pool),
             path: path.to_path_buf(),
             ckpt,
+            cursors: parking_lot::Mutex::new(HashMap::new()),
         })
     }
 
@@ -1464,7 +1948,9 @@ impl MetaEngine {
     /// Raw parent_id lookup without nlink/size computation (cheap, for fs_impl).
     pub fn readdir(&self, parent: i64) -> Vec<NodeInfo> {
         let _t = stats::start(stats::Stage::MetaReaddir);
-        let sql = format!("SELECT {COLS} FROM node WHERE parent_id=?1 ORDER BY name");
+        // `name>''` only pins the plan to UNIQUE(parent_id,name) so the scan
+        // comes out already ordered (see `readdir_page`).
+        let sql = format!("SELECT {COLS} FROM node WHERE parent_id=?1 AND name>'' ORDER BY name");
         let raws = {
             let _r = stats::start(stats::Stage::SqliteRead);
             let conn = self.read_conn();
@@ -1491,23 +1977,95 @@ impl MetaEngine {
     /// taking minutes.
     pub fn readdir_page(&self, parent: i64, offset: usize, limit: usize) -> Vec<NodeInfo> {
         let _t = stats::start(stats::Stage::MetaReaddirPage);
-        let sql =
-            format!("SELECT {COLS} FROM node WHERE parent_id=?1 ORDER BY name LIMIT ?2 OFFSET ?3");
+        // Resume from the nearest checkpoint at or before `offset`. A keyset
+        // page costs O(limit*log n); the OFFSET form walks every row it skips,
+        // so a full listing paid sum(offset) = O(n^2). Offset 0 has no
+        // predecessor by definition, and any offset whose checkpoint is gone
+        // (seekdir, a fresh reader, a directory mutated since) keeps the old
+        // query — never wrong, just the slow path.
+        let base = offset - offset % READDIR_CURSOR_STRIDE;
+        let after = if offset == 0 {
+            None
+        } else {
+            self.cursors.lock().get(&(parent, base)).cloned()
+        };
+        let start = if after.is_some() { base } else { offset };
+        let skip = offset - start;
+        // Fetch the skipped prefix together with the page, then drop it here.
+        let fetch = limit.saturating_add(skip);
         let raws = {
             let _r = stats::start(stats::Stage::SqliteRead);
             let conn = self.read_conn();
-            let mut stmt = match conn.prepare_cached(&sql) {
-                Ok(s) => s,
-                Err(_) => return Vec::new(),
-            };
-            let rows =
-                match stmt.query_map(params![parent, limit as i64, offset as i64], row_to_raw) {
-                    Ok(r) => r,
-                    Err(_) => return Vec::new(),
-                };
-            rows.filter_map(|r| r.ok()).collect::<Vec<_>>()
+            match &after {
+                Some(last) => {
+                    let sql = format!(
+                        "SELECT {COLS} FROM node WHERE parent_id=?1 AND name>?2 ORDER BY name LIMIT ?3"
+                    );
+                    let mut stmt = match conn.prepare_cached(&sql) {
+                        Ok(s) => s,
+                        Err(_) => return Vec::new(),
+                    };
+                    let rows = match stmt.query_map(
+                        params![parent, last, fetch as i64],
+                        row_to_raw,
+                    ) {
+                        Ok(r) => r,
+                        Err(_) => return Vec::new(),
+                    };
+                    rows.filter_map(|r| r.ok()).collect::<Vec<_>>()
+                }
+                None => {
+                    // `name>''` is a no-op (a name is never empty) whose only job
+                    // is to pin the plan to the UNIQUE(parent_id,name) index:
+                    // without it the planner may pick a parent-prefix index that
+                    // cannot produce `ORDER BY name`, then scan the whole
+                    // directory into a temp b-tree for every OFFSET page.
+                    let sql = format!(
+                        "SELECT {COLS} FROM node WHERE parent_id=?1 AND name>'' ORDER BY name LIMIT ?2 OFFSET ?3"
+                    );
+                    let mut stmt = match conn.prepare_cached(&sql) {
+                        Ok(s) => s,
+                        Err(_) => return Vec::new(),
+                    };
+                    let rows = match stmt.query_map(
+                        params![parent, fetch as i64, start as i64],
+                        row_to_raw,
+                    ) {
+                        Ok(r) => r,
+                        Err(_) => return Vec::new(),
+                    };
+                    rows.filter_map(|r| r.ok()).collect::<Vec<_>>()
+                }
+            }
         };
-        self.finalize_batch(&raws)
+        let mut out = self.finalize_batch(&raws);
+        if skip > 0 {
+            out.drain(..skip.min(out.len()));
+        }
+        // Checkpoint the listing: `(parent, n)` -> the name of row n-1, so a
+        // resume at any offset within STRIDE rows of n becomes a keyset seek.
+        {
+            let mut c = self.cursors.lock();
+            for (i, row) in out.iter().enumerate() {
+                let next = offset + i + 1;
+                if next % READDIR_CURSOR_STRIDE == 0 {
+                    if c.len() >= READDIR_CURSOR_CAP {
+                        c.clear();
+                    }
+                    c.insert((parent, next), row.name.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Drop the paging cursors: any name change can invalidate the "resume
+    /// after this name" position a reader is holding.
+    fn drop_cursors(&self) {
+        let mut c = self.cursors.lock();
+        if !c.is_empty() {
+            c.clear();
+        }
     }
 
     /// Create a new file/dir node. `data_ref` is Some for files, None for dirs.
@@ -1551,6 +2109,7 @@ impl MetaEngine {
         gid: u32,
     ) -> Result<i64, MetaError> {
         let _t = stats::start(stats::Stage::MetaCreate);
+        self.drop_cursors();
         let t = now();
         // Ledger-ordered write: see [`with_ledger_serial`] (one process-wide
         // lock order for everything that can book the shared refs ledger).
@@ -1613,6 +2172,7 @@ impl MetaEngine {
         new_name: &str,
     ) -> Result<i64, MetaError> {
         let _t = stats::start(stats::Stage::MetaCreate);
+        self.drop_cursors();
         with_ledger_serial(|| {
             let mut conn = self.conn.lock();
             // One IMMEDIATE tx over read-source + INSERT (+ ledger bookkeeping):
@@ -1685,6 +2245,7 @@ impl MetaEngine {
         noreplace: bool,
     ) -> Result<Option<String>, MetaError> {
         let _t = stats::start(stats::Stage::MetaRename);
+        self.drop_cursors();
         let t = now();
         with_ledger_serial(|| {
             let mut conn = self.conn.lock();
@@ -1818,6 +2379,7 @@ impl MetaEngine {
     /// makes the loser of a lock race wait rather than error.
     pub fn unlink(&self, parent: i64, name: &str) -> Result<Option<String>, MetaError> {
         let _t = stats::start(stats::Stage::MetaUnlink);
+        self.drop_cursors();
         // Ledger-ordered write (see [`with_ledger_serial`]): the holder count and
         // the node rows it describes leave in one IMMEDIATE commit.
         with_ledger_serial(|| {
@@ -2295,13 +2857,27 @@ pub trait MetaProvider: Send + Sync {
     fn display_targets(&self, _src_parent: i64, _name: &str) -> Vec<(i64, String)> {
         Vec::new()
     }
+    /// Drop whatever this provider has materialized for the listing of
+    /// `parent` from its OWN cache, so the next read reflects the mutation that
+    /// prompted the call.
+    ///
+    /// The companion of [`Self::display_targets`]: invalidating the KERNEL's
+    /// view of a display coordinate is not enough when the provider also caches
+    /// listings itself. A push event about the base tree never passes through a
+    /// lens's mutating operations, so nothing else would flush it, and the
+    /// display coordinate would keep serving the pre-event rows until the
+    /// attribute TTL. Providers that read their store afresh (every engine, a
+    /// plain remote client) keep the default no-op.
+    fn flush_listing(&self, _parent: i64) {}
     /// Page `offset..offset+limit` of the same deterministic listing `readdir`
     /// returns. `GroveFS` streams directory replies through this so a big
     /// directory costs one small query per kernel buffer. Engines that page
     /// inside their store (SQLite, PostgreSQL, and a `RemoteMeta` client whose
-    /// server advertised `M_READDIRP`) override this; providers that cannot (a
-    /// derived/layout lens, or a remote client against a server too old to page)
-    /// keep working through the default below, just without the O(page) win.
+    /// server advertised `M_READDIRP`) override this, and so does a
+    /// derived/layout lens (which pages over one materialized listing instead of
+    /// SQL). Providers that cannot — a remote client against a server too old to
+    /// page — keep working through the default below, just without the O(page)
+    /// win.
     fn readdir_page(&self, parent: i64, offset: usize, limit: usize) -> Vec<NodeInfo> {
         self.readdir(parent)
             .into_iter()
@@ -2309,12 +2885,12 @@ pub trait MetaProvider: Send + Sync {
             .take(limit)
             .collect()
     }
-    /// Whether [`Self::readdir_page`] is a real sub-query or just a slice of a
-    /// full listing. Only engines that can page *inside their store* answer
-    /// true. `GroveFS` uses this to keep the cheap behaviour for the others:
-    /// a provider with no store-level paging is asked for one whole listing per
-    /// kernel buffer (exactly what it did before paging existed), and it is not
-    /// offered READDIRPLUS, whose fatter records would multiply that full fetch.
+    /// Whether [`Self::readdir_page`] is a real sub-query (or, for a lens, a
+    /// slice of a listing materialized once) rather than a full listing rebuilt
+    /// per call. `GroveFS` uses this to decide its fetch chunking: a provider
+    /// that cannot page is asked for one whole listing per kernel buffer
+    /// (exactly what it did before paging existed), and it is not offered
+    /// READDIRPLUS, whose fatter records would multiply that full fetch.
     fn supports_paged_readdir(&self) -> bool {
         false
     }
@@ -2398,6 +2974,13 @@ pub trait MetaProvider: Send + Sync {
     fn fetch_fence_epoch(&self) -> u64 {
         self.fence_handle()
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Flat dump of the full tree for server-side aggregation (`du`). Each
+    /// entry is `(id, parent_id, name, is_dir, data_ref)`. Providers that
+    /// cannot dump (e.g. derived lenses, remote proxy) return empty.
+    fn dump_tree(&self) -> Vec<(i64, i64, String, bool, Option<String>)> {
+        Vec::new()
     }
 }
 
@@ -2496,6 +3079,24 @@ impl MetaProvider for MetaEngine {
     }
     fn renew_locks(&self, sid: u64) {
         MetaEngine::renew_locks(self, sid)
+    }
+    fn dump_tree(&self) -> Vec<(i64, i64, String, bool, Option<String>)> {
+        let conn = self.read_conn();
+        let mut stmt = match conn.prepare("SELECT id, parent_id, name, is_dir, data_ref FROM node ORDER BY id") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)? != 0,
+                r.get::<_, Option<String>>(4)?,
+            ))
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
     }
 }
 
@@ -2724,6 +3325,12 @@ impl MetaProvider for MetaStore {
         match self {
             MetaStore::Sqlite(m) => m.fence_handle(),
             MetaStore::Pg(p) => p.fence_handle(),
+        }
+    }
+    fn dump_tree(&self) -> Vec<(i64, i64, String, bool, Option<String>)> {
+        match self {
+            MetaStore::Sqlite(m) => MetaProvider::dump_tree(m),
+            MetaStore::Pg(p) => MetaProvider::dump_tree(&**p),
         }
     }
 }
@@ -3016,6 +3623,56 @@ mod tests {
         assert!(e.readdir_page(ROOT_INO, 0, 0).is_empty());
     }
 
+    /// The kernel resumes a listing at the entry after the last one its reply
+    /// buffer accepted — an offset tied to a 4 KiB reply, not to our pages —
+    /// so every offset must serve the same window. Mutations drop the
+    /// checkpoints those resumes are built on, so a stale one can never skip
+    /// or duplicate an entry.
+    #[test]
+    fn readdir_page_resumes_at_arbitrary_offsets_and_drops_stale_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = MetaEngine::open(&dir.path().join("view.db")).unwrap();
+        let make = |name: String| {
+            e.create_node(ROOT_INO, &name, false, Some("k"), 0o644, 1000, 1000)
+                .unwrap();
+        };
+        for i in 0..200 {
+            make(format!("f{i:03}"));
+        }
+        let names = |e: &MetaEngine| -> Vec<String> {
+            e.readdir(ROOT_INO).into_iter().map(|n| n.name).collect()
+        };
+        let full = names(&e);
+        assert_eq!(full.len(), 200);
+        // Lay down the checkpoints a sequential walk would have left behind.
+        assert_eq!(e.readdir_page(ROOT_INO, 0, 100).len(), 100);
+        for off in [1usize, 31, 33, 47, 64, 96, 97, 150] {
+            let got: Vec<String> = e
+                .readdir_page(ROOT_INO, off, 7)
+                .into_iter()
+                .map(|n| n.name)
+                .collect();
+            let want = &full[off..(off + 7).min(full.len())];
+            assert_eq!(got, want, "resume at offset {off} must match the listing");
+        }
+        // A deletion before a checkpoint shifts every later index: the
+        // checkpoint must be gone, and the resume must follow the new order.
+        e.unlink(ROOT_INO, "f010").unwrap();
+        make("f005x".to_string());
+        let shifted = names(&e);
+        assert_ne!(shifted, full);
+        let got: Vec<String> = e
+            .readdir_page(ROOT_INO, 40, 9)
+            .into_iter()
+            .map(|n| n.name)
+            .collect();
+        assert_eq!(
+            got,
+            shifted[40..49].to_vec(),
+            "a mutation must invalidate the checkpoints, not skip a row"
+        );
+    }
+
     /// Metadata reads are served from pooled side connections, so they must
     /// still observe this engine's own committed writes immediately — `create`
     /// followed by `ls` from another FUSE worker thread is exactly this path.
@@ -3191,15 +3848,38 @@ mod tests {
             "forwarded readdir_page stitches into readdir"
         );
 
-        // A derived lens over the same engine keeps the trait default (false):
-        // its shaped view has no single SQL page equivalent, so it is not
-        // offered READDIRPLUS and answers each buffer with one whole listing.
+        // A derived lens pages over its materialized listing instead of SQL: it
+        // must advertise that (so `GroveFS` keeps chunking and READDIRPLUS) and
+        // its pages must stitch back into its `readdir` exactly the same way.
+        for i in 0..4 {
+            eng.create_node(ROOT_INO, &format!("e{i}"), false, None, 0o644, 0, 0)
+                .ok();
+        }
         let lens: std::sync::Arc<dyn MetaProvider> = std::sync::Arc::new(
             crate::layout::LayoutMeta::new(eng.clone(), crate::layout::LayoutRules::default()),
         );
         assert!(
-            !lens.supports_paged_readdir(),
-            "a derived lens cannot page in SQL"
+            lens.supports_paged_readdir(),
+            "a lens pages over one materialized listing"
+        );
+        let lens_full: Vec<String> = lens
+            .readdir(ROOT_INO)
+            .into_iter()
+            .map(|n| n.name)
+            .collect();
+        let mut lens_stitched = Vec::new();
+        let mut lens_off = 0usize;
+        loop {
+            let page = lens.readdir_page(ROOT_INO, lens_off, 3);
+            if page.is_empty() {
+                break;
+            }
+            lens_stitched.extend(page.into_iter().map(|n| n.name));
+            lens_off += 3;
+        }
+        assert_eq!(
+            lens_stitched, lens_full,
+            "lens pages stitch into its own readdir"
         );
     }
 
@@ -3296,34 +3976,209 @@ mod tests {
         );
     }
 
-    /// A base tree predating the ledger has no holder rows. Forking must book
-    /// the BASE's hold too, or the base's last-name delete would see the fork's
-    /// single hold, drop it to zero, and free bytes the fork still names.
+    /// A plan is DATA handed in by another program: one `<src>` or
+    /// `<src>TAB<dst>` per line, `#` comments and blank lines skipped, only the
+    /// first tab splitting (names may contain spaces), `..` refused outright.
     #[test]
-    fn fork_self_heals_a_base_that_predates_the_ledger() {
+    fn graft_plan_parses_bulk_lists_and_renames() {
+        let p = parse_graft_plan(
+            "# curated subset\n\n A/uuid-1.fits \tbody/M31 2025.fits\nA/uuid-2.fits\n",
+        )
+        .unwrap();
+        assert_eq!(p.len(), 2);
+        assert_eq!(p[0].src, "A/uuid-1.fits");
+        assert_eq!(
+            p[0].dst, "body/M31 2025.fits",
+            "only the first tab splits, so spaces survive"
+        );
+        assert_eq!(p[1].dst, p[1].src, "no tab keeps the name (bulk list form)");
+        let err = parse_graft_plan("a/b\n../etc/passwd\n").unwrap_err();
+        assert!(
+            err.contains("line 2") && err.contains(".."),
+            "a plan must not walk out of the view: {err}"
+        );
+        assert!(parse_graft_plan("# nothing\n").unwrap().is_empty());
+    }
+
+    /// The point of `--empty` + graft: a fork holding only a curated, renamed
+    /// subset — bytes shared (a graft never copies content), unlisted entries
+    /// left behind, and the ledger still protecting both sides.
+    #[test]
+    fn empty_fork_then_graft_places_renamed_subset_and_shares_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let meta = dir.path().join("meta");
         std::fs::create_dir_all(&meta).unwrap();
         {
-            let e = MetaEngine::open(&meta.join("legacy.db")).unwrap();
-            e.create_node(ROOT_INO, "f", false, Some("k"), 0o644, 1000, 1000)
+            let e = MetaEngine::open(&meta.join("base.db")).unwrap();
+            let docs = e
+                .create_node(ROOT_INO, "docs", true, None, 0o755, 1000, 1000)
+                .unwrap();
+            e.create_node(docs, "uuid-a", false, Some("blob-a"), 0o644, 1000, 1000)
+                .unwrap();
+            let sub = e
+                .create_node(docs, "sub", true, None, 0o755, 1000, 1000)
+                .unwrap();
+            e.create_node(sub, "uuid-b", false, Some("blob-b"), 0o644, 1000, 1000)
+                .unwrap();
+            e.create_node(ROOT_INO, "unrelated", false, Some("blob-c"), 0o644, 1000, 1000)
                 .unwrap();
         }
-        // Simulate a pre-ledger store: the view tree exists, refs.db does not.
-        std::fs::remove_file(meta.join("refs.db")).unwrap();
-        fork_view(dir.path(), "legacy", "copy").unwrap();
-        let base = MetaEngine::open(&meta.join("legacy.db")).unwrap();
-        let copy = MetaEngine::open(&meta.join("copy.db")).unwrap();
+        let st = fork_view_with(dir.path(), "base", "lab", false).unwrap();
+        assert_eq!((st.nodes, st.blobs), (1, 0), "empty fork is root only");
+        let lab = MetaEngine::open(&meta.join("lab.db")).unwrap();
+        assert!(lab.readdir(ROOT_INO).is_empty(), "nothing was copied");
+
+        let items = parse_graft_plan(
+            "docs/uuid-a\tby_target/M31_2025.fits\ndocs/sub\tby_target/raw\n",
+        )
+        .unwrap();
+        let g = graft_view(dir.path(), "lab", "base", &items, "", false).unwrap();
         assert_eq!(
-            base.unlink(ROOT_INO, "f").unwrap(),
+            (g.nodes, g.dirs, g.blobs, g.skipped),
+            (4, 2, 2, 0),
+            "by_target + renamed file + raw dir + its child"
+        );
+        let by = lab.lookup(ROOT_INO, "by_target").expect("dest dir created");
+        let fits = lab
+            .lookup(by.id, "M31_2025.fits")
+            .expect("renamed file placed");
+        assert_eq!(
+            fits.data_ref.as_deref(),
+            Some("blob-a"),
+            "bytes are shared, not copied"
+        );
+        let raw = lab.lookup(by.id, "raw").expect("renamed subtree dir");
+        let b = lab
+            .lookup(raw.id, "uuid-b")
+            .expect("subtree child kept its name");
+        assert_eq!(b.data_ref.as_deref(), Some("blob-b"));
+        assert!(
+            lab.lookup(ROOT_INO, "unrelated").is_none(),
+            "entries the plan did not name stay out"
+        );
+        // Two holders now: the base's last-name delete must keep the bytes the
+        // fork still names, and the fork's delete then frees them.
+        let base = MetaEngine::open(&meta.join("base.db")).unwrap();
+        let docs = base.lookup(ROOT_INO, "docs").unwrap();
+        assert_eq!(
+            base.unlink(docs.id, "uuid-a").unwrap(),
             None,
-            "fork still holds k"
+            "the fork still names blob-a"
         );
         assert_eq!(
-            copy.unlink(ROOT_INO, "f").unwrap().as_deref(),
-            Some("k"),
+            lab.unlink(by.id, "M31_2025.fits").unwrap().as_deref(),
+            Some("blob-a"),
             "last holder frees"
         );
+    }
+
+    /// Re-running a curation script must not blow up on the skeleton it made
+    /// last time: `--skip-existing` merges into an existing directory and skips
+    /// a colliding file, while a plain graft refuses the WHOLE plan so nothing
+    /// is half-written.
+    #[test]
+    fn graft_conflicts_are_all_or_nothing_unless_skipping() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = dir.path().join("meta");
+        std::fs::create_dir_all(&meta).unwrap();
+        {
+            let e = MetaEngine::open(&meta.join("base.db")).unwrap();
+            let d = e
+                .create_node(ROOT_INO, "d", true, None, 0o755, 1000, 1000)
+                .unwrap();
+            e.create_node(d, "x", false, Some("blob-x"), 0o644, 1000, 1000)
+                .unwrap();
+        }
+        fork_view_with(dir.path(), "base", "lab", false).unwrap();
+        let first = parse_graft_plan("d\tstage\n").unwrap();
+        let g = graft_view(dir.path(), "lab", "base", &first, "", false).unwrap();
+        assert_eq!((g.nodes, g.dirs, g.blobs), (2, 1, 1));
+
+        // Re-run with an extra line: the existing dir is merged into, the
+        // colliding file is skipped, the new name lands.
+        let again = parse_graft_plan("d\tstage\nd/x\tstage/new.txt\n").unwrap();
+        let g = graft_view(dir.path(), "lab", "base", &again, "", true).unwrap();
+        assert_eq!(
+            (g.nodes, g.dirs, g.skipped, g.blobs),
+            (1, 0, 1, 1),
+            "one new name, one skipped collision"
+        );
+        let lab = MetaEngine::open(&meta.join("lab.db")).unwrap();
+        let stage = lab.lookup(ROOT_INO, "stage").unwrap();
+        assert!(lab.lookup(stage.id, "new.txt").is_some());
+        assert!(lab.lookup(stage.id, "x").is_some());
+
+        // Without the flag, a conflict anywhere rolls back everything: the
+        // first line's fresh name must not survive the second line's refusal.
+        let bad = parse_graft_plan("d/x\tstage/fresh.txt\nd\tstage\n").unwrap();
+        let err = graft_view(dir.path(), "lab", "base", &bad, "", false).unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
+        assert!(
+            lab.lookup(stage.id, "fresh.txt").is_none(),
+            "a refused plan writes nothing at all"
+        );
+    }
+
+    /// Two source names sharing one inode stay hard links after a graft (one
+    /// inode, nlink 2), so a curated tree cannot silently duplicate a file it
+    /// only meant to rename twice.
+    #[test]
+    fn graft_keeps_hard_links_inside_the_subset() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = dir.path().join("meta");
+        std::fs::create_dir_all(&meta).unwrap();
+        {
+            let e = MetaEngine::open(&meta.join("base.db")).unwrap();
+            let f = e
+                .create_node(ROOT_INO, "a", false, Some("one"), 0o644, 1000, 1000)
+                .unwrap();
+            e.link_node(f, ROOT_INO, "b").unwrap();
+        }
+        fork_view_with(dir.path(), "base", "lab", false).unwrap();
+        let items = parse_graft_plan("a\tp/a\nb\tq/b\n").unwrap();
+        let g = graft_view(dir.path(), "lab", "base", &items, "", false).unwrap();
+        assert_eq!((g.nodes, g.dirs, g.blobs), (4, 2, 1), "two dirs + two names, one blob");
+        let lab = MetaEngine::open(&meta.join("lab.db")).unwrap();
+        let p = lab.lookup(ROOT_INO, "p").unwrap();
+        let a = lab.lookup(p.id, "a").unwrap();
+        let q = lab.lookup(ROOT_INO, "q").unwrap();
+        let b = lab.lookup(q.id, "b").unwrap();
+        assert_eq!(a.nlink, 2, "one inode, two names after the graft");
+        assert_eq!(b.nlink, 2);
+        assert_eq!(a.data_ref, b.data_ref);
+    }
+
+    /// A typo deep in a plan refuses the whole thing (nothing is written), and
+    /// a `dest` prefix creates its missing directories on the successful path.
+    #[test]
+    fn graft_is_atomic_on_unknown_source_and_creates_dest_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = dir.path().join("meta");
+        std::fs::create_dir_all(&meta).unwrap();
+        {
+            let e = MetaEngine::open(&meta.join("base.db")).unwrap();
+            e.create_node(ROOT_INO, "x", false, Some("blob-x"), 0o644, 1000, 1000)
+                .unwrap();
+        }
+        fork_view_with(dir.path(), "base", "lab", false).unwrap();
+        let items = parse_graft_plan("x\tok.txt\nmissing\tbad.txt\n").unwrap();
+        let err = graft_view(dir.path(), "lab", "base", &items, "", false).unwrap_err();
+        assert!(
+            err.contains("'missing' does not exist in view 'base'"),
+            "{err}"
+        );
+        let lab = MetaEngine::open(&meta.join("lab.db")).unwrap();
+        assert!(
+            lab.readdir(ROOT_INO).is_empty(),
+            "the good line before the bad one was rolled back too"
+        );
+
+        let items = parse_graft_plan("x\n").unwrap();
+        let g = graft_view(dir.path(), "lab", "base", &items, "stage/2026", false).unwrap();
+        assert_eq!((g.nodes, g.dirs, g.blobs), (3, 2, 1), "stage + 2026 + the file");
+        let stage = lab.lookup(ROOT_INO, "stage").unwrap();
+        let y = lab.lookup(stage.id, "2026").unwrap();
+        assert!(lab.lookup(y.id, "x").is_some(), "dest prefix is mkdir -p");
     }
 
     /// Refusals: no source tree, and never overwrite an existing target db.
@@ -3454,8 +4309,8 @@ mod tests {
 
         let dangling = format!(
             "{{\"format\":\"grovefs-view-metadata\",\"version\":1,\"kind\":\"physical\",\"nodes\":2}}\n{}\n{}\n",
-            serde_json::json!({"id":1,"parent_id":null,"name":"/","is_dir":1}),
-            serde_json::json!({"id":2,"parent_id":99,"name":"f","is_dir":0})
+            serde_json::json!({"id":1,"ino":1,"parent_id":null,"name":"/","is_dir":1}),
+            serde_json::json!({"id":2,"ino":2,"parent_id":99,"name":"f","is_dir":0})
         );
         std::fs::write(&bad, dangling).unwrap();
         let err = import_view(dir.path(), "v", &bad, false).unwrap_err();
@@ -3463,7 +4318,7 @@ mod tests {
 
         let mismatch = format!(
             "{{\"format\":\"grovefs-view-metadata\",\"version\":1,\"nodes\":9}}\n{}\n",
-            serde_json::json!({"id":1,"parent_id":null,"name":"/","is_dir":1})
+            serde_json::json!({"id":1,"ino":1,"parent_id":null,"name":"/","is_dir":1})
         );
         std::fs::write(&bad, mismatch).unwrap();
         let err = import_view(dir.path(), "v2", &bad, false).unwrap_err();
@@ -3480,8 +4335,8 @@ mod tests {
         let good = dir.path().join("good.jsonl");
         let text = format!(
             "{{\"format\":\"grovefs-view-metadata\",\"version\":1,\"nodes\":2}}\n{}\n{}\n",
-            serde_json::json!({"id":1,"parent_id":null,"name":"/","is_dir":1}),
-            serde_json::json!({"id":2,"parent_id":1,"name":"keep","is_dir":0,"data_ref":"k"})
+            serde_json::json!({"id":1,"ino":1,"parent_id":null,"name":"/","is_dir":1}),
+            serde_json::json!({"id":2,"ino":2,"parent_id":1,"name":"keep","is_dir":0,"data_ref":"k"})
         );
         std::fs::write(&good, text).unwrap();
         import_view(dir.path(), "v", &good, false).unwrap();
@@ -3491,8 +4346,8 @@ mod tests {
             &bad,
             format!(
                 "{{\"format\":\"grovefs-view-metadata\",\"version\":1}}\n{}\n{}\n",
-                serde_json::json!({"id":1,"parent_id":null,"name":"/","is_dir":1}),
-                serde_json::json!({"id":2,"parent_id":99,"name":"x","is_dir":0})
+                serde_json::json!({"id":1,"ino":1,"parent_id":null,"name":"/","is_dir":1}),
+                serde_json::json!({"id":2,"ino":2,"parent_id":99,"name":"x","is_dir":0})
             ),
         )
         .unwrap();

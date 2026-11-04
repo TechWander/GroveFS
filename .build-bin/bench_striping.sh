@@ -33,8 +33,8 @@ set -u
 cd /data/xy/grovefs
 export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
 Y=./target/release/grovefs
-S1=127.0.0.1:50141
-S2=127.0.0.1:50142
+S1=127.0.0.1:15141
+S2=127.0.0.1:15142
 SIZE_MB=${SIZE_MB:-512}
 
 rm -rf .bs; mkdir -p .bs/home .bs/r1 .bs/r2 .bs/mnt1 .bs/mnt2

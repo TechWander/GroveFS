@@ -223,9 +223,9 @@ impl GroveFS {
     /// not the whole directory. This covers the SQLite and PostgreSQL engines,
     /// and a remote client whose `meta-server` advertised the `M_READDIRP` cap.
     /// Providers that cannot page in their store (a derived/layout lens, or a
-    /// remote client against a server too old to page) would re-materialise the
+    /// remote server that did not advertise the cap) would re-materialise the
     /// entire listing for every page, so they are asked for one full listing per
-    /// kernel buffer: their behaviour before paging existed, no extra round trips.
+    /// kernel buffer: one round trip per buffer, no paging assumption.
     fn fetch_policy(&self) -> (usize, usize) {
         if self.meta.supports_paged_readdir() {
             (READDIR_FETCH_MIN, READDIR_FETCH_MAX)

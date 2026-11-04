@@ -44,7 +44,7 @@ wording** — it only adds implementation details and pitfalls. Each tool's own
 | `initialize` | open | the only method that can carry `apiKey`; success stamps the session's identity (later audit attribution) |
 | `ping` | open | answers `{}` |
 | `notifications/*`, `initialized` | open | received silently, **never answered** (don't wait for a reply) |
-| `tools/list` | **gated** | 9 tools plus self-describing schemas |
+| `tools/list` | **gated** | 10 tools plus self-describing schemas |
 | `tools/call` | **gated** | governance failures stay inside the result (`isError`), never the JSON-RPC error layer |
 | `resources/list` | **gated** | enumerates slot by slot (physical→tree; derived/alias/fork→definition+tree); `-32603` if the store cannot be read |
 | `resources/templates/list` | **gated** | two templates (static) |
@@ -65,7 +65,7 @@ key attributes are enforced only on the mount plane and are NOT consulted by
 `grovefs mcp`:
 
 - `--ro` / `apikey set-ro`: an `--ro` key with scope `mcp` still calls
-  `define_derived_view` / `alias_view` / `fork_view` / `remove_view`
+  `define_derived_view` / `alias_view` / `fork_view` / `graft_view` / `remove_view`
   successfully — verified. There is no read-only MCP credential.
 - `--view V` binding: the MCP server never reads it. Bind a mount credential
   to a view; do not expect the same key to lock an agent to a view through
@@ -147,15 +147,17 @@ SQLite backend (default) — effects on disk:
 |---|---|
 | `define_derived_view` | overwrites `<db>/meta/views/<name>.layout` (first line `base <base>` + rule lines) |
 | `alias_view` | writes `<db>/meta/views/<name>.layout` (`alias <real>`); with `retire`, **writes the new one before deleting the old** |
-| `fork_view` | new tree `<db>/meta/<name>.db` (plus `-wal`/`-shm`) + `<db>/meta/views/<name>.layout`, and updates the cross-view ledger `refs.db` |
+| `fork_view` | new tree `<db>/meta/<name>.db` (plus `-wal`/`-shm`) + `<db>/meta/views/<name>.layout`, and updates the cross-view ledger `refs.db` (with `seed:false` the tree is root-only) |
+| `graft_view` | inserts rows into the DESTINATION's `<db>/meta/<name>.db` (ids/inos allocated above both existing id and ino spaces, hard links preserved), creates missing destination directories (0755), and books one ledger hold per new blob — one IMMEDIATE transaction, so a refused plan writes nothing. The destination may be a fork **or a bare base view**; only a derived lens or an alias is refused by role |
 | `remove_view` | deletes the `.layout`; if the slot was a fork, also deletes its `meta/<name>.db*` and runs `rebuild_ledger` |
 | `preview_rules` / `validate_definition` / the three read-only probes | **write nothing** |
 
 Under `--store postgres://…` nothing control-plane lands on disk: the
 `.layout` writes above become rows in `grovefs_control.view_defs`
 (verify with `SELECT name, definition FROM grovefs_control.view_defs`), and
-`fork_view` is refused (`fork is not implemented on the PostgreSQL backend
-yet …`).
+`fork_view` and `graft_view` are refused (`fork is not implemented on the
+PostgreSQL backend yet …` / `graft is not implemented on the PostgreSQL
+backend yet …`).
 
 A read-only probe never mints anything on PG either: `list_view_tree` on a
 view whose `grovefs_v_<hex>` schema does not exist is refused with the same
@@ -172,8 +174,26 @@ then showed up in the next `list_views` as a physical view.)
 | `list_views` | `grovefs view list` |
 | `define_derived_view` | `grovefs view define --name N --base B --rules F` (rules come from a **file**, not inline text) |
 | `alias_view` | `grovefs view alias --name N --real R [--retire OLD]` |
-| `fork_view` | `grovefs view fork --name N --base B` |
+| `fork_view` | `grovefs view fork --name N --base B [--empty]` — `--empty` is the CLI spelling of `seed:false` |
+| `graft_view` | `grovefs view graft --name N --map PLAN\|- [--src S] [--dest P] [--skip-existing]` — a plan file, or `-` to read the plan from stdin |
 | `remove_view` | `grovefs view rm --name N` |
+
+**Graft plan format** (one entry per line; verified against the current build):
+
+| Line | Where it lands |
+|---|---|
+| `<src>` (no TAB) | the **same full relative path** in the destination — `src/docs/a.md` rebuilds `src/docs/` there, it does **not** become `/a.md` |
+| `<src>TAB<dst>` | exactly `dst`; the TAB is the **only** rename mechanism |
+| `--dest D` (CLI) / `dest` (tool) | prefixes **every** line, TAB lines included (`<src>TAB<dst>` → `D/<dst>`) |
+| `skip_existing` | existing names are skipped in place; without it any conflict refuses the **whole** plan |
+| `# …` | comment **only** when `#` is the first character of the line — a trailing `#` becomes part of the name |
+
+A directory source brings its whole subtree; missing destination parents are created (0755) and counted in the reply's `entries` (so a 4-line plan can legitimately report `13 entries (8 directories)`). `src` defaults to the fork's recorded base but is **mandatory** when the destination is a base view.
+
+Every row in this table is byte-identical between the two entrances (same
+refusal text, same on-disk effect): the CLI is a thin parser over the same
+`grovefs::mcp` functions, so neither entrance can do anything the other
+cannot, and neither bypasses a guard.
 
 **Four interface-only calls** (no same-named CLI subcommand; they are read-only
 probe / dry-run library functions in `grovefs::mcp`):

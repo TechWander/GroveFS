@@ -35,7 +35,7 @@ bad(){ echo "  FAIL: $1"; fail=$((fail+1)); }
 chk(){ if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got '$1' want '$2')"; fi; }
 T(){ timeout 5 "$@"; }
 
-META=127.0.0.1:50174; DATA=127.0.0.1:50175
+META=127.0.0.1:15174; DATA=127.0.0.1:15175
 wait_port(){ local a=$1; for _ in $(seq 1 100); do (echo >/dev/tcp/${a%%:*}/${a##*:}) 2>/dev/null && return 0; sleep 0.05; done; return 1; }
 
 # ---- build a small "survey archive" already on disk --------------------------

@@ -43,8 +43,9 @@
 //! reports unsupported and a `meta-server --store postgres://...` refuses the HA
 //! flags. Everything else is a drop-in.
 
-use crate::meta::{LockConflict, LockType, MetaError, MetaProvider, NodeInfo, NodeKind, ROOT_INO};
+use crate::meta::{LockConflict, LockType, MetaError, MetaProvider, NodeInfo, NodeKind};
 use crate::stats;
+use postgres::types::ToSql;
 use postgres::{Client, NoTls};
 use std::collections::HashMap;
 use std::path::Path;
@@ -155,7 +156,18 @@ pub struct PgEngine {
     /// started by `Client::connect` sees committed writes in its own read
     /// transaction, so read-your-writes holds.
     read_pool: parking_lot::Mutex<Vec<Client>>,
+    /// Keyset cursors for sequential READDIR paging, mirroring the SQLite
+    /// engine: `(parent, checkpoint offset)` -> the name of the row before it.
+    /// Cleared by any name mutation; a miss falls back to `LIMIT/OFFSET`.
+    cursors: parking_lot::Mutex<HashMap<(i64, usize), String>>,
 }
+
+/// Ceiling on those cursors (one checkpoint per [`READDIR_CURSOR_STRIDE`] rows
+/// per open directory).
+const READDIR_CURSOR_CAP: usize = 65_536;
+/// Checkpoint granularity: the kernel resumes wherever its reply buffer filled,
+/// which rarely lands on our own page boundary (see the SQLite engine).
+const READDIR_CURSOR_STRIDE: usize = 32;
 
 /// Number of pooled writer connections per PG view engine. Bounded by
 /// `max_connections` on the server (default 100); a small per-view pool keeps
@@ -222,6 +234,7 @@ impl PgEngine {
             conn_uri: conn_uri.to_string(),
             write_pool: parking_lot::Mutex::new(write_pool),
             read_pool: parking_lot::Mutex::new(read_pool),
+            cursors: parking_lot::Mutex::new(HashMap::new()),
         };
         // Ensure the schema exists through the normal writer checkout: if
         // every pool connect above failed, `checkout_writer` opens a fresh
@@ -399,6 +412,10 @@ impl PgEngine {
                  UNIQUE(parent_id, name)
              );
              CREATE INDEX IF NOT EXISTS node_parent  ON {node}(parent_id);
+             -- Directory nlink (2 + subdirs) counts the parent's rows filtered
+             -- by is_dir; carrying is_dir in the key lets that COUNT stay inside
+             -- the index instead of re-checking every child heap row.
+             CREATE INDEX IF NOT EXISTS node_parent_kind ON {node}(parent_id, is_dir);
              CREATE INDEX IF NOT EXISTS node_dataref ON {node}(data_ref);
              CREATE INDEX IF NOT EXISTS node_ino     ON {node}(ino);
              CREATE TABLE IF NOT EXISTS {ctrl} (k TEXT PRIMARY KEY, v BIGINT NOT NULL);
@@ -704,7 +721,7 @@ impl PgEngine {
     pub fn readdir(&self, parent: i64) -> Vec<NodeInfo> {
         let _t = stats::start(stats::Stage::MetaReaddir);
         let node = self.t("node");
-        let sql = format!("SELECT {COLS} FROM {node} WHERE parent_id=$1 ORDER BY name");
+        let sql = format!("SELECT {COLS} FROM {node} WHERE parent_id=$1 AND name>'' ORDER BY name");
         self.with_read(|c| {
             let rows = match c.query(&sql, &[&parent]) {
                 Ok(r) => r,
@@ -723,18 +740,73 @@ impl PgEngine {
     /// entry.
     pub fn readdir_page(&self, parent: i64, offset: usize, limit: usize) -> Vec<NodeInfo> {
         let _t = stats::start(stats::Stage::MetaReaddirPage);
+        // Same strided-checkpoint trick as the SQLite engine: resume from the
+        // nearest checkpoint at or before `offset` so the walk costs
+        // O((limit+stride)*log n) per buffer instead of O(offset); a missing
+        // checkpoint keeps the OFFSET form (seekdir).
+        let base = offset - offset % READDIR_CURSOR_STRIDE;
+        let after = if offset == 0 {
+            None
+        } else {
+            self.cursors.lock().get(&(parent, base)).cloned()
+        };
+        let start = if after.is_some() { base } else { offset };
+        let skip = offset - start;
+        let fetch = limit.saturating_add(skip);
         let node = self.t("node");
-        let sql = format!(
-            "SELECT {COLS} FROM {node} WHERE parent_id=$1 ORDER BY name LIMIT $2 OFFSET $3"
-        );
-        self.with_read(|c| {
-            let rows = match c.query(&sql, &[&parent, &(limit as i64), &(offset as i64)]) {
+        let fetch_i = fetch as i64;
+        let start_i = start as i64;
+        let (sql, args): (String, Vec<&(dyn ToSql + Sync)>) = match &after {
+            Some(last) => (
+                format!(
+                    "SELECT {COLS} FROM {node} WHERE parent_id=$1 AND name>$2 ORDER BY name LIMIT $3"
+                ),
+                vec![&parent, last, &fetch_i],
+            ),
+            None => (
+                // Same plan-pinning no-op as the SQLite engine: a name is never
+                // empty, and the range keeps the walk on the
+                // UNIQUE(parent_id,name) index in `name` order.
+                format!(
+                    "SELECT {COLS} FROM {node} WHERE parent_id=$1 AND name>'' ORDER BY name LIMIT $2 OFFSET $3"
+                ),
+                vec![&parent, &fetch_i, &start_i],
+            ),
+        };
+        let mut out = self.with_read(|c| {
+            let rows = match c.query(&sql, &args[..]) {
                 Ok(r) => r,
                 Err(_) => return Vec::new(),
             };
             let raws: Vec<RawNode> = rows.iter().map(parse_node).collect();
             self.finalize_batch(c, &raws)
-        })
+        });
+        if skip > 0 {
+            out.drain(..skip.min(out.len()));
+        }
+        // Checkpoint `(parent, n)` -> the name of row n-1 every STRIDE rows.
+        {
+            let mut c = self.cursors.lock();
+            for (i, row) in out.iter().enumerate() {
+                let next = offset + i + 1;
+                if next % READDIR_CURSOR_STRIDE == 0 {
+                    if c.len() >= READDIR_CURSOR_CAP {
+                        c.clear();
+                    }
+                    c.insert((parent, next), row.name.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Drop the paging cursors: any name change can invalidate the "resume
+    /// after this name" position a reader is holding.
+    fn drop_cursors(&self) {
+        let mut c = self.cursors.lock();
+        if !c.is_empty() {
+            c.clear();
+        }
     }
 
     // ---- write paths ------------------------------------------------------
@@ -759,6 +831,7 @@ impl PgEngine {
         uid: u32,
         gid: u32,
     ) -> Result<i64, MetaError> {
+        self.drop_cursors();
         let t = now();
         let node = self.t("node");
         // Insert + set `ino = id` must be atomic: otherwise a mid-op PG
@@ -845,6 +918,7 @@ impl PgEngine {
         new_name: &str,
     ) -> Result<i64, MetaError> {
         let _t = stats::start(stats::Stage::MetaCreate);
+        self.drop_cursors();
         let node = self.t("node");
         let t = now();
         // Read-of-source + INSERT of new name now share one SERIALIZABLE tx
@@ -905,6 +979,7 @@ impl PgEngine {
         noreplace: bool,
     ) -> Result<Option<String>, MetaError> {
         let _t = stats::start(stats::Stage::MetaRename);
+        self.drop_cursors();
         let node = self.t("node");
         let t = now();
         // Full rename stays one transaction end-to-end: SELECT src -> cycle
@@ -999,6 +1074,7 @@ impl PgEngine {
 
     pub fn unlink(&self, parent: i64, name: &str) -> Result<Option<String>, MetaError> {
         let _t = stats::start(stats::Stage::MetaUnlink);
+        self.drop_cursors();
         let node = self.t("node");
         // Find -> emptiness check (dirs) -> DELETE -> refcount read is one
         // tx, so two hardlink names being removed concurrently can never
@@ -1589,10 +1665,25 @@ impl MetaProvider for PgEngine {
     fn renew_locks(&self, sid: u64) {
         PgEngine::renew_locks(self, sid)
     }
+    fn dump_tree(&self) -> Vec<(i64, i64, String, bool, Option<String>)> {
+        let node = self.t("node");
+        let sql = format!("SELECT id, parent_id, name, is_dir, data_ref FROM {node} ORDER BY id");
+        self.with_read(|c| {
+            c.query(&sql, &[])
+                .map(|rows| {
+                    rows.iter()
+                        .map(|r| {
+                            (
+                                r.get::<_, i64>(0),
+                                r.get::<_, Option<i64>>(1).unwrap_or(0),
+                                r.get::<_, String>(2),
+                                r.get::<_, i64>(3) != 0,
+                                r.get::<_, Option<String>>(4),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+    }
 }
-
-// Silence the ROOT_INO unused-import warning if not referenced in a given build
-// (it *is* referenced in comments; this keeps the compiler happy without a
-// runtime use).
-#[allow(dead_code)]
-const _ROOT: i64 = ROOT_INO;

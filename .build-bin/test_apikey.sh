@@ -98,9 +98,13 @@ if [ "$(fget .apitest/out_bad 2 .error.code)" = "-32001" ]; then
 else bad "wrong secret admitted: $(cat .apitest/out_bad)"; fi
 
 # (c) the real key in initialize -> admitted; a governance write succeeds.
+# The admission checks below ask only "did tools/list come back with the
+# registry" (length >= 10), never an exact count: the tool SET is pinned
+# name-for-name by the `mcp` suite, so adding a tool must not silently break
+# this suite — while a shrunken registry is still a failure here.
 frames "$KEY" > .apitest/in_ok
 T $Y mcp --db-path "$BASE" --require-api-key < .apitest/in_ok > .apitest/out_ok 2>/dev/null
-if [ "$(fget .apitest/out_ok 2 '.result.tools|length')" = "9" ] \
+if [ "$(fget .apitest/out_ok 2 '.result.tools|length>=10')" = "true" ] \
    && [ "$(fget .apitest/out_ok 4 .result.isError)" != "true" ]; then
   ok "initialize(apiKey) authenticates the session; tools/list + define admitted"
 else bad "key not admitted: $(cat .apitest/out_ok)"; fi
@@ -158,7 +162,7 @@ KEY3=$(echo "$C3" | sed -n 's/^  key:   //p')
 frames "" > .apitest/in_env        # initialize WITHOUT a key
 GROVEFS_MCP_API_KEY="$KEY3" T $Y mcp --db-path "$BASE" --require-api-key \
   < .apitest/in_env > .apitest/out_env 2>/dev/null
-if [ "$(fget .apitest/out_env 2 '.result.tools|length')" = "9" ]; then
+if [ "$(fget .apitest/out_env 2 '.result.tools|length>=10')" = "true" ]; then
   ok "GROVEFS_MCP_API_KEY pre-authenticates the server (handshake needs no key)"
 else bad "env pre-auth did not admit tools/list: $(cat .apitest/out_env)"; fi
 
@@ -166,7 +170,7 @@ else bad "env pre-auth did not admit tools/list: $(cat .apitest/out_env)"; fi
 echo "===== 6) regression: plain 'grovefs mcp' (no --require-api-key) needs no key ====="
 frames "" > .apitest/in_plain
 T $Y mcp --db-path "$BASE" < .apitest/in_plain > .apitest/out_plain 2>/dev/null
-if [ "$(fget .apitest/out_plain 2 '.result.tools|length')" = "9" ]; then
+if [ "$(fget .apitest/out_plain 2 '.result.tools|length>=10')" = "true" ]; then
   ok "opt-in honored: without --require-api-key the tool surface stays open (logged, not gated)"
 else bad "plain server unexpectedly gated: $(cat .apitest/out_plain)"; fi
 
@@ -186,7 +190,7 @@ COL4=$($Y apikey --db-path "$BASE" list 2>&1 | grep -F "$ID4" | awk '{print $6}'
 # liveness/scope; `ro` itself is a mount-plane dimension the MCP gate ignores).
 frames "$KEY4" tog > .apitest/in_tog
 T $Y mcp --db-path "$BASE" --require-api-key < .apitest/in_tog > .apitest/out_tog 2>/dev/null
-[ "$(fget .apitest/out_tog 2 '.result.tools|length')" = "9" ] \
+[ "$(fget .apitest/out_tog 2 '.result.tools|length>=10')" = "true" ] \
   && ok "the flipped key still authenticates (set-ro never breaks liveness)" || bad "flipped key lost auth: $(cat .apitest/out_tog)"
 $Y apikey --db-path "$BASE" set-ro --id "$ID4" --ro 2>&1 | grep -q "is now ro (read-only)" \
   && ok "explicit --ro flips back to read-only" || bad "set-ro --ro output wrong"

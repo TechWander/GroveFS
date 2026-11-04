@@ -213,7 +213,7 @@ once):
 
 ```bash
 grovefs apikey --db-path <D>/store create --label agent --for mcp     # → "<id>:<secret>"
-python3 scripts/mcp_call.py --db-path <D>/store --server-arg --require-api-key --api-key '<id>:<secret>' list   # normal 9-tool answer
+python3 scripts/mcp_call.py --db-path <D>/store --server-arg --require-api-key --api-key '<id>:<secret>' list   # normal 10-tool answer
 grovefs apikey --db-path <D>/store calls                              # the refused tools/list is in the audit too
 ```
 
@@ -233,3 +233,67 @@ Any `FAIL:` line means **the contract between this skill and the implementation
 has been broken** (the implementation changed a wording, or the client framing
 here is wrong) — it is never a data problem: the script never touches a real
 store root and deletes its temp dir on exit.
+
+## 8. A curated view: empty fork → graft (real transcript)
+
+`fork_view` copies the whole tree. When you want **only a few entries, renamed**,
+fork EMPTY and graft a plan into it. Everything below is one actual run on a
+throwaway store root holding a base view `team` (6 directories / 6 objects):
+
+```bash
+... call fork_view '{"name":"lab","base":"team","seed":false}'
+```
+```
+forked view 'lab' from base 'team' as an EMPTY tree: root only, nothing copied
+note: place the subset you want with `grovefs view graft --name lab --src team --map plan.tsv` (or the `graft_view` tool, same implementation) — a directory source brings its subtree; each destination basename is the rename
+```
+
+The plan (one entry per line; `<src>` alone keeps its **full relative path**,
+TAB is the **only** rename, and `#` is a comment only at the start of a line):
+
+```
+# comment line — a trailing # would instead become part of the name
+src/docs/2026/a.md	notes/A.md
+src/docs/2026/readme.md	src/docs/2026/README.md
+src/calib
+src/data/4f2c.fits	by_target/M31.fits
+```
+
+```bash
+... call graft_view '{"name":"lab","src":"team","map":"<the four lines above>"}'
+```
+```
+grafted 13 entries (8 directories) from 'team' into 'lab' at /: 5 shared object(s), 0 skipped
+note: bytes were not copied — every grafted name holds the same object as its source; the object is freed only when no view names it anymore
+```
+
+Read that `13` literally: **4 plan lines became 13 entries** because every missing
+parent is created for you (`notes`, `src`, `src/docs`, `src/docs/2026`,
+`src/calib`, `calib/x`, `calib/y`, `by_target` = 8 directories + 5 files).
+
+Replaying the same plan is **refused as a whole** — one transaction, so the
+partial name that hit the conflict is not left behind:
+
+```
+Error: "'A.md' already exists in the destination — rename it in the plan or pass --skip-existing"
+```
+
+With `skip_existing` the same replay lands nothing and says so:
+
+```
+grafted 0 entries (0 directories) from 'team' into 'lab' at /: 0 shared object(s), 5 skipped
+```
+
+A destination need not be a fork: `graft_view` also fills a **bare base view**,
+but then `src` is mandatory (there is no recorded base to infer it from):
+
+```
+... call graft_view '{"name":"team","map":"ok.md"}'
+→ 'team' is a base view — pass --src to name the view its entries come from
+```
+
+Guard rails you can hit on purpose (all verified verbatim in `SKILL.md` §refusals):
+an alias destination (`this is an alias of 'team' — use 'team'`), a derived lens
+destination (`it renders another tree read-only and owns no nodes`), a name with
+no tree at all (`no tree for graft destination … create it first`), and a source
+path outside the source view (`'…' does not exist in view 'team'`).
