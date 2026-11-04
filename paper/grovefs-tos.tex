@@ -6,9 +6,10 @@
 %%   latexmk -pdf grovefs-tos.tex  # pdflatex xelatex both fine
 %%
 %% NOTE: this source has been machine-compiled with TeX Live (latexmk/pdfLaTeX,
-%% 20 pages, no errors) including the Sec. 6 agent-MCP/API-key paragraph, the
-%% Sec. 7 executed mcp/apikey evidence and the Sec. 8 agent-interface
-%% positioning. Re-run `latexmk -pdf grovefs-tos.tex` after any edit.
+%% 23 pages, no errors, one benign font-shape warning) including the Sec. 6
+%% agent-MCP/API-key paragraph, the fork-curation (empty fork + graft) paragraph
+%% of Sec. 4, the Sec. 7 executed mcp/apikey/fork evidence and the Sec. 8
+%% agent-interface positioning. Re-run `latexmk -pdf grovefs-tos.tex` after any edit.
 
 \documentclass[numberedsection,acmtos]{acmart}
 
@@ -483,6 +484,29 @@ definition of its own (PostgreSQL cannot be forked, as its authority does not
 live in a file), the fork name must differ from its base, and an alias may not
 target a fork (a fork is a tree identity, not a public name).
 
+\paragraph{Curating a fork.} Seeding the whole snapshot is a choice, because what
+is usually delivered is a curated subset: a fork may be left empty (root row
+only) by \texttt{fork\_view} with \texttt{seed:false}, and a placement
+step---\emph{grafting}, the \texttt{graft\_view} tool (like every governance
+method, a thin entrance onto the shared library function, with the same guards and
+the same refusal text)---then inserts entries named by another
+view's tree at arbitrary destinations of the fork's own tree, renaming as it goes:
+one plan line per entry, \texttt{\textless src\textgreater{}} or
+\texttt{\textless src\textgreater{}TAB\textless dst\textgreater{}}, a directory
+source bringing its subtree and the destination basename acting as the rename, the
+plan read from a file or from stdin so an external program can pipe a generated
+listing. A graft inserts namespace rows and nothing else, so it inherits the
+property above: no bytes are copied, every grafted name is booked as an
+additional holder of the source object, and reclamation keeps its single rule.
+Two further properties bound the mechanism. A whole plan commits in one
+transaction---a destination name already taken aborts the batch unless the caller
+opts into skipping those lines---so a malformed plan never leaves a half-curated
+tree. And only a view that \emph{owns} a tree may receive a graft: lenses and
+aliases are defined by rules, not by names inserted into them, so curation cannot
+reintroduce the divergence Lemma~\ref{lem:derived} forbids. Empty fork plus graft
+is the economical curation path, costing one row per published entry instead of
+one per source entry, with the source untouched and its bytes shared.
+
 \subsection{Zero-Copy Import (onboarding)}\label{sec:import}
 Pre-existing data already on disk is registered into a view with
 \texttt{import --view \textless v\textgreater{} --source \textless dir\textgreater{}}. When source and object store share a
@@ -915,7 +939,7 @@ completion of arguments (\texttt{completion/}\allowbreak\texttt{complete}) and l
 notifications are accepted but never answered. The protocol is a hand-rolled dispatch loop, not a
 framework binding. Its decisive property is that it is \emph{not a second
 implementation}: every method reuses the same crate functions that back the
-\texttt{grovefs view} CLI (the seven governance and two read-only introspection
+\texttt{grovefs view} CLI (the eight governance and two read-only introspection
 tools), and the resource, prompt and completion surfaces render through the very
 same view-definition and listing renderers, so an agent cannot perform any
 operation the CLI cannot, bypass any governance guard, or observe a listing that
@@ -1120,8 +1144,10 @@ exercises all four primitives over one authoritative store for the non-landing
 requirement.
 
 \paragraph{Agent entrance is the same contract (executed).} The
-\texttt{mcp} suite (48 assertions) drives the JSON-RPC server as an MCP client
-would---\texttt{initialize} (checking the advertised capability surface),
+\texttt{mcp} suite (65 assertions) drives the JSON-RPC server as an MCP client
+would---\texttt{initialize} (checking the advertised capability surface and that
+its handshake instructions name every one of the ten tools, so nothing is
+discoverable only through \texttt{tools/list}),
 \texttt{tools/list}, \texttt{tools/call}, \texttt{resources/*},
 \texttt{prompts/*}, \texttt{completion/complete}, and
 \texttt{logging/setLevel}~$\rightarrow$~\texttt{notifications/message}---and
@@ -1131,7 +1157,14 @@ for the same operation, that a view read as a resource or rendered through
 subtree pruned, relocated entries homed under their display parent), and that
 protocol faults behave correctly (id-less notifications never answered, a
 malformed frame returns \texttt{-32700} and the server keeps serving, an unknown
-view resource returns \texttt{-32002}). The \texttt{apikey} suite (33 assertions)
+view resource returns \texttt{-32002}). It also drives the curation pair end to
+end---an empty fork (\texttt{seed:false}) filled by a batch graft that places and
+renames a subset---and pins the whole refusal surface of that pair, all eleven
+rejection texts (self-graft, empty plan, \texttt{..}, the root itself, a base view
+without \texttt{src}, a lens or alias as destination or source, a nameless tree,
+an invalid name, a taken destination aborting the batch, and the
+\texttt{skip\_existing} variant) byte-for-byte, because the agent manual quotes
+them as self-checks. The \texttt{apikey} suite (33 assertions)
 exercises the gate end-to-end: an unauthenticated \texttt{tools/list} is refused
 with \texttt{-32001} while \texttt{initialize} still answers, a presented key
 admits the session and attributes each logged call, a wrong secret is refused,
@@ -1143,13 +1176,20 @@ control-plane checks (they mount nothing on the MCP path), evidencing that the
 agent surface introduces no capability or guard the CLI entrance does not
 already enforce.
 
-\paragraph{Fork views (executed).} The \texttt{fork} suite (55 assertions)
+\paragraph{Fork views (executed).} The \texttt{fork} suite (70 assertions)
 exercises the organisation sandbox on both metadata paths: creation and its
 guards, the bare base view listed beside the fork, key queries filtered by
 view, structural writes admitted while content writes and truncations return
 \texttt{EROFS} locally and through the \texttt{meta-server}, delete isolation
 with ledger-driven reclamation, and \texttt{view rm} removing the fork's tree
-while the base stays intact.
+while the base stays intact. The same suite drives the curated path through the
+\emph{CLI} entrance: \texttt{view fork --empty} exports a root-only tree, a
+plan piped on stdin (\texttt{--map -}) places two entries under new names and
+brings a directory subtree with them, a colliding name refuses the whole plan
+unless \texttt{--skip-existing} is given, and a base view asked to receive
+entries without \texttt{--src} is refused. Because the CLI and the MCP tool
+call the same library function, the transcript wording the assertions pin is
+the one an agent sees.
 
 \paragraph{Per-view metadata migration (executed).} Two properties matter here:
 that the exported file carries no host-dependent field, and that a tree rebuilt
@@ -1346,6 +1386,17 @@ Sec.~\ref{sec:eval}.\footnote{The translation fires for every \texttt{map}/\text
 leaf whose display parent is a synthesised dir; entries under a real display
 parent keep their source inode identity, so the existing source-coordinate
 invalidation already reaches them without enrichment.}
+The window stays closed only if every cache the lens keeps is part of that
+invalidation. The paged-READDIR optimisation (Sec.~\ref{sec:impl}) materialises
+one shaped listing per directory for the attribute TTL, which is a second cache
+above the kernel's: a peer's mutation never passes through that lens, so nothing
+in its own mutating path would ever drop the rows. The push therefore carries a
+second obligation, releasing the materialised listing for each coordinate it
+invalidates (\texttt{flush\_listing}), on both the client's local lens and the
+server-rendered derived view; omitting it does not corrupt anything, it silently
+restores the $\approx$2\,s window the enrichment had just removed. The
+display-coordinate freshness suite (Sec.~\ref{sec:eval}) asserts the sub-500\,ms
+convergence, so such a regression is caught rather than absorbed into a TTL.
 The remaining TTL-bounded case is a rule-set change (adding or removing
 an entire relocation, which creates or destroys a scaffolding directory
 itself); a server-side definition edit converges via the per-operation mtime
