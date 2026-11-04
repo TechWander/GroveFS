@@ -214,8 +214,8 @@ pub struct ApiKeyStore {
     backend: Backend,
 }
 
-/// The two backend spellings of the same key/audit schema. SQLite may keep
-/// the legacy `rowid`; PG gets a serial identity so `ORDER BY <identity> DESC`
+/// The two backend spellings of the same key/audit schema. SQLite keeps the
+/// `rowid`; PG gets a serial identity so `ORDER BY <identity> DESC`
 /// matches the file's `rowid DESC` audit ordering.
 const KEYS_DDL_SQLITE: &str = "CREATE TABLE IF NOT EXISTS api_keys (
                  id          TEXT PRIMARY KEY,
@@ -288,53 +288,9 @@ impl ApiKeyStore {
              {CALLS_DDL_SQLITE}"
         ))
         .map_err(|e| e.to_string())?;
-        // `scope` arrived with mount-plane admission, so an existing store
-        // needs it added in place. Everything already minted predates the
-        // split and is therefore unrestricted ('any'), which keeps a live MCP
-        // deployment authenticating exactly as before.
-        let has_scope: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('api_keys') WHERE name = 'scope'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-        if has_scope == 0 {
-            conn.execute(
-                "ALTER TABLE api_keys ADD COLUMN scope TEXT NOT NULL DEFAULT 'any'",
-                [],
-            )
-            .map_err(|e| e.to_string())?;
-        }
-        // `view`/`ro` arrived with the view-bound token model: a key can be
-        // locked to one physical view (NULL = any) and flagged read-only. Every
-        // pre-existing row predates both, so it stays an unrestricted read-write
-        // key — an existing deployment keeps authenticating exactly as before.
-        let has_view: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('api_keys') WHERE name = 'view'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-        if has_view == 0 {
-            conn.execute("ALTER TABLE api_keys ADD COLUMN view TEXT", [])
-                .map_err(|e| e.to_string())?;
-        }
-        let has_ro: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('api_keys') WHERE name = 'ro'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-        if has_ro == 0 {
-            conn.execute(
-                "ALTER TABLE api_keys ADD COLUMN ro INTEGER NOT NULL DEFAULT 0",
-                [],
-            )
-            .map_err(|e| e.to_string())?;
-        }
+        // One schema, no in-place upgrades: `scope`/`view`/`ro` are part of
+        // KEYS_DDL_SQLITE, so a store created by any build that has this DDL
+        // already carries them. An older api_keys.db is not migrated.
         Ok(Self {
             backend: Backend::Sqlite(parking_lot::Mutex::new(conn)),
         })
@@ -833,7 +789,7 @@ mod tests {
         let s = store();
         let (_mid, mkey) = s.create_for("mounter", Scope::Mount).unwrap();
         let (_aid, akey) = s.create_for("governor", Scope::Mcp).unwrap();
-        let (_did, dkey) = s.create("legacy-any").unwrap();
+        let (_did, dkey) = s.create("unscoped").unwrap();
         assert_eq!(s.list().unwrap()[0].scope, "any", "default is unrestricted");
         // Right entrance: authenticates.
         assert_eq!(s.authenticate_mount(&mkey).unwrap().label, "mounter");

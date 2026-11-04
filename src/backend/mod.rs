@@ -12,8 +12,11 @@
 //! - Keys are content-addressed later for dedup if desired; for now they are
 //!   stable object ids that support random read/write (needed for POSIX write).
 
+#[cfg(feature = "native")]
 pub mod local;
+#[cfg(feature = "native")]
 pub mod placement;
+#[cfg(feature = "native")]
 pub mod sharded;
 
 use std::io::{self, Read};
@@ -47,10 +50,10 @@ pub struct FsStat {
 pub trait StorageBackend: Send + Sync {
     /// Decide the durable identifier to store for a freshly generated uuid
     /// base. Backends that keep one object per file return `uuid` verbatim
-    /// (the default), so existing views and on-disk keys are unchanged. A
+    /// (the default), so an unstriped view's on-disk keys are the uuids. A
     /// striping backend instead encodes its layout (server count + stripe size)
-    /// into the returned key so later reads are self-describing and legacy,
-    /// unprefixed keys still resolve through the single-object path. The result
+    /// into the returned key so later reads are self-describing and an
+    /// unprefixed key still resolves through the single-object path. The result
     /// is what lands in `node.data_ref` and is passed back to every other
     /// method, so a backend must accept any key it can produce here.
     fn new_key(&self, uuid: &str) -> String {
@@ -107,6 +110,7 @@ pub trait StorageBackend: Send + Sync {
 
 /// Factory used at startup to pick a backend from CLI options. Keeps the
 /// `Filesystem` code backend-agnostic (it only ever sees `Box<dyn StorageBackend>`).
+#[cfg(feature = "native")]
 pub fn open_local(root: &std::path::Path) -> io::Result<Box<dyn StorageBackend>> {
     Ok(Box::new(local::LocalBackend::new(root)?))
 }
@@ -114,6 +118,7 @@ pub fn open_local(root: &std::path::Path) -> io::Result<Box<dyn StorageBackend>>
 /// Multi-disk variant: one `data-server` storage root per disk, each whole
 /// object placed on one root by a hash of its key (the root list must stay
 /// fixed for a given store). A single-path list degrades to exactly [`open_local`].
+#[cfg(feature = "native")]
 pub fn open_local_roots(roots: &[std::path::PathBuf]) -> io::Result<Box<dyn StorageBackend>> {
     if roots.len() == 1 {
         return open_local(&roots[0]);
@@ -121,4 +126,5 @@ pub fn open_local_roots(roots: &[std::path::PathBuf]) -> io::Result<Box<dyn Stor
     Ok(Box::new(placement::PlacementBackend::new(roots)?))
 }
 
+#[cfg(feature = "native")]
 pub use sharded::ShardedBackend;

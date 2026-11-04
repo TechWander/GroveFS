@@ -4,8 +4,9 @@
 //! `STRIPE_BYTES` chunks: logical chunk `i` lives on server `i % N` under the
 //! object key `{base}#{i}`. The layout is encoded into the durable `data_ref`
 //! key (`s<N>:<stripe>:<uuid>`) at create time so reads are self-describing and
-//! an unprefixed (legacy) key still falls through to the single-object path —
-//! the metadata schema, `MetaProvider` and the wire protocol are all untouched.
+//! an unprefixed key (a single-object write, striping off) still resolves to
+//! server 0 — the metadata schema, `MetaProvider` and the wire protocol are
+//! all untouched.
 //!
 //! Concurrency: a large read/write that spans several chunks fans its chunk
 //! operations out with `std::thread::scope`, so aggregate bandwidth scales with
@@ -36,8 +37,8 @@ struct Layout {
     base: String,
 }
 
-/// Parse `s<N>:<stripe>:<base>`; `None` for any other (legacy) key. A v4 uuid
-/// never begins with `s` followed by digits+`:`, so legacy keys cannot collide.
+/// Parse `s<N>:<stripe>:<base>`; `None` for any other (unstriped) key. A v4 uuid
+/// never begins with `s` followed by digits+`:`, so the two forms cannot collide.
 fn parse_layout(key: &str) -> Option<Layout> {
     let rest = key.strip_prefix('s')?;
     let (n_str, tail) = rest.split_once(':')?;
@@ -638,7 +639,7 @@ mod tests {
         assert_eq!(k, "s2:1024:abcd-uuid");
         let l = parse_layout(&k).unwrap();
         assert_eq!((l.n, l.stripe, l.base.as_str()), (2, 1024, "abcd-uuid"));
-        // legacy uuid keys are never mistaken for a layout
+        // an unstriped uuid key is never mistaken for a layout
         assert!(parse_layout("3f2a-1b-00").is_none());
         for r in roots {
             let _ = std::fs::remove_dir_all(r);

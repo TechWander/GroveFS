@@ -81,7 +81,7 @@ or as an agent-facing governance service over MCP (`grovefs mcp`).
 Run `grovefs <command> --help` for a command's full options.
 
   Long commands shrink: a KEY=VALUE file is auto-loaded into the environment
-  ($GROVEFS_CONFIG, else ~/.grovefs/grovefs.conf or ~/.config/grovefs/grovefs.conf),
+  ($GROVEFS_CONFIG, else $HOME/.config/grovefs/grovefs.conf),
   and the repeat-heavy flags fall back to env — GROVEFS_META / GROVEFS_DATA /
   GROVEFS_TOKEN for `mount` and the servers, GROVEFS_HOME, GROVEFS_DB_PATH,
   GROVEFS_STATS, GROVEFS_API_KEY, GROVEFS_MCP_API_KEY, GROVEFS_BW_READ /
@@ -213,8 +213,8 @@ enum Cmd {
         #[arg(long, num_args = 0..)]
         o: Vec<String>,
         /// FUSE worker threads dispatching requests concurrently (fuser 0.18
-        /// session `n_threads`). 0 = single-threaded (legacy behavior, useful as
-        /// an A/B knob for the bench). Each thread gets its own /dev/fuse fd via
+        /// session `n_threads`). 0 = single-threaded mode, useful as an A/B
+        /// knob for the bench. Each thread gets its own /dev/fuse fd via
         /// `FUSE_DEV_IOC_CLONE` (Linux 4.5+), so kernel replies are not serialized
         /// behind one channel lock.
         #[arg(long, default_value_t = 4)]
@@ -359,13 +359,13 @@ enum Cmd {
         #[arg(short, long, default_value = "127.0.0.1:50053")]
         listen: String,
         /// Authoritative metadata root for this server: under SQLite every
-        /// view DB is created under `<db-path>/meta/<view>.db` (lazily, on
-        /// first open) and the API-key/audit store lives at
-        /// `<db-path>/meta/api_keys.db`; under PostgreSQL (`--store
-        /// postgres://…`) the view trees live in PG, making `<db-path>` a
-        /// config-only directory (derived-view definitions, logs). Takes
-        /// precedence over the global `--home`, which is kept for backward
-        /// compatibility.
+        /// view DB lives under `<db-path>/meta/<view>.db` (created explicitly
+        /// by `view create` / `init` / `view import`, never by a mount) and
+        /// the API-key/audit store lives at `<db-path>/meta/api_keys.db`;
+        /// under PostgreSQL (`--store postgres://…`) the view trees live in
+        /// PG, making `<db-path>` a config-only directory (derived-view
+        /// definitions, logs). Takes precedence over the global `--home` when
+        /// both are given.
         #[arg(long)]
         db_path: Option<PathBuf>,
         /// Shared secret clients must present (`mount --token`). When set, the
@@ -393,8 +393,8 @@ enum Cmd {
         role: String,
         /// The other HA node's `host:port`. A primary pushes every ~500ms and
         /// heartbeats its epoch here; a standby promotes after missing heartbeats.
-        /// Requires a *separate* metadata root (`--db-path`, or the legacy
-        /// global `--home`) from the peer (each node keeps its own
+        /// Requires a *separate* metadata root (`--db-path`, or the global
+        /// `--home`) from the peer (each node keeps its own
         /// copy of the view dbs; replication ships whole snapshots between them).
         #[arg(long)]
         peer: Option<String>,
@@ -459,18 +459,6 @@ enum Cmd {
         /// PostgreSQL's own streaming/logical replication for HA instead.
         #[arg(long)]
         store: Option<String>,
-        /// Refuse an `M_OPEN` whose view name does NOT already exist, instead of
-        /// lazily creating `<db-path>/meta/<view>.db` (or a PG schema) on first
-        /// open. Default off: the first mount of a name is also how a base view
-        /// is bootstrapped, but it means a typo silently becomes an empty tree.
-        /// With this on, an unknown name is refused with a readable reason (the
-        /// client prints it, not a bare EIO), nothing is written to disk, and
-        /// the refusal is recorded in the `grovefs apikey calls` audit log when
-        /// `--require-api-key` is active. Existing trees, derived views, forks
-        /// and aliases still mount. Create a new base view first (SQLite:
-        /// `grovefs --home <db-path> init --view <name>`), then mount it.
-        #[arg(long)]
-        strict_view: bool,
     },
     /// Unmount a mountpoint
     Umount {
@@ -669,6 +657,58 @@ NOTES
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Report disk usage (subtree byte totals) without going through FUSE.
+    /// Connects directly to the metadata backend (PG or SQLite) for the tree
+    /// structure, then batch-stats content sizes via the data-server (or local
+    /// blocks/). Output is `du`-compatible: `<size>\t<path>`, sorted by depth.
+    Du {
+        /// View to measure.
+        #[arg(long)]
+        view: String,
+        /// Meta-server endpoint (host:port) — uses M_TREE_DUMP RPC to get
+        /// the tree without direct PG/SQLite access.
+        #[arg(long)]
+        meta: Option<String>,
+        /// Access token for meta-server (if --meta requires auth).
+        #[arg(long)]
+        meta_token: Option<String>,
+        /// API key for meta-server (if --meta requires auth).
+        #[arg(long)]
+        meta_api_key: Option<String>,
+        /// PostgreSQL store URI (same as meta-server --store).
+        #[arg(long)]
+        store: Option<String>,
+        /// Metadata root for SQLite mode (meta/<view>.db lives under here).
+        #[arg(long)]
+        db_path: Option<PathBuf>,
+        /// Data-server endpoint (host:port) for remote batch stat; omit for
+        /// local mode (stat blocks/ directly from --data-root).
+        #[arg(long)]
+        data: Option<String>,
+        /// Local data root holding blocks/ (for local-mode du).
+        #[arg(long)]
+        data_root: Option<PathBuf>,
+        /// API key for data-server authentication.
+        #[arg(long)]
+        api_key: Option<String>,
+        /// Access token for data-server (legacy --token mode).
+        #[arg(long)]
+        token: Option<String>,
+        /// Subpath within the view to start from (default: root /).
+        #[arg(long, default_value = "/")]
+        path: String,
+        /// Show per-directory breakdown up to N levels deep (0 = only the
+        /// grand total of --path, 1 = plus immediate children, etc.).
+        #[arg(long, default_value = "999999")]
+        depth: usize,
+        /// Print raw byte counts (no human K/M/G suffix).
+        #[arg(long, short = 'b')]
+        bytes: bool,
+        /// Print only the grand total (equivalent to --depth 1 --path /).
+        #[arg(long)]
+        total: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -714,6 +754,40 @@ enum ViewAction {
         name: String,
         #[arg(long)]
         base: String,
+        /// Start EMPTY (root row only) instead of copying the base's entries,
+        /// to be filled by `view graft`. Same guards and the same mount
+        /// semantics; only the initial row set differs.
+        #[arg(long)]
+        empty: bool,
+    },
+    /// Graft entries of view `--src` into fork `--name`, at arbitrary
+    /// destinations and under new names. One plan line per entry:
+    /// `<src>` (keep its basename, placed in `--dest`) or `<src>TAB<dst>`
+    /// (rename and/or another directory). `--map -` reads the plan from
+    /// stdin, so an external program can generate it on the fly. A directory
+    /// source brings its whole subtree; the placement is ONE transaction (all
+    /// or nothing) and copies no bytes — rows enter the fork, objects stay
+    /// shared through the cross-view ledger. An existing name refuses the
+    /// plan unless `--skip-existing` leaves it alone. Only a view that OWNS
+    /// its tree (a fork) can receive.
+    Graft {
+        /// Fork view receiving the entries.
+        #[arg(long)]
+        name: String,
+        /// Plan file; `-` reads the plan from stdin.
+        #[arg(long)]
+        map: PathBuf,
+        /// View whose entries are taken; defaults to the fork's base. A BASE
+        /// view must be named explicitly (nothing infers which tree to lift).
+        #[arg(long)]
+        src: Option<String>,
+        /// In-fork destination directory for lines without a TAB; defaults
+        /// to the fork root. Missing directories are created.
+        #[arg(long)]
+        dest: Option<String>,
+        /// Leave names that already exist instead of refusing the whole plan.
+        #[arg(long)]
+        skip_existing: bool,
     },
     /// Create/replace derived view `--name` on physical `--base`, rules read
     /// from `--rules FILE` (same verbs as `mount --layout`: hide/only/map/link).
@@ -919,8 +993,8 @@ enum RefsAction {
 /// Auto-load a `KEY=VALUE` config file into the environment, WITHOUT clobbering
 /// variables that are already set — the precedence chain for every knob below
 /// is always flag > live env > config file > built-in default. Search order:
-/// `$GROVEFS_CONFIG` (explicit path) > `$HOME/.grovefs/grovefs.conf` >
-/// `$HOME/.config/grovefs/grovefs.conf`; the first existing file wins. Only
+/// `$GROVEFS_CONFIG` (explicit path) > `$HOME/.config/grovefs/grovefs.conf`;
+/// the first existing file wins. Only
 /// `GROVEFS_`-prefixed keys are honored (the rest are ignored with a warning);
 /// recognized: GROVEFS_HOME, GROVEFS_META / GROVEFS_DATA / GROVEFS_TOKEN
 /// (mount defaults), GROVEFS_STATS, GROVEFS_API_KEY, GROVEFS_MCP_API_KEY, …
@@ -936,10 +1010,6 @@ fn load_config_file() {
         .map(PathBuf::from)
         .or_else(|| {
             std::env::var("HOME").ok().map(|h| {
-                let legacy = PathBuf::from(&h).join(".grovefs").join("grovefs.conf");
-                if legacy.is_file() {
-                    return legacy;
-                }
                 PathBuf::from(&h)
                     .join(".config")
                     .join("grovefs")
@@ -1029,6 +1099,26 @@ fn base_dir(home: &Option<PathBuf>) -> PathBuf {
 
 fn meta_path(base: &Path, view: &str) -> PathBuf {
     base.join("meta").join(format!("{view}.db"))
+}
+
+/// Open an EXISTING local view tree. A mount never creates one: an unknown
+/// name is refused with the same "create it first" guidance the meta-server's
+/// `M_OPEN` gives, so a typo cannot silently become an empty tree.
+fn open_existing_view(
+    base: &Path,
+    view: &str,
+) -> Result<MetaEngine, Box<dyn std::error::Error>> {
+    let mp = meta_path(base, view);
+    if !mp.is_file() {
+        return Err(format!(
+            "view '{view}' has no tree at {} — views are created explicitly; run `grovefs view --db-path {} create --view {view}` (or `grovefs --home {} init --view {view}`) first",
+            mp.display(),
+            base.display(),
+            base.display()
+        )
+        .into());
+    }
+    Ok(MetaEngine::open(&mp)?)
 }
 
 /// Resolve the metadata backend URI for a CONTROL-plane command. The explicit
@@ -1219,8 +1309,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         uid,
                         &api_key,
                     )?;
-                    // The M_OPEN ack flagged derived names (absent = old server
-                    // or physical view → stays writable, behavior-compatible).
+                    // The M_OPEN ack flags derived names (byte [0]); a
+                    // physical view stays writable.
                     view_ro = rm.is_readonly_view();
                     // Ack byte [2] flags a FORK: structure writable, content RO.
                     content_ro = rm.is_content_ro_view();
@@ -1230,7 +1320,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Local mount: access control is the OS's (`--home`/
                     // `blocks/` file permissions) — there is no server-side
                     // credential gate to apply against a local sqlite tree.
-                    std::fs::create_dir_all(base.join("meta"))?;
+                    // A mount never creates a tree: every branch below opens an
+                    // EXISTING db through `open_existing_view`.
                     // PURE ALIAS resolution mirrors the meta-server's M_OPEN
                     // gate (see `load_view_aliases`): a governed real name is
                     // not a local mount entry point either, and the public
@@ -1310,7 +1401,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             println!(
                                 "note: derived (virtual) views mount read-only — write to base view '{b}'"
                             );
-                            let engine = MetaEngine::open(&meta_path(&base, &b))?;
+                            let engine = open_existing_view(&base, &b)?;
                             Arc::new(grovefs::layout::LayoutMeta::new(Arc::new(engine), rules))
                         }
                         Some(grovefs::layout::ViewDef::Fork(b)) => {
@@ -1319,26 +1410,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             );
                             // The fork's tree is its OWN db: never fall back to
                             // creating a fresh empty one silently.
-                            let mp = meta_path(&base, &effective);
-                            if !mp.is_file() {
-                                return Err(format!(
-                                    "fork view '{effective}': its own tree {} is missing (removed out-of-band? `grovefs view list` shows what exists)",
-                                    mp.display()
-                                )
-                                .into());
-                            }
                             content_ro = true;
-                            Arc::new(MetaEngine::open(&mp)?)
+                            Arc::new(open_existing_view(&base, &effective)?)
                         }
                         Some(grovefs::layout::ViewDef::Alias(real)) => {
                             // Alias resolution already swapped `effective` to the
                             // real name; this is unreachable but stays honest.
-                            Arc::new(MetaEngine::open(&meta_path(&base, &real))?)
+                            Arc::new(open_existing_view(&base, &real)?)
                         }
-                        None => {
-                            let mp = meta_path(&base, &effective);
-                            Arc::new(MetaEngine::open(&mp)?)
-                        }
+                        None => Arc::new(open_existing_view(&base, &effective)?),
                     }
                 }
             };
@@ -1466,7 +1546,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cfg.mount_options.push(fuser::MountOption::RO);
             }
             // Concurrent dispatch: n_threads worker event loops, each with its own
-            // cloned /dev/fuse fd. `threads = 0` maps to single-threaded legacy mode.
+            // cloned /dev/fuse fd. `threads = 0` maps to single-threaded mode.
             cfg.n_threads = if threads > 1 { Some(threads) } else { None };
             cfg.clone_fd = threads > 1;
             // Only print `base` when the mount actually reads/writes under it:
@@ -1585,7 +1665,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             sync_repl,
             witness,
             store,
-            strict_view,
         } => {
             let role = if role.eq_ignore_ascii_case("standby") {
                 grovefs::remote::meta::Role::Standby
@@ -1596,8 +1675,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // definitions + api_keys): `--store` > `GROVEFS_STORE` > SQLite.
             let store = resolve_store(store);
             // `--db-path` is the explicit, self-describing form of the metadata
-            // root; the global `--home` still works (back-compat) but loses if
-            // both are given. A `GROVEFS_DB_PATH` env default slots between them,
+            // root; the global `--home` is the default and loses if both are
+            // given. A `GROVEFS_DB_PATH` env default slots between them,
             // and `GROVEFS_TOKEN` fills a missing `--token` (same flag > env >
             // config-file chain as the mount side).
             let token = token.or_else(|| std::env::var("GROVEFS_TOKEN").ok());
@@ -1626,7 +1705,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             srv = srv.with_witness(witness);
             srv = srv.with_store(store);
-            srv = srv.with_strict_view(strict_view);
             srv.serve()?;
         }
         Cmd::Umount { mountpoint } => {
@@ -1652,14 +1730,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 u.starts_with("postgres://") || u.starts_with("postgresql://")
             });
             let ctrl = grovefs::mcp::control_store_for(&vbase, store.as_deref())?;
-            // A PG deployment has no local per-view db file: base trees are PG
-            // schemas created lazily on first open, and their bytes move through a
-            // mount — so the file-level physical ops below are refused rather than
-            // silently writing a local artifact the PG meta-server never reads.
+            // A PG deployment has no local per-view db file: a base tree is a
+            // `grovefs_v_<hex(view)>` schema that `view create` provisions
+            // explicitly, and its bytes move through a mount — so the file-level
+            // physical ops below are refused rather than silently writing a
+            // local artifact the PG meta-server never reads.
             let require_sqlite = |op: &str| -> Result<(), Box<dyn std::error::Error>> {
                 if store_is_pg {
                     Err(format!(
-                        "{op} operates on a local SQLite view db; under `--store postgres://…` a base tree is a PG schema created on first mount and its bytes move through a mounted path — drop --store for a local store"
+                        "{op} operates on a local SQLite view db; under `--store postgres://…` a base tree is a PG schema (create one with `view create`) and its bytes move through a mounted path — drop --store for a local store"
                     )
                     .into())
                 } else {
@@ -1668,36 +1747,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             match action {
                 ViewAction::Create { view, manifest } => {
-                    // Base (physical) view creation — the same authoritative db
-                    // `init` produces, framed as an explicit first-class step so
-                    // the "only base views GC for real" rule has an obvious
-                    // entry point. Refuse a name already governed by a derived
-                    // or alias definition (that slot is a lens/alias, not a tree).
-                    require_sqlite("`view create`")?;
-                    if vbase
-                        .join("meta")
-                        .join("views")
-                        .join(format!("{view}.layout"))
-                        .exists()
-                    {
+                    // Base (physical) view creation — the same authoritative
+                    // tree `init` produces, framed as an explicit first-class
+                    // step so the "only base views GC for real" rule has an
+                    // obvious entry point. This is the ONLY way a tree comes
+                    // into existence: a mount (local or M_OPEN) refuses an
+                    // unknown name instead of materializing an empty one.
+                    if !grovefs::layout::valid_view_name(&view) {
+                        return Err(format!("invalid view name '{view}'").into());
+                    }
+                    if ctrl.has_def(&view)? {
                         return Err(format!(
                             "view '{view}' already has a derived/alias/fork definition — choose a different base name (`grovefs view list` shows it)"
                         )
                         .into());
                     }
-                    let mp = meta_path(&vbase, &view);
-                    if let Some(dir) = mp.parent() {
-                        std::fs::create_dir_all(dir)?;
+                    if ctrl.has_physical(&view)? {
+                        return Err(format!(
+                            "view '{view}' already exists — remove it first (`grovefs view rm --name {view} --base`) or choose a different name"
+                        )
+                        .into());
                     }
-                    let meta = MetaEngine::open(&mp)?;
-                    println!("created BASE view '{view}' at {}", mp.display());
+                    if store_is_pg {
+                        // A PG base view is one `grovefs_v_<hex(view)>` schema.
+                        // `PgEngine::open` creates the schema, its three tables
+                        // and the root row; dropping the handle leaves the tree
+                        // in place for mounts to open.
+                        if manifest.is_some() {
+                            return Err("`view create --manifest` seeds a SQLite db file; under `--store postgres://…` mount the view and write the files instead".into());
+                        }
+                        let uri = store.as_deref().expect("store_is_pg implies a URI");
+                        drop(grovefs::pg_store::PgEngine::open(uri, &view, false)?);
+                        println!("created BASE view '{view}' in {uri} (schema grovefs_v_<hex>)");
+                    } else {
+                        let mp = meta_path(&vbase, &view);
+                        if let Some(dir) = mp.parent() {
+                            std::fs::create_dir_all(dir)?;
+                        }
+                        let meta = MetaEngine::open(&mp)?;
+                        println!("created BASE view '{view}' at {}", mp.display());
+                        if let Some(mf) = manifest {
+                            let backend = backend::open_local(&vbase)?;
+                            seed_manifest(&meta, backend.as_ref(), &mf)?;
+                            println!("applied seed manifest {}", mf.display());
+                        }
+                    }
                     println!("  deletes in a base view free the underlying object once no other view references it;");
                     println!("  reshape it with `view define` or publish it under a name with `view alias`.");
-                    if let Some(mf) = manifest {
-                        let backend = backend::open_local(&vbase)?;
-                        seed_manifest(&meta, backend.as_ref(), &mf)?;
-                        println!("applied seed manifest {}", mf.display());
-                    }
                 }
                 ViewAction::Define {
                     name,
@@ -1717,10 +1813,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
-                ViewAction::Fork { name, base } => {
+                ViewAction::Fork { name, base, empty } => {
                     // Same shared implementation as the MCP `fork_view` tool
-                    // (validation, tree seeding, ledger booking, definition slot).
-                    for l in grovefs::mcp::fork_view(&*ctrl, &name, &base)? {
+                    // (validation, tree seeding, ledger booking, definition
+                    // slot); `--empty` only changes how many rows it starts with.
+                    for l in grovefs::mcp::fork_view_seeded(&*ctrl, &name, &base, !empty)? {
+                        match l {
+                            grovefs::mcp::OutLine::Info(s) => println!("{s}"),
+                            grovefs::mcp::OutLine::Note(s) => eprintln!("{s}"),
+                        }
+                    }
+                }
+                ViewAction::Graft {
+                    name,
+                    map,
+                    src,
+                    dest,
+                    skip_existing,
+                } => {
+                    // Same shared implementation as the MCP `graft_view` tool.
+                    // The plan is text either way: a file serves an editor, `-`
+                    // serves a pipe — one parser, no second code path.
+                    let text = if map.to_str() == Some("-") {
+                        std::io::read_to_string(std::io::stdin())
+                            .map_err(|e| format!("cannot read plan from stdin: {e}"))?
+                    } else {
+                        std::fs::read_to_string(&map)
+                            .map_err(|e| format!("cannot read plan file {}: {e}", map.display()))?
+                    };
+                    for l in grovefs::mcp::graft_view(
+                        &*ctrl,
+                        &name,
+                        src.as_deref(),
+                        &text,
+                        dest.as_deref().unwrap_or(""),
+                        skip_existing,
+                    )? {
                         match l {
                             grovefs::mcp::OutLine::Info(s) => println!("{s}"),
                             grovefs::mcp::OutLine::Note(s) => eprintln!("{s}"),
@@ -1779,7 +1907,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     // A base others' definitions still resolve through must not
                     // vanish from under them: an alias/lens/fork referencing it
-                    // would dangle (its mount then lazily creates an empty tree).
+                    // would dangle (mounting it afterwards is refused, not
+                    // auto-created).
                     for (dname, text) in ctrl.list_defs()? {
                         let dep = match grovefs::layout::LayoutRules::parse_def(&text) {
                             Ok(grovefs::layout::ViewDef::Derived(b, _)) => b == name,
@@ -1863,7 +1992,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         );
                     }
                     eprintln!(
-                        "note: new mounts of '{name}' are refused or lazily create an EMPTY tree (lazy mode) — run `init --view {name}` / `view create` to start over; live mounts of the removed name on other machines keep their resolved handles until they remount"
+                        "note: new mounts of '{name}' are now refused — run `init --view {name}` / `view create` to start over; live mounts of the removed name on other machines keep their resolved handles until they remount"
                     );
                 }
                 ViewAction::Export { view, out, force } => {
@@ -2399,6 +2528,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if st.failed > 0 {
                 return Err(format!("{} entry(ies) failed to import", st.failed).into());
             }
+        }
+        Cmd::Du {
+            view,
+            meta,
+            meta_token,
+            meta_api_key,
+            store,
+            db_path,
+            data,
+            data_root,
+            api_key,
+            token,
+            path,
+            depth,
+            bytes,
+            total,
+        } => {
+            let opts = grovefs::du::DuOpts {
+                view,
+                meta: meta.or_else(|| std::env::var("GROVEFS_META").ok().filter(|s| !s.is_empty())),
+                meta_token: meta_token.or_else(|| std::env::var("GROVEFS_TOKEN").ok().filter(|s| !s.is_empty())),
+                meta_api_key: meta_api_key.or_else(|| std::env::var("GROVEFS_API_KEY").ok().filter(|s| !s.is_empty())),
+                store: resolve_store(store),
+                db_path: db_path.or_else(|| Some(base.clone())),
+                data: data.or_else(|| std::env::var("GROVEFS_DATA").ok().filter(|s| !s.is_empty())),
+                data_root,
+                api_key: api_key.or_else(|| std::env::var("GROVEFS_API_KEY").ok().filter(|s| !s.is_empty())),
+                token: token.or_else(|| std::env::var("GROVEFS_TOKEN").ok().filter(|s| !s.is_empty())),
+                path,
+                depth: if total { 0 } else { depth },
+                bytes,
+            };
+            grovefs::du::run(&opts).map_err(|e| e.to_string())?;
         }
     }
     Ok(())

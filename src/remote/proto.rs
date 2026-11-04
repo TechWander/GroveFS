@@ -61,6 +61,11 @@ pub const OP_OPEN: u8 = 9;
 /// rather than promote/keep-writing blind, closing the two-node double-write
 /// window (the data-server persists the token so its restart won't zero it).
 pub const OP_FENCE: u8 = 10;
+/// Batch stat: request encodes `[count: u32][key1][key2]...` (each key uses
+/// `put_key` framing), response DATA is `[len1: u64][len2: u64]...` in the same
+/// order. STATUS=0 on full success, or errno on a protocol error. A missing key
+/// contributes `0u64` (non-existent == zero size) rather than aborting the batch.
+pub const OP_BATCH_LEN: u8 = 11;
 
 /// Data-plane ops that MUTATE stored object bytes/state. Since fencing, each
 /// carries a leading `[u64 epoch]` prefix on the request body — the fence token

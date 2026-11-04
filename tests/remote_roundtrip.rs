@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 use grovefs::backend::{self, StorageBackend};
 use grovefs::remote::{
-    proto,
     server::{serve_on, serve_on_auth},
     RemoteBackend,
 };
@@ -116,15 +115,6 @@ fn remote_concurrent_writes_no_corruption() {
     for h in handles {
         h.join().unwrap();
     }
-}
-
-// Keep a direct reference to proto so the test crate depends on it too,
-// guarding against accidental dead-code removal of the ops used above.
-#[allow(dead_code)]
-fn _assert_ops_exist() {
-    let _ = proto::OP_CREATE;
-    let _ = proto::OP_STATFS;
-    let _ = proto::OP_OPEN;
 }
 
 /// P3: reads >= 1MiB take the chunked parallel path. Byte-exact agreement with

@@ -5,25 +5,46 @@ edition = "2021"
 description = "A user-view FUSE filesystem with pluggable storage backend, no NFS"
 license = "MIT"
 
+# The `[[bin]]` is the Linux FUSE mount + cluster server. A Windows client
+# (see the sibling `grovefs-win` crate) depends on the `lib` only, with the
+# `remote-only` feature, so it never pulls `fuser`/`libc` and builds without a
+# FUSE or POSIX-libc dependency. The binary needs the full native stack.
 [[bin]]
 name = "grovefs"
 path = "src/main.rs"
+required-features = ["native"]
 
 [lib]
 name = "grovefs"
 path = "src/lib.rs"
+
+[features]
+# Full build: FUSE mount path + cluster server + local/POSIX storage backend.
+default = ["native"]
+# Everything that needs `fuser` (kernel FUSE bridge) or POSIX `libc` calls
+# (pread/pwrite/fsync, getuid, kill). On by default; disabled for the
+# client-only Windows build.
+native = ["dep:fuser", "dep:libc"]
+# Ergonomic alias for the Windows / headless client build: depend on the
+# remote MetaProvider + StorageBackend + wire protocol only, no fuser/libc.
+# Combine with `--no-default-features` so `native` (and thus fuser/libc) is
+# dropped from the dependency graph: `--no-default-features --features remote-only`.
+remote-only = []
 
 [dependencies]
 # FUSE in userspace. 0.18: high-level Filesystem trait is &self + Send/Sync and
 # the session dispatches concurrently across worker threads (Config::n_threads
 # with per-worker cloned /dev/fuse fds via FUSE_DEV_IOC_CLONE, Linux). The old
 # abi-7-* feature flags are gone; capabilities are negotiated at runtime in
-# `init` (KernelConfig::add_capabilities with InitFlags).
-fuser = "0.18"
+# `init` (KernelConfig::add_capabilities with InitFlags). OPTIONAL: only the
+# `native` mount/server path needs it, so the client-only build drops it.
+fuser = { version = "0.18", optional = true }
 # Embedded metadata engine: view tree + inode mapping. bundled = compile SQLite from source, no system dep
 rusqlite = { version = "0.31", features = ["bundled"] }
-# libc for pread/pwrite/fsync (true positional IO, no seek races)
-libc = "0.2"
+# libc for pread/pwrite/fsync (true positional IO, no seek races) and POSIX
+# ids/signals. OPTIONAL: the client-only build uses `src/platform.rs` shims
+# instead, so this is only pulled in under `native`.
+libc = { version = "0.2", optional = true }
 # CLI
 clap = { version = "4", features = ["derive"] }
 # Fast in-process locks for the attribute/handle caches

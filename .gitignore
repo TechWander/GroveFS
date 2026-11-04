@@ -41,6 +41,19 @@
 /.cfgtest/
 /.vrtest/
 /.bwtest/
+/.ruletest/
+/.skilltest/
+/.dperf*/
+/.sigtest/
+/.bt-t*/
+
+# Ad-hoc browser screenshots taken while verifying docs.html rendering; they
+# document nothing the page itself doesn't, so they never belong in a commit.
+/preview_top.png
+/shot_*.png
+/verify_*.png
+/docs_theme_*.png
+/docs_s*.png
 
 # .build-bin tracks the test/bench scripts and the pkg-config wrapper,
 # but never its run output or captured logs.

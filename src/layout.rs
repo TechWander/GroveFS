@@ -62,6 +62,15 @@ const CACHE_TTL: Duration = Duration::from_secs(2);
 /// set is retained.
 const RESOLVE_CAP: usize = 65_536;
 const SRC_PATH_CAP: usize = 65_536;
+/// How many materialized directory listings a lens keeps. The kernel asks for
+/// one directory in many READDIR buffers; without this the whole shaped
+/// listing (rule engine included) was recomputed per buffer, so a big
+/// directory cost O(n^2). Four dirs covers a `find` walking down one branch
+/// plus a concurrent `ls` of another.
+const PAGE_CACHE_DIRS: usize = 4;
+/// Ceiling on the entries held across those listings. Past it the listing is
+/// still served (correct, just recomputed next buffer) rather than eating RAM.
+const PAGE_CACHE_ROWS: usize = 400_000;
 
 /// Enforce a hard ceiling on a `(Instant, _)`-valued TTL map. First drop every
 /// entry already past [`CACHE_TTL`] — the steady-state bound, since a still-used
@@ -473,6 +482,20 @@ struct State {
     next_vino: i64,
 }
 
+/// One materialized lens listing, served to every READDIR buffer of that
+/// directory until [`CACHE_TTL`] expires. Holds the already-shaped rows, so a
+/// cache hit costs a slice, not a rule pass.
+struct CachedListing {
+    at: Instant,
+    rows: Arc<Vec<NodeInfo>>,
+}
+
+/// Per-directory listing cache (see [`PAGE_CACHE_DIRS`]).
+struct PageCache {
+    dirs: HashMap<i64, CachedListing>,
+    rows: usize,
+}
+
 /// The overlay itself: `MetaProvider` implementation translating between the
 /// display namespace and the wrapped source provider.
 pub struct LayoutMeta {
@@ -483,6 +506,10 @@ pub struct LayoutMeta {
     /// parent display path -> synthesized intermediate dir names.
     vdirs: HashMap<String, Vec<String>>,
     st: Mutex<State>,
+    /// Materialized directory listings, keyed by the directory inode (see
+    /// [`PageCache`]): the shaped listing is computed once per [`CACHE_TTL`]
+    /// and then sliced per READDIR buffer.
+    pages: Mutex<PageCache>,
     uid: u32,
     gid: u32,
     born: i64,
@@ -524,8 +551,12 @@ impl LayoutMeta {
                 virt_by_path: HashMap::new(),
                 next_vino: i64::MAX,
             }),
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
+            pages: Mutex::new(PageCache {
+                dirs: HashMap::new(),
+                rows: 0,
+            }),
+            uid: crate::platform::getuid(),
+            gid: crate::platform::getgid(),
             born: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
@@ -543,6 +574,60 @@ impl LayoutMeta {
         let mut st = self.st.lock();
         st.resolve.clear();
         st.src_path.clear();
+        drop(st);
+        let mut c = self.pages.lock();
+        c.dirs.clear();
+        c.rows = 0;
+    }
+
+    /// Materialize (or reuse) the shaped listing of `parent`. The kernel walks
+    /// one directory across many READDIR buffers; running the rules once per
+    /// [`CACHE_TTL`] window and slicing per buffer turns that O(n^2) walk into
+    /// O(n). A listing larger than [`PAGE_CACHE_ROWS`] is still served — just
+    /// not cached, so it costs a rebuild on the next buffer.
+    fn listing(&self, parent: i64) -> Arc<Vec<NodeInfo>> {
+        {
+            let c = self.pages.lock();
+            if let Some(hit) = c.dirs.get(&parent) {
+                if hit.at.elapsed() < CACHE_TTL {
+                    return Arc::clone(&hit.rows);
+                }
+            }
+        }
+        let rows = Arc::new(self.readdir(parent));
+        if rows.len() > PAGE_CACHE_ROWS {
+            return rows;
+        }
+        let mut c = self.pages.lock();
+        if let Some(old) = c.dirs.insert(
+            parent,
+            CachedListing {
+                at: Instant::now(),
+                rows: Arc::clone(&rows),
+            },
+        ) {
+            c.rows = c.rows.saturating_sub(old.rows.len());
+        }
+        c.rows += rows.len();
+        // Evict the stalest directory once either bound is exceeded; the one
+        // just inserted is the freshest, so it is never the victim while
+        // another entry remains.
+        while c.dirs.len() > PAGE_CACHE_DIRS || c.rows > PAGE_CACHE_ROWS {
+            let victim = c
+                .dirs
+                .iter()
+                .min_by_key(|(ino, l)| (l.at, *ino))
+                .map(|(ino, _)| *ino);
+            match victim {
+                Some(k) if c.dirs.len() > 1 => {
+                    if let Some(v) = c.dirs.remove(&k) {
+                        c.rows = c.rows.saturating_sub(v.rows.len());
+                    }
+                }
+                _ => break,
+            }
+        }
+        rows
     }
 
     /// Resolve a SOURCE path to its inode by walking the raw tree. Results
@@ -938,6 +1023,20 @@ impl MetaProvider for LayoutMeta {
         self.display_spots(&jjoin(&sp, name))
     }
 
+    /// See [`MetaProvider::flush_listing`]. The lens materializes a shaped
+    /// listing per directory for [`CACHE_TTL`] (see [`LayoutMeta::listing`]), so
+    /// a peer's mutation of the base tree — which arrives as a push event, never
+    /// as an operation through THIS lens, and therefore never reaches
+    /// [`LayoutMeta::invalidate`] — would otherwise stay invisible behind the
+    /// cached rows until the TTL. The event handler flushes the coordinates it
+    /// invalidates in the kernel, which is exactly the pair this closes.
+    fn flush_listing(&self, parent: i64) {
+        let mut c = self.pages.lock();
+        if let Some(v) = c.dirs.remove(&parent) {
+            c.rows = c.rows.saturating_sub(v.rows.len());
+        }
+    }
+
     fn getattr(&self, ino: i64) -> Option<NodeInfo> {
         if let Some(n) = self.virt_get(ino) {
             return Some(n);
@@ -1005,6 +1104,24 @@ impl MetaProvider for LayoutMeta {
         self.rule_children(&dp, parent, &mut out, &mut seen);
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
+    }
+
+    /// Serve the kernel's READDIR buffers from one materialized listing. The
+    /// trait default (`readdir` + `skip/take` per buffer) re-ran the whole rule
+    /// engine for every 4 KB the kernel asked for, which made listing a big
+    /// directory quadratic; the shape is computed once per [`CACHE_TTL`] — the
+    /// same window the mount's attr/dentry caches already give an out-of-band
+    /// change — and every buffer after that is a slice.
+    fn readdir_page(&self, parent: i64, offset: usize, limit: usize) -> Vec<NodeInfo> {
+        let rows = self.listing(parent);
+        rows.iter().skip(offset).take(limit).cloned().collect()
+    }
+
+    /// The lens pages, just not in SQL: it pages over the materialized listing.
+    /// Advertising it is what lets `GroveFS` use its normal fetch chunking (and
+    /// READDIRPLUS) instead of asking for one whole listing per buffer.
+    fn supports_paged_readdir(&self) -> bool {
+        true
     }
 
     #[allow(clippy::too_many_arguments)]

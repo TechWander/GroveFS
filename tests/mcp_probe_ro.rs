@@ -1,6 +1,6 @@
 //! The MCP control-plane probes must be **read-only in the strongest sense**:
 //! on a PostgreSQL-bound store, `open_ro_view` may not run the schema-ensure
-//! DDL that a MOUNT uses to lazily create a view. Without the guard, probing a
+//! DDL that would create a view's schema. Without the guard, probing a
 //! typo'd view name silently minted a `grovefs_v_<hex>` schema, and the next
 //! `list_views` reported that phantom as a physical view the agent never
 //! created — a write hiding behind a "read-only introspection" tool.
@@ -97,8 +97,8 @@ fn probe_of_existing_pg_view_walks_it_without_mutating_the_view_set() {
     let view = phantom_view("bb");
     let before = store.list_physical().unwrap();
 
-    // A MOUNT-like open still creates the tree lazily (that contract is the
-    // mount's, not the probe's); the probe then reads it and changes nothing.
+    // Provision the tree the way `view create --store` does; the probe then
+    // reads it and changes nothing.
     drop(grovefs::pg_store::PgEngine::open(&uri, &view, false).expect("create PG tree"));
     let after_create = store.list_physical().unwrap();
     assert!(after_create.contains(&view), "created tree not listed");

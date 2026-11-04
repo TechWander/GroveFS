@@ -22,7 +22,7 @@
 
 use super::proto;
 use crate::backend::{FsStat, StorageBackend};
-use libc::{EACCES, EIO, ENOENT, EROFS};
+use crate::platform::{EACCES, EIO, ENOENT, EROFS};
 use parking_lot::Mutex;
 use std::io;
 use std::net::TcpStream;
@@ -467,6 +467,28 @@ impl RemoteBackend {
         }
         Ok(val as usize)
     }
+
+    /// Batch stat: returns lengths for all keys in one round-trip.
+    /// A missing key yields 0 (does not abort the batch).
+    pub fn batch_len(&self, keys: &[String]) -> io::Result<Vec<u64>> {
+        let mut body = Vec::with_capacity(4 + keys.len() * 40);
+        proto::put_u32(&mut body, keys.len() as u32);
+        for k in keys {
+            proto::put_key(&mut body, k);
+        }
+        let (status, _, data) = self.round_trip(proto::OP_BATCH_LEN, &body)?;
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status));
+        }
+        let sizes: Vec<u64> = data
+            .chunks_exact(8)
+            .map(|c| u64::from_be_bytes(c.try_into().unwrap()))
+            .collect();
+        if sizes.len() != keys.len() {
+            return Err(io::Error::other("batch_len: response count mismatch"));
+        }
+        Ok(sizes)
+    }
 }
 
 impl StorageBackend for RemoteBackend {
@@ -580,8 +602,8 @@ fn status_to_io(status: i32) -> io::Result<()> {
     }
 }
 
-/// Decode an auth-refusal payload into a message. An old server sends an empty
-/// body, so the fallback text keeps the pre-existing wording.
+/// Decode an auth-refusal payload into a message. A refusal with an empty body
+/// cannot name its cause, so the caller's generic wording is used instead.
 fn refusal_text(data: &[u8], fallback: &str) -> String {
     if data.is_empty() {
         fallback.to_string()

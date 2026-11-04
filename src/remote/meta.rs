@@ -28,10 +28,12 @@ use crate::meta::{
     LockConflict, LockType, MetaEngine, MetaError, MetaProvider, MetaStore, NodeInfo, NodeKind,
 };
 use crate::stats;
+#[cfg(feature = "native")]
 use fuser::{INodeNo, Notifier};
-use libc::EIO;
+use crate::platform::EIO;
 use parking_lot::Mutex;
 use std::collections::HashMap;
+#[cfg(feature = "native")]
 use std::ffi::OsStr;
 use std::io::{self, BufReader, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
@@ -81,9 +83,12 @@ const M_RELEASE_LOCKS: u8 = 35;
 const M_RENEW: u8 = 36;
 /// Paged variant of `M_READDIR`: `{parent, offset, limit}` -> one page of the
 /// `ORDER BY name` listing. Sent only when the `M_OPEN` ack advertised that the
-/// server pages in its own store; an unknown-op (old server) falls through to
-/// `E_DB`, which the client treats as "fall back to a full readdir". Read op.
+/// server pages in its own store. Read op.
 const M_READDIRP: u8 = 37;
+/// One-shot flat tree dump for server-side `du` aggregation. Request body is
+/// empty (the view is already bound from the session's M_OPEN). Response DATA
+/// is `[count: u32][id(i64) parent_id(i64) name(key) is_dir(u8) data_ref(key)]*`.
+const M_TREE_DUMP: u8 = 38;
 
 // --- pushed invalidation event kinds (carried in a response frame's status) --
 // EV_ENTRY: val = parent inode, data = length-prefixed name -> kernel
@@ -109,8 +114,8 @@ const E_DB: i32 = 7;
 // bound to. Not a
 // MetaError code — it only ever appears during connect (where the client maps it
 // to a PermissionDenied error) or as a refusal on an established session. The
-// `data` payload states the cause in plain text; an old server sends none, and
-// the client then falls back to the historical "rejected the access token" text.
+// `data` payload states the cause in plain text; an empty body carries no cause,
+// so the client prints its generic "rejected the access token" wording.
 const E_AUTH: i32 = 8;
 // Returned by a HA *standby* (or a demoted ex-primary) for any write-intent op
 // while it is read-only. Not a MetaError code; the client reads it as a signal
@@ -404,15 +409,15 @@ pub struct RemoteMeta {
     /// Nonzero when the `M_OPEN` handshake ack reported that the server's store
     /// can page a directory listing itself (SQLite or PostgreSQL backend). Only
     /// then does [`RemoteMeta::readdir_page`] issue the small `M_READDIRP` RPC
-    /// and only then is READDIRPLUS offered; an empty/short ack body (an old
-    /// server) leaves this 0 and the client keeps the pre-paging behaviour: one
-    /// full `M_READDIR` per kernel buffer, no READDIRPLUS. Refreshed on every
-    /// (re)handshake so a failover re-reads the cap from the live node.
+    /// and only then is READDIRPLUS offered. A zero flag leaves the client on
+    /// the non-paged path: one full `M_READDIR` per kernel buffer, no
+    /// READDIRPLUS. Refreshed on every (re)handshake so a failover re-reads the
+    /// cap from the live node.
     paged: AtomicU8,
     /// Nonzero when the `M_OPEN` ack flagged a FORK view: its metadata tree is
     /// writable (mkdir/rename/unlink) but CONTENT writes are refused with
     /// EROFS, because the bytes are shared with the base view. Refreshed on
-    /// every (re)handshake; absent on an old server -> 0 (pre-fork behavior).
+    /// every (re)handshake.
     content_ro: AtomicU8,
 }
 
@@ -427,7 +432,7 @@ impl RemoteMeta {
     /// The presenting uid: the mount process's real euid, reported to the
     /// server's call audit.
     fn self_uid() -> u32 {
-        unsafe { libc::geteuid() }
+        crate::platform::geteuid()
     }
 
     /// Like [`RemoteMeta::new`], but presents `token` in the `M_OPEN` handshake.
@@ -489,8 +494,7 @@ impl RemoteMeta {
     /// True when the bound view name resolved to a server-side DERIVED view on
     /// the last `M_OPEN` handshake — the mount must be read-only (virtual views
     /// render a shape over the base tree but refuse every mutation; writes go
-    /// to the original/physical view). False for physical views and against
-    /// servers old enough to omit the handshake flag.
+    /// to the original/physical view). Set from ack byte [0].
     pub fn is_readonly_view(&self) -> bool {
         self.readonly.load(Ordering::SeqCst) != 0
     }
@@ -499,7 +503,7 @@ impl RemoteMeta {
     /// client's to organize (mkdir/rename/unlink are served), but CONTENT
     /// writes (write/truncate) must be refused with EROFS because the bytes are
     /// shared with the base view. Signalled by `M_OPEN` ack byte [2]; false for
-    /// physical/derived views and against servers old enough to omit it.
+    /// physical/derived views.
     pub fn is_content_ro_view(&self) -> bool {
         self.content_ro.load(Ordering::SeqCst) != 0
     }
@@ -542,24 +546,26 @@ impl RemoteMeta {
                                 // data-plane client stamps writes with the live
                                 // token (advances automatically on failover).
                                 self.fence.store(epoch, Ordering::SeqCst);
-                                // Handshake ack carries a 1-byte flag: nonzero
-                                // when the view is a DERIVED (virtual) view the
-                                // server mounts read-only. An empty body is an
-                                // old server without the flag -> stays writable.
-                                self.readonly
-                                    .store(data.first().copied().unwrap_or(0), Ordering::SeqCst);
-                                // Second ack byte (if present) = server can page a
-                                // directory listing (M_READDIRP). Absent on an old
-                                // server or one whose store cannot page -> the client
-                                // keeps fetching one full listing per buffer and is
-                                // not offered READDIRPLUS.
-                                self.paged
-                                    .store(data.get(1).copied().unwrap_or(0), Ordering::SeqCst);
-                                // Third ack byte (if present) = FORK: structure
-                                // writable, content read-only (EROFS at the FUSE
-                                // layer). Absent on an old server -> fully writable.
-                                self.content_ro
-                                    .store(data.get(2).copied().unwrap_or(0), Ordering::SeqCst);
+                                // The ack body is exactly the three capability
+                                // flags below; a short body means the peer is
+                                // not this protocol. Refuse it instead of
+                                // guessing a default (a silently "writable"
+                                // mount of a read-only view is far worse than
+                                // a clear handshake error).
+                                let Some(&[ro, paged, content_ro]) = data.get(..3) else {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "meta-server handshake ack is missing the capability flags — client and server builds must match",
+                                    ));
+                                };
+                                // [0] view is DERIVED (read-only) or the key is
+                                //     read-only; [1] the store pages listings
+                                //     itself (M_READDIRP + READDIRPLUS); [2] the
+                                //     view is a FORK (structure writable, content
+                                //     read-only).
+                                self.readonly.store(ro, Ordering::SeqCst);
+                                self.paged.store(paged, Ordering::SeqCst);
+                                self.content_ro.store(content_ro, Ordering::SeqCst);
                                 self.active.store(idx, Ordering::Relaxed);
                                 return Ok((s, false));
                             }
@@ -584,13 +590,13 @@ impl RemoteMeta {
                             }
                             Ok((_, _, reason)) => {
                                 // The server refused the open with a non-auth
-                                // status (e.g. `--strict-view` saying the view
+                                // status (e.g. the explicit-creation gate saying the view
                                 // does not exist, or a resolve failure). It
                                 // carries a readable cause in the payload; print
                                 // that instead of a bare EIO, which at the FUSE
                                 // layer is indistinguishable from a dead disk.
-                                // An empty payload (an old server, or a refusal
-                                // without a reason) keeps the pre-existing EIO.
+                                // An empty payload (a refusal without a reason)
+                                // keeps the pre-existing EIO.
                                 last_err = if reason.is_empty() {
                                     io::Error::from_raw_os_error(EIO)
                                 } else {
@@ -743,11 +749,10 @@ impl MetaProvider for RemoteMeta {
         proto::put_u64(&mut b, limit as u64);
         match self.round_trip(M_READDIRP, &b) {
             Ok((0, _, data)) => nodes_from(&data).unwrap_or_default(),
-            // A failed page RPC (we raced a reconnect to a node too old to know
-            // M_READDIRP, or a transient transport error) must not truncate the
-            // directory: fall back to slicing one full listing. `round_trip`
-            // already re-handshakes on a stale socket, so `paged` reflects the
-            // live node before the next page call.
+            // A failed page RPC (a transient transport error) must not
+            // truncate the directory: fall back to slicing one full listing.
+            // `round_trip` already re-handshakes on a stale socket, so `paged`
+            // reflects the live node before the next page call.
             _ => self
                 .readdir(parent)
                 .into_iter()
@@ -1149,10 +1154,6 @@ struct MetaRuntime {
     /// stamp) evicts the cached lens so live mounts converge on the new shape
     /// without a remount. Physical entries are absent here and never re-checked.
     defs: Arc<Mutex<HashMap<String, String>>>,
-    /// `--strict-view`: gate `M_OPEN` on the view already existing (see
-    /// [`MetaServer::with_strict_view`]). Read here because the handshake
-    /// handler only has the runtime.
-    strict_view: bool,
 }
 
 impl MetaRuntime {
@@ -1254,8 +1255,9 @@ impl MetaRuntime {
     }
 }
 
-/// Central metadata authority. Holds one [`MetaEngine`] per view (lazily opened
-/// against `<base>/meta/<view>.db`), shared across all connection threads, so
+/// Central metadata authority. Holds one [`MetaEngine`] per view, opened on
+/// demand against an EXISTING `<base>/meta/<view>.db` (a missing one is
+/// refused, never created), shared across all connection threads, so
 /// every client mounting the same view sees one consistent tree. Serving a whole
 /// view from a single engine means SQLite writes are serialized in-process by
 /// the engine's own mutex — no cross-process divergence by construction.
@@ -1274,23 +1276,6 @@ pub struct MetaServer {
     sync_repl: bool,
     witness: Option<String>,
     store: StoreKind,
-    /// `--strict-view`: refuse an `M_OPEN` naming a view that does not already
-    /// exist, instead of letting [`store_for`] lazily create `meta/<view>.db`
-    /// (or a PG schema) on first open. ON BY DEFAULT: every base view is created
-    /// explicitly (`view create` / `init` / `view import`), and a typo should be
-    /// an error rather than a silent empty tree. `GROVEFS_ALLOW_LAZY_VIEW=1`
-    /// restores the old permissive behavior for throwaway clusters and legacy
-    /// scripts; an explicit `--strict-view` always wins.
-    strict_view: bool,
-}
-
-/// `GROVEFS_ALLOW_LAZY_VIEW=1|true` opts out of the default strict gate and
-/// restores lazy creation of empty view trees. An escape hatch only — the
-/// default refuses an unknown name instead of materializing `meta/<view>.db`.
-fn allow_lazy_view_env() -> bool {
-    std::env::var("GROVEFS_ALLOW_LAZY_VIEW")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
 }
 
 /// Upper bound on the primary's wait for a standby ACK under `--sync-repl`.
@@ -1313,7 +1298,6 @@ impl MetaServer {
             sync_repl: false,
             witness: None,
             store: StoreKind::Sqlite,
-            strict_view: true,
         }
     }
 
@@ -1331,7 +1315,6 @@ impl MetaServer {
             sync_repl: false,
             witness: None,
             store: StoreKind::Sqlite,
-            strict_view: true,
         }
     }
 
@@ -1344,39 +1327,6 @@ impl MetaServer {
     /// established mount instead of only refusing the next one.
     pub fn with_api_keys(mut self, store: crate::apikeys::ApiKeyStore) -> Self {
         self.keys = Some(Arc::new(store));
-        self
-    }
-
-    /// Refuse an `M_OPEN` whose view name does not ALREADY exist here, rather
-    /// than lazily creating an empty tree for it (the default: the first mount
-    /// of a new name is also how a base view is bootstrapped, so an unknown
-    /// name is not an error unless the operator says so). Strict mode answers
-    /// the typo question honestly: "no such view", with a readable reason the
-    /// client prints, and WITHOUT leaving a `meta/<view>.db` (or PG schema)
-    /// behind. The probe is the control plane's own existence check
-    /// (`has_def`/`has_physical`), so it is backend-agnostic: a governed
-    /// definition (derived/fork/alias) or an existing physical tree counts.
-    ///
-    /// Admission-time only: the per-op re-resolve in the connection loop is NOT
-    /// re-probed (under PG that would cost a catalog query per op), so a tree
-    /// deleted out-of-band under a LIVE mount is recreated by that mount's next
-    /// op — same as permissive mode. Strict mode governs who may OPEN a name,
-    /// not what an already-admitted session does.
-    /// `--strict-view` is the DEFAULT: a name that is neither an existing tree
-    /// nor a governed definition is refused at `M_OPEN` (see `view_exists`).
-    /// `GROVEFS_ALLOW_LAZY_VIEW=1` opts back into lazy creation; an explicit
-    /// `--strict-view` still wins over the env escape hatch.
-    pub fn with_strict_view(mut self, yes: bool) -> Self {
-        self.strict_view = yes || !allow_lazy_view_env();
-        self
-    }
-
-    /// Explicit opt-out of the strict gate (`--allow-lazy-view`): an unknown
-    /// view name is materialized as an EMPTY tree on its first `M_OPEN`, exactly
-    /// like the old default. The caller decides precedence — an explicit
-    /// `--strict-view` should skip this call rather than be overridden by it.
-    pub fn with_lazy_view(mut self) -> Self {
-        self.strict_view = false;
         self
     }
 
@@ -1478,7 +1428,12 @@ impl MetaServer {
                 "--store postgres://… cannot be combined with --role standby / --peer / --witness: \n                     GroveFS-native HA snapshot shipping is SQLite-only.\n                     Run PostgreSQL's own streaming / logical replication for HA,\n                     or keep the meta-server single-instance under PG.",
             ));
         }
-        std::fs::create_dir_all(self.base.join("meta"))?;
+        // SQLite trees live under `<base>/meta`; a PG store writes nothing
+        // locally, so creating that directory would be a misleading footprint
+        // (an empty `meta/` on a host that has no local metadata at all).
+        if matches!(self.store, StoreKind::Sqlite) {
+            std::fs::create_dir_all(self.base.join("meta"))?;
+        }
         let listener = TcpListener::bind(&self.listen)?;
         println!(
             "meta-server listening on {} (base {}, role {:?}{})",
@@ -1495,14 +1450,10 @@ impl MetaServer {
             // must know why the next mount got refused.
             println!("meta-server: api-key auth REQUIRED (present `mount --api-key`, minted by `grovefs apikey create --for mount|any`); a revoke closes live mounts on their next op");
         }
-        if self.strict_view {
-            // State the mode explicitly: a new base view must be created first
-            // (`view create` / `init` / `view import`), and a typo is refused
-            // instead of silently becoming an empty tree.
-            println!("meta-server: STRICT VIEW mode (default): M_OPEN refuses a name with no existing tree or definition; create it first (`grovefs view create --view <name>`, or `--home <dir> init --view <name>`), no empty tree is auto-created");
-        } else {
-            println!("meta-server: LAZY VIEW mode (GROVEFS_ALLOW_LAZY_VIEW): an unknown view name is auto-created as an EMPTY tree on first mount — a typo becomes a silent empty view");
-        }
+        // State the gate explicitly: a new base view must be created first
+        // (`view create` / `init` / `view import`), and a typo is refused
+        // instead of silently becoming an empty tree.
+        println!("meta-server: views are created explicitly — M_OPEN refuses a name with no existing tree or definition (`grovefs view create --view <name>`, or `--home <dir> init --view <name>`); no empty tree is ever auto-created");
         // HA coordination is live only when a peer was configured or we start as
         // a standby; otherwise `ha = None` preserves single-node semantics.
         let ha = if self.peer.is_some() || self.role == Role::Standby {
@@ -1539,7 +1490,6 @@ impl MetaServer {
             views: Arc::new(Mutex::new(HashMap::new())),
             bases: Arc::new(Mutex::new(HashMap::new())),
             defs: Arc::new(Mutex::new(HashMap::new())),
-            strict_view: self.strict_view,
         });
         if rt.sync_repl {
             println!("meta-server: synchronous replication ON (RPO=0 for mutating ops, ACK timeout {SYNC_REPL_ACK_TIMEOUT:?})");
@@ -1624,22 +1574,15 @@ pub fn serve_on_meta(listener: TcpListener, base: PathBuf) {
     serve_on_meta_auth(listener, base, "")
 }
 
-/// Accept loop with an access token (`""` disables the check). Single-node (no
-/// HA), matching the historical behavior all existing tests rely on.
+/// Accept loop with an access token (`""` disables the check). Single-node
+/// (no HA), the shape every test server uses.
 pub fn serve_on_meta_auth(listener: TcpListener, base: PathBuf, token: &str) {
-    serve_on_meta_full(listener, base, token, false);
+    serve_on_meta_full(listener, base, token);
 }
 
-/// The same single-node loop with `--strict-view` semantics, for tests: an
-/// `M_OPEN` naming a view that does not exist is refused (with a readable
-/// reason) instead of being lazily created.
-pub fn serve_on_meta_strict(listener: TcpListener, base: PathBuf, token: &str, strict: bool) {
-    serve_on_meta_full(listener, base, token, strict);
-}
-
-fn serve_on_meta_full(listener: TcpListener, base: PathBuf, token: &str, strict_view: bool) {
-    // SQLite-only helper (the historical single-node path): the control plane is
-    // the local `meta/views` dir, matching `store: StoreKind::Sqlite`.
+fn serve_on_meta_full(listener: TcpListener, base: PathBuf, token: &str) {
+    // SQLite-only helper (single-node path): the control plane is the local
+    // `meta/views` dir, matching `store: StoreKind::Sqlite`.
     let control =
         crate::mcp::control_store_for(&base, None).expect("file control store is infallible");
     let rt = Arc::new(MetaRuntime {
@@ -1659,7 +1602,6 @@ fn serve_on_meta_full(listener: TcpListener, base: PathBuf, token: &str, strict_
         views: Arc::new(Mutex::new(HashMap::new())),
         bases: Arc::new(Mutex::new(HashMap::new())),
         defs: Arc::new(Mutex::new(HashMap::new())),
-        strict_view,
     });
     serve_runtime(listener, rt);
 }
@@ -1729,10 +1671,9 @@ fn load_aliases(store: &dyn crate::mcp::ControlStore) -> io::Result<HashMap<Stri
 
 /// Does `view` already exist here — as a governed definition (derived / fork /
 /// alias) or as a physical tree — WITHOUT creating anything? This is the probe
-/// `--strict-view` gates `M_OPEN` with, and it must stay non-creating: calling
+/// `M_OPEN` gates with, and it must stay non-creating: calling
 /// [`view_provider`] first would already have materialized `meta/<view>.db`
-/// (or a PG schema) via [`store_for`], which is exactly what strict mode is
-/// there to prevent.
+/// (or a PG schema) via [`store_for`].
 ///
 /// Backend-agnostic by construction: both questions go to the control store
 /// that follows the metadata backend (a `meta/views/*.layout` file / a
@@ -1850,12 +1791,11 @@ fn view_provider(rt: &MetaRuntime, view: &str) -> io::Result<Arc<dyn MetaProvide
                     "derived view cannot build on another derived view",
                 ));
             }
-            // Strict mode forbids creating the base as a side effect of mounting
-            // the lens: a published definition whose base was never created is a
+            // Never create the base as a side effect of mounting the lens: a
+            // published definition whose base was never created is a
             // provisioning mistake, and `store_for` below would otherwise leave
-            // an empty `meta/<base>.db` (or PG schema) behind exactly like the
-            // permissive `M_OPEN` path it replaced.
-            if rt.strict_view && !control.has_physical(&b).map_err(io::Error::other)? {
+            // an empty `meta/<base>.db` (or PG schema) behind.
+            if !control.has_physical(&b).map_err(io::Error::other)? {
                 return Err(io::Error::other(format!(
                     "derived view '{view}': its base '{b}' has no physical tree in {} — create the base first (`grovefs view create --view {b}`), then mount `{view}` again",
                     control.describe()
@@ -2016,7 +1956,15 @@ fn broadcast_derived_display(rt: &MetaRuntime, phys: &str, events: &[Event]) {
                     // Flush the display parent's cached listing (synthesized
                     // dirs have fixed mtime → pages never self-invalidate).
                     extra.push(Event::Inode { ino: p });
+                    prov.flush_listing(p);
                 }
+                // This very server renders the lens for its derived
+                // subscribers, materializing each shaped listing (see
+                // `LayoutMeta::listing`). The mutation reached the kernel
+                // caches above, but nothing told the provider it renders with,
+                // so without this the subscriber's next READDIR would be served
+                // the pre-event rows straight out of the lens's own cache.
+                prov.flush_listing(*parent);
             }
         }
         broadcast(&rt.subs, &dname, &extra);
@@ -2179,7 +2127,7 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
     // public alias).
     let presented_name = view.clone();
     // Enforce the shared secret when one is configured; an empty server token
-    // accepts any client (backward-compatible, LAN-trusted).
+    // means no auth at all (trusted LAN).
     if !rt.token.is_empty() && presented != rt.token {
         proto::send_response(
             &mut writer,
@@ -2280,13 +2228,12 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
             }
         }
     }
-    // Strict mode (`--strict-view`): refuse a name that does not ALREADY exist,
-    // instead of the default lazy creation below. This must run BEFORE
-    // `view_provider`, because that call is what materializes the tree: by the
-    // time it fails (or succeeds with an empty tree), `meta/<view>.db` (or a
-    // PG schema) is already on disk — the one side effect strict mode exists
-    // to prevent. The probe is non-creating and backend-agnostic
-    // (`has_def` / `has_physical` on the control store).
+    // Explicit-creation gate: refuse a name that does not ALREADY exist. This
+    // must run BEFORE `view_provider`, because that call is what materializes
+    // the tree: by the time it fails (or succeeds with an empty tree),
+    // `meta/<view>.db` (or a PG schema) is already on disk — the one side
+    // effect this gate exists to prevent. The probe is non-creating and
+    // backend-agnostic (`has_def` / `has_physical` on the control store).
     //
     // Placement after the binding check is deliberate: an out-of-scope key is
     // still reported as an access decision first (`E_AUTH`, with the reason),
@@ -2294,44 +2241,42 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
     // refusal is `E_DB` (a data-plane fact, not a credential one) WITH a
     // readable payload, which the client prints instead of a bare EIO; it is
     // also recorded in the API-key audit log when a key store is configured.
-    if rt.strict_view {
-        let why = match view_exists(&rt, &view) {
-            Ok(true) => String::new(),
-            Ok(false) => {
-                let hint = if rt.control.backend() == "postgres" {
-                    "a PG base view is a schema: create it first with `grovefs view --store postgres://… --db-path <db-path> create --view <name>`, or restore the schema from a dump"
-                } else {
-                    "create it first: `grovefs view --db-path <db-path> create --view <name>` (or `grovefs --home <db-path> init --view <name>`, or seed it with `grovefs view import`)"
-                };
-                // `view` is the POST-ALIAS real name; name the alias the caller
-                // actually mounted too, so "pub does not exist" never reads as
-                // if the alias itself were unknown.
-                let backend = rt.control.backend();
-                let where_ = if presented_name != view {
-                    format!("{backend}; mounted as alias '{presented_name}' -> '{view}'")
-                } else {
-                    backend.to_string()
-                };
-                format!(
-                    "view '{view}' does not exist on this meta-server ({where_}): no tree and no definition — views are created explicitly, so unknown names are refused instead of becoming an empty tree; {hint}"
-                )
-            }
-            Err(e) => format!("view '{view}': cannot verify existence: {e}"),
-        };
-        if !why.is_empty() {
-            eprintln!("meta: M_OPEN view='{view}' refused (strict): {why}");
-            if let Some(store) = &rt.keys {
-                let _ = store.log_call(
-                    authed.as_ref(),
-                    "meta",
-                    "M_OPEN",
-                    false,
-                    &format!("view='{view}': strict-view: {why}"),
-                );
-            }
-            proto::send_response(&mut writer, E_DB, 0, why.as_bytes())?;
-            return Ok(());
+    let why = match view_exists(&rt, &view) {
+        Ok(true) => String::new(),
+        Ok(false) => {
+            let hint = if rt.control.backend() == "postgres" {
+                "a PG base view is a schema: create it first with `grovefs view --store postgres://… --db-path <db-path> create --view <name>`, or restore the schema from a dump"
+            } else {
+                "create it first: `grovefs view --db-path <db-path> create --view <name>` (or `grovefs --home <db-path> init --view <name>`, or seed it with `grovefs view import`)"
+            };
+            // `view` is the POST-ALIAS real name; name the alias the caller
+            // actually mounted too, so "pub does not exist" never reads as
+            // if the alias itself were unknown.
+            let backend = rt.control.backend();
+            let where_ = if presented_name != view {
+                format!("{backend}; mounted as alias '{presented_name}' -> '{view}'")
+            } else {
+                backend.to_string()
+            };
+            format!(
+                "view '{view}' does not exist on this meta-server ({where_}): no tree and no definition — views are created explicitly, so unknown names are refused instead of becoming an empty tree; {hint}"
+            )
         }
+        Err(e) => format!("view '{view}': cannot verify existence: {e}"),
+    };
+    if !why.is_empty() {
+        eprintln!("meta: M_OPEN view='{view}' refused: {why}");
+        if let Some(store) = &rt.keys {
+            let _ = store.log_call(
+                authed.as_ref(),
+                "meta",
+                "M_OPEN",
+                false,
+                &format!("view='{view}': {why}"),
+            );
+        }
+        proto::send_response(&mut writer, E_DB, 0, why.as_bytes())?;
+        return Ok(());
     }
     // Validate the view resolves (physical db or a parseable derived-view
     // definition) before acking. We deliberately do NOT hold this provider for
@@ -2378,9 +2323,6 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
     //   [2] nonzero when `view` is a FORK: the metadata tree is writable but
     //       CONTENT writes are refused client-side with EROFS (bytes are shared
     //       with the base view).
-    // Old clients read only the bytes they know and ignore the rest; an old
-    // server sends just [0], so a new client sees no [1]/[2] and keeps the
-    // pre-paging / pre-fork writable behavior.
     let client_ro = rt.is_derived(&view) || authed.as_ref().map(|a| a.ro).unwrap_or(false);
     let content_ro = is_fork_def(&*rt.control, &view)?;
     let ack_flags = [client_ro as u8, paged_cap, content_ro as u8];
@@ -3500,6 +3442,19 @@ fn dispatch_meta(
             engine.renew_locks(sid);
             (0, 0, Vec::new(), Vec::new())
         }
+        M_TREE_DUMP => {
+            let entries = engine.dump_tree();
+            let mut d = Vec::with_capacity(4 + entries.len() * 60);
+            proto::put_u32(&mut d, entries.len() as u32);
+            for (id, pid, name, is_dir, data_ref) in &entries {
+                d.extend_from_slice(&id.to_be_bytes());
+                d.extend_from_slice(&pid.to_be_bytes());
+                proto::put_key(&mut d, name);
+                d.push(if *is_dir { 1 } else { 0 });
+                proto::put_key(&mut d, data_ref.as_deref().unwrap_or(""));
+            }
+            (0, 0, d, Vec::new())
+        }
         _ => (E_DB, 0, Vec::new(), Vec::new()),
     }
 }
@@ -3607,6 +3562,7 @@ fn split_addrs(s: &str) -> Vec<String> {
 /// source-coordinate events into display coordinates (inval_entry + inval_inode
 /// at the synthesized parent), narrowing the staleness window for relocated
 /// entries from the attr-TTL (~2s) to sub-ms.
+#[cfg(feature = "native")]
 pub fn spawn_invalidation_listener(
     addr: &str,
     view: &str,
@@ -3646,6 +3602,7 @@ pub fn spawn_invalidation_listener(
     })
 }
 
+#[cfg(feature = "native")]
 fn run_event_stream(
     addr: &str,
     view: &str,
@@ -3666,9 +3623,14 @@ fn run_event_stream(
                     let _ = notifier.inval_entry(INodeNo(val), OsStr::new(&name));
                     // Display-coordinate enrichment for local-lens mounts:
                     if let Some(prov) = display {
+                        // Whoever's listing changed, the materialized rows for
+                        // it are now wrong — the kernel is told, the provider
+                        // must be told too (a lens caches its own shaping).
+                        prov.flush_listing(val as i64);
                         for (p, dn) in prov.display_targets(val as i64, &name) {
                             let _ = notifier.inval_entry(INodeNo(p as u64), OsStr::new(&dn));
                             let _ = notifier.inval_inode(INodeNo(p as u64), 0, -1);
+                            prov.flush_listing(p);
                         }
                     }
                 }
@@ -3677,6 +3639,12 @@ fn run_event_stream(
                 // offset 0, len -1 => invalidate the whole inode (attrs + pages),
                 // so a peer's write to a file we have open is seen on next read.
                 let _ = notifier.inval_inode(INodeNo(val), 0, -1);
+                // The server sends this for a display parent whose listing a
+                // relocated entry just changed; a provider caching listings has
+                // to drop the same rows the kernel just forgot.
+                if let Some(prov) = display {
+                    prov.flush_listing(val as i64);
+                }
             }
             _ => {}
         }
@@ -3696,7 +3664,7 @@ mod ha_tests {
         );
         // whitespace tolerated, empties dropped
         assert_eq!(split_addrs(" a , , b "), vec!["a", "b"]);
-        // a single address stays a single-element list (legacy behavior intact)
+        // a single address stays a single-element list (unchanged)
         assert_eq!(split_addrs("only:1"), vec!["only:1"]);
         // a degenerate all-empty input collapses to the original so nothing vanishes
         assert_eq!(split_addrs(""), vec![""]);
@@ -3791,7 +3759,8 @@ mod ha_tests {
             .tempdir()
             .unwrap();
         let base = dir.path().to_path_buf();
-        std::fs::create_dir_all(base.join("meta")).unwrap();
+        // Views are explicit: provision the one this test mounts.
+        drop(MetaStore::open_sqlite(&base, "alice", false).unwrap());
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         std::thread::spawn(move || serve_on_meta_auth(listener, base, ""));
@@ -3872,7 +3841,6 @@ mod ha_tests {
             standby_push: Mutex::new(()),
             witness: Some(waddr),
             store: StoreKind::Sqlite,
-            strict_view: false,
         });
 
         // Witness holds nothing above our epoch: the first proof grants a lease
@@ -3921,8 +3889,8 @@ mod ha_tests {
 
     #[test]
     fn quorum_size_is_a_strict_majority() {
-        // A single arbiter (the legacy `--witness` shape) needs exactly 1 grant,
-        // so the quorum path is a strict superset of the old single-witness one.
+        // A single arbiter (the N=1 `--witness` shape) needs exactly 1 grant,
+        // so the quorum path is a strict superset of the single-witness one.
         assert_eq!(quorum_size(1), 1);
         assert_eq!(
             quorum_size(2),
@@ -3935,9 +3903,9 @@ mod ha_tests {
     }
 
     #[test]
-    fn classify_single_arbiter_matches_legacy_verdicts() {
-        // N=1: quorum_size==1, so a single reply drives the verdict exactly as the
-        // old single witness did — advancing wins+leases, being ahead fences.
+    fn classify_single_arbiter_matches_single_witness_verdicts() {
+        // N=1: quorum_size==1, so a single reply drives the verdict exactly as a
+        // single witness does — advancing wins+leases, being ahead fences.
         let q = quorum_size(1);
         let ahead_of_us = classify(&[(7, true)], 5);
         assert!(

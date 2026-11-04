@@ -57,8 +57,8 @@ pub struct PlacementBackend {
 }
 
 impl PlacementBackend {
-    /// Open one [`LocalBackend`](super::local::LocalBackend) per root (bucket
-    /// table and legacy sweep included on each). Errors if a root cannot be
+    /// Open one [`LocalBackend`](super::local::LocalBackend) per root (its bucket
+    /// table included). Errors if a root cannot be
     /// opened — a storage node must not silently serve a subset of its disks.
     pub fn new(roots: &[PathBuf]) -> io::Result<Self> {
         if roots.is_empty() {
