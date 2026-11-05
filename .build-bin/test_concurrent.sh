@@ -11,11 +11,11 @@
 #   - Final PRAGMA integrity_check == ok.
 # Assertion-based (pass/fail counters + real exit code) like the other suites.
 set -u
-cd /data/xy/grovefs
+cd "$(dirname "$0")/.."
 # Force English coreutils messages so the EEXIST/EIO text assertions below are
 # locale-independent (this host's default locale is Chinese).
 export LC_ALL=C LANG=C
-export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
+export PKG_CONFIG="$PWD/.build-bin/pkg-config"
 Y=./target/release/grovefs
 
 rm -rf .ctest; mkdir -p .ctest/home .ctest/m1 .ctest/m2

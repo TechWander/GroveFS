@@ -1,5 +1,5 @@
 #!/bin/bash
-cd /data/xy/grovefs
+cd "$(dirname "$0")/.."
 S=/tmp/grove_case
 rm -rf $S; mkdir -p $S/data $S/mnt_da $S/mnt_db $S/etc
 umask 077

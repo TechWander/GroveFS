@@ -5,8 +5,8 @@
 # source, and the synthesized-dir creation guard. Assertion-based like the
 # other mount suites; SUMMARY line for run_all.sh.
 set -u
-cd /data/xy/grovefs
-export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
+cd "$(dirname "$0")/.."
+export PKG_CONFIG="$PWD/.build-bin/pkg-config"
 Y=./target/release/grovefs
 rm -rf .ltest; mkdir -p .ltest/home .ltest/mnt_base .ltest/mnt_a .ltest/mnt_b .ltest/mnt_c .ltest/mnt_d
 export GROVEFS_HOME=$PWD/.ltest/home

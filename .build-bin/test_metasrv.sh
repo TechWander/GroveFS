@@ -9,9 +9,9 @@
 #
 # Assertion-based (pass/fail counters + a real exit code) like the other suites.
 set -u
-cd /data/xy/grovefs
+cd "$(dirname "$0")/.."
 export LC_ALL=C LANG=C
-export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
+export PKG_CONFIG="$PWD/.build-bin/pkg-config"
 Y=./target/release/grovefs
 
 META=127.0.0.1:15094

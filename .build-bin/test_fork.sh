@@ -18,8 +18,8 @@
 #   - `view rm` deletes the fork's own tree + rebuilds the ledger, base intact.
 # Assertion-based; emits a SUMMARY line run_all reads.
 set -u
-cd /data/xy/grovefs
-export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
+cd "$(dirname "$0")/.."
+export PKG_CONFIG="$PWD/.build-bin/pkg-config"
 Y=./target/release/grovefs
 rm -rf .ftest
 mkdir -p .ftest/home .ftest/mnt_base .ftest/mnt_lab .ftest/mnt_srv_lab .ftest/mnt_srv_base

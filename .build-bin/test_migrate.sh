@@ -19,8 +19,8 @@
 #   - several base views coexist, each with its own tree and its own bytes.
 # Assertion-based; emits a SUMMARY line run_all reads.
 set -u
-cd /data/xy/grovefs
-export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
+cd "$(dirname "$0")/.."
+export PKG_CONFIG="$PWD/.build-bin/pkg-config"
 Y=./target/release/grovefs
 rm -rf .migtest
 mkdir -p .migtest/src .migtest/dst .migtest/mnt_src .migtest/mnt_dst .migtest/mnt_lab \

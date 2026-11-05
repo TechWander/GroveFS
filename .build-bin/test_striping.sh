@@ -13,8 +13,8 @@
 #   * a legacy single-object key (bare uuid, no `s` prefix) still round-trips —
 #     backward compatibility with pre-striping objects is preserved.
 set -u
-cd /data/xy/grovefs
-export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
+cd "$(dirname "$0")/.."
+export PKG_CONFIG="$PWD/.build-bin/pkg-config"
 Y=./target/release/grovefs
 # two data servers, distinct roots — the striping targets.
 A=127.0.0.1:15121

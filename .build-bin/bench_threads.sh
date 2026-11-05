@@ -14,8 +14,8 @@
 # single-stream write was large (an earlier run: 407 -> 534), the concurrent and
 # read numbers were stable.
 set -u
-cd /data/xy/grovefs
-export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
+cd "$(dirname "$0")/.."
+export PKG_CONFIG="$PWD/.build-bin/pkg-config"
 Y=./target/release/grovefs
 SIZE_MB=${SIZE_MB:-512}
 BS=${BS:-1M}

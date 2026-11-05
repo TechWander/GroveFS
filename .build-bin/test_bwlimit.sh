@@ -20,9 +20,9 @@
 # and fails the 1.4 s floor; a slow CI disk only adds time, never subtracts.
 # Assertion-based (pass/fail counters + real exit code).
 set -u
-cd /data/xy/grovefs
+cd "$(dirname "$0")/.."
 export LC_ALL=C LANG=C
-export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
+export PKG_CONFIG="$PWD/.build-bin/pkg-config"
 Y=./target/release/grovefs
 B=.bwtest
 rm -rf $B

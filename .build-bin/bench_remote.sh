@@ -16,8 +16,8 @@
 # before claiming a win. Correctness of the chunked path is gated by test_remote
 # section 8 and tests/remote_roundtrip.rs instead.
 set -u
-cd /data/xy/grovefs
-export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
+cd "$(dirname "$0")/.."
+export PKG_CONFIG="$PWD/.build-bin/pkg-config"
 Y=./target/release/grovefs
 ADDR=127.0.0.1:15098
 SIZE_MB=${SIZE_MB:-512}

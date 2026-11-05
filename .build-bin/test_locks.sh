@@ -20,9 +20,9 @@
 #
 # Assertion-based (pass/fail counters + real exit code) like every other suite.
 set -u
-cd /data/xy/grovefs
+cd "$(dirname "$0")/.."
 export LC_ALL=C LANG=C
-export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
+export PKG_CONFIG="$PWD/.build-bin/pkg-config"
 # Short lease so section 4 finishes in seconds, not minutes. Local mounts pick
 # this up through `LockLease::secs()` reading the env at first call.
 export GROVEFS_LOCK_LEASE_SECS=3

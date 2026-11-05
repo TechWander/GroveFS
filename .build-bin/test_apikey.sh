@@ -8,7 +8,7 @@
 # file-piped stdio pattern (stdin EOF shuts the server), deterministic for
 # request->response assertions. Assertion-based; emits a SUMMARY line run_all reads.
 set -u
-cd /data/xy/grovefs
+cd "$(dirname "$0")/.."
 Y=./target/release/grovefs
 BASE=$PWD/.apitest/home
 rm -rf .apitest

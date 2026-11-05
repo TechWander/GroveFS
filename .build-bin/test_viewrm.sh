@@ -16,8 +16,8 @@
 #     removed name is refused (there is no lazy re-creation switch at all).
 # Assertion-based; emits a SUMMARY line run_all reads.
 set -u
-cd /data/xy/grovefs
-export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
+cd "$(dirname "$0")/.."
+export PKG_CONFIG="$PWD/.build-bin/pkg-config"
 Y=./target/release/grovefs
 rm -rf .vrtest
 mkdir -p .vrtest/home .vrtest/mnt .vrtest/mnt2 .vrtest/src

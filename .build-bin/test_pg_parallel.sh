@@ -15,9 +15,9 @@
 # on the `grovefs` database. Self-skips cleanly if PG is unreachable, so the
 # run_all board stays GREEN on hosts without PG.
 set -u
-cd /data/xy/grovefs
+cd "$(dirname "$0")/.."
 export LC_ALL=C LANG=C
-export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
+export PKG_CONFIG="$PWD/.build-bin/pkg-config"
 Y=./target/release/grovefs
 
 PGHOST=${PGHOST:-127.0.0.1}

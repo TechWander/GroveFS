@@ -20,8 +20,8 @@
 #
 # Assertion-based like the other suites; emits a SUMMARY line for run_all.sh.
 set -u
-cd /data/xy/grovefs
-export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
+cd "$(dirname "$0")/.."
+export PKG_CONFIG="$PWD/.build-bin/pkg-config"
 Y=./target/release/grovefs
 HOME_DIR=$PWD/.govcheck/home
 rm -rf .govcheck; mkdir -p .govcheck/home .govcheck/mnt_base .govcheck/mnt_lens .govcheck/mnt_map

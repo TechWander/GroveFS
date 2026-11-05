@@ -2,8 +2,8 @@
 # End-to-end check of the opt-in per-stage telemetry + the .grove-stats control
 # node. Runs entirely on the local (embedded SQLite) backend, debug binary.
 set -u
-cd /data/xy/grovefs
-export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
+cd "$(dirname "$0")/.."
+export PKG_CONFIG="$PWD/.build-bin/pkg-config"
 Y=./target/debug/grovefs
 W=$(mktemp -d)
 mkdir -p "$W/home" "$W/mnt"

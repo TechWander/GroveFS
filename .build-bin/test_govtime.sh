@@ -15,8 +15,8 @@
 #
 # Assertion-based like the other suites; emits a SUMMARY line for run_all.sh.
 set -u
-cd /data/xy/grovefs
-export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
+cd "$(dirname "$0")/.."
+export PKG_CONFIG="$PWD/.build-bin/pkg-config"
 Y=./target/release/grovefs
 rm -rf .govtime; mkdir -p .govtime/home .govtime/mnt_base .govtime/mnt_dv .govtime/mnt_al
 export GROVEFS_HOME=$PWD/.govtime/home

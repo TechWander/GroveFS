@@ -28,6 +28,8 @@ pub mod control;
 pub mod du;
 #[cfg(feature = "native")]
 pub mod fs_impl;
+#[cfg(feature = "native")]
+pub mod gc;
 pub mod layout;
 #[cfg(feature = "native")]
 pub mod mcp;

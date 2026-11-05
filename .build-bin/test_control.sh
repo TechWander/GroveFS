@@ -19,9 +19,9 @@
 #   5) mount admission gated by a PG-stored key: a --require-api-key meta-server
 #      on PG admits a mount presenting the key and refuses one that does not.
 set -u
-cd /data/xy/grovefs
+cd "$(dirname "$0")/.."
 export LC_ALL=C LANG=C
-export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
+export PKG_CONFIG="$PWD/.build-bin/pkg-config"
 Y=${Y:-./target/release/grovefs}
 [ -x "$Y" ] || Y=./target/debug/grovefs
 

@@ -21,6 +21,7 @@
 | 看有哪些视图 / 某棵树实际长什么样 | `view list` · MCP `list_views` / `get_view` / `list_view_tree` | §3.2、§3.5 |
 | 换机器/换系统迁移单个视图 | `view export` + `view import` | §3.4.2 |
 | 删一个定义 / 删整棵基视图并回收字节 | `view rm --name F` / `view rm --name F --base` | §3.4.3、§5.3 |
+| 排查/回收孤儿对象(离线) | `gc --db-path D [--data-root R] [--apply]` | §12.6 |
 | 让智能体自己定制数据列表 | `grovefs mcp`(stdio JSON-RPC) | §3.5 |
 | 给接口和挂载点加锁、逐调用方撤销 | `apikey create/list/revoke/set-ro/calls` | §3.5.1、§6 |
 | 只读挂载 / 零缓存强一致 | `mount --ro` / `--strict` | §7 |
@@ -92,7 +93,7 @@
 
 ```bash
 # 依赖:Linux + fuse3(fusermount)、pkg-config shim(已内置,无需 libfuse 开发包)
-export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config   # 构建时需要
+export PKG_CONFIG="$PWD/.build-bin/pkg-config"   # 构建时需要(在仓库根目录执行)
 export LC_ALL=C LANG=C
 cargo build --release                                       # 产物:target/release/grovefs
 ```
@@ -990,7 +991,7 @@ docs  photos
 {"kind":"derived","base":"team","hide":1,"only":0,"reloc":0,"definition":"base team\nhide /photos/private","mount":"read-only (virtual shape; writes go to the base view)"}
 ```
 
-十个工具与参数:治理八个——`list_views`(可选 `db_path`)、`define_derived_view`(`name`/`base`/`rules`,后者为内联规则文本)、`alias_view`(`name`/`real`/可选 `retire` 原子轮换)、`fork_view`(`name`/`base`,可选 `seed`——`false` 只建一个空树根,把“拷不拷目录项”交给调用方;把基视图目录项复制成独立元数据树——结构可写、内容 EROFS)、`graft_view`(`name`/`map` 计划文本,可选 `src`(缺省取 fork 定义的基名)/`dest`/`skip_existing`——把别的视图里点名的条目(源为目录则连整棵子树)接进目标视图的任意位置,逐条改名,字节零复制、整份计划一个事务),`remove_view`(`name`,删 fork 时连同其自己的树)、`preview_rules`(`rules`,干跑校验动词语法不写盘)、`validate_definition`(`name`/`base`/`rules`,发布前把整副定义走完 define 的全部治理守卫——非法名、名与基同名、遮蔽物理 db、覆盖纯别名、规则语法——拒绝时回与真实发布逐字节相同的文案、接受时回 JSON 判定,绝不写盘);只读探查两个——`list_view_tree`(`view` 或 `base`+`rules` 模拟,可选 `path`/`depth`/`max`/`db_path`;渲染挂载实际所见的路径清单,可经已发布透镜或不落盘模拟一副规则)、`get_view`(`name`,返回单个定义的原始 `definition` 文本与计数)。同一套治理再以 MCP 其余常用方法面二次暴露,复用**完全相同的渲染器**,故资源/提示/补全与工具结果逐字节一致:**资源** `resources/list`/`resources/templates/list`/`resources/read` 把某视图作为可附着上下文——`grovefs://view/<name>/definition`(原样治理文本)与 `/tree`(挂载实见的清单);**提示** `prompts/list`/`prompts/get` 提供两副参数化治理剧本(`reshape-view`、`rotate-alias`);**补全** `completion/complete` 用存储里的真实视图名对 `name`/`base`/`view`/`real` 参数做前缀补全;**日志** `logging/setLevel` 设会话阈值后,服务端在每次应答调用后按严重度(成功 `info`、失败 `warning`)推送 `notifications/message`。语义:全部治理守卫照常适用(派生挂载只读、别名期间真实名拒挂、`--retire` 先写后删、fork 结构写放行/内容 EROFS;改定义热生效仍只在 `meta-server` 入口,本地挂载挂载时解析一次)。协议细节:通知(无 id)一律不作答;非法帧回 `-32700` 后继续服务;缺参与未知工具按 MCP 惯例回 `isError` 而非协议错误。`db_path` 默认取 `grovefs mcp --db-path`(回退 `--home`),也可逐调用覆盖。e2e 见 `mcp` 套件(65 条断言:握手能力面声明/发现(含 handshake `instructions` 逐个点名十工具)/内联规则换形/路径探查与形状预览/发布前干跑校验/别名轮换/空 fork `seed:false` + `graft_view` 接枝/接枝守卫面 11 条拒绝原文(自接·空计划·`..`·根路径·基视图缺 `src`·目标或源为派生/别名·无名树·非法名·重名整批回滚·`skip_existing` 跳过)/CLI 同文案/资源枚举与读取/提示实例化/视图名补全/日志阈值→通知/协议错误路径)。智能体侧的接线手册（英文，便于国际化部署）已随仓库沉淀为一个项目 skill(`skills/grovefs-mcp/`):`SKILL.md`(拉起方式、十工具参数表、黄金工作流、逐个确切拒绝文案表、硬边界)、`reference.md`(完整方法面/鉴权门矩阵/错误码/落盘效果/CLI 对照)、`examples.md`(真实回显),并附两个脚本:`scripts/mcp_call.py`(零依赖 stdio JSON-RPC 客户端,回包分开 stdout/stderr,退出码 0 成功 / 2 协议错误 / 3 工具拒绝 / 4 传输问题)与 `scripts/smoke.sh`(在 `mktemp -d` 的临时存储根上跑完全链路并逐条断言,不碰真实数据)。
+十个工具与参数:治理八个——`list_views`(可选 `db_path`)、`define_derived_view`(`name`/`base`/`rules`,后者为内联规则文本)、`alias_view`(`name`/`real`/可选 `retire` 原子轮换)、`fork_view`(`name`/`base`,可选 `seed`——`false` 只建一个空树根,把“拷不拷目录项”交给调用方;把基视图目录项复制成独立元数据树——结构可写、内容 EROFS)、`graft_view`(`name`/`map` 计划文本,可选 `src`(缺省取 fork 定义的基名)/`dest`/`skip_existing`——把别的视图里点名的条目(源为目录则连整棵子树)接进目标视图的任意位置,逐条改名,字节零复制、整份计划一个事务),`remove_view`(`name`,删 fork 时连同其自己的树)、`preview_rules`(`rules`,干跑校验动词语法不写盘)、`validate_definition`(`name`/`base`/`rules`,发布前把整副定义走完 define 的全部治理守卫——非法名、名与基同名、遮蔽物理 db、覆盖纯别名、规则语法——拒绝时回与真实发布逐字节相同的文案、接受时回 JSON 判定,绝不写盘);只读探查两个——`list_view_tree`(`view` 或 `base`+`rules` 模拟,可选 `path`/`depth`/`max`/`db_path`;渲染挂载实际所见的路径清单,可经已发布透镜或不落盘模拟一副规则)、`get_view`(`name`,返回单个定义的原始 `definition` 文本与计数)。同一套治理再以 MCP 其余常用方法面二次暴露,复用**完全相同的渲染器**,故资源/提示/补全与工具结果逐字节一致:**资源** `resources/list`/`resources/templates/list`/`resources/read` 把视图与手册作为可附着上下文——`grovefs://guide` 原样回分节操作手册、`grovefs://views` 回与 `list_views` 相同的快照、`grovefs://view/<name>/definition`(原样治理文本)与 `/tree`(挂载实见的清单,模板带 `{?path,depth,max}`,与 `list_view_tree` 的参数同义——大树可一次只附一个子树,被界剪断时 `truncated:true`);**提示** `prompts/list`/`prompts/get` 提供两副参数化治理剧本(`reshape-view`、`rotate-alias`);**补全** `completion/complete` 按 `ref` 角色感知(`reshape-view.base` / `rotate-alias.real` 只给物理视图,`rotate-alias.new`/`old` 只给别名,其余给全部视图名);**日志** `logging/setLevel` 设会话阈值后,服务端在每次应答调用后按严重度(成功 `info`、失败 `warning`)推送 `notifications/message`,`data` 带方法与被操作对象(如 `tools/call list_views ok`)。面向运行时的元数据:每个工具带 `title` 与 `annotations`(`readOnlyHint` 标出 `list_views`/`preview_rules`/`validate_definition`/`list_view_tree`/`get_view`,`destructiveHint` 只给 `alias_view`/`remove_view`);四个回 JSON 的工具带 `outputSchema`,结果同时给 `structuredContent`;`initialize` 的 `instructions` 分七节(Discover/Reshape/Curate/Validate before publishing/Golden order/Beyond tools/Mechanics),客户端注入上下文即可照做。协议细节补一条:按 `2025-06-18`/`2025-03-26`/`2024-11-05` 协商,不认识的版本回 `2025-06-18`;`arguments` 也接受 JSON 字符串;缺参附 `(tool 'x' requires: …)`、工具名打错附 `did you mean '…'?` 与 `available:` 清单。语义:全部治理守卫照常适用(派生挂载只读、别名期间真实名拒挂、`--retire` 先写后删、fork 结构写放行/内容 EROFS;改定义热生效仍只在 `meta-server` 入口,本地挂载挂载时解析一次)。协议细节:通知(无 id)一律不作答;非法帧回 `-32700` 后继续服务;缺参与未知工具按 MCP 惯例回 `isError` 而非协议错误。`db_path` 默认取 `grovefs mcp --db-path`(回退 `--home`),也可逐调用覆盖。e2e 见 `mcp` 套件(77 条断言:握手能力面声明与协议协商/发现(`instructions` 逐个点名十工具且分节、`title`+`annotations`+`outputSchema`)/内联规则换形/路径探查与形状预览/发布前干跑校验/别名轮换/空 fork `seed:false` + `graft_view` 接枝/接枝守卫面 11 条拒绝原文(自接·空计划·`..`·根路径·基视图缺 `src`·目标或源为派生/别名·无名树·非法名·重名整批回滚·`skip_existing` 跳过)/CLI 同文案/资源枚举与读取(含 `grovefs://guide`、`grovefs://views`、树查询参数下钻与 `max` 截断)/提示实例化/按 `ref` 角色感知的视图名补全/`structuredContent` 与文本一致/未知工具建议与缺参提示/日志阈值→通知且 `data` 带工具名/协议错误路径)。智能体侧的接线手册（英文，便于国际化部署）已随仓库沉淀为一个项目 skill(`skills/grovefs-mcp/`):`SKILL.md`(拉起方式、十工具参数表、黄金工作流、逐个确切拒绝文案表、硬边界)、`reference.md`(完整方法面/鉴权门矩阵/错误码/落盘效果/CLI 对照)、`examples.md`(真实回显),并附两个脚本:`scripts/mcp_call.py`(零依赖 stdio JSON-RPC 客户端,回包分开 stdout/stderr,退出码 0 成功 / 2 协议错误 / 3 工具拒绝 / 4 传输问题)与 `scripts/smoke.sh`(在 `mktemp -d` 的临时存储根上跑完全链路并逐条断言,不碰真实数据)。
 
 ### 3.5.1 给接口和挂载点上把锁:API key 认证、scope 分区与调用审计(`grovefs apikey`)
 
@@ -1483,15 +1484,15 @@ ps aux | grep grovefs                     # 查看在跑的 server / mount
 
 ## 10. 验证与回归
 
-全板一共 **32 段**:`build` → `unit` → **29 个套件** → `bench`。**前 31 段门控 GREEN,`bench` 只打吞吐参考值、永不门控**(只要纯功能回归就 `SKIP_BENCH=1`)。`pg`/`pg_parallel`/`control` 在无可达 PostgreSQL 的主机上自动 SKIP,不拉低 GREEN。
+全板一共 **33 段**:`build` → `unit` → **30 个套件** → `bench`。**前 32 段门控 GREEN,`bench` 只打吞吐参考值、永不门控**(只要纯功能回归就 `SKIP_BENCH=1`)。`pg`/`pg_parallel`/`control` 在无可达 PostgreSQL 的主机上自动 SKIP,不拉低 GREEN。
 
 ```bash
-export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config LC_ALL=C LANG=C
-bash .build-bin/run_all.sh                # 全板 32 段(31 门控 + bench)
+export PKG_CONFIG="$PWD/.build-bin/pkg-config" LC_ALL=C LANG=C   # 仓库根目录下执行
+bash .build-bin/run_all.sh                # 全板 33 段(32 门控 + bench)
                                           #   build unit
                                           #   posix edge e2e remote errors resilience concurrent
                                           #   metasrv ha striping locks freshness disp_fresh
-                                          #   layout fork viewrm bwlimit migrate import
+                                          #   layout fork viewrm gc bwlimit migrate import
                                           #   govcheck govtime grovesci mcp apikey mountkey
                                           #   config pg pg_parallel control
                                           #   bench(只打吞吐,不门控)
@@ -1835,7 +1836,16 @@ HA 拓扑滚动升级(写不中断,切换瞬间除外):
 
 ### 12.6 容量与回收的实话
 
-- `unlink`(最后一个链接消失)时后端据 key 尽力删除对象/全部分块,幂等;但 **CLI 没有提供孤儿对象扫描/回收命令**(未实现),长期运行的 `blocks/` 容量以 `du` 实测为准,不要假设能整目录清空重采。
+- `unlink`(最后一个链接消失)时后端据 key 尽力删除对象/全部分块,幂等。**没有任何存活视图树命名、账本也不再记账的页**(孤儿)由离线命令 `grovefs gc` 审计/回收:默认只扫描,列出最大的孤儿、账本仍持有的键(先 `refs rebuild`)和被跳过的非对象项;`--apply` 才真删,且只删比 `--older-than`(默认 `24h`)更老的页,永不删账本仍持有的键,并要求本存储没有活挂载、本机没有 grovefs 进程(`--apply` 必须离线;硬链接 `import` 会继承源文件旧 mtime,所以年龄门是硬约束而不是仅供参考)。
+
+  ```bash
+  grovefs gc --db-path D                        # 只扫描:孤儿 / 账本持有 / 跳过项
+  grovefs gc --db-path D --data-root /data      # meta 与 data 分家时指向真正存 blocks/ 的根
+  grovefs gc --db-path D --apply                # 回收 24h 以上的孤儿(离线)
+  grovefs gc --db-path D --apply --older-than 0 --json   # 立即回收 + 机器可读
+  ```
+
+  守卫:任何视图树读不开就整体中止(跳过一棵树会把它的对象全误判成孤儿);账本仍持有的键只报告不删;`--data-root` 与所有树零交集时拒绝(防 `--db-path`/`--data-root` 配错,`--force` 可越过);PG 部署直接拒绝(树是 schema,字节归 data-server)。e2e 见 `gc` 套件(41 条断言:干净库/out-of-band 删树→held→rebuild→孤儿→grace→真删/非对象不删/本库挂载拒与他库同名不拦/错根防呆/PG 与非法时长拒绝/`--json` 字段)。
 - 把 `du` 变成可判的三条：① **记斜率而不是记大小**（每周同一天追一行带日期读数，斜率对不上业务增量才叫异常）；② **除一遍逻辑量**——`blocks/` 是物理字节，挂载里看到的是逻辑字节，两者同量级才正常：
 
   ```bash
@@ -1843,7 +1853,7 @@ HA 拓扑滚动升级(写不中断,切换瞬间除外):
   ```
 
   ③ **比值 > 1 只有两个成因**：该删的没删（去视图里确认文件真 unlink 了），或 import/fork 的共享字节还被别的视图持着（`grovefs view --db-path D list` 看还有谁在引用，归零才物理回收，§5.3）。
-- 最常见的第三种其实是事故：**绕过挂载直接 `rm meta/<view>.db` 不会触发后端删除**，对象会永远留在 `blocks/` 里（引用账本只会高估不会误删，所以它只占空间、不丢数据）；回收账本可用 `grovefs refs --db-path D rebuild` 归位。
+- 最常见的第三种其实是事故:**绕过挂载直接 `rm meta/<view>.db` 不会触发后端删除**,对象会永远留在 `blocks/` 里(引用账本只会高估不会误删,所以它只占空间、不丢数据);回收账本可用 `grovefs refs --db-path D rebuild` 归位。归位后再跑一次 `grovefs gc --db-path D`,这些页会从 `ledger-held` 变成孤儿,`--apply` 才会回收;不重建则 `gc` 一直保守地不删。
 - SQLite 视图库的回收在引擎内部处理(锁表事务回收、hardlink refcount GC);PG 模式下交给 VACUUM。
 
 ### 12.7 变更后的回归验证
@@ -2721,7 +2731,7 @@ sudo -u postgres psql -d grovefs -c 'DROP SCHEMA "grovefs_v_64656d6f" CASCADE'
 find /data/cluster/blocks -type f | wc -l; du -sh /data/cluster/blocks
 ```
 
-- 第 4 步的空间需要按 §12.6 的取舍手工处理；GC 是**引用驱动**的，没有“扫孤儿”命令；
+- 第 4 步的空间需要按 §12.6 的取舍手工处理:`grovefs gc` 只审计**本地 page 文件**(SQLite 后端),PG 下树是 schema、字节归 data-server,没有等价命令(`gc` 会明确拒绝);
 - `grovefs_refs` **不要随手 DROP**：它是跨视图删除安全的账本，丢了只会让系统保守地多留字节（不会误删对象），但 PG 侧没有 `refs rebuild` 可用（§15.9）；
 - 删完确认：§15.6 的第 1 条 SQL 里那个 schema 消失、客户端不再能挂载该视图名。
 
@@ -2953,6 +2963,7 @@ $G meta-server --listen 0.0.0.0:50110
 | 泄露后轮换公开名 | `grovefs view --db-path D alias --name A2 --real R --retire A`(先写后删零窗口:`A` 失效、`R` 全程不可直挂,§3.4) |
 | 列出/删除视图定义 | `grovefs view --db-path D list`(定义槽 + 裸基视图) / `grovefs view --db-path D rm --name V`(派生/别名只删定义不动数据;fork 连自己的 `meta/V.db` 一并删除并重建账本) |
 | 删整个基视图(连字节回收) | `grovefs view --db-path D rm --name V --base [--data-root R]`(删 `meta/V.db`+WAL/SHM、`refs rebuild` 重建账本、回收无其他视图持有的字节;受治名/依赖定义/本机活挂载/PG 部署均拒绝,§3.4.3) |
+| 排查/回收孤儿对象(离线) | `grovefs gc --db-path D [--data-root R] [--apply] [--older-than 24h] [--json]`(默认只扫描;`--apply` 要求本存储无活挂载、本机无 grovefs 进程,永不删账本仍持有的键,PG 部署拒绝,§12.6) |
 | 导入存量目录 | `grovefs import --view V --source DIR [--prefix P] [--data-root R] [--dry-run]`(同盘硬链接零拷贝,重跑增量;在存储机执行,§3.3) |
 | 卸载 | `grovefs umount -m MP` |
 | 数据服务 | `grovefs data-server --listen IP:PORT --root DIR [--token T] [--require-api-key [--keys-from D]]` |

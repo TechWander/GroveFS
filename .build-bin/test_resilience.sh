@@ -13,8 +13,8 @@
 #      pooled socket and succeeds (transparent reconnect, app sees no error).
 #   E) two client mounts against one server write concurrently and stay isolated.
 set -u
-cd /data/xy/grovefs
-export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
+cd "$(dirname "$0")/.."
+export PKG_CONFIG="$PWD/.build-bin/pkg-config"
 Y=./target/release/grovefs
 ADDR=127.0.0.1:15098
 HOST=${ADDR%:*}; PORT=${ADDR#*:}

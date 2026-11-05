@@ -7,8 +7,8 @@
 # views (virtual directories over real data). Assertion-based; SUMMARY line
 # for run_all.sh.
 set -u
-cd /data/xy/grovefs
-export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
+cd "$(dirname "$0")/.."
+export PKG_CONFIG="$PWD/.build-bin/pkg-config"
 Y=./target/release/grovefs
 rm -rf .itest
 mkdir -p .itest/home .itest/src/photos/2026 .itest/src/docs .itest/mnt
