@@ -326,10 +326,8 @@ fn check_case(seed: u64, counters: &mut Counters) {
 
     // ---- I4 write-through: a create in a REAL dir lands in the store ----
     if !has_only {
-        let mut marker = 0usize;
-        for d in real_dirs.iter().take(6) {
+        for (marker, d) in real_dirs.iter().take(6).enumerate() {
             let name = format!("MARK{marker}");
-            marker += 1;
             match lens.create_node(*d, &name, false, Some("mk"), 0o0644, 1000, 1000) {
                 Ok(_) => {
                     assert!(
@@ -352,7 +350,10 @@ fn check_case(seed: u64, counters: &mut Counters) {
     let before_refusals = eng_count(&*eng);
     let mut refused_here = 0usize;
     for d in synth_dirs.iter().take(6) {
-        if let Ok(_) = lens.create_node(*d, "sneak", true, None, 0o0755, 1000, 1000) {
+        if lens
+            .create_node(*d, "sneak", true, None, 0o0755, 1000, 1000)
+            .is_ok()
+        {
             panic!(
                 "seed {seed}: lens materialised a source twin by creating in synthesised dir {d} (I4)"
             );

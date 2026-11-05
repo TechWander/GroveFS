@@ -545,7 +545,12 @@ fn dispatch(backend: &dyn StorageBackend, op: u8, body: &[u8]) -> (i32, u64, Vec
             let sz = backend.len(&k).unwrap_or(0);
             data.extend_from_slice(&sz.to_be_bytes());
         }
-        let total: u64 = data.chunks_exact(8).map(|c| u64::from_be_bytes(c.try_into().unwrap())).sum();
+        let total: u64 = data
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_be_bytes(*c))
+            .sum();
         return (0, total, data);
     }
 

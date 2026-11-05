@@ -12,13 +12,13 @@
 //! refcounts and cross-client sharing are untouched.
 //!
 //! Rules (plain text, one per line, `#` starts a comment):
-//! - `hide  <src-path>`            hide a subtree at its original location
-//! - `only  <src-path>`            whitelist mode: show only these subtrees
-//!                                 (plus the ancestor dirs needed to reach them)
-//! - `map   <src-path> <dst-path>` reorganize: the entry is displayed at
-//!                                 `<dst>` and disappears from its source spot
-//! - `link  <src-path> <dst-path>` alias: displayed at `<dst>` AND kept at its
-//!                                 source spot (same inode in both places)
+//! - `hide  <src-path>` — hide a subtree at its original location
+//! - `only  <src-path>` — whitelist mode: show only these subtrees (plus the
+//!   ancestor dirs needed to reach them)
+//! - `map   <src-path> <dst-path>` — reorganize: the entry is displayed at
+//!   `<dst>` and disappears from its source spot
+//! - `link  <src-path> <dst-path>` — alias: displayed at `<dst>` AND kept at
+//!   its source spot (same inode in both places)
 //!
 //! Design notes & honest limits:
 //! - `hide`/`only` are evaluated against SOURCE paths; `map`/`link` display a
@@ -1079,7 +1079,7 @@ impl MetaProvider for LayoutMeta {
                 || self
                     .vdirs
                     .get(&dp)
-                    .map(|v| v.iter().any(|d| *d == n.name))
+                    .map(|v| v.contains(&n.name))
                     .unwrap_or(false)
             {
                 continue;

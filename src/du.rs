@@ -61,11 +61,9 @@ pub fn run(opts: &DuOpts) -> io::Result<()> {
     let mut si = 0usize;
     for n in &nodes {
         id_node.insert(n.id, n);
-        if !n.is_dir && n.data_ref.is_some() {
-            if si < sizes.len() {
-                size_map.insert(n.id, sizes[si]);
-                si += 1;
-            }
+        if !n.is_dir && n.data_ref.is_some() && si < sizes.len() {
+            size_map.insert(n.id, sizes[si]);
+            si += 1;
         }
     }
 
@@ -75,8 +73,12 @@ pub fn run(opts: &DuOpts) -> io::Result<()> {
     let start_id = if root_path == "/" {
         root_id
     } else {
-        find_by_path(&nodes, root_path.trim_matches('/'), root_id)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("path not found: {}", opts.path)))?
+        find_by_path(&nodes, root_path.trim_matches('/'), root_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("path not found: {}", opts.path),
+            )
+        })?
     };
 
     // Children map: parent_id → [child_ids]
@@ -91,7 +93,16 @@ pub fn run(opts: &DuOpts) -> io::Result<()> {
 
     // 6. Enumerate directories up to depth limit, print.
     let mut results: Vec<DuEntry> = Vec::new();
-    collect_entries(start_id, &root_path, &children, &id_node, &subtree_sum, opts.depth, 0, &mut results);
+    collect_entries(
+        start_id,
+        &root_path,
+        &children,
+        &id_node,
+        &subtree_sum,
+        opts.depth,
+        0,
+        &mut results,
+    );
     results.sort_by(|a, b| a.0.cmp(&b.0));
 
     // 7. Print.
@@ -109,14 +120,22 @@ pub fn run(opts: &DuOpts) -> io::Result<()> {
 
 fn gather_nodes(opts: &DuOpts) -> io::Result<Vec<FlatNode>> {
     if let Some(addr) = &opts.meta {
-        return gather_via_meta(addr, &opts.view, opts.meta_token.as_deref().unwrap_or(""), opts.meta_api_key.as_deref().unwrap_or(""));
+        return gather_via_meta(
+            addr,
+            &opts.view,
+            opts.meta_token.as_deref().unwrap_or(""),
+            opts.meta_api_key.as_deref().unwrap_or(""),
+        );
     }
     let store = resolve_store(&opts.store);
     if let Some(uri) = store {
         gather_pg(&uri, &opts.view)
     } else {
         let db_path = opts.db_path.as_ref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "need --meta, --store or --db-path")
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "need --meta, --store or --db-path",
+            )
         })?;
         gather_sqlite(db_path, &opts.view)
     }
@@ -132,9 +151,8 @@ fn gather_pg(uri: &str, view: &str) -> io::Result<Vec<FlatNode>> {
     let schema = grovefs_pg_schema(view);
     let conn = postgres::Client::connect(uri, postgres::tls::NoTls)
         .map_err(|e| io::Error::other(format!("pg connect: {e}")))?;
-    let sql = format!(
-        "SELECT id, parent_id, name, is_dir, data_ref FROM {schema}.node ORDER BY id"
-    );
+    let sql =
+        format!("SELECT id, parent_id, name, is_dir, data_ref FROM {schema}.node ORDER BY id");
     let mut conn = conn;
     let rows = conn
         .query(sql.as_str(), &[])
@@ -179,10 +197,15 @@ fn grovefs_pg_schema(view: &str) -> String {
 }
 
 /// Gather tree via meta-server RPC (M_OPEN + M_TREE_DUMP). No direct PG/SQLite needed.
-fn gather_via_meta(addr: &str, view: &str, token: &str, api_key: &str) -> io::Result<Vec<FlatNode>> {
+fn gather_via_meta(
+    addr: &str,
+    view: &str,
+    token: &str,
+    api_key: &str,
+) -> io::Result<Vec<FlatNode>> {
+    use crate::remote::proto;
     use std::io::BufReader;
     use std::net::TcpStream;
-    use crate::remote::proto;
 
     let stream = TcpStream::connect(addr)?;
     stream.set_nodelay(true)?;
@@ -198,14 +221,19 @@ fn gather_via_meta(addr: &str, view: &str, token: &str, api_key: &str) -> io::Re
     proto::send_request(&mut writer, 16, &body)?; // M_OPEN=16
     let (status, _, _) = proto::recv_response(&mut reader)?;
     if status != 0 {
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("meta-server rejected open: status {status}")));
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("meta-server rejected open: status {status}"),
+        ));
     }
 
     // M_TREE_DUMP: empty body
     proto::send_request(&mut writer, 38, &[])?; // M_TREE_DUMP=38
     let (status, _, data) = proto::recv_response(&mut reader)?;
     if status != 0 {
-        return Err(io::Error::other(format!("M_TREE_DUMP failed: status {status}")));
+        return Err(io::Error::other(format!(
+            "M_TREE_DUMP failed: status {status}"
+        )));
     }
 
     // Decode: [count: u32][id(8B) pid(8B) name(key) is_dir(1B) data_ref(key)]*
@@ -214,10 +242,25 @@ fn gather_via_meta(addr: &str, view: &str, token: &str, api_key: &str) -> io::Re
         .map_err(|_| io::Error::other("tree_dump: short header"))? as usize;
     let mut nodes = Vec::with_capacity(count);
     for _ in 0..count {
-        let id = i64::from_be_bytes(data[i..i + 8].try_into().map_err(|_| io::Error::other("tree_dump: id"))?); i += 8;
-        let parent_id = i64::from_be_bytes(data[i..i + 8].try_into().map_err(|_| io::Error::other("tree_dump: pid"))?); i += 8;
-        let name = proto::get_key(&data, &mut i).map_err(|_| io::Error::other("tree_dump: name"))?;
-        let is_dir = *data.get(i).ok_or_else(|| io::Error::other("tree_dump: dir flag"))? != 0; i += 1;
+        let id = i64::from_be_bytes(
+            data[i..i + 8]
+                .try_into()
+                .map_err(|_| io::Error::other("tree_dump: id"))?,
+        );
+        i += 8;
+        let parent_id = i64::from_be_bytes(
+            data[i..i + 8]
+                .try_into()
+                .map_err(|_| io::Error::other("tree_dump: pid"))?,
+        );
+        i += 8;
+        let name =
+            proto::get_key(&data, &mut i).map_err(|_| io::Error::other("tree_dump: name"))?;
+        let is_dir = *data
+            .get(i)
+            .ok_or_else(|| io::Error::other("tree_dump: dir flag"))?
+            != 0;
+        i += 1;
         let dr = proto::get_key(&data, &mut i).map_err(|_| io::Error::other("tree_dump: ref"))?;
         nodes.push(FlatNode {
             id,
@@ -255,7 +298,11 @@ fn resolve_sizes(opts: &DuOpts, refs: &[String]) -> io::Result<Vec<u64>> {
 // --- Tree operations ---
 
 fn find_root(nodes: &[FlatNode]) -> i64 {
-    nodes.iter().find(|n| n.name == "/" || n.parent_id == 0 && n.is_dir).map(|n| n.id).unwrap_or(1)
+    nodes
+        .iter()
+        .find(|n| n.name == "/" || n.parent_id == 0 && n.is_dir)
+        .map(|n| n.id)
+        .unwrap_or(1)
 }
 
 fn find_by_path(nodes: &[FlatNode], path: &str, root_id: i64) -> Option<i64> {
@@ -295,7 +342,11 @@ fn compute_subtree(
     let mut stack: Vec<(i64, bool)> = vec![(root, false)];
     while let Some((id, visited)) = stack.pop() {
         if visited {
-            let own = if let Some(sz) = file_sizes.get(&id) { *sz } else { 0 };
+            let own = if let Some(sz) = file_sizes.get(&id) {
+                *sz
+            } else {
+                0
+            };
             let child_sum: u64 = children
                 .get(&id)
                 .map(|ch| ch.iter().filter_map(|c| out.get(c).copied()).sum())
@@ -312,6 +363,10 @@ fn compute_subtree(
     }
 }
 
+/// Depth-limited walk that flattens the subtree into `(path, size)` rows. The
+/// read-only context (children / node / sum maps plus the depth bound) is passed
+/// straight through the recursion instead of being rebuilt per call.
+#[allow(clippy::too_many_arguments)] // recursive walk: 7-value read-only context + cursor
 fn collect_entries(
     id: i64,
     path: &str,
@@ -337,7 +392,16 @@ fn collect_entries(
                     } else {
                         format!("{}/{}", path, n.name)
                     };
-                    collect_entries(cid, &child_path, children, node_map, sums, max_depth, depth + 1, results);
+                    collect_entries(
+                        cid,
+                        &child_path,
+                        children,
+                        node_map,
+                        sums,
+                        max_depth,
+                        depth + 1,
+                        results,
+                    );
                 }
             }
         }

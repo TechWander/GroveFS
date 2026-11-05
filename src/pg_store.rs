@@ -13,17 +13,17 @@
 //!   (a deterministic, injection-safe identifier; the per-view sequence keeps
 //!   `id`/`ino` small exactly like the file-per-view model, and the root row is
 //!   pinned at id 1 so [`crate::meta::ROOT_INO`] stays valid);
-//! - `INTEGER PRIMARY KEY` (rowid)      ->  `BIGSERIAL PRIMARY KEY`;
-//! - `INSERT OR IGNORE`                 ->  `ON CONFLICT DO NOTHING`;
-//! - `TransactionBehavior::Immediate` + single-writer mutex
-//!   ->  per-op `SERIALIZABLE` transaction on a pooled writer connection,
-//!       with automatic retry on `SQLSTATE 40001 serialization_failure` /
-//!       `40P01 deadlock_detected`. This is the HopsFS route (Sharma et al.,
-//!       FAST'18) implemented on top of PostgreSQL's own SSI (Ports & O'Neil,
-//!       OSDI'12), adapted to a single-cluster deployment: no namespace
-//!       partitioning, no cross-server 2PC.
-//! - `busy_timeout` cross-process wait  ->  SSI retry with bounded exponential
-//!       backoff (200us..25ms, up to 12 attempts).
+//! - `INTEGER PRIMARY KEY` (rowid) -> `BIGSERIAL PRIMARY KEY`;
+//! - `INSERT OR IGNORE` -> `ON CONFLICT DO NOTHING`;
+//! - `TransactionBehavior::Immediate` + single-writer mutex -> per-op
+//!   `SERIALIZABLE` transaction on a pooled writer connection, with automatic
+//!   retry on `SQLSTATE 40001 serialization_failure` / `40P01
+//!   deadlock_detected`. This is the HopsFS route (Sharma et al., FAST'18)
+//!   implemented on top of PostgreSQL's own SSI (Ports & O'Neil, OSDI'12),
+//!   adapted to a single-cluster deployment: no namespace partitioning, no
+//!   cross-server 2PC.
+//! - `busy_timeout` cross-process wait -> SSI retry with bounded exponential
+//!   backoff (200us..25ms, up to 12 attempts).
 //!
 //! Why SERIALIZABLE and not READ COMMITTED: GroveFS's governance invariants
 //! I1–I4 (see §5 of the TOS manuscript) are safety properties about the final
@@ -789,7 +789,7 @@ impl PgEngine {
             let mut c = self.cursors.lock();
             for (i, row) in out.iter().enumerate() {
                 let next = offset + i + 1;
-                if next % READDIR_CURSOR_STRIDE == 0 {
+                if next.is_multiple_of(READDIR_CURSOR_STRIDE) {
                     if c.len() >= READDIR_CURSOR_CAP {
                         c.clear();
                     }

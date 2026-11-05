@@ -16,8 +16,9 @@ grovefs mcp [--db-path <D>] [--home <H>] [--require-api-key]
   (one process serving several store roots).
 - Framing: newline-delimited JSON-RPC 2.0, one frame per line, UTF-8, in on
   stdin / out on stdout.
-- `initialize` `params`: `protocolVersion` (echoed back verbatim, not validated),
-  `capabilities`, `clientInfo`, plus the optional
+- `initialize` `params`: `protocolVersion` (echoed when the server speaks it —
+  `2025-06-18` / `2025-03-26` / `2024-11-05`; any other value is answered with
+  `2025-06-18`), `capabilities`, `clientInfo`, plus the optional
   **`apiKey: "<ID>:<SECRET>"`** (the only open method that can carry a credential).
 - A successful handshake answers:
 
@@ -29,11 +30,12 @@ grovefs mcp [--db-path <D>] [--home <H>] [--require-api-key]
  "instructions":"…"}
 ```
 
-`instructions` is the server's own operating manual (four paragraphs on
-discover / preview / reshape / dry-run, plus the authentication hint). Clients
-inject it into context, so **this skill deliberately does not repeat its
-wording** — it only adds implementation details and pitfalls. Each tool's own
-`description` is likewise self-explanatory.
+`instructions` is the server's own operating manual, sectioned for skimming
+(`## Discover` / `## Reshape` / `## Curate` / `## Validate before publishing` /
+`## Golden order` / `## Beyond tools` / `## Mechanics`). Clients inject it into
+context, so **this skill deliberately does not repeat its wording** — it only adds
+implementation details and pitfalls. Each tool's own `description` is likewise
+self-explanatory; `grovefs://guide` serves the same manual as a resource.
 
 - The client then sends `notifications/initialized` (**no id, never answered**).
 
@@ -44,12 +46,12 @@ wording** — it only adds implementation details and pitfalls. Each tool's own
 | `initialize` | open | the only method that can carry `apiKey`; success stamps the session's identity (later audit attribution) |
 | `ping` | open | answers `{}` |
 | `notifications/*`, `initialized` | open | received silently, **never answered** (don't wait for a reply) |
-| `tools/list` | **gated** | 10 tools plus self-describing schemas |
-| `tools/call` | **gated** | governance failures stay inside the result (`isError`), never the JSON-RPC error layer |
+| `tools/list` | **gated** | 10 tools plus self-describing schemas, `title` + `annotations` (`readOnlyHint` on the five read-only tools), and an `outputSchema` on the four JSON-returning ones |
+| `tools/call` | **gated** | governance failures stay inside the result (`isError`), never the JSON-RPC error layer; the JSON tools also return `structuredContent`; `arguments` may be an object or a string holding one |
 | `resources/list` | **gated** | enumerates slot by slot (physical→tree; derived/alias/fork→definition+tree); `-32603` if the store cannot be read |
 | `resources/templates/list` | **gated** | two templates (static) |
 | `resources/read` | **gated** | malformed URI / unknown view → `-32002` (a bad URI is a protocol problem, not a governance refusal) |
-| `completion/complete` | **gated** | uses `params.argument` only (`ref` is ignored); non-view-name arguments answer an empty list |
+| `completion/complete` | **gated** | role-aware: a prompt's `base`/`real` completes against physical trees, `rotate-alias`' `new`/`old` against aliases, a resource's `{name}` against every name; non-view-name arguments answer an empty list |
 | `prompts/list` | open | two playbooks |
 | `prompts/get` | open | missing/unknown prompt → `-32602` |
 | `logging/setLevel` | open | only tunes this session's verbosity; never behind the gate |
@@ -85,7 +87,7 @@ revocation therefore takes effect on the *next* `initialize`, not mid-session.
 | `-32603` | internal error: `resources/list` cannot read the store | — |
 | `-32001` | authentication gate | see above |
 | `-32002` | resource URI unavailable | `unsupported resource uri '<uri>' (expected grovefs://view/<name>/(definition\|tree))` / `resource uri '<uri>' names no view` |
-| (no code) | governance refusals, missing tool arguments, unknown tools | `isError:true` inside the result + the CLI's verbatim wording |
+| (no code) | governance refusals, missing tool arguments, unknown tools | `isError:true` inside the result + the CLI's verbatim wording; a missing argument appends `(tool '<name>' requires: …)` and an unknown tool lists the surface plus a nearest-name suggestion |
 
 ## 4. Resources (byte-identical to tool results)
 
@@ -93,15 +95,25 @@ Templates:
 
 ```json
 [{"uriTemplate":"grovefs://view/{name}/definition","name":"view-definition","mimeType":"application/json"},
- {"uriTemplate":"grovefs://view/{name}/tree","name":"view-tree","mimeType":"application/json"}]
+ {"uriTemplate":"grovefs://view/{name}/tree{?path,depth,max}","name":"view-tree","mimeType":"application/json"}]
 ```
 
+`resources/list` also enumerates two store-wide resources (first, so they are
+the easiest to attach), plus every slot:
+
+- `grovefs://guide` (`text/markdown`): the operating manual — the same text as
+  `initialize.instructions`, plus the resource list.
+- `grovefs://views` (`application/json`): the whole-store snapshot, byte-identical
+  to `list_views`.
 - `grovefs://view/<name>/definition`: the slot's **verbatim governance text**
   (raw derived rules, or the `base <x>` line of an alias/fork); a physical view
   answers its mount semantics. Equivalent to `get_view`.
-- `grovefs://view/<name>/tree`: the listing a mount actually sees (rendered
-  through the real lens, synthetic directories included). Equivalent to
-  `list_view_tree {"view":"<name>"}`.
+- `grovefs://view/<name>/tree{?path,depth,max}`: the listing a mount actually
+  sees (rendered through the real lens, synthetic directories included).
+  Equivalent to `list_view_tree`, and the query parameters are that tool's
+  arguments: `path` (display subtree), `depth` (default 6), `max` (default 800).
+  A malformed number is refused (`'depth' must be a non-negative integer`) rather
+  than silently ignored, and a bounded render still says `truncated: true`.
 
 In both (resources and tools) `entries[].size` is a **metadata field, not a byte
 count**: dirs `4096`, files `0`, symlinks their target's character length — the
@@ -121,17 +133,23 @@ byte-identical JSON string lives inside `text` (so a client must peel
 
 ## 6. Completion and logging
 
-- `completion/complete`: `{"argument":{"name":"base","value":"re"}}` → view names
-  from the served store matching the prefix (case-insensitive), as
-  `{"completion":{"values":[…],"total":N,"hasMore":bool}}` (at most 100). Works only
-  for `name`/`base`/`view`/`real`; queries the store's **own backend** — local
-  SQLite files, or PostgreSQL (`grovefs_control` + `grovefs_v_*`) when the server
-  runs with `--store postgres://…`; never a remote `meta-server`.
+- `completion/complete`: `{"ref":{"type":"ref/prompt","name":"reshape-view"},
+  "argument":{"name":"base","value":"re"}}` → view names from the served
+  store matching the prefix (case-insensitive), as
+  `{"completion":{"values":[…],"total":N,"hasMore":bool}}` (at most 100).
+  The `ref` is honored: a prompt's `base`/`real` suggests physical trees only,
+  `rotate-alias`' `new`/`old` suggests existing aliases only, and a resource URI's
+  `{name}` suggests every mountable name. Without a recognized `ref` all names
+  are suggested. It queries the store's **own backend** — local SQLite files, or
+  PostgreSQL (`grovefs_control` + `grovefs_v_*`) when the server runs with
+  `--store postgres://…`; never a remote `meta-server`.
 - `logging/setLevel`: `{"level":"warning"}`. Once a threshold is set, the server
   appends `notifications/message` frames (logger `"grove-mcp"`) **after the
   answered call**, but **only at or above the threshold**: success is `info` +
-  `<method> ok`, any refusal or failure is `warning` + `<method> failed: <reason>`
-  — with the threshold at `warning`, a successful call pushes nothing at all.
+  `<method> <tool-or-uri> ok`, any refusal or failure is `warning` +
+  `<method> <tool-or-uri> failed: <reason>` (e.g. `tools/call list_view_tree
+  failed: no metadata tree for view 'ghost' …`) — with the threshold at
+  `warning`, a successful call pushes nothing at all.
   Logged calls: `tools/call`, `tools/list`, `resources/list`, `resources/read`,
   `prompts/get`, `completion/complete`; `initialize`/`ping`/`prompts/list`/
   templates stay quiet. Notification frames are written **after** the response,

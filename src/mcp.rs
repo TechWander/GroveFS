@@ -20,6 +20,16 @@
 //!   back a single definition verbatim. No framework crate: the protocol surface
 //!   we implement is a handful of methods, and serde_json `Value` is enough.
 //!
+//! Beyond the tool calls the same governance is attachable as MCP *resources*
+//! (`grovefs://guide`, `grovefs://views`, `grovefs://view/<name>/definition` and
+//! `/tree{?path,depth,max}`), *prompts* (the two playbooks) and *completion*.
+//! Tools are annotated (`readOnlyHint`/`destructiveHint`/`idempotentHint`) so a
+//! client can auto-approve the read-only half, and the four machine-readable
+//! ones declare an `outputSchema` plus `structuredContent`, so an agent gets a
+//! typed payload instead of re-parsing the text block. Errors name what was
+//! wrong AND what to do next (the whole tool surface, the required arguments,
+//! the nearest tool name).
+//!
 //! The MCP entry point is `grovefs mcp`: an MCP client (Claude Desktop, any
 //! agent runtime) spawns it as a subprocess, and the agent then lists views,
 //! inspects their listings, and reshapes them (`hide`/`only`/`map`/`link` rules
@@ -47,6 +57,77 @@ use crate::meta::{MetaEngine, MetaProvider, NodeKind, ROOT_INO};
 
 /// Protocol revision we advertise when the client does not name one.
 pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+
+/// Protocol revisions this server can actually honor. `initialize` echoes a
+/// revision from this list and answers an unknown one with
+/// [`MCP_PROTOCOL_VERSION`] — the spec's "reply with a version you support"
+/// rule, so a client never believes it negotiated something this server lacks.
+pub const SUPPORTED_PROTOCOLS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// The whole tool surface, in `tools/list` order — the single source for the
+/// unknown-tool hint and the dry-run/tool metadata tables below.
+pub const TOOL_NAMES: [&str; 10] = [
+    "list_views",
+    "define_derived_view",
+    "alias_view",
+    "fork_view",
+    "graft_view",
+    "remove_view",
+    "preview_rules",
+    "validate_definition",
+    "list_view_tree",
+    "get_view",
+];
+
+/// Required arguments per tool, so a missing one names the tool and the full
+/// required set instead of a bare `missing string argument 'name'`.
+const TOOL_REQUIRED: [(&str, &[&str]); 10] = [
+    ("list_views", &[]),
+    ("define_derived_view", &["name", "base", "rules"]),
+    ("alias_view", &["name", "real"]),
+    ("fork_view", &["name", "base"]),
+    ("graft_view", &["name", "map"]),
+    ("remove_view", &["name"]),
+    ("preview_rules", &["rules"]),
+    ("validate_definition", &["name", "base", "rules"]),
+    ("list_view_tree", &[]),
+    ("get_view", &["name"]),
+];
+
+/// The server's operating manual, returned as `initialize.instructions` and as
+/// the `grovefs://guide` resource. It is deliberately sectioned: an agent reads
+/// it once and can skim to the part it needs (the previous one-paragraph form
+/// was a wall of text). Every tool name must appear here — discovery that only
+/// exists in `tools/list` is discovery an agent misses.
+pub const INSTRUCTIONS: &str = "\
+GroveFS view governance over ONE control-plane store (local SQLite files, or a PostgreSQL `grovefs_control` schema). You reshape how data LISTINGS are presented. This entrance never mounts a filesystem and never reads object bytes.
+
+## Discover (read-only, metadata only)
+- `list_views` — every slot as {backend, store, physical[], defined[]}
+- `get_view` — one slot in full, including the verbatim `definition` rules (read before editing)
+- `list_view_tree` — the exact listing a mount would show; pass `view`, or `base` + `rules` to preview an unpublished lens. Each entry `path` is the absolute DISPLAY path to reuse in rules. `size` is metadata (dirs 4096, files 0, symlinks target length), never a byte count.
+
+## Reshape (writes <db>/meta/views/*.layout; live meta-server mounts hot-reload within their cache TTL)
+- `define_derived_view` — read-only lens from rule text: `hide /x` (prune), `only /x` (serve just that), `map /src /dst` (re-home), `link /src /dst` (second name). Paths MUST come from `list_view_tree`; a `base` line inside rules is refused.
+- `alias_view` — writable public name for a physical view; `retire` rotates the previous name gaplessly
+- `remove_view` — drop a definition (a fork also drops its own tree; content bytes survive while any view holds them)
+
+## Curate
+- `fork_view` — independent metadata tree seeded from a base; `seed:false` starts EMPTY (root only). Structure writable, content read-only, bytes shared.
+- `graft_view` — place a curated, renamable subset into a fork or base view; plan lines are `<src>` or `<src>TAB<dst>`, the whole plan lands in one transaction.
+
+## Validate before publishing (writes nothing)
+- `preview_rules` — verb syntax only, line-numbered errors
+- `validate_definition` — the FULL guard set as a dry run; returns the exact refusal a real publish would give
+
+## Golden order
+`list_views` -> (`get_view` when editing) -> `list_view_tree` -> draft rules -> `preview_rules` -> `validate_definition` -> `define_derived_view` -> `list_view_tree` (verify the rendered shape). Do not skip the dry run, and do not treat a truncated tree as the whole tree.
+
+## Beyond tools
+MCP resources: `grovefs://guide` (this manual), `grovefs://views` (whole-store snapshot), `grovefs://view/<name>/definition`, and `grovefs://view/<name>/tree[?path=/sub&depth=6&max=800]` (drill into a big tree without a tool call). Prompts: `reshape-view`, `rotate-alias`. Completion fills view-name arguments. `logging/setLevel` streams `notifications/message` per call.
+
+## Mechanics
+Protocol 2025-06-18 over newline-delimited JSON-RPC 2.0 on stdio (2025-03-26 / 2024-11-05 clients are accepted too). Governance refusals arrive INSIDE the result as `isError:true` with the CLI's verbatim text; the JSON-RPC error layer is protocol-only. Tools are annotated (`readOnlyHint` etc.) and the JSON-returning ones also carry `structuredContent`. If the server runs with `--require-api-key`, pass `apiKey: '<id>:<secret>'` in the `initialize` params. A per-call `db_path` re-points a FILE store; a PG-bound server ignores it. Introspection walks the bound store's own backend — a remote tree is not reachable.";
 
 // ---------------------------------------------------------------------------
 // Shared view-governance operations (CLI `grovefs view` and MCP tools, one impl)
@@ -148,7 +229,7 @@ pub trait ControlStore: Send + Sync {
     /// (the caller rate-probes at the ≤2s lens TTL, matching the file path's
     /// convergence window).
     fn defs_changed(&self, name: &str, seen: &str) -> bool {
-        self.stamp(name).map_or(true, |s| s != seen)
+        self.stamp(name).is_none_or(|s| s != seen)
     }
     /// The pure-alias map (alias name → real view) as a resolver would apply
     /// it: malformed or non-alias entries are skipped (the branches that need
@@ -779,10 +860,7 @@ pub fn validate_definition(
         "would_replace_existing_definition": replaces_existing,
         "base_view_db_present": base_present,
         "mount": "read-only (derived)",
-        "note": match store.base_tree_missing_note(base)? {
-            Some(n) => n,
-            None => String::new(),
-        },
+        "note": store.base_tree_missing_note(base)?.unwrap_or_default(),
     }))
 }
 
@@ -1299,6 +1377,7 @@ fn open_meta_ro(store: &dyn ControlStore, view: &str) -> Result<Arc<dyn MetaProv
 /// absolute display paths to `out`. `readdir` already sorts by name, so the
 /// listing matches what a mount shows; synthesized scaffolding dirs carry a
 /// virtual ino that `LayoutMeta::readdir` resolves on the next recursion.
+#[allow(clippy::too_many_arguments)] // recursive walk: read-only context passed through
 fn walk_tree(
     provider: &dyn MetaProvider,
     ino: i64,
@@ -1490,25 +1569,103 @@ pub fn describe_view(store: &dyn ControlStore, name: &str) -> Result<Value, Stri
 /// disagree about what a view is.
 pub const VIEW_URI_PREFIX: &str = "grovefs://view/";
 
-/// The two resource templates advertised (fixed shape, `{name}` filled per view).
+/// Canonical URIs of the two STORE-WIDE resources: the server's operating
+/// manual and one whole-store snapshot — attachable context that does not name
+/// a view, so a client can load the map before drilling into it.
+pub const VIEWS_URI: &str = "grovefs://views";
+pub const GUIDE_URI: &str = "grovefs://guide";
+
+/// The resource templates advertised (fixed shape, `{name}` filled per view).
+/// The tree template carries RFC 6570 query parameters, so a client can attach
+/// a DRILLED-DOWN listing (`?path=/photos&depth=2&max=50`) instead of always
+/// paying for the default depth-6 / 800-entry render.
 pub fn resource_templates() -> Value {
     json!([
         { "uriTemplate": "grovefs://view/{name}/definition",
           "name": "view-definition",
           "description": "Verbatim governance definition of one view slot (derived rules or the alias target); a physical view reports its mount semantics instead.",
           "mimeType": "application/json" },
-        { "uriTemplate": "grovefs://view/{name}/tree",
+        { "uriTemplate": "grovefs://view/{name}/tree{?path,depth,max}",
           "name": "view-tree",
-          "description": "The directory listing a mount of this view actually shows, rendered through its lens (metadata only — no mount, no data bytes; `size` is the metadata field, so dirs read 4096 and files read 0).",
+          "description": "The directory listing a mount of this view actually shows, rendered through its lens (metadata only — no mount, no data bytes; `size` is the metadata field, so dirs read 4096 and files read 0). Optional query parameters drill down: `path` (display subtree, default /), `depth` (default 6), `max` (default 800).",
           "mimeType": "application/json" },
     ])
 }
 
+/// The whole-store snapshot the `list_views` tool and the `grovefs://views`
+/// resource both answer with — one builder, so the two can never disagree.
+pub fn views_snapshot(store: &dyn ControlStore) -> Result<Value, String> {
+    let sv = list_views(store)?;
+    let defined: Vec<Value> = sv
+        .defined
+        .iter()
+        .map(|e| {
+            json!({
+                "name": e.name, "kind": e.kind, "real_view": e.real_view,
+                "hide": e.hide, "only": e.only, "reloc": e.reloc,
+                "mount": match e.kind {
+                    "alias" => "read-write (alias)",
+                    "fork" => "structure read-write / content read-only (fork)",
+                    _ => "read-only (derived)",
+                },
+                "line": entry_line(e),
+            })
+        })
+        .collect();
+    Ok(json!({
+        "backend": store.backend(),
+        "store": store.describe(),
+        "physical": sv.physical,
+        "defined": defined,
+    }))
+}
+
+/// The JSON shape of a rendered tree, shared by the `list_view_tree` tool and
+/// the `.../tree` resource (so a tool call and a resource read are byte-equal).
+pub fn tree_json(t: &ShapeTree) -> Value {
+    let dir_count = t.entries.iter().filter(|e| e.kind == "dir").count();
+    let entries: Vec<Value> = t
+        .entries
+        .iter()
+        .map(|e| json!({ "path": e.path, "kind": e.kind, "size": e.size }))
+        .collect();
+    json!({
+        "kind": t.kind,
+        "rendered_from": t.rendered_from,
+        "root_path": t.root_path,
+        "truncated": t.truncated,
+        "dir_count": dir_count,
+        "file_count": t.entries.len() - dir_count,
+        "entries": entries,
+    })
+}
+
+/// `grovefs://guide` — the operating manual as markdown, for clients that
+/// attach resources as context instead of reading `initialize.instructions`.
+pub fn guide_text() -> String {
+    format!(
+        "# GroveFS MCP guide\n\n{INSTRUCTIONS}\n\n## Resources\n- `{GUIDE_URI}` — this guide (text/markdown)\n- `{VIEWS_URI}` — whole-store snapshot (JSON, same as `list_views`)\n- `grovefs://view/<name>/definition` — one slot's verbatim definition\n- `grovefs://view/<name>/tree?path=&depth=&max=` — its rendered listing, optionally drilled down\n"
+    )
+}
+
 /// Enumerate every view slot in the store as MCP resources (physical → tree;
-/// derived/alias → definition + tree).
+/// derived/alias → definition + tree), preceded by the two store-wide ones.
 pub fn list_resources(store: &dyn ControlStore) -> Result<Value, String> {
     let s = list_views(store)?;
-    let mut resources: Vec<Value> = Vec::new();
+    let mut resources: Vec<Value> = vec![
+        json!({
+            "uri": GUIDE_URI,
+            "name": "guide",
+            "description": "Operating manual: tool surface, golden order, resources, protocol mechanics",
+            "mimeType": "text/markdown",
+        }),
+        json!({
+            "uri": VIEWS_URI,
+            "name": "views (snapshot)",
+            "description": "Whole-store snapshot: backend, store root, physical trees, governed definitions",
+            "mimeType": "application/json",
+        }),
+    ];
     for p in &s.physical {
         resources.push(json!({
             "uri": format!("{VIEW_URI_PREFIX}{p}/tree"),
@@ -1534,15 +1691,73 @@ pub fn list_resources(store: &dyn ControlStore) -> Result<Value, String> {
     Ok(json!({ "resources": resources }))
 }
 
+/// Percent-decode one URI query value (`%20`, `%2F`, …); `+` stays literal so
+/// a display path containing it is not silently rewritten.
+fn pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hex = std::str::from_utf8(&b[i + 1..i + 3]).ok();
+            if let Some(v) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// One query parameter of a resource URI (`...tree?path=/docs&depth=2`).
+fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    query
+        .split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(k, _)| *k == key)
+        .map(|(_, v)| v)
+}
+
+/// Parse an optional non-negative integer query parameter.
+fn query_usize(uri: &str, query: &str, key: &str) -> Result<usize, String> {
+    match query_param(query, key) {
+        None => Ok(0),
+        Some(v) => pct_decode(v)
+            .parse::<usize>()
+            .map_err(|_| format!("resource uri '{uri}': '{key}' must be a non-negative integer")),
+    }
+}
+
 /// Read one resource by URI, delegating to `describe_view` / `view_tree` so the
-/// bytes match the corresponding tool result exactly.
+/// bytes match the corresponding tool result exactly. The tree facet accepts
+/// `path`/`depth`/`max` query parameters — the resource-side equivalent of the
+/// `list_view_tree` arguments, so a client can drill into a big tree.
 pub fn read_resource(store: &dyn ControlStore, uri: &str) -> Result<Value, String> {
+    if uri == GUIDE_URI {
+        return Ok(json!({ "contents": [
+            { "uri": uri, "mimeType": "text/markdown", "text": guide_text() }
+        ] }));
+    }
+    if uri == VIEWS_URI {
+        let text = serde_json::to_string_pretty(&views_snapshot(store)?).unwrap_or_default();
+        return Ok(json!({ "contents": [
+            { "uri": uri, "mimeType": "application/json", "text": text }
+        ] }));
+    }
     let rest = uri.strip_prefix(VIEW_URI_PREFIX).ok_or_else(|| {
         format!(
-            "unsupported resource uri '{uri}' (expected {VIEW_URI_PREFIX}<name>/(definition|tree))"
+            "unsupported resource uri '{uri}' (expected {VIEW_URI_PREFIX}<name>/(definition|tree), {VIEWS_URI} or {GUIDE_URI})"
         )
     })?;
-    let (name, facet) = rest.rsplit_once('/').ok_or_else(|| {
+    // Split the query off FIRST: `<name>` and the facet live in the path part.
+    let (path_part, query) = match rest.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => (rest, ""),
+    };
+    let (name, facet) = path_part.rsplit_once('/').ok_or_else(|| {
         format!("malformed resource uri '{uri}' (expected .../<name>/(definition|tree))")
     })?;
     if name.is_empty() {
@@ -1553,23 +1768,17 @@ pub fn read_resource(store: &dyn ControlStore, uri: &str) -> Result<Value, Strin
             serde_json::to_string_pretty(&describe_view(store, name)?).unwrap_or_default()
         }
         "tree" => {
-            let t = view_tree(store, TreeTarget::Existing(name), None, 0, 0)?;
-            let dir_count = t.entries.iter().filter(|e| e.kind == "dir").count();
-            let entries: Vec<Value> = t
-                .entries
-                .iter()
-                .map(|e| json!({ "path": e.path, "kind": e.kind, "size": e.size }))
-                .collect();
-            serde_json::to_string_pretty(&json!({
-                "kind": t.kind,
-                "rendered_from": t.rendered_from,
-                "root_path": t.root_path,
-                "truncated": t.truncated,
-                "dir_count": dir_count,
-                "file_count": t.entries.len() - dir_count,
-                "entries": entries,
-            }))
-            .unwrap_or_default()
+            let path = query_param(query, "path").map(pct_decode);
+            let depth = query_usize(uri, query, "depth")?;
+            let max = query_usize(uri, query, "max")?;
+            let t = view_tree(
+                store,
+                TreeTarget::Existing(name),
+                path.as_deref(),
+                depth,
+                max,
+            )?;
+            serde_json::to_string_pretty(&tree_json(&t)).unwrap_or_default()
         }
         other => {
             return Err(format!(
@@ -1653,23 +1862,55 @@ pub fn get_prompt(name: &str, arguments: &Value) -> Result<Value, String> {
 }
 
 /// Complete a prompt/resource argument: for view-name-ish arguments return the
-/// existing view names IN THE BOUND CONTROL-PLANE STORE matching the typed
-/// prefix (physical trees and governed definitions alike, file or PG).
-pub fn complete(store: &dyn ControlStore, argument: &Value) -> Result<Value, String> {
+/// existing names IN THE BOUND CONTROL-PLANE STORE matching the typed prefix
+/// (physical trees and governed definitions alike, file or PG).
+///
+/// The `ref` is honored so the suggestion fits the role being asked about:
+/// a prompt's `base`/`real` argument lists physical trees (the only legal
+/// targets), `rotate-alias`' `new`/`old` list existing ALIASES, and a resource
+/// URI's `name` lists every mountable name. Unknown refs still complete against
+/// all names, so a hand-written client keeps working.
+pub fn complete(store: &dyn ControlStore, params: &Value) -> Result<Value, String> {
+    let argument = params
+        .get("argument")
+        .cloned()
+        .unwrap_or(Value::Object(Map::new()));
     let name = argument.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let value = argument.get("value").and_then(|v| v.as_str()).unwrap_or("");
-    let wants_view = matches!(name, "name" | "base" | "view" | "real");
+    let r = params.get("ref").cloned().unwrap_or(Value::Null);
+    let ref_type = r.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let ref_name = r.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let wants_view = matches!(name, "name" | "base" | "view" | "real" | "new" | "old");
     if !wants_view {
         return Ok(json!({ "completion": { "values": [], "total": 0, "hasMore": false } }));
     }
     let s = list_views(store)?;
-    let mut names: Vec<String> = s.physical.clone();
-    names.extend(s.defined.iter().map(|e| e.name.clone()));
+    let all = || -> Vec<String> {
+        let mut n = s.physical.clone();
+        n.extend(s.defined.iter().map(|e| e.name.clone()));
+        n
+    };
+    let aliases = || -> Vec<String> {
+        s.defined
+            .iter()
+            .filter(|e| e.kind == "alias")
+            .map(|e| e.name.clone())
+            .collect()
+    };
+    // Role-aware pools: only the names that can legally fill this argument.
+    let pool: Vec<String> = match (ref_type, ref_name, name) {
+        ("ref/prompt", "reshape-view", "base") => s.physical.clone(),
+        ("ref/prompt", "rotate-alias", "real") => s.physical.clone(),
+        ("ref/prompt", "rotate-alias", "new" | "old") => aliases(),
+        _ => all(),
+    };
     let lower = value.to_lowercase();
-    let matched: Vec<String> = names
+    let mut matched: Vec<String> = pool
         .into_iter()
         .filter(|n| n.to_lowercase().starts_with(&lower))
         .collect();
+    matched.sort();
+    matched.dedup();
     let total = matched.len();
     let values: Vec<String> = matched.into_iter().take(100).collect();
     let has_more = total > values.len();
@@ -1679,6 +1920,118 @@ pub fn complete(store: &dyn ControlStore, argument: &Value) -> Result<Value, Str
 // ---------------------------------------------------------------------------
 // The MCP server proper (stdio, newline-delimited JSON-RPC 2.0)
 // ---------------------------------------------------------------------------
+
+/// MCP tool annotations: a client uses these to decide what it may auto-approve
+/// and how loudly to confirm. Every tool here is closed-world (it only touches
+/// the bound store), so `openWorldHint` is always false.
+fn annot(title: &str, read_only: bool, destructive: bool, idempotent: bool) -> Value {
+    json!({
+        "title": title,
+        "readOnlyHint": read_only,
+        "destructiveHint": destructive,
+        "idempotentHint": idempotent,
+        "openWorldHint": false,
+    })
+}
+
+/// `outputSchema` of `list_views` / the `grovefs://views` resource.
+fn views_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "backend": { "type": "string", "enum": ["sqlite", "postgres"] },
+            "store": { "type": "string" },
+            "physical": { "type": "array", "items": { "type": "string" } },
+            "defined": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "kind": { "type": "string", "enum": ["derived", "alias", "fork"] },
+                        "real_view": { "type": "string" },
+                        "hide": { "type": "integer" },
+                        "only": { "type": "integer" },
+                        "reloc": { "type": "integer" },
+                        "mount": { "type": "string" },
+                        "line": { "type": "string" }
+                    },
+                    "required": ["name", "kind", "real_view"]
+                }
+            }
+        },
+        "required": ["backend", "store", "physical", "defined"]
+    })
+}
+
+/// `outputSchema` of `list_view_tree` / the `.../tree` resource.
+fn tree_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "kind": { "type": "string", "enum": ["physical", "derived", "alias", "fork", "simulated"] },
+            "rendered_from": { "type": "string" },
+            "root_path": { "type": "string" },
+            "truncated": { "type": "boolean" },
+            "dir_count": { "type": "integer" },
+            "file_count": { "type": "integer" },
+            "entries": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "kind": { "type": "string", "enum": ["dir", "file", "link"] },
+                        "size": { "type": "integer" }
+                    },
+                    "required": ["path", "kind", "size"]
+                }
+            }
+        },
+        "required": ["kind", "rendered_from", "root_path", "truncated", "entries"]
+    })
+}
+
+/// `outputSchema` of `get_view` — deliberately permissive: the fields differ by
+/// view kind and `definition` is verbatim text, so extra keys are meaningful.
+fn describe_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string" },
+            "kind": { "type": "string", "enum": ["derived", "alias", "fork", "physical"] },
+            "backend": { "type": "string" },
+            "base": { "type": "string" },
+            "real_view": { "type": "string" },
+            "definition": { "type": "string" },
+            "mount": { "type": "string" }
+        },
+        "required": ["name", "kind", "backend"]
+    })
+}
+
+/// `outputSchema` of `validate_definition`'s accepted verdict.
+fn validate_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "accepted": { "type": "boolean" },
+            "dry_run": { "type": "boolean" },
+            "kind": { "type": "string" },
+            "name": { "type": "string" },
+            "base": { "type": "string" },
+            "backend": { "type": "string" },
+            "hide": { "type": "integer" },
+            "only": { "type": "integer" },
+            "reloc": { "type": "integer" },
+            "would_replace_existing_definition": { "type": "boolean" },
+            "base_view_db_present": { "type": "boolean" },
+            "mount": { "type": "string" },
+            "note": { "type": "string" }
+        },
+        "required": ["accepted", "dry_run"]
+    })
+}
 
 /// JSON-schema `inputSchema` block shared by the tools' `name`-style args.
 fn str_prop(desc: &str) -> Value {
@@ -1691,16 +2044,21 @@ pub fn tool_defs() -> Value {
     json!([
         {
             "name": "list_views",
+            "title": "List views",
+            "annotations": annot("List views", true, false, true),
             "description": "List every view in the store: physical view trees (storage identities, mountable read-write) and governed definitions — derived views (read-only shaped lenses over a base view), pure aliases (writable public names for a real view; while an alias exists its real name is not a mount entry point) and forks (independent metadata trees seeded from a physical view: structure writable, content read-only, deletes touch only the fork). Answers as JSON: {backend, store, physical:[...], defined:[{name,kind,real_view,hide,only,reloc,mount,line}]} — `backend` is sqlite or postgres and `store` names the control-plane root the call read.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "db_path": str_prop("Metadata root holding meta/*.db and meta/views/*.layout; defaults to the server's --db-path/--home. Ignored when the server is bound to a `--store postgres://…` URI — the control plane is URI-bound there")
                 }
-            }
+            },
+            "outputSchema": views_output_schema()
         },
         {
             "name": "define_derived_view",
+            "title": "Define derived view",
+            "annotations": annot("Define derived view", false, false, true),
             "description": "Create or replace a DERIVED view: a named, centrally-governed presentation lens over the physical base view, built from `rules` text (one verb per line, # comments allowed): `hide <src>` (prune a subtree), `only <src>` (serve just that subtree), `map <src> <dst>` (re-home entries to a virtual display path), `link <src> <dst>` (add a second name for the same entries). Mounts of the derived name are READ-ONLY — writes go to the base view and show up through the lens within the client cache TTL. Against a live meta-server, remounts are not needed: the server hot-reloads the definition and mounts converge within ≤2s. A `base` line inside rules is rejected (the base is the `base` argument).",
             "inputSchema": {
                 "type": "object",
@@ -1715,6 +2073,8 @@ pub fn tool_defs() -> Value {
         },
         {
             "name": "alias_view",
+            "title": "Alias view",
+            "annotations": annot("Alias view", false, true, false),
             "description": "Create or replace a PURE ALIAS: a public writable name for a physical view (name governance, not shape). The alias mounts the FULL tree read-write, and while it exists the real name is refused as a mount entry point — locally and via meta-server. Pass `retire` to rotate a previous alias of the SAME real view gaplessly (write-before-delete: the real name never becomes mountable). Chaining aliases and aliasing a derived view are rejected.",
             "inputSchema": {
                 "type": "object",
@@ -1729,6 +2089,8 @@ pub fn tool_defs() -> Value {
         },
         {
             "name": "fork_view",
+            "title": "Fork view",
+            "annotations": annot("Fork view", false, false, false),
             "description": "Create a FORK: an INDEPENDENT metadata tree named `name`, seeded as a point-in-time copy of the physical view `base` (`<db-path>/meta/<name>.db`). Content bytes are SHARED through the cross-view ledger (no copies), so the fork costs metadata only. Structure (mkdir/rename/unlink/symlink/link) is WRITABLE; content writes (write/truncate) are refused with EROFS client-side. Deleting a name in the fork removes only the fork's own metadata — the base tree is untouched, and a shared object is freed only when no view holds a name for it. With `seed: false` the fork's tree starts EMPTY (root only) so a curated subset can be placed with `graft_view`. Requires a local SQLite base tree (a PostgreSQL-bound control store refuses forks — its trees are PG schemas, not files).",
             "inputSchema": {
                 "type": "object",
@@ -1743,6 +2105,8 @@ pub fn tool_defs() -> Value {
         },
         {
             "name": "graft_view",
+            "title": "Graft view",
+            "annotations": annot("Graft view", false, false, false),
             "description": "Copy a CURATED SUBSET of one view's names into `name` (a base view or a fork), renaming as it goes. `map` is a plan, one line per entry: `<src>` or `<src>TAB<dst>`, paths relative to each view's root; blank lines and `#` comments are ignored. A directory source brings its whole subtree (original names); a file/symlink brings just itself; the destination basename is the rename (this is how UUID-named objects become a human-shaped tree). Missing destination directories are created (0755), all entries land in ONE transaction (a bad line writes nothing), and bytes are SHARED via the cross-view ledger — a graft moves metadata, never content. Typical flow: fork_view with `seed: false`, then graft_view the subset you want. `src` defaults to the fork's recorded base.",
             "inputSchema": {
                 "type": "object",
@@ -1759,6 +2123,8 @@ pub fn tool_defs() -> Value {
         },
         {
             "name": "remove_view",
+            "title": "Remove view",
+            "annotations": annot("Remove view", false, true, true),
             "description": "Remove a view DEFINITION by name (derived, alias or fork — they share a slot). For derived/alias the underlying data is untouched; already-mounted clients keep their resolved lens until remount, and removing an alias makes the real name mountable again for NEW mounts. For a fork this also deletes its independent metadata tree and rebuilds the cross-view ledger (content bytes survive while any view still holds them).",
             "inputSchema": {
                 "type": "object",
@@ -1771,6 +2137,8 @@ pub fn tool_defs() -> Value {
         },
         {
             "name": "preview_rules",
+            "title": "Preview rules",
+            "annotations": annot("Preview rules", true, false, true),
             "description": "Dry-run a rules text through the exact parser `define_derived_view` uses: returns an error with the offending line number, or the accepted rule counts and echo. Call this before publishing a view so a bad lens never lands.",
             "inputSchema": {
                 "type": "object",
@@ -1782,6 +2150,8 @@ pub fn tool_defs() -> Value {
         },
         {
             "name": "validate_definition",
+            "title": "Validate definition",
+            "annotations": annot("Validate definition", true, false, true),
             "description": "Pre-publish DRY RUN of a whole derived-view definition — not just the verb syntax (`preview_rules`) but every governance guard `define_derived_view` enforces: invalid names, name==base, shadowing a physical <name>.db, replacing a pure alias, bad rules text. Returns the EXACT refusal string a real publish would give (so nothing lands by surprise), or on success a JSON verdict {accepted:true, dry_run:true, backend, hide/only/reloc counts, would_replace_existing_definition, base_view_db_present}. Writes NOTHING. Call this right before define_derived_view to confirm a name+base+rules trio is acceptable.",
             "inputSchema": {
                 "type": "object",
@@ -1792,10 +2162,13 @@ pub fn tool_defs() -> Value {
                     "db_path": str_prop("Metadata root; defaults to the server's --db-path/--home (ignored under a PG-bound server — one URI-bound control plane serves every slot)")
                 },
                 "required": ["name", "base", "rules"]
-            }
+            },
+            "outputSchema": validate_output_schema()
         },
         {
             "name": "list_view_tree",
+            "title": "List view tree",
+            "annotations": annot("List view tree", true, false, true),
             "description": "DISCOVERY + SHAPE PREVIEW: render the directory listing a mount would actually show, read from the bound store's metadata (no mount, no data IO). Give `view` (physical, derived — rendered through its real lens including synthesized dirs, alias — the full real tree, or fork — the fork's OWN tree) to inspect an existing listing, OR `base` + inline `rules` to preview an UNPUBLISHED lens before committing it. Returns JSON {kind, rendered_from, root_path, dir_count, file_count, truncated, entries:[{path,kind,size}]} where each `path` is an absolute DISPLAY path — exactly the string to reuse in a hide/only/map rule. Use this to learn which paths exist instead of guessing. `size` is the metadata field, NOT a byte count: dirs report 4096, files 0, symlinks their target length (the walk never asks the data backend) — stat through a mount for real sizes. Trees are walked through the bound control store's own backend: a file store needs a local meta/<view>.db (a remote tree is not walked), while a PG-bound store reads the view's Postgres schema directly.",
             "inputSchema": {
                 "type": "object",
@@ -1808,10 +2181,13 @@ pub fn tool_defs() -> Value {
                     "max": json!({"type":"integer","description":"Max entries to render (default 800; sets truncated=true when cut)"}),
                     "db_path": str_prop("Metadata root; defaults to the server's --db-path/--home")
                 }
-            }
+            },
+            "outputSchema": tree_output_schema()
         },
         {
             "name": "get_view",
+            "title": "Get view",
+            "annotations": annot("Get view", true, false, true),
             "description": "Describe ONE view in full for read-modify-write editing: for a derived view the verbatim `definition` text plus base and hide/only/reloc counts and the read-only mount note; for an alias the real view and that its real name is not mountable; for a physical view that it is a storage identity. `list_views` summarizes every slot; use this to read a single lens's exact rules before changing them. Errors on an unknown name rather than hiding a malformed definition.",
             "inputSchema": {
                 "type": "object",
@@ -1820,9 +2196,68 @@ pub fn tool_defs() -> Value {
                     "db_path": str_prop("Metadata root; defaults to the server's --db-path/--home")
                 },
                 "required": ["name"]
-            }
+            },
+            "outputSchema": describe_output_schema()
         }
     ])
+}
+
+/// Build the `tools/call` result for a machine-readable payload: the same JSON
+/// as pretty text (every client can display it) AND as `structuredContent`
+/// (a client that honors `outputSchema` hands the agent a typed object instead
+/// of making it peel and re-parse the text block).
+fn json_result(v: Value) -> Value {
+    let text = serde_json::to_string_pretty(&v).unwrap_or_default();
+    json!({
+        "content": [{ "type": "text", "text": text }],
+        "structuredContent": v,
+    })
+}
+
+/// The `(tool '…' requires: …)` tail of a missing-argument refusal, so an agent
+/// learns the whole contract without a second `tools/list` round-trip.
+fn required_hint(tool: &str) -> String {
+    match TOOL_REQUIRED.iter().find(|(n, _)| *n == tool) {
+        Some((_, reqs)) if !reqs.is_empty() => {
+            format!(" (tool '{tool}' requires: {})", reqs.join(", "))
+        }
+        Some(_) => format!(" (tool '{tool}' takes no required arguments)"),
+        None => String::new(),
+    }
+}
+
+/// Levenshtein distance over chars — the tool surface is ten short names, so a
+/// plain table walk is cheaper than any clever index.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            cur[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// Nearest tool name to a typo, for a "did you mean" hint.
+fn closest_tool(typed: &str) -> Option<&'static str> {
+    let typed = typed.to_lowercase();
+    let mut best: Option<(usize, &'static str)> = None;
+    for cand in TOOL_NAMES {
+        let d = edit_distance(&typed, &cand.to_lowercase());
+        if best.map(|(bd, _)| d < bd).unwrap_or(true) {
+            best = Some((d, cand));
+        }
+    }
+    match best {
+        Some((d, n)) if d <= 3 => Some(n),
+        _ => None,
+    }
 }
 
 /// Dispatch one `tools/call`; returns the JSON-RPC `result` object.
@@ -1844,7 +2279,12 @@ pub fn call_tool(name: &str, args: &Value, default_store: &Arc<dyn ControlStore>
         args.get(key)
             .and_then(|v| v.as_str())
             .map(|v| v.to_string())
-            .ok_or_else(|| err(format!("missing string argument '{key}'")))
+            .ok_or_else(|| {
+                err(format!(
+                    "missing string argument '{key}'{}",
+                    required_hint(name)
+                ))
+            })
     };
     // A per-call `db_path` re-points a FILE store (the historical multi-root
     // behavior); a PG-bound store is URI-bound and serves the call itself.
@@ -1854,33 +2294,8 @@ pub fn call_tool(name: &str, args: &Value, default_store: &Arc<dyn ControlStore>
     };
     let store: &dyn ControlStore = &*store;
     match name {
-        "list_views" => match list_views(store) {
-            Ok(sv) => {
-                let defined: Vec<Value> = sv
-                    .defined
-                    .iter()
-                    .map(|e| {
-                        json!({
-                            "name": e.name, "kind": e.kind, "real_view": e.real_view,
-                            "hide": e.hide, "only": e.only, "reloc": e.reloc,
-                            "mount": match e.kind {
-                                "alias" => "read-write (alias)",
-                                "fork" => "structure read-write / content read-only (fork)",
-                                _ => "read-only (derived)",
-                            },
-                            "line": entry_line(e),
-                        })
-                    })
-                    .collect();
-                let text = serde_json::to_string_pretty(&json!({
-                    "backend": store.backend(),
-                    "store": store.describe(),
-                    "physical": sv.physical,
-                    "defined": defined,
-                }))
-                .unwrap_or_default();
-                json!({ "content": [{ "type": "text", "text": text }] })
-            }
+        "list_views" => match views_snapshot(store) {
+            Ok(v) => json_result(v),
             Err(e) => err(e),
         },
         "define_derived_view" => {
@@ -1985,9 +2400,7 @@ pub fn call_tool(name: &str, args: &Value, default_store: &Arc<dyn ControlStore>
                 Err(e) => return e,
             };
             match validate_definition(store, &vname, &vbase, &rules) {
-                Ok(v) => {
-                    json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&v).unwrap_or_default() }] })
-                }
+                Ok(v) => json_result(v),
                 Err(e) => err(e),
             }
         }
@@ -1997,9 +2410,7 @@ pub fn call_tool(name: &str, args: &Value, default_store: &Arc<dyn ControlStore>
                 Err(e) => return e,
             };
             match describe_view(store, &vname) {
-                Ok(v) => {
-                    json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&v).unwrap_or_default() }] })
-                }
+                Ok(v) => json_result(v),
                 Err(e) => err(e),
             }
         }
@@ -2033,30 +2444,20 @@ pub fn call_tool(name: &str, args: &Value, default_store: &Arc<dyn ControlStore>
                     ),
                 };
             match view_tree(store, target, path, depth, max) {
-                Ok(t) => {
-                    let dir_count = t.entries.iter().filter(|e| e.kind == "dir").count();
-                    let file_count = t.entries.len() - dir_count;
-                    let entries: Vec<Value> = t
-                        .entries
-                        .iter()
-                        .map(|e| json!({ "path": e.path, "kind": e.kind, "size": e.size }))
-                        .collect();
-                    let text = serde_json::to_string_pretty(&json!({
-                        "kind": t.kind,
-                        "rendered_from": t.rendered_from,
-                        "root_path": t.root_path,
-                        "truncated": t.truncated,
-                        "dir_count": dir_count,
-                        "file_count": file_count,
-                        "entries": entries,
-                    }))
-                    .unwrap_or_default();
-                    json!({ "content": [{ "type": "text", "text": text }] })
-                }
+                Ok(t) => json_result(tree_json(&t)),
                 Err(e) => err(e),
             }
         }
-        other => err(format!("unknown tool '{other}'")),
+        other => {
+            let hint = match closest_tool(other) {
+                Some(n) => format!(" — did you mean '{n}'?"),
+                None => String::new(),
+            };
+            err(format!(
+                "unknown tool '{other}'{hint} (available: {})",
+                TOOL_NAMES.join(", ")
+            ))
+        }
     }
 }
 
@@ -2087,9 +2488,12 @@ pub fn handle_request(
                 .get("protocolVersion")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            let advertised = client_version
-                .clone()
-                .unwrap_or_else(|| MCP_PROTOCOL_VERSION.to_string());
+            // Echo a revision we can honor; an unknown one is answered with the
+            // newest we speak (the spec's negotiation rule), never echoed blindly.
+            let advertised = match client_version.as_deref() {
+                Some(v) if SUPPORTED_PROTOCOLS.contains(&v) => v.to_string(),
+                _ => MCP_PROTOCOL_VERSION.to_string(),
+            };
             json!({
                 "protocolVersion": advertised,
                 "capabilities": {
@@ -2104,17 +2508,48 @@ pub fn handle_request(
                     "title": "GroveFS view governance",
                     "version": env!("CARGO_PKG_VERSION"),
                 },
-                "instructions": "Customize data listings by governing SERVER-SIDE views over one store. If the server was started with `--require-api-key`, pass your credential as `apiKey` (a `grovefs apikey create` key, format '<id>:<secret>') in the initialize params — the state-touching methods (tools/list, tools/call, resources/list, resources/read, completion/complete) are refused until it authenticates, and every call is logged against your key. Discover: list_views (all slots) and get_view (one slot's exact rules). Explore/preview shape: list_view_tree renders a view's real directory listing — or a base+rules lens SIMULATED before you commit it — so you use exact display paths instead of guessing. Reshape: define_derived_view (hide/only/map/link rules, read-only lenses hot-reloaded into live meta-server mounts), alias_view (public writable names), remove_view. Curate: fork_view copies a base's names into an INDEPENDENT tree (structure writable, content refused EROFS, bytes shared), and with `seed:false` it starts EMPTY so graft_view can place just the chosen subset — a plan of `<src>` or `<src>TAB<dst>` lines (a directory source brings its subtree, each destination basename is the rename, missing parents are created, the whole plan commits in one transaction, nothing is ever copied). Validate before publishing: preview_rules (dry-run a rules text's verb syntax) and validate_definition (dry-run a whole name+base+rules against every governance guard, writing nothing). Beyond tools, the same governance is exposed as MCP RESOURCES (grovefs://view/<name>/definition and /tree, read via resources/read), PROMPTS (reshape-view and rotate-alias playbooks via prompts/get), and COMPLETION (completion/complete fills a view-name argument from the store); set a threshold with logging/setLevel to receive notifications/message frames per call. Rule paths are absolute view-tree paths; a base line inside rules is rejected. The control plane follows the server's metadata backend: a file server reads/writes <db-path>/meta (a per-call `db_path` may re-point it), a PG-bound server (`--store postgres://…`) reads/writes grovefs_control and `db_path` is ignored. Introspection is metadata-only over the bound store: it never mounts and reads no data bytes, so a rendered tree reports the metadata `size` field rather than byte counts (dirs 4096, files 0, symlinks their target length) — stat through a mount if you need real sizes.",
+                "instructions": INSTRUCTIONS,
             })
         }
         "ping" => json!({}),
         "tools/list" => json!({ "tools": tool_defs() }),
         "tools/call" => {
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
-            let args = params
+            if name.is_empty() {
+                return id.map(|id| {
+                    error_frame(
+                        id,
+                        -32602,
+                        format!(
+                            "tools/call requires a 'name' (one of: {})",
+                            TOOL_NAMES.join(", ")
+                        ),
+                    )
+                });
+            }
+            // Some clients serialize `arguments` as a JSON string rather than an
+            // object; accept that instead of reporting every argument as missing.
+            let raw = params
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| Value::Object(Map::new()));
+            let args = match raw {
+                Value::String(s) if s.trim().is_empty() => Value::Object(Map::new()),
+                Value::String(s) => match serde_json::from_str::<Value>(&s) {
+                    Ok(v @ Value::Object(_)) => v,
+                    _ => {
+                        return id.map(|id| {
+                            error_frame(
+                                id,
+                                -32602,
+                                "'arguments' must be a JSON object (or a string holding one)"
+                                    .into(),
+                            )
+                        })
+                    }
+                },
+                other => other,
+            };
             call_tool(name, &args, store)
         }
         // Resources: the same governance exposed as attachable context, so a
@@ -2152,17 +2587,12 @@ pub fn handle_request(
                 Err(e) => return id.map(|id| error_frame(id, -32602, e)),
             }
         }
-        // Completion: fill a view-name argument from the store's own names.
-        "completion/complete" => {
-            let a = params
-                .get("argument")
-                .cloned()
-                .unwrap_or(Value::Object(Map::new()));
-            match complete(&**store, &a) {
-                Ok(v) => v,
-                Err(e) => return id.map(|id| error_frame(id, -32602, e)),
-            }
-        }
+        // Completion: fill a view-name argument from the store's own names,
+        // role-aware when the ref names a prompt argument.
+        "completion/complete" => match complete(&**store, &params) {
+            Ok(v) => v,
+            Err(e) => return id.map(|id| error_frame(id, -32602, e)),
+        },
         // Logging: the ack is stateless; the threshold itself is held per session
         // (see `Session::handle`), which decides which notifications/message to emit.
         "logging/setLevel" => json!({}),
@@ -2446,10 +2876,18 @@ impl Session {
         if let (Some(min), Some(frame)) = (self.log_min, &resp) {
             if is_loggable_call(method) {
                 let (ok, reason) = call_outcome(&Some(frame.clone()));
-                let (lvl, rank, msg) = if ok {
-                    ("info", 20, format!("{method} ok"))
+                // Name WHICH tool / URI was called — `tools/call ok` alone told a
+                // log watcher nothing it could act on.
+                let subject = audit_subject(method, &params);
+                let what = if subject.is_empty() {
+                    method.to_string()
                 } else {
-                    ("warning", 40, format!("{method} failed: {reason}"))
+                    format!("{method} {subject}")
+                };
+                let (lvl, rank, msg) = if ok {
+                    ("info", 20, format!("{what} ok"))
+                } else {
+                    ("warning", 40, format!("{what} failed: {reason}"))
                 };
                 if rank >= min {
                     self.pending.push(json!({
@@ -2484,7 +2922,7 @@ pub fn serve(
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     let mut session =
-        Session::new(default_db, store_uri, require_key).map_err(|e| std::io::Error::other(e))?;
+        Session::new(default_db, store_uri, require_key).map_err(std::io::Error::other)?;
     if require_key {
         eprintln!(
             "[grovefs mcp] api-key auth REQUIRED (state-touching methods — tools/list, tools/call, resources/*, completion/complete — gated until a key in `initialize` authenticates; mint one with `grovefs apikey create`)"
@@ -2545,6 +2983,29 @@ mod tests {
         Arc::new(FileControlStore::new(p))
     }
 
+    /// Seed `<home>/meta/team.db` with `/docs/a.md` and `/photos/private/x.jpg`
+    /// (the fixture the introspection tests walk). The writer is dropped before
+    /// returning so a read-only probe opens a clean handle.
+    fn seed_team_tree(home: &Path) {
+        std::fs::create_dir_all(home.join("meta")).unwrap();
+        {
+            let m = MetaEngine::open(&home.join("meta/team.db")).unwrap();
+            let docs = m
+                .create_node(ROOT_INO, "docs", true, None, 0o0755, 0, 0)
+                .unwrap();
+            m.create_node(docs, "a.md", false, Some("k-docs-a"), 0o0644, 0, 0)
+                .unwrap();
+            let photos = m
+                .create_node(ROOT_INO, "photos", true, None, 0o0755, 0, 0)
+                .unwrap();
+            let priv_ = m
+                .create_node(photos, "private", true, None, 0o0755, 0, 0)
+                .unwrap();
+            m.create_node(priv_, "x.jpg", false, Some("k-priv-x"), 0o0644, 0, 0)
+                .unwrap();
+        }
+    }
+
     #[test]
     fn initialize_echoes_client_version() {
         let r = ask(
@@ -2575,7 +3036,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_advertises_the_nine_governance_tools() {
+    fn tools_list_advertises_the_ten_governance_tools() {
         let r = ask(
             &json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}),
             &fstore(Path::new("/")),
@@ -2604,7 +3065,143 @@ mod tests {
         );
         for t in r["result"]["tools"].as_array().unwrap() {
             assert!(t["inputSchema"]["type"] == "object" && t["description"].is_string());
+            // Every tool is annotated so a client can auto-approve the safe half.
+            assert!(t["title"].is_string(), "tool {} has no title", t["name"]);
+            assert_eq!(t["annotations"]["openWorldHint"], false);
+            assert!(t["annotations"]["readOnlyHint"].is_boolean());
+            // ...and the machine-readable answers declare their output shape.
+            let name = t["name"].as_str().unwrap();
+            let machine = matches!(
+                name,
+                "list_views" | "list_view_tree" | "get_view" | "validate_definition"
+            );
+            assert_eq!(
+                t["outputSchema"].is_object(),
+                machine,
+                "outputSchema presence wrong for {name}"
+            );
         }
+    }
+
+    #[test]
+    fn read_only_tools_are_annotated_as_such() {
+        let tools = tool_defs();
+        let tools = tools.as_array().unwrap();
+        let ro = |n: &str| -> bool {
+            tools.iter().find(|t| t["name"] == n).unwrap()["annotations"]["readOnlyHint"]
+                .as_bool()
+                .unwrap()
+        };
+        for n in [
+            "list_views",
+            "list_view_tree",
+            "get_view",
+            "preview_rules",
+            "validate_definition",
+        ] {
+            assert!(ro(n), "{n} must be readOnlyHint=true");
+        }
+        for n in [
+            "define_derived_view",
+            "alias_view",
+            "fork_view",
+            "graft_view",
+            "remove_view",
+        ] {
+            assert!(!ro(n), "{n} writes and must not claim readOnlyHint");
+        }
+        assert_eq!(
+            tools.iter().find(|t| t["name"] == "remove_view").unwrap()["annotations"]
+                ["destructiveHint"],
+            true
+        );
+    }
+
+    #[test]
+    fn unknown_protocol_version_negotiates_to_a_supported_one() {
+        for v in SUPPORTED_PROTOCOLS {
+            let r = ask(
+                &json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+                        "params":{"protocolVersion":v}}),
+                &fstore(Path::new("/")),
+            )
+            .unwrap();
+            assert_eq!(r["result"]["protocolVersion"], v);
+        }
+        let r = ask(
+            &json!({"jsonrpc":"2.0","id":2,"method":"initialize",
+                    "params":{"protocolVersion":"1999-01-01"}}),
+            &fstore(Path::new("/")),
+        )
+        .unwrap();
+        assert_eq!(r["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn tool_errors_carry_actionable_hints() {
+        let store = fstore(Path::new("/"));
+        let text = |v: &Value| -> String {
+            v["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        // A typo gets the whole surface plus the nearest name.
+        let r = ask(
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":"define_derived_vew","arguments":{}}}),
+            &store,
+        )
+        .unwrap();
+        let t = text(&r);
+        assert!(t.starts_with("unknown tool 'define_derived_vew'"), "{t}");
+        assert!(t.contains("did you mean 'define_derived_view'?"), "{t}");
+        assert!(t.contains("available: list_views"), "{t}");
+        // A missing argument names the tool and its whole required set.
+        let r = ask(
+            &json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+                    "params":{"name":"define_derived_view","arguments":{"name":"x"}}}),
+            &store,
+        )
+        .unwrap();
+        let t = text(&r);
+        assert!(t.contains("missing string argument 'base'"), "{t}");
+        assert!(t.contains("requires: name, base, rules"), "{t}");
+        // `tools/call` with no name is a protocol error that names the surface.
+        let r = ask(
+            &json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{}}),
+            &store,
+        )
+        .unwrap();
+        assert_eq!(r["error"]["code"], -32602);
+        assert!(r["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("list_views"));
+    }
+
+    #[test]
+    fn arguments_may_arrive_as_a_json_string() {
+        let home = db();
+        let store = fstore(&home);
+        seed_team_tree(&home);
+        let r = ask(
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":"list_view_tree",
+                              "arguments":"{\"view\":\"team\",\"depth\":2}"}}),
+            &store,
+        )
+        .unwrap();
+        assert!(r["result"]["isError"].is_null(), "{r}");
+        assert_eq!(r["result"]["structuredContent"]["kind"], "physical");
+        // A string that is not a JSON object is a protocol error, not silence.
+        let r = ask(
+            &json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+                    "params":{"name":"list_views","arguments":"not json"}}),
+            &store,
+        )
+        .unwrap();
+        assert_eq!(r["error"]["code"], -32602);
     }
 
     #[test]
@@ -2735,10 +3332,17 @@ mod tests {
                 .to_string()
         };
         // Default seed=true copies; seed=false leaves a bare root.
-        let empty = call(40, "fork_view", json!({"name": "lab", "base": "base", "seed": false}));
+        let empty = call(
+            40,
+            "fork_view",
+            json!({"name": "lab", "base": "base", "seed": false}),
+        );
         let t = text(&empty);
         assert!(t.contains("as an EMPTY tree: root only"), "{t}");
-        assert!(t.contains("view graft --name lab --src base --map plan.tsv"), "{t}");
+        assert!(
+            t.contains("view graft --name lab --src base --map plan.tsv"),
+            "{t}"
+        );
         // The plan renames into a directory the graft creates; src defaults to
         // the fork's recorded base.
         let g = call(
@@ -2747,11 +3351,16 @@ mod tests {
             json!({"name": "lab", "map": "docs/uuid-1\tby_target/M31_2025.fits"}),
         );
         let t = text(&g);
-        assert!(t.contains("grafted 2 entries (1 directory) from 'base' into 'lab' at /"), "{t}");
+        assert!(
+            t.contains("grafted 2 entries (1 directory) from 'base' into 'lab' at /"),
+            "{t}"
+        );
         assert!(t.contains("1 shared object(s)"), "{t}");
         let lab = crate::meta::MetaEngine::open(&home.join("meta/lab.db")).unwrap();
         let by = lab.lookup(crate::meta::ROOT_INO, "by_target").unwrap();
-        let f = lab.lookup(by.id, "M31_2025.fits").expect("renamed entry placed");
+        let f = lab
+            .lookup(by.id, "M31_2025.fits")
+            .expect("renamed entry placed");
         assert_eq!(f.data_ref.as_deref(), Some("blob-1"));
         // A lens renders another tree: it owns no nodes, so it cannot host a graft.
         let d = call(
@@ -2760,17 +3369,33 @@ mod tests {
             json!({"name": "lens", "base": "base", "rules": "only /docs"}),
         );
         assert!(!d["result"]["isError"].as_bool().unwrap_or(false));
-        let lens = call(43, "graft_view", json!({"name": "lens", "map": "docs/uuid-1"}));
+        let lens = call(
+            43,
+            "graft_view",
+            json!({"name": "lens", "map": "docs/uuid-1"}),
+        );
         assert_eq!(lens["result"]["isError"], true);
         assert!(text(&lens).contains("derived lens"), "{}", text(&lens));
         // A base view has no recorded base: --src is required, and said so.
-        let nosrc = call(44, "graft_view", json!({"name": "base", "map": "docs/uuid-1"}));
+        let nosrc = call(
+            44,
+            "graft_view",
+            json!({"name": "base", "map": "docs/uuid-1"}),
+        );
         assert_eq!(nosrc["result"]["isError"], true);
         assert!(text(&nosrc).contains("pass --src"), "{}", text(&nosrc));
         // A plan that tries to walk out of the view is refused line-accurately.
-        let esc = call(45, "graft_view", json!({"name": "lab", "map": "../etc/passwd"}));
+        let esc = call(
+            45,
+            "graft_view",
+            json!({"name": "lab", "map": "../etc/passwd"}),
+        );
         assert_eq!(esc["result"]["isError"], true);
-        assert!(text(&esc).contains("line 1") && text(&esc).contains(".."), "{}", text(&esc));
+        assert!(
+            text(&esc).contains("line 1") && text(&esc).contains(".."),
+            "{}",
+            text(&esc)
+        );
     }
 
     /// A fork is created, listed, described, protected from aliasing and
@@ -3290,6 +3915,8 @@ mod tests {
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0]["method"], "notifications/message");
         assert_eq!(notes[0]["params"]["level"], "info");
+        // The message names WHICH tool ran, not just the method family.
+        assert_eq!(notes[0]["params"]["data"], "tools/call list_views ok");
 
         // Threshold = warning: a refused call emits a warning frame...
         sess.handle(&json!({"jsonrpc":"2.0","id":4,"method":"logging/setLevel",
@@ -3303,5 +3930,188 @@ mod tests {
         sess.handle(&json!({"jsonrpc":"2.0","id":6,"method":"tools/call",
                             "params":{"name":"list_views","arguments":{}}}));
         assert!(sess.drain_notifications().is_empty());
+    }
+
+    #[test]
+    fn json_tools_return_structured_content_matching_the_text() {
+        let home = db();
+        let store = fstore(&home);
+        seed_team_tree(&home);
+        let call = |id: i64, name: &str, args: Value| {
+            ask(
+                &json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+                        "params":{"name":name,"arguments":args}}),
+                &store,
+            )
+            .unwrap()
+        };
+        let assert_mirrors = |r: &Value| -> Value {
+            let text = r["result"]["content"][0]["text"].as_str().unwrap();
+            let parsed: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(&r["result"]["structuredContent"], &parsed);
+            parsed
+        };
+        let snap = assert_mirrors(&call(1, "list_views", json!({})));
+        assert!(snap["physical"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p == "team"));
+
+        let tree = assert_mirrors(&call(
+            2,
+            "list_view_tree",
+            json!({"view": "team", "depth": 3}),
+        ));
+        assert_eq!(tree["kind"], "physical");
+        assert!(tree["entries"].is_array());
+
+        let view = assert_mirrors(&call(3, "get_view", json!({"name": "team"})));
+        assert_eq!(view["name"], "team");
+
+        let verdict = assert_mirrors(&call(
+            4,
+            "validate_definition",
+            json!({"name": "safe", "base": "team", "rules": "hide /photos/private"}),
+        ));
+        assert_eq!(verdict["accepted"], true);
+        assert_eq!(verdict["dry_run"], true);
+
+        // A refusal stays a plain error, with no structured payload to trust.
+        let bad = call(5, "get_view", json!({"name": "ghost"}));
+        assert_eq!(bad["result"]["isError"], true);
+        assert!(bad["result"]["structuredContent"].is_null());
+    }
+
+    #[test]
+    fn resources_expose_the_guide_snapshot_and_a_drilled_tree() {
+        let home = db();
+        let store = fstore(&home);
+        seed_team_tree(&home);
+        let d: &dyn ControlStore = &*store;
+
+        // Discovery lists the two store-wide resources first.
+        let lr = list_resources(d).unwrap();
+        let uris: Vec<&str> = lr["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["uri"].as_str().unwrap())
+            .collect();
+        assert_eq!(uris[0], GUIDE_URI);
+        assert_eq!(uris[1], VIEWS_URI);
+        assert!(uris.contains(&"grovefs://view/team/tree"));
+
+        // The guide is markdown and still names every tool (the only map an
+        // agent gets before tools/list).
+        let g = read_resource(d, GUIDE_URI).unwrap();
+        assert_eq!(g["contents"][0]["mimeType"], "text/markdown");
+        let text = g["contents"][0]["text"].as_str().unwrap();
+        for t in TOOL_NAMES {
+            assert!(text.contains(t), "guide does not mention {t}");
+        }
+
+        // The snapshot is byte-identical to the list_views payload.
+        let snap: Value = serde_json::from_str(
+            read_resource(d, VIEWS_URI).unwrap()["contents"][0]["text"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(snap, views_snapshot(d).unwrap());
+
+        // `?path=` + `?depth=` drill into one subtree (percent-encoded path).
+        let drilled: Value = serde_json::from_str(
+            read_resource(d, "grovefs://view/team/tree?path=%2Fphotos&depth=1").unwrap()
+                ["contents"][0]["text"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(drilled["root_path"], "/photos");
+        let paths: Vec<&str> = drilled["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["path"].as_str().unwrap())
+            .collect();
+        assert!(paths.contains(&"/photos/private"));
+        assert!(!paths.contains(&"/docs"));
+        assert!(paths.iter().all(|p| p.starts_with("/photos")));
+
+        // `?max=` bounds the render and says so.
+        let capped: Value = serde_json::from_str(
+            read_resource(d, "grovefs://view/team/tree?max=1").unwrap()["contents"][0]["text"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(capped["truncated"], true);
+
+        // A malformed bound is refused instead of silently ignored.
+        let e = read_resource(d, "grovefs://view/team/tree?depth=x").unwrap_err();
+        assert!(e.contains("'depth' must be a non-negative integer"), "{e}");
+        // ...and an unknown scheme still names what is supported.
+        let e = read_resource(d, "grovefs://bogus").unwrap_err();
+        assert!(e.contains("unsupported resource uri"), "{e}");
+        assert!(e.contains(GUIDE_URI), "{e}");
+    }
+
+    #[test]
+    fn completion_is_role_aware() {
+        let home = db();
+        let store = fstore(&home);
+        seed_team_tree(&home);
+        let d: &dyn ControlStore = &*store;
+        let call = |id: i64, name: &str, args: Value| {
+            ask(
+                &json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+                        "params":{"name":name,"arguments":args}}),
+                &store,
+            )
+            .unwrap()
+        };
+        call(1, "alias_view", json!({"name": "pub", "real": "team"}));
+        call(
+            2,
+            "define_derived_view",
+            json!({"name": "safe", "base": "team", "rules": "hide /photos/private"}),
+        );
+        let asked = |id: i64, params: Value| -> Vec<String> {
+            ask(
+                &json!({"jsonrpc":"2.0","id":id,"method":"completion/complete","params":params}),
+                &store,
+            )
+            .unwrap()["result"]["completion"]["values"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect()
+        };
+        // A resource URI's {name} completes against every mountable name.
+        let all = asked(
+            3,
+            json!({"ref":{"type":"ref/resource","value":"grovefs://view/{name}/tree"},
+                   "argument":{"name":"name","value":""}}),
+        );
+        assert!(all.contains(&"team".to_string()));
+        assert!(all.contains(&"pub".to_string()));
+        assert!(all.contains(&"safe".to_string()));
+        // reshape-view's `base` can only be a physical tree.
+        let bases = asked(
+            4,
+            json!({"ref":{"type":"ref/prompt","name":"reshape-view"},
+                   "argument":{"name":"base","value":""}}),
+        );
+        assert_eq!(bases, vec!["team".to_string()]);
+        // rotate-alias' `old` can only be an existing alias.
+        let olds = asked(
+            5,
+            json!({"ref":{"type":"ref/prompt","name":"rotate-alias"},
+                   "argument":{"name":"old","value":""}}),
+        );
+        assert_eq!(olds, vec!["pub".to_string()]);
+        let _ = d;
     }
 }

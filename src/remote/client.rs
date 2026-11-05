@@ -481,8 +481,10 @@ impl RemoteBackend {
             return Err(io::Error::from_raw_os_error(status));
         }
         let sizes: Vec<u64> = data
-            .chunks_exact(8)
-            .map(|c| u64::from_be_bytes(c.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_be_bytes(*c))
             .collect();
         if sizes.len() != keys.len() {
             return Err(io::Error::other("batch_len: response count mismatch"));

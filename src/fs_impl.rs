@@ -131,6 +131,10 @@ fn gen_sid() -> u64 {
 }
 
 impl GroveFS {
+    /// One flat constructor for the mount's option surface (the CLI resolves
+    /// every knob once and passes it through verbatim), so the call site stays
+    /// readable rather than hiding them behind a builder struct.
+    #[allow(clippy::too_many_arguments)] // mount options mirror the CLI flags 1:1
     pub fn new(
         meta: Arc<dyn MetaProvider>,
         backend: Arc<dyn StorageBackend>,

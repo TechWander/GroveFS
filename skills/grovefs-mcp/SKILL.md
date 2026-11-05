@@ -77,8 +77,10 @@ bash scripts/smoke.sh
 
 ## Protocol essentials (verbatim with the implementation)
 
-- Newline-delimited JSON-RPC 2.0, protocol version `2025-06-18`; `initialize`
-  echoes the client's `protocolVersion` back verbatim without validating it.
+- Newline-delimited JSON-RPC 2.0, protocol version `2025-06-18`; the
+  `2025-03-26` and `2024-11-05` revisions are accepted too. `initialize` echoes
+  a revision the server speaks and answers any other value with `2025-06-18`
+  (never a blind echo of something it cannot honor).
 - **Governance failures are not protocol errors**: per MCP convention they come
   back inside the result as
   `{"result":{"content":[{"type":"text","text":"…"}],"isError":true}}`, so an
@@ -95,7 +97,9 @@ bash scripts/smoke.sh
   | `-32002` | resource URI unusable — malformed URI **or** the view's tree is not in the bound store |
 
   A *missing tool argument* is deliberately **not** a protocol error: it comes
-  back as `isError` with `missing string argument 'name'`, like any refusal.
+  back as `isError` with `missing string argument 'name' (tool '…' requires: …)`,
+  like any refusal. An unknown tool lists the whole surface and, when the name is
+  close to a real one, adds `— did you mean '…'?`.
 - Frames without an id (notifications) are never answered — do not wait for
   a reply after sending one (`notifications/initialized`,
   `notifications/cancelled`).
@@ -109,6 +113,15 @@ bash scripts/smoke.sh
   refusal text below).
 - Missing arguments and unknown tools surface as `isError`, not as protocol
   errors.
+- `tools/list` entries carry `title` + `annotations` (`readOnlyHint`,
+  `destructiveHint`, `idempotentHint`, `openWorldHint:false`), so a client can
+  auto-approve the five read-only tools (`list_views`, `get_view`,
+  `list_view_tree`, `preview_rules`, `validate_definition`). The four
+  JSON-returning ones also declare an `outputSchema` and return
+  `structuredContent` next to the text block — prefer `structuredContent` when
+  your client surfaces it; the text block is the same JSON for everyone else.
+- `arguments` may arrive as a JSON object or as a string holding one (both are
+  accepted); anything else is `-32602`.
 
 ## The ten tools
 
@@ -144,6 +157,22 @@ cannot be served is treated as a protocol problem, not a governance refusal).
 Because the walk only reads metadata and never asks the data plane for object
 lengths, the `size` in a response is **not a file size** (dirs `4096`, files `0`,
 symlinks report their target's character length); mount and `stat` for real bytes.
+
+## Attachable context: resources, prompts, completion
+
+When your client surfaces MCP resources, use them instead of a tool round-trip:
+
+| URI | What you get |
+|---|---|
+| `grovefs://guide` | This server's operating manual as markdown (`text/markdown`) — the same content as `initialize.instructions` |
+| `grovefs://views` | The whole-store snapshot — byte-identical to `list_views` |
+| `grovefs://view/<name>/definition` | One slot's verbatim definition — identical to `get_view` |
+| `grovefs://view/<name>/tree{?path,depth,max}` | The rendered listing — identical to `list_view_tree`, and `?path=&depth=&max=` drill into a big tree |
+
+`prompts/list` offers the two playbooks (`reshape-view`, `rotate-alias`);
+`completion/complete` is role-aware — a prompt's `base`/`real` argument completes
+against physical trees, `rotate-alias`' `new`/`old` against existing aliases, and
+a resource's `{name}` against every mountable name.
 
 ## Rule text (four verbs)
 
@@ -238,8 +267,8 @@ lines interpolates your own names/paths.
 
 | What you tried | The `isError` text you get back |
 |---|---|
-| Missing a required tool argument | `missing string argument '<key>'` |
-| Typoed a tool name | `unknown tool '<name>'` |
+| Missing a required tool argument | `missing string argument '<key>' (tool '<name>' requires: …)` |
+| Typoed a tool name | `unknown tool '<name>'` + `— did you mean '<nearest>'?` + `(available: …)` |
 | `list_view_tree` with only `base` | `'base' also needs inline 'rules' to simulate a lens (got base '<b>' alone)` |
 | `list_view_tree` with neither `view` nor `base`+`rules` | `provide 'view' (an existing view) or 'base' + 'rules' (a simulated lens)` |
 | `list_view_tree` on a name with no reachable tree | `no metadata tree for view '<X>' (<path>) — list_view_tree walks this store's own backend; …` |

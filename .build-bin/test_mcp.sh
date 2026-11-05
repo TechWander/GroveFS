@@ -12,8 +12,8 @@
 # (view-name fill), and logging/setLevel -> notifications/message streaming.
 # Assertion-based like the other suites; emits a SUMMARY line for run_all.sh.
 set -u
-cd /data/xy/grovefs
-export PKG_CONFIG=/data/xy/grovefs/.build-bin/pkg-config
+cd "$(dirname "$0")/.."                 # run from any checkout, not a hard-coded path
+export PKG_CONFIG=$PWD/.build-bin/pkg-config
 Y=./target/release/grovefs
 BASE=$PWD/.mcptest/home
 fusermount -u .mcptest/mnt .mcptest/mnt_al 2>/dev/null   # drop last run's mounts
@@ -73,6 +73,25 @@ say '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
 if have 2 '[.result.tools[].name]|sort==["alias_view","define_derived_view","fork_view","get_view","graft_view","list_view_tree","list_views","preview_rules","remove_view","validate_definition"]'; then
   ok "tools/list advertises exactly the ten governance + introspection tools"
 else bad "tools/list: $(resp 2 || echo NO-RESPONSE)"; fi
+# Tool metadata modern clients actually read: a title + safety hints (so the
+# read-only half can be auto-approved) and an outputSchema on the JSON tools.
+if have 2 '[.result.tools[]|select(.name=="list_view_tree")|(.title|length>0) and .annotations.readOnlyHint and (.annotations.openWorldHint==false) and (.outputSchema.properties.entries|type=="object")]|length==1'; then
+  ok "tools carry a title + annotations and the JSON ones declare an outputSchema"
+else bad "tool metadata: $(resp 2 || echo NO-RESPONSE)"; fi
+if have 2 '[.result.tools[]|select(.annotations.readOnlyHint==true)|.name]|sort==["get_view","list_view_tree","list_views","preview_rules","validate_definition"]'; then
+  ok "exactly the read-only tools are marked readOnlyHint (client approval prompts get it right)"
+else bad "readOnly hints: $(resp 2 || echo NO-RESPONSE)"; fi
+# The handshake manual is sectioned, not one wall of text.
+if have 1 '.result.instructions|test("## Golden order") and test("## Discover")'; then
+  ok "initialize.instructions is a sectioned operating manual"
+else bad "instructions layout: $(resp 1 || echo NO-RESPONSE)"; fi
+# An unknown protocol revision is negotiated DOWN, never echoed blindly.
+say '{"jsonrpc":"2.0","id":16,"method":"initialize","params":{"protocolVersion":"1999-01-01","capabilities":{}}}'
+if have 16 '.result.protocolVersion=="2025-06-18"'; then
+  ok "unknown protocol revision is answered with a supported one (2025-06-18)"
+else bad "protocol negotiation: $(resp 16 || echo NO-RESPONSE)"; fi
+say '{"jsonrpc":"2.0","id":17,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{}}}'
+have 17 '.result.protocolVersion=="2025-06-18"' >/dev/null || bad "re-handshake failed"
 # The notification must NOT have produced a response frame (id-less = no answer).
 if jq -e 'select(has("id")|not)' "$MCPOUT" >/dev/null 2>&1; then
   bad "notification was answered (protocol violation)"
@@ -128,6 +147,11 @@ echo "===== 2b) agent discovers paths + previews shapes (introspection) ====="
 say '{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"list_view_tree","arguments":{"view":"team","depth":20}}}'
 TT=$(resp 20 | jq -r '.result.content[0].text' 2>/dev/null | jq -e '.kind=="physical" and ([.entries[].path]|index("/photos/private/x.jpg")) and ([.entries[].path]|index("/docs/a.md"))' 2>/dev/null)
 [ "$TT" = "true" ] && ok "list_view_tree shows the whole physical tree (exact paths to reuse in rules)" || bad "physical tree: $(resp 20 || echo NO-RESP)"
+# structuredContent mirrors the text block exactly — a client honoring
+# outputSchema hands the agent a typed object instead of making it re-parse.
+if resp 20 | jq -e '(.result.structuredContent.kind=="physical") and ((.result.structuredContent|tojson)==(.result.content[0].text|fromjson|tojson))' >/dev/null 2>&1; then
+  ok "list_view_tree returns structuredContent identical to its text block"
+else bad "structuredContent: $(resp 20 || echo NO-RESP)"; fi
 # THROUGH a live derived lens: /photos/private is pruned exactly as the mount shows it.
 say '{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"list_view_tree","arguments":{"view":"release","depth":20}}}'
 TT=$(resp 21 | jq -r '.result.content[0].text' 2>/dev/null | jq -e '.kind=="derived" and .rendered_from=="team" and ([.entries[].path]|index("/docs")) and ([.entries[].path]|index("/photos")) and (([.entries[].path]|index("/photos/private"))==null)' 2>/dev/null)
@@ -174,6 +198,30 @@ RT2=$(resp 43 | jq -r '.result.contents[0].text' 2>/dev/null | jq -e '.kind=="de
 [ "$RT2" = "true" ] && ok "resources/read renders the lens tree (same shape the mount shows)" || bad "resources/read tree: $(resp 43 || echo NO-RESP)"
 say '{"jsonrpc":"2.0","id":44,"method":"resources/read","params":{"uri":"grovefs://view/team/bogus"}}'
 if have 44 '.error.code==-32002'; then ok "unknown resource facet -> protocol error -32002 (not a crash)"; else bad "bad facet: $(resp 44 || echo NO-RESP)"; fi
+# Store-wide context resources: the manual and the whole-store snapshot, so a
+# client can attach the map before drilling into one view.
+say '{"jsonrpc":"2.0","id":48,"method":"resources/read","params":{"uri":"grovefs://guide"}}'
+if resp 48 | jq -e '.result.contents[0].mimeType=="text/markdown" and (.result.contents[0].text|test("## Golden order")) and (.result.contents[0].text|test("validate_definition"))' >/dev/null 2>&1; then
+  ok "resources/read grovefs://guide returns the markdown operating manual"
+else bad "guide resource: $(resp 48 || echo NO-RESP)"; fi
+say '{"jsonrpc":"2.0","id":49,"method":"resources/read","params":{"uri":"grovefs://views"}}'
+if resp 49 | jq -r '.result.contents[0].text' 2>/dev/null | jq -e '(.physical|index("team")) and (.defined|map(.name)|index("release"))' >/dev/null 2>&1; then
+  ok "resources/read grovefs://views returns the list_views snapshot"
+else bad "views resource: $(resp 49 || echo NO-RESP)"; fi
+# The tree resource accepts query parameters, so a big tree can be attached
+# one subtree at a time instead of paying for the default render.
+say '{"jsonrpc":"2.0","id":52,"method":"resources/read","params":{"uri":"grovefs://view/team/tree?path=%2Fphotos&depth=2"}}'
+if resp 52 | jq -r '.result.contents[0].text' 2>/dev/null | jq -e '.root_path=="/photos" and ([.entries[].path]|index("/photos/private")) and (([.entries[].path]|index("/docs"))==null)' >/dev/null 2>&1; then
+  ok "tree resource drills into ?path=/?depth= (only that subtree is rendered)"
+else bad "drilled tree: $(resp 52 || echo NO-RESP)"; fi
+say '{"jsonrpc":"2.0","id":53,"method":"resources/read","params":{"uri":"grovefs://view/team/tree?max=1"}}'
+if resp 53 | jq -r '.result.contents[0].text' 2>/dev/null | jq -e '.truncated==true' >/dev/null 2>&1; then
+  ok "tree resource honors ?max= and reports truncated honestly"
+else bad "max tree: $(resp 53 || echo NO-RESP)"; fi
+say '{"jsonrpc":"2.0","id":54,"method":"resources/templates/list"}'
+if have 54 '[.result.resourceTemplates[]|select(.name=="view-tree")|.uriTemplate]|any(test("\\{\\?path,depth,max\\}"))'; then
+  ok "the tree template advertises its query parameters (RFC 6570)"
+else bad "tree template: $(resp 54 || echo NO-RESP)"; fi
 say '{"jsonrpc":"2.0","id":45,"method":"prompts/list"}'
 if have 45 '[.result.prompts[].name]|sort==["reshape-view","rotate-alias"]'; then ok "prompts/list advertises the two governance playbooks"; else bad "prompts/list: $(resp 45 || echo NO-RESP)"; fi
 say '{"jsonrpc":"2.0","id":46,"method":"prompts/get","params":{"name":"reshape-view","arguments":{"base":"team","goal":"hide private shots"}}}'
@@ -320,13 +368,17 @@ grep -q "view 'release' -> base 'team': 1 hide, 0 only, 0 reloc rule(s) (read-on
 # ------------------------------------------------------------------ error paths
 echo "===== 4) protocol + tool error paths ====="
 say '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"define_derived_view","arguments":{"name":"x"}}}'
-if have 9 '.result.isError==true and (.result.content[0].text|test("missing string argument"))'; then
-  ok "missing argument -> isError inside result (agent-visible, no crash)"
+if have 9 '.result.isError==true and (.result.content[0].text|test("missing string argument")) and (.result.content[0].text|test("requires: name, base, rules"))'; then
+  ok "missing argument names the tool and its full required set"
 else bad "missing-arg path: $(resp 9 || echo NO-RESPONSE)"; fi
 say '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"no_such_tool","arguments":{}}}'
-if have 10 '.result.isError==true and (.result.content[0].text|test("unknown tool"))'; then
-  ok "unknown tool -> isError with a readable message"
+if have 10 '.result.isError==true and (.result.content[0].text|test("unknown tool")) and (.result.content[0].text|test("available:"))'; then
+  ok "unknown tool -> isError naming the whole available surface"
 else bad "unknown-tool path: $(resp 10 || echo NO-RESPONSE)"; fi
+say '{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"define_derived_vew","arguments":{}}}'
+if have 15 '.result.content[0].text|test("did you mean .define_derived_view.")'; then
+  ok "a typo'd tool name gets a \"did you mean\" suggestion"
+else bad "typo hint: $(resp 15 || echo NO-RESPONSE)"; fi
 say '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"define_derived_view","arguments":{"name":"team","base":"team","rules":"only /docs"}}}'
 if have 11 '.result.isError==true and (.result.content[0].text|test("must differ from its base"))'; then
   ok "governance refusals match the CLI strings exactly"
@@ -352,6 +404,10 @@ if have 51 '.result.isError==true'; then
   if jq -s 'map(select(.method=="notifications/message" and .params.logger=="grove-mcp"))|length>=1' "$MCPOUT" | grep -q true; then
     ok "a refused call streams a notifications/message frame (warning) on the server side"
   else bad "no notification frame emitted after the refused call"; fi
+  # The frame names WHICH tool ran — "tools/call ok" alone is not actionable.
+  if jq -s 'map(select(.method=="notifications/message"))|any(.params.data|test("list_view_tree"))' "$MCPOUT" | grep -q true; then
+    ok "the notification names the tool (tools/call list_view_tree failed: ...)"
+  else bad "notification does not name the tool"; fi
 else bad "ghost call not answered: $(resp 51 || echo NO-RESP)"; fi
 
 # Cleanup: agent removes its definitions; underlying data stays.

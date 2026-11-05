@@ -82,7 +82,7 @@ impl LocalBackend {
         // are irrelevant.
         for b in 0..BUCKETS {
             let mut name = [0u8; 2];
-            name.copy_from_slice(&hex_pair(b as u64));
+            name.copy_from_slice(&hex_pair(b));
             let _ = fs::create_dir(blocks.join(std::str::from_utf8(&name).unwrap()));
         }
         Ok(Self {
