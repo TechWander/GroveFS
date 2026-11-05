@@ -126,13 +126,17 @@ Only two frames come back — `notifications/initialized` **gets no reply**, by
 design rather than by packet loss:
 
 ```
-{"id":1,"jsonrpc":"2.0","result":{"capabilities":{"completions":{},"logging":{},"prompts":{"listChanged":false},"resources":{"listChanged":false,"subscribe":false},"tools":{"listChanged":false}},"instructions":"Customize data listings by governing SERVER-SIDE views over one store. …","protocolVersion":"2025-06-18","serverInfo":{"name":"grovefs","title":"GroveFS view governance","version":"0.1.0"}}}
+{"id":1,"jsonrpc":"2.0","result":{"capabilities":{"completions":{},"logging":{},"prompts":{"listChanged":false},"resources":{"listChanged":false,"subscribe":false},"tools":{"listChanged":false}},"instructions":"GroveFS view governance over ONE control-plane store …","protocolVersion":"2025-06-18","serverInfo":{"name":"grovefs","title":"GroveFS view governance","version":"0.1.0"}}}
 {"id":2,"jsonrpc":"2.0","result":{"content":[{"text":"{\n  \"db_path\": \".migtest/skill/store\",\n  \"defined\": [\n    {\n      \"hide\": 1,\n      \"kind\": \"derived\",\n      \"line\": \"view 'release' -> base 'team': 1 hide, 0 only, 0 reloc rule(s) (read-only)\",\n      \"mount\": \"read-only (derived)\",\n      \"name\": \"release\",\n ...
 ```
 
 The `instructions` field in the `initialize` result is the server's own
-operating manual; MCP clients inject it into context, so this skill does not
-repeat its wording.
+operating manual — sectioned (`## Discover`, `## Reshape`, `## Curate`,
+`## Validate before publishing`, `## Golden order`, `## Beyond tools`,
+`## Mechanics`) so it can be skimmed. MCP clients inject it into context, so
+this skill does not repeat its wording. An unknown `protocolVersion` is answered
+with `2025-06-18` (a revision this server actually speaks) instead of being
+echoed back.
 
 ## 4. Resources / completion / log pushes
 
@@ -152,6 +156,20 @@ repeat its wording.
 ```
 
 You must peel `contents[0].text` first (that inner string is the JSON payload).
+The same JSON also rides in `structuredContent` on the matching `tools/call`, so
+a client honoring `outputSchema` never has to parse the text block.
+
+Store-wide resources need no view name:
+
+```bash
+... guide                       # grovefs://guide  — the markdown manual (text/markdown)
+... views                       # grovefs://views  — the same payload as list_views
+... tree team /photos 2         # grovefs://view/team/tree?path=%2Fphotos&depth=2
+```
+
+`?path=`, `?depth=` and `?max=` are the resource-side spelling of the
+`list_view_tree` arguments: a big tree can be attached one subtree at a time, and
+the render still reports `"truncated": true` when a bound cuts it.
 
 ```bash
 ... complete base 'r'
@@ -165,7 +183,7 @@ You must peel `contents[0].text` first (that inner string is the JSON payload).
 ```
 ```
 [stderr] [setlevel] warning — later calls may push notifications/message
-[stderr] [push] notifications/message {"data": "tools/call failed: no metadata tree for view 'ghost' (.migtest/skill/store/meta/ghost.db) \u2014 list_view_tree walks this store's own backend; a remote tree not reachable from here is not", "level": "warning", "logger": "grove-mcp"}
+[stderr] [push] notifications/message {"data": "tools/call list_view_tree failed: no metadata tree for view 'ghost' (.migtest/skill/store/meta/ghost.db) \u2014 list_view_tree walks this store's own backend; a remote tree not reachable from here is not", "level": "warning", "logger": "grove-mcp"}
 [stderr] the tool refused this call (isError) — not a protocol error
 ```
 

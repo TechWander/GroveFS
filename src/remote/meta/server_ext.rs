@@ -769,7 +769,7 @@ fn view_provider(rt: &MetaRuntime, view: &str) -> io::Result<Arc<dyn MetaProvide
             .defs
             .lock()
             .get(view)
-            .map_or(false, |seen| control.defs_changed(view, seen));
+            .is_some_and(|seen| control.defs_changed(view, seen));
         if !stale {
             return Ok(p);
         }
@@ -971,7 +971,7 @@ fn broadcast_derived_display(rt: &MetaRuntime, phys: &str, events: &[Event]) {
         .collect();
     for dname in derived {
         // Only enrich if this bucket has actual subscribers.
-        let has_subs = rt.subs.lock().get(&dname).map_or(false, |m| !m.is_empty());
+        let has_subs = rt.subs.lock().get(&dname).is_some_and(|m| !m.is_empty());
         if !has_subs {
             continue;
         }
@@ -2566,9 +2566,9 @@ fn try_open_event_stream(
     Ok(s)
 }
 
-/// Split a `--meta` value into a failover address list. Lives in the client
-/// half ([`super::split_addrs`], always compiled); re-exported here via
-/// `use super::*;` so the meta-server failover paths keep calling it.
+// Split a `--meta` value into a failover address list. Lives in the client
+// half (`super::split_addrs`, always compiled); re-exported here via
+// `use super::*;` so the meta-server failover paths keep calling it.
 
 /// Keep this mount's kernel cache coherent with peers WITHOUT `--strict`: connect
 /// an event stream to the meta-server and translate each pushed frame into a
@@ -2675,7 +2675,6 @@ fn run_event_stream(
 #[cfg(test)]
 mod ha_tests {
     use super::*;
-
 
     #[test]
     fn forward_event_codec_roundtrips() {

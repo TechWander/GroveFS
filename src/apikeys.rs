@@ -42,6 +42,7 @@
 //!   shared `grovefs_control` schema ([`crate::control`]) — a key minted or
 //!   revoked against the URI is authoritative for every meta-server, MCP
 //!   server and CLI pointing at it, with no per-node file to colocate.
+//!
 //! The backend is picked once at open time ([`ApiKeyStore::open`] for the
 //! local file, [`ApiKeyStore::open_pg`] for the URI; [`ApiKeyStore::open_for`]
 //! routes like the view backend). Both backends expose identical columns,
@@ -93,7 +94,7 @@ impl AuthedKey {
     /// Does this key's view binding admit `view`? An unbound key (`view: None`,
     /// a system-level credential) admits any view; a bound key only its own.
     pub fn binds_to(&self, view: &str) -> bool {
-        self.view.as_deref().map_or(true, |v| v == view)
+        self.view.as_deref().is_none_or(|v| v == view)
     }
 }
 
@@ -874,7 +875,7 @@ mod tests {
             !s.set_ro(&id, true).unwrap(),
             "a revoked row is not flipped"
         );
-        assert_eq!(s.list().unwrap()[0].ro, false, "ro stayed as it was");
+        assert!(!s.list().unwrap()[0].ro, "ro stayed as it was");
     }
 
     /// A key can now carry a view binding and a read-only flag. An unbound key

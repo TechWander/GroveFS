@@ -17,6 +17,10 @@ Commands:
   resources                   resources/list
   templates                   resources/templates/list
   read URI                    resources/read
+  guide                       resources/read grovefs://guide (the operating manual)
+  views                       resources/read grovefs://views (whole-store snapshot)
+  tree NAME [PATH] [DEPTH] [MAX]
+                              resources/read grovefs://view/NAME/tree?path=…
   prompts                     prompts/list
   prompt NAME [JSON_ARGS]     prompts/get
   complete NAME PREFIX        completion/complete (view-name completion)
@@ -40,6 +44,7 @@ import select
 import shutil
 import subprocess
 import sys
+import urllib.parse
 
 PROTOCOL_VERSION = "2025-06-18"
 
@@ -197,7 +202,9 @@ def show_result(method, result, as_json):
         for t in result.get("tools", []):
             desc = (t.get("description") or "").split(". ")[0][:96]
             req = t.get("inputSchema", {}).get("required", [])
-            print("%-22s required=[%s]  %s" % (t["name"], ",".join(req), desc))
+            # The safety hint decides whether a client may auto-approve the call.
+            mode = "ro" if t.get("annotations", {}).get("readOnlyHint") else "rw"
+            print("[%s] %-22s required=[%s]  %s" % (mode, t["name"], ",".join(req), desc))
         print("(%d tools)" % len(result.get("tools", [])))
         return 0
     if method == "prompts/list":
@@ -212,6 +219,18 @@ def show_result(method, result, as_json):
     if method == "prompts/get":
         for m in result.get("messages", []):
             print(m.get("content", {}).get("text", ""))
+        return 0
+    if method == "resources/read":
+        # Markdown (the guide) reads as-is; everything else is JSON in `text`.
+        for c in result.get("contents", []):
+            body = c.get("text", "")
+            if str(c.get("mimeType", "")).startswith("text/markdown"):
+                print(body)
+            else:
+                try:
+                    print(json.dumps(json.loads(body), indent=2, ensure_ascii=False))
+                except ValueError:
+                    print(body)
         return 0
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0
@@ -319,6 +338,24 @@ def main():
             method, params, rc = "ping", None, "plain"
         elif cmd == "read":
             method, params, rc = "resources/read", {"uri": rest[1]}, "plain"
+        elif cmd == "guide":
+            method, params, rc = "resources/read", {"uri": "grovefs://guide"}, "plain"
+        elif cmd == "views":
+            method, params, rc = "resources/read", {"uri": "grovefs://views"}, "plain"
+        elif cmd == "tree":
+            if len(rest) < 2:
+                die("`tree` needs a view name", 4)
+            uri = "grovefs://view/%s/tree" % urllib.parse.quote(rest[1], safe="")
+            q = []
+            if len(rest) > 2 and rest[2]:
+                q.append("path=" + urllib.parse.quote(rest[2], safe=""))
+            if len(rest) > 3 and rest[3]:
+                q.append("depth=" + rest[3])
+            if len(rest) > 4 and rest[4]:
+                q.append("max=" + rest[4])
+            if q:
+                uri += "?" + "&".join(q)
+            method, params, rc = "resources/read", {"uri": uri}, "plain"
         elif cmd == "prompt":
             method, params, rc = "prompts/get", {"name": rest[1], "arguments": jload(rest[2] if len(rest) > 2 else "{}", "prompt arguments")}, "plain"
         elif cmd == "complete":

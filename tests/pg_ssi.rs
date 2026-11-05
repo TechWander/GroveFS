@@ -365,7 +365,7 @@ fn ssi_retry_under_mixed_workload_converges() {
         for i in 0..8 {
             let want = format!("c{t}_{i}");
             assert!(
-                names.iter().any(|n| *n == want),
+                names.contains(&want),
                 "expected created entry {want} to be present"
             );
         }
@@ -373,7 +373,7 @@ fn ssi_retry_under_mixed_workload_converges() {
     for idx in 0..4 {
         let moved = format!("r{idx}_moved");
         let old = format!("src{idx}");
-        let either = names.iter().any(|n| *n == moved) || names.iter().any(|n| *n == old);
+        let either = names.contains(&moved) || names.contains(&old);
         assert!(
             either,
             "renamed entry must appear under new name {moved} or old name {old}"

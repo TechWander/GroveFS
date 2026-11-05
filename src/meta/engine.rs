@@ -13,8 +13,8 @@ use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::stats;
 use super::*;
+use crate::stats;
 
 static LEDGER_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -701,14 +701,7 @@ pub fn graft_view(
                 };
                 let parent = graft_ensure_dir(&tx, parent_path, &mut ctx)?;
                 graft_copy(
-                    &tx,
-                    &mut ins,
-                    &rows,
-                    &children,
-                    *idx,
-                    parent,
-                    name,
-                    &mut ctx,
+                    &tx, &mut ins, &rows, &children, *idx, parent, name, &mut ctx,
                 )?;
             }
         }
@@ -725,7 +718,8 @@ pub fn graft_view(
                 )
                 .is_ok();
             if !booked {
-                ledger_add(&tx, dr).map_err(|e| format!("cannot book '{dr}' in the ledger: {e}"))?;
+                ledger_add(&tx, dr)
+                    .map_err(|e| format!("cannot book '{dr}' in the ledger: {e}"))?;
             }
             ledger_add(&tx, dr).map_err(|e| format!("cannot book '{dr}' in the ledger: {e}"))?;
         }
@@ -1819,10 +1813,8 @@ impl MetaEngine {
                         Ok(s) => s,
                         Err(_) => return Vec::new(),
                     };
-                    let rows = match stmt.query_map(
-                        params![parent, last, fetch as i64],
-                        row_to_raw,
-                    ) {
+                    let rows = match stmt.query_map(params![parent, last, fetch as i64], row_to_raw)
+                    {
                         Ok(r) => r,
                         Err(_) => return Vec::new(),
                     };
@@ -1841,10 +1833,9 @@ impl MetaEngine {
                         Ok(s) => s,
                         Err(_) => return Vec::new(),
                     };
-                    let rows = match stmt.query_map(
-                        params![parent, fetch as i64, start as i64],
-                        row_to_raw,
-                    ) {
+                    let rows = match stmt
+                        .query_map(params![parent, fetch as i64, start as i64], row_to_raw)
+                    {
                         Ok(r) => r,
                         Err(_) => return Vec::new(),
                     };
@@ -1862,7 +1853,7 @@ impl MetaEngine {
             let mut c = self.cursors.lock();
             for (i, row) in out.iter().enumerate() {
                 let next = offset + i + 1;
-                if next % READDIR_CURSOR_STRIDE == 0 {
+                if next.is_multiple_of(READDIR_CURSOR_STRIDE) {
                     if c.len() >= READDIR_CURSOR_CAP {
                         c.clear();
                     }
@@ -2740,7 +2731,9 @@ impl MetaProvider for MetaEngine {
     }
     fn dump_tree(&self) -> Vec<(i64, i64, String, bool, Option<String>)> {
         let conn = self.read_conn();
-        let mut stmt = match conn.prepare("SELECT id, parent_id, name, is_dir, data_ref FROM node ORDER BY id") {
+        let mut stmt = match conn
+            .prepare("SELECT id, parent_id, name, is_dir, data_ref FROM node ORDER BY id")
+        {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
@@ -2771,6 +2764,12 @@ impl MetaProvider for MetaEngine {
 /// GroveFS-native HA (`VACUUM INTO` snapshot shipping) is SQLite-only; under the
 /// PG variant `backup_to_bytes` reports unsupported and a `--store postgres://…`
 /// meta-server rejects the `--role/--peer/--witness` flags at CLI time.
+///
+/// Every server-side holder keeps this in an `Arc<MetaStore>` and picks the
+/// variant once at construction (`engine_for`), so the size gap between the two
+/// variants never shows up in a per-op move — boxing the SQLite handle would add
+/// an indirection to the hot path for no allocation win.
+#[allow(clippy::large_enum_variant)]
 pub enum MetaStore {
     Sqlite(MetaEngine),
     Pg(Box<crate::pg_store::PgEngine>),
@@ -3026,7 +3025,6 @@ fn row_to_raw(r: &rusqlite::Row) -> rusqlite::Result<RawNode> {
         ino: r.get(12)?,
     })
 }
-
 
 impl From<rusqlite::Error> for MetaError {
     fn from(e: rusqlite::Error) -> Self {
@@ -3494,11 +3492,7 @@ mod tests {
             lens.supports_paged_readdir(),
             "a lens pages over one materialized listing"
         );
-        let lens_full: Vec<String> = lens
-            .readdir(ROOT_INO)
-            .into_iter()
-            .map(|n| n.name)
-            .collect();
+        let lens_full: Vec<String> = lens.readdir(ROOT_INO).into_iter().map(|n| n.name).collect();
         let mut lens_stitched = Vec::new();
         let mut lens_off = 0usize;
         loop {
@@ -3652,18 +3646,25 @@ mod tests {
                 .unwrap();
             e.create_node(sub, "uuid-b", false, Some("blob-b"), 0o644, 1000, 1000)
                 .unwrap();
-            e.create_node(ROOT_INO, "unrelated", false, Some("blob-c"), 0o644, 1000, 1000)
-                .unwrap();
+            e.create_node(
+                ROOT_INO,
+                "unrelated",
+                false,
+                Some("blob-c"),
+                0o644,
+                1000,
+                1000,
+            )
+            .unwrap();
         }
         let st = fork_view_with(dir.path(), "base", "lab", false).unwrap();
         assert_eq!((st.nodes, st.blobs), (1, 0), "empty fork is root only");
         let lab = MetaEngine::open(&meta.join("lab.db")).unwrap();
         assert!(lab.readdir(ROOT_INO).is_empty(), "nothing was copied");
 
-        let items = parse_graft_plan(
-            "docs/uuid-a\tby_target/M31_2025.fits\ndocs/sub\tby_target/raw\n",
-        )
-        .unwrap();
+        let items =
+            parse_graft_plan("docs/uuid-a\tby_target/M31_2025.fits\ndocs/sub\tby_target/raw\n")
+                .unwrap();
         let g = graft_view(dir.path(), "lab", "base", &items, "", false).unwrap();
         assert_eq!(
             (g.nodes, g.dirs, g.blobs, g.skipped),
@@ -3769,7 +3770,11 @@ mod tests {
         fork_view_with(dir.path(), "base", "lab", false).unwrap();
         let items = parse_graft_plan("a\tp/a\nb\tq/b\n").unwrap();
         let g = graft_view(dir.path(), "lab", "base", &items, "", false).unwrap();
-        assert_eq!((g.nodes, g.dirs, g.blobs), (4, 2, 1), "two dirs + two names, one blob");
+        assert_eq!(
+            (g.nodes, g.dirs, g.blobs),
+            (4, 2, 1),
+            "two dirs + two names, one blob"
+        );
         let lab = MetaEngine::open(&meta.join("lab.db")).unwrap();
         let p = lab.lookup(ROOT_INO, "p").unwrap();
         let a = lab.lookup(p.id, "a").unwrap();
@@ -3807,7 +3812,11 @@ mod tests {
 
         let items = parse_graft_plan("x\n").unwrap();
         let g = graft_view(dir.path(), "lab", "base", &items, "stage/2026", false).unwrap();
-        assert_eq!((g.nodes, g.dirs, g.blobs), (3, 2, 1), "stage + 2026 + the file");
+        assert_eq!(
+            (g.nodes, g.dirs, g.blobs),
+            (3, 2, 1),
+            "stage + 2026 + the file"
+        );
         let stage = lab.lookup(ROOT_INO, "stage").unwrap();
         let y = lab.lookup(stage.id, "2026").unwrap();
         assert!(lab.lookup(y.id, "x").is_some(), "dest prefix is mkdir -p");
