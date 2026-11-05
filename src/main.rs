@@ -18,6 +18,7 @@
 //!            can customize data listings through the same validated API
 //!   import — mirror an EXISTING local directory tree into a view, zero-copy
 //!            (hard link into blocks/) where the filesystem allows it
+//!   gc     — offline orphan-object audit / reclaim for a LOCAL store
 //!   data-server / meta-server — centralized storage/metadata services
 
 use clap::{Parser, Subcommand};
@@ -72,6 +73,10 @@ or as an agent-facing governance service over MCP (`grovefs mcp`).
   Server-side governance (no local rules file needed on clients):
     grovefs view --db-path /meta define --name lens   --base alice --rules lens.rules
     grovefs view --db-path /meta alias  --name public --real alice
+
+  Audit/reclaim orphan bytes in a LOCAL store (offline; scan is the default):
+    grovefs gc --db-path ~/grovefs              # report orphans / ledger-held keys
+    grovefs gc --db-path ~/grovefs --apply      # delete >24h orphans (store offline)
 
   AI-agent surface over MCP (stdio), guarded by an API key:
     grovefs apikey --db-path /meta create --label claude-desktop --for mcp   # prints <id>:<secret> once
@@ -518,8 +523,11 @@ enum Cmd {
     /// sets the default metadata root (falls back to `--home`); a per-call
     /// `db_path` argument overrides it.
     #[command(
-        after_long_help = r#"MCP TOOL SURFACE — what `tools/list` returns (9 tools).
-Every tool takes an optional `db_path` (defaults to this server's --db-path/--home).
+        after_long_help = r#"MCP TOOL SURFACE — what `tools/list` returns (10 tools).
+Every tool takes an optional `db_path` (defaults to this server's --db-path/--home),
+carries MCP annotations (readOnlyHint/destructiveHint/idempotentHint) for client
+approval prompts, and the four JSON-returning ones also declare an outputSchema
+and return structuredContent alongside the human-readable text.
 
   DISCOVERY (read-only, never mutates; metadata only, no data bytes):
     list_views            every slot: physical trees + derived lenses + forks + aliases (JSON summary)
@@ -529,6 +537,7 @@ Every tool takes an optional `db_path` (defaults to this server's --db-path/--ho
   GOVERNANCE (writes <db>/meta/views/*.layout definitions; never mounts or touches data):
     define_derived_view   create/replace a READ-ONLY derived lens (name, base, rules: hide/only/map/link)
     fork_view             create an INDEPENDENT tree (name, base): structure writable, content read-only
+    graft_view            copy a curated, renamable subset into a fork/base view (name, map plan)
     alias_view            create/replace a WRITABLE public alias (name, real; `retire` rotates gaplessly)
     remove_view           drop a definition by name (a fork also drops its own tree; data bytes stay while held)
 
@@ -536,9 +545,17 @@ Every tool takes an optional `db_path` (defaults to this server's --db-path/--ho
     preview_rules         parse-check rules text alone (line-level error + accepted counts)
     validate_definition   full governance pre-check — returns the exact refusal a real publish would give
 
+  BEYOND TOOLS (same store, no extra configuration):
+    resources             grovefs://guide, grovefs://views,
+                          grovefs://view/<name>/definition|tree{?path,depth,max}
+    prompts               reshape-view, rotate-alias playbooks
+    completion            fills view-name arguments from the store
+    logging/setLevel      streams notifications/message (naming the tool) per call
+
 NOTES
-  Protocol: 2025-06-18 over newline-delimited JSON-RPC 2.0 on stdio; core
-    initialize / ping / tools-list / tools-call (plus prompts + resources).
+  Protocol: 2025-06-18 over newline-delimited JSON-RPC 2.0 on stdio; the
+    2025-03-26 and 2024-11-05 revisions are accepted too (an unknown revision
+    is answered with 2025-06-18 rather than echoed).
   Control plane only: it reshapes how a view LIST is presented; it never mounts
     a filesystem or reads/writes file bytes.
   Auth: start with --require-api-key, mint an MCP-scoped key via
@@ -614,6 +631,46 @@ NOTES
         db_path: Option<PathBuf>,
         #[command(subcommand)]
         action: RefsAction,
+    },
+    /// Audit and reclaim ORPHAN objects in a LOCAL store (offline GC).
+    ///
+    /// An orphan is a page under `<data-root>/blocks/` that NO surviving view
+    /// tree names and the cross-view ledger does not book — the residue of an
+    /// out-of-band `rm meta/<view>.db` (no unlink ever ran) or a crash between
+    /// object creation and the node insert. SCAN IS THE DEFAULT: it prints the
+    /// counts, the biggest orphans and any ledger-held keys that must first be
+    /// released with `grovefs refs rebuild`.
+    ///
+    /// `--apply` deletes only objects older than `--older-than` (a hard-linked
+    /// import inherits the SOURCE file's mtime, so young-object filtering alone
+    /// is not enough), never a key the ledger still holds, and refuses to run
+    /// while this store is mounted or served by a local grovefs process. A
+    /// view tree that cannot be read aborts the whole scan rather than guessing
+    /// — a skipped tree would make every blob it names look orphaned.
+    Gc {
+        /// Metadata root holding `meta/*.db` — same option name and directory
+        /// as `meta-server --db-path`; falls back to the global `--home`.
+        #[arg(long)]
+        db_path: Option<PathBuf>,
+        /// Data root(s) holding `blocks/` — comma-separated for several disks,
+        /// same convention as `data-server --root`; defaults to `--db-path`.
+        #[arg(long)]
+        data_root: Option<PathBuf>,
+        /// Minimum object age to reclaim (`30m`, `24h`, `7d`; `0` disables the
+        /// grace window). Younger objects are never deleted: an in-flight
+        /// create/import may not have committed its node row yet.
+        #[arg(long, default_value = "24h", value_name = "DURATION")]
+        older_than: String,
+        /// Delete the reclaimable candidates (default is a dry-run report).
+        #[arg(long)]
+        apply: bool,
+        /// Emit one JSON object instead of the text report.
+        #[arg(long)]
+        json: bool,
+        /// Bypass the "this data root shares no object with any tree" guard —
+        /// only for a store whose every surviving reference lives elsewhere.
+        #[arg(long)]
+        force: bool,
     },
     /// Import an existing local directory tree into a view, zero-copy where possible.
     ///
@@ -1104,10 +1161,7 @@ fn meta_path(base: &Path, view: &str) -> PathBuf {
 /// Open an EXISTING local view tree. A mount never creates one: an unknown
 /// name is refused with the same "create it first" guidance the meta-server's
 /// `M_OPEN` gives, so a typo cannot silently become an empty tree.
-fn open_existing_view(
-    base: &Path,
-    view: &str,
-) -> Result<MetaEngine, Box<dyn std::error::Error>> {
+fn open_existing_view(base: &Path, view: &str) -> Result<MetaEngine, Box<dyn std::error::Error>> {
     let mp = meta_path(base, view);
     if !mp.is_file() {
         return Err(format!(
@@ -1726,9 +1780,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // and stay file-based.
             let vbase = db_path.unwrap_or_else(|| base.clone());
             let store = resolve_store(store);
-            let store_is_pg = store.as_deref().map_or(false, |u| {
-                u.starts_with("postgres://") || u.starts_with("postgresql://")
-            });
+            let store_is_pg = store
+                .as_deref()
+                .is_some_and(|u| u.starts_with("postgres://") || u.starts_with("postgresql://"));
             let ctrl = grovefs::mcp::control_store_for(&vbase, store.as_deref())?;
             // A PG deployment has no local per-view db file: a base tree is a
             // `grovefs_v_<hex(view)>` schema that `view create` provisions
@@ -2152,7 +2206,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ro,
                 } => {
                     let scope = grovefs::apikeys::Scope::parse(&r#for)
-                        .map_err(|e| Box::<dyn std::error::Error>::from(e))?;
+                        .map_err(Box::<dyn std::error::Error>::from)?;
                     let (id, full) = keys.create_bound(&label, scope, view.as_deref(), ro)?;
                     println!(
                         "apikey created — shown ONCE (only its SHA-256 is stored; save it now):"
@@ -2220,7 +2274,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 r.view.as_deref() == Some(v.as_str())
                                     || real
                                         .as_deref()
-                                        .map_or(false, |x| r.view.as_deref() == Some(x))
+                                        .is_some_and(|x| r.view.as_deref() == Some(x))
                             }
                         })
                         .collect();
@@ -2232,16 +2286,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         return Ok(());
                     }
                     println!(
-                        "{:<3} {:<34} {:<16} {:<7} {:<12} {:<4} {:<25} {:<25} {}",
-                        "#",
-                        "id",
-                        "label",
-                        "scope",
-                        "view",
-                        "rw",
-                        "created",
-                        "last_used",
-                        "revoked"
+                        "{:<3} {:<34} {:<16} {:<7} {:<12} {:<4} {:<25} {:<25} revoked",
+                        "#", "id", "label", "scope", "view", "rw", "created", "last_used"
                     );
                     for (i, r) in rows.iter().enumerate() {
                         println!(
@@ -2257,28 +2303,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             r.revoked_at.as_deref().unwrap_or("-"),
                         );
                     }
-                    match &view {
-                        Some(v) => {
+                    if let Some(v) = &view {
+                        println!(
+                            "{} bound key(s) for view '{}' of {} total",
+                            rows.len(),
+                            v,
+                            all.len()
+                        );
+                        if let Some(real) = &real {
                             println!(
-                                "{} bound key(s) for view '{}' of {} total",
-                                rows.len(),
-                                v,
-                                all.len()
+                                "  ('{}' is a pure alias — keys bound to its real view '{}' are included)",
+                                v, real
                             );
-                            if let Some(real) = &real {
-                                println!(
-                                    "  ('{}' is a pure alias — keys bound to its real view '{}' are included)",
-                                    v, real
-                                );
-                            }
-                            let unbound = all.iter().filter(|r| r.view.is_none()).count();
-                            if unbound > 0 {
-                                println!(
-                                    "  note: {unbound} unbound key(s) admit every view too — plain `apikey list` shows them"
-                                );
-                            }
                         }
-                        None => {}
+                        let unbound = all.iter().filter(|r| r.view.is_none()).count();
+                        if unbound > 0 {
+                            println!(
+                                "  note: {unbound} unbound key(s) admit every view too — plain `apikey list` shows them"
+                            );
+                        }
                     }
                 }
                 ApikeyAction::Revoke { id } => {
@@ -2376,8 +2419,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         println!("last {} call(s), newest first:", rows.len());
                         println!(
-                            "{:<25} {:<34} {:<12} {:<22} {:<4} {}",
-                            "ts", "key_id", "method", "tool", "ok", "detail"
+                            "{:<25} {:<34} {:<12} {:<22} {:<4} detail",
+                            "ts", "key_id", "method", "tool", "ok"
                         );
                         for r in &rows {
                             println!(
@@ -2409,6 +2452,84 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         counted
                     );
                 }
+            }
+        }
+        Cmd::Gc {
+            db_path,
+            data_root,
+            older_than,
+            apply,
+            json,
+            force,
+        } => {
+            // The trees this command audits are local `<view>.db` files. Under
+            // PG they are schemas and the bytes belong to the data servers —
+            // there is no offline page tree to walk here.
+            if resolve_store(None)
+                .as_deref()
+                .is_some_and(|u| u.starts_with("postgres://") || u.starts_with("postgresql://"))
+            {
+                return Err("`gc` audits LOCAL page files under <data-root>/blocks; a PostgreSQL deployment's trees are schemas and its bytes are owned by the data servers — reclaim there with the DBA/data-server tooling, not this command".into());
+            }
+            let mbase = db_path.unwrap_or_else(|| base.clone());
+            let root_arg = data_root.unwrap_or_else(|| mbase.clone());
+            let roots: Vec<PathBuf> = root_arg
+                .to_string_lossy()
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .collect();
+            if roots.is_empty() {
+                return Err("gc: no data root to scan (pass --data-root)".into());
+            }
+            let age = grovefs::gc::parse_age(&older_than)?;
+            let views = grovefs::gc::physical_views(&mbase)?;
+            // Offline gate: a live writable mount of any tree here (or an alias
+            // that writes through to one) can commit a node row between our
+            // scan and delete. A derived lens is read-only by contract and is
+            // not a blocker.
+            if apply {
+                let live = gc_live_mounts(&mbase, &roots, &views);
+                if !live.is_empty() {
+                    return Err(format!(
+                        "gc --apply refused: this store has live mounts — {}; unmount them first (reclaim must run offline)",
+                        live.join("; ")
+                    )
+                    .into());
+                }
+            }
+            let users = local_store_users(&mbase, &roots);
+            if !users.is_empty() {
+                let list = users.join("; ");
+                if apply {
+                    return Err(format!(
+                        "gc --apply refused: this store is in use by local grovefs process(es) — {list}; stop them first (a hard-linked import can expose an OLD mtime before its node row commits, so the grace window alone cannot protect it)"
+                    )
+                    .into());
+                }
+                eprintln!("note: this store is in use by local grovefs process(es) — {list}");
+            }
+            let rep = grovefs::gc::scan(&mbase, &roots, age)?;
+            // Wrong-root guard: a data root that shares ZERO objects with the
+            // surviving trees is almost always a --db-path/--data-root mixup,
+            // and deleting there would kill another store's bytes.
+            if rep.objects > 0 && rep.refs > 0 && rep.matched == 0 && !force {
+                return Err(format!(
+                    "gc: the data root(s) share no object with any view tree in {} ({} object(s), {} referenced key(s)) — wrong --db-path/--data-root? Nothing was deleted; pass --force only if this is expected",
+                    mbase.display(), rep.objects, rep.refs
+                )
+                .into());
+            }
+            let reclaimed = if apply {
+                Some(grovefs::gc::reclaim(&rep.orphans, age))
+            } else {
+                None
+            };
+            if json {
+                println!("{}", gc_json(&rep, reclaimed.as_ref()));
+            } else {
+                print_gc_report(&rep, reclaimed.as_ref());
             }
         }
         Cmd::Import {
@@ -2548,14 +2669,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let opts = grovefs::du::DuOpts {
                 view,
                 meta: meta.or_else(|| std::env::var("GROVEFS_META").ok().filter(|s| !s.is_empty())),
-                meta_token: meta_token.or_else(|| std::env::var("GROVEFS_TOKEN").ok().filter(|s| !s.is_empty())),
-                meta_api_key: meta_api_key.or_else(|| std::env::var("GROVEFS_API_KEY").ok().filter(|s| !s.is_empty())),
+                meta_token: meta_token.or_else(|| {
+                    std::env::var("GROVEFS_TOKEN")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                }),
+                meta_api_key: meta_api_key.or_else(|| {
+                    std::env::var("GROVEFS_API_KEY")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                }),
                 store: resolve_store(store),
                 db_path: db_path.or_else(|| Some(base.clone())),
                 data: data.or_else(|| std::env::var("GROVEFS_DATA").ok().filter(|s| !s.is_empty())),
                 data_root,
-                api_key: api_key.or_else(|| std::env::var("GROVEFS_API_KEY").ok().filter(|s| !s.is_empty())),
-                token: token.or_else(|| std::env::var("GROVEFS_TOKEN").ok().filter(|s| !s.is_empty())),
+                api_key: api_key.or_else(|| {
+                    std::env::var("GROVEFS_API_KEY")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                }),
+                token: token.or_else(|| {
+                    std::env::var("GROVEFS_TOKEN")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                }),
                 path,
                 depth: if total { 0 } else { depth },
                 bytes,
@@ -2688,7 +2825,7 @@ fn import_walk(
                 st.skipped += 1; // incremental re-run: keep whatever is there
                 continue;
             }
-            let fm = match std::fs::metadata(&e.path()) {
+            let fm = match std::fs::metadata(e.path()) {
                 Ok(fm) => fm,
                 Err(err) => {
                     eprintln!("import: {}: {err}", e.path().display());
@@ -2985,7 +3122,7 @@ fn mounted_at(wants: &[String]) -> bool {
                     .replace("\\011", "\t")
                     .replace("\\012", "\n")
                     .replace("\\134", "\\");
-                wants.iter().any(|w| *w == mp)
+                wants.contains(&mp)
             }
             None => false,
         }
@@ -3016,6 +3153,440 @@ fn view_mounted_at(view: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Live mounts of THIS store that can write: every physical tree name (base or
+/// fork) plus pure ALIASES resolving to one. A derived lens is read-only by
+/// contract, so it cannot commit a node row and is not a gc blocker.
+/// Mounts of another store's names are ignored (their db is not under `mbase`).
+fn gc_live_mounts(mbase: &Path, roots: &[PathBuf], views: &[String]) -> Vec<String> {
+    let Ok(content) = std::fs::read_to_string("/proc/mounts") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for l in content.lines() {
+        let mut it = l.split_whitespace();
+        let (Some(dev), Some(mp)) = (it.next(), it.next()) else {
+            continue;
+        };
+        let Some(name) = dev.strip_prefix("grovefs:") else {
+            continue;
+        };
+        let Some(reason) = gc_writer_reason(name, mbase, views) else {
+            continue;
+        };
+        let mp = mp
+            .replace("\\040", " ")
+            .replace("\\011", "\t")
+            .replace("\\012", "\n")
+            .replace("\\134", "\\");
+        let mpp = Path::new(&mp);
+        // The same view NAME can mount in unrelated stores, so attribute the
+        // entry to the process that serves it before calling it a writer of
+        // THIS store. A daemon that names another store — or is a remote
+        // `--meta`/`--data` client — never touches these pages.
+        match gc_mount_daemon(mpp) {
+            Some(pid) if !proc_store_hit(pid, mbase, roots) => continue,
+            // No daemon visible: a stale FUSE entry whose mountpoint no longer
+            // answers is dead. Anything else stays a conservative block.
+            None if !mount_answers(mpp) => continue,
+            _ => {}
+        }
+        out.push(format!("'{name}' at {mp} ({reason})"));
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The `grovefs mount` daemon serving `mp`, matched by its `-m/--mountpoint`
+/// value (absolute, or relative to the daemon's cwd). `None` means the FUSE
+/// entry outlived its daemon (or the daemon is not visible in /proc).
+fn gc_mount_daemon(mp: &Path) -> Option<u32> {
+    let want = std::fs::canonicalize(mp).unwrap_or_else(|_| mp.to_path_buf());
+    for pid in proc_pids() {
+        let Some(args) = proc_args(pid) else {
+            continue;
+        };
+        if !args.iter().any(|a| a.contains("grovefs")) || !args.iter().any(|a| a == "mount") {
+            continue;
+        }
+        let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).ok();
+        let mut i = 0;
+        while i < args.len() {
+            let a = &args[i];
+            let target = if a == "-m" || a == "--mountpoint" {
+                let v = args.get(i + 1).cloned();
+                i += 2;
+                v
+            } else if let Some(v) = a.strip_prefix("--mountpoint=") {
+                i += 1;
+                Some(v.to_string())
+            } else {
+                i += 1;
+                None
+            };
+            let Some(target) = target else {
+                continue;
+            };
+            let p = Path::new(&target);
+            let abs = if p.is_absolute() {
+                p.to_path_buf()
+            } else if let Some(c) = &cwd {
+                c.join(p)
+            } else {
+                continue;
+            };
+            let canon = std::fs::canonicalize(&abs).unwrap_or_else(|_| abs.clone());
+            if canon == want || abs == mp {
+                return Some(pid);
+            }
+        }
+    }
+    None
+}
+
+/// Does `mp` still answer? A dead FUSE daemon leaves `/proc/mounts` entries
+/// behind until someone unmounts them; probing the root returns ENOTCONN (107)
+/// or EIO (5) for those, while a served mount always stats.
+fn mount_answers(mp: &Path) -> bool {
+    match std::fs::metadata(mp) {
+        Ok(_) => true,
+        Err(e) => !matches!(e.raw_os_error(), Some(107) | Some(5)),
+    }
+}
+
+fn proc_pids() -> Vec<u32> {
+    let Ok(rd) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    rd.flatten()
+        .filter_map(|e| e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()))
+        .collect()
+}
+
+fn proc_args(pid: u32) -> Option<Vec<String>> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    if raw.is_empty() {
+        return None;
+    }
+    Some(
+        raw.split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect(),
+    )
+}
+
+fn proc_env(pid: u32, key: &str) -> Option<String> {
+    let raw = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    for kv in raw.split(|b| *b == 0) {
+        let kv = String::from_utf8_lossy(kv);
+        if let Some((k, v)) = kv.split_once('=') {
+            if k == key {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn gc_writer_reason(name: &str, mbase: &Path, views: &[String]) -> Option<String> {
+    if views.iter().any(|v| v == name) {
+        return Some("writable view tree".to_string());
+    }
+    let slot = mbase
+        .join("meta")
+        .join("views")
+        .join(format!("{name}.layout"));
+    if !slot.is_file() {
+        return None;
+    }
+    match grovefs::layout::LayoutRules::parse_def_file(&slot) {
+        Ok(grovefs::layout::ViewDef::Alias(real)) if views.iter().any(|v| v == &real) => {
+            Some(format!("alias of '{real}'"))
+        }
+        // Derived (read-only by contract) and foreign names cannot write.
+        _ => None,
+    }
+}
+
+/// Local `grovefs` processes that name this metadata root or one of its data
+/// roots on the command line (or through the GROVEFS_* env knobs). Best-effort
+/// `/proc` probe: a remote client of a meta-server on ANOTHER machine is not
+/// visible here, which is why `--apply` is documented as strictly offline.
+fn local_store_users(mbase: &Path, roots: &[PathBuf]) -> Vec<String> {
+    let me = std::process::id();
+    let mut out = Vec::new();
+    for pid in proc_pids() {
+        if pid == me || !proc_store_hit(pid, mbase, roots) {
+            continue;
+        }
+        let mut cmd = proc_args(pid).unwrap_or_default().join(" ");
+        if cmd.len() > 160 {
+            cmd.truncate(157);
+            cmd.push_str("...");
+        }
+        out.push(format!("pid {pid}: {cmd}"));
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Does one process reference this store? Args first (`--home`/`--db-path`/
+/// `--data-root`/`--root`, in both `--flag value` and `--flag=value` form),
+/// then the GROVEFS_* env knobs. A grovefs process that names NO store falls
+/// back to `$HOME/.grovefs` unless it is a remote client (`--meta`/`--data`),
+/// which never writes a local page tree.
+fn proc_store_hit(pid: u32, mbase: &Path, roots: &[PathBuf]) -> bool {
+    let Some(args) = proc_args(pid) else {
+        return false;
+    };
+    if !args.iter().any(|a| a.contains("grovefs")) {
+        return false;
+    }
+    let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).ok();
+    let mut named = false;
+    let mut remote = false;
+    // Which knobs were given on the command line; a flag overrides its env twin.
+    let mut seen = (false, false, false); // --home, --db-path, --data-root/--root
+    for (i, a) in args.iter().enumerate() {
+        if a == "--meta" || a == "--data" || a.starts_with("--meta=") || a.starts_with("--data=") {
+            remote = true;
+        }
+        let (flag, val) = if let Some(eq) = a.find('=') {
+            (&a[..eq], Some(a[eq + 1..].to_string()))
+        } else if matches!(a.as_str(), "--home" | "--db-path" | "--data-root" | "--root") {
+            (a.as_str(), args.get(i + 1).cloned())
+        } else {
+            continue;
+        };
+        if !matches!(flag, "--home" | "--db-path" | "--data-root" | "--root") {
+            continue;
+        }
+        named = true;
+        match flag {
+            "--home" => seen.0 = true,
+            "--db-path" => seen.1 = true,
+            _ => seen.2 = true,
+        }
+        if let Some(v) = val {
+            if arg_hits_store(flag, &v, cwd.as_deref(), mbase, roots) {
+                return true;
+            }
+        }
+    }
+    // Env fallbacks, per knob: a flag on the command line overrides its env
+    // counterpart, so a mount started with `--home other` is NOT attributed to
+    // this store just because GROVEFS_HOME was inherited from the shell.
+    for (given, key) in [
+        (seen.0, "GROVEFS_HOME"),
+        (seen.1, "GROVEFS_DB_PATH"),
+        (seen.2, "GROVEFS_DATA"),
+    ] {
+        if given {
+            continue;
+        }
+        if let Some(v) = proc_env(pid, key) {
+            named = true;
+            if arg_hits_store("--home", &v, cwd.as_deref(), mbase, roots) {
+                return true;
+            }
+        }
+    }
+    if named || remote {
+        return false;
+    }
+    // No store named anywhere: the process uses the default home.
+    proc_env(pid, "HOME")
+        .map(|h| arg_hits_store("--home", &format!("{h}/.grovefs"), None, mbase, roots))
+        .unwrap_or(false)
+}
+
+/// Does one flag value (a path or comma-separated path list) name `mbase` or
+/// one of `roots`? Relative values resolve against the process's cwd.
+fn arg_hits_store(
+    flag: &str,
+    val: &str,
+    cwd: Option<&Path>,
+    mbase: &Path,
+    roots: &[PathBuf],
+) -> bool {
+    if !matches!(flag, "--home" | "--db-path" | "--data-root" | "--root") {
+        return false;
+    }
+    val.split(',').any(|part| {
+        let part = part.trim();
+        if part.is_empty() {
+            return false;
+        }
+        let p = Path::new(part);
+        let abs = if p.is_absolute() {
+            p.to_path_buf()
+        } else if let Some(c) = cwd {
+            c.join(p)
+        } else {
+            return false;
+        };
+        let canon = std::fs::canonicalize(&abs).unwrap_or_else(|_| abs.clone());
+        let same = |w: &Path| {
+            let wc = std::fs::canonicalize(w).unwrap_or_else(|_| w.to_path_buf());
+            canon == wc || abs == w
+        };
+        same(mbase) || roots.iter().any(|r| same(r))
+    })
+}
+
+fn fmt_bytes(n: u64) -> String {
+    const K: f64 = 1024.0;
+    let f = n as f64;
+    if f >= K * K * K {
+        format!("{:.1} GiB", f / (K * K * K))
+    } else if f >= K * K {
+        format!("{:.1} MiB", f / (K * K))
+    } else if f >= K {
+        format!("{:.1} KiB", f / K)
+    } else {
+        format!("{n} B")
+    }
+}
+
+fn fmt_age(secs: u64) -> String {
+    if secs >= 86400 {
+        format!("{}d{}h", secs / 86400, (secs % 86400) / 3600)
+    } else if secs >= 3600 {
+        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m{}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+fn print_gc_report(rep: &grovefs::gc::Report, rec: Option<&grovefs::gc::Reclaimed>) {
+    let roots: Vec<String> = rep
+        .data_roots
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    println!("gc: meta {}", rep.meta_root.display());
+    println!("  data root(s): {}", roots.join(", "));
+    println!(
+        "  views: {} tree(s), {} referenced key(s), {} striped layout(s)",
+        rep.views.len(),
+        rep.refs,
+        rep.striped_layouts
+    );
+    println!(
+        "  objects: {} ({})",
+        rep.objects,
+        fmt_bytes(rep.objects_bytes)
+    );
+    println!(
+        "  orphans: {} ({}; {} reclaimable, {} within grace <{})",
+        rep.orphans.len(),
+        fmt_bytes(rep.orphan_bytes()),
+        rep.reclaimable(),
+        rep.within_grace(),
+        fmt_age(rep.grace.as_secs())
+    );
+    for c in rep.orphans.iter().take(20) {
+        println!(
+            "    {:>10}  {:>8}  {:<5}  {}",
+            fmt_bytes(c.size),
+            fmt_age(grovefs::gc::age_secs(c.mtime)),
+            c.kind_str(),
+            c.key
+        );
+    }
+    if rep.orphans.len() > 20 {
+        println!(
+            "    ... {} more (use --json for the full list)",
+            rep.orphans.len() - 20
+        );
+    }
+    if !rep.held.is_empty() {
+        println!(
+            "  ledger-held: {} ({}) — NOT deleted; run `grovefs refs --db-path {} rebuild` first if these are stale",
+            rep.held.len(),
+            fmt_bytes(rep.held_bytes()),
+            rep.meta_root.display()
+        );
+        for c in rep.held.iter().take(5) {
+            println!("    {:>10}  {}", fmt_bytes(c.size), c.key);
+        }
+        if rep.held.len() > 5 {
+            println!("    ... {} more", rep.held.len() - 5);
+        }
+    }
+    if !rep.skipped.is_empty() {
+        println!(
+            "  skipped: {} entr(ies) left untouched (never deleted)",
+            rep.skipped.len()
+        );
+        for s in rep.skipped.iter().take(5) {
+            println!("    {s}");
+        }
+        if rep.skipped.len() > 5 {
+            println!("    ... {} more", rep.skipped.len() - 5);
+        }
+    }
+    match rec {
+        None => println!(
+            "dry run: nothing deleted. Re-run with --apply (offline) to reclaim {} object(s), {}.",
+            rep.reclaimable(),
+            fmt_bytes(rep.reclaimable_bytes())
+        ),
+        Some(r) => {
+            println!(
+                "reclaimed: {} object(s), {} freed; {} within grace kept; {} failed",
+                r.deleted,
+                fmt_bytes(r.bytes),
+                r.within_grace,
+                r.failed.len()
+            );
+            for f in r.failed.iter().take(10) {
+                println!("    failed: {f}");
+            }
+        }
+    }
+}
+
+fn gc_json(rep: &grovefs::gc::Report, rec: Option<&grovefs::gc::Reclaimed>) -> serde_json::Value {
+    let cand = |c: &grovefs::gc::Candidate| {
+        serde_json::json!({
+            "key": c.key,
+            "data_root": c.data_root.display().to_string(),
+            "size": c.size,
+            "age_secs": grovefs::gc::age_secs(c.mtime),
+            "kind": c.kind_str(),
+            "within_grace": c.within_grace,
+        })
+    };
+    serde_json::json!({
+        "meta_root": rep.meta_root.display().to_string(),
+        "data_roots": rep.data_roots.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        "views": &rep.views,
+        "referenced_keys": rep.refs,
+        "striped_layouts": rep.striped_layouts,
+        "objects": rep.objects,
+        "object_bytes": rep.objects_bytes,
+        "matched_objects": rep.matched,
+        "orphans": rep.orphans.iter().map(cand).collect::<Vec<_>>(),
+        "orphan_bytes": rep.orphan_bytes(),
+        "reclaimable": rep.reclaimable(),
+        "reclaimable_bytes": rep.reclaimable_bytes(),
+        "within_grace": rep.within_grace(),
+        "ledger_held": rep.held.iter().map(cand).collect::<Vec<_>>(),
+        "ledger_held_bytes": rep.held_bytes(),
+        "skipped": &rep.skipped,
+        "grace_secs": rep.grace.as_secs(),
+        "applied": rec.is_some(),
+        "deleted": rec.map(|r| r.deleted).unwrap_or(0),
+        "deleted_bytes": rec.map(|r| r.bytes).unwrap_or(0),
+        "delete_failed": rec.map(|r| r.failed.clone()).unwrap_or_default(),
+    })
 }
 
 fn run_fusermount(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
