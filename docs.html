@@ -456,6 +456,7 @@
           <tr><td>排查/回收孤儿对象(离线)</td><td><code>gc --db-path D [--data-root R] [--apply]</code></td><td><a href="#data">§11.3</a> / <a href="#maint-regress">§14.8</a></td></tr>
           <tr><td>看清元数据到底存了什么（表 / 字段 / 索引 / 账本）</td><td><code>sqlite3 meta/&lt;view&gt;.db</code>；<code>view export</code> 写出的 13 个键</td><td><a href="#s8-schema">§11.1.1</a></td></tr>
           <tr><td>备份、恢复、迁移</td><td>冷拷五步 / <code>pg_dump</code> / <code>view export</code></td><td><a href="#data">§11.4</a> / <a href="#maint">§14.2–§14.3</a></td></tr>
+          <tr><td>搬机器后确认字节拷全 / 换掉某台 data-server 的 IP</td><td><code>gc</code> 比 <code>refs</code> 与 <code>matched</code>；<code>-o data=</code> 列表<b>原位替换</b>那一项</td><td><a href="#data">§11.1</a> / <a href="#s15-8-2">§12.8.2</a> / <a href="#maint-trouble">§14.7</a></td></tr>
           <tr><td>快数磁盘用量（<b>比 <code>du -sh</code> 快 500–1000×</b>）</td><td><code>grovefs du --view V [--meta A | --store U | --db-path D] [--data A] [--total]</code></td><td><a href="#s11-5">§11.5</a></td></tr>
           <tr class="grp"><td colspan="3">运维与排障</td></tr>
           <tr><td>日志在哪、怎么看、出事往哪查</td><td>四类日志 + 症状路由表</td><td><a href="#ops">§13</a> / <a href="#maint-trouble">§14.7</a></td></tr>
@@ -541,7 +542,7 @@
     </details>
     <h3 id="four-kinds">四种视图：先分清「正本 / 滤镜 / 门牌 / 复印册」</h3>
     <p class="lead">写入数据<b>不会</b>创建基视图——写只是往已经存在的树里加节点。基视图由 <code>init --view</code> / <code>view create --view</code> 显式创建（<code>import</code> 目标不存在时也会建树）；<b>未知视图名直接拒绝</b>，本地与服务端一致，<b>不存在</b>任何退回懒创建的开关。四种形态落盘对照表：</p>
-    <div class="note"><b>显式创建（必读）</b>：服务端 <code>meta-server</code> 与本地 <code>--home</code> 挂载走<b>同一条规则</b>——<code>meta/&lt;名字&gt;.db</code>（PG 下是 <code>grovefs_v_&lt;hex&gt;</code> schema）不存在时直接拒绝，带可读原因，<b>从不</b>在挂载时创建空库。没有环境变量或参数可以退回旧行为（<code>--strict-view</code> 与 <code>GROVEFS_ALLOW_LAZY_VIEW</code> 已从代码中移除）。</div>
+    <div class="note"><b>显式创建（必读）</b>：服务端 <code>meta-server</code> 与本地 <code>--home</code> 挂载走<b>同一条规则</b>——<code>meta/&lt;名字&gt;.db</code>（PG 下是 <code>grovefs_v_&lt;hex&gt;</code> schema）不存在时直接拒绝，带可读原因，<b>从不</b>在挂载时创建空库。这条规则没有开关。</div>
     <div class="grid">
       <div class="card"><h4>基视图 = 正本</h4><p>真实物理树 <code>meta/&lt;V&gt;.db</code>；数据归属的正本，能写内容、删名会真正回收字节。</p></div>
       <div class="card"><h4>派生 = 只读滤镜</h4><p>不建树，只写 <code>meta/views/&lt;D&gt;.layout</code>（<code>base B</code> + 规则）；挂载只读，写回基视图。</p></div>
@@ -664,15 +665,15 @@
       <li><b>中心 MetaServer</b>:同一用户在多客户机共享<b>一份权威视图</b>,不再各存各的副本导致分叉。</li>
       <li><b>事件总线 + Notifier</b>:写成功后向订阅者推送失效,解决"默认缓存下内容新鲜度"。</li>
       <li><b>fuser 0.18 多线程</b>:每线程独立 <code>/dev/fuse</code> fd(<code>clone_fd</code>),请求并发派发不串行。</li>
-      <li><b>元数据读并行 + 目录分页 + READDIRPLUS</b>:每个视图引擎除单条写连接外再开 4 条只读连接(SQLite <code>READ_POOL_SIZE</code> / PG <code>PG_READ_POOL_SIZE</code>)服务 <code>lookup</code>/<code>getattr</code>/<code>readdir</code>,读不再排在写锁后面;目录列举按 <code>readdir_page</code> 下推成 SQL 页,<b>每 32 行记一个 keyset 游标</b>(内核在回复缓冲填满处续读的偏移量对不上页边界),回复缓冲按 32→1024 几何块填充,一次内核请求付 <code>O(缓冲)</code> 而非 <code>O(整棵目录)</code>;默认协商 <code>FUSE_DO_READDIRPLUS</code>(内核 ≥4.6)让属性随目录项一次带回。写侧:SQLite 仍串行在同一权威连接,PG 走 SERIALIZABLE 写池并行(见 §9.2)。</li>
+      <li><b>元数据读并行 + 目录分页 + READDIRPLUS</b>:每个视图引擎除单条写连接外再开 4 条只读连接(SQLite <code>READ_POOL_SIZE</code> / PG <code>PG_READ_POOL_SIZE</code>)服务 <code>lookup</code>/<code>getattr</code>/<code>readdir</code>,读不必排在写锁后面;目录列举按 <code>readdir_page</code> 下推成 SQL 页,<b>每 32 行记一个 keyset 游标</b>(内核在回复缓冲填满处续读的偏移量对不上页边界),回复缓冲按 32→1024 几何块填充,一次内核请求付 <code>O(缓冲)</code> 而非 <code>O(整棵目录)</code>;默认协商 <code>FUSE_DO_READDIRPLUS</code>(内核 ≥4.6)让属性随目录项一次带回。写侧:SQLite 仍串行在同一权威连接,PG 走 SERIALIZABLE 写池并行(见 §9.2)。</li>
     </ul>
     <details>
-      <summary>实测：5001 条目录的 <code>ls -l</code> 从 55s 降到 2.5s；10 万条从 18s / 20 分钟降到 1 秒级</summary>
+      <summary>实测：5001 条目录的 <code>ls -l</code> 本地 2.56s、远端 2.29s；10 万条目录 1 秒级</summary>
       <ul>
-        <li><b>本地</b>：同一份 5001 条目录、同一挂载点、每趟新挂载实测 <code>ls -l</code> <b>2.56s</b>（只留分页 5.22s；改造前基线 55.34s，三份输出排序后逐字节相同）。</li>
-        <li><b>10 万条</b>：含 10,002 个条目的目录 <code>ls -f</code> 基视图 <b>131ms</b>、100 规则派生 <b>105ms</b>（<code>ls -l</code> 162ms）；含 100,002 个条目的目录 <code>ls -f</code> 基视图 <b>1.19s</b>、fork <b>1.19s</b>、100 规则派生 <b>1.01s</b>（2s 内重读 <b>0.12s</b>）。同数据集改造前：基视图 18.0s、派生（100 规则）约 <b>20 分钟</b>。</li>
-        <li><b>本地 100k 的三处修正</b>：① 续读用每 32 行的 keyset 游标，OFFSET 只做无游标回落；② 列表 SQL 带恒真的 <code>name&gt;''</code> 把计划钉在 <code>UNIQUE(parent_id,name)</code>（否则退到前缀索引 + 临时 B 树排序，单页 13–55ms）；③ 目录 nlink 改走覆盖索引 <code>idx_node_parent_kind(parent_id,is_dir)</code>，100k 子项从 9.6ms 降到 <b>0.02ms</b>（它原先占 100k 列表 13.6s 里的 11s）。</li>
-        <li><b>远端</b>：新 <code>M_READDIRP</code> 帧把 <code>offset/limit</code> 下推到服务端，同一 5001 条目录经 <code>meta-server</code>+<code>data-server</code> 由 ~54s → <b>2.29s</b>（只关 PLUS 保留分页 4.22s，两份输出逐字节相同）。</li>
+        <li><b>本地</b>：同一份 5001 条目录、同一挂载点、每趟新挂载实测 <code>ls -l</code> <b>2.56s</b>（<code>--no-readdirplus</code> 只留分页时 5.22s，两份输出排序后逐字节相同）。</li>
+        <li><b>10 万条</b>：含 10,002 个条目的目录 <code>ls -f</code> 基视图 <b>131ms</b>、100 规则派生 <b>105ms</b>（<code>ls -l</code> 162ms）；含 100,002 个条目的目录 <code>ls -f</code> 基视图 <b>1.19s</b>、fork <b>1.19s</b>、100 规则派生 <b>1.01s</b>（2s 内重读 <b>0.12s</b>）。</li>
+        <li><b>本地 100k 的三个关键点</b>：① 续读用每 32 行的 keyset 游标，OFFSET 只做无游标回落；② 列表 SQL 带恒真的 <code>name&gt;''</code> 把计划钉在 <code>UNIQUE(parent_id,name)</code>（否则退到前缀索引 + 临时 B 树排序，单页 13–55ms）；③ 目录 nlink 走覆盖索引 <code>idx_node_parent_kind(parent_id,is_dir)</code>，100k 子项 <b>0.02ms</b>。</li>
+        <li><b>远端</b>：新 <code>M_READDIRP</code> 帧把 <code>offset/limit</code> 下推到服务端，同一 5001 条目录经 <code>meta-server</code>+<code>data-server</code> 实测 <b>2.29s</b>（<code>--no-readdirplus</code> 只留分页时 4.22s，两份输出逐字节相同）。</li>
         <li><b>覆盖范围</b>：本地 SQLite/PG 与对接 SQLite/PG <code>meta-server</code> 的远端挂载都启用；<code>LayoutMeta</code> 派生/透镜也覆写 <code>readdir_page</code>（每父目录物化一份形状、4 目录 / 40 万行 / TTL 2s，超出上限仍逐缓冲现算）；只剩不含该能力位的老服务端走每缓冲一次全量列表、不协商 PLUS。</li>
       </ul>
     </details>
@@ -841,7 +842,7 @@ $Y mount --view alice \
       <tr><td><code>--meta 主,备</code></td><td>故障转移列表,主挂自动切备(见 §15)。</td></tr>
     </table>
     <p>客户机本地<b>不留视图副本、也不落盘</b>：给了 <code>--data</code>/<code>--meta</code> 的远程挂载<b>不需要 <code>--home</code></b>（传了也不写任何东西）——字节直连 data-server，视图树直连 meta-server，访问控制全部在服务端。</p>
-    <div class="note"><b>视图名不存在时直接拒绝</b>：名字必须已经有树或治理定义（派生/别名/fork 都算），否则握手直接拒绝，而且<b>服务端什么都不写</b>；拒绝原因带可读文本（客户端打印出来，不再只是 <code>Input/output error</code>，服务端日志同一句），开了 <code>--require-api-key</code> 时还进 <code>apikey calls</code> 审计。建新视图要<b>先建后挂</b>：SQLite 用 <code>view create</code> / <code>init</code> / <code>view import</code>；PG 用 <code>view create --store postgres://…</code> 建 schema（或从 dump 恢复）。没有任何开关可以退回懒创建——<code>--strict-view</code> 与 <code>GROVEFS_ALLOW_LAZY_VIEW</code> 已从代码中移除。细节与实测输出见 USAGE §4。</div>
+    <div class="note"><b>视图名不存在时直接拒绝</b>：名字必须已经有树或治理定义（派生/别名/fork 都算），否则握手直接拒绝，而且<b>服务端什么都不写</b>；拒绝原因带可读文本（客户端直接打印，服务端日志同一句），开了 <code>--require-api-key</code> 时还进 <code>apikey calls</code> 审计。建新视图要<b>先建后挂</b>：SQLite 用 <code>view create</code> / <code>init</code> / <code>view import</code>；PG 用 <code>view create --store postgres://…</code> 建 schema（或从 dump 恢复）。这条规则没有开关。细节与实测输出见 USAGE §4。</div>
     <div class="chnav"><a href="#manifest"><span>← 上一章</span><b>§5 预建目录层级</b></a><a class="r" href="#deploy"><span>下一章 →</span><b>§7 手把手部署</b></a></div>
   </section>
 
@@ -1360,7 +1361,7 @@ $Y mount --view alice \\
     <ul>
       <li><b>单对象</b>:<code>blocks/&lt;2hex&gt;/&lt;key&gt;</code>,一文件=一对象文件;对象按 key 哈希自动扇出进 256 个桶子目录,单层即止——单目录条目数不随总量增长,千万级对象下备份/遍历工具不退化；桶名是 key 的纯函数，启动时预建 256 个，热路径不做 mkdir。</li>
       <li><b>key 命名</b>:写入时生成 UUID 作对象 key,存进视图 <code>data_ref</code> 字段。</li>
-      <li><b>条带编码</b>:<code>data_ref</code> = <code>s&lt;N&gt;:&lt;stripe_bytes&gt;:&lt;uuid&gt;</code>,第 i 块 key = <code>{uuid}#{i}</code>,落在 <code>servers[i % N]</code>。<b>无 <code>s</code> 前缀 = 单对象</b>（未启用条带的存储形态）。</li>
+      <li><b>条带编码</b>:<code>data_ref</code> = <code>s&lt;N&gt;:&lt;stripe_bytes&gt;:&lt;uuid&gt;</code>,第 i 块 key = <code>{uuid}#{i}</code>,落在 <code>servers[i % N]</code>——<b>是列表下标，不是地址</b>。key 里只编码 <code>N</code> 与条带大小，所以某台成员换 IP、换端口、换机器，只要在 <code>-o data=</code> 列表的<b>原位替换那一项</b>就能自动识别：元数据不用改，已写对象不用 rebal（读完全自描述；轮转放置 <code>i % N</code> 只决定新写入对象落哪台）。两种错配后果不同：<b>数量不符会被明确拒绝</b>（报 <code>laid out across N servers but this mount has M; refusing to remap</code>）；<b>顺序错位检不出来</b>（守卫只比 <code>N</code>），接手那台没有它现在被派到的 <code>{uuid}#{i}</code>，症状是那批文件读失败——不会读到别人的数据，因为对象名带全局 <code>#i</code>。<b>无 <code>s</code> 前缀 = 单对象</b>（未启用条带的存储形态）。</li>
     </ul>
 
     <h4 id="s8-schema">11.1.1 元数据库里到底存了什么：三张表 + 一本共享账本</h4>
@@ -1371,7 +1372,7 @@ $Y mount --view alice \\
       <thead><tr><th>字段</th><th>类型 / 约束</th><th>含义</th><th>谁写 · 何时变</th></tr></thead>
       <tbody>
         <tr><td><code>id</code></td><td>INTEGER PRIMARY KEY（PG <code>BIGSERIAL</code>）</td><td>行号：这一行在库内的身份，<b>根固定为 <code>1</code></b>；别的行通过 <code>parent_id</code> 指向它</td><td>INSERT 时分配；rename、改属性都不动它</td></tr>
-        <tr><td><code>ino</code></td><td>INTEGER，可空（老库在打开时回填 <code>ino=id</code>）</td><td><b>GroveFS 自己的 inode 号，就是内核看到的 <code>st_ino</code></b>；<b>硬链接共享同一个 ino</b>。新名字的 ino 起手等于自己的 <code>id</code>；<code>view fork</code> 与 <code>view export+import</code> 连号原样复制，所以基树里的硬链接在 fork 里仍是硬链接；<code>view graft</code> 会重新分配号，但<b>源里共用一个 ino 的几个名字接进来仍共用一个新 ino</b>（硬链接关系保住）。<code>getattr</code>/<code>setattr</code> 全按它查行，<b>rename 不改它</b></td><td>create 在同一事务里 <code>UPDATE node SET ino=id</code>；<code>ln</code> 复用源 ino。之后永不改变</td></tr>
+        <tr><td><code>ino</code></td><td>INTEGER，可空（老库在打开时回填 <code>ino=id</code>）</td><td><b>GroveFS 自己的 inode 号，就是内核看到的 <code>st_ino</code></b>；<b>硬链接共享同一个 ino</b>。新名字的 ino 起手等于自己的 <code>id</code>；<code>view fork</code> 与 <code>view export+import</code> 连号原样复制，所以基树里的硬链接在 fork 里仍是硬链接；<code>view graft</code> 会重新分配号，但<b>源里共用一个 ino 的几个名字接进来仍共用一个新 ino</b>（硬链接关系保住）。<code>getattr</code>/<code>setattr</code> 全按它查行，<b>rename 不改它</b>；<b><code>st_ino</code> 随库走、迁机器也不变，但 <code>st_dev</code> 是 FUSE 每次挂载新分配的</b>——按 <code>(dev, ino)</code> 二元组去重的备份/同步工具在重挂或迁库后要重建映射，只按 ino 查（<code>find -inum</code>、<code>stat -c %i</code>）不受影响</td><td>create 在同一事务里 <code>UPDATE node SET ino=id</code>；<code>ln</code> 复用源 ino。之后永不改变</td></tr>
         <tr><td><code>parent_id</code></td><td>INTEGER，可空</td><td>父目录的 <code>id</code>；<b>根为 NULL</b></td><td><code>rename</code>/<code>mv</code> 换目录时改它（同时刷 <code>ctime</code>）</td></tr>
         <tr><td><code>name</code></td><td>TEXT NOT NULL</td><td>这一项在父目录里的名字，<b>单段、不含 <code>/</code></b>；<b>根的名字是一个 <code>/</code></b></td><td>create / rename；与 <code>parent_id</code> 组成唯一键</td></tr>
         <tr><td><code>is_dir</code></td><td>INTEGER NOT NULL</td><td><code>0</code> = 非目录，<code>1</code> = 目录。FUSE 的 <code>FileType</code> 由它与 <code>link_target</code> 还原——<b>没有单独的「类型」列</b></td><td>创建时定，之后只读</td></tr>
@@ -1509,13 +1510,13 @@ b97be2d6    1</code></pre>
     <ul>
       <li>文件 ≥ <b>16 MiB</b> 才分块;小文件自然只落 chunk0(单节点)。</li>
       <li>条带读写内部复用分块并行 IO 原语。</li>
-      <li>单地址 <code>--data host:port</code> 与旧行为完全一致。</li>
+      <li>单地址 <code>--data host:port</code> 就是未启用条带：整对象落那一台，key 不带 <code>s</code> 前缀。</li>
     </ul>
     <div class="warn"><b>诚实:</b>条带的价值是把大文件摊到多节点的<b>聚合容量</b>。单条已饱和链路(loopback/单网卡)上实测<b>无吞吐增益</b>,须真独立链路才能测出收益——无实测数字不声称收益。</div>
 
     <h3>11.3 删除 / GC</h3>
     <p><code>unlink</code> 后视图解除引用,后端据 key 尽力删全部分块;条带 <code>remove</code> 展开删所有 chunk,<b>幂等</b>(残留块可被 GC 清)。</p>
-    <p><b>跨视图共享对象的引用账本 <code>refs</code></b>：一个 <code>data_ref</code> 命名唯一一个底层对象，却可能被多个物理视图同时挂着名字（<code>view fork</code> 与 <code>view export/import --as-fork</code> 复制同一批 <code>data_ref</code>、派生视图/别名共享基视图字节；而 <code>grovefs import</code> 把同一源文件导进两个视图时各得一个<b>独立 key</b>——两处 <code>blocks/</code> 都是源文件的硬链接，字节仍是同一 inode、零额外占用，但账本按 key 分别计数）。视图内引用计数看不见别的视图，单看它会误删他视图仍在引用的对象。故记账落在 <code>&lt;base&gt;/meta/refs.db</code>（PG 后端落共享表 <code>grovefs_refs.holders</code>）：每个视图 ATTACH 该账本，holder 计数与节点增删进<b>同一个 IMMEDIATE 事务</b>，跨文件原子提交。物理删除的准确规则是“<b>该视图内此 key 的最后一个名字被摘除、且全局账本再无其它视图持有</b>”——只有此时才 <code>backend.remove</code>。视图 db 被 out-of-band 删除（<code>rm meta/x.db</code>、新 <code>--home</code>）只会让账本<b>高估</b>、对象多留不误删；<code>grovefs refs --db-path D rebuild</code> 按现存视图树重算 holder 归位（SQLite 后端专用）。<b>只有基视图（<code>grovefs view create</code> 显式创建的物理树）的删除才真正回收底层字节</b>，派生视图/别名只读挂载、其删除从不物理 GC。无账本行的历史库退回“单视图”旧行为，既有部署不受影响。对账本高估留下的残留页（没有任何树命名、账本也不再记账），离线审计/回收用 <code>grovefs gc</code>（§14.8）。</p>
+    <p><b>跨视图共享对象的引用账本 <code>refs</code></b>：一个 <code>data_ref</code> 命名唯一一个底层对象，却可能被多个物理视图同时挂着名字（<code>view fork</code> 与 <code>view export/import --as-fork</code> 复制同一批 <code>data_ref</code>、派生视图/别名共享基视图字节；而 <code>grovefs import</code> 把同一源文件导进两个视图时各得一个<b>独立 key</b>——两处 <code>blocks/</code> 都是源文件的硬链接，字节仍是同一 inode、零额外占用，但账本按 key 分别计数）。视图内引用计数看不见别的视图，单看它会误删他视图仍在引用的对象。故记账落在 <code>&lt;base&gt;/meta/refs.db</code>（PG 后端落共享表 <code>grovefs_refs.holders</code>）：每个视图 ATTACH 该账本，holder 计数与节点增删进<b>同一个 IMMEDIATE 事务</b>，跨文件原子提交。物理删除的准确规则是“<b>该视图内此 key 的最后一个名字被摘除、且全局账本再无其它视图持有</b>”——只有此时才 <code>backend.remove</code>。视图 db 被 out-of-band 删除（<code>rm meta/x.db</code>、新 <code>--home</code>）只会让账本<b>高估</b>、对象多留不误删；<code>grovefs refs --db-path D rebuild</code> 按现存视图树重算 holder 归位（SQLite 后端专用）。<b>只有基视图（<code>grovefs view create</code> 显式创建的物理树）的删除才真正回收底层字节</b>，派生视图/别名只读挂载、其删除从不物理 GC。无账本行的键即该视图私有（空账本不需要任何初始化步骤）。对账本高估留下的残留页（没有任何树命名、账本也不再记账），离线审计/回收用 <code>grovefs gc</code>（§14.8）。</p>
 
     <h3>11.4 备份与迁移</h3>
     <ul>
@@ -1807,7 +1808,7 @@ $ grovefs view --db-path $BASE list
 alias 'teamwork2' -&gt; real view 'team' (full tree, writable; 'team' not mountable by its own name)
 $ grovefs mount --view teamwork -m /mnt/leak --meta ... --data ...   <span class="cmt"># 拿旧泄露名再挂：空，不再解析到真实树</span>
 $ ls /mnt/leak   <span class="cmt"># (命名空间按需新建，数据不外泄)</span></code></pre>
-    <p class="lead">守卫(<code>alias</code> 命令处 fail-fast，<code>layout</code> 套件第 10/11 节 26 条断言)：拒 <code>name == real</code>、拒遮蔽物理 <code>&lt;name&gt;.db</code>、拒目标是派生视图、拒<b>别名链</b>；一个真实视图同时只允许一个对外名（<code>--retire</code> 在同一条命令内先写后删，不受此约束卡住）。本地(<code>--home</code>)同契约：直挂被治理真实名回 <code>"view 'R' is governed by an alias"</code>。实现事实：别名解析<b>单跳</b>、每 <code>M_OPEN</code> 重扫 <code>views/</code> 目录，已建立连接不受定义增删/轮换影响；被轮换掉的旧名落到按需新建的空命名空间、触不到真实树，故泄露无害；<code>meta/views/</code> 是普通文件，HA 备机随控制面库手工同步。如实标注：拒因现在<b>随协议回传</b>（远端拒挂真实名时客户端打印与服务端逐字节相同的原文；对老服务端 payload 为空、客户端退回通用文案）。<b>轮换是名字治理(泄露止损)而非安全边界</b>——硬边界仍是 token+可撤销 api-key。</p>
+    <p class="lead">守卫(<code>alias</code> 命令处 fail-fast，<code>layout</code> 套件第 10/11 节 26 条断言)：拒 <code>name == real</code>、拒遮蔽物理 <code>&lt;name&gt;.db</code>、拒目标是派生视图、拒<b>别名链</b>；一个真实视图同时只允许一个对外名（<code>--retire</code> 在同一条命令内先写后删，不受此约束卡住）。本地(<code>--home</code>)同契约：直挂被治理真实名回 <code>"view 'R' is governed by an alias"</code>。实现事实：别名解析<b>单跳</b>、每 <code>M_OPEN</code> 重扫 <code>views/</code> 目录，已建立连接不受定义增删/轮换影响；被轮换掉的旧名落到按需新建的空命名空间、触不到真实树，故泄露无害；<code>meta/views/</code> 是普通文件，HA 备机随控制面库手工同步。如实标注：拒因<b>随协议回传</b>（远端拒挂真实名时客户端打印与服务端逐字节相同的原文；对老服务端 payload 为空、客户端退回通用文案）。<b>轮换是名字治理(泄露止损)而非安全边界</b>——硬边界仍是 token+可撤销 api-key。</p>
 
     <h3 id="s15-8-1">12.8.1 fork 视图：独立元数据树，结构可写、内容只读：<code>grovefs view fork</code></h3>
     <p class="lead">派生视图是只读的「显示透镜」，别名是全树可写的「公开名」；两者之间还缺一档真实需求：<b>能整理目录树、但不能上传内容，且删掉自己的名字绝不伤基视图</b>。<code>grovefs view fork</code> 就是这一档——把基视图的目录项<b>复制</b>成一份独立元数据树(<code>&lt;db-path&gt;/meta/&lt;name&gt;.db</code>，保留 inode 与硬链接)，内容字节一个不拷、经跨视图账本共享；定义仅一行 <code>fork &lt;基视图&gt;</code>：</p>
@@ -2057,7 +2058,8 @@ $ grovefs view --db-path /data/dst import --view team --in /tmp/team.jsonl
 imported view 'team' from /tmp/team.jsonl: 42 node(s), 37 blob reference(s); cross-view ledger rebuilt
 $ grovefs --home /data/dst mount --view team -m /mnt/team   <span class="cmt"># 硬链接仍是同一 inode，权限/时间原样</span></code></pre>
     <p class="lead"><b>导入是原子的</b>：先在 <code>D/meta/.V.import-&lt;pid&gt;-&lt;时间&gt;</code> 建临时树，全部行与校验通过、WAL 合并后才 <code>rename</code> 到 <code>D/meta/V.db</code>——坏文件/悬挂父节点/计数不符/失败的 <code>--replace</code> 都不会破坏旧树。<b>守卫</b>：输出已存在需 <code>--force</code>；目标已有定义槽先 <code>view rm</code>；表头 format/version 不符、根不是 <code>id=1</code> 的目录、悬挂父节点、表头计数与正文不符均整单拒绝；<code>--as-fork</code> 要求基视图在目标机已存在且本身无定义。</p>
-    <p class="lead"><b>迁移的拓扑约束</b>(数据分布，不是硬件绑定)：多盘 <code>--root</code> 的数量与顺序要一致(或合并成单 root)；条带 <code>s&lt;N&gt;:</code> 要保留 N 个 data-server 及顺序(否则明确拒绝)；整目录拷会把 HA <code>epoch</code> 带过去，旧主必须先停(<code>export/import</code> 与 <code>fork</code> 有意不复制 <code>ctrl</code>/<code>locks</code>)；PG 后端用 <code>pg_dump</code>/逻辑复制，<code>view export/import</code> 目前面向本地 SQLite 树；整目录冷拷不能裸拷运行中的 SQLite(WAL)，用停写或 <code>.backup</code>/<code>VACUUM INTO</code>。<b>多个基视图</b>：可建任意多个基视图(<code>init --view A</code>/<code>view create --view A</code>)，各自一棵 <code>meta/A.db</code>，树/字节/权限/删除互不影响，<code>view list</code> 全部列出；迁移可按视图进行，key 也可按视图分别绑定。回归：<code>migrate</code> 套件 74 条断言(挂载中导出/宿主无关性/虚拟名与覆盖守卫/跨绝对路径导入/硬链接与权限保真/原子替换/损坏输入拒绝/<code>--as-fork</code> 账本共享/多基视图独立)。</p>
+    <p class="lead"><b>迁移的拓扑约束</b>(数据分布，不是硬件绑定)：多盘 <code>--root</code> 的数量与顺序要一致(或合并成单 root)；条带 <code>s&lt;N&gt;:</code> 要保留 N 个 data-server 及顺序(数量不符才会被拒)——<b>换机器 / 换 IP 本身不是约束</b>：条带成员按列表<b>下标</b>寻址（<code>i % N</code>），原位替掉 <code>-o data=</code> 里那一项即可自动识别，已写对象不需 rebal，详 §11.1；顺序错位不会被报出来，只会缺文件；整目录拷会把 HA <code>epoch</code> 带过去，旧主必须先停(<code>export/import</code> 与 <code>fork</code> 有意不复制 <code>ctrl</code>/<code>locks</code>)；PG 后端用 <code>pg_dump</code>/逻辑复制，<code>view export/import</code> 目前面向本地 SQLite 树；整目录冷拷不能裸拷运行中的 SQLite(WAL)，用停写或 <code>.backup</code>/<code>VACUUM INTO</code>。<b>多个基视图</b>：可建任意多个基视图(<code>init --view A</code>/<code>view create --view A</code>)，各自一棵 <code>meta/A.db</code>，树/字节/权限/删除互不影响，<code>view list</code> 全部列出；迁移可按视图进行，key 也可按视图分别绑定。回归：<code>migrate</code> 套件 74 条断言(挂载中导出/宿主无关性/虚拟名与覆盖守卫/跨绝对路径导入/硬链接与权限保真/原子替换/损坏输入拒绝/<code>--as-fork</code> 账本共享/多基视图独立)。</p>
+    <p class="lead"><b>拷完怎么确认没漏</b>：对象是 <code>blocks/&lt;2hex&gt;/&lt;key&gt;</code> 下只增不改的文件，key 是 UUID（<b>不是内容哈希，也不按内容去重</b>），所以拷贝不用重算任何东西，但也没有「哈希不符自动发现」这层保护——漏拷只能主动比。① <b>数量比</b>：树上引用的键数（<code>sqlite3 D/meta/team.db 'SELECT COUNT(DISTINCT data_ref) FROM node WHERE data_ref IS NOT NULL;'</code>）对 <code>grovefs gc --db-path D --data-root R</code> 输出里的 <code>matched</code>——<b><code>matched</code> 小于 <code>refs</code> 就是缺对象</b>（漏拷、或 <code>--root</code> 列表不对的典型症状）；② <b>落点抽查</b>：取一个 <code>data_ref</code>，按 §11.1 的纯函数算出桶名，确认文件在；③ 用 <code>rsync -a</code> 保住 mtime：<code>gc --older-than</code> 靠对象 mtime 判「新对象宽限」，时间戳全变成「刚刚」只会让回收保守（不误删，但判据失真）；用过 <code>import</code> 的存储必带 <code>-H</code>（导入的对象与源文件是硬链接，解开会变双份字节）。</p>
     <p class="lead"><b>规模实测</b>(单机、默认 IO，<code>bash .build-bin/perf_migrate_scale.sh</code> 可复跑)：迁移一棵 5052 节点、含 5000 个对象的视图——<code>export</code> 0.19s 产出 1.16 MB JSONL(视图库文件的 1.16 倍，约 230 B/节点)；<code>import</code> 到另一个绝对路径的存储根 0.56s(含跨视图账本重建)；挂载后 0.23s 枚举完 5000 个文件，内容逐字节一致、权限与属主保留。同一批文件当初注册进源视图(零拷贝导入)花了 83s——逐对象的存储开销完全不在导出/导入路径上。<b>迁移代价由命名空间大小决定，不由数据量决定</b>；字节那一半另走 <code>rsync -a -H blocks/</code>。</p>
 
     <h3 id="s15-8-3">12.8.3 删整个基视图：连字节一起回收：<code>grovefs view rm --base</code></h3>
@@ -2074,6 +2076,7 @@ $ grovefs view --db-path metaA rm --name rview --base --data-root dataA
 removed base view 'rview': … 1 object(s) freed from dataA/blocks, …</code></pre>
     <p class="lead"><b>四重守卫</b>（任一命中即拒，树分毫不删）：① 名字被定义治理（是派生/别名/fork 的定义槽）——先跑不带 <code>--base</code> 的 <code>view rm</code> 删定义；② 仍有别名/透镜/fork <b>定义</b>经此基解析（否则删基会让那棵挂载悬空），报 <code>view 'lens1' is governed by a definition over base 'alice' — remove it first</code>；③ 本机 <code>/proc/mounts</code> 里有 <code>grovefs:&lt;V&gt;</code> 活挂载，报 <code>view 'alice' is mounted here at …  — unmount it first</code>（<b>其他机器</b>对同一 meta-server 的挂载本机看不到，须自行先停）；④ <code>--store postgres://…</code> 部署直接拒（基树是 PG schema，字节由 PG/data-server 自持，走 <code>DROP SCHEMA … CASCADE</code>，§12.8）。</p>
     <p class="lead"><b>最后一个命名者死才释放</b>：fork 的 blob 引用来自基视图自己的 key，账本 hold&gt;1，删基时那些仍被 fork 命名的字节<b>一个都不能动</b>（经 fork 的新挂载验证）；只有当基与所有依赖定义都消失、账本再无持有者时字节才真正回收。条带 key <code>s&lt;N&gt;:&lt;stripe&gt;:&lt;uuid&gt;</code> 活在 data-server 上，普通本地根无法回收——诚实计入 failed 并跳过，绝不半删。<b>MCP 边界</b>：<code>remove_view</code> 是控制面 only（等价不带 <code>--base</code> 的 <code>view rm</code>），<b>删整基视图只经 CLI</b>——接口从不碰数据字节。回归：<code>viewrm</code> 套件 42 条断言（种树/挂载守卫/多重守卫/共享字节删失/最后命名者死后回收/分家根 <code>--data-root</code>/删后重挂空树语义）。</p>
+    <p class="lead"><b>绕过 CLI 手工 <code>rm meta/&lt;V&gt;.db</code> 会怎样</b>（唯一能让“基先没、依赖还在”成立的路径）：守卫在命令里，不在文件系统里，所以硬删留下的是<b>悬空引用</b>而不是损坏——① 依赖它的 fork <b>照常可挂可用</b>：解析 fork 只查它自己的树（自己的树缺了才会被拒，报 <code>fork view 'X' has no tree … removed out-of-band?</code>），<code>view list</code> 仍显示 <code>fork 'lab' of base 'team'</code>，只是那个基名不再有树；② 需要基树的操作<b>明确失败</b>：<code>view graft</code> 不带 <code>--src</code> 时取定义里的基名，报 <code>no tree for graft source 'team' … create it first</code>（显式给 <code>--src</code> 就能继续用）；③ <b>字节不会误删</b>：仍被 fork 命名的对象不是孤儿，但<b>只有那棵死树独占</b>的键会被账本高估（没跑过 unlink 减 hold）——<code>refs rebuild</code> 按现存树重算后，它们才变成可回收孤儿（<code>gc --apply</code>，§14.8）；④ fork 之后仍能正常 <code>view rm</code>（删 fork 不依赖基：先删定义 → 删自己的 db → 重建账本）。一句话：硬删的代价是“悬空引用 + 一次 <code>refs rebuild</code>”；要连字节一起干净收尾，就按 <code>view rm --base</code> 的倒序（先删依赖定义，再删基）。</p>
 
     <h3 id="s15-9">12.9 智能体定制数据列表：MCP 接口：<code>grovefs mcp</code></h3>
     <p class="lead">§12.6/§12.8/§12.8.1 的视图治理同时是一套 <b>MCP(Model Context Protocol)工具</b>：<code>grovefs mcp</code> 在 stdio 上说换行分隔的 JSON-RPC 2.0，任何 MCP 客户端(Claude Desktop、IDE 智能体等)把它当子进程拉起，智能体即可<b>通过接口自动定制数据列表的形状</b>——查视图、<b>探查某视图真实呈现的目录清单并按绝对显示路径写规则</b>(<code>list_view_tree</code> 经已发布透镜渲染、还能不落盘预览一副待发布规则的形状)、用<b>内联规则文本</b>发布只读派生透镜、轮换公开名、删定义、<b>发布前把整副定义走完全部治理守卫做干跑校验</b>(<code>validate_definition</code>，不写盘)；规则以文本随行，智能体<b>不需要碰任何文件</b>。十个工具与 <code>grovefs view</code> 子命令共用<b>同一套库函数</b>(<code>grovefs::mcp</code>)：一个契约、两个入口，校验/拒绝文案/落盘动作逐字节相同。</p>
@@ -2090,7 +2093,7 @@ removed base view 'rview': … 1 object(s) freed from dataA/blocks, …</code></
       <tr><td><code>list_view_tree</code></td><td><code>view</code> 或 <code>base</code>+<code>rules</code>；可选 <code>path</code>/<code>depth</code>/<code>max</code>/<code>db_path</code></td><td><b>只读探查</b>：以只读方式打开本地 <code>&lt;db-path&gt;/meta/&lt;view&gt;.db</code>、经与挂载同一副 <code>LayoutMeta</code> 透镜渲染真实目录清单(不挂载、不读对象字节)，返回带绝对显示路径的 JSON；也可 <code>base</code>+<code>rules</code> 不落盘预览一副待发布形状；按 <code>path</code>/<code>depth</code>/<code>max</code> 收窄大树的遍历。远端/PG 后端的树不在此遍历；回包里的 <code>size</code> 是元数据字段而非字节数(目录 <code>4096</code>、文件 <code>0</code>、软链为 target 长度)，需真实字节请挂载后 <code>stat</code></td></tr>
       <tr><td><code>get_view</code></td><td><code>name</code></td><td>读回<b>单个</b>定义的原始 <code>definition</code> 文本与规则计数，供“读—改—写”迭代；未知名报错而非静默</td></tr>
     </table>
-    <p class="lead">同一治理再以 MCP 其余常用方法面二次暴露，复用<b>完全相同的渲染器</b>：<b>资源</b>(<code>resources/list</code>/<code>resources/templates/list</code>/<code>resources/read</code> 把视图与手册作为可附着上下文——<code>grovefs://guide</code> 原样回分节操作手册、<code>grovefs://views</code> 回与 <code>list_views</code> 相同的快照、<code>grovefs://view/&lt;name&gt;/definition</code> 与 <code>/tree</code>；树模板带查询参数 <code>{?path,depth,max}</code>，与 <code>list_view_tree</code> 的参数同义，大树可一次只附一个子树、被界剪断时仍报 <code>truncated:true</code>)；<b>提示</b>(<code>prompts/list</code>/<code>prompts/get</code> 提供 <code>reshape-view</code> 与 <code>rotate-alias</code> 两副 playbook)；<b>补全</b>(<code>completion/complete</code> 按 <code>ref</code> 角色感知：<code>reshape-view.base</code>/<code>rotate-alias.real</code> 只给物理视图，<code>rotate-alias.new</code>/<code>old</code> 只给别名，其余给全部视图名)；<b>日志</b>(<code>logging/setLevel</code> 设阈值后按严重度推送 <code>notifications/message</code>，<code>data</code> 带方法与被操作对象，如 <code>tools/call list_views ok</code>)。<b>工具元数据</b>：每个工具带 <code>title</code> 与 <code>annotations</code>(<code>readOnlyHint</code> 标出 <code>list_views</code>/<code>preview_rules</code>/<code>validate_definition</code>/<code>list_view_tree</code>/<code>get_view</code> 五个纯读工具，<code>destructiveHint</code> 只给 <code>alias_view</code>/<code>remove_view</code>，客户端据此决定能否自动放行)，四个回 JSON 的工具带 <code>outputSchema</code> 且结果同时给 <code>structuredContent</code>，客户端无需再剥 <code>content[0].text</code>；<code>initialize</code> 的 <code>instructions</code> 分七节(Discover/Reshape/Curate/Validate before publishing/Golden order/Beyond tools/Mechanics)，智能体照做即可。</p>
+    <p class="lead">同一治理再以 MCP 其余常用方法面二次暴露，复用<b>完全相同的渲染器</b>：<b>资源</b>(<code>resources/list</code>/<code>resources/templates/list</code>/<code>resources/read</code> 把视图与手册作为可附着上下文——<code>grovefs://guide</code> 原样回分节操作手册、<code>grovefs://views</code> 回与 <code>list_views</code> 相同的快照、<code>grovefs://view/&lt;name&gt;/definition</code> 与 <code>/tree</code>；树模板带查询参数 <code>{?path,depth,max}</code>，与 <code>list_view_tree</code> 的参数同义，大树可一次只附一个子树、被界剪断时仍报 <code>truncated:true</code>)；<b>提示</b>(<code>prompts/list</code>/<code>prompts/get</code> 两副 playbook：<code>reshape-view</code> 取 <code>base</code>/<code>goal</code>、<code>rotate-alias</code> 取 <code>real</code>/<code>new</code>/<code>old</code>)；<b>补全</b>(<code>completion/complete</code> 按 <code>ref</code> 角色感知：<code>reshape-view.base</code>/<code>rotate-alias.real</code> 只给物理视图，<code>rotate-alias.new</code>/<code>old</code> 只给别名，其余给全部视图名)；<b>日志</b>(<code>logging/setLevel</code> 设阈值后按严重度推送 <code>notifications/message</code>，<code>data</code> 带方法与被操作对象，如 <code>tools/call list_views ok</code>)。<b>工具元数据</b>：每个工具带 <code>title</code> 与 <code>annotations</code>(<code>readOnlyHint</code> 标出 <code>list_views</code>/<code>preview_rules</code>/<code>validate_definition</code>/<code>list_view_tree</code>/<code>get_view</code> 五个纯读工具，<code>destructiveHint</code> 只给 <code>alias_view</code>/<code>remove_view</code>，客户端据此决定能否自动放行)，四个回 JSON 的工具带 <code>outputSchema</code> 且结果同时给 <code>structuredContent</code>，客户端无需再剥 <code>content[0].text</code>；<code>initialize</code> 的 <code>instructions</code> 分七节(Discover/Reshape/Curate/Validate before publishing/Golden order/Beyond tools/Mechanics)，智能体照做即可。</p>
     <pre><code><span class="cmt"># 客户端配置一行(mcpServers)，重启客户端即生效——无需任何注册/发现步骤：</span>
 #   "grovefs": { "command": "grovefs", "args": ["mcp", "--db-path", "$BASE"] }
 $ grovefs mcp --db-path $BASE     <span class="cmt"># 客户端实际这样拉起：stdin 进帧、stdout 出帧</span>
@@ -2133,7 +2136,7 @@ $ grovefs apikey --db-path $BASE create --label x --for both   <span class="cmt"
 Error: "unknown api key scope 'both' (expected any|mcp|mount)"
 $ grovefs meta-server --db-path $BASE --listen 0.0.0.0:50110 --require-api-key
 meta-server: api-key auth REQUIRED (present `mount --api-key`, minted by `grovefs apikey create --for mount|any`); a revoke closes live mounts on their next op
-<span class="cmt"># 拒因现在逐字节随握手回传(不再只有一个错误码):</span>
+<span class="cmt"># 拒因逐字节随握手回传(不只是一个错误码):</span>
 $ grovefs mount --view alice -m /mnt/a --meta ... --data ...                    <span class="cmt"># 不带 key</span>
 Error: Custom { kind: PermissionDenied, error: "no api key presented: this server requires one (pass `mount --api-key ID:SECRET` or export GROVEFS_API_KEY; mint with `grovefs apikey create --for mount`)" }
 $ grovefs mount --view alice -m /mnt/a --meta ... --data ... --api-key "$MCP_KEY"  <span class="cmt"># 拿治理 key 来挂</span>
@@ -2609,7 +2612,7 @@ grovefs apikey --db-path /data/cluster list                  <span class="cmt">#
         <pre><code>sudo systemctl stop grove-meta-server</code></pre></li>
       <li>整颗元数据根拷走（<code>meta/</code> 一起走：<code>&lt;view&gt;.db</code>+WAL、<code>views/*.layout</code>、<code>api_keys.db</code>、<code>refs.db</code>）：
         <pre><code>sudo cp -a /data/cluster/meta /backup/meta-$(date +%F)</code></pre></li>
-      <li>数据对象另拷（内容寻址、只增不改，所以可以热拷）：
+      <li>数据对象另拷（key 是 UUID、只增不改，不依赖周围内容，所以这一半可以热拷；<b>但也没有内容哈希式的自动纠错</b>，拷全靠 <code>rsync -a -H</code>，验漏见 §12.8.2）：
         <pre><code>rsync -a -H /data/cluster/blocks/ /backup/blocks/   <span class="cmt"># 用过 import 必带 -H，见上表</span></code></pre></li>
       <li>凭据单独加密保存：<code>/etc/grovefs/grovefs.env</code>（token / key 明文只在这里）。</li>
       <li>起回服务并抽查：<code>systemctl start grove-meta-server</code> → <code>ls</code> / <code>cat</code> 一个已知文件 → 写一个探针文件再读回来。
@@ -2645,10 +2648,10 @@ sudo sh -c 'echo probe &gt; /mnt/da/probe.txt' &amp;&amp; cat /mnt/db/probe.txt<
 
     <h4>升级前快查</h4>
     <ul class="checks">
-      <li>先备份再动手（14.2 的冷拷五步）：升级失败只退回旧二进制，数据不动。</li>
+      <li>先备份再动手（14.2 的冷拷五步）：升级失败换回原二进制即可，数据不动。</li>
       <li>客户端滚动时一台一台来：单台 <code>stop</code> → 换二进制 → <code>start</code>，其余客户机全程无感。</li>
       <li>真被 kill 了（没走 <code>systemctl stop</code>）：先 <code>fusermount -u</code> 清死挂载再重挂，否则 <code>findmnt</code> 一直挂着一个探不到的点。</li>
-      <li>升级后先看旧行为有没漏：<code>run_all.sh</code> 里 <code>posix</code>/<code>edge</code>/<code>errors</code> 三套 errno 不过，就别往生产放。</li>
+      <li>升级后先验证 errno 语义没有回退：<code>run_all.sh</code> 里 <code>posix</code>/<code>edge</code>/<code>errors</code> 三套 errno 不过，就别往生产放。</li>
     </ul>
 
     <h3 id="maint-rotate">14.5 凭证轮换：token 与 API key</h3>
@@ -2709,11 +2712,11 @@ sudo grovefs view --db-path /data list</code></pre>
     </ol>
 
     <h3 id="maint-trouble">14.7 故障处理速查表</h3>
-    <p class="lead">三步定位法：<b>先分边界</b>（挂载/网络/服务/凭据）→ <b>再看拒因原文</b>（现已随握手逐字节回传，不要猜）→ <b>最后才动数据</b>。下表每一行都是“第一反应”，不是根因结论。</p>
+    <p class="lead">三步定位法：<b>先分边界</b>（挂载/网络/服务/凭据）→ <b>再看拒因原文</b>（随握手逐字节回传，不要猜）→ <b>最后才动数据</b>。下表每一行都是“第一反应”，不是根因结论。</p>
     <table>
       <tr><th>症状</th><th>第一反应</th><th>解释</th></tr>
       <tr><td><code>ls</code> 报 <code>Transport endpoint is not connected</code></td><td><code>fusermount -u /mnt/x</code>(或 <code>grovefs umount -m /mnt/x</code>)后重启 mount 服务</td><td>挂载 daemon 死了/被 kill,留下死挂载点</td></tr>
-      <tr><td>挂载即报 <code>Permission denied</code></td><td>看错误里的<b>拒因原文</b>(现已随握手逐字节回传)：<code>meta-server rejected the access token</code> / <code>no api key presented</code> / <code>unknown api key id</code> / <code>invalid api key secret</code> / <code>malformed api key</code> / <code>scoped to 'mcp', not 'mount'</code> / <code>this api key has been revoked</code></td><td><code>OP_OPEN</code>/<code>M_OPEN</code> 握手不过不重试,fail-fast;前者比对 token,后者查 <code>grovefs apikey list</code> 的 scope/revoked 列与 <code>apikey calls</code> 的归属行</td></tr>
+      <tr><td>挂载即报 <code>Permission denied</code></td><td>看错误里的<b>拒因原文</b>(随握手逐字节回传)：<code>meta-server rejected the access token</code> / <code>no api key presented</code> / <code>unknown api key id</code> / <code>invalid api key secret</code> / <code>malformed api key</code> / <code>scoped to 'mcp', not 'mount'</code> / <code>this api key has been revoked</code></td><td><code>OP_OPEN</code>/<code>M_OPEN</code> 握手不过不重试,fail-fast;前者比对 token,后者查 <code>grovefs apikey list</code> 的 scope/revoked 列与 <code>apikey calls</code> 的归属行</td></tr>
       <tr><td>挂载用着用着自己卸了(日志 <code>access refused by the server … — unmounting this view</code>)</td><td><code>grovefs apikey calls</code> 看那把 key 是否刚被 revoke</td><td>预期行为:服务端每秒复证活连接,撤销后首个往返即封停该挂载(§16),避免留一个还能读的服务端已不认的视图;退出码 0(有意的收手、不是崩溃),所以 <code>Restart=on-failure</code> 不会重拉</td></tr>
       <tr><td>写全部 <code>EPERM</code>、读正常</td><td><code>grovefs apikey list</code> 查该 key 是否 <code>--ro</code></td><td>写门逐 op 重查即时生效;<b>这是权限不是故障</b>,故意区别于 <code>EROFS</code>。另一来源:旧/改造客户端挂着派生(虚拟)视图名写(服务端派生只读门禁同样回 <code>EPERM</code>,§12.6)</td></tr>
       <tr><td>挂基名被拒 <code>"view 'R' is governed by an alias"</code>(本地与远端同原文,§12.8)</td><td><code>grovefs view list</code> 查该真实名是否被纯别名治理</td><td>预期行为:别名是其唯一挂载入口;要恢复基名直挂,<code>grovefs view rm --name &lt;别名&gt;</code>(仅影响新挂载)</td></tr>
@@ -2724,6 +2727,9 @@ sudo grovefs view --db-path /data list</code></pre>
       <tr><td><code>--store postgres://…</code> 加 <code>--peer</code> 启动即退</td><td>去掉 HA 参数</td><td>PG 与自研快照 HA 互斥是设计决定;高可用用 PG 流复制</td></tr>
       <tr><td>大文件没看到条带分块</td><td>确认文件 ≥16MiB 且 <code>--data</code> 给了逗号分隔多地址</td><td>小文件自然只落 chunk0,是设计不是 bug</td></tr>
       <tr><td>磁盘写满</td><td>先扩 <code>blocks/</code> 所在盘；事后用 14.1 的三条容量判据查“是业务量还是没回收”</td><td>容量治理没有 magic:对象只增删不压缩,长期靠 <code>du</code> 斜率 + 物理/逻辑比值定位</td></tr>
+      <tr><td>条带挂载换了一台 data-server 的 IP 后，<b>一部分文件读失败</b>（其余正常）</td><td>核对 <code>-o data=</code> 列表的<b>位置</b>而不是内容：把新地址放回<b>原位</b>，不要重排、不要插到最前</td><td>成员是按 <code>i % N</code> 的<b>列表下标</b>寻址的，key 里不含地址；<code>check_layout</code> 只比数量，所以<b>错位不会被报出来</b>，只表现为接手那台缺它被派到的 <code>{uuid}#{i}</code>（§11.1）</td></tr>
+      <tr><td>迁移后想确认 <code>blocks/</code> 拷全了没</td><td><code>grovefs gc --db-path D --data-root R</code>，比输出里的 <code>refs</code> 与 <code>matched</code></td><td><code>matched &lt; refs</code> = 有键没有对象（漏拷或 <code>--root</code> 列表不对）。对象名是 UUID 而非内容哈希，<b>读侧没有校验环节</b>，只能主动比（§12.8.2）</td></tr>
+      <tr><td>手工 <code>rm meta/&lt;V&gt;.db</code> 后，<code>view list</code> 里的 fork 还写着不存在的基</td><td><code>grovefs refs --db-path D rebuild</code>；此后需要基树的 <code>view graft</code> 显式给 <code>--src</code></td><td>守卫在 CLI 里，不在文件系统里：硬删只造<b>悬空引用</b>，fork 自己的树完好、共享字节不会被误删，独占键会因账本高估而暂时收不掉（§12.8.3）</td></tr>
     </table>
 
     <h3 id="maint-regress">14.8 容量与回收的实话 + 变更后回归</h3>
@@ -2770,7 +2776,7 @@ $Y mount --view alice \
       <li>两节点必须用<b>各自独立的 <code>--db-path</code></b>(各存一份视图副本,节点间靠快照复制)。</li>
       <li>primary 每 ~500ms 推快照 + 心跳 epoch;standby 心跳超时后提升并 epoch+1,旧主恢复发现更高 epoch 自动降级。</li>
       <li><code>--sync-repl</code>(opt-in,默认关闭):写 op 返回客户端前同步推快照并等备 fsync + 原子 rename 的 ACK,把 <b>RPO 从 ~500ms 降到 0</b>;代价为多一个控制通道 RTT + 一次 <code>VACUUM INTO</code> fsync。备不可达/超时时<b>诚实降级为 async 并打 warn</b>(不谎报 0)。由 <code>test_ha.sh</code> 段 7(RPO=0)/段 8(分区降级)证明。</li>
-      <li><code>--witness &lt;addr[,addr...]&gt;</code>(opt-in,默认关闭):用主备都能访问的一个或多个共享 <code>data-server</code> 作<b>独立仲裁者集合</b>(逗号分隔,推荐奇数 N;N=1 即退化为单仲裁、只要求 1 个仲裁者)。权威需<b>严格多数派</b> <code>quorum_size(N)=N/2+1</code> 个仲裁者同时授予——每个仲裁者都是下述相同的 <code>Fence</code> 租约节点,meta 侧对全列表并发 fan-out 并按多数派判决(<code>witness_quorum</code>)。</li>
+      <li><code>--witness &lt;addr[,addr...]&gt;</code>(opt-in,默认关闭):用主备都能访问的一个或多个共享 <code>data-server</code> 作<b>独立仲裁者集合</b>(逗号分隔,推荐奇数 N;N=1 即单仲裁者、只要求 1 个仲裁者)。权威需<b>严格多数派</b> <code>quorum_size(N)=N/2+1</code> 个仲裁者同时授予——每个仲裁者都是下述相同的 <code>Fence</code> 租约节点,meta 侧对全列表并发 fan-out 并按多数派判决(<code>witness_quorum</code>)。</li>
     </ul>
     <details>
       <summary>展开：租约怎么续、数据面怎么一起门控、以及部署前提</summary>
@@ -2788,7 +2794,7 @@ $Y mount --view alice \
       <ul>
         <li><b>RPO</b>：默认 async <b>RPO ≈ 500ms</b>，极端故障下最后 &lt;500ms 的写可能丢失；加 <code>--sync-repl</code> 可降到 0。</li>
         <li><b>没有第三仲裁者就防不住脑裂</b>：严格两节点、不配 <code>--witness</code> 时双写窗口<b>不封顶</b>（CAP 硬边界）；配了即 fail-safe——仲裁者<b>多数派不可达</b>时<b>冻结写</b>而非盲写/盲升，双写窗口收敛到<b>租约安全余量内</b>并保证收敛单主。</li>
-        <li><b>代价</b>：每续租一次向仲裁列表 fan-out；witness 须与内容盘同节点（见上）。（N=1 则退化为单仲裁旧行为）</li>
+        <li><b>代价</b>：每续租一次向仲裁列表 fan-out；witness 须与内容盘同节点（见上）。（N=1 即单仲裁者，多数派为 1）</li>
       </ul>
     </div>
     <div class="chnav"><a href="#maint"><span>← 上一章</span><b>§14 维护手册</b></a><a class="r" href="#security"><span>下一章 →</span><b>§16 鉴权 / 只读 / 性能</b></a></div>
@@ -2840,7 +2846,7 @@ bash: ... Read-only file system</code></pre>
       <tr><td>分块并行 IO</td><td>客户端读 ≥1MiB 按 1MiB 切片并发;写 ≥4MiB 分片并发(零协议改动)。</td></tr>
       <tr><td><code>--o allow_other</code></td><td>额外 fuser 挂载选项透传。</td></tr>
       <tr><td>touch 去抖</td><td><code>write()</code> 对同 inode 200ms 窗口去抖 <code>touch_mtime</code>,减少元数据面 RPC 与 HA 日志量(<code>setattr-size</code> 不去抖,语义要求即时)。</td></tr>
-      <tr><td>元数据读连接池</td><td>每视图 4 条只读连接服务 <code>lookup</code>/<code>getattr</code>/<code>readdir</code>，读不再排写入锁；写侧 SQLite 单连接、PG 走 8 连接写池。</td></tr>
+      <tr><td>元数据读连接池</td><td>每视图 4 条只读连接服务 <code>lookup</code>/<code>getattr</code>/<code>readdir</code>，读不必排写入锁；写侧 SQLite 单连接、PG 走 8 连接写池。</td></tr>
       <tr><td>目录分页 + READDIRPLUS</td><td><code>readdir</code> 下推成 SQL 页 + 每 32 行一个 keyset 游标（任意续读偏移不再付 OFFSET 扫描），属性随目录项一次带回；<code>--no-readdirplus</code> 可关做 A/B。</td></tr>
       <tr><td>分阶段延迟遥测 <code>--stats</code></td><td>把一次 op 内部各阶段的墙钟延迟汇成 p50/p90/p99/max，<b>默认关闭、零成本</b>，仅排障时开。</td></tr>
     </table>
@@ -2855,7 +2861,7 @@ bash: ... Read-only file system</code></pre>
     <h3>加速与内核自适应（新内核走快路、老内核自动降级）</h3>
     <table>
       <tr><th>项</th><th>说明</th></tr>
-      <tr><td>后台 WAL checkpoint</td><td>每个可写视图引擎起一条后台 <code>wal_checkpoint(PASSIVE)</code> 线程（每 1s，~30s 一次 <code>TRUNCATE</code>），写连接 <code>wal_autocheckpoint=0</code>——把提交里的同步 checkpoint 停顿（曾使 <code>create</code> 单次 125ms 尾刺）移出写热路径；随引擎 <code>Drop</code> 关停，只读/备机引擎不启动。实测（同一 3000 文件建目录）：<code>meta.create</code> total 1.64s→<b>0.38s</b>、max 125ms→<b>33ms</b>；<code>lookup</code> p50 39→17µs、<code>getattr</code> p50 66→36µs。</td></tr>
+      <tr><td>后台 WAL checkpoint</td><td>每个可写视图引擎起一条后台 <code>wal_checkpoint(PASSIVE)</code> 线程（每 1s，~30s 一次 <code>TRUNCATE</code>），写连接 <code>wal_autocheckpoint=0</code>——把提交里的同步 checkpoint 停顿移出写热路径；随引擎 <code>Drop</code> 关停，只读/备机引擎不启动。实测（同一 3000 文件建目录）：<code>meta.create</code> total <b>0.38s</b>、max <b>33ms</b>；<code>lookup</code> p50 17µs、<code>getattr</code> p50 36µs。</td></tr>
       <tr><td><code>--tune-cache &lt;秒&gt;</code> 读缓存 TTL</td><td>把内核 attr/dentry 缓存 TTL 从默认 2s 放大，适合读多/不可变树（天文“数据不落地”一次性流读）。安全边界：跨端新鲜度仍由默认 <code>notify</code> 实时失效推送保证，且新内核（≥ 3.15）协商到 <code>FUSE_AUTO_INVAL_DATA</code>（size/mtime 变则丢陈旧页数据）；<code>--strict</code> 恒把 TTL 钉为 0。能力位按各自组协商，<code>AUTO_INVAL_DATA</code> 单独成组→老内核只丢此位不伤其余。见 <code>run_all.sh</code> <code>freshness</code>/<code>disp_fresh</code>。</td></tr>
       <tr><td><code>--bw-read &lt;速率&gt;</code> / <code>--bw-write &lt;速率&gt;</code> 内容带宽整形</td><td>给本次挂载的内容读、写各上一道客户端 GCRA 令牌槽，按实际交付字节铺开互不重叠的时间槽（长跑速率精确等于上限；单个大于 1 秒额度的 op 最多提前 1 秒放行）：读在回复前、写在落盘后，超额 op 只睡到自己的时间槽，绝不丢字节/截断，写侧延迟天然形成背压。语法支持 <code>K</code>/<code>M</code>/<code>G</code>（1024 进制）与纯字节数，<code>0</code>/缺省 = 不限（热路径仅一次 <code>rate == 0</code> 分支）；env 回退 <code>GROVEFS_BW_READ</code>/<code>GROVEFS_BW_WRITE</code>，非法速率在解析处即拒。<code>--stats</code> 的 <code>bytes read</code>/<code>bytes written</code> 可核对实际吞吐（整形开启时 <code>op_total</code> 含蓄意等待、<code>backend_total</code> 不含）。诚实边界：客户端自限速，不是隔离——绕开 FUSE 直连 data-server、或多挂载同视图各自拿满额度；服务端也无法把内容寻址的字节归到某棵视图上。见 <code>run_all.sh</code> <code>bwlimit</code>。</td></tr>
       <tr><td>内核自适应大块 IO</td><td><code>max_write</code>/<code>max_readahead</code> 申请 4MiB，由 fuser 与内核按 <code>FUSE_MAX_MAX_PAGES</code> 各自截断：老内核（5.4）自动降到页上限，6.x+ 更大块=更少往返；<code>PARALLEL_DIROPS</code>、<code>WRITEBACK_CACHE</code>、<code>MAX_PAGES</code> 均能力协商。<code>--stats</code> 下会打印 <code>grovefs negotiated caps: …</code> 显示本机实际授予位。大块读写已贴近底层地板，实测 FUSE 每 op 仅加 ~50–70µs。</td></tr>
@@ -2956,8 +2962,8 @@ MAX_FRAME = 1&lt;&lt;28 (256 MiB)：声明超此值的帧直接拒收而非先�
     <h3>18.3 已有实测地板与数字（可复跑，非声称）</h3>
     <ul>
       <li><b>FUSE 自身开销</b>：大块读写每 op 仅加 ~50–70µs（已贴底层地板，§16 实测）。</li>
-      <li><b>readdir 改造链</b>：5001 条目录 <code>ls -l</code> 本地 55.34s → 只留分页 5.22s → 分页+PLUS <b>2.56s</b>；远程经 <code>M_READDIRP</code> 同目录 ~54s → <b>2.29s</b>（两份输出排序后逐字节相同，§3）。后续 keyset 游标 + 计划钉死 + 目录 nlink 覆盖索引又把这套机制推到 10 万级：含 10,002 个条目的目录 <code>ls -f</code> 131ms；含 100,002 个条目的目录 <code>ls -f</code> 1.19s（fork 1.19s、100 规则派生 1.01s / 2s 内重读 0.12s），此前同数据集基视图 18.0s、派生约 20 分钟。</li>
-      <li><b>后台 WAL checkpoint</b>：3000 文件建目录 <code>meta.create</code> total 1.64s→<b>0.38s</b>，max 125ms→33ms；<code>lookup</code> p50 39→17µs（§16）。</li>
+      <li><b>readdir 实测</b>：5001 条目录 <code>ls -l</code> 本地 <b>2.56s</b>（<code>--no-readdirplus</code> 只留分页 5.22s）；远程经 <code>M_READDIRP</code> 同目录 <b>2.29s</b>（只留分页 4.22s，两份输出排序后逐字节相同，§3）。keyset 游标 + 计划钉死 + 目录 nlink 覆盖索引把同一机制推到 10 万级：含 10,002 个条目的目录 <code>ls -f</code> 131ms；含 100,002 个条目的目录 <code>ls -f</code> 1.19s（fork 1.19s、100 规则派生 1.01s / 2s 内重读 0.12s）。</li>
+      <li><b>后台 WAL checkpoint</b>：3000 文件建目录 <code>meta.create</code> total 0.38s、max 33ms；<code>lookup</code> p50 17µs（§16）。</li>
       <li><b>元数据迁移规模</b>：5052 节点视图 <code>export</code> 0.19s/1.16MB、<code>import</code> 0.56s（含账本重建），与数据量无关；<code>bash .build-bin/perf_migrate_scale.sh</code> 可复跑（§12.8.2）。</li>
       <li><b>新鲜度上界</b>：默认推送失效下 A 写 B 见 &lt;500ms（freshness 套件 100 行追加/截断/反读三类场景实测，§10）。</li>
       <li><b>未做声称的领域</b>：全部验证在 127.0.0.1 回环完成，真实多机/fio 级基准未跑——拓环境后数字需重测才可写入结论（§21）。</li>
@@ -3114,7 +3120,7 @@ ExecStart=/usr/local/bin/grovefs meta-server --listen 0.0.0.0:20053 --require-ap
     <h4>传输、HA 与验证</h4>
     <ul>
       <li><b>传输协议</b>：当前为自定义 TCP 帧，非 gRPC。gRPC(tonic/prost)已过 go/no-go 闸门评估（GO，tonic 0.14 免 protoc），但完整集成<b>有意延后</b>——独立可弃的末位项，现协议已正确且被测。</li>
-      <li><b>HA</b>：RPO ≈ 500ms（async；<code>--sync-repl</code> 可降到 0）。真 fencing 依赖第三方仲裁：<code>--witness</code> 多数派仲裁已落地且 <b>fail-safe</b>——仲裁多数派不可达时冻结写而非盲升，primary 持有界租约，双写窗口收敛到租约安全余量内；仅严格两节点<b>不配 witness</b> 时仍无法防脑裂、窗口不封顶（CAP 硬边界）。详见 §15。</li>
+      <li><b>HA</b>：RPO ≈ 500ms（async；<code>--sync-repl</code> 可降到 0）。真 fencing 依赖第三方仲裁：<code>--witness</code> 多数派仲裁且 <b>fail-safe</b>——仲裁多数派不可达时冻结写而非盲升，primary 持有界租约，双写窗口收敛到租约安全余量内；仅严格两节点<b>不配 witness</b> 时仍无法防脑裂、窗口不封顶（CAP 硬边界）。详见 §15。</li>
       <li><b>条带</b>：单条饱和链路无吞吐增益，价值在多节点聚合容量；真实多机链路须重测后才可声称收益。</li>
       <li><b>验证环境</b>：全部在 127.0.0.1 回环(模拟 LAN)验证，尚未做真实多机与 fio 级基准。</li>
     </ul>
@@ -3142,6 +3148,7 @@ ExecStart=/usr/local/bin/grovefs meta-server --listen 0.0.0.0:20053 --require-ap
       <li><b>元数据读并行 / 目录分页的作用范围</b>：只读连接池与 SQL 分页长在<b>两个存储引擎</b>（SQLite <code>MetaEngine</code> / PG <code>PgEngine</code>），各 4 连接只读池。本地 <code>--home</code> 吃满分页与 PLUS；<code>meta-server</code> 的并发处理器吃各自后端的池，<code>M_READDIRP</code> 帧把分页下推到服务端。<code>LayoutMeta</code> 派生/透镜也覆写 <code>readdir_page</code>（每父目录物化一份形状、4 目录 / 40 万行 / TTL 2s），仍走 trait 默认实现的只剩对接<b>老 <code>meta-server</code></b> 的挂载。元数据<b>写</b>并行已覆盖 PG（SERIALIZABLE 写池，见 §9.2）；<b>跨节点多权威/分片</b>的写扩展未做。</li>
     </ul>
     <div class="ok">凡未实测数字处,文档不做收益声称;凡有限制处,均在代码注释与本节明示。</div>
+    <div class="ok"><b>文档口径:只陈述当前版本的行为。</b>不记录已移除的参数/环境变量/开关(提及它们的名字,就等于给旧行为招魂);不做版本前后对比,不引用历史基线数字;不写「新增了 / 现已支持 / 与旧版一致 / 退回旧行为」这类变更叙述——演变史归 git 提交记录,手册只管现在怎么用。两类内容不在此列,应照常保留:① 当前版本内的真实回退语义(跨设备导入退化为独立拷贝、对接不含某能力位的老服务端时退回全量列表);② 本节的「未实现(诚实标注)」负空间清单。</div>
     <div class="chnav"><a href="#config"><span>← 上一章</span><b>§20 命令瘦身与配置</b></a><a class="r" href="#featuremap"><span>回到 →</span><b>功能地图</b></a></div>
   </section>
 
