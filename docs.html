@@ -956,6 +956,7 @@ WantedBy=multi-user.target
 sudo systemctl start grove-mount@alice          <span class="cmt"># 视图名已先在中心 `view create --view alice` 建好;名字不存在会被拒</span>
 findmnt -T /mnt/alice                           <span class="cmt"># 期望:grovefs:alice,FUSE</span></code></pre>
     <div class="note"><b>uid 两件事</b>(见 <a href="#share">§9.1</a>):systemd 默认以 root 起挂载,上报 uid=<b>0</b>——无白名单约束时 root 放行即可访问;要其他用户也能访问挂点,加 <code>--o allow_other</code> 并在 <code>/etc/fuse.conf</code> 打开 <code>user_allow_other</code>。</div>
+    <div class="note"><b>两处「看起来是 POSIX 但不是」的边界(实测确证)</b>:① <b>权限位存储、显示、不强制</b>——<code>chmod</code>/<code>ls -l</code> 如实记录 <code>node.mode</code>,但挂载准入不看树内 mode:同 uid 对 <code>chmod 444</code> 的文件追加写仍 <code>rc=0</code> 且字节落盘;真正的访问控制是 token/API key、<code>--ro</code> 挂载、<code>allow_other</code> 可见性与本机 OS 权限,不要把 <code>chmod</code> 当视图内隔离手段。② <b>稀疏洞不省盘</b>——后端按完整对象存字节,<code>truncate -s 1M</code> 后 <code>st_blocks*512 == st_size</code>(<code>size=1048576 blocks=2048</code>,无洞);稀疏镜像文件不会少占网络/磁盘。均为设计取舍,见 USAGE.md §7.1。</div>
     <div class="note"><b>改成逐调用方可撤销凭据</b>（踢掉一台机不再需要轮换共享 token 并断全部人）：两个 server 的 <code>ExecStart</code> 各加 <code>--require-api-key</code>（data 侧另需 <code>--keys-from</code> 指到元数据根，若它不等于首个 <code>--root</code>），客户端把 <code>--token ${GROVE_TOKEN}</code> 换成 <code>--api-key ${GROVE_API_KEY}</code>，并用 <code>grovefs apikey create --label &lt;主机名&gt; --for mount</code> 铸造后写进同一份 root-owned 0600 的 <code>grovefs.env</code>（密钥因而进不了 <code>ps</code> 可见的 unit 文本）。撤销后的真实行为（实测）：该挂载在首个服务端往返上打印服务端拒因、<b>干净自卸载并以退出码 0 结束</b>——一次有意的收手而不是崩溃，所以 <code>Restart=on-failure</code> <b>不会</b>重拉，unit 落 <code>inactive (dead)</code>（要辨"被踢"请看 journal 里那行拒因，或挂 <code>OnFailure=</code>/<code>ExecStopPost=</code> 告警）；拿被撤销的 key 重挂则 fail-fast。若希望被踢后自动重试（运维会重新铸一把），改用 <code>Restart=always</code>。其他主机的挂载全程不受波及。</div>
     <h4>挂载多线程与服务端并发模型</h4>
     <table>
@@ -1721,7 +1722,7 @@ grovefs import --db-path /data/cluster --view legacy --source /data/legacy --pre
 rsync -a /srv/legacy/ /mnt/da/imported/
 <span class="cmt"># ≥4MiB 写自动分片并发；多地址且 ≥16MiB 自动条带——导入无需特殊调优</span>
 ls /data/blocks | head &amp;&amp; find /mnt/da/imported -maxdepth 2 | head   <span class="cmt"># 抽验</span></code></pre>
-    <p class="lead">取舍：import 零拷贝但导入对象是单文件（不走条带）、向在线挂载靠 TTL 收敛；rsync 灌入多一份字节但可条带、即时推送。经 FUSE 写入的吞吐上限在帧链路与中心盘，TB 级存量低峰分批；百万级文件会让 view.db 相应增长，属正常。</p>
+    <p class="lead">取舍：import 零拷贝但导入对象是单文件（不走条带）、向在线挂载靠 TTL 收敛；rsync 灌入多一份字节但可条带、即时推送。经 FUSE 写入的吞吐上限在帧链路与中心盘，TB 级存量低峰分批；百万级文件会让 view.db 相应增长，属正常。<b>远程直连导入未实现</b>：<code>grovefs import</code> 只收 <code>--db-path</code>/<code>--data-root</code> 本地路径，不接受 <code>--meta</code>/<code>--data</code> 远程地址——它直接写权威树，零拷贝靠源与 <code>blocks/</code> 同盘硬链接，远程协议里没有“批量提交整棵树”的对应操作；跨机批量走上面的 rsync 备选路，或在存储机上执行 import。</p>
 
     <h3 id="s15-3">12.2 显示机制一览：想看到什么形状，就选哪条路</h3>
     <table>
@@ -1748,7 +1749,7 @@ rm imported/report.pdf                             <span class="cmt"># 安全：
       <li><b>同 view + 目录约定</b>：B 只进 <code>by_public/</code> 这类发布目录——简单，但约定不是强制。</li>
       <li><b>拆两个 view + 灌两遍</b>：公开部分单独一 view 配只读 key——硬隔离真只读，代价是字节多一份。要真安全隔离选这条。</li>
     </ul>
-    <p class="lead"><b>未实现(诚实标注)</b>：子树挂载 <code>--subpath</code>/<code>--prefix</code>(<code>--layout only/hide</code> 是显示裁剪，不是路径 chroot)；跨 view 硬链接(link 只在树内；跨视图共享字节用 <b>fork 视图</b>——独立元数据树、内容共享，§12.8.1)；导入后源目录的持续自动同步(watcher/定时重扫)——<code>grovefs import</code> 是手动幂等增量命令；per-directory 强制权限（现有机制的粒度是 view × 调用方凭据；<code>--layout</code> 可做目录级显示裁剪但不构成强制隔离）。</p>
+    <p class="lead"><b>未实现(诚实标注)</b>：子树挂载 <code>--subpath</code>/<code>--prefix</code>(<code>--layout only/hide</code> 是显示裁剪，不是路径 chroot)；跨 view 硬链接(link 只在树内；跨视图共享字节用 <b>fork 视图</b>——独立元数据树、内容共享，§12.8.1)；导入后源目录的持续自动同步(watcher/定时重扫)——<code>grovefs import</code> 是手动幂等增量命令；<b>远程直连导入</b>（<code>grovefs import</code> 经 <code>--meta</code>/<code>--data</code> 向远端集群批量导入）——只在存储机执行，跨机走挂载点 rsync（§12.1.1）；per-directory 强制权限（现有机制的粒度是 view × 调用方凭据；<code>--layout</code> 可做目录级显示裁剪但不构成强制隔离）。</p>
 
     <h3 id="s15-5">12.5 显示透镜：<code>mount --layout rules.txt</code></h3>
     <p class="lead">同一棵存储树、同一份字节，不同客户端挂载时各自套一层显示规则(源路径 = 存储树坐标，<code>#</code> 注释，绝对路径)：</p>
@@ -2685,7 +2686,7 @@ sudo sh -c 'echo probe &gt; /mnt/da/probe.txt' &amp;&amp; cat /mnt/db/probe.txt<
     <ul>
       <li><b>客户端二进制</b>(单台无中断):<code>systemctl stop grove-mount@alice</code> → 替换 <code>/usr/local/bin/grovefs</code> → <code>start</code>。直接 kill 不行——死挂载要 <code>fusermount -u</code> 手工清。</li>
       <li><b>中心 server(无 HA)</b>:替换二进制 → <code>systemctl restart grove-data-server grove-meta-server</code>,接受秒级 IO 暂停。客户机挂载进程<b>不需要</b>跟着重启——远程链路对 server 重启透明(resilience 套件:连接池整体丢弃后有限退避重连)。</li>
-      <li><b>HA 滚动升级</b>:先升级并拉起 standby → stop primary(≤3s <code>PROMOTE_TIMEOUT</code> 内备提升,客户端自动切地址)→ 升级旧主并以 standby 拉起(自动降级回初始形态)。混版未经验证,同一次大版本升级请中心与客户机保持同版。</li>
+      <li><b>HA 滚动升级</b>:先升级并拉起 standby → stop primary(≤3s <code>PROMOTE_TIMEOUT</code> 内备提升,客户端自动切地址)→ 升级旧主并以 standby 拉起(自动降级回初始形态)。切换窗口内在途/首次的写往返可能失败(<code>EIO</code> 或门禁路径的 <code>EROFS</code>/<code>EPERM</code>,实测状态相关),调用方应带重试;写不中断的承诺只对切换完成后的新主成立。混版未经验证,同一次大版本升级请中心与客户机保持同版。</li>
     </ul>
 
     <div class="warn"><b>两条硬规则</b>：① 升级后必跑 <code>bash .build-bin/run_all.sh</code> 统一验收（见 14.8）；② <b>混版未经验证</b>，同一次大版本升级请中心与客户机保持同版。</div>
