@@ -105,6 +105,22 @@ pub struct GroveFS {
     /// Set once the lock-renewal heartbeat thread has been spawned (first lock
     /// grant), so we never spawn more than one per process.
     lock_renew_started: std::sync::atomic::AtomicBool,
+    /// Server-arbitrated POSIX record locks (`fcntl F_SETLK/F_SETLKW`) get NO
+    /// close/exit notification from the kernel: `fuser` surfaces a `release`
+    /// `lock_owner` only for flock(2) (`FUSE_RELEASE_FLOCK_UNLOCK`), so the
+    /// `if let Some(owner)` teardown in [`GroveFS::release`] never fires for
+    /// them. Without bookkeeping a POSIX lock left by `close`/process exit
+    /// would be renewed forever by the sid heartbeat and hang blocked waiters
+    /// up to the 10-minute cap (§5-3). So this mount records, per open file
+    /// description (`fh`), the `(ino, owner)` it took POSIX locks for, and
+    /// drops the authority-side rows from `release` once the LAST locking
+    /// description of that `(ino, owner)` closes.
+    posix_lock_fh_owner: RwLock<std::collections::HashMap<u64, (i64, u64)>>,
+    /// Live locking file descriptions per `(ino, owner)`, so a description
+    /// closing while another of the same `(ino, owner)` stays open does NOT
+    /// drop the lock (it is released only when the last one closes).
+    posix_lock_owner_fds:
+        RwLock<std::collections::HashMap<(i64, u64), std::collections::HashSet<u64>>>,
 }
 
 /// Generate a process-unique, non-zero mount session id from the clock, pid and
@@ -160,6 +176,8 @@ impl GroveFS {
             bw_write: crate::bwlimit::RateLimiter::new(bw_write_bps),
             lock_sid: gen_sid(),
             lock_renew_started: std::sync::atomic::AtomicBool::new(false),
+            posix_lock_fh_owner: RwLock::new(std::collections::HashMap::new()),
+            posix_lock_owner_fds: RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -188,6 +206,56 @@ impl GroveFS {
             std::thread::sleep(std::time::Duration::from_secs(cadence));
             meta.renew_locks(sid);
         });
+    }
+
+    /// Record that file description `fh` holds POSIX locks on `(ino, owner)`.
+    /// Called on every Read/Write grant; inserting an already-present `fh` is
+    /// a no-op, so repeat locks (same-owner convert) do not inflate the set.
+    fn note_posix_lock(&self, fh: u64, ino: i64, owner: u64) {
+        self.posix_lock_fh_owner
+            .write()
+            .insert(fh, (ino, owner));
+        self.posix_lock_owner_fds
+            .write()
+            .entry((ino, owner))
+            .or_default()
+            .insert(fh);
+    }
+
+    /// POSIX counterpart of the `release` `lock_owner` teardown, which the
+    /// kernel never delivers for `fcntl` locks. When the LAST locking
+    /// description of an `(ino, owner)` closes, delete its rows from the
+    /// authority with a full-range Unlock (the delete arm ignores `pid`), so
+    /// a lock left by `close`/process exit stops being renewed and a blocked
+    /// `F_SETLKW` waiter is released within one poll instead of hanging to the
+    /// 10-minute cap (§5-3). Best-effort: if the meta call fails the row still
+    /// ages out within one lease, which is no worse than the pre-fix state.
+    fn drop_posix_lock_on_release(&self, fh: u64) {
+        let pair = match self.posix_lock_fh_owner.write().remove(&fh) {
+            Some(p) => p,
+            None => return,
+        };
+        let mut live = self.posix_lock_owner_fds.write();
+        let last = match live.get_mut(&pair) {
+            Some(set) => {
+                set.remove(&fh);
+                set.is_empty()
+            }
+            None => false,
+        };
+        if last {
+            live.remove(&pair);
+            drop(live);
+            let _ = self.meta.lock_op(
+                pair.0,
+                pair.1,
+                0,
+                u64::MAX,
+                LockType::Unlock,
+                0,
+                self.lock_sid,
+            );
+        }
     }
 
     /// Entry/attribute cache lifetime for lookups that could go stale from a
@@ -949,7 +1017,7 @@ impl fuser::Filesystem for GroveFS {
         &self,
         _req: &Request,
         _ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         _flags: OpenFlags,
         lock_owner: Option<LockOwner>,
         _flush: bool,
@@ -961,14 +1029,18 @@ impl fuser::Filesystem for GroveFS {
         //
         // FUSE delivers `release` exactly once, when the file description's LAST
         // reference closes — on normal exit *and* on `SIGKILL` (the kernel still
-        // tears the fd down). With lock passthrough the request carries the
-        // `lock_owner` that held POSIX record locks on that description, so this
-        // is the authoritative "holder is gone" signal: drop its lock rows so a
-        // peer (or the renewal heartbeat) sees them released immediately rather
-        // than after a lease timeout.
+        // tears the fd down). flock(2) passthrough makes the request carry a
+        // `lock_owner` (only under `FUSE_RELEASE_FLOCK_UNLOCK`), so that is the
+        // authoritative "holder is gone" signal for flock locks: drop its rows
+        // immediately rather than after a lease timeout.
         if let Some(o) = lock_owner {
             self.meta.release_locks_of_owner(o.0);
         }
+        // POSIX `fcntl` locks arrive with NO `lock_owner` (the kernel sets
+        // `FUSE_RELEASE_FLOCK_UNLOCK` only for flock), so the branch above
+        // cannot see them. Reclaim them from the `(fh -> ino, owner)` bookkeeping
+        // instead, when the last locking description of that pair closes (§5-3).
+        self.drop_posix_lock_on_release(fh.0);
         reply.ok();
     }
 
@@ -1094,7 +1166,7 @@ impl fuser::Filesystem for GroveFS {
         &self,
         _req: &Request,
         ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         lock_owner: LockOwner,
         start: u64,
         end: u64,
@@ -1142,9 +1214,14 @@ impl fuser::Filesystem for GroveFS {
                     // A granted Read/Write lock must be kept alive: start the
                     // per-mount renewal heartbeat (idempotent) so peers see it
                     // held for exactly as long as the holder's file description
-                    // stays open (dropped by `release` the moment it closes).
+                    // stays open. Record the `(fh -> ino, owner)` so `release`
+                    // can drop it: the kernel never hands `release` a
+                    // `lock_owner` for POSIX locks (only flock(2)), so without
+                    // this a `close`/exit-released lock would be renewed forever
+                    // and hang blocked waiters (§5-3).
                     if ty != LockType::Unlock {
                         self.ensure_lock_renewer();
+                        self.note_posix_lock(fh.0, ino.0 as i64, lock_owner.0);
                     }
                     reply.ok();
                     return;

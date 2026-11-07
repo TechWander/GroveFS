@@ -457,7 +457,7 @@
           <tr><td>看清元数据到底存了什么（表 / 字段 / 索引 / 账本）</td><td><code>sqlite3 meta/&lt;view&gt;.db</code>；<code>view export</code> 写出的 13 个键</td><td><a href="#s8-schema">§11.1.1</a></td></tr>
           <tr><td>备份、恢复、迁移</td><td>冷拷五步 / <code>pg_dump</code> / <code>view export</code></td><td><a href="#data">§11.4</a> / <a href="#maint">§14.2–§14.3</a></td></tr>
           <tr><td>搬机器后确认字节拷全 / 换掉某台 data-server 的 IP</td><td><code>gc</code> 比 <code>refs</code> 与 <code>matched</code>；<code>-o data=</code> 列表<b>原位替换</b>那一项</td><td><a href="#data">§11.1</a> / <a href="#s15-8-2">§12.8.2</a> / <a href="#maint-trouble">§14.7</a></td></tr>
-          <tr><td>快数磁盘用量（<b>比 <code>du -sh</code> 快 500–1000×</b>）</td><td><code>grovefs du --view V [--meta A | --store U | --db-path D] [--data A] [--total]</code></td><td><a href="#s11-5">§11.5</a></td></tr>
+          <tr><td>快数磁盘用量（<b>比 <code>du -sh</code> 快 500–1000×</b>）</td><td><code>grovefs du --view V (--db-path D | --meta A --data A | --store U --data A) [--total]</code></td><td><a href="#s11-5">§11.5</a></td></tr>
           <tr class="grp"><td colspan="3">运维与排障</td></tr>
           <tr><td>日志在哪、怎么看、出事往哪查</td><td>四类日志 + 症状路由表</td><td><a href="#ops">§13</a> / <a href="#maint-trouble">§14.7</a></td></tr>
           <tr><td>性能观测与限速</td><td><code>--stats*</code> / <code>--bw-read</code> <code>--bw-write</code> / <code>--tune-cache</code></td><td><a href="#security">§16</a> / <a href="#tuning">§18</a></td></tr>
@@ -748,7 +748,7 @@ grovefs meta-server --db-path /data/gfs --listen 0.0.0.0:20053 --token mysecret
 <span class="cmt"># PG 后端时把 --db-path 换成 --store postgres://user:pw@localhost:5432/grovefs</span>
 
 <span class="cmt">── 本地 SQLite du （单机无服务时） ──</span>
-grovefs du --view alice --db-path /data/myfs --data-root /data/myfs --total
+grovefs du --view alice --db-path /data/myfs --total   <span class="cmt"># 字节默认取同一根下的 blocks/</span>
 
 <span class="cmt">── 查看 PG 后端 du（运维机直连 PG） ──</span>
 grovefs du --view main --store postgres://grovefs:pw@10.3.10.170:5432/grovefs \
@@ -1361,7 +1361,7 @@ $Y mount --view alice \\
     <ul>
       <li><b>单对象</b>:<code>blocks/&lt;2hex&gt;/&lt;key&gt;</code>,一文件=一对象文件;对象按 key 哈希自动扇出进 256 个桶子目录,单层即止——单目录条目数不随总量增长,千万级对象下备份/遍历工具不退化；桶名是 key 的纯函数，启动时预建 256 个，热路径不做 mkdir。</li>
       <li><b>key 命名</b>:写入时生成 UUID 作对象 key,存进视图 <code>data_ref</code> 字段。</li>
-      <li><b>条带编码</b>:<code>data_ref</code> = <code>s&lt;N&gt;:&lt;stripe_bytes&gt;:&lt;uuid&gt;</code>,第 i 块 key = <code>{uuid}#{i}</code>,落在 <code>servers[i % N]</code>——<b>是列表下标，不是地址</b>。key 里只编码 <code>N</code> 与条带大小，所以某台成员换 IP、换端口、换机器，只要在 <code>-o data=</code> 列表的<b>原位替换那一项</b>就能自动识别：元数据不用改，已写对象不用 rebal（读完全自描述；轮转放置 <code>i % N</code> 只决定新写入对象落哪台）。两种错配后果不同：<b>数量不符会被明确拒绝</b>（报 <code>laid out across N servers but this mount has M; refusing to remap</code>）；<b>顺序错位检不出来</b>（守卫只比 <code>N</code>），接手那台没有它现在被派到的 <code>{uuid}#{i}</code>，症状是那批文件读失败——不会读到别人的数据，因为对象名带全局 <code>#i</code>。<b>无 <code>s</code> 前缀 = 单对象</b>（未启用条带的存储形态）。</li>
+      <li><b>条带编码</b>:<code>data_ref</code> = <code>s&lt;N&gt;:&lt;stripe_bytes&gt;:&lt;uuid&gt;</code>,第 i 块 key = <code>{uuid}#{i}</code>,落在 <code>servers[i % N]</code>——<b>是列表下标，不是地址</b>。key 里只编码 <code>N</code> 与条带大小，所以某台成员换 IP、换端口、换机器，只要在 <code>-o data=</code> 列表的<b>原位替换那一项</b>就能自动识别：元数据不用改，已写对象不用 rebal（读完全自描述；轮转放置 <code>i % N</code> 只决定新写入对象落哪台）。两种错配后果不同：<b>数量不符会被明确拒绝</b>（报 <code>laid out across N servers but this mount has M; refusing to remap</code>）；<b>顺序错位会被 stat 检出</b>——每个非空条带对象的 <code>{uuid}#0</code> 必定在成员 0，若在别的成员上就被报为“服务器对、顺序不对”而不出数（否则整棵树会被读成一堆 0 字节的空文件）。<code>read</code> 路径本身仍只按分块定位，不做这层回溯。<b>无 <code>s</code> 前缀 = 单对象</b>（未启用条带的存储形态，对任意长度的列表都落在成员 0）。</li>
     </ul>
 
     <h4 id="s8-schema">11.1.1 元数据库里到底存了什么：三张表 + 一本共享账本</h4>
@@ -1523,7 +1523,7 @@ b97be2d6    1</code></pre>
       <li><b>数据对象</b>:<code>blocks/</code> 就是普通文件目录,可直接 <code>rsync -a -H</code>/文件系统快照备份。</li>
       <li><b>视图库</b>:SQLite——本地模式 <code>&lt;home&gt;/meta/&lt;view&gt;.db</code>,meta-server 则在其 <code>&lt;db-path&gt;/meta/</code> 下。<b>勿在有写活动时裸拷 DB 文件</b>;不能停机就 <code>sqlite3 &lt;db&gt; ".backup"</code>/<code>VACUUM INTO</code> 做一致性快照;HA 模式由 meta-server 用备份 API 复制(见 §15)。PG 后端时 <code>backup_to_bytes</code> 有意返回错误,交给 PG 自己的流复制/PITR。</li>
       <li><b>元数据不绑定硬件</b>:<code>node</code> 行只存 <code>data_ref</code>(对象 key),对象路径 <code>blocks/&lt;FNV1a(key)%256 两hex&gt;/&lt;key&gt;</code> 是 key 的纯函数;没有绝对路径、设备号、主机名或宿主 inode。换机器/换系统只要把 <code>blocks/</code> + <code>meta/</code> 一起带走即可用(详见 §12.8.2)。按视图迁移的实测规模:5052 节点的视图 <code>export</code> 0.19s/1.16 MB、<code>import</code> 0.56s(含账本重建)，与数据量无关。</li>
-      <li><b>拓扑边界</b>(数据分布、非硬件绑定):多盘 <code>--root</code> 的数量与顺序要一致(或合并成单 root);条带 <code>s&lt;N&gt;:</code> 要保留 N 个 data-server 及顺序;整目录拷会把 HA <code>epoch</code> 带过去,旧主必须先停;PG 后端用 <code>pg_dump</code>/逻辑复制。</li>
+      <li><b>拓扑边界</b>(数据分布、非硬件绑定):多盘 <code>--root</code> 的数量与顺序要一致(等盘克隆原位顶替不影响定位,增删/调序才重映射;或合并成单 root);条带 <code>s&lt;N&gt;:</code> 要保留 N 个 data-server 及顺序;整目录拷会把 HA <code>epoch</code> 带过去,旧主必须先停;PG 后端用 <code>pg_dump</code>/逻辑复制。</li>
     </ul>
 
     <h3 id="s11-5">11.5 磁盘用量快速统计（<code>grovefs du</code>）</h3>
@@ -1535,17 +1535,20 @@ b97be2d6    1</code></pre>
       <tbody>
         <tr><td><b>元数据服务 RPC</b>（推荐）</td><td><code>--meta HOST:20053</code> + <code>--data HOST:20100</code></td><td>客户端机不能直连 PG（防火墙 / 安全）；与挂载同身份，一个 api-key 通吃</td></tr>
         <tr><td><b>直连 PG</b></td><td><code>--store postgres://…</code> + <code>--data HOST:20100</code></td><td>运维机与 PG 同网，无 API-key 也能跑</td></tr>
-        <tr><td><b>本地 SQLite</b></td><td><code>--db-path BASE</code> + <code>--data-root BASE</code></td><td>单机本地模式：<code>meta/&lt;view&gt;.db</code> + <code>blocks/</code> 均在本机</td></tr>
+        <tr><td><b>本地 SQLite</b></td><td><code>--db-path BASE</code>（挂载式目录写 <code>--home BASE</code>）</td><td>单机本地模式：<code>meta/&lt;view&gt;.db</code> + <code>blocks/</code> 均在本机</td></tr>
       </tbody>
     </table>
 
+    <div class="note"><b>字节来源的判定</b>：先看 <code>--data</code>（含 <code>GROVEFS_DATA</code>），再看 <code>--data-root</code>，最后退回<b>树所在的 store root</b>——本地 SQLite 部署的 <code>meta/</code> 与 <code>blocks/</code> 同在一个根下，所以 <code>--db-path</code>/<code>--home</code> 一个参数就够。经 <code>--meta</code>/<code>--store</code> 取树时本机没有对应的字节，两个地址都没给就直接拒绝统计：<code>no data source to measure: pass --data &lt;host:port&gt; … or --data-root &lt;dir holding blocks/&gt;</code>。部分对象不在选中的根里（多盘放置、事后搬盘）时照常出数，但在 stderr 报 <code>warning: N of M object(s) are not in the data source and count as 0 bytes</code>——少算了多少要看得见。这句警告只给服务端明确回答 <code>ENOENT</code> 的对象：超时、拒连、读失败、<code>EIO</code> 都是“没人回答”而不是“字节不在”，一律报错不出数。地址列表的台数与对象 <code>s&lt;N&gt;</code> 布局不符（包括同一棵树里混有扩容前后的两代布局）在任何探测之前就按方向拒绝：少了提示“把整列表一次给全”，多了提示“只按写入时那 N 个地址、原顺序给”，绝不把布局错配说成对象丢失。<code>du</code> 是只读命令，不会为了测量去创建 <code>blocks/</code>。</div>
+
     <h4>命令例（与真实回显）</h4>
     <pre><code><span class="cmt"># 1. 本地单机模式：直接报目录树各级字节数</span>
-grovefs du --view alice --db-path /data/myfs --data-root /data/myfs
-<span class="cmt">#  500.0K  /                          ← 根，含全部子孙</span>
-<span class="cmt">#  500.0K  /a</span>
-<span class="cmt">#  500.0K  /a/b</span>
-<span class="cmt">#      5B  /c</span>
+grovefs du --view alice --db-path /data/myfs
+<span class="cmt">#  1.1M   /                          ← 根，含全部子孙</span>
+<span class="cmt">#  1.1M   /src</span>
+<span class="cmt">#  64.0K  /src/datasets</span>
+<span class="cmt">#  4.0K   /src/sub</span>
+<span class="cmt"># 字节在别的盘上时点名：--data-root /disk2（多根部署逐根统计）</span>
 
 <span class="cmt"># 2. 远程 meta-server（token 门控 + data-server api-key）</span>
 grovefs du --view main \
@@ -1582,7 +1585,7 @@ grovefs du --view main --depth 1</code></pre>
         <tr><td><code>--store URI</code></td><td><code>GROVEFS_STORE</code></td><td>PG 直连 URI（<code>postgres://user:pw@host/db</code>）</td></tr>
         <tr><td><code>--db-path DIR</code></td><td><code>GROVEFS_DB_PATH</code></td><td>本地 SQLite 元数据根（<code>meta/&lt;view&gt;.db</code> 在此下）</td></tr>
         <tr><td><code>--data HOST:PORT</code></td><td><code>GROVEFS_DATA</code></td><td>data-server 地址，一次批量 RPC <code>OP_BATCH_LEN</code> 拿大小</td></tr>
-        <tr><td><code>--data-root DIR</code></td><td>——</td><td>本地模式：<code>blocks/</code> 所在目录（无 data-server 时直 stat）</td></tr>
+        <tr><td><code>--data-root DIR</code></td><td><code>--db-path</code>/<code>--home</code> 的 store root</td><td>本地模式：<code>blocks/</code> 所在目录，直接 <code>stat()</code>；字节来源优先级为 <code>--data</code> &gt; <code>--data-root</code> &gt; store root</td></tr>
         <tr><td><code>--meta-token STR</code></td><td><code>GROVEFS_TOKEN</code></td><td>meta-server 的共享 token（开了 <code>--token</code> 时必带）</td></tr>
         <tr><td><code>--meta-api-key K</code></td><td><code>GROVEFS_API_KEY</code></td><td>meta-server 的 API key（<code>id:secret</code>，开了 <code>--require-api-key</code> 时必带）</td></tr>
         <tr><td><code>--api-key K</code></td><td><code>GROVEFS_API_KEY</code></td><td>data-server 的 API key（<code>id:secret</code>）</td></tr>
@@ -1657,7 +1660,7 @@ grovefs du --view main --depth 1</code></pre>
     <h3 id="s15-1">12.1 服务端两个各自独立的目录旋钮</h3>
     <table>
       <tr><th>旋钮</th><th>存什么</th><th>能放哪</th></tr>
-      <tr><td><code>data-server --root DIR</code></td><td>数据基目录:自动建 <code>&lt;root&gt;/blocks/</code> 与 256 个桶,字节按 key 哈希存入 <code>blocks/&lt;2hex&gt;/&lt;key&gt;</code>;可逗号分隔多路径做多盘自动放置(整对象按 key 哈希选一条盘;根列表须固定,增删盘会重映射所有 key)</td><td>任意路径/挂载点,不存在自动建</td></tr>
+      <tr><td><code>data-server --root DIR</code></td><td>数据基目录:自动建 <code>&lt;root&gt;/blocks/</code> 与 256 个桶,字节按 key 哈希存入 <code>blocks/&lt;2hex&gt;/&lt;key&gt;</code>;可逗号分隔多路径做多盘自动放置(整对象按 key 哈希选一条盘;落盘位置现场重算、不记录盘序号,故等盘克隆原位顶替照常定位;根列表须固定,增删盘或调序会重映射所有 key)</td><td>任意路径/挂载点,不存在自动建</td></tr>
       <tr><td><code>meta-server --db-path DIR</code></td><td>权威视图树 <code>&lt;db-path&gt;/meta/&lt;view&gt;.db</code>(+<code>api_keys.db</code>/<code>refs.db</code>;SQLite 后端形态,PG 后端下树与控制面全进 PG)</td><td>任意路径,可与对象盘不同盘</td></tr>
     </table>
     <pre><code><span class="cmt"># 对象盘改指大盘(/mnt/bigdisk)：改 unit 的 --root，并声明挂载依赖：</span>
@@ -1667,7 +1670,7 @@ sudo systemctl daemon-reload &amp;&amp; sudo systemctl restart grove-data-server
 
 <span class="cmt"># 搬迁已有对象目录(安全：key 只是 UUID 不含路径)：停客户端写→停服务→rsync→改 --root→拉起</span>
 rsync -a /data/blocks/ /mnt/bigdisk/blocks/</code></pre>
-    <p class="lead"><b>例外——条带文件</b>：条带布局自描述在 <code>data_ref</code>(<code>s&lt;N&gt;:&lt;stripe&gt;:&lt;uuid&gt;</code>)，但 chunk i 落哪台由 <code>--data</code> 列表<b>顺序</b>(<code>servers[i%N]</code>)决定——多地址顺序/台数一变，已写条带文件找不回分块（单地址无此问题）。<b>多盘聚合</b>：<code>--root /data,/mnt/d2,...</code> 逗号分隔多根，整对象按哈希自动放置，statfs 聚合容量；但根列表须<b>固定</b>（增删盘会重映射所有 key），扩容宜一次性配齐，或在 OS 层用 LVM/mdadm 合成单文件系统再挂单路径。<b>无 per-directory 配额/存储分层</b>（未实现）。</p>
+    <p class="lead"><b>例外——条带文件</b>：条带布局自描述在 <code>data_ref</code>(<code>s&lt;N&gt;:&lt;stripe&gt;:&lt;uuid&gt;</code>)，但 chunk i 落哪台由 <code>--data</code> 列表<b>顺序</b>(<code>servers[i%N]</code>)决定——多地址顺序/台数一变，已写条带文件找不回分块（单地址无此问题）。<b>多盘聚合</b>：<code>--root /data,/mnt/d2,...</code> 逗号分隔多根，整对象按哈希自动放置，statfs 聚合容量；落盘位置是 key 哈希 mod 根数现场重算，根列表与对象本身都不记录盘序号，故坏盘用等尺寸克隆盘<b>原位顶替</b>（同路径、同一位置、根数不变）照常定位；但根列表须<b>固定</b>（增删盘或调换顺序会重映射所有 key，放置层不报错、只静默 ENOENT），扩容宜一次性配齐，或在 OS 层用 LVM/mdadm 合成单文件系统再挂单路径。<b>无 per-directory 配额/存储分层</b>（未实现）。</p>
 
     <h4 id="s15-2">12.1.1 存量大量数据进来：首选零拷贝 <code>grovefs import</code></h4>
     <p class="lead"><b>首选——原地登记不搬家</b>(同文件系统,§12.7):字节零复制、秒级完成、时间戳/权限保真。需要重组数据、PG 后端、或想让大文件享受条带时,走<b>备选——经 FUSE 写路径灌入</b>:</p>
@@ -2058,7 +2061,7 @@ $ grovefs view --db-path /data/dst import --view team --in /tmp/team.jsonl
 imported view 'team' from /tmp/team.jsonl: 42 node(s), 37 blob reference(s); cross-view ledger rebuilt
 $ grovefs --home /data/dst mount --view team -m /mnt/team   <span class="cmt"># 硬链接仍是同一 inode，权限/时间原样</span></code></pre>
     <p class="lead"><b>导入是原子的</b>：先在 <code>D/meta/.V.import-&lt;pid&gt;-&lt;时间&gt;</code> 建临时树，全部行与校验通过、WAL 合并后才 <code>rename</code> 到 <code>D/meta/V.db</code>——坏文件/悬挂父节点/计数不符/失败的 <code>--replace</code> 都不会破坏旧树。<b>守卫</b>：输出已存在需 <code>--force</code>；目标已有定义槽先 <code>view rm</code>；表头 format/version 不符、根不是 <code>id=1</code> 的目录、悬挂父节点、表头计数与正文不符均整单拒绝；<code>--as-fork</code> 要求基视图在目标机已存在且本身无定义。</p>
-    <p class="lead"><b>迁移的拓扑约束</b>(数据分布，不是硬件绑定)：多盘 <code>--root</code> 的数量与顺序要一致(或合并成单 root)；条带 <code>s&lt;N&gt;:</code> 要保留 N 个 data-server 及顺序(数量不符才会被拒)——<b>换机器 / 换 IP 本身不是约束</b>：条带成员按列表<b>下标</b>寻址（<code>i % N</code>），原位替掉 <code>-o data=</code> 里那一项即可自动识别，已写对象不需 rebal，详 §11.1；顺序错位不会被报出来，只会缺文件；整目录拷会把 HA <code>epoch</code> 带过去，旧主必须先停(<code>export/import</code> 与 <code>fork</code> 有意不复制 <code>ctrl</code>/<code>locks</code>)；PG 后端用 <code>pg_dump</code>/逻辑复制，<code>view export/import</code> 目前面向本地 SQLite 树；整目录冷拷不能裸拷运行中的 SQLite(WAL)，用停写或 <code>.backup</code>/<code>VACUUM INTO</code>。<b>多个基视图</b>：可建任意多个基视图(<code>init --view A</code>/<code>view create --view A</code>)，各自一棵 <code>meta/A.db</code>，树/字节/权限/删除互不影响，<code>view list</code> 全部列出；迁移可按视图进行，key 也可按视图分别绑定。回归：<code>migrate</code> 套件 74 条断言(挂载中导出/宿主无关性/虚拟名与覆盖守卫/跨绝对路径导入/硬链接与权限保真/原子替换/损坏输入拒绝/<code>--as-fork</code> 账本共享/多基视图独立)。</p>
+    <p class="lead"><b>迁移的拓扑约束</b>(数据分布，不是硬件绑定)：多盘 <code>--root</code> 的数量与顺序要一致(等盘克隆原位顶替不影响定位——落盘位置是 key 哈希 mod 根数现场重算、列表与对象都不记录盘序号;增删盘或调序才会重映射;或合并成单 root)；条带 <code>s&lt;N&gt;:</code> 要保留 N 个 data-server 及顺序(数量不符才会被拒)——<b>换机器 / 换 IP 本身不是约束</b>：条带成员按列表<b>下标</b>寻址（<code>i % N</code>），原位替掉 <code>-o data=</code> 里那一项即可自动识别，已写对象不需 rebal，详 §11.1；顺序错位不会被报出来，只会缺文件；整目录拷会把 HA <code>epoch</code> 带过去，旧主必须先停(<code>export/import</code> 与 <code>fork</code> 有意不复制 <code>ctrl</code>/<code>locks</code>)；PG 后端用 <code>pg_dump</code>/逻辑复制，<code>view export/import</code> 目前面向本地 SQLite 树；整目录冷拷不能裸拷运行中的 SQLite(WAL)，用停写或 <code>.backup</code>/<code>VACUUM INTO</code>。<b>多个基视图</b>：可建任意多个基视图(<code>init --view A</code>/<code>view create --view A</code>)，各自一棵 <code>meta/A.db</code>，树/字节/权限/删除互不影响，<code>view list</code> 全部列出；迁移可按视图进行，key 也可按视图分别绑定。回归：<code>migrate</code> 套件 74 条断言(挂载中导出/宿主无关性/虚拟名与覆盖守卫/跨绝对路径导入/硬链接与权限保真/原子替换/损坏输入拒绝/<code>--as-fork</code> 账本共享/多基视图独立)。</p>
     <p class="lead"><b>拷完怎么确认没漏</b>：对象是 <code>blocks/&lt;2hex&gt;/&lt;key&gt;</code> 下只增不改的文件，key 是 UUID（<b>不是内容哈希，也不按内容去重</b>），所以拷贝不用重算任何东西，但也没有「哈希不符自动发现」这层保护——漏拷只能主动比。① <b>数量比</b>：树上引用的键数（<code>sqlite3 D/meta/team.db 'SELECT COUNT(DISTINCT data_ref) FROM node WHERE data_ref IS NOT NULL;'</code>）对 <code>grovefs gc --db-path D --data-root R</code> 输出里的 <code>matched</code>——<b><code>matched</code> 小于 <code>refs</code> 就是缺对象</b>（漏拷、或 <code>--root</code> 列表不对的典型症状）；② <b>落点抽查</b>：取一个 <code>data_ref</code>，按 §11.1 的纯函数算出桶名，确认文件在；③ 用 <code>rsync -a</code> 保住 mtime：<code>gc --older-than</code> 靠对象 mtime 判「新对象宽限」，时间戳全变成「刚刚」只会让回收保守（不误删，但判据失真）；用过 <code>import</code> 的存储必带 <code>-H</code>（导入的对象与源文件是硬链接，解开会变双份字节）。</p>
     <p class="lead"><b>规模实测</b>(单机、默认 IO，<code>bash .build-bin/perf_migrate_scale.sh</code> 可复跑)：迁移一棵 5052 节点、含 5000 个对象的视图——<code>export</code> 0.19s 产出 1.16 MB JSONL(视图库文件的 1.16 倍，约 230 B/节点)；<code>import</code> 到另一个绝对路径的存储根 0.56s(含跨视图账本重建)；挂载后 0.23s 枚举完 5000 个文件，内容逐字节一致、权限与属主保留。同一批文件当初注册进源视图(零拷贝导入)花了 83s——逐对象的存储开销完全不在导出/导入路径上。<b>迁移代价由命名空间大小决定，不由数据量决定</b>；字节那一半另走 <code>rsync -a -H blocks/</code>。</p>
 

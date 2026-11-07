@@ -385,7 +385,7 @@ PG 下 `view define/alias/rm --name` 照常可用(写 `view_defs`);`view create 
 | `--retire OLD` | `view alias` | 原子轮换:创建新别名后删除同一真实视图的旧别名 |
 | `--rules F` | `view define` | 规则文件路径(纯文本,一行一个动词) |
 | `--manifest F` | `init`/`view create` | 种子清单(`mkdir`/`touch` 行),建树时预铺骨架 |
-| `--data-root D` | `view rm --base`/`import` | `blocks/` 所在根;删基视图时从这里回收字节 |
+| `--data-root D` | `view rm --base`/`import`/`du` | `blocks/` 所在根;默认取元数据根(与 `--db-path`/`--home` 同一路径),meta 与 data 分家时才需点名;删基视图从这里回收字节,`du` 从这里量字节 |
 | `--layout F` | `mount` | 本次挂载的本地规则文件;只影响这个挂载,可写;本地 `--home` 下与派生名同用时显式文件优先,不叠两层透镜 |
 
 **规则文件(`--rules` / `--layout`)的四个动词**
@@ -906,7 +906,7 @@ $ grovefs --home /data/dst mount --view team -m /mnt/team     # 硬链接仍是�
 **迁移的拓扑约束(数据分布,不是硬件绑定)**:
 
 - 多盘 `--root`:对象按 `FNV1a(key) % root 数量` 选盘,目标机 root **数量与顺序要一致**;也可合并成单 root(把各盘 `blocks/` 合并)。
-- 跨 server 条带(`s<N>:...`):第 i 块在 `servers[i % N]`,目标必须保留 **N 个 data-server 及顺序**;但**顺序错位检不出来**(守卫只比 N):接手那台没有它现在被派到的 `{uuid}#{i}`,症状是那批文件读失败(不会读到别人的数据,对象名带全局 `#i`)。**换机器 / 换 IP 本身不是约束**:成员按下标寻址,在 `-o data=` 里**原位替换**那一项就能自动识别,元数据不改、已写对象不需 `rebal`(轮转放置 `i % N` 只决定新写入对象落哪台)。
+- 跨 server 条带(`s<N>:...`)：第 i 块在 `servers[i % N]`，目标必须保留 **N 个 data-server 及顺序**；台数不符直接被拒（报 `laid out across N servers but this mount has M; refusing to remap`），**顺序不符会被 stat 检出**：非空条带对象的 `{uuid}#0` 必在成员 0，落在别的成员上就报“服务器对、顺序不对”而不是出一个 0（否则整棵树会被读成一堆空文件）；`read` 路径本身仍只按分块定位，不做这层回溯（不会读到别人的数据，对象名带全局 `#i`）。**换机器 / 换 IP 本身不是约束**：成员按下标寻址，在 `-o data=` 里**原位替换**那一项就能自动识别，元数据不改、已写对象不需 `rebal`（轮转放置 `i % N` 只决定新写入对象落哪台）。
 - HA `epoch`(每个视图的 `ctrl` 表):整目录拷贝会带过去,迁移后旧主必须停;`view export/import` 与 `view fork` 有意不复制 `ctrl` 与 `locks`。
 - PG 后端不能用文件拷贝,用 `pg_dump`/逻辑复制;`view export/import` 目前只面向本地 SQLite 树。
 - `uid/gid` 是数值元数据(advisory),按数字保留;symlink 目标文本是用户数据,原样保留。
@@ -1262,7 +1262,7 @@ $Y mount --view alice \
 - **要迁的清单**:`blocks/`(字节)、`meta/<view>.db`(每视图树)、`meta/refs.db`(跨视图账本,可用 `grovefs refs rebuild` 重算)、`meta/views/*.layout`(派生/别名/fork 定义)、`meta/api_keys.db`(用过 key 才需要)。以上是 SQLite 后端清单;PG 后端下树、账本、定义、key、审计全在库内,随 `pg_dump`/`pg_restore` 迁移,本地只需搬 `blocks/` + env。
 - **整目录冷拷**:停掉所有挂载与 `meta-server` 后 `rsync -a -H` 整个存储根;**勿裸拷运行中的 SQLite**(WAL),不能停机就 `sqlite3 <db> ".backup"` / `VACUUM INTO`。
 - **单视图导出/导入**:`grovefs view --db-path D export --view V --out F` → 目标机拷 `blocks/` 后 `grovefs view --db-path D2 import --view V --in F`;保留 id/inode/硬链接/权限/属主/符号链接,原子替换(失败不伤旧树),`--as-fork B` 可恢复 fork 语义。详见 §3.4.2。
-- **拓扑边界**:多盘 `--root` 的数量与顺序要一致(或合并成单 root);跨 server 条带 `s<N>:` 要保留 N 个 data-server 及顺序;整目录拷会把 HA `epoch` 带过去,旧主必须先停;PG 后端用 `pg_dump`/逻辑复制。
+- **拓扑边界**:多盘 `--root` 的数量与顺序要一致(等盘克隆原位顶替不影响定位,增删/调序才重映射;或合并成单 root);跨 server 条带 `s<N>:` 要保留 N 个 data-server 及顺序;整目录拷会把 HA `epoch` 带过去,旧主必须先停;PG 后端用 `pg_dump`/逻辑复制。
 - **多基视图**:任意多个基视图各自一棵 `meta/<name>.db`,可只迁其中一棵,key 也可按视图分别绑定。
 - **HA** 模式下另可由 meta-server 用备份 API 复制(见 5.5)。
 
@@ -1801,7 +1801,7 @@ journalctl -u grove-meta-server -f        # systemd 下实时追日志
 
 **PostgreSQL 后端**:视图树备份完全交给 PG 工具链(`pg_dump`/`pg_basebackup` + WAL 归档/PITR);GroveFS 侧只备 `blocks/` + env 文件——key、审计与视图定义都已在 `grovefs_control` schema 里,一次 `pg_dump` 同时覆盖树+控制面(`control` 套件实证),没有本地要单独冷拷的控制面文件。`--store` 模式下自研快照备份 API 有意返回错误(设计如此)。可直接照抄的 dump/恢复/演练命令（含 DBA 建库与恢复后核对项）见 **§15.7**。
 
-**迁到新机器/换系统**:元数据不绑定硬件(只存对象 key,路径是 key 的纯函数),整目录冷拷即可用;要按视图选择性迁移用 `view export/import`(详见 §3.4.2)。三个拓扑边界:多盘 `--root` 的数量/顺序要一致(或合并成单 root);条带 `s<N>:` 要保留 N 个 data-server 及顺序;整目录拷会把 HA `epoch` 带过去,旧主必须先停。PG 后端用 `pg_dump`/逻辑复制。
+**迁到新机器/换系统**:元数据不绑定硬件(只存对象 key,路径是 key 的纯函数),整目录冷拷即可用;要按视图选择性迁移用 `view export/import`(详见 §3.4.2)。三个拓扑边界:多盘 `--root` 的数量/顺序要一致(等盘克隆原位顶替可,增删/调序会重映射;或合并成单 root);条带 `s<N>:` 要保留 N 个 data-server 及顺序;整目录拷会把 HA `epoch` 带过去,旧主必须先停。PG 后端用 `pg_dump`/逻辑复制。
 
 ### 12.4 升级与滚动变更
 
@@ -1848,11 +1848,15 @@ HA 拓扑滚动升级(写不中断,切换瞬间除外):
   ```
 
   守卫:任何视图树读不开就整体中止(跳过一棵树会把它的对象全误判成孤儿);账本仍持有的键只报告不删;`--data-root` 与所有树零交集时拒绝(防 `--db-path`/`--data-root` 配错,`--force` 可越过);PG 部署直接拒绝(树是 schema,字节归 data-server)。e2e 见 `gc` 套件(41 条断言:干净库/out-of-band 删树→held→rebuild→孤儿→grace→真删/非对象不删/本库挂载拒与他库同名不拦/错根防呆/PG 与非法时长拒绝/`--json` 字段)。
-- 把 `du` 变成可判的三条：① **记斜率而不是记大小**（每周同一天追一行带日期读数，斜率对不上业务增量才叫异常）；② **除一遍逻辑量**——`blocks/` 是物理字节，挂载里看到的是逻辑字节，两者同量级才正常：
+- 把 `du` 变成可判的三条：① **记斜率而不是记大小**（每周同一天追一行带日期读数，斜率对不上业务增量才叫异常）；② **除一遍逻辑量**——`blocks/` 是物理字节，挂载里看到的是逻辑字节，两者同量级才正常。逻辑量用 `grovefs du`（一次批量取全部对象字节，万级文件几十毫秒；在挂载里 `find` 走的是逐文件 stat，慢两个数量级）：
 
   ```bash
+  grovefs du --home H --view V --total          # 本地 SQLite 部署：一个参数就够
+  grovefs du --view V --meta M --data A1,A2 --total   # 条带部署：给全 data-server 列表
   find /mnt/da -type f -printf '%s\n' | awk '{t+=$1} END{printf "logical %.2f GiB\n", t/1073741824}'
   ```
+
+  字节来源判定不了时 `du` 拒绝出数而不是出一版 0：`--data` > `--data-root` > 元数据根，树来自 meta/PG 而两个地址都没给即报错；地址列表与对象 `s<N>` 布局台数不符（含同一棵树里有扩容前后的两代）也直接按方向报出该给哪几个地址，列表台数对但**顺序反了**同样报错不出数（否则整树会被量成一堆 0）。**只有确认缺失的对象**才计入 `warning: N of M object(s) are not in the data source and count as 0 bytes`；超时、拒连、读失败一律报错不出数，因为没人回答的字节不是 0 字节。
 
   ③ **比值 > 1 只有两个成因**：该删的没删（去视图里确认文件真 unlink 了），或 import/fork 的共享字节还被别的视图持着（`grovefs view --db-path D list` 看还有谁在引用，归零才物理回收，§5.3）。
 - 最常见的第三种其实是事故:**绕过挂载直接 `rm meta/<view>.db` 不会触发后端删除**,对象会永远留在 `blocks/` 里(引用账本只会高估不会误删,所以它只占空间、不丢数据);回收账本可用 `grovefs refs --db-path D rebuild` 归位。归位后再跑一次 `grovefs gc --db-path D`,这些页会从 `ledger-held` 变成孤儿,`--apply` 才会回收;不重建则 `gc` 一直保守地不删。
@@ -1961,7 +1965,7 @@ grovefs meta-server --db-path /data --listen 0.0.0.0:50110 --token "$TOK"
 | 参数 | 本案例取值 | 意义 |
 | --- | --- | --- |
 | `--listen` | `0.0.0.0:50100` | 监听地址。**缺省是 `127.0.0.1:50052`(只接本机)**——要接两台客户端必须显式写 `0.0.0.0`;端口号本身自定,客户端 `--data` 指对即可(50100/50110 是本文档约定值) |
-| `--root` | `/data` | 数据基目录:服务会在其下自动建 `blocks/` 子目录与 256 个桶,文件字节以 UUID 为 key 存入 `blocks/<2hex>/<key>`。**可传逗号分隔多路径(`/data,/mnt/d2,...`)= 机内多盘自动放置**:整对象按 key 哈希选定一条盘(客户端与 `data_ref` 全不知情,statfs 自动聚合容量)。但根列表对同一存储须**固定**——放置是哈希 mod 根数,增删盘会重映射所有 key、使旧对象按新布局不可达;扩容宜一次性配齐多根,或在 OS 层用 LVM/mdadm 合盘后只挂单路径 `--root`。server 只认这个布局,基目录指错 = 数据"丢"(其实是没去找) |
+| `--root` | `/data` | 数据基目录:服务会在其下自动建 `blocks/` 子目录与 256 个桶,文件字节以 UUID 为 key 存入 `blocks/<2hex>/<key>`。**可传逗号分隔多路径(`/data,/mnt/d2,...`)= 机内多盘自动放置**:整对象按 key 哈希选定一条盘(客户端与 `data_ref` 全不知情,statfs 自动聚合容量)。但根列表对同一存储须**固定**——放置是哈希 mod 根数,列表与对象本身都不记录盘序号,故坏盘用等尺寸克隆盘**原位顶替**(同路径、同一位置、根数不变)照常定位;而增删盘或调换 `--root` 顺序才会重映射所有 key、使旧对象按新布局不可达(放置层不报错、只静默 ENOENT);扩容宜一次性配齐多根,或在 OS 层用 LVM/mdadm 合盘后只挂单路径 `--root`。server 只认这个布局,基目录指错 = 数据"丢"(其实是没去找) |
 | `--token` | grovefs.env 里那串 | 数据面握手(`OP_OPEN`)口令。客户端不带对同一串 → 连接即 `PermissionDenied`,不重试。不给 = LAN-trusted 无鉴权,仅限全可信内网 |
 | (可加 `--require-api-key`) | — | 把数据面准入改成**逐调用方可撤销的 API key**(客户端 `mount --api-key`):只收 `grovefs apikey create --for mount`(或 `any`)铸造的活 key,每次连(含被拒)落审计,且每秒复证活连接——撤销会断掉已建立的连接并使其自卸载。与 `--token` 同时给出则两道都得过;不给 = 行为与从前一致(只是依旧落审计)。key 库路径由 `--keys-from <元数据根>` 指定,**默认取首个 `--root`**(分盘部署时必须指对,指到没铸造过 key 的目录 = 一个也不放) |
 
@@ -2391,6 +2395,8 @@ rsync -a /data/blocks/ /mnt/bigdisk/blocks/
 > **例外——条带文件的搬迁**:条带布局自描述在 `data_ref`(`s<N>:<stripe>:<uuid>`)里,但 chunk i 落在哪台是由客户端 `--data` 列表的**顺序**(`servers[i%N]`)决定的——多地址列表迁移时,列表顺序与台数一变,已写条带文件就找不回分块。单地址 `--root` 搬迁无此问题。
 
 **多块盘/容量扩展**：两条正路① 一条 data-server 挂多盘：`--root /data,/mnt/d2,...` 逗号分隔多存储根,整对象按 key 哈希自动放置到其中一条盘,`df`(statfs)自动聚合全盘容量——但根列表对同一存储须**固定**(放置是哈希 mod 根数,增删盘会重映射所有 key、使旧对象按新布局不可达),故宜一次性配齐多根;② 起多台 data-server + 客户端 `--data a,b,c` 条带(≥16MiB 才分块,小文件只落一台;链路未饱和才有带宽收益,见 §5.2 诚实标注)。也可在 OS 层用 LVM/mdadm 把多盘合成一个文件系统再挂给单路径 `--root`。没有 per-directory 配额与存储分层(未实现)。
+
+> **换盘不影响定位,增删/调序才影响**:落盘位置是 key 的纯函数(哈希 mod 根数)现场重算,`--root` 列表与对象本身都不记录"第几块盘"。故坏盘用等尺寸克隆盘**原位顶替**(同路径、`--root` 里同一位置、根数不变)后数据照常定位——盘内容与其内部 256 桶扇出都是按 key 寻址的整块拷贝,无需重建任何索引。反之一旦**增、删、或调换 `--root` 顺序**,取模基数变、所有 key 重映射,旧对象按新布局寻址即不可达;放置层不做 remap 守卫,只会静默 ENOENT(跨 server 条带则在 `--data` 台数/顺序对不上时直接拒挂并报 `refusing to remap`)。运维上把 `--root` 列表当作不可变配置:等盘克隆原位替换可,原地扩容/重排不可,需扩容走"全量重灌到新固定布局"。
 
 ### 14.2 存量大量数据怎么进来:两条正路,首选零拷贝 `grovefs import`
 
@@ -2969,6 +2975,7 @@ $G meta-server --listen 0.0.0.0:50110
 | 删整个基视图(连字节回收) | `grovefs view --db-path D rm --name V --base [--data-root R]`(删 `meta/V.db`+WAL/SHM、`refs rebuild` 重建账本、回收无其他视图持有的字节;受治名/依赖定义/本机活挂载/PG 部署均拒绝,§3.4.3) |
 | 排查/回收孤儿对象(离线) | `grovefs gc --db-path D [--data-root R] [--apply] [--older-than 24h] [--json]`(默认只扫描;`--apply` 要求本存储无活挂载、本机无 grovefs 进程,永不删账本仍持有的键,PG 部署拒绝,§12.6) |
 | 导入存量目录 | `grovefs import --view V --source DIR [--prefix P] [--data-root R] [--dry-run]`(同盘硬链接零拷贝,重跑增量;在存储机执行,§3.3) |
+| 服务端用量统计 | `grovefs du --home H --view V [--data A[,A2]\|--data-root R] [--path P] [-d N] [-b] [--total]`(批量取对象字节汇总,不走逐文件 stat;字节来源 `--data` > `--data-root` > 元数据根,判不出来源直接拒绝,只有确认缺失才计入 warning,§12.6) |
 | 卸载 | `grovefs umount -m MP` |
 | 数据服务 | `grovefs data-server --listen IP:PORT --root DIR [--token T] [--require-api-key [--keys-from D]]` |
 | 元数据服务（默认 SQLite） | `grovefs meta-server --db-path D --listen IP:PORT [--token T] [--require-api-key] [--role primary\|standby --peer ADDR [--sync-repl] [--witness ADDR]]` |

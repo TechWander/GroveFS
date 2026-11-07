@@ -28,6 +28,11 @@ pub const STRIPE_BYTES: u64 = 16 * 1024 * 1024;
 pub struct ShardedBackend {
     servers: Vec<Arc<dyn StorageBackend>>,
     stripe: u64,
+    /// Set once some object's chunk 0 has been found where this list puts it:
+    /// the order of this address list is then known to agree with the writer's,
+    /// so [`ShardedBackend::chunk0_elsewhere`] no longer has to re-check every
+    /// chunk-0 miss. A reversed list never sets it and keeps reporting.
+    order_verified: std::sync::atomic::AtomicBool,
 }
 
 /// Decoded stripe layout carried in a `data_ref` key.
@@ -35,6 +40,15 @@ struct Layout {
     n: usize,
     stripe: u64,
     base: String,
+}
+
+/// How many data-servers a `data_ref` was laid out across: `Some(N)` for the
+/// `s<N>` prefix, `None` for a key with no layout prefix. An unstriped key is
+/// not pinned to a list length — it names one whole object, wherever the
+/// single-server writer put it, and any list looks it up on member 0 — so
+/// reporting commands must only constrain the keys that state a count.
+pub(crate) fn layout_server_count(key: &str) -> Option<usize> {
+    parse_layout(key).map(|l| l.n)
 }
 
 /// Parse `s<N>:<stripe>:<base>`; `None` for any other (unstriped) key. A v4 uuid
@@ -64,6 +78,7 @@ impl ShardedBackend {
         Self {
             servers,
             stripe: stripe.max(1),
+            order_verified: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -132,6 +147,44 @@ impl ShardedBackend {
             Probe::Absent => Ok(None),
             Probe::Unknown => Err(io::Error::from_raw_os_error(libc::EIO)),
         }
+    }
+
+    /// Explain a missing chunk 0, which [`Self::len`] is about to read as an
+    /// empty object.
+    ///
+    /// Every non-empty striped object has `{base}#0`, and the contiguity
+    /// invariant puts it on member 0 — so if a DIFFERENT member holds it, the
+    /// bytes are real and only the list order disagrees with the writer's.
+    /// Answering `0` there is the worst possible output: a reversed `--data`
+    /// list reported every file in the tree as empty, in the mount and in `du`
+    /// alike, with nothing on stderr. Detection costs one probe per member and
+    /// only runs on the chunk-0-absent branch: empty files and misordered
+    /// lists, never a healthy tree.
+    fn chunk0_elsewhere(&self, l: &Layout) -> io::Result<()> {
+        if self
+            .order_verified
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(());
+        }
+        let ck = self.chunk(l, 0).1;
+        for i in 1..self.servers.len() {
+            match self.probe(i, &ck) {
+                Probe::Present(_) => {
+                    return Err(io::Error::other(format!(
+                        "object {} keeps chunk #0 on data-server #{i}, but this --data list \
+                         orders it at #0: the servers are right and their order is not, so \
+                         sizes and reads would be attributed to the wrong member",
+                        l.base
+                    )))
+                }
+                // A definite miss elsewhere is consistent with an empty object.
+                Probe::Absent => {}
+                // Nothing was confirmed, so emptiness is not established either.
+                Probe::Unknown => return Err(io::Error::from_raw_os_error(libc::EIO)),
+            }
+        }
+        Ok(())
     }
 
     /// Enumerate the (chunk_index, sub_offset, sub_len) tuples covering the
@@ -404,8 +457,22 @@ impl StorageBackend for ShardedBackend {
         // Chunk 0 first: absent => empty object; present-and-short => it is the
         // only (trailing) chunk, size == its length.
         let len0 = match self.chunk_len(&l, 0)? {
-            None => return Ok(0),
-            Some(c) => c,
+            None => {
+                // `None` here means THIS list found no chunk 0 on member 0. For
+                // a contiguous object that is an empty object — unless some
+                // other member holds `{base}#0`, which is the signature of the
+                // right servers in the wrong order. Reporting 0 for that made a
+                // misordered list look like a tree full of empty files.
+                self.chunk0_elsewhere(&l)?;
+                return Ok(0);
+            }
+            Some(c) => {
+                // Chunk 0 sits where this list says: the order is proven for
+                // this backend, so later chunk-0 misses are real empty objects.
+                self.order_verified
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                c
+            }
         };
         if len0 < l.stripe {
             return Ok(len0);
@@ -664,6 +731,45 @@ mod tests {
         let slice = sb.read(&key, 4000, 500).unwrap();
         assert_eq!(slice, &data[4000..4500]);
         sb.remove(&key).unwrap();
+        assert_eq!(sb.len(&key).unwrap(), 0);
+        for r in roots {
+            let _ = std::fs::remove_dir_all(r);
+        }
+    }
+
+    /// A reversed `--data` list used to answer `0` for every striped file, the
+    /// "whole tree looks empty" failure: the bytes are real and only the list
+    /// order disagrees, which has to come back as an error, not a size.
+    #[test]
+    fn a_reversed_server_list_is_reported_not_read_as_empty() {
+        let roots = tmp_root("order", 2);
+        let stripe = 4096u64;
+        let sb = ShardedBackend::new(members(&roots), stripe);
+        let key = sb.new_key("obj1");
+        sb.create(&key).unwrap();
+        let data: Vec<u8> = (0..10000u32).map(|i| i as u8).collect();
+        sb.write(&key, 0, &data).unwrap();
+        assert_eq!(sb.len(&key).unwrap(), data.len() as u64);
+
+        let m = members(&roots);
+        let flipped = ShardedBackend::new(vec![m[1].clone(), m[0].clone()], stripe);
+        let err = flipped.len(&key).expect_err("a reversed list must not answer 0");
+        let msg = err.to_string();
+        assert!(msg.contains("order"), "{msg}");
+        assert!(msg.contains("wrong member"), "{msg}");
+        for r in roots {
+            let _ = std::fs::remove_dir_all(r);
+        }
+    }
+
+    /// The same check must not turn an object with no bytes into an error: an
+    /// empty striped object has no chunk #0 anywhere.
+    #[test]
+    fn an_empty_striped_object_still_measures_zero() {
+        let roots = tmp_root("empty0", 2);
+        let sb = ShardedBackend::new(members(&roots), 4096);
+        let key = sb.new_key("emp");
+        sb.create(&key).unwrap();
         assert_eq!(sb.len(&key).unwrap(), 0);
         for r in roots {
             let _ = std::fs::remove_dir_all(r);
