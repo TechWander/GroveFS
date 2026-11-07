@@ -1699,20 +1699,21 @@ bash .build-bin/vm_audit.sh        # 重启后拿一次全量复核
 
 ```
 $ git log --oneline -4
+be7c237 docs(display): close out remaining §5/§6 items with honest-boundary notes
+5e624e8 docs(report): refresh §8 git snapshot for the §5-7 reclassification commit
 c7bb45c docs(display): scope the set-ro resume-write claim to kernel-RO mounts (§5-7)
 d4617e1 docs(display): split interior-gap mount-read silence into its own row in tables (b)
-15ca356 docs(report): refresh §8 git snapshot for the §6-10 commit
-1fc8c99 feat(display): data-server startup banner echoes host + root list (§6-10)
 
-$ git show --stat c7bb45c       # §5-7 复测定性 + “恢复写要重挂”口径限定（纯文档）
- TEST_REPORT.md | 32 +++++++++++++++++++++++++++++---
- USAGE.md       |  4 ++--
- docs.html      |  2 +-
- 3 files changed, 32 insertions(+), 5 deletions(-)
+$ git show --stat be7c237       # §5-1/§5-2 能力边界 + §5-9 重试要求 + §5-11/§6-11 终审（纯文档）
+ TEST_REPORT.md | 26 +++++++++++++++++++++-----
+ USAGE.md       | 12 +++++++++++-
+ docs.html      |  7 ++++---
+ 3 files changed, 36 insertions(+), 9 deletions(-)
 
-$ git status --short            # 跟踪文件已全部入库，仅剩未跟踪的取证/编排脚本（本报告快照随 §5-7 复测 commit 刷新）
+$ git status --short            # 跟踪文件已全部入库，仅剩未跟踪的取证/编排脚本（本报告快照随 §5/§6 遗留收口 commit 刷新）
 ?? .build-bin/gfs_provision.sh
 ?? .build-bin/probe_posix_lock.py
+?? .build-bin/probe_51_52.sh         # §3.1 §5-1/§5-2 本机复测探针（取证用，不入库）
 ?? .build-bin/repro_du_damage.sh      # §6-2 本机端到端复现（取证用，不入库）
 ?? .build-bin/repro_fork_fsync.sh     # §6-3 本机复现（取证用，不入库）
 ?? .build-bin/repro_read_gap.sh       # §3.6.6 条带中间块丢的挂载读复现（取证用，不入库）
