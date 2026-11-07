@@ -1683,23 +1683,24 @@ bash .build-bin/vm_audit.sh        # 重启后拿一次全量复核
 
 ```
 $ git log --oneline -4
+c7bb45c docs(display): scope the set-ro resume-write claim to kernel-RO mounts (§5-7)
 d4617e1 docs(display): split interior-gap mount-read silence into its own row in tables (b)
 15ca356 docs(report): refresh §8 git snapshot for the §6-10 commit
 1fc8c99 feat(display): data-server startup banner echoes host + root list (§6-10)
-b35536d docs(report): refresh §8 git snapshot for the §6-3 fix commit
 
-$ git show --stat d4617e1       # 表(b) 补“条带中间分块丢失→挂载读静默短报”行 + §3.6.6 证据 + §5-6 口径对齐（纯文档）
- TEST_REPORT.md | 37 ++++++++++++++++++++++++++++++++++---
- USAGE.md       |  1 +
- docs.html      |  1 +
- 3 files changed, 36 insertions(+), 3 deletions(-)
+$ git show --stat c7bb45c       # §5-7 复测定性 + “恢复写要重挂”口径限定（纯文档）
+ TEST_REPORT.md | 32 +++++++++++++++++++++++++++++---
+ USAGE.md       |  4 ++--
+ docs.html      |  2 +-
+ 3 files changed, 32 insertions(+), 5 deletions(-)
 
-$ git status --short            # 跟踪文件已全部入库，仅剩未跟踪的取证/编排脚本（本报告快照随表(b) 补行 commit 刷新）
+$ git status --short            # 跟踪文件已全部入库，仅剩未跟踪的取证/编排脚本（本报告快照随 §5-7 复测 commit 刷新）
 ?? .build-bin/gfs_provision.sh
 ?? .build-bin/probe_posix_lock.py
 ?? .build-bin/repro_du_damage.sh      # §6-2 本机端到端复现（取证用，不入库）
 ?? .build-bin/repro_fork_fsync.sh     # §6-3 本机复现（取证用，不入库）
 ?? .build-bin/repro_read_gap.sh       # §3.6.6 条带中间块丢的挂载读复现（取证用，不入库）
+?? .build-bin/repro_setro_resume.sh   # §3.9.1 §5-7 恢复写热生效复测（取证用，不入库）
 ?? .build-bin/repro_setro_local.sh    # 本机 --home set-ro 口径探针（取证用，不入库）
 ?? .build-bin/vm_audit.sh … vm_verify_striping.sh（其余 vm_* 同前几轮）
 ```
