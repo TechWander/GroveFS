@@ -1883,6 +1883,7 @@ HA 拓扑滚动升级(写不中断,切换瞬间除外):
 | 地址列表台数/顺序与 `s<N>` 布局不符 | `du --data` | **会（拒统计）**：探测前按方向拒绝，绝不把布局错配说成对象丢失 |
 | 条带对象**中间分块**真丢 | `du` | **会（判损坏）**：stderr `warning: N of M object(s) are damaged striped objects and are excluded from the total (their true size is unknown)`，损坏字节不计入总数 |
 | 条带对象**首分块**真丢（后续分块仍在） | `du` | **会（判损坏）**：同上进 `damaged` 告警（`missing its leading chunk #0 …`），不再给错位极小值 |
+| 条带对象**中间分块**真丢，经挂载读取 | 挂载内 `read`/`stat` | **不会（已知缺陷）**：`stat size` 截短到首个缺失分块的偏移（如 40 MiB 对象报 16 MiB），整读 rc=0 且内容纯为缺口前缀，缺口后存活分块亦不可见，不报 `EIO`；仅 `du` 判损坏 |
 | 读一个对象已丢的文件（重挂后/fd 缓存已清） | 挂载内 `read`/`stat` | **不会（已知缺陷）**：`stat size=0`、整读 rc=0 空内容，不报 `EIO` |
 | 对象被外部 `mv`/`rm`，但挂载已建立 | 挂载内旧 fd | **不会（且不可观察）**：data-server 按 key 缓存旧 fd，需清缓存/重启后才可测 |
 | `view rm --base` 时数据根打不开 | `view rm --base` | **会**：`error: cannot open data root …` + 离线 `gc` 回收提示（分开陈述“树已删”与“字节未收”） |

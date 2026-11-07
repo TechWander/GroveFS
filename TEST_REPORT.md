@@ -920,6 +920,36 @@
 
 - **结论**：**通过**。中间分块丢失不再静默短报（修复前同形态为 `40MiB → 16MiB` 无声，见 §3.6.3 情形二）：du 给出独立 `damaged` warning（区别于「不在数据源」的 lost warning，更区别于误报），不可确认的字节不计入总数；尾块丢失仍按 EOF 静默短报、不误报损坏（`rc=0`，无 warning）。单测 `len_strict_flags_interior_and_leading_gaps_but_not_a_short_tail`（`src/backend/sharded.rs`）同时钉住首块缺失、中间空洞、短尾三态。
 
+#### 3.6.6 条带中间分块丢失的挂载读形态（本机复现，表(b) 补行的证据）
+
+- **命令**（`bash .build-bin/repro_read_gap.sh`，本机两台 data-server + 本地 meta，与 §3.6.5 同拓扑）：`mount --data A,B` 下 `dd` 一个 40 MiB 文件（跨分块 #0/#1/#2，#1 在 B）；记录 md5 → umount、停服（按端口 `ss -ltn` 确认已释）、`rm` 掉 B 上的 `{uuid}#1` → 重启两 server → 重挂后 `stat`、整读、比对 md5；控组再跑 `du`。
+- **回显**：
+
+  ```
+    === write 40MiB, record md5 ===
+    4004ab7ba993bdd2fa9c12aee2a0fec6  .rgap/mnt/big.bin
+    === stop mount+servers, delete ONE interior chunk (#1 lives on B) ===
+    .rgap/sB/blocks/3c/f6255ff9-fcd4-4657-a9b7-49b07a01ebde#1
+    === stat (metadata says?) ===
+    size=16777216
+    === full read through mount: rc, bytes landed, md5 vs original ===
+    rc=0
+    44a5a2b1d4024f472ad74461693c2d57  .rgap/mnt/big.bin
+    byte count actually returned by read:
+    16777216
+    === du still announces damage (control) ===
+    warning: 1 of 1 object(s) are damaged striped objects and are excluded from the total (their true size is unknown); first: striped object f6255ff9-fcd4-4657-a9b7-49b07a01ebde has a gap at chunk #1 (a present chunk lies beyond the first absent one) — content is damaged, not short; its true size is unknown
+  ```
+
+  存活分块尾验（读回内容是否纯缺口前缀，非错位读）：
+
+  ```
+    44a5a2b1d4024f472ad74461693c2d57  .rgap/sA/blocks/ef/f6255ff9-fcd4-4657-a9b7-49b07a01ebde#0
+    44a5a2b1d4024f472ad74461693c2d57  .rgap/md5.read
+  ```
+
+- **结论**：与源码机制吻合（`src/backend/sharded.rs` 的 `read()`：缺失分块 `NotFound` 被翻译成空读/EOF，存活分块按序号拼接；`len` 二分停在首个缺失块，`build_attr` 用其短报值作 `i_size`）：中间分块丢失时挂载整读 **rc=0、无 `EIO`**，`stat size` 截短到首个缺失分块的偏移（40 MiB → 16 MiB），读回内容逐字节等于存活首分块 chunk#0（短报而非错位读），缺口后的存活尾分块 chunk#2（8 MiB，仍在 A）因超出 `i_size` 而不可见；同场景 `du` 判损坏出声（§3.6.5）。此形态与“整对象丢失 → size=0 静默”（§3.6.3/§3.6.4）不同，不互相蕴含：前者 size 停在中途、有真前缀内容，后者 size=0 全空。据此在 `docs.html` §11.5 / `USAGE.md` §12.6 表(b) 增补独立一行；挂载侧行为本身不变，属 §5-6 既有设计取舍（len 是 getattr 热路径且静默形态不被改动）。
+
 ### 3.7 `view export/import` 跳机迁移与 `--as-fork`
 
 - **命令**：
@@ -1471,7 +1501,7 @@
 | 5-3 | **POSIX 记录锁 close/退出隐式释放时漏清，阻塞等待方不唤醒** | 修复前的对照实验：显式 `F_UNLCK` 释放 → 等待方 3.01s 唤醒；只 `close(fd)`/进程退出释放 → 新进程非阻塞加锁仍 `EACCES`（锁泄漏），阻塞等待方卡 `request_wait_answer` 直至 600s 上限 | 根因已定位（§3.2）：`fuser` 0.18 `Release::lock_owner()` 仅在 `FUSE_RELEASE_FLOCK_UNLOCK`（只有 flock(2) 路径置位）时返回 `Some`；POSIX 锁走 close 时返回 `None`，`release_locks_of_owner` 不触发，幽灵锁行又被按 sid 的续租心跳（`LOCK_LEASE_SECS=15`）无限 刷新 | **已修复**（release `d2a3b262`，实机复验）：`setlk` 按 `(fh→ino,owner)` 记账、`release` 在末次锁定描述符关闭时用全区间 Unlock 精确回收；close 后新进程加锁由 `EACCES` 变 `GRANTED`、阻塞 `F_SETLKW` 于持有者 close 后 `2.74s` 唤醒（见 §3.2、§6-2a） |
 | 5-4 | `view rm --base` 在数据根不可用时只给裸 `Permission denied` | 修复前：`Error: Os { code: 13, kind: PermissionDenied, message: "Permission denied" }`，不报路径、不给下一步，且发生在元数据树已删之后 | 回收阶段直接上抛 `io::Error`，未经包装 | **已修复**（release `d2a3b262`，实机复验）：回收 `open_local` 失败时 `map_err` 补上数据根路径、视图名与“树已删/字节未收”上下文及离线 `gc` 提示；连同 §5-12 改走 Display，实机报 `error: cannot open data root …`（见 §6-4） |
 | 5-5 | **条带对象真丢分块时 du 仍静默短报（本类中数据源真缺字节的形态；错配/瞬时故障形态已修）** | 修复前探针：中间分块缺失 `67108869 → 16777221`（无 warning）；首分块真缺：`--total` 给极小值 | `ShardedBackend::len` 假定分块连续，指数+二分把“第一个缺失分块”当 EOF（chunk#0 真缺时 `chunk0_elsewhere` 在其它成员也探不到 `{base}#0` → `Ok(0)`） | **已修复（du 诊断路径）**：`du` 改走 `len_strict`，二分停在首个缺失块后多探一块、首块缺失而后续存在也同样检测，命中即归入独立 `damaged` 计数并单独 warning（字节不计入总数）；本机端到端复验见 §3.6.5，单测 `len_strict_flags_interior_and_leading_gaps_but_not_a_short_tail`。挂载侧静默形态（stat size 短/0、读无 EIO）属 §5-6，未改（len 是 getattr 热路径且 `build_attr` 会回退元数据 size，改 len 既拖热路径又不会让挂载出声）；同一命令对“列表长度不符/倒置/超时拒连”的既有拒绝与硬报错不变（见 §3.6.2） |
-| 5-6 | 非条带路径的挂载读丢失对象也不出声 | 重挂后读丢失对象：`rc=0`、`stat size=0`（无 `EIO`） | 同上：`len` 给 0 而非错误 | 未修，列入遗留 |
+| 5-6 | 挂载读丢失对象不出声：非条带路径整对象丢（size=0 空读）与条带路径中间分块丢（size 截短到缺口偏移、内容纯前缀、后续存活块不可见）两形态均无 `EIO` | 重挂后读丢失对象：`rc=0`、`stat size=0`；条带中间块丢：`stat size=16777216`、整读 rc=0 且 md5==chunk#0（本机复验见 §3.6.6） | 同上：`len` 给短报/0 而非错误，`read()` 将缺失块 `NotFound` 当 EOF | 未修，列入遗留；两形态均已在表(b) 分行诚实标注 |
 | 5-7 | `apikey set-ro` 回到 rw 后同一挂载仍拒写 | `is now rw (read-write)` 后紧接追加写 `errno=30` | 服务端复检窗口/客户端缓存时机，文档声称 ≤1s | 未修，列入遗留（建议回显明记生效时刻而非窗口上限） |
 | 5-8 | `set-ro` 后回读内容尾部多 7 个零字节 | `'first\n\x00\x00\x00\x00\x00\x00\x00'` | 本轮探针用固定长缓冲区读回所致，非产品写入；作为取证脚本缺陷记录 | 已确认非产品缺陷（取证手段问题） |
 | 5-9 | HA 切换瞬间首次写存在瞬时 `EIO` | 上一轮观察到一次 `EIO` 且文件未生成；本轮为 `rc=0`（0.76 s） | 转接窗口内旧主连接失效 | 状态相关，不作稳定性断言；建议文档写明重试要求 |
@@ -1513,7 +1543,7 @@
 9. ★**`--stats` 表的字节口径——本轮已实现**（表头说明方案，不改定宽列；release `c8d68580`，本机挂载复验）。原建议：`read.op_total bytes=0` 与 `read.backend_total bytes=…` 并存易误读为“没读到数据”；`p50=0` 这类静默 0 易误读为漏采样。**已采用的改法**（`src/stats.rs` 的 `report_text` 表头，未动表格列宽以免破坏对齐与 CSV）：新增两行——`bytes= is tallied only on the backend-boundary stages (read/write.backend_total, io.*); a 0 there is expected on op_total lines and means "not counted at this stage", not "no data"`、`a latency of 0 is sub-µs (below the histogram's µs resolution), not a missing sample`。同步 `docs.html` §8 的真实回显样本与 `USAGE.md` §8.1 口径说明。`test_stats.sh` E2E 通过（表头 `per-stage latency telemetry` 断言未受影响）。
 10. **`ls -d /data/gfs*/grove` 的展示歧义——本轮已实现（启动 banner 回显 host + 根列表）**。两台机器上都存在 `/data/gfs1/grove` 与 `/data/gfs2/grove` 两个同名目录（分块落点看似“在 gfs1 上”实际在 gfs2 的盘），本轮 E1/D2 回显已造成多次误读。**已采用的改法**（纯显示，不动放置逻辑）：`src/remote/server.rs` 的 `DataServer` 新增展示字段 `roots`（`with_roots()` 由 CLI 注入）与 best-effort `node_hostname()`（`libc::gethostname`，退回 `HOSTNAME` env，再退 `<unknown>`，不因此拒绝启动），启动行由裸 `data-server listening on <addr>` 改为 `data-server listening on <addr> (host <h>, N data root(s): <p1>, <p2>)`——翻日志先认 host 再认路径。未采纳“根名从主机名推导”（`/data/<host>/grove`）：那会改变既有存储的根路径布局，与“root 列表必须固定”的口径冲突，属部署惯例而非产品缺陷。本机冒烟：`data-server listening on 127.0.0.1:59977 (host lc, 2 data root(s): /tmp/ds_a, /tmp/ds_b)`；`test_remote.sh` 新增 banner 断言（套件 19/0）；`docs.html` §13.11 终端实录与 `USAGE.md` §13.3/部署走读的 banner 示例同步为新形。
 11. **静默 0 值的通用约束**。建议约定：任何统计命令的 0 值必须区分三种情况——真零、无法测（数据源不对）、部分丢失，分别给 `0`、`0 (not measurable here: …)`、`<N> (excluding M lost object(s))`。本轮命中的四处：`du --total: 55B`、`stat size=0`、`gc objects: 0 (0 B)`、`--stats bytes=0`。
-12. ★**`docs.html`/`USAGE.md` 两张运维语义表——本轮已实现**（纯文档，无代码改动）。原建议：添加（a）fork/透镜/别名/key-ro 四种“写意图”的失败时点对比，（b）“对象丢失时各命令的声音”矩阵。**已采用的改法**：（a）写入 `docs.html` §12“报错对照”后（含逐 `open` 探针 errno 的 `<pre>` 与“为何截断类在 open 拒、追加类拖到 fsync”的 note）与 `USAGE.md` §3.0（写契约 note 后的精简表 + “不能拿 shell `>>` 的 rc 判断写成功”的告警）；（b）写入 `docs.html` §11.5（du 字节来源 note 后，9 行情形×会/不会出声×逐字回显关键词）与 `USAGE.md` §12.6（同矩阵精简版 + 一句话选型）。未出声的条带丢分块与挂载读均标为“当前版本已知缺陷（未实现、诚实标注）”，与 §5-5/§5-6 遗留项一致。doccheck 退出码 0（标签闭合无错、参数对账非负空间差集 0、新增汉字均为正当用字）。
+12. ★**`docs.html`/`USAGE.md` 两张运维语义表——本轮已实现**（纯文档，无代码改动）。原建议：添加（a）fork/透镜/别名/key-ro 四种“写意图”的失败时点对比，（b）“对象丢失时各命令的声音”矩阵。**已采用的改法**：（a）写入 `docs.html` §12“报错对照”后（含逐 `open` 探针 errno 的 `<pre>` 与“为何截断类在 open 拒、追加类拖到 fsync”的 note）与 `USAGE.md` §3.0（写契约 note 后的精简表 + “不能拿 shell `>>` 的 rc 判断写成功”的告警）；（b）写入 `docs.html` §11.5（du 字节来源 note 后，逐情形×会/不会出声×逐字回显关键词）与 `USAGE.md` §12.6（同矩阵精简版 + 一句话选型），现为 10 行——后续轮按 §3.6.6 取证增补了“条带中间分块丢失→经挂载读”独立一行（此前只有“整对象丢失→size=0”行，两种静默形态不互相蕴含）。未出声的条带丢分块与挂载读均标为“当前版本已知缺陷（未实现、诚实标注）”，与 §5-5/§5-6 遗留项一致。doccheck 退出码 0（标签闭合无错、参数对账非负空间差集 0、新增汉字均为正当用字）。
 
 ---
 
@@ -1645,6 +1675,7 @@ $ git status --short            # 跟踪文件已全部入库，仅剩未跟踪�
 ?? .build-bin/probe_posix_lock.py
 ?? .build-bin/repro_du_damage.sh      # §6-2 本机端到端复现（取证用，不入库）
 ?? .build-bin/repro_fork_fsync.sh     # §6-3 本机复现（取证用，不入库）
+?? .build-bin/repro_read_gap.sh       # §3.6.6 条带中间块丢的挂载读复现（取证用，不入库）
 ?? .build-bin/repro_setro_local.sh    # 本机 --home set-ro 口径探针（取证用，不入库）
 ?? .build-bin/vm_audit.sh … vm_verify_striping.sh（其余 vm_* 同前几轮）
 ```
@@ -1660,7 +1691,7 @@ $ git status --short            # 跟踪文件已全部入库，仅剩未跟踪�
 | `README.md` | `--root /d1,/d2` 行写明“落盘位置是 key 哈希 mod 根数现场重算，列表与对象都不记录盘序号”的口径 | 机内多根落盘实测在 §3.11（回显 `同机双根的放置由 key 哈希决定`）；条带侧根数不对必须拒的实测在 §3.6.2（`refusing to remap` 原文）；§4.4 doccheck 结论 OK |
 | `USAGE.md` | `--data-root` 的适用命令加 `du` 与默认取值说明；§12.3/§14.1/部署案例表同步多根布局口径 | du 的默认数据根取值见 §3.6.1，三种缺数据源硬拒绝见 §3.6.2，丢对象出声见 §3.6.3；§4.4 doccheck 参数对账“非外部工具/非负空间 0 项” |
 | `docs.html` | 同步上述表格与措辞 | §4.4 |
-| `docs.html` + `USAGE.md`（§6-12；表(a) 已随 §6-3 同步为新行为） | 新增两张运维语义表：（a）fork/透镜/别名/key-ro 四种写意图的失败时点（结构写 / 内容写截断类 open 即 `EROFS` / 内容写追加类当前版本首次 `write(2)` 即 `EROFS`、shell `>>` rc 可靠；唯一延迟暴露形态是经服务端挂载被 `set-ro` 原地切换；本机 `--home` 无服务端凭据门，set-ro 不影响已建挂载），含逐 `open` 探针 errno 回显（`docs.html` 放 §12、`USAGE.md` 放 §3.0）；（b）“对象丢失/数据源不对时各命令会不会出声” 9 行矩阵（`docs.html` 放 §11.5、`USAGE.md` 放 §12.6），未出声的挂载读形态标为已知缺陷 | 逐形态失败时点实测在 §3.4.4/§3.4.4b/§3.9（含本机 `--home` set-ro 探针）；丢对象出声矩阵逐行取自 §3.6（du 整对象缺失→warning、无数据源/布局不符→拒）与 §5-5/§5-6（挂载读 size=0 无 EIO）；§6-12 行、本轮 doccheck 退出码 0 |
+| `docs.html` + `USAGE.md`（§6-12；表(a) 已随 §6-3 同步为新行为） | 新增两张运维语义表：（a）fork/透镜/别名/key-ro 四种写意图的失败时点（结构写 / 内容写截断类 open 即 `EROFS` / 内容写追加类当前版本首次 `write(2)` 即 `EROFS`、shell `>>` rc 可靠；唯一延迟暴露形态是经服务端挂载被 `set-ro` 原地切换；本机 `--home` 无服务端凭据门，set-ro 不影响已建挂载），含逐 `open` 探针 errno 回显（`docs.html` 放 §12、`USAGE.md` 放 §3.0）；（b）“对象丢失/数据源不对时各命令会不会出声” 10 行矩阵（`docs.html` 放 §11.5、`USAGE.md` 放 §12.6；含按 §3.6.6 取证增补的“条带中间分块丢失→挂载读截短到缺口偏移”行），未出声的挂载读形态标为已知缺陷 | 逐形态失败时点实测在 §3.4.4/§3.4.4b/§3.9（含本机 `--home` set-ro 探针）；丢对象出声矩阵逐行取自 §3.6（du 整对象缺失→warning、无数据源/布局不符→拒、条带中间块丢挂载读→§3.6.6）与 §5-5/§5-6（挂载读 size=0/截短 无 EIO）；§6-12 行、本轮 doccheck 退出码 0 |
 
 | `src/backend/sharded.rs` | 本轮复核新增：`layout_server_count`（供 du 前置门控只约束有 `s<N>` 前缀的键）与 `chunk0_elsewhere`（用 `{uuid}#0` 归属确定性检出反序列列表）+ `order_verified` 零成本门控；新增 2 个单测 | §3.6.2（倒置列表由静默 `0B` 改为报错的实机回显）、§4.2（`a_reversed_server_list_is_reported_not_read_as_empty`、`an_empty_striped_object_still_measures_zero`） |
 | `src/fs_impl.rs` | 本轮修复 §5-3：新增 `posix_lock_fh_owner`/`posix_lock_owner_fds` 两表与 `note_posix_lock`/`drop_posix_lock_on_release`，`setlk` 授予时记账、`release` 末次锁定时全区间 Unlock 精确回收 POSIX 锁（不依赖内核不交的 `lock_owner`） | §3.2（根因+修复说明与实机 `GRANTED`/`2.74s` 唤醒回显）、§5-3行、§4.2（`tests/locks.rs` 11 passed） |
