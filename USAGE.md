@@ -223,6 +223,18 @@ $Y --home $BASE init --view alice --manifest ./seed.txt
 
 > “能不能写内容”是硬契约:派生挂载在客户端就是只读挂载;fork 的结构操作放行,`write`/`truncate` 由客户端回 `EROFS`。服务端对派生名的写意图另有 `EPERM` 门禁,绕过客户端也写不进去。**派生/别名/fork 都不是安全边界**——能挂基名的人仍看到全树;硬隔离用独立视图 + token/API key(§6)。
 
+**写不进去时,在哪一步报错**(运维排错速查;逐 `open` 探针回显与成因见 docs.html §12):
+
+| 形态 | 结构写<br>mkdir/rename/unlink | 内容写·截断类<br>`O_TRUNC`/`truncate` | 内容写·追加/普通写<br>`O_WRONLY`/`O_APPEND` 的 `write()` | shell `>>` 追加观感 |
+| --- | --- | --- | --- | --- |
+| **基视图**(可写 key) | 放行 | 放行 | 放行 | rc=0,确实落盘 |
+| **纯别名** A→R(底层可写) | 放行(同一棵树) | 放行 | 放行 | rc=0,写 A 即写 R |
+| **派生透镜** D over B | `EROFS`(整树只读) | `EROFS` | `EROFS` | 写不过去,`>>` 也报错 |
+| **fork**(结构可写/内容只读) | 放行 | `EROFS` **在 open 即拒**(`>` rc=1) | `write()` 不报错,**`EROFS` 拖到 fsync/close** | **rc=0 假成功**,字节未落盘 |
+| **只读 key**(set-ro 挂载) | 结构写同样被拒 | `EROFS` | 同 fork:失败在落盘点可见 | **rc=0 假成功**;ro 生效/恢复各有 ≤1s 复检窗口 |
+
+> ⚠ 对**内容只读**的 fork 与只读 key,**不能拿 shell `>>` 的 rc 判断是否写成功**——追加走的 `write()` 落在页缓存,`EROFS` 直到 fsync/close 刷脏页才暴露,bash 把它吞掉后返回 rc=0。要可靠检测就显式 `fsync` 后再查,或逐 `open` 探针。把失败提前到首次 `write` 是待议的行为改动,尚未实现。
+
 #### 2.1 三个常见追问(别把“滤镜”当成“复制”)
 
 | 追问 | 答案 | 从哪里能看出来 |
@@ -1861,6 +1873,22 @@ HA 拓扑滚动升级(写不中断,切换瞬间除外):
   ③ **比值 > 1 只有两个成因**：该删的没删（去视图里确认文件真 unlink 了），或 import/fork 的共享字节还被别的视图持着（`grovefs view --db-path D list` 看还有谁在引用，归零才物理回收，§5.3）。
 - 最常见的第三种其实是事故:**绕过挂载直接 `rm meta/<view>.db` 不会触发后端删除**,对象会永远留在 `blocks/` 里(引用账本只会高估不会误删,所以它只占空间、不丢数据);回收账本可用 `grovefs refs --db-path D rebuild` 归位。归位后再跑一次 `grovefs gc --db-path D`,这些页会从 `ledger-held` 变成孤儿,`--apply` 才会回收;不重建则 `gc` 一直保守地不删。
 - SQLite 视图库的回收在引擎内部处理(锁表事务回收、hardlink refcount GC);PG 模式下交给 VACUUM。
+
+**对象丢失 / 数据源不对时,各命令会不会出声**(运维速查;完整回显与成因见 docs.html §11.5):
+
+| 情形 | 命令 / 路径 | 会出声吗 |
+| --- | --- | --- |
+| 整个对象不在选中的根里 | `du --data-root`/`--data` | **会**：stderr `warning: N of M object(s) are not in the data source and count as 0 bytes` |
+| 数据源根本没给 | `du` | **会（拒统计）**：`no data source to measure: pass --data … or --data-root …` |
+| 地址列表台数/顺序与 `s<N>` 布局不符 | `du --data` | **会（拒统计）**：探测前按方向拒绝，绝不把布局错配说成对象丢失 |
+| 条带对象**中间分块**真丢 | `du` | **不会（已知缺陷）**：静默短报（如 `64.0M→16.0M`）且无 warning |
+| 条带对象**首分块**真丢 | `du` | **不会（已知缺陷）**：`len` 返 `Ok(0)`，给 `55B` 这种错位极小值，不拒也不吭 |
+| 读一个对象已丢的文件（重挂后/fd 缓存已清） | 挂载内 `read`/`stat` | **不会（已知缺陷）**：`stat size=0`、整读 rc=0 空内容，不报 `EIO` |
+| 对象被外部 `mv`/`rm`，但挂载已建立 | 挂载内旧 fd | **不会（且不可观察）**：data-server 按 key 缓存旧 fd，需清缓存/重启后才可测 |
+| `view rm --base` 时数据根打不开 | `view rm --base` | **会**：`error: cannot open data root …` + 离线 `gc` 回收提示（分开陈述“树已删”与“字节未收”） |
+| 条带对象全在远端、本机无 `blocks/` | `gc --db-path D`（审计） | **会（不误报为空）**：`objects: 0 local block(s) — N striped layout(s) … use \`grovefs du\` for their bytes` |
+
+> 一句话选型：要“发现字节丢了”用 `du`（整对象不在数据源、列表不符都会出声；但条带内部分块丢失与挂载读丢失仍会静默——属未实现项）；要“回收无人引用的页”用离线 `gc`；要“把账本归位”用 `refs rebuild`。挂载读本身不担当完整性校验。
 
 ### 12.7 变更后的回归验证
 
