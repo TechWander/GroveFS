@@ -313,6 +313,9 @@ impl Registry {
         let mut out = String::new();
         out.push_str("GroveFS per-stage latency telemetry  (durations in \u{b5}s)\n");
         out.push_str("  diagnostic tooling only \u{2014} not a throughput/scalability claim\n");
+        out.push_str("  bytes= is tallied only on the backend-boundary stages (read/write.backend_total, io.*);\n");
+        out.push_str("    a 0 there is expected on op_total lines and means \"not counted at this stage\", not \"no data\"\n");
+        out.push_str("  a latency of 0 is sub-\u{b5}s (below the histogram's \u{b5}s resolution), not a missing sample\n");
         out.push_str(&format!(
             "  snapshot @ {}\n\n",
             chrono::Local::now().format("%Y-%m-%d %H:%M:%S")

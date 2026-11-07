@@ -210,28 +210,39 @@
 
   ```
   ##### [构建产物] md5 对账 #####
-  d2a3b2620245aa228bf3dee45752a716  /data/grovefs/grovefs/target/release/grovefs
+  c8d68580aa5fb7e5ed531bb79bed2ab6  /data/grovefs/grovefs/target/release/grovefs
   ```
 
   ```
   $ md5sum target/release/grovefs
-  d2a3b2620245aa228bf3dee45752a716  target/release/grovefs
+  c8d68580aa5fb7e5ed531bb79bed2ab6  target/release/grovefs
   $ for h in gfs1 gfs2 gfs-client; do ssh -n $h "md5sum /usr/local/bin/grovefs"; done
-  d2a3b2620245aa228bf3dee45752a716  /usr/local/bin/grovefs
-  d2a3b2620245aa228bf3dee45752a716  /usr/local/bin/grovefs
-  d2a3b2620245aa228bf3dee45752a716  /usr/local/bin/grovefs
+  c8d68580aa5fb7e5ed531bb79bed2ab6  /usr/local/bin/grovefs
+  c8d68580aa5fb7e5ed531bb79bed2ab6  /usr/local/bin/grovefs
+  c8d68580aa5fb7e5ed531bb79bed2ab6  /usr/local/bin/grovefs
   ```
 
   运行体级核对（`sudo md5sum /proc/<MainPID>/exe`，四个单元逐个重启后）：
 
   ```
-  gfs1 grovefs-data-server   -> active pid=23281 exe=d2a3b2620245aa228bf3dee45752a716
-  gfs2 grovefs-data-server   -> active pid=17542 exe=d2a3b2620245aa228bf3dee45752a716
-  gfs-client grovefs-meta-server  -> active pid=44448 exe=d2a3b2620245aa228bf3dee45752a716
-  gfs-client grovefs-mount-alice  -> active pid=44531 exe=d2a3b2620245aa228bf3dee45752a716
+  gfs1 grovefs-data-server   -> active pid=23644 exe=c8d68580aa5fb7e5ed531bb79bed2ab6
+  gfs2 grovefs-data-server   -> active pid=17896 exe=c8d68580aa5fb7e5ed531bb79bed2ab6
+  gfs-client grovefs-meta-server  -> active pid=45820 exe=c8d68580aa5fb7e5ed531bb79bed2ab6
+  gfs-client grovefs-mount-alice  -> active pid=45903 exe=c8d68580aa5fb7e5ed531bb79bed2ab6
   ```
 
-- **结论**：通过。三台文件与运行体均为 `d2a3b262…`（在上一轮 `2f373afb` 的 du 行为 + POSIX 锁 close-release 修复、`8d5bd979` 的显示/使用方式修复（致命错误改走 Display、连不上服务点名地址、`view list` 去自相矛盾、`view rm --base` 补上下文、别名/建视图提示填实路径）之上，叠加本轮 §5-10 悬空别名校验：`view alias` 在定义时拒绝指向不存在物理视图的目标）。四个单元已逐个 `systemctl restart` 到该产物，排除了“文件已换新但进程还跑旧二进制”的中间态。
+  本轮 §6-8 在条带 meta 存储上的 `gc` 只读审计回显（正是“objects=0 但字节都在远端”的形态）：
+
+  ```
+  $ sudo grovefs gc --db-path /home/hanjun/meta      # 运行 c8d68580 的 gfs-client
+    views: 1 tree(s), 7 referenced key(s), 7 striped layout(s)
+    objects: 0 local block(s) — 7 striped layout(s) place their chunks on data-servers, which gc does not audit (use `grovefs du` for their bytes)
+  dry run: nothing deleted. No unreferenced objects were found.
+  $ sudo grovefs du --view alice --total             # 同一存储的字节仍由 du 给出，未回归
+    64.0M   /
+  ```
+
+- **结论**：通过。三台文件与运行体均为 `c8d68580…`（血缘：`2f373afb` 的 du 行为 + POSIX 锁 close-release 修复 → `8d5bd979` 的显示/使用方式修复（致命错误改走 Display、连不上服务点名地址、`view list` 去自相矛盾、`view rm --base` 补上下文、别名/建视图提示填实路径）→ `d2a3b262` 的 §5-10 悬空别名校验 → 本轮 `c8d68580` 仅追加 §6-8（gc 区分“本地无块 vs 条带在远端”与 dry-run 三态）与 §6-9（`--stats` 表头说明 `bytes=` 列口径与 sub-µs 零值）。`c8d68580` 与 `d2a3b262` 仅在 gc/stats 的显示字符串上不同，运行时行为、协议与既有实机证据（§3.2 POSIX 锁、§3.4.3 别名、§3.6 du 定点）一致；§6-8 已在实机条带存储复验（上方 `gc` 回显），§6-9 已在本机挂载 `--stats` 复验表头。四个单元已逐个 `systemctl restart` 到该产物，排除了“文件已换新但进程还跑旧二进制”的中间态。
 - **一个需要如实说明的取证细节**：首次落地时的 `ss -ltn | grep -c :50100` 在两台数据服务器上返回 `0`（`/tmp/vm_phase3.log`：`gfs1 data-server=active 端口=0 env权限=600 root:root`），当时单元已 `active` 但轮询窗口不够长；重启新二进制后的核对为 `端口=1`（`/tmp/redeploy_newbin.log`），§2.1/§7.5 的 audit 也稳定报 `监听: 0.0.0.0:50100`。本报告的监听断言引自后两轮，不拿 `端口=0` 那一轮当作通过证据。
 
 ---
@@ -1409,10 +1420,10 @@
 3. ★**fork/只读 key 的 `EROFS` 在 shell 里假成功**。`>>` 追加 `rc=0` 而字节未落盘（§3.4.4、§3.9），用户只会看到“写了但没变”。建议：把内容写门从 `fsync` 提前到首次 `write` 就返回 `EROFS`（至少对 `O_WRONLY`/`O_APPEND` 的开写路径做前置检查）；若保留现状，`USAGE.md`/`docs.html` 的 fork 语义行必须明写：“追加写的失败只在 fsync/close 可见，shell 重定向会报 0” 并给出验证命令（`sync; < cmd; echo $?` 或 `python3 -c` 逐 open 探针）。
 4. ★**`view rm --base` 的 `Permission denied` 裸文案——本轮已实现**。原建议：按同文件内其他守卫的写法包上上下文。**已采用的改法**：`src/main.rs` 的回收阶段 `backend::open_local(&droot)` 失败时 `map_err` 补上“cannot open data root <路径> to free view '<name>' objects … 元数据树 meta/'<name>'.db 已删除 … 可用 `grovefs gc --db-path … --data-root …` 离线回收”的上下文，把“树已删、字节未收”分开陈述并给出下一条可执行命令。连同 §5-12 的 Display 改动，实机不再报裸 `Permission denied`（见 §2.3）。
 5. ★**提示里的占位符未替换 + 悬空目标校验——均已实现**（§6-5 文案 + §5-10 行为）。原建议：`note: no local <db-path>/meta/pv.db yet` 与 meta-server 错误里的 `--db-path <db-path>`/`--view <name>` 应填实值；`view alias` 应在定义时检查目标物理树存在。**已采用的改法**：（文案）`src/mcp.rs` 的 `base_tree_missing_note` 用 `self.db(view).display()`+`self.base.display()` 填实树路径与存储根；`src/remote/meta/server_ext.rs` 的“view does not exist”create-hint 用 `rt.base.display()`+具体 `view` 填实（file/PG 两分支），配套收紧 `tests/meta_roundtrip.rs` 断言到具体视图名。（行为）`src/mcp.rs` 的 `alias_view` 在排除别名/派生/分叉目标后新增 `has_physical(real)` 硬拒绝悬空目标，错误文案复用上述已填实的 note。实机复验见 §2.3。
-6. ★**拒绝文案的“下一步命令”完备性巡检——du 部分本轮已实现**。本轮已对上文案的命令均为好例（`--skip-existing`、`--replace`、`--retire`、`--force`、`umount -m`）。**已采用的改法**：`src/du.rs` 的 `path not found: {}` 现回显规范化后的视图相对路径（`normalize_path` 会自动补前导 `/`）并提示 `--path takes a view-relative path such as /<top-dir>/...`；`gather_via_meta` 连不上 meta-server 时点名地址。其余（`apikey set-ro` 生效时点、`gc` 的 `objects: 0 (0 B)` 行）仍未改。
-7. **单位与计数口径**。`import` 同时给 `blocks/ 路径数: 8` 与 `distinct inode 数: 4`、`holders 台账: 8,8`，而磁盘字节为 8388620；建议统一为三行带单位的陈述：`objects(path names) 8`、`distinct blobs 4`、`bytes on disk 8388620 (8.0 MiB)`，并把 `holders 8,8` 这类裸 SQL 元组改为 `ledger: 8 rows, 16 holders`。`du` 侧 `8.0M` 与 `-b` 字节值、`55B` 这种尾差值建议统一后缀（与 GNU du 一致用 `K/M/G` 十进制或明确标注 `MiB`）。
-8. **`gc` 对在用存储的输出应区分“无字节”与“无垃圾”**。现为 `objects: 0 (0 B)` + `dry run: nothing deleted. Re-run with --apply … to reclaim 0 object(s), 0 B.`，而实际是 9 个条带对象全在远端。建议：当 `striped layout(s) > 0` 且 `objects == 0` 时改打 `objects: 0 visible here (9 striped object(s) live on data-servers; gc only audits local blocks/)`，并将 `--apply` 提示置灰而不是邀请重跑。位置：`src/main.rs:3543` 的汇总行。
-9. **`--stats` 表的字节口径**。`read.op_total bytes=0` 与 `read.backend_total bytes=25165824` 并存易误读为“没读到数据”。建议：`op_total` 行汇总其子阶段字节，或在表头加一句 `bytes: counted at the stage where the payload crosses the backend boundary`；`p50=0` 这类静默 0 建议打 `0 (sub-µs)`。
+6. ★**拒绝文案的“下一步命令”完备性巡检——du 部分本轮已实现**。本轮已对上文案的命令均为好例（`--skip-existing`、`--replace`、`--retire`、`--force`、`umount -m`）。**已采用的改法**：`src/du.rs` 的 `path not found: {}` 现回显规范化后的视图相对路径（`normalize_path` 会自动补前导 `/`）并提示 `--path takes a view-relative path such as /<top-dir>/...`；`gather_via_meta` 连不上 meta-server 时点名地址。其余中，`gc` 的 `objects: 0 (0 B)` 行已于本轮 §6-8 改掉（见下条）；`apikey set-ro` 生效时点（§5-7）仍未改。
+7. **单位与计数口径——本轮复核定性：属取证脚本产物，非产品输出，不动**。`import` 同时给 `blocks/ 路径数: 8` 与 `distinct inode 数: 4`、`holders 台账: 8,8` 这类裸 SQL 元组，经定位均来自 `.build-bin/` 取证/编排脚本的 `psql`/`find` 探针输出，不是 `grovefs` 产品命令的打印。产品 `grovefs import` 的汇总行本就统一且人话：`imported into view 'X' under /: N dir(s), M object(s) (H hardlinked zero-copy, C copied), S skipped, F failed`；`du` 默认后缀已是 `K/M/G`。故本项无需产品侧改动。
+8. ★**`gc` 对在用存储的输出区分“无字节”与“无垃圾”——本轮已实现**（release `c8d68580`，实机复验见 §2.3）。原建议：`striped layout(s) > 0` 且 `objects == 0` 时不应让裸 `0` 读成“无字节”，且不应邀请对 0 字节重跑 `--apply`。**已采用的改法**（`src/main.rs` 的 `print_gc_report`）：当 `objects == 0 && striped_layouts > 0` 时，objects 行改打 `objects: 0 local block(s) — N striped layout(s) place their chunks on data-servers, which gc does not audit (use \`grovefs du\` for their bytes)`；dry-run 汇总保留稳定前缀 `dry run: nothing deleted.`，再按三态给尾句——有可回收项才邀请 `--apply`，`orphans` 为空打 `No unreferenced objects were found.`，全在宽限期内打 `N orphan(s) are all within the <grace> grace; re-run after it elapses.`。实机条带 meta 存储 `gc` 回显见 §2.3，`test_gc.sh` 41/0 仍绿（clean-store 用例断言的 `dry run: nothing deleted` 前缀未破）。
+9. ★**`--stats` 表的字节口径——本轮已实现**（表头说明方案，不改定宽列；release `c8d68580`，本机挂载复验）。原建议：`read.op_total bytes=0` 与 `read.backend_total bytes=…` 并存易误读为“没读到数据”；`p50=0` 这类静默 0 易误读为漏采样。**已采用的改法**（`src/stats.rs` 的 `report_text` 表头，未动表格列宽以免破坏对齐与 CSV）：新增两行——`bytes= is tallied only on the backend-boundary stages (read/write.backend_total, io.*); a 0 there is expected on op_total lines and means "not counted at this stage", not "no data"`、`a latency of 0 is sub-µs (below the histogram's µs resolution), not a missing sample`。同步 `docs.html` §8 的真实回显样本与 `USAGE.md` §8.1 口径说明。`test_stats.sh` E2E 通过（表头 `per-stage latency telemetry` 断言未受影响）。
 10. **`ls -d /data/gfs*/grove` 的展示歧义**。两台机器上都存在 `/data/gfs1/grove` 与 `/data/gfs2/grove` 两个同名目录（分块落点看似“在 gfs1 上”实际在 gfs2 的盘），本轮 E1/D2 回显已造成多次误读。建议：数据根名称从主机名推导（`/data/<host>/grove`）或在 `data-server --root` 的启动日志里逐根打一行 `root <path> on <hostname>`；`USAGE.md` 的部署示例需明写“每台两个根目录同名属预期”并推荐异名方案。
 11. **静默 0 值的通用约束**。建议约定：任何统计命令的 0 值必须区分三种情况——真零、无法测（数据源不对）、部分丢失，分别给 `0`、`0 (not measurable here: …)`、`<N> (excluding M lost object(s))`。本轮命中的四处：`du --total: 55B`、`stat size=0`、`gc objects: 0 (0 B)`、`--stats bytes=0`。
 12. **`docs.html`/`USAGE.md` 表格措辞**。建议添加两张表：（a）fork/透镜/别名/key-ro 四种“写意图”的失败时点对比（open/write/fsync/close 哪一步报错），把 §3.4.4/§3.9 的逐 open 回显作为表内示例代码；（b）“对象丢失时各命令的声音”矩阵（du / 挂载读 / `view rm --base` / `gc`），让运维人员能直接查到何时会出声、何时不会。
@@ -1507,7 +1518,7 @@ bash .build-bin/vm_audit.sh        # 重启后拿一次全量复核
      存活挂载仍可用: 可读 ; 写入 after-kill
 
   ##### [构建产物] md5 对账（最终交付态，与 §2.3 一致） #####
-  d2a3b2620245aa228bf3dee45752a716  /data/grovefs/grovefs/target/release/grovefs
+  c8d68580aa5fb7e5ed531bb79bed2ab6  /data/grovefs/grovefs/target/release/grovefs
   ```
 
 - **结论**：通过。崩溃拉起为第二次独立复现（`NRestarts` 1→2，监听在 14×0.25 s = 3.5 s 内恢复，与 `RestartSec=3` 相符；§2.2 贴的是首次 0→1）。本轮 audit 会在 gfs-client 上 SIGKILL 一次 meta-server 主进程（由 systemd 自动重起，不留现场），因此它属于只读复核而非零开销动作；若需完全不动运行体，可只看 §3.17 的清场回显。
@@ -1528,36 +1539,30 @@ bash .build-bin/vm_audit.sh        # 重启后拿一次全量复核
 
 ```
 $ git log --oneline -4
+74c765b fix(mcp): refuse aliases whose target has no physical view tree (§5-10)
 1d624dd fix(cli,mcp,du,meta): route fatal errors through Display and make messages actionable
 63f8c8f test(du): add du integration tests to version control
 08a5c4d fix(du,sharded,fs): correct du error handling, striped order detection, POSIX lock release
-9e9607f docs: 清除历史叙述并立「只写当前版本」口径，配 doccheck 收口脚本
 
-$ git show --stat 1d624dd       # 显示/使用方式修复轮（11 个已跟踪文件 + 本报告，已入库）
- .build-bin/test_layout.sh     |    4 +-
- README.md                     |   32 +-
- TEST_REPORT.md                | 1635 +++++++++++++++++++++++++++++++++++++++++
- USAGE.md                      |   46 +-
- docs.html                     |   32 +-
- src/du.rs                     |   15 +-
- src/main.rs                   |   31 +-
- src/mcp.rs                    |   39 +-
- src/remote/client.rs          |    9 +-
- src/remote/meta.rs            |   10 +-
- src/remote/meta/server_ext.rs |    9 +-
- tests/meta_roundtrip.rs       |    4 +-
- 12 files changed, 1787 insertions(+), 79 deletions(-)
+$ git show --stat 74c765b       # §5-10 悬空别名校验轮（已入库）
+ .build-bin/test_control.sh |  21 +++++--
+ TEST_REPORT.md             | 149 ++++++++++++++++++++-------------------------
+ src/mcp.rs                 |  63 +++++++++++++++++++
+ 3 files changed, 147 insertions(+), 86 deletions(-)
 
-$ git diff --stat               # §5-10 悬空别名校验轮（产品+回归+本报告，待确认入库）
- .build-bin/test_control.sh | 21 +++++++++++++++++----
- TEST_REPORT.md             | 74 ++++++++++++++++++++++------------------------
- src/mcp.rs                 | 63 ++++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 116 insertions(+), 42 deletions(-)
+$ git diff --stat               # 本轮 §6-8/§6-9 gc/stats 显示改动（待确认入库；本报告除外）
+ USAGE.md     |  2 +-
+ docs.html    |  3 +++
+ src/main.rs  | 46 +++++++++++++++++++++++++++++++++++----------
+ src/stats.rs |  3 +++
+ 4 files changed, 43 insertions(+), 11 deletions(-)
 
-$ git status --short            # 工作区：§5-10 两个产品/回归文件为 M + 未跟踪的取证/编排脚本
- M .build-bin/test_control.sh
+$ git status --short            # 工作区：本轮 4 个产品/文档文件 + 本报告为 M + 未跟踪的取证/编排脚本
  M TEST_REPORT.md
- M src/mcp.rs
+ M USAGE.md
+ M docs.html
+ M src/main.rs
+ M src/stats.rs
 ?? .build-bin/gfs_provision.sh
 ?? .build-bin/probe_posix_lock.py
 ?? .build-bin/vm_audit.sh
@@ -1574,7 +1579,6 @@ $ git status --short            # 工作区：§5-10 两个产品/回归文件�
 ?? .build-bin/vm_redeploy.sh
 ?? .build-bin/vm_repocheck.sh
 ?? .build-bin/vm_verify_striping.sh
-?? TEST_REPORT.md
 ```
 
 改动逐项对应实测证据（无一项是无据声称）：
@@ -1610,11 +1614,20 @@ $ git status --short            # 工作区：§5-10 两个产品/回归文件�
 
 上述显示/使用方式修复已提交为 `1d624dd`（11 个已跟踪文件 + 本报告，`+1787/-79`）。
 
-本轮 §5-10 悬空别名校验（行为级校验改动，经作者批准后实现；已入运行体 `d2a3b262` 并在实机复验，见 §3.4.3 X2）：
+§5-10 悬空别名校验（行为级校验改动，经作者批准后实现）已提交为 `74c765b`（`src/mcp.rs` 校验+单测、`.build-bin/test_control.sh` PG 回归、本报告）：
 
 | 文件 | 改动内容 | 证据 |
 |---|---|---|
 | `src/mcp.rs` | §5-10：`alias_view` 在排除别名/派生/分叉三类目标后，用 `store.has_physical(real)` 校验别名目标指向的物理视图树确实存在；不存在则在**定义时**硬拒，并用 `base_tree_missing_note`（file 侧）或自造 create/import 文案（PG 侧）填实提示。一处改动同时覆盖 CLI（`main.rs` 经同一 `alias_view`）与 MCP 两入口、file 与 PG 两 store。新增单测 `alias_refuses_a_dangling_physical_target` | §3.4.3 X2（悬空别名 `rc=1` 定义被拒、控制面未写入）、§4.2（`cargo test` 全绿含该单测）、§4.3 `run_all.sh` GREEN |
 | `.build-bin/test_control.sh` | §5-10 配套：PG 别名目标改用独立物理视图 `AREAL`（避免治理 `$BASE` 致 §3 真实名挂载被拒），并新增悬空别名定义被拒的回归用例（断言报错含 `no physical view tree`） | §4.3（`run_all.sh` RESULT: GREEN，control 套件 16/0） |
 
-本次未做的改动（如实列出）：§5 遗留项中除上述当场修复外均未改代码；§5-3（POSIX 锁 close 释放泄漏）本轮已定位确定性根因并实现修复（`setlk` 记账 + `release` 精确回收，不改 sid 续租模型），配套集成测与实机复验均通过（见 §3.2、§6-2a）；§5-5 中“数据源真丢字节”的内部空洞/首块真丢形态仍需 §6-2 方案。
+本轮 §6-8/§6-9 gc/stats 显示改动（不改运行时逻辑或协议，已入运行体 `c8d68580` 并复验，待确认入库）：
+
+| 文件 | 改动内容 | 证据 |
+|---|---|---|
+| `src/main.rs` | §6-8：`print_gc_report` 当 `objects == 0 && striped_layouts > 0` 时改打 `objects: 0 local block(s) — N striped layout(s) … use \`grovefs du\` for their bytes`；dry-run 尾句拆为三态（有可回收项才邀请 `--apply`、无孤儿打 `No unreferenced objects were found.`、全在宽限期打提示），保留 `dry run: nothing deleted.` 稳定前缀 | §2.3（条带 meta 存储 `gc` 实机回显 + `du` 64.0M 未回归）、`.build-bin/test_gc.sh` 41/0（§4.3 run_all gc PASS） |
+| `src/stats.rs` | §6-9：`report_text` 表头新增两行，说明 `bytes=` 列仅在后端边界阶段累计（`op_total` 行为 0 属预期、非“没读到数据”）与 sub-µs 零值含义；不改表格列宽与 CSV | §4.3（run_all stats PASS）、本机 `--stats` 挂载表头回显、`.build-bin/test_stats.sh` E2E PASS |
+| `docs.html` | §6-9 同步：§8 的 `--stats` 真实回显样本补齐三行表头（与当前产物输出一致） | §4.4 doccheck OK |
+| `USAGE.md` | §6-9 同步：§8.1 加一句 `bytes=` 列口径与 sub-µs 零值说明 | §4.4 doccheck OK |
+
+本次未做的改动（如实列出）：§5 遗留项中除上述当场修复外均未改代码；§5-3（POSIX 锁 close 释放泄漏）已定位确定性根因并实现修复（`setlk` 记账 + `release` 精确回收，不改 sid 续租模型），配套集成测与实机复验均通过（见 §3.2、§6-2a）；§5-5 中“数据源真丢字节”的内部空洞/首块真丢形态仍需 §6-2 方案（行为+RPC 改动，待批）。§6-7 经定位为取证脚本产物，非产品输出，未改。

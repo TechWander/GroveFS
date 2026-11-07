@@ -3512,11 +3512,21 @@ fn print_gc_report(rep: &grovefs::gc::Report, rec: Option<&grovefs::gc::Reclaime
         rep.refs,
         rep.striped_layouts
     );
-    println!(
-        "  objects: {} ({})",
-        rep.objects,
-        fmt_bytes(rep.objects_bytes)
-    );
+    if rep.objects == 0 && rep.striped_layouts > 0 {
+        // A "0" here is not "empty store": the trees reference striped objects
+        // whose chunks live on data-servers, and gc only audits local block
+        // roots. Say so instead of letting the bare 0 read as "no bytes".
+        println!(
+            "  objects: 0 local block(s) — {} striped layout(s) place their chunks on data-servers, which gc does not audit (use `grovefs du` for their bytes)",
+            rep.striped_layouts
+        );
+    } else {
+        println!(
+            "  objects: {} ({})",
+            rep.objects,
+            fmt_bytes(rep.objects_bytes)
+        );
+    }
     println!(
         "  orphans: {} ({}; {} reclaimable, {} within grace <{})",
         rep.orphans.len(),
@@ -3567,11 +3577,27 @@ fn print_gc_report(rep: &grovefs::gc::Report, rec: Option<&grovefs::gc::Reclaime
         }
     }
     match rec {
-        None => println!(
-            "dry run: nothing deleted. Re-run with --apply (offline) to reclaim {} object(s), {}.",
-            rep.reclaimable(),
-            fmt_bytes(rep.reclaimable_bytes())
-        ),
+        None => {
+            // Keep "nothing deleted" as the stable dry-run prefix, then give
+            // the reason: only invite `--apply` when there is something to
+            // reclaim, rather than suggesting a pointless re-run on 0 bytes.
+            let tail = if rep.reclaimable() > 0 {
+                format!(
+                    " Re-run with --apply (offline) to reclaim {} object(s), {}.",
+                    rep.reclaimable(),
+                    fmt_bytes(rep.reclaimable_bytes())
+                )
+            } else if rep.orphans.is_empty() {
+                " No unreferenced objects were found.".to_string()
+            } else {
+                format!(
+                    " {} orphan(s) are all within the {} grace; re-run after it elapses.",
+                    rep.orphans.len(),
+                    fmt_age(rep.grace.as_secs())
+                )
+            };
+            println!("dry run: nothing deleted.{}", tail);
+        }
         Some(r) => {
             println!(
                 "reclaimed: {} object(s), {} freed; {} within grace kept; {} failed",

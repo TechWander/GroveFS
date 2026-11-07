@@ -2873,6 +2873,9 @@ bash: ... Read-only file system</code></pre>
     <div class="note"><b>真实回显</b>(本地 SQLite 挂载加 <code>--stats</code>,做了若干读写 / mkdir / readdir 后 <code>cat &lt;mnt&gt;/.grove-stats</code> 的 <code>[op]</code> 节选,单位 µs;<code>[data-io]</code>/<code>[meta]</code>/<code>[counters]</code> 同形,完整清单见 <code>USAGE.md</code> §8.1):
       <pre>GroveFS per-stage latency telemetry  (durations in µs)
   diagnostic tooling only — not a throughput/scalability claim
+  bytes= is tallied only on the backend-boundary stages (read/write.backend_total, io.*);
+    a 0 there is expected on op_total lines and means "not counted at this stage", not "no data"
+  a latency of 0 is sub-µs (below the histogram's µs resolution), not a missing sample
   snapshot @ 2026-10-25 01:48:05
 
 [op]
