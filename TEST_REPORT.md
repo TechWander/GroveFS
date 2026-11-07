@@ -1426,7 +1426,7 @@
 9. ★**`--stats` 表的字节口径——本轮已实现**（表头说明方案，不改定宽列；release `c8d68580`，本机挂载复验）。原建议：`read.op_total bytes=0` 与 `read.backend_total bytes=…` 并存易误读为“没读到数据”；`p50=0` 这类静默 0 易误读为漏采样。**已采用的改法**（`src/stats.rs` 的 `report_text` 表头，未动表格列宽以免破坏对齐与 CSV）：新增两行——`bytes= is tallied only on the backend-boundary stages (read/write.backend_total, io.*); a 0 there is expected on op_total lines and means "not counted at this stage", not "no data"`、`a latency of 0 is sub-µs (below the histogram's µs resolution), not a missing sample`。同步 `docs.html` §8 的真实回显样本与 `USAGE.md` §8.1 口径说明。`test_stats.sh` E2E 通过（表头 `per-stage latency telemetry` 断言未受影响）。
 10. **`ls -d /data/gfs*/grove` 的展示歧义**。两台机器上都存在 `/data/gfs1/grove` 与 `/data/gfs2/grove` 两个同名目录（分块落点看似“在 gfs1 上”实际在 gfs2 的盘），本轮 E1/D2 回显已造成多次误读。建议：数据根名称从主机名推导（`/data/<host>/grove`）或在 `data-server --root` 的启动日志里逐根打一行 `root <path> on <hostname>`；`USAGE.md` 的部署示例需明写“每台两个根目录同名属预期”并推荐异名方案。
 11. **静默 0 值的通用约束**。建议约定：任何统计命令的 0 值必须区分三种情况——真零、无法测（数据源不对）、部分丢失，分别给 `0`、`0 (not measurable here: …)`、`<N> (excluding M lost object(s))`。本轮命中的四处：`du --total: 55B`、`stat size=0`、`gc objects: 0 (0 B)`、`--stats bytes=0`。
-12. **`docs.html`/`USAGE.md` 表格措辞**。建议添加两张表：（a）fork/透镜/别名/key-ro 四种“写意图”的失败时点对比（open/write/fsync/close 哪一步报错），把 §3.4.4/§3.9 的逐 open 回显作为表内示例代码；（b）“对象丢失时各命令的声音”矩阵（du / 挂载读 / `view rm --base` / `gc`），让运维人员能直接查到何时会出声、何时不会。
+12. ★**`docs.html`/`USAGE.md` 两张运维语义表——本轮已实现**（纯文档，无代码改动）。原建议：添加（a）fork/透镜/别名/key-ro 四种“写意图”的失败时点对比，（b）“对象丢失时各命令的声音”矩阵。**已采用的改法**：（a）写入 `docs.html` §12“报错对照”后（含逐 `open` 探针 errno 的 `<pre>` 与“为何截断类在 open 拒、追加类拖到 fsync”的 note）与 `USAGE.md` §3.0（写契约 note 后的精简表 + “不能拿 shell `>>` 的 rc 判断写成功”的告警）；（b）写入 `docs.html` §11.5（du 字节来源 note 后，9 行情形×会/不会出声×逐字回显关键词）与 `USAGE.md` §12.6（同矩阵精简版 + 一句话选型）。未出声的条带丢分块与挂载读均标为“当前版本已知缺陷（未实现、诚实标注）”，与 §5-5/§5-6 遗留项一致。doccheck 退出码 0（标签闭合无错、参数对账非负空间差集 0、新增汉字均为正当用字）。
 
 ---
 
@@ -1539,30 +1539,28 @@ bash .build-bin/vm_audit.sh        # 重启后拿一次全量复核
 
 ```
 $ git log --oneline -4
+07e24d8 fix(cli,stats): clarify gc and --stats output (§6-8/§6-9)
 74c765b fix(mcp): refuse aliases whose target has no physical view tree (§5-10)
 1d624dd fix(cli,mcp,du,meta): route fatal errors through Display and make messages actionable
 63f8c8f test(du): add du integration tests to version control
-08a5c4d fix(du,sharded,fs): correct du error handling, striped order detection, POSIX lock release
 
-$ git show --stat 74c765b       # §5-10 悬空别名校验轮（已入库）
- .build-bin/test_control.sh |  21 +++++--
- TEST_REPORT.md             | 149 ++++++++++++++++++++-------------------------
- src/mcp.rs                 |  63 +++++++++++++++++++
- 3 files changed, 147 insertions(+), 86 deletions(-)
+$ git show --stat 07e24d8       # §6-8/§6-9 gc/stats 显示改动（已入库）
+ TEST_REPORT.md | 101 ++++++++++++++++++++++++++++++++-------------------------
+ USAGE.md       |   2 +-
+ docs.html      |   3 ++
+ src/main.rs    |  46 ++++++++++++++++++++------
+ src/stats.rs   |   3 ++
+ 5 files changed, 100 insertions(+), 55 deletions(-)
 
-$ git diff --stat               # 本轮 §6-8/§6-9 gc/stats 显示改动（待确认入库；本报告除外）
- USAGE.md     |  2 +-
- docs.html    |  3 +++
- src/main.rs  | 46 +++++++++++++++++++++++++++++++++++----------
- src/stats.rs |  3 +++
- 4 files changed, 43 insertions(+), 11 deletions(-)
+$ git diff --stat               # 本轮 §6-12 两张运维语义表（纯文档，待确认入库；本报告除外）
+ USAGE.md  | 28 ++++++++++++++++++++++++++++
+ docs.html | 40 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 68 insertions(+)
 
-$ git status --short            # 工作区：本轮 4 个产品/文档文件 + 本报告为 M + 未跟踪的取证/编排脚本
+$ git status --short            # 工作区：本轮 §6-12 两份文档 + 本报告为 M + 未跟踪的取证/编排脚本（无产品代码改动）
  M TEST_REPORT.md
  M USAGE.md
  M docs.html
- M src/main.rs
- M src/stats.rs
 ?? .build-bin/gfs_provision.sh
 ?? .build-bin/probe_posix_lock.py
 ?? .build-bin/vm_audit.sh
@@ -1592,6 +1590,7 @@ $ git status --short            # 工作区：本轮 4 个产品/文档文件 + 
 | `README.md` | `--root /d1,/d2` 行写明“落盘位置是 key 哈希 mod 根数现场重算，列表与对象都不记录盘序号”的口径 | 机内多根落盘实测在 §3.11（回显 `同机双根的放置由 key 哈希决定`）；条带侧根数不对必须拒的实测在 §3.6.2（`refusing to remap` 原文）；§4.4 doccheck 结论 OK |
 | `USAGE.md` | `--data-root` 的适用命令加 `du` 与默认取值说明；§12.3/§14.1/部署案例表同步多根布局口径 | du 的默认数据根取值见 §3.6.1，三种缺数据源硬拒绝见 §3.6.2，丢对象出声见 §3.6.3；§4.4 doccheck 参数对账“非外部工具/非负空间 0 项” |
 | `docs.html` | 同步上述表格与措辞 | §4.4 |
+| `docs.html` + `USAGE.md`（§6-12、本轮待入库） | 新增两张运维语义表：（a）fork/透镜/别名/key-ro 四种写意图的失败时点（结构写 / 内容写截断类 open 即 `EROFS` / 内容写追加类 `EROFS` 拖到 fsync-close / shell `>>` 假成功），含逐 `open` 探针 errno 回显（`docs.html` 放 §12、`USAGE.md` 放 §3.0）；（b）“对象丢失/数据源不对时各命令会不会出声” 9 行矩阵（`docs.html` 放 §11.5、`USAGE.md` 放 §12.6），未出声的条带丢分块与挂载读标为已知缺陷 | 逐形态失败时点实测在 §3.4.4/§3.9；丢对象出声矩阵逐行取自 §3.6（du 整对象缺失→warning、无数据源/布局不符→拒）与 §5-5/§5-6（条带中/首分块丢失静默、挂载读 size=0 无 EIO）；§6-12 行、本轮 doccheck 退出码 0 |
 
 | `src/backend/sharded.rs` | 本轮复核新增：`layout_server_count`（供 du 前置门控只约束有 `s<N>` 前缀的键）与 `chunk0_elsewhere`（用 `{uuid}#0` 归属确定性检出反序列列表）+ `order_verified` 零成本门控；新增 2 个单测 | §3.6.2（倒置列表由静默 `0B` 改为报错的实机回显）、§4.2（`a_reversed_server_list_is_reported_not_read_as_empty`、`an_empty_striped_object_still_measures_zero`） |
 | `src/fs_impl.rs` | 本轮修复 §5-3：新增 `posix_lock_fh_owner`/`posix_lock_owner_fds` 两表与 `note_posix_lock`/`drop_posix_lock_on_release`，`setlk` 授予时记账、`release` 末次锁定时全区间 Unlock 精确回收 POSIX 锁（不依赖内核不交的 `lock_owner`） | §3.2（根因+修复说明与实机 `GRANTED`/`2.74s` 唤醒回显）、§5-3行、§4.2（`tests/locks.rs` 11 passed） |
