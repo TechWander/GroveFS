@@ -23,6 +23,14 @@ use std::thread;
 /// across every server. 16 MiB matches the plan's size threshold.
 pub const STRIPE_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Stable leading token on the error message [`ShardedBackend::len_with`]
+/// returns when a strict sweep finds a striped object whose chunks do not form
+/// a contiguous run (a present chunk living beyond an absent one). Carried
+/// inside an ordinary [`io::ErrorKind::Other`] so callers can detect corruption
+/// with [`ShardedBackend::is_damaged`] without string-matching the human-readable
+/// sentence that follows it.
+const DAMAGE_TAG: &str = "grovefs:striped-damaged:";
+
 /// A [`StorageBackend`] that shards each object across an ordered set of member
 /// backends (typically one [`crate::remote::RemoteBackend`] per data server).
 pub struct ShardedBackend {
@@ -241,6 +249,122 @@ impl ShardedBackend {
         }
         Ok(())
     }
+
+    /// Measure an object's length, optionally *strictly*.
+    ///
+    /// `strict == false` is the ordinary length used by `getattr`/reads: it
+    /// trusts the contiguity invariant (write keeps every chunk below a new
+    /// write full — see [`Self::pad_below`]) and finds the end with an
+    /// exponential+binary search in O(log A) probes.
+    ///
+    /// `strict == true` is for the explicit `grovefs du` diagnostic sweep only.
+    /// A silently truncated measure is the exact failure `du` exists to avoid,
+    /// so after the search stops at the first absent chunk it probes ONE chunk
+    /// further: a present chunk living beyond an absent one means the search
+    /// stopped early on a hole, i.e. the object is damaged, not short. It also
+    /// checks the leading chunk: a real (non-empty) object always begins at
+    /// chunk #0, so a later chunk present while #0 is gone is damage too.
+    /// Returns [`io::ErrorKind::Other`] carrying [`DAMAGE_TAG`] in that case.
+    ///
+    /// Scope, stated honestly: this catches the under-report symptom (the
+    /// search halts before still-present chunks). A hole buried entirely inside
+    /// a run of present chunks does not change the measured size — it is a
+    /// read-path integrity matter (a wrong-byte read), not a du size error, and
+    /// is left to the deeper §5-5 line of work; detecting it would cost an
+    /// O(chunk-count) walk that both `len` and `du` deliberately avoid.
+    fn len_with(&self, key: &str, strict: bool) -> io::Result<u64> {
+        let l = match parse_layout(key) {
+            Some(l) => l,
+            None => return self.servers[0].len(key),
+        };
+        self.check_layout(&l)?;
+        let len0 = match self.chunk_len(&l, 0)? {
+            None => {
+                self.chunk0_elsewhere(&l)?;
+                if strict && self.chunk_len(&l, 1)?.is_some() {
+                    return Err(Self::damaged(format!(
+                        "striped object {} is missing its leading chunk #0 but a later chunk \
+                         is present — content is damaged, not empty; its true size is unknown",
+                        l.base
+                    )));
+                }
+                return Ok(0);
+            }
+            Some(c) => {
+                self.order_verified
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                c
+            }
+        };
+        if len0 < l.stripe {
+            if strict && self.chunk_len(&l, 1)?.is_some() {
+                return Err(Self::damaged(format!(
+                    "striped object {} ends short inside chunk #0 yet chunk #1 is present — \
+                     content is damaged, not short; its true size is unknown",
+                    l.base
+                )));
+            }
+            return Ok(len0);
+        }
+        let mut lo = 0u64;
+        let mut hi = 1u64;
+        while self.chunk_len(&l, hi)?.is_some() {
+            lo = hi;
+            match hi.checked_mul(2) {
+                Some(next) if next <= u32::MAX as u64 => hi = next,
+                _ => return Ok((lo + 1) * l.stripe),
+            }
+        }
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            match self.chunk_len(&l, mid)? {
+                Some(_) => lo = mid,
+                None => hi = mid,
+            }
+        }
+        let last = self
+            .chunk_len(&l, hi - 1)?
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EIO))?;
+        if strict && self.chunk_len(&l, hi + 1)?.is_some() {
+            return Err(Self::damaged(format!(
+                "striped object {} has a gap at chunk #{} (a present chunk lies beyond the \
+                 first absent one) — content is damaged, not short; its true size is unknown",
+                l.base, hi
+            )));
+        }
+        Ok((hi - 1) * l.stripe + last)
+    }
+
+    /// Strict length for the `du` diagnostic sweep; see [`Self::len_with`].
+    pub fn len_strict(&self, key: &str) -> io::Result<u64> {
+        self.len_with(key, true)
+    }
+
+    /// A corruption signal: bytes that ought to be there are not, and the size
+    /// cannot be trusted. Carried as [`io::ErrorKind::Other`] with a stable
+    /// [`DAMAGE_TAG`] prefix so callers (currently only `du`) can tell it apart
+    /// from "absent" (a real miss, [`io::ErrorKind::NotFound`]) and from "nobody
+    /// answered" (a transient failure) without stringly matching on the prose.
+    fn damaged(why: String) -> io::Error {
+        io::Error::other(format!("{} {why}", DAMAGE_TAG))
+    }
+
+    /// Whether `e` is a [`Self::damaged`] corruption signal (as opposed to a
+    /// confirmed miss or an unanswered probe).
+    pub fn is_damaged(e: &io::Error) -> bool {
+        e.kind() == io::ErrorKind::Other && e.to_string().starts_with(DAMAGE_TAG)
+    }
+
+    /// The human-readable sentence behind a [`Self::is_damaged`] error, with
+    /// the machine [`DAMAGE_TAG`] prefix trimmed, for a caller to quote in a
+    /// warning line.
+    pub fn damage_reason(e: &io::Error) -> String {
+        let msg = e.to_string();
+        match msg.strip_prefix(DAMAGE_TAG) {
+            Some(rest) => rest.trim().to_string(),
+            None => msg,
+        }
+    }
 }
 
 /// See [`ShardedBackend::probe`].
@@ -437,72 +561,11 @@ impl StorageBackend for ShardedBackend {
     }
 
     fn len(&self, key: &str) -> io::Result<u64> {
-        let l = match parse_layout(key) {
-            Some(l) => l,
-            None => return self.servers[0].len(key),
-        };
-        self.check_layout(&l)?;
-        // Chunks are CONTIGUOUS: `write` keeps every chunk below a new write full
-        // (see `pad_below`), so exactly the range [0, A) is present and every
-        // chunk at/after A is absent, with only the trailing chunk A-1 allowed to
-        // be short. "chunk i is absent" is therefore a monotone predicate with a
-        // single boundary — we find A with exponential bounding + binary search
-        // in O(log A) probes instead of the old O(A) linear walk. That walk made
-        // getattr (and READDIRPLUS over a directory of large striped files) fan
-        // out one probe per chunk — e.g. ~6400 round-trips for a 100 GiB file at
-        // a 16 MiB stripe — the `backend.len` hot-spot `read` itself refuses to
-        // pay (see the comment there). A `Probe::Unknown` still fails honestly
-        // (EIO) rather than reporting a too-short size.
-        //
-        // Chunk 0 first: absent => empty object; present-and-short => it is the
-        // only (trailing) chunk, size == its length.
-        let len0 = match self.chunk_len(&l, 0)? {
-            None => {
-                // `None` here means THIS list found no chunk 0 on member 0. For
-                // a contiguous object that is an empty object — unless some
-                // other member holds `{base}#0`, which is the signature of the
-                // right servers in the wrong order. Reporting 0 for that made a
-                // misordered list look like a tree full of empty files.
-                self.chunk0_elsewhere(&l)?;
-                return Ok(0);
-            }
-            Some(c) => {
-                // Chunk 0 sits where this list says: the order is proven for
-                // this backend, so later chunk-0 misses are real empty objects.
-                self.order_verified
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                c
-            }
-        };
-        if len0 < l.stripe {
-            return Ok(len0);
-        }
-        // Chunk 0 is a full stripe, so A >= 1. Exponential search for a present
-        // low bound `lo` and an absent high bound `hi` (present(lo), absent(hi)).
-        let mut lo = 0u64;
-        let mut hi = 1u64;
-        while self.chunk_len(&l, hi)?.is_some() {
-            lo = hi;
-            match hi.checked_mul(2) {
-                Some(next) if next <= u32::MAX as u64 => hi = next,
-                // Beyond 2^32 chunks (>~68 YiB at a 16 MiB stripe) the old
-                // walk bailed with the confirmed-full total; mirror that.
-                _ => return Ok((lo + 1) * l.stripe),
-            }
-        }
-        // Binary search the boundary in (lo, hi]: lo present, hi absent.
-        while hi - lo > 1 {
-            let mid = lo + (hi - lo) / 2;
-            match self.chunk_len(&l, mid)? {
-                Some(_) => lo = mid,
-                None => hi = mid,
-            }
-        }
-        // `hi` is the first absent chunk; `hi-1` is the trailing (present) chunk.
-        let last = self
-            .chunk_len(&l, hi - 1)?
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::EIO))?;
-        Ok((hi - 1) * l.stripe + last)
+        // Ordinary (non-strict) length: see [`Self::len_with`] for the
+        // contiguity assumption and the exponential+binary search that finds
+        // the end in O(log A) probes, keeping `getattr`/READDIRPLUS off the
+        // per-chunk walk this replaced.
+        self.len_with(key, false)
     }
 
     fn fsync(&self, key: &str) -> io::Result<()> {
@@ -771,6 +834,82 @@ mod tests {
         let key = sb.new_key("emp");
         sb.create(&key).unwrap();
         assert_eq!(sb.len(&key).unwrap(), 0);
+        for r in roots {
+            let _ = std::fs::remove_dir_all(r);
+        }
+    }
+
+    /// §6-2: the strict length `du` uses must name a striped under-report
+    /// (chunks present beyond the point the monotone search stopped) instead of
+    /// silently returning the short size — while a genuinely short TAIL stays a
+    /// valid size, not a false "damaged". Files are deleted through fresh
+    /// member handles and re-probed through yet another fresh `ShardedBackend`
+    /// so the `LocalBackend` fd cache cannot mask an unlink.
+    #[test]
+    fn len_strict_flags_interior_and_leading_gaps_but_not_a_short_tail() {
+        let roots = tmp_root("gap", 2);
+        let stripe = 4096u64;
+        let nchunks = 5u64;
+        let data: Vec<u8> = (0..(stripe * nchunks) as usize)
+            .map(|i| (i % 251) as u8)
+            .collect();
+
+        // Write a full contiguous 5-chunk object under `base`, then drop the
+        // backend so later handles open the files fresh.
+        let build = |base: &str| -> String {
+            let sb = ShardedBackend::new(members(&roots), stripe);
+            let key = sb.new_key(base);
+            sb.create(&key).unwrap();
+            sb.write(&key, 0, &data).unwrap();
+            key
+        };
+        let remove_chunk = |key: &str, i: u64| {
+            let l = parse_layout(key).unwrap();
+            let ms = members(&roots);
+            let ck = format!("{}#{}", l.base, i);
+            ms[(i as usize) % l.n].remove(&ck).unwrap();
+        };
+        let reopen = || ShardedBackend::new(members(&roots), stripe);
+
+        // 0) Intact: measures exactly, no error.
+        let key = build("intact");
+        assert_eq!(reopen().len_strict(&key).unwrap(), data.len() as u64);
+
+        // 1) Interior gap: chunk #0 present, #1 gone, #2.. present.
+        let key = build("interior");
+        remove_chunk(&key, 1);
+        let sb = reopen();
+        // The old non-strict path still under-reports to one chunk — the very
+        // silent short-report §3.6.3 recorded (64.0M -> 16.0M).
+        assert_eq!(sb.len(&key).unwrap(), stripe);
+        let err = sb
+            .len_strict(&key)
+            .expect_err("interior gap must be reported, not measured short");
+        assert!(ShardedBackend::is_damaged(&err), "{err}");
+        assert!(err.to_string().contains("has a gap at chunk #1"), "{err}");
+
+        // 2) Leading gap: chunk #0 gone, a later chunk present — damaged,
+        //    not the empty object `Ok(0)` it used to look like.
+        let key = build("leading");
+        remove_chunk(&key, 0);
+        let err = reopen()
+            .len_strict(&key)
+            .expect_err("leading gap must be reported");
+        assert!(ShardedBackend::is_damaged(&err), "{err}");
+        assert!(
+            err.to_string().contains("missing its leading chunk #0"),
+            "{err}"
+        );
+
+        // 3) Short TAIL: only the last chunk is gone — a legitimate truncation,
+        //    so strict must agree with len and NOT call it damaged.
+        let key = build("tail");
+        remove_chunk(&key, nchunks - 1);
+        assert_eq!(
+            reopen().len_strict(&key).unwrap(),
+            stripe * (nchunks - 1)
+        );
+
         for r in roots {
             let _ = std::fs::remove_dir_all(r);
         }

@@ -794,7 +794,7 @@
     复原后挂载 md5: 1304cb5a5f3e8b534c5bda7ee4e107b4  /home/hanjun/mnt/datasets/big.bin
   ```
 
-- **结论**：**失败/未实现**。中间分块丢失时 du 不报 warning，而是静默把对象短报为 16 MiB（`67108869 → 16777221`）；挂载侧同步变短（`stat size=16777216`），越过新 EOF 的读返回 0 字节且 `rc=0`、无任何错误；整文件 md5 变了但无任何提示。机制见 `src/backend/sharded.rs:386-430`：`ShardedBackend::len` 假定分块连续，用指数+二分定位「第一个缺失分块」当 EOF，因此内部空洞不可区分。列为遗留项（§5-5）。
+- **结论**：**探针当时为失败/未实现；现 du 侧已修复**。探针当时：中间分块丢失时 du 不报 warning，而是静默把对象短报为 16 MiB（`67108869 → 16777221`）；机制见 `src/backend/sharded.rs` 的 `len_with`：普通 `len` 假定分块连续，用指数+二分定位「第一个缺失分块」当 EOF，因此内部空洞不可区分。**当前版本**：`du` 的诊断扫描改走 `ShardedBackend::len_strict`，二分停在首个缺失分块后多探一块，存在即在「其后」就判损坏并出声（独立 `damaged` warning，字节不计入总数），本机端到端复验见 §3.6.5。挂载侧 `stat`/读的行为不变（见 §5-6，属设计取舍：`build_attr` 对 `len` 错误回退到元数据 size，且 len 是 getattr 热路径）。
 
 **情形三：条带对象的第一个分块丢失。**
 
@@ -816,7 +816,7 @@
     复原后挂载 md5: 1304cb5a5f3e8b534c5bda7ee4e107b4  /home/hanjun/mnt/datasets/big.bin
   ```
 
-- **结论**：**失败/未实现**。chunk#0 缺失时 `len` 返回 `Ok(0)`，du 既不拒绝也不出声，而是给出 `55B` 这种完全错位的极小值（同一棵树其余目录项占位）；挂载内该文件看起来是空文件且读不报错。归入同一遗留项 §5-5，并作为「静默 0 值」的头号显示优化案例（§6-2）。
+- **结论**：**探针当时为失败/未实现；现 du 侧已修复**。探针当时：chunk#0 缺失时 `len` 返回 `Ok(0)`，du 给出 `55B` 这种完全错位的极小值。**当前版本**：`len_strict` 在 chunk#0 缺失而 chunk#1 存在（或 #0 短报但 #1 存在）时同样判损坏出声，不再给出极小总值；挂载 `stat size=0` 且读不报错的行为不变（§5-6）。本机复验见 §3.6.5。
 
 #### 3.6.4 本地挂载内读丢失对象（重挂后）
 
@@ -836,6 +836,33 @@
   ```
 
 - **结论**：两条当前行为必须写进文档：① `data-server` 按 key 长期缓存原始 fd（`src/backend/local.rs:109-145`），因此对象被外部改名/删除后，已建立的进程仍能读写旧 inode——用 `mv` 模拟丢对象在任何统计上都不可观察（本任务早期一轮 C5 的「无变化」回显即此原因，已用上面 unlink+重启的探针推翻并重测）；② fd 缓存失效后，丢失对象的挂载读不报 `EIO`，而是 `size=0` + 空内容 rc=0（静默）。列为遗留项 §5-6。
+
+#### 3.6.5 条带对象损坏的 du 出声（§6-2 修复后，本机端到端复现）
+
+- **命令**（`bash .build-bin/repro_du_damage.sh`，本机两台 data-server + 本地 meta）：`mount --data A,B` 下 `dd` 一个 40 MiB 文件（跨分块 #0/#1/#2，#1 在 B）；基线 du → umount、停服、`rm` 掉 B 上的 `{uuid}#1` → 重启两 server → 再跑 du。对照变体同法拔掉**尾块** `#2`（在 A）。
+- **回显**（中间块 #1 缺失）：
+
+  ```
+    === baseline du (intact) ===
+    41943040        /
+    === kill servers, remove chunk #1 (on B), restart ===
+    .d62/sB/blocks/62/208f94a7-afa0-4e90-ab0c-1b0336e8930f#1
+    === du after damage ===
+    warning: 1 of 1 object(s) are damaged striped objects and are excluded from the total (their true size is unknown); first: striped object 208f94a7-afa0-4e90-ab0c-1b0336e8930f has a gap at chunk #1 (a present chunk lies beyond the first absent one) — content is damaged, not short; its true size is unknown
+    0       /
+  ```
+
+- **回显**（对照：尾块 #2 缺失，EOF 前的分块仍连续）：
+
+  ```
+    === baseline: ===
+    41943040        /
+    === du after TAIL loss ===
+    33554432        /
+    rc=0
+  ```
+
+- **结论**：**通过**。中间分块丢失不再静默短报（修复前同形态为 `40MiB → 16MiB` 无声，见 §3.6.3 情形二）：du 给出独立 `damaged` warning（区别于「不在数据源」的 lost warning，更区别于误报），不可确认的字节不计入总数；尾块丢失仍按 EOF 静默短报、不误报损坏（`rc=0`，无 warning）。单测 `len_strict_flags_interior_and_leading_gaps_but_not_a_short_tail`（`src/backend/sharded.rs`）同时钉住首块缺失、中间空洞、短尾三态。
 
 ### 3.7 `view export/import` 跳机迁移与 `--as-fork`
 
@@ -1282,11 +1309,11 @@
 - **回显**（`/tmp/repo_cargo_test.log` 的各套件汇总行，全部 `ok`，共 210 个 `test …` 行）：
 
   ```
-  test result: ok. 130 passed; 0 failed; …      # lib 单测（含本轮 du 分类与条带错序新测）
+  test result: ok. 132 passed; 0 failed; …      # lib 单测（含 §6-2 len_strict 新测、du 分类与条带错序新测）
   test result: ok. 3 passed; 0 failed; …                   # tests/du.rs
   test result: ok. 11 passed; 0 failed; …                  # du 模块单测（含新增 5 个分类/门控用例）
   test result: ok. 11 passed; 0 failed; …
-  test result: ok. 12 passed; 0 failed; …                  # sharded 模块单测（含错序/空对象 2 个新用例）
+  test result: ok. 14 passed; 0 failed; …                  # sharded 模块单测（含错序/空对象 + §6-2 len_strict 三态用例）
   test result: ok. 10 passed; 0 failed; …
   test result: ok. 1 passed; 0 failed; …                   # 集成套件
   ```
@@ -1302,25 +1329,27 @@
   # 条带错序检测（chunk0_elsewhere）
   test a_reversed_server_list_is_reported_not_read_as_empty ... ok
   test an_empty_striped_object_still_measures_zero ... ok
+  # §6-2 严格长度三态（首块缺失/中间空洞报错，短尾不报错）
+  test len_strict_flags_interior_and_leading_gaps_but_not_a_short_tail ... ok
   ```
 
-- **结论**：通过（无 failed；`fanout_scale` 一条 `ignored` 为原有设定）。本轮新增：du 5 个分类/门控纯逻辑单测、sharded 2 个错序单测、tests/du 桶碰撞修正。
+- **结论**：通过（无 failed；`fanout_scale` 一条 `ignored` 为原有设定）。历轮新增：du 5 个分类/门控纯逻辑单测、sharded 错序 2 个单测、tests/du 桶碰撞修正；本轮新增 §6-2 `len_strict` 三态单测。
 
 ### 4.3 `bash .build-bin/run_all.sh`
 
 - **命令**：`bash .build-bin/run_all.sh`
-- **回显**（`/tmp/repo_run_all2.log` 首尾）：
+- **回显**（本轮重跑尾屏；首屏套件列表与下表汇总行不变）：
 
   ```
   ==================================================================
-   grovefs test board   (2026-11-06 17:25:29)
+   grovefs test board   (2026-11-07 13:34:05)
    suites: build unit posix edge e2e remote errors resilience concurrent metasrv ha striping locks freshness disp_fresh layout fork viewrm gc bwlimit migrate import govcheck govtime grovesci mcp apikey mountkey config pg pg_parallel control bench
-   logs:   .build-bin/logs/20261106-172528
+   logs:   .build-bin/logs/20261107-133405
   ==================================================================
   ### build — cargo build --release
     OK
   ### unit — cargo test --release
-    test result: ok. 130 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+    test result: ok. 132 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
   ...
     ha      PASS
     striping PASS
@@ -1349,7 +1378,7 @@
   RESULT: GREEN (all gating suites passed)
   ```
 
-- **结论**：通过（`bench` 为 INFO 非门禁项）。
+- **结论**：通过（`bench` 为 INFO 非门禁项；§6-2 改动后全板重跑仍 GREEN）。
 
 ### 4.4 `bash skills/grovefs-docs/scripts/doccheck.sh`
 
@@ -1384,7 +1413,7 @@
 | 5-2 | 稀疏洞不省盘 | `st_size=1048576` 且 `st_blocks*512=1048576` | 后端按完整对象存字节 | 未修，列入遗留 |
 | 5-3 | **POSIX 记录锁 close/退出隐式释放时漏清，阻塞等待方不唤醒** | 修复前的对照实验：显式 `F_UNLCK` 释放 → 等待方 3.01s 唤醒；只 `close(fd)`/进程退出释放 → 新进程非阻塞加锁仍 `EACCES`（锁泄漏），阻塞等待方卡 `request_wait_answer` 直至 600s 上限 | 根因已定位（§3.2）：`fuser` 0.18 `Release::lock_owner()` 仅在 `FUSE_RELEASE_FLOCK_UNLOCK`（只有 flock(2) 路径置位）时返回 `Some`；POSIX 锁走 close 时返回 `None`，`release_locks_of_owner` 不触发，幽灵锁行又被按 sid 的续租心跳（`LOCK_LEASE_SECS=15`）无限 刷新 | **已修复**（release `d2a3b262`，实机复验）：`setlk` 按 `(fh→ino,owner)` 记账、`release` 在末次锁定描述符关闭时用全区间 Unlock 精确回收；close 后新进程加锁由 `EACCES` 变 `GRANTED`、阻塞 `F_SETLKW` 于持有者 close 后 `2.74s` 唤醒（见 §3.2、§6-2a） |
 | 5-4 | `view rm --base` 在数据根不可用时只给裸 `Permission denied` | 修复前：`Error: Os { code: 13, kind: PermissionDenied, message: "Permission denied" }`，不报路径、不给下一步，且发生在元数据树已删之后 | 回收阶段直接上抛 `io::Error`，未经包装 | **已修复**（release `d2a3b262`，实机复验）：回收 `open_local` 失败时 `map_err` 补上数据根路径、视图名与“树已删/字节未收”上下文及离线 `gc` 提示；连同 §5-12 改走 Display，实机报 `error: cannot open data root …`（见 §6-4） |
-| 5-5 | **条带对象真丢分块时 du 仍静默短报（本类中数据源真缺字节的形态；错配/瞬时故障形态已修）** | 中间分块缺失：`67108869 → 16777221`（无 warning）；首分块真缺：`--total` 给极小值、挂载 `stat size=0` 且读 rc=0 | `ShardedBackend::len` 假定分块连续，指数+二分把“第一个缺失分块”当 EOF（chunk#0 真缺时 `chunk0_elsewhere` 在其它成员也探不到 `{base}#0` → `Ok(0)`） | 未修，列入遗留；可执行方案见 §6-2。区分：同一命令对“列表长度不符”与“列表顺序倒置”现已分别前置拒绝/报错（见 §3.6.2），对超时/拒连不再误报为“对象不在数据源”（现进入 `could not be confirmed` 硬报错） |
+| 5-5 | **条带对象真丢分块时 du 仍静默短报（本类中数据源真缺字节的形态；错配/瞬时故障形态已修）** | 修复前探针：中间分块缺失 `67108869 → 16777221`（无 warning）；首分块真缺：`--total` 给极小值 | `ShardedBackend::len` 假定分块连续，指数+二分把“第一个缺失分块”当 EOF（chunk#0 真缺时 `chunk0_elsewhere` 在其它成员也探不到 `{base}#0` → `Ok(0)`） | **已修复（du 诊断路径）**：`du` 改走 `len_strict`，二分停在首个缺失块后多探一块、首块缺失而后续存在也同样检测，命中即归入独立 `damaged` 计数并单独 warning（字节不计入总数）；本机端到端复验见 §3.6.5，单测 `len_strict_flags_interior_and_leading_gaps_but_not_a_short_tail`。挂载侧静默形态（stat size 短/0、读无 EIO）属 §5-6，未改（len 是 getattr 热路径且 `build_attr` 会回退元数据 size，改 len 既拖热路径又不会让挂载出声）；同一命令对“列表长度不符/倒置/超时拒连”的既有拒绝与硬报错不变（见 §3.6.2） |
 | 5-6 | 非条带路径的挂载读丢失对象也不出声 | 重挂后读丢失对象：`rc=0`、`stat size=0`（无 `EIO`） | 同上：`len` 给 0 而非错误 | 未修，列入遗留 |
 | 5-7 | `apikey set-ro` 回到 rw 后同一挂载仍拒写 | `is now rw (read-write)` 后紧接追加写 `errno=30` | 服务端复检窗口/客户端缓存时机，文档声称 ≤1s | 未修，列入遗留（建议回显明记生效时刻而非窗口上限） |
 | 5-8 | `set-ro` 后回读内容尾部多 7 个零字节 | `'first\n\x00\x00\x00\x00\x00\x00\x00'` | 本轮探针用固定长缓冲区读回所致，非产品写入；作为取证脚本缺陷记录 | 已确认非产品缺陷（取证手段问题） |
@@ -1403,7 +1432,7 @@
 - **`USAGE.md` 完全没有 `grovefs du` 的文档缺口**：补命令速查行 + §12.6 用法与拒绝语义；`docs.html` 同步为“顺序错位会被 stat 检出，read 路径仍只按分块定位”。
 - **POSIX 锁 close/exit 隐式释放泄漏**（`src/fs_impl.rs`）：`setlk` 授予时按 `(fh→ino,owner)` 记账、`release(fh)` 在末次锁定描述符关闭时用全区间 `lock_op(Unlock)` 精确回收（`note_posix_lock`/`drop_posix_lock_on_release`）；不改 sid 续租模型。配套新增 `test_locks.sh` §4c 集成用例（close 后新进程加锁 + 阻塞唤醒延时），本地 17/17、实机复验通过。
 
-未当场修复、仅确证并记录的：§5-5 中“真丢字节”形态（仍需 §6-2 方案）。
+未当场修复、仅确证并记录的：§5-5 原“真丢字节”形态中的挂载侧静默（归 §5-6）；du 侧已于后续轮按 §6-2 方案修复（见 §3.6.5）。
 
 ---
 
@@ -1412,10 +1441,11 @@
 以下每条都给出可执行的改法（文件 + 具体输出），不只是评论。标★的与§5 遗留项直接对应。
 
 1. ★**`view list` 首行与列表自相矛盾——本轮已实现**。无定义时先打 `no view definitions in the control plane store …`，紧接着又列出 `base view 'alice' -> …`。**已采用的改法**：`src/mcp.rs` 的 `list_views_text` 先算出 bare（基视图）数量，`defined` 为空时按 bare 是否为空分两支——两者皆空才打“无任何视图定义”，仅 `defined` 空而 bare 非空时打“无别名/分叉/透镜定义 —— 下面 N 个基视图各映射自己的树”，不再与列表矛盾。实机复验见 §2.3。
-2. ★**条带对象丢分块时的静默 0 / 静默短报（最严重的一条）**。建议分两步：
-   - `ShardedBackend::len` 在二分定界后多探一个分块（探 `A+1`）：若存在则说明是内部空洞，返回 `io::Error`(kind=`Other`, 文案 `striped object <uuid> has a gap at chunk #A (present after an absent one) — content is damaged, not short`)；`du` 侧现有 `lost` 计数会自动报出 warning，挂载侧 getattr 得 `EIO` 而不是假 EOF（成本：每对象 +1 次 RPC，与现有 `Probe::Unknown` 失败原则一致，见 `src/backend/sharded.rs:401` 注释）。
-   - chunk#0 缺失目前返回 `Ok(0)`，与空对象不可区分；建议同路报 `ENOENT`，使 `du` 进 `lost` 分支。
-   - 文档同步：`docs.html` 的 du 字节来源说明（原本只讲了非条带的 `warning: N of M …`）——**本轮已补上“条带对象分块丢失时的行为”**：在字节来源 note 内加一句——中间分块缺失时 `len` 把首个缺失分块当 EOF、静默短报，首分块缺失时给一个错位的极小值，与挂载读不到丢失对象一样不出声，属已知缺陷，并指向下方“会不会出声”表（表(b) 本轮 §6-12 已落）。上述两条**行为改动**（多探一分块报 gap / chunk#0 缺失改报 ENOENT）仍属待议，需实测与逐项征询，本轮未动代码。
+2. ★**条带对象丢分块时的静默 0 / 静默短报（最严重的一条）——本轮已实现（du 诊断路径）**。原建议分两步（给 `len` 加严、chunk#0 缺失改报 ENOENT）；实测取证后**采用了不同的改法**：取证发现 `build_attr`（`src/fs_impl.rs`）对每个普通文件的 getattr 都调 `backend.len(k).unwrap_or(node.size)` —— len 是热路径且错误会被静默回退到元数据 size，直接改 `len()` 既拖慢 stat/readdirplus 又不会让挂载侧真正出声。故：
+   - `src/backend/sharded.rs` 新增 `len_with(key, strict)`：普通 `len` 委托 `strict=false`（零行为/零成本变化）；`len_strict()`（仅 `du` 调用）在二分停在首个缺失块后多探一块（探 `hi+1`）、并检测首块缺失而后续存在/首块短报而 #1 存在两种形态，命中即返回带稳定前缀 `grovefs:striped-damaged:` 的 `io::Error::other`（`is_damaged`/`damage_reason` 供调用方类型化识别，不做散文串匹配）。
+   - `src/du.rs` 分类改为三档：`NotFound` → lost（既有 warning）；`is_damaged` → **独立 `damaged` 计数 + 独立 warning 行**（原句引用首个损坏原因，字节不计入总数）——损坏不再被读成“对象不在数据源/该传 --data-root”；其它 Err → 仍硬报错不出数。本地单根路径永不跨机条带，damaged 恒 0。
+   - 诚实边界：strict 只捕获“搜索停在缺失块、其后仍有存在块”的短报症状；完全埋在连续存在块内部的洞不改变测得尺寸，属读路径完整性（错字节读），需 O(分块数) 全扫，本轮不做。挂载侧静默形态（§5-6）按取舍保持不动。
+   - 文档同步：`docs.html` 的 du 字节来源 note 与“会不会出声”表(b)、`USAGE.md` §12.6 表(b) 的条带丢块行同步为新行为（du 出声：damaged warning；挂载读仍不出声）。本机端到端复验（中间块出声/尾块不误报）见 §3.6.5；单测 + `cargo test --release` 全绿见 §4.2。
 2a. ★**POSIX 记录锁 close/退出隐式释放泄漏（§5-3）——本轮已实现**。原建议：既然 `fuser` 0.18 仅在 `FUSE_RELEASE_FLOCK_UNLOCK`（只有 flock(2) 路径置位）时向 `release` 交 `lock_owner`，POSIX 锁走 close 拿到 `None`，旧回收不触发。**已采用的改法**：在 `setlk`（已不再忽略 `fh`）按 `(fh → ino, owner)` 记账，`release(fh)` 据此在某个 `(ino,owner)` 的最后一个锁定描述符关闭时，用一次全区间 `lock_op(..., Unlock, ...)` 精确删除其行（`src/fs_impl.rs` 的 `note_posix_lock`/`drop_posix_lock_on_release`）。采用“删除行”而非“收窄 `renew_locks` 到仍打开的描述符”，是为了不动 meta 协议与跨机续租模型：行一旦删除，按 sid 的续租心跳自然不再刷新它，效果与“只刷新存活行”等价，且失败时仍退化为一个租期内自然过期。已配套集成测（`test_locks.sh` §4c：跨进程持有/释放 + 阻塞唤醒延时），本地 17/17、三机实机复验通过（close 后 `GRANTED`、阻塞 `2.74s` 唤醒）。
 3. ★**fork/只读 key 的 `EROFS` 在 shell 里假成功**。`>>` 追加 `rc=0` 而字节未落盘（§3.4.4、§3.9），用户只会看到“写了但没变”。建议：把内容写门从 `fsync` 提前到首次 `write` 就返回 `EROFS`（至少对 `O_WRONLY`/`O_APPEND` 的开写路径做前置检查）；若保留现状，`USAGE.md`/`docs.html` 的 fork 语义行必须明写：“追加写的失败只在 fsync/close 可见，shell 重定向会报 0” 并给出验证命令（`sync; < cmd; echo $?` 或 `python3 -c` 逐 open 探针）。
 4. ★**`view rm --base` 的 `Permission denied` 裸文案——本轮已实现**。原建议：按同文件内其他守卫的写法包上上下文。**已采用的改法**：`src/main.rs` 的回收阶段 `backend::open_local(&droot)` 失败时 `map_err` 补上“cannot open data root <路径> to free view '<name>' objects … 元数据树 meta/'<name>'.db 已删除 … 可用 `grovefs gc --db-path … --data-root …` 离线回收”的上下文，把“树已删、字节未收”分开陈述并给出下一条可执行命令。连同 §5-12 的 Display 改动，实机不再报裸 `Permission denied`（见 §2.3）。
