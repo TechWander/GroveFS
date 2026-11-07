@@ -1177,7 +1177,7 @@ sudo systemctl stop grove-meta-server; sudo cp -a /data/meta /backup/meta-$(date
     <pre class="term"><b>$</b> grep -o '=.*' /etc/grovefs/grovefs.env | cut -d= -f2
 690987478d9cb1a4fee062db6a3d04c4
 <b>$</b> ./grovefs data-server --listen 127.0.0.1:50100 --root /tmp/grove_case/data --token "$TOK"
-<i>data-server listening on 127.0.0.1:50100</i>          <i># 三机上用 0.0.0.0:50100,这行会显示 0.0.0.0</i>
+<i>data-server listening on 127.0.0.1:50100 (host &lt;本机主机名&gt;, 1 data root(s): /tmp/grove_case/data)</i>   <i># 三机上用 0.0.0.0:50100,这行还会回显主机名与根列表——各节点根路径常同名,先认 host 再认路径</i>
 <b>$</b> ./grovefs meta-server --db-path /tmp/grove_case/data --listen 127.0.0.1:50110 --token "$TOK"
 <i>meta-server listening on 127.0.0.1:50110 (base /tmp/grove_case/data, role Primary)</i>
 <b>$</b> ss -lntp | grep -E "5010|5011"

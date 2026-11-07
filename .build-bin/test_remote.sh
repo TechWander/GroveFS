@@ -35,6 +35,12 @@ bad(){ echo "  FAIL: $1"; fail=$((fail+1)); }
 chk(){ if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got '$1' want '$2')"; fi; }
 T(){ timeout 10 "$@"; }
 
+# startup banner must identify host + root list: root paths repeat across
+# nodes in real deployments, so a bare listen line is ambiguous in cluster logs
+if grep -q "data-server listening on $ADDR (host .*, 1 data root(s): $PWD/.test/rsrv)" .test/srv.log; then
+  ok "data-server banner carries host + root list"
+else bad "data-server banner missing host/roots: $(head -1 .test/srv.log)"; fi
+
 echo "===== 1) create tree + roundtrip over remote backend ====="
 T mkdir $M/docs
 T sh -c "printf 'remote grovefs works' > $M/docs/hello.txt"

@@ -36,6 +36,22 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// This node's hostname for the startup banner: data roots carry the SAME
+/// paths across machines in typical deployments, so the listen line alone
+/// cannot tell which node a log came from. Best-effort: falls back to the
+/// `HOSTNAME` env, then `<unknown>`, rather than refusing to start.
+fn node_hostname() -> String {
+    let mut buf = [0u8; 256];
+    if unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) } == 0 {
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        let h = String::from_utf8_lossy(&buf[..end]).into_owned();
+        if !h.is_empty() {
+            return h;
+        }
+    }
+    std::env::var("HOSTNAME").unwrap_or_else(|_| "<unknown>".to_string())
+}
+
 /// Monotonic fencing token held by the witness (the `data-server`).
 ///
 /// A node folds its HA epoch in via [`Fence::claim`]; the arbiter hands back the
@@ -217,6 +233,13 @@ impl Fence {
 
 pub struct DataServer {
     listen: String,
+    /// Display-only copy of the `--root` list, echoed at startup so an operator
+    /// reading one node's log can tell WHICH disks this node serves and on
+    /// WHICH host they live — root paths repeat across machines (the same
+    /// `/data/gfs1/grove` name exists on several nodes), so a bare listen line
+    /// is ambiguous in a multi-node cluster log. Placement itself is decided
+    /// by the backend, not here.
+    roots: Vec<PathBuf>,
     backend: Arc<dyn StorageBackend>,
     token: String,
     /// Optional per-caller credential gate (`--require-api-key`). When set, every
@@ -242,6 +265,7 @@ impl DataServer {
     pub fn new(listen: &str, backend: Arc<dyn StorageBackend>) -> Self {
         Self {
             listen: listen.to_string(),
+            roots: Vec::new(),
             backend,
             token: String::new(),
             keys: None,
@@ -256,6 +280,7 @@ impl DataServer {
     pub fn with_token(listen: &str, backend: Arc<dyn StorageBackend>, token: &str) -> Self {
         Self {
             listen: listen.to_string(),
+            roots: Vec::new(),
             backend,
             token: token.to_string(),
             keys: None,
@@ -280,10 +305,27 @@ impl DataServer {
         self
     }
 
+    /// Record the `--root` list for the startup banner (display only; the
+    /// backend already owns the real roots).
+    pub fn with_roots(mut self, roots: &[PathBuf]) -> Self {
+        self.roots = roots.to_vec();
+        self
+    }
+
     /// Blocks forever serving connections.
     pub fn serve(&self) -> io::Result<()> {
         let listener = TcpListener::bind(&self.listen)?;
-        println!("data-server listening on {}", self.listen);
+        println!(
+            "data-server listening on {} (host {}, {} data root(s): {})",
+            self.listen,
+            node_hostname(),
+            self.roots.len(),
+            self.roots
+                .iter()
+                .map(|r| r.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         if self.keys.is_some() {
             println!("data-server: api-key auth REQUIRED (present `mount --api-key`, minted by `grovefs apikey create --for mount|any`); a revoke closes live connections on the next op");
         }

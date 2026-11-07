@@ -1728,6 +1728,9 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             // Durable fencing token: a witness restart must not zero the epoch
             // and let a deposed primary sneak back in as a writer.
             let srv = srv.with_fence_store(roots[0].join(".fence_token"));
+            // Startup banner echoes the root list + host (display only): root
+            // paths repeat across nodes, so the listen line alone is ambiguous.
+            let srv = srv.with_roots(&roots);
             srv.serve()?;
         }
         Cmd::MetaServer {

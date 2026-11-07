@@ -1399,9 +1399,9 @@
 
   ```
   ==================================================================
-   grovefs test board   (2026-11-07 14:03:49)
+   grovefs test board   (2026-11-07 14:30:31)
    suites: build unit posix edge e2e remote errors resilience concurrent metasrv ha striping locks freshness disp_fresh layout fork viewrm gc bwlimit migrate import govcheck govtime grovesci mcp apikey mountkey config pg pg_parallel control bench
-   logs:   .build-bin/logs/20261107-140349
+   logs:   .build-bin/logs/20261107-143031
   ==================================================================
   ### build — cargo build --release
     OK
@@ -1435,7 +1435,7 @@
   RESULT: GREEN (all gating suites passed)
   ```
 
-- **结论**：通过（`bench` 为 INFO 非门禁项；§6-3 改动后全板重跑仍 GREEN）。fork 套件含新 4b 段后 `pass=75 fail=0`；bench 写 392.0 MB/s（与上轮同量级，可写挂载 writeback 未受影响）。
+- **结论**：通过（`bench` 为 INFO 非门禁项；§6-3/§6-10 改动后全板重跑仍 GREEN）。fork 套件含新 4b 段后 `pass=75 fail=0`；remote 套件含新 banner 断言后 `pass=19 fail=0`；bench 写 392.0 MB/s（与上轮同量级，可写挂载 writeback 未受影响）。
 
 ### 4.4 `bash skills/grovefs-docs/scripts/doccheck.sh`
 
@@ -1511,7 +1511,7 @@
 7. **单位与计数口径——本轮复核定性：属取证脚本产物，非产品输出，不动**。`import` 同时给 `blocks/ 路径数: 8` 与 `distinct inode 数: 4`、`holders 台账: 8,8` 这类裸 SQL 元组，经定位均来自 `.build-bin/` 取证/编排脚本的 `psql`/`find` 探针输出，不是 `grovefs` 产品命令的打印。产品 `grovefs import` 的汇总行本就统一且人话：`imported into view 'X' under /: N dir(s), M object(s) (H hardlinked zero-copy, C copied), S skipped, F failed`；`du` 默认后缀已是 `K/M/G`。故本项无需产品侧改动。
 8. ★**`gc` 对在用存储的输出区分“无字节”与“无垃圾”——本轮已实现**（release `c8d68580`，实机复验见 §2.3）。原建议：`striped layout(s) > 0` 且 `objects == 0` 时不应让裸 `0` 读成“无字节”，且不应邀请对 0 字节重跑 `--apply`。**已采用的改法**（`src/main.rs` 的 `print_gc_report`）：当 `objects == 0 && striped_layouts > 0` 时，objects 行改打 `objects: 0 local block(s) — N striped layout(s) place their chunks on data-servers, which gc does not audit (use \`grovefs du\` for their bytes)`；dry-run 汇总保留稳定前缀 `dry run: nothing deleted.`，再按三态给尾句——有可回收项才邀请 `--apply`，`orphans` 为空打 `No unreferenced objects were found.`，全在宽限期内打 `N orphan(s) are all within the <grace> grace; re-run after it elapses.`。实机条带 meta 存储 `gc` 回显见 §2.3，`test_gc.sh` 41/0 仍绿（clean-store 用例断言的 `dry run: nothing deleted` 前缀未破）。
 9. ★**`--stats` 表的字节口径——本轮已实现**（表头说明方案，不改定宽列；release `c8d68580`，本机挂载复验）。原建议：`read.op_total bytes=0` 与 `read.backend_total bytes=…` 并存易误读为“没读到数据”；`p50=0` 这类静默 0 易误读为漏采样。**已采用的改法**（`src/stats.rs` 的 `report_text` 表头，未动表格列宽以免破坏对齐与 CSV）：新增两行——`bytes= is tallied only on the backend-boundary stages (read/write.backend_total, io.*); a 0 there is expected on op_total lines and means "not counted at this stage", not "no data"`、`a latency of 0 is sub-µs (below the histogram's µs resolution), not a missing sample`。同步 `docs.html` §8 的真实回显样本与 `USAGE.md` §8.1 口径说明。`test_stats.sh` E2E 通过（表头 `per-stage latency telemetry` 断言未受影响）。
-10. **`ls -d /data/gfs*/grove` 的展示歧义**。两台机器上都存在 `/data/gfs1/grove` 与 `/data/gfs2/grove` 两个同名目录（分块落点看似“在 gfs1 上”实际在 gfs2 的盘），本轮 E1/D2 回显已造成多次误读。建议：数据根名称从主机名推导（`/data/<host>/grove`）或在 `data-server --root` 的启动日志里逐根打一行 `root <path> on <hostname>`；`USAGE.md` 的部署示例需明写“每台两个根目录同名属预期”并推荐异名方案。
+10. **`ls -d /data/gfs*/grove` 的展示歧义——本轮已实现（启动 banner 回显 host + 根列表）**。两台机器上都存在 `/data/gfs1/grove` 与 `/data/gfs2/grove` 两个同名目录（分块落点看似“在 gfs1 上”实际在 gfs2 的盘），本轮 E1/D2 回显已造成多次误读。**已采用的改法**（纯显示，不动放置逻辑）：`src/remote/server.rs` 的 `DataServer` 新增展示字段 `roots`（`with_roots()` 由 CLI 注入）与 best-effort `node_hostname()`（`libc::gethostname`，退回 `HOSTNAME` env，再退 `<unknown>`，不因此拒绝启动），启动行由裸 `data-server listening on <addr>` 改为 `data-server listening on <addr> (host <h>, N data root(s): <p1>, <p2>)`——翻日志先认 host 再认路径。未采纳“根名从主机名推导”（`/data/<host>/grove`）：那会改变既有存储的根路径布局，与“root 列表必须固定”的口径冲突，属部署惯例而非产品缺陷。本机冒烟：`data-server listening on 127.0.0.1:59977 (host lc, 2 data root(s): /tmp/ds_a, /tmp/ds_b)`；`test_remote.sh` 新增 banner 断言（套件 19/0）；`docs.html` §13.11 终端实录与 `USAGE.md` §13.3/部署走读的 banner 示例同步为新形。
 11. **静默 0 值的通用约束**。建议约定：任何统计命令的 0 值必须区分三种情况——真零、无法测（数据源不对）、部分丢失，分别给 `0`、`0 (not measurable here: …)`、`<N> (excluding M lost object(s))`。本轮命中的四处：`du --total: 55B`、`stat size=0`、`gc objects: 0 (0 B)`、`--stats bytes=0`。
 12. ★**`docs.html`/`USAGE.md` 两张运维语义表——本轮已实现**（纯文档，无代码改动）。原建议：添加（a）fork/透镜/别名/key-ro 四种“写意图”的失败时点对比，（b）“对象丢失时各命令的声音”矩阵。**已采用的改法**：（a）写入 `docs.html` §12“报错对照”后（含逐 `open` 探针 errno 的 `<pre>` 与“为何截断类在 open 拒、追加类拖到 fsync”的 note）与 `USAGE.md` §3.0（写契约 note 后的精简表 + “不能拿 shell `>>` 的 rc 判断写成功”的告警）；（b）写入 `docs.html` §11.5（du 字节来源 note 后，9 行情形×会/不会出声×逐字回显关键词）与 `USAGE.md` §12.6（同矩阵精简版 + 一句话选型）。未出声的条带丢分块与挂载读均标为“当前版本已知缺陷（未实现、诚实标注）”，与 §5-5/§5-6 遗留项一致。doccheck 退出码 0（标签闭合无错、参数对账非负空间差集 0、新增汉字均为正当用字）。
 

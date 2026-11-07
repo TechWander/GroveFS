@@ -2014,7 +2014,7 @@ grovefs meta-server --db-path /data --listen 0.0.0.0:50110 --token "$TOK"
 ss -lntp | grep -E '50100|50110'      # 两行都在,进程名 grovefs
 ```
 
-两个前台窗口应分别打出一行 banner——`data-server listening on 0.0.0.0:50100` 和 `meta-server listening on 0.0.0.0:50110 (base /data, role Primary)`;长什么样的完整终端见 §13.11 实录①。
+两个前台窗口应分别打出一行 banner——`data-server listening on 0.0.0.0:50100 (host <存储机主机名>, 1 data root(s): /data)` 和 `meta-server listening on 0.0.0.0:50110 (base /data, role Primary)`;data 行回显主机名与根列表,是因为各节点根路径常常同名——翻日志时先认准 host 再认路径。长什么样的完整终端见 §13.11 实录①。
 
 ### 13.4 第四步:存储机 systemd 常驻 + 防火墙
 
@@ -2275,7 +2275,7 @@ ssh 192.168.1.12 'sudo systemctl stop grove-mount && findmnt -T /mnt/db | grep -
 $ grep -o '=.*' /etc/grovefs/grovefs.env | cut -d= -f2
 690987478d9cb1a4fee062db6a3d04c4
 $ ./grovefs data-server --listen 127.0.0.1:50100 --root /tmp/grove_case/data --token "$TOK"
-data-server listening on 127.0.0.1:50100        # 三机上用 0.0.0.0:50100,这行会显示 0.0.0.0
+data-server listening on 127.0.0.1:50100 (host <本机主机名>, 1 data root(s): /tmp/grove_case/data)        # 三机上用 0.0.0.0:50100,这行会显示 0.0.0.0 与存储机主机名
 $ ./grovefs meta-server --db-path /tmp/grove_case/data --listen 127.0.0.1:50110 --token "$TOK"
 meta-server listening on 127.0.0.1:50110 (base /tmp/grove_case/data, role Primary)
 $ ss -lntp | grep -E "5010|5011"
