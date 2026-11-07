@@ -1626,28 +1626,26 @@ bash .build-bin/vm_audit.sh        # 重启后拿一次全量复核
 
 ```
 $ git log --oneline -4
+f90ae9e fix(fuse): refuse content writes at first write(2) on content-ro mounts (§6-3)
 7aec76b docs(report): refresh §8 git snapshot for the §6-2 fix commit
 507e3f2 fix(du,sharded): announce damaged striped objects instead of silent under-report (§6-2)
 ca6c358 docs(report): refresh §8 git snapshot for §6-12/§6-2 commits
-20308e2 docs(du): describe striped chunk-loss behavior in byte-source note (§6-2 doc sync)
 
-$ git status --short            # §6-3 待提交形态（本段随 §6-3 commit 后再次刷新）
- M .build-bin/test_fork.sh      # 4b 段：非 strict fork 挂载 5 条断言
- M USAGE.md                     # 表(a) write 即拒 + set-ro 例外限定为经服务端挂载
- M docs.html                    # 同上
- M src/fs_impl.rs               # init() 按 content_ro 条件化 FUSE_WRITEBACK_CACHE
-?? .build-bin/repro_fork_fsync.sh   # §6-3 本机复现脚本（取证用，不入库）
-?? .build-bin/repro_setro_local.sh  # 本机 --home set-ro 口径探针（取证用，不入库）
-?? .build-bin/repro_du_damage.sh    # §6-2 本机端到端复现（取证用，不入库）
-?? （其余 vm_*.sh / gfs_provision.sh / probe_posix_lock.py 同上轮，均为未跟踪取证脚本）
+$ git show --stat f90ae9e       # §6-3 行为修复（init 按 content_ro 条件化 writeback + test_fork 4b + 表(a)/set-ro 口径文档 + 报告同步）
+ TEST_REPORT.md         | 76 ++++++++++++++++++++++++++++++++++++++++-----
+ USAGE.md               | 15 +++++-----
+ docs.html              | 26 ++++++++--------
+ src/fs_impl.rs         | 15 +++++++++-
+ .build-bin/test_fork.sh | 21 +++++++++++++
+ 5 files changed, 127 insertions(+), 46 deletions(-)
 
-$ git show --stat 507e3f2       # §6-2 行为修复（len_strict + du damaged 三档分类 + 文档/报告同步，已入库）
- TEST_REPORT.md       | 49 +++++++++++++++++++++++++++++-----------------
- USAGE.md             |  6 +++---
- docs.html            | 10 +++++-----
- src/backend/sharded.rs | 137 +++++++++++++++++++++++++++++++++++++++++++++++
- src/du.rs            | 102 ++++++++++++++++++++++++++-------------
- 5 files changed, 303 insertions(+), 101 deletions(-)
+$ git status --short            # 跟踪文件已全部入库，仅剩未跟踪的取证/编排脚本（本报告快照随 §6-3 commit 刷新）
+?? .build-bin/gfs_provision.sh
+?? .build-bin/probe_posix_lock.py
+?? .build-bin/repro_du_damage.sh      # §6-2 本机端到端复现（取证用，不入库）
+?? .build-bin/repro_fork_fsync.sh     # §6-3 本机复现（取证用，不入库）
+?? .build-bin/repro_setro_local.sh    # 本机 --home set-ro 口径探针（取证用，不入库）
+?? .build-bin/vm_audit.sh … vm_verify_striping.sh（其余 vm_* 同前几轮）
 ```
 
 改动逐项对应实测证据（无一项是无据声称）：
@@ -1665,7 +1663,7 @@ $ git show --stat 507e3f2       # §6-2 行为修复（len_strict + du damaged �
 
 | `src/backend/sharded.rs` | 本轮复核新增：`layout_server_count`（供 du 前置门控只约束有 `s<N>` 前缀的键）与 `chunk0_elsewhere`（用 `{uuid}#0` 归属确定性检出反序列列表）+ `order_verified` 零成本门控；新增 2 个单测 | §3.6.2（倒置列表由静默 `0B` 改为报错的实机回显）、§4.2（`a_reversed_server_list_is_reported_not_read_as_empty`、`an_empty_striped_object_still_measures_zero`） |
 | `src/fs_impl.rs` | 本轮修复 §5-3：新增 `posix_lock_fh_owner`/`posix_lock_owner_fds` 两表与 `note_posix_lock`/`drop_posix_lock_on_release`，`setlk` 授予时记账、`release` 末次锁定时全区间 Unlock 精确回收 POSIX 锁（不依赖内核不交的 `lock_owner`） | §3.2（根因+修复说明与实机 `GRANTED`/`2.74s` 唤醒回显）、§5-3行、§4.2（`tests/locks.rs` 11 passed） |
-| `src/fs_impl.rs` + `.build-bin/test_fork.sh`（§6-3，本轮待入库） | `init()` 协商 flags 按 `content_ro` 条件化 `FUSE_WRITEBACK_CACHE`：内容只读挂载不申请页缓存写回，追加/普通写的 `EROFS` 从 fsync 提前到首次 `write(2)` 即返，shell `>>` 无假成功；`test_fork.sh` 新增 4b 段（非 strict fork 挂载 5 条断言）固化该行为 | §3.4.4b（修复前后逐字对照 + 逐 open 探针）、§4.3（fork 套件 75/0、全板 GREEN logs/20261107-140349、bench 写 392.0 MB/s 无回归） |
+| `src/fs_impl.rs` + `.build-bin/test_fork.sh`（§6-3，已入库 `f90ae9e`） | `init()` 协商 flags 按 `content_ro` 条件化 `FUSE_WRITEBACK_CACHE`：内容只读挂载不申请页缓存写回，追加/普通写的 `EROFS` 从 fsync 提前到首次 `write(2)` 即返，shell `>>` 无假成功；`test_fork.sh` 新增 4b 段（非 strict fork 挂载 5 条断言）固化该行为 | §3.4.4b（修复前后逐字对照 + 逐 open 探针）、§4.3（fork 套件 75/0、全板 GREEN logs/20261107-140349、bench 写 392.0 MB/s 无回归） |
 | `.build-bin/test_locks.sh` | 本轮新增 §4c：跨进程 POSIX `fcntl` 整文件锁的 close 释放（新进程非阻塞加锁）+ 阻塞 `F_SETLKW` 唤醒延时两个回归用例 | 本地 `bash .build-bin/test_locks.sh` SUMMARY `pass=17 fail=0`（含新增两项），实机集群复验同结果 |
 | `.build-bin/probe_posix_lock.py` | 本轮新增：三机集群挂载点上的 §5-3 实机探针（holder close 后 asker、blocker 唤醒），取证用 | §3.2 实机回显（`ask:GRANTED`、`block:WAKE 2.74s`、`RESULT: PASS`） |
 
