@@ -88,9 +88,16 @@ pub fn run(opts: &DuOpts) -> io::Result<()> {
         root_id
     } else {
         find_by_path(&nodes, root_path.trim_matches('/'), root_id).ok_or_else(|| {
+            // Echo the normalized path actually searched (a leading `/` is added
+            // by normalize_path, so `docs` is looked up as `/docs`) and name the
+            // expected form, so a `path not found` reads as actionable rather
+            // than a bare string (§6-6).
             io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("path not found: {}", opts.path),
+                format!(
+                    "path not found: {} (resolved to '{}' from the view root; --path takes a view-relative path such as /<top-dir>/...)",
+                    opts.path, root_path
+                ),
             )
         })?
     };
@@ -221,7 +228,11 @@ fn gather_via_meta(
     use std::io::BufReader;
     use std::net::TcpStream;
 
-    let stream = TcpStream::connect(addr)?;
+    // Name the target so a refused/unreachable meta-server reads as
+    // "cannot reach meta-server 127.0.0.1:50053: Connection refused" rather
+    // than a bare errno (§5-12); the ErrorKind is preserved for callers.
+    let stream = TcpStream::connect(addr)
+        .map_err(|e| io::Error::new(e.kind(), format!("cannot reach meta-server {addr}: {e}")))?;
     stream.set_nodelay(true)?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;

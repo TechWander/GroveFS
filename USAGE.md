@@ -536,7 +536,7 @@ $ grovefs view --db-path $BASE define --name docsonly --base team --rules docson
 defined derived view 'docsonly' over base 'team': 0 hide, 1 only, 0 reloc rule(s)
 note: mounts of 'docsonly' are read-only (virtual shape) — write to base view 'team'
 $ grovefs view --db-path $BASE define --name team --base team --rules docsonly.rules   # 名与基同名
-Error: "derived view name must differ from its base"
+error: derived view name must differ from its base
 $ grovefs view --db-path $BASE list
 view 'docsonly' -> base 'team': 0 hide, 1 only, 0 reloc rule(s)
 
@@ -605,7 +605,7 @@ $ echo hello > /mnt/work/docs/2026/new.md   # 别名挂载可写,写入即真实
 $ ls /mnt_docs/docs/2026                    # 同一写经另一路派生名(docsonly)挂载穿透可见
 a.md new.md
 $ grovefs mount --view team -m /mnt/t --meta 10.0.0.5:50241 --data 10.0.0.5:50240
-Error: Custom { kind: PermissionDenied, error: "view 'team' is governed by an alias — mount the alias name instead (`grovefs view list` shows it)" }   # 直挂被治理的真实名:服务端拒挂(exit=1)
+error: view 'team' is governed by an alias — mount the alias name instead (`grovefs view list` shows it)   # 直挂被治理的真实名:服务端拒挂(exit=1)
 $ findmnt /mnt/work | tail -1
 /mnt/work grovefs:teamwork fuse rw,nosuid,nodev,relatime   # 别名可写;派生名的挂载行是 ro
 ```
@@ -622,10 +622,10 @@ alias 'teamwork2' -> real view 'team' (full tree, writable; 'team' not mountable
 $ grovefs mount --view teamwork -m /mnt/leak --meta 10.0.0.5:50241 --data 10.0.0.5:50240   # 拿旧泄露名再挂
 $ ls /mnt/leak          # 空:旧名不再解析到真实树(命名空间按需新建,数据不外泄)
 $ grovefs mount --view team -m /mnt/probe --meta 10.0.0.5:50241 --data 10.0.0.5:50240        # 猜真实名同样被拒(全程治理)
-Error: Custom { kind: PermissionDenied, error: "view 'team' is governed by an alias — mount the alias name instead (`grovefs view list` shows it)" }
+error: view 'team' is governed by an alias — mount the alias name instead (`grovefs view list` shows it)
 ```
 
-守卫(`alias` 命令处 fail-fast,layout 套件第 10/11 节 26 条断言):拒绝 `name == real`、拒绝遮蔽物理 `<name>.db`、拒绝目标是派生视图(别名只映射物理视图)、拒绝**别名链**(`--real` 指向另一个别名)、一个真实视图同时只允许一个对外名(`--retire` 轮换在同一条命令内先写后删,不受此约束卡住);`--retire` 还拒绝指向派生视图或不存在的别名(不会误删形状定义)。本地(`--home`)同契约:挂载先解析 `views/<name>.layout`,别名换名后照常挂载并打印 `alias view 'A' resolves to real view 'R' (full tree, writable)`;直挂被治理的真实名回 `Error: "view 'R' is governed by an alias — mount the alias name instead"`;`grovefs import --view A` 拒绝以别名为目标(别名不是存储身份,写出无人可读的影子 db)。实现事实:别名解析单跳、每 `M_OPEN` 重扫 `views/` 目录(挂载罕见事件,小目录全读比维护失效协议便宜);轮换/`rm` 只影响**新**挂载(已建立的旧名连接持续到老连接断开,与只读门同语义);被轮换掉的旧名落到按需新建的空命名空间,触不到真实树,故泄露无害;`meta/views/` 是普通文件,HA 备机随控制面库(`api_keys.db`/`refs.db`)手工同步;`grovefs view`/`import` 在存储机执行(操作服务端本地文件)。拒因**逐字节入协议**(`M_OPEN` 应答的 data 段带服务端原文),故远端拒挂真实名的回显与本地完全一致——上面两处 `view 'team' is governed by an alias …` 就是真实运行输出;同样精确的还有 token 不符、api key 缺失/无效/超范围/已撤销、视图绑定 key 拒开其它视图这些拒因(对接**老服务端**时 data 段为空,客户端才退回通用文案)。**轮换是名字治理(泄露止损),不是安全边界**:硬隔离仍靠 token+key——轮换只让旧的公开名不再通向真实树,并不能撤销一个已持有 token 者的既有访问。
+守卫(`alias` 命令处 fail-fast,layout 套件第 10/11 节 26 条断言):拒绝 `name == real`、拒绝遮蔽物理 `<name>.db`、拒绝目标是派生视图(别名只映射物理视图)、拒绝**别名链**(`--real` 指向另一个别名)、一个真实视图同时只允许一个对外名(`--retire` 轮换在同一条命令内先写后删,不受此约束卡住);`--retire` 还拒绝指向派生视图或不存在的别名(不会误删形状定义)。本地(`--home`)同契约:挂载先解析 `views/<name>.layout`,别名换名后照常挂载并打印 `alias view 'A' resolves to real view 'R' (full tree, writable)`;直挂被治理的真实名回 `error: view 'R' is governed by an alias — mount the alias name instead`;`grovefs import --view A` 拒绝以别名为目标(别名不是存储身份,写出无人可读的影子 db)。实现事实:别名解析单跳、每 `M_OPEN` 重扫 `views/` 目录(挂载罕见事件,小目录全读比维护失效协议便宜);轮换/`rm` 只影响**新**挂载(已建立的旧名连接持续到老连接断开,与只读门同语义);被轮换掉的旧名落到按需新建的空命名空间,触不到真实树,故泄露无害;`meta/views/` 是普通文件,HA 备机随控制面库(`api_keys.db`/`refs.db`)手工同步;`grovefs view`/`import` 在存储机执行(操作服务端本地文件)。拒因**逐字节入协议**(`M_OPEN` 应答的 data 段带服务端原文),故远端拒挂真实名的回显与本地完全一致——上面两处 `view 'team' is governed by an alias …` 就是真实运行输出;同样精确的还有 token 不符、api key 缺失/无效/超范围/已撤销、视图绑定 key 拒开其它视图这些拒因(对接**老服务端**时 data 段为空,客户端才退回通用文案)。**轮换是名字治理(泄露止损),不是安全边界**:硬隔离仍靠 token+key——轮换只让旧的公开名不再通向真实树,并不能撤销一个已持有 token 者的既有访问。
 
 ### 3.4.1 fork 视图:独立元数据树,结构可写、内容只读(`grovefs view fork`)
 
@@ -788,7 +788,7 @@ $ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protoc
 
 ```text
 $ grovefs view --db-path /tmp/gv graft --name lab --src team --map /tmp/gv/plan.tsv
-Error: "'A.md' already exists in the destination — rename it in the plan or pass --skip-existing"
+error: 'A.md' already exists in the destination — rename it in the plan or pass --skip-existing
 $ echo $?
 1
 
@@ -835,7 +835,7 @@ grafted 1 entry (0 directories) from 'team' into 'lab' at /: 1 shared object(s),
 
 ```text
 $ printf 'src/docs/2026/b.md\n' | grovefs view --db-path /tmp/gv graft --name team --map -
-Error: "'team' is a base view — pass --src to name the view its entries come from"
+error: 'team' is a base view — pass --src to name the view its entries come from
 
 $ printf 'notes/A.md\tfrom_lab/A.md\n' | grovefs view --db-path /tmp/gv graft --name team --src lab --map -
 grafted 2 entries (1 directory) from 'lab' into 'team' at /: 1 shared object(s), 0 skipped
@@ -849,12 +849,12 @@ note: the destination is a base view — content stays writable there; re-runnin
 
 | 情形 | 拒绝原文(逐字) |
 | --- | --- |
-| 目标已存在同名(未加 `--skip-existing`) | `Error: "'A.md' already exists in the destination — rename it in the plan or pass --skip-existing"` |
-| 目标名不存在 | `Error: "no tree for graft destination 'ghost' in /tmp/gv (local files) — create it first (…)"` |
-| 目标/源是派生透镜 | `Error: "graft destination 'lens' is a derived lens: it renders another tree read-only and owns no nodes — use a base view or a fork"` |
-| 目标/源是纯别名 | `Error: "graft destination 'pub' is an alias of 'team' — use 'team' (an alias has no tree of its own)"` |
-| 计划为空(只有注释/空行) | `Error: "empty graft plan — one '<src>' or '<src>TAB<dst>' line per entry (blank lines and '#' comments are ignored)"` |
-| 源路径在当前源视图里不存在 | `Error: "'src/docs/nope.md' does not exist in view 'team'"`(整份计划**一行不落**) |
+| 目标已存在同名(未加 `--skip-existing`) | `error: 'A.md' already exists in the destination — rename it in the plan or pass --skip-existing` |
+| 目标名不存在 | `error: no tree for graft destination 'ghost' in /tmp/gv (local files) — create it first (…)` |
+| 目标/源是派生透镜 | `error: graft destination 'lens' is a derived lens: it renders another tree read-only and owns no nodes — use a base view or a fork` |
+| 目标/源是纯别名 | `error: graft destination 'pub' is an alias of 'team' — use 'team' (an alias has no tree of its own)` |
+| 计划为空(只有注释/空行) | `error: empty graft plan — one '<src>' or '<src>TAB<dst>' line per entry (blank lines and '#' comments are ignored)` |
+| 源路径在当前源视图里不存在 | `error: 'src/docs/nope.md' does not exist in view 'team'`(整份计划**一行不落**) |
 
 **同一个能力的 MCP 入口**(`graft_view` 的 `map` 直接传计划文本,`\t` 是 TAB):
 
@@ -1019,7 +1019,7 @@ Revoke later with: grovefs apikey --db-path $HOME_DIR revoke --id 06fc0287c1464b
 $ grovefs apikey --db-path $HOME_DIR create --label laptop-alice --for mount
   id:    aac1f51a0d5641ddaa8dbb83dc1cf646   scope: mount   key: aac1f51a...:a5d5450a...
 $ grovefs apikey --db-path $HOME_DIR create --label x --for both
-Error: "unknown api key scope 'both' (expected any|mcp|mount)"      # exit=1
+error: unknown api key scope 'both' (expected any|mcp|mount)      # exit=1
 
 # 2b) 视图绑定 + 只读的 key(访问控制维度)
 $ grovefs apikey --db-path $HOME_DIR create --label reader --for mount --view alice --ro
@@ -1031,7 +1031,7 @@ apikey created — shown ONCE (only its SHA-256 is stored; save it now):
   rw:    ro (read-only)
   key:   7c0e...:…(64 hex secret)     # 只能挂 view alice,写一律被服务端拒
 $ grovefs mount --view bob -m /mnt/b --meta ... --data ... --api-key "$READER_KEY"   # 挂别的视图
-Error: ... "permission denied: this api key is bound to view 'alice', not 'bob'"    # M_OPEN 处 E_AUTH
+error: permission denied: this api key is bound to view 'alice', not 'bob'    # M_OPEN 处 E_AUTH
 $ mkdir /mnt/a/should_fail                                                          # alice 的只读 key
 bash: /mnt/a/should_fail: 只读文件系统                                               # 据握手标志落内核只读;服务端另逐写拒 E_NOTPERM/EROFS
 
@@ -1066,15 +1066,15 @@ data-server: api-key auth REQUIRED (present `mount --api-key`, minted by `grovef
 
 # 5) 客户端拿各种坏凭据去挂:拒因逐字节的原文回到本地 stderr(退出码 1,不留脏挂载)
 $ grovefs mount --view alice -m /mnt/a --meta ... --data ...                      # 不带 key
-Error: Custom { kind: PermissionDenied, error: "no api key presented: this server requires one (pass `mount --api-key ID:SECRET` or export GROVEFS_API_KEY; mint with `grovefs apikey create --for mount`)" }
+error: no api key presented: this server requires one (pass `mount --api-key ID:SECRET` or export GROVEFS_API_KEY; mint with `grovefs apikey create --for mount`)
 $ grovefs mount --view alice -m /mnt/a --meta ... --data ... --api-key "aac1f51a...:deadbeef"
-Error: Custom { kind: PermissionDenied, error: "authentication failed: invalid api key secret" }
+error: authentication failed: invalid api key secret
 $ grovefs mount --view alice -m /mnt/a --meta ... --data ... --api-key "00000000...:whatever"
-Error: Custom { kind: PermissionDenied, error: "authentication failed: unknown api key id" }
+error: authentication failed: unknown api key id
 $ grovefs mount --view alice -m /mnt/a --meta ... --data ... --api-key "no-colon-here"
-Error: Custom { kind: PermissionDenied, error: "malformed api key (expected '<id>:<secret>')" }
+error: malformed api key (expected '<id>:<secret>')
 $ grovefs mount --view alice -m /mnt/a --meta ... --data ... --api-key "$MCP_KEY"   # 拿治理 key 来挂
-Error: Custom { kind: PermissionDenied, error: "authentication failed: this api key is scoped to 'mcp', not 'mount'" }
+error: authentication failed: this api key is scoped to 'mcp', not 'mount'
 #   反方向同样被拒:把 mount key 塞进 MCP initialize 的 apiKey,tools/list 回 -32001,
 #   且这条跨入口尝试同样被审计成 scope 拒因。
 
@@ -1150,9 +1150,9 @@ $Y mount --view alice \
 > ```text
 > meta-server: views are created explicitly — M_OPEN refuses a name with no existing tree or definition …; no empty tree is ever auto-created
 > $ grovefs mount --view typo1 --meta 10.0.0.5:50110 --data 10.0.0.5:50100 -m /mnt/t
-> Error: … "view 'typo1' does not exist on this meta-server (sqlite): no tree and no definition —
+> error: view 'typo1' does not exist on this meta-server (sqlite): no tree and no definition —
 >   views are created explicitly, so unknown names are refused instead of becoming an empty tree;
->   create it first: `grovefs view --db-path <db-path> create --view <name>` …"
+>   create it first: `grovefs view --db-path /data/cluster create --view typo1` …
 > meta: M_OPEN view='typo1' refused: …                          # 服务端日志
 > $ ls /data/cluster/meta | grep typo1                          # 空:没有 typo1.db,也没有 -wal/-shm
 > ```
@@ -2731,7 +2731,7 @@ $G umount -m /mnt/demo
 
 # 2) CLI 删不了 PG 里的树——它只认本地 meta/<view>.db(实测原文):
 $G view --db-path /data/cluster rm --name demo
-#   Error: "no view definition 'demo' under /data/cluster/meta/views"
+#   error: no view definition 'demo' under /data/cluster/meta/views
 
 # 3) 手工 DROP(schema 名 = grovefs_v_ + hex(视图名))
 sudo -u postgres psql -d grovefs -c 'DROP SCHEMA "grovefs_v_64656d6f" CASCADE'
@@ -2899,7 +2899,7 @@ $G meta-server --listen 0.0.0.0:50110
 | 你看到 | 真实原因 | 去哪儿处理 |
 | --- | --- | --- |
 | 客户端 `Input/output error` + `background mount exited (exit status: 1)` | 服务端在 `M_OPEN` 里**解析不出**这棵视图（PG 下名字超 25 字节、元数据库损坏等）。注意：**名字不存在不属于这一类**，那会在握手处收到可读拒绝，不建树 | 看 meta-server 日志的最后一条 `M_OPEN view='…' resolve failed: …`；key 类拒绝不走 EIO，会直接回可读原因 |
-| `Error: … "view 'x' does not exist on this meta-server (sqlite/postgres): … views are created explicitly …"` | 视图名还没有树/定义,服务端拒绝未创建的视图名(任何情况下都不会自建) | §4：先建后挂(SQLite `view create --view x` / `init` / `view import`；PG `view create --store postgres://… --view x`) |
+| `error: view 'x' does not exist on this meta-server (sqlite/postgres): … views are created explicitly …` | 视图名还没有树/定义,服务端拒绝未创建的视图名(任何情况下都不会自建) | §4：先建后挂(SQLite `view create --view x` / `init` / `view import`；PG `view create --store postgres://… --view x`) |
 | 挂载**成功**了，但目录是空的 | 视图确实存在,但树里还没有内容——例如刚 `view create` 的空树,或历史上手工遗留的空树 | `ls meta/` 确认；建错了就按 §15.8 清掉重来 |
 | `no physical base tree … cannot be forked` | 在 PG 后端下跑 `view fork` | §15.13 换派生视图/别名 |
 | `no view definition '<v>' under …/views` | 在 PG 下用 CLI 删视图 | §15.8 手工 `DROP SCHEMA` |

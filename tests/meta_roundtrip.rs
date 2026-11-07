@@ -312,8 +312,8 @@ fn mount_of_unknown_view_is_refused_without_creating_it() {
         "reason must say views are explicit: {msg}"
     );
     assert!(
-        msg.contains("create --view <name>"),
-        "reason must name the way to create it: {msg}"
+        msg.contains("create --view ghost"),
+        "reason must name the way to create it with the concrete view name: {msg}"
     );
     assert!(
         !base.join("meta/ghost.db").exists(),

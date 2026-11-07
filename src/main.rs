@@ -1221,7 +1221,21 @@ fn load_view_aliases(base: &Path) -> HashMap<String, String> {
     out
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
+    // Rust's default `Termination` for `fn main() -> Result<(), Box<dyn Error>>`
+    // prints the Err via Debug, so a failed operation surfaced as
+    // `Error: Os { code: 111, kind: ConnectionRefused, message: .. }` and a
+    // `String`/`to_string` error came out wrapped in quotes
+    // (`Error: "..."`). Neither is readable or greppable (§5-12). Route every
+    // fatal error through Display with a stable `error: ` prefix, matching
+    // clap's own stderr wording, and preserve the non-zero exit status.
+    if let Err(e) = real_main() {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn real_main() -> Result<(), Box<dyn std::error::Error>> {
     load_config_file();
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -1995,7 +2009,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     let rm = meta::remove_base_view(&vbase, &name)?;
                     let droot = data_root.unwrap_or_else(|| vbase.clone());
-                    let backend = backend::open_local(&droot)?;
+                    // The metadata tree is already gone at this point, so a bare
+                    // io error from opening the data root would leave the user
+                    // with no clue that the objects are now orphans (§5-4/§6-4).
+                    // Name the root and point at `gc`, which reclaims exactly this
+                    // "tree deleted, bytes unreleased" state once the root is usable.
+                    let backend = backend::open_local(&droot).map_err(|e| format!(
+                        "cannot open data root {} to free view '{}' objects: {}. The metadata tree meta/'{}'.db was already removed, so its now-unreferenced bytes are orphans; once the root is writable, reclaim them offline with `grovefs gc --db-path {} --data-root {}` (add --apply to delete) — re-running the rm will not re-touch them",
+                        droot.display(),
+                        name,
+                        e,
+                        name,
+                        vbase.display(),
+                        droot.display()
+                    ))?;
                     let (mut freed, mut stayed, mut missing, mut failed) =
                         (0usize, 0usize, 0usize, 0usize);
                     for dr in &rm.blob_refs {

@@ -1747,7 +1747,7 @@ $ grovefs view --db-path $BASE define --name docsonly --base team --rules docson
 defined derived view 'docsonly' over base 'team': 0 hide, 1 only, 0 reloc rule(s)
 note: mounts of 'docsonly' are read-only (virtual shape) — write to base view 'team'
 $ grovefs view --db-path $BASE define --name team --base team --rules docsonly.rules   <span class="cmt"># 名与基同名</span>
-Error: "derived view name must differ from its base"
+error: derived view name must differ from its base
 $ grovefs view --db-path $BASE list
 view 'docsonly' -> base 'team': 0 hide, 1 only, 0 reloc rule(s)
 
@@ -1799,9 +1799,9 @@ $ grovefs mount --view teamwork -m /mnt/work --meta 10.0.0.5:50241 --data 10.0.0
 mounting view 'teamwork' at /mnt/work (fully remote: no local store)
 $ echo hello &gt; /mnt/work/docs/2026/new.md   <span class="cmt"># 别名写入即真实树，经派生名挂载穿透可见</span>
 $ grovefs mount --view team -m /mnt/t --meta 10.0.0.5:50241 --data 10.0.0.5:50240   <span class="cmt"># 直挂被治理的真实名：服务端拒挂</span>
-Error: Custom { kind: PermissionDenied, error: "view 'team' is governed by an alias — mount the alias name instead (`grovefs view list` shows it)" }
+error: view 'team' is governed by an alias — mount the alias name instead (`grovefs view list` shows it)
 $ grovefs --home $BASE mount --view team -m /mnt/t   <span class="cmt"># 本地同契约</span>
-Error: "view 'team' is governed by an alias — mount the alias name instead (`grovefs view list` shows it)"
+error: view 'team' is governed by an alias — mount the alias name instead (`grovefs view list` shows it)
 $ findmnt /mnt/work | tail -1   <span class="cmt"># 别名 rw；派生名的挂载行是 ro</span></code></pre>
     <p class="lead">公开名泄露后，<b>一条 <code>--retire</code> 命令原子轮换</b>(先写新名再删旧名，真实名全程不可直挂、无裸露窗口；视图绑定 / 只读 key 按名签发，不随真实名轮换)：</p>
     <pre><code>$ grovefs view --db-path $BASE alias --name teamwork2 --real team --retire teamwork   <span class="cmt"># 'teamwork' 已泄露，换成 'teamwork2'</span>
@@ -1907,23 +1907,23 @@ forked view 'lab' from base 'team' as an EMPTY tree: root only, nothing copied
 $ grovefs view --db-path /tmp/gv graft --name lab --src team --map plan.tsv
 grafted 13 entries (8 directories) from 'team' into 'lab' at /: 5 shared object(s), 0 skipped
 $ grovefs view --db-path /tmp/gv graft --name lab --src team --map plan.tsv     <span class="cmt"># 重跑同一份计划：无 --skip-existing 时首个冲突就整份回滚</span>
-Error: "'A.md' already exists in the destination — rename it in the plan or pass --skip-existing"
+error: 'A.md' already exists in the destination — rename it in the plan or pass --skip-existing
 $ grovefs view --db-path /tmp/gv graft --name lab --src team --map plan.tsv --skip-existing
 grafted 0 entries (0 directories) from 'team' into 'lab' at /: 0 shared object(s), 5 skipped</code></pre>
     <pre><code><span class="cmt"># 目标是裸基视图：省略 --src 直接拒；显式 --src 就能反向接枝</span>
 $ printf 'src/docs/2026/b.md\n' | grovefs view graft --name team --map -
-Error: "'team' is a base view — pass --src to name the view its entries come from"
+error: 'team' is a base view — pass --src to name the view its entries come from
 $ printf 'notes/A.md\tfrom_lab/A.md\n' | grovefs view graft --name team --src lab --map -
 grafted 2 entries (1 directory) from 'lab' into 'team' at /: 1 shared object(s), 0 skipped
 note: the destination is a base view — content stays writable there; ...</code></pre>
     <table>
       <tr><th>情形</th><th>拒绝原文（逐字）</th></tr>
-      <tr><td>目标已存在同名（未加 <code>--skip-existing</code>）</td><td><code>Error: "'A.md' already exists in the destination — rename it in the plan or pass --skip-existing"</code></td></tr>
-      <tr><td>目标名不存在</td><td><code>Error: "no tree for graft destination 'ghost' in /tmp/gv (local files) — create it first (…)"</code></td></tr>
-      <tr><td>目标/源是派生透镜</td><td><code>Error: "graft destination 'lens' is a derived lens: it renders another tree read-only and owns no nodes — use a base view or a fork"</code></td></tr>
-      <tr><td>目标/源是纯别名</td><td><code>Error: "graft destination 'pub' is an alias of 'team' — use 'team' (an alias has no tree of its own)"</code></td></tr>
-      <tr><td>计划为空（只有注释/空行）</td><td><code>Error: "empty graft plan — one '&lt;src&gt;' or '&lt;src&gt;TAB&lt;dst&gt;' line per entry (blank lines and '#' comments are ignored)"</code></td></tr>
-      <tr><td>源路径在当前源视图里不存在</td><td><code>Error: "'src/docs/nope.md' does not exist in view 'team'"</code>（整份计划<b>一行不落</b>）</td></tr>
+      <tr><td>目标已存在同名（未加 <code>--skip-existing</code>）</td><td><code>error: 'A.md' already exists in the destination — rename it in the plan or pass --skip-existing</code></td></tr>
+      <tr><td>目标名不存在</td><td><code>error: no tree for graft destination 'ghost' in /tmp/gv (local files) — create it first (…)</code></td></tr>
+      <tr><td>目标/源是派生透镜</td><td><code>error: graft destination 'lens' is a derived lens: it renders another tree read-only and owns no nodes — use a base view or a fork</code></td></tr>
+      <tr><td>目标/源是纯别名</td><td><code>error: graft destination 'pub' is an alias of 'team' — use 'team' (an alias has no tree of its own)</code></td></tr>
+      <tr><td>计划为空（只有注释/空行）</td><td><code>error: empty graft plan — one '&lt;src&gt;' or '&lt;src&gt;TAB&lt;dst&gt;' line per entry (blank lines and '#' comments are ignored)</code></td></tr>
+      <tr><td>源路径在当前源视图里不存在</td><td><code>error: 'src/docs/nope.md' does not exist in view 'team'</code>（整份计划<b>一行不落</b>）</td></tr>
     </table>
     <p class="lead"><b>规则</b>：路径相对各自视图的根，<code>..</code> 直接拒（计划是数据，不许越界）；<b>整份计划一个事务</b>—— 任一行坏则一行不落。<b>字节零复制</b>：接进来的名字与源视图指向同一个对象，<code>refs.db</code> 多记一个 holder，两边各自删名字、最后一个持有者才回收（<a href="#i-fork-ledger">四步账本实测</a>）；源里共用 inode 的名字接进来仍是同一个 inode（号会换成新分配的）。<b>能/不能</b>：一次调用一个 <code>--src</code>（多个源就多次调用，各自原子）；不能借接枝改字节（目标是 fork 时内容仍 <code>EROFS</code>，接进基视图则基视图照常可写）；派生/别名不能当源或目标；PG 后端暂不支持（与 fork 同因）。</p>
 
@@ -2020,7 +2020,7 @@ $ while IFS=$'&#9;' read -r old new; do printf 'raw/2025-06/%s\timages/%s\n' "$o
     <p class="lead"><code>--dest D</code> 给<b>每一行</b>的落点再套一层 <code>D/</code>（只改「放哪」，不改名字）；<code>--skip-existing</code> 把冲突从「拒掉整份计划」变成「<b>已存在的目录合并、同名文件跳过</b>」，于是一份整理脚本可以反复跑、只补新条目——这就是「今天先搭骨架、明天再加几块」的增量做法：</p>
     <pre><code><span class="cmt"># 不带 --skip-existing 重跑同一份计划 → 首个冲突就整份回滚，一行不落</span>
 $ grovefs --home $GV view --db-path $GV graft --name lab --map plan.tsv
-Error: "'M31_2025-06.fits' already exists in the destination — rename it in the plan or pass --skip-existing"
+error: 'M31_2025-06.fits' already exists in the destination — rename it in the plan or pass --skip-existing
 <span class="cmt"># 带 --skip-existing → 8 个已存在的都跳过，骨架保住，目录合并</span>
 $ grovefs --home $GV view --db-path $GV graft --name lab --map plan.tsv --skip-existing
 grafted 0 entries (0 directories) from 'team' into 'lab' at /: 0 shared object(s), 8 skipped
@@ -2136,14 +2136,14 @@ apikey created — shown ONCE (only its SHA-256 is stored; save it now):
   scope: mount
   key:   aac1f51a0d5641ddaa8dbb83dc1cf646:a5d5450a7cf4...(64 hex secret)
 $ grovefs apikey --db-path $BASE create --label x --for both   <span class="cmt"># 打错一个词不静默放宽权限</span>
-Error: "unknown api key scope 'both' (expected any|mcp|mount)"
+error: unknown api key scope 'both' (expected any|mcp|mount)
 $ grovefs meta-server --db-path $BASE --listen 0.0.0.0:50110 --require-api-key
 meta-server: api-key auth REQUIRED (present `mount --api-key`, minted by `grovefs apikey create --for mount|any`); a revoke closes live mounts on their next op
 <span class="cmt"># 拒因逐字节随握手回传(不只是一个错误码):</span>
 $ grovefs mount --view alice -m /mnt/a --meta ... --data ...                    <span class="cmt"># 不带 key</span>
-Error: Custom { kind: PermissionDenied, error: "no api key presented: this server requires one (pass `mount --api-key ID:SECRET` or export GROVEFS_API_KEY; mint with `grovefs apikey create --for mount`)" }
+error: no api key presented: this server requires one (pass `mount --api-key ID:SECRET` or export GROVEFS_API_KEY; mint with `grovefs apikey create --for mount`)
 $ grovefs mount --view alice -m /mnt/a --meta ... --data ... --api-key "$MCP_KEY"  <span class="cmt"># 拿治理 key 来挂</span>
-Error: Custom { kind: PermissionDenied, error: "authentication failed: this api key is scoped to 'mcp', not 'mount'" }
+error: authentication failed: this api key is scoped to 'mcp', not 'mount'
 $ grovefs apikey --db-path $BASE calls --limit 6   <span class="cmt"># 挂载连接与治理调用同表审计</span>
 ts                            key_id                              method  tool    ok  detail
 ...                           aac1f51a0d5641ddaa8dbb83dc1cf646     meta    M_OPEN  yes  view='alice' uid=1005
@@ -2823,7 +2823,7 @@ $Y mount --view alice --data ... --meta ... --api-key '&lt;id&gt;:&lt;secret&gt;
 $Y apikey --db-path /data/cluster calls --limit 20   <span class="cmt"># 每次挂载连接(含被拒)都归属到具体 key</span>
 $Y apikey --db-path /data/cluster revoke --id &lt;id&gt;   <span class="cmt"># 封停该 key 的活挂载(秒级)</span>
 $Y mount --view bob --data ... --meta ... --api-key '&lt;reader key&gt;'   <span class="cmt"># 绑定 alice 的 key 挂 bob</span>
-Error: ... "permission denied: this api key is bound to view 'alice', not 'bob'"   <span class="cmt"># 视图绑定 key 开其它视图即拒</span>
+error: permission denied: this api key is bound to view 'alice', not 'bob'   <span class="cmt"># 视图绑定 key 开其它视图即拒</span>
 $ mkdir &lt;ro key 挂载点&gt;/x   <span class="cmt"># --ro key 的挂载写一律被服务端拒，客户端据握手标志落内核只读</span>
 bash: ... Read-only file system</code></pre>
     <p>与 token 的两处关键差异：① <b>拒因逐字节随握手回客户端</b>(缺失 key/未知 id/密文不符/格式不符(缺冒号)/scope 不符/已撤销各自成文),且服务端<b>每秒复证活连接</b>——撤销后该挂载在首个服务端往返上被打断、打印服务端原文并<b>干净自卸载</b>(不留下 <code>Transport endpoint is not connected</code>),其他 key 的挂载不受影响；② 挂载连接与治理调用同表可审计。<code>--token</code> 与 <code>--require-api-key</code> 可同时开(两道都得过)；不开时行为与不设门完全一致(仍落审计)。两面门都是 <b>opt-in</b>；<code>data-server --keys-from</code> 缺省取它的<b>首个 <code>--root</code></b>(同机部署免参,分盘部署必须指对——指向空 key 库则 fail-closed、所有挂载被拒)。详细回显与诚实边界见 <a href="#customize">§12.9.1</a> 与 <a href="USAGE.md">USAGE.md §3.5.1/§6</a>。</p>

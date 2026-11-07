@@ -645,7 +645,15 @@ impl RemoteMeta {
                             Err(e) => last_err = e,
                         }
                     }
-                    Err(e) => last_err = e,
+                    Err(e) => {
+                        // Name the unreachable meta-server so a mount that fails
+                        // fast on a dead primary reads as "cannot reach
+                        // meta-server <addr>: Connection refused" instead of a
+                        // bare errno (§5-12); ErrorKind is preserved for the
+                        // failover/retry logic above.
+                        last_err =
+                            io::Error::new(e.kind(), format!("cannot reach meta-server {addr}: {e}"))
+                    }
                 }
                 if attempt + 1 < self.connect_retries {
                     thread::sleep(self.reconnect_backoff);

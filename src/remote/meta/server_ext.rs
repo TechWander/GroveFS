@@ -1276,10 +1276,15 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
     let why = match view_exists(&rt, &view) {
         Ok(true) => String::new(),
         Ok(false) => {
+            // Fill the placeholders with the concrete store root and the real
+            // view name, so a remote operator gets a command they can paste on
+            // the meta-server host rather than `--db-path <db-path> --view
+            // <name>` (which they must mentally expand) (§6-5).
+            let root = rt.base.display();
             let hint = if rt.control.backend() == "postgres" {
-                "a PG base view is a schema: create it first with `grovefs view --store postgres://… --db-path <db-path> create --view <name>`, or restore the schema from a dump"
+                format!("a PG base view is a schema: create it first with `grovefs view --store postgres://… --db-path {root} create --view {view}`, or restore the schema from a dump")
             } else {
-                "create it first: `grovefs view --db-path <db-path> create --view <name>` (or `grovefs --home <db-path> init --view <name>`, or seed it with `grovefs view import`)"
+                format!("create it first: `grovefs view --db-path {root} create --view {view}` (or `grovefs --home {root} init --view {view}`, or seed it with `grovefs view import`)")
             };
             // `view` is the POST-ALIAS real name; name the alias the caller
             // actually mounted too, so "pub does not exist" never reads as
