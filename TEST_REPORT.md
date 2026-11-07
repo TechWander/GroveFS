@@ -1569,25 +1569,23 @@ bash .build-bin/vm_audit.sh        # 重启后拿一次全量复核
 
 ```
 $ git log --oneline -4
+507e3f2 fix(du,sharded): announce damaged striped objects instead of silent under-report (§6-2)
+ca6c358 docs(report): refresh §8 git snapshot for §6-12/§6-2 commits
 20308e2 docs(du): describe striped chunk-loss behavior in byte-source note (§6-2 doc sync)
 50f1564 docs(cli): add two ops-semantics tables (§6-12)
-07e24d8 fix(cli,stats): clarify gc and --stats output (§6-8/§6-9)
-74c765b fix(mcp): refuse aliases whose target has no physical view tree (§5-10)
 
-$ git show --stat 50f1564       # §6-12 两张运维语义表（已入库，纯文档）
- TEST_REPORT.md | 37 +++++++++++++++++++++++--------------
- USAGE.md       | 28 ++++++++++++++++++++++++++++
- docs.html      | 40 ++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 86 insertions(+), 19 deletions(-)
-
-$ git show --stat 20308e2       # §6-2 文档同步子项（du 字节来源说明补条带分块丢失行为，已入库）
- TEST_REPORT.md | 19 +++++++------------
- docs.html      |  2 +-
- 2 files changed, 16 insertions(+), 19 deletions(-)
+$ git show --stat 507e3f2       # §6-2 行为修复（len_strict + du damaged 三档分类 + 文档/报告同步，已入库）
+ TEST_REPORT.md       | 49 +++++++++++++++++++++++++++++-----------------
+ USAGE.md             |  6 +++---
+ docs.html            | 10 +++++-----
+ src/backend/sharded.rs | 137 +++++++++++++++++++++++++++++++++++++++++++++++
+ src/du.rs            | 102 ++++++++++++++++++++++++++-------------
+ 5 files changed, 303 insertions(+), 101 deletions(-)
 
 $ git status --short            # 跟踪文件已全部入库，仅剩未跟踪的取证/编排脚本（本报告快照随最后一次内容改动一起提交）
 ?? .build-bin/gfs_provision.sh
 ?? .build-bin/probe_posix_lock.py
+?? .build-bin/repro_du_damage.sh
 ?? .build-bin/vm_audit.sh
 ?? .build-bin/vm_battery_1.sh
 ?? .build-bin/vm_battery_2.sh
