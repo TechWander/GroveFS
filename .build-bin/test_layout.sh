@@ -304,7 +304,7 @@ T sh -c "printf 'rw' > .ltest/mnt_ra/docs/2026/ralias.md" && ok "remote alias mo
 $Y mount --view team -m .ltest/mnt_rr --meta $META2 --data $DATA2 --foreground > .ltest/rr.log 2>&1 &
 RRP=$!
 sleep 1.5
-[ ! -d .ltest/mnt_rr/docs ] && grep -qiE "rejected|refused|Permission|denied|token" .ltest/rr.log \
+[ ! -d .ltest/mnt_rr/docs ] && grep -qiE "rejected|refused|Permission|denied|token|governed by an alias|mount the alias name" .ltest/rr.log \
   && ok "meta-server refuses mounts of the governed real name" || bad "real name mounted remotely: $(cat .ltest/rr.log)"
 kill $RRP 2>/dev/null; wait $RRP 2>/dev/null
 # writes through the alias are the real tree: a fresh alias mount sees them
@@ -317,7 +317,7 @@ $Y view --db-path .ltest/home alias --name pubr --real team --retire pub > .ltes
 # right after rotation the real name is STILL refused (governed by pubr) — zero window
 $Y mount --view team -m .ltest/mnt_rr --meta $META2 --data $DATA2 --foreground > .ltest/rr3.log 2>&1 &
 RR3=$!; sleep 1.5
-[ ! -d .ltest/mnt_rr/docs ] && grep -qiE "token|denied|permission|refus" .ltest/rr3.log \
+[ ! -d .ltest/mnt_rr/docs ] && grep -qiE "token|denied|permission|refus|governed by an alias|mount the alias name" .ltest/rr3.log \
   && ok "remote: real name stays refused across the rotation (no gap)" || bad "gap during rotation: $(cat .ltest/rr3.log)"
 kill $RR3 2>/dev/null; wait $RR3 2>/dev/null
 # the rotated name serves the full tree

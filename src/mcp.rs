@@ -485,8 +485,13 @@ impl ControlStore for FileControlStore {
         Ok(if self.db(view).is_file() {
             None
         } else {
+            // Name the concrete tree path the caller is missing rather than a
+            // `<db-path>` placeholder, so the note is copy-paste actionable and
+            // tells the user exactly which file `init`/`create` must produce (§6-5).
             Some(format!(
-                "note: no local <db-path>/meta/{view}.db yet — create it with `grovefs --home ... init --view {view}` (or `view create`) first"
+                "note: no local tree {} yet — create it with `grovefs --home {} init --view {view}` (or `view create`) first",
+                self.db(view).display(),
+                self.base.display()
             ))
         })
     }
@@ -1231,23 +1236,33 @@ pub fn list_views(store: &dyn ControlStore) -> Result<StoreViews, String> {
 /// answers "what views exist here, and what is each one?").
 pub fn list_views_text(store: &dyn ControlStore) -> Result<Vec<OutLine>, String> {
     let s = list_views(store)?;
-    let mut out = Vec::new();
-    if s.defined.is_empty() {
-        out.push(OutLine::Info(format!(
-            "no view definitions in the control plane store {} (every view name maps to its own tree)",
-            store.describe()
-        )));
-    }
-    for e in &s.defined {
-        out.push(OutLine::Info(entry_line(e)));
-    }
     // Bare base views: physical trees with NO definition slot. A defined name
-    // is reported above (a fork's own db is its tree, not a separate base).
+    // is reported below (a fork's own db is its tree, not a separate base).
+    // Computed first so the "no definitions" note can't contradict the base
+    // view lines that immediately follow it (§6-1).
     let bare: Vec<&String> = s
         .physical
         .iter()
         .filter(|p| !s.defined.iter().any(|e| &e.name == *p))
         .collect();
+    let mut out = Vec::new();
+    if s.defined.is_empty() {
+        out.push(OutLine::Info(if bare.is_empty() {
+            format!(
+                "no view definitions in the control plane store {} (every view name maps to its own tree)",
+                store.describe()
+            )
+        } else {
+            format!(
+                "no alias/fork/lens definitions in {} — the {} base view(s) below each map to their own tree",
+                store.describe(),
+                bare.len()
+            )
+        }));
+    }
+    for e in &s.defined {
+        out.push(OutLine::Info(entry_line(e)));
+    }
     for p in bare {
         out.push(OutLine::Info(format!(
             "base view '{p}' -> own tree meta/{p}.db (read-write; deletes free a shared object only when no view holds it)"

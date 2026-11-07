@@ -348,7 +348,7 @@ $ grovefs view --db-path .demo5/home define --name docsonly --base team --rules 
 defined derived view 'docsonly' over base 'team': 0 hide, 1 only, 0 reloc rule(s)
 note: mounts of 'docsonly' are read-only (virtual shape) — write to base view 'team'
 $ grovefs view --db-path .demo5/home define --name team --base team --rules .demo5/docsonly.rules   # 名与基同名
-Error: "derived view name must differ from its base"
+error: derived view name must differ from its base
 $ grovefs view --db-path .demo5/home list
 view 'docsonly' -> base 'team': 0 hide, 1 only, 0 reloc rule(s)
 
@@ -394,9 +394,9 @@ defined pure alias 'teamwork' -> real view 'team'
 note: 'team' is no longer a mount entry point while this definition exists (mounts by its real name are refused, locally and via meta-server); alias mounts show the FULL tree and are WRITABLE
 $ grovefs mount --view teamwork -m /mnt/work --meta 10.0.0.5:50241 --data 10.0.0.5:50240   # 全树、可写
 $ grovefs mount --view team -m /mnt/t --meta 10.0.0.5:50241 --data 10.0.0.5:50240          # 直挂真实名被拒
-Error: Custom { kind: PermissionDenied, error: "view 'team' is governed by an alias — mount the alias name instead (`grovefs view list` shows it)" }
+error: view 'team' is governed by an alias — mount the alias name instead (`grovefs view list` shows it)
 $ grovefs --home $BASE mount --view team -m /mnt/t                                        # 本地同契约
-Error: "view 'team' is governed by an alias — mount the alias name instead (`grovefs view list` shows it)"
+error: view 'team' is governed by an alias — mount the alias name instead (`grovefs view list` shows it)
 ```
 
 公开名泄露后，**一条 `--retire` 命令原子轮换**（先写新名再删旧名，真实名全程被治理、无裸露窗口；视图绑定 key 记在真实名上，对别名与基名同时生效，故轮换公开名不需重铸 key）：
@@ -455,9 +455,9 @@ grafted 5 entries (3 directories) from 'team' into 'lab' at /staging: 2 shared o
 note: bytes were not copied — every grafted name holds the same object as its source; the object is freed only when no view names it anymore
 note: content stays read-only in a fork (EROFS); re-running the same plan with --skip-existing merges into what is already there
 $ grovefs view --db-path $BASE graft --name lab --src team --map plan.tsv --dest staging   # 同名再跑 → 整份拒绝
-Error: "'docs' already exists in the destination — rename it in the plan or pass --skip-existing"
+error: 'docs' already exists in the destination — rename it in the plan or pass --skip-existing
 $ grovefs view --db-path $BASE graft --name team --map plan.tsv   # 基视图不接受接枝
-Error: "'team' is a base view — pass --src to name the view its entries come from"
+error: 'team' is a base view — pass --src to name the view its entries come from
 ```
 
 ## 智能体定制数据列表：MCP 接口（`grovefs mcp`）
@@ -530,21 +530,21 @@ apikey created — shown ONCE (only its SHA-256 is stored; save it now):
 
 # 用绑定/只读 key 挂别的视图 / 写数据都被拒（无需任何按 uid 的授权表）：
 $ grovefs mount --view bob -m /mnt/b --meta ... --data ... --api-key "$READER_KEY"
-Error: ... "permission denied: this api key is bound to view 'alice', not 'bob'"   # M_OPEN 处 E_AUTH
+error: permission denied: this api key is bound to view 'alice', not 'bob'   # M_OPEN 处 E_AUTH
 $ mkdir /mnt/a/should_fail                                                          # alice 的只读 key
 bash: /mnt/a/should_fail: 只读文件系统                                               # 客户端据握手标志落内核只读；服务端另逐写拒 E_NOTPERM/EROFS
 
 $ grovefs apikey --db-path <home> create --label x --for both               # 打错一个词不静默放宽权限
-Error: "unknown api key scope 'both' (expected any|mcp|mount)"
+error: unknown api key scope 'both' (expected any|mcp|mount)
 
 $ grovefs meta-server --db-path <home> --listen 0.0.0.0:50110 --require-api-key
 meta-server: api-key auth REQUIRED (present `mount --api-key`, minted by `grovefs apikey create --for mount|any`); a revoke closes live mounts on their next op
 
 # 拒因逐字节随握手回传（不只是一个错误码）：
 $ grovefs mount --view alice -m /mnt/a --meta ... --data ...                      # 不带 key
-Error: Custom { kind: PermissionDenied, error: "no api key presented: this server requires one (pass `mount --api-key ID:SECRET` or export GROVEFS_API_KEY; mint with `grovefs apikey create --for mount`)" }
+error: no api key presented: this server requires one (pass `mount --api-key ID:SECRET` or export GROVEFS_API_KEY; mint with `grovefs apikey create --for mount`)
 $ grovefs mount --view alice -m /mnt/a --meta ... --data ... --api-key "$MCP_KEY"   # 拿治理 key 来挂
-Error: Custom { kind: PermissionDenied, error: "authentication failed: this api key is scoped to 'mcp', not 'mount'" }
+error: authentication failed: this api key is scoped to 'mcp', not 'mount'
 
 $ grovefs apikey --db-path <home> calls --limit 6        # 挂载连接与治理调用同表审计
 last 6 call(s), newest first:
@@ -1212,7 +1212,7 @@ $ grovefs view --db-path .demo5/home define --name docsonly --base team --rules 
 defined derived view 'docsonly' over base 'team': 0 hide, 1 only, 0 reloc rule(s)
 note: mounts of 'docsonly' are read-only (virtual shape) — write to base view 'team'
 $ grovefs view --db-path .demo5/home define --name team --base team --rules .demo5/docsonly.rules   # name == base
-Error: "derived view name must differ from its base"
+error: derived view name must differ from its base
 $ grovefs view --db-path .demo5/home list
 view 'docsonly' -> base 'team': 0 hide, 1 only, 0 reloc rule(s)
 
@@ -1258,9 +1258,9 @@ defined pure alias 'teamwork' -> real view 'team'
 note: 'team' is no longer a mount entry point while this definition exists (mounts by its real name are refused, locally and via meta-server); alias mounts show the FULL tree and are WRITABLE
 $ grovefs mount --view teamwork -m /mnt/work --meta 10.0.0.5:50241 --data 10.0.0.5:50240   # full tree, writable
 $ grovefs mount --view team -m /mnt/t --meta 10.0.0.5:50241 --data 10.0.0.5:50240          # the governed real name: refused
-Error: Custom { kind: PermissionDenied, error: "view 'team' is governed by an alias — mount the alias name instead (`grovefs view list` shows it)" }
+error: view 'team' is governed by an alias — mount the alias name instead (`grovefs view list` shows it)
 $ grovefs --home $BASE mount --view team -m /mnt/t                                        # local mount: same contract
-Error: "view 'team' is governed by an alias — mount the alias name instead (`grovefs view list` shows it)"
+error: view 'team' is governed by an alias — mount the alias name instead (`grovefs view list` shows it)
 ```
 
 When a public name leaks, rotate it in **one gapless command** with `--retire` (write the new alias before removing the old, so the real name stays governed throughout — there is no window where it becomes mountable by itself):
@@ -1344,21 +1344,21 @@ apikey created — shown ONCE (only its SHA-256 is stored; save it now):
 
 # using a bound/read-only key where it doesn't belong is refused outright:
 $ grovefs mount --view bob -m /mnt/b --meta ... --data ... --api-key "$READER_KEY"
-Error: ... "permission denied: this api key is bound to view 'alice', not 'bob'"   # E_AUTH at M_OPEN
+error: permission denied: this api key is bound to view 'alice', not 'bob'   # E_AUTH at M_OPEN
 $ mkdir /mnt/a/should_fail                                                          # alice's read-only key
 bash: /mnt/a/should_fail: Read-only file system                                     # kernel RO from the handshake flag; the server also refuses every write
 
 $ grovefs apikey --db-path <home> create --label x --for both              # a typo never silently widens a privilege
-Error: "unknown api key scope 'both' (expected any|mcp|mount)"
+error: unknown api key scope 'both' (expected any|mcp|mount)
 
 $ grovefs meta-server --db-path <home> --listen 0.0.0.0:50110 --require-api-key
 meta-server: api-key auth REQUIRED (present `mount --api-key`, minted by `grovefs apikey create --for mount|any`); a revoke closes live mounts on their next op
 
 # refusal reasons travel byte-for-byte with the handshake (not just an error code):
 $ grovefs mount --view alice -m /mnt/a --meta ... --data ...                       # no key at all
-Error: Custom { kind: PermissionDenied, error: "no api key presented: this server requires one (pass `mount --api-key ID:SECRET` or export GROVEFS_API_KEY; mint with `grovefs apikey create --for mount`)" }
+error: no api key presented: this server requires one (pass `mount --api-key ID:SECRET` or export GROVEFS_API_KEY; mint with `grovefs apikey create --for mount`)
 $ grovefs mount --view alice -m /mnt/a --meta ... --data ... --api-key "$MCP_KEY"  # an agent key mounting the view
-Error: Custom { kind: PermissionDenied, error: "authentication failed: this api key is scoped to 'mcp', not 'mount'" }
+error: authentication failed: this api key is scoped to 'mcp', not 'mount'
 
 $ grovefs apikey --db-path <home> calls --limit 6        # mount connections and governance calls, one table
 last 6 call(s), newest first:

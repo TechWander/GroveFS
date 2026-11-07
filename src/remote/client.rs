@@ -215,7 +215,14 @@ impl RemoteBackend {
                     }
                 }
                 Err(e) => {
-                    last_err = e;
+                    // Name the unreachable data-server so a mount/read failure on
+                    // a dead member reads as "cannot reach data-server <addr>:
+                    // Connection refused" rather than a bare errno (§5-12);
+                    // ErrorKind is preserved for the retry logic above.
+                    last_err = io::Error::new(
+                        e.kind(),
+                        format!("cannot reach data-server {}: {e}", self.addr),
+                    );
                 }
             }
             if attempt + 1 < self.connect_retries {
