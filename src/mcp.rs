@@ -959,6 +959,29 @@ pub fn alias_view(
             "alias target '{real}' is a fork (an independent metadata tree) — aliases map onto a physical view only; give the fork its own key binding (`apikey create --view {real}`) instead"
         ));
     }
+    // The target must be a PHYSICAL view that ACTUALLY EXISTS, not just a name
+    // that is none of the governed kinds. A previous gap let `alias <missing>`
+    // be recorded and only fail at mount (§5-10): reject it here so both
+    // entrances (CLI and MCP) name the create/import command before anything
+    // is written. The kind checks above already handled alias/derived/fork
+    // targets, so reaching here with no physical tree means a dangling name.
+    if !store.has_physical(real)? {
+        let hint = store
+            .base_tree_missing_note(real)?
+            // The store's pre-flight note is phrased for a governance OUT
+            // (`note: no local tree … first`); drop that leading tag so the
+            // concrete path/command reads as one sentence inside the refusal.
+            .map(|n| format!(": {}", n.strip_prefix("note: ").unwrap_or(&n)))
+            .unwrap_or_else(|| {
+                format!(
+                    ": create the physical view first (`grovefs view create --view {real}` against this store, or `grovefs --home <dir> init --view {real}`, or seed it with `grovefs view import`), then define the alias"
+                )
+            });
+        return Err(format!(
+            "alias target '{real}' has no physical view tree in {desc}{hint}",
+            desc = store.describe()
+        ));
+    }
     if let Some(existing) = alias_to.iter().find(|(_, r)| **r == real) {
         if existing.0 != name {
             return Err(format!(
@@ -3217,6 +3240,46 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn alias_refuses_a_dangling_physical_target() {
+        let home = db();
+        let store = fstore(&home);
+        std::fs::create_dir_all(home.join("meta")).unwrap();
+        std::fs::write(home.join("meta/team.db"), b"").unwrap();
+        let call = |id, name: &str, args: Value| {
+            ask(
+                &json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+                        "params":{"name":name,"arguments":args}}),
+                &store,
+            )
+            .unwrap()
+        };
+        let text = |v: &Value| -> String {
+            v["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        // A real physical tree is aliasable.
+        let okres = call(1, "alias_view", json!({"name": "pub", "real": "team"}));
+        assert_eq!(okres["result"]["isError"], Value::Null);
+        assert!(text(&okres).contains("defined pure alias 'pub' -> real view 'team'"));
+        // A target with no physical tree is refused at definition time, not
+        // deferred to mount (§5-10), and the refusal names the missing view.
+        let bad = call(2, "alias_view", json!({"name": "ghost", "real": "no-such-tree"}));
+        assert_eq!(bad["result"]["isError"], true);
+        assert!(text(&bad).contains("no physical view tree"), "{}", text(&bad));
+        assert!(text(&bad).contains("no-such-tree"), "{}", text(&bad));
+        // The refused alias must not have been recorded in the control plane.
+        let l = call(3, "list_views", json!({}));
+        let parsed: Value = serde_json::from_str(&text(&l)).unwrap();
+        assert!(parsed["defined"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|d| d["name"] != "ghost"));
     }
 
     #[test]
