@@ -49,7 +49,7 @@ psqlq(){ PGPASSWORD=grovepw psql -h "$PGHOST" -p "$PGPORT" -U grove -d grovefs -
 
 # unique per run so concurrent/shared-DB runs never bleed defs or keys
 TS=$(date +%s)
-BASE="ct${TS}b"; LENS="ct${TS}l"; ALIAS="ct${TS}a"; KLBL="ctlabel${TS}"
+BASE="ct${TS}b"; LENS="ct${TS}l"; ALIAS="ct${TS}a"; KLBL="ctlabel${TS}"; AREAL="ct${TS}t"
 
 pass=0; fail=0
 ok(){ echo "  OK: $1"; pass=$((pass+1)); }
@@ -76,14 +76,27 @@ cleanup(){
   psqlq "DELETE FROM grovefs_control.view_defs WHERE name IN ('$LENS','$ALIAS')" >/dev/null
   psqlq "DELETE FROM grovefs_control.api_keys WHERE label='$KLBL'" >/dev/null
   psqlq "DROP SCHEMA IF EXISTS grovefs_v_$(printf '%s' "$BASE" | od -An -tx1 | tr -d ' \n') CASCADE" >/dev/null
+  psqlq "DROP SCHEMA IF EXISTS grovefs_v_$(printf '%s' "$AREAL" | od -An -tx1 | tr -d ' \n') CASCADE" >/dev/null
 }
 trap cleanup EXIT
 
 echo "===== 1) view define + alias land in PG, nothing in the local home ====="
+# An alias must name an EXISTING physical view (§5-10). Provision a dedicated
+# physical schema `AREAL` as the alias target, deliberately NOT `$BASE` —
+# governing `$BASE` would make it unmountable by its real name in section 3.
+# `view create` over PG makes a grovefs_v_* schema, not a local db file, so the
+# "nothing lands in the local home" assertions still hold.
+$Y view --db-path "$BASEHOME" --store "$PGURI" create --view "$AREAL" > .cttest/create.log 2>&1 \
+  || { bad "view create (alias target) --store failed: $(cat .cttest/create.log)"; exit 1; }
 $Y view --db-path "$BASEHOME" --store "$PGURI" define --name "$LENS" --base "$BASE" --rules "$RULES1" > .cttest/define.log 2>&1 \
   && ok "view define over PG" || bad "view define failed: $(cat .cttest/define.log)"
-$Y view --db-path "$BASEHOME" --store "$PGURI" alias --name "$ALIAS" --real "ct${TS}r" > .cttest/alias.log 2>&1 \
+$Y view --db-path "$BASEHOME" --store "$PGURI" alias --name "$ALIAS" --real "$AREAL" > .cttest/alias.log 2>&1 \
   && ok "view alias over PG" || bad "view alias failed: $(cat .cttest/alias.log)"
+# §5-10: an alias to a name with no physical schema is refused at definition.
+$Y view --db-path "$BASEHOME" --store "$PGURI" alias --name "ct${TS}x" --real "ct${TS}dangle" > .cttest/alias_dangle.log 2>&1 \
+  && bad "alias accepted a dangling physical target" || ok "alias refuses a target with no physical view (§5-10)"
+grep -qi "no physical view tree" .cttest/alias_dangle.log \
+  && ok "dangling refusal names the missing physical view" || bad "dangle refusal unclear: $(cat .cttest/alias_dangle.log)"
 NDEFS=$(psqlq "SELECT count(*) FROM grovefs_control.view_defs WHERE name IN ('$LENS','$ALIAS')")
 chk "$NDEFS" "2" "both definitions present in grovefs_control.view_defs"
 if [ -e "$BASEHOME/meta/views/$LENS.layout" ]; then bad "LEAK: a local .layout was created under PG"; else ok "no local .layout file under PG"; fi
@@ -99,8 +112,8 @@ echo "===== 3) a meta-server on PG serves a derived lens DEFINED IN PG ====="
 DATA=127.0.0.1:15124; META=127.0.0.1:15125
 $Y data-server --listen $DATA --root .cttest/data > .cttest/data.log 2>&1 & DP=$!
 # Views are explicit: provision the PG schema up front, before any mount.
-$Y view --db-path "$BASEHOME" --store "$PGURI" create --view "$BASE" > .cttest/create.log 2>&1 \
-  || { bad "view create --store failed: $(cat .cttest/create.log)"; exit 1; }
+$Y view --db-path "$BASEHOME" --store "$PGURI" create --view "$BASE" > .cttest/createbase.log 2>&1 \
+  || { bad "view create --store failed: $(cat .cttest/createbase.log)"; exit 1; }
 $Y meta-server --listen $META --home "$BASEHOME" --store "$PGURI" > .cttest/meta.log 2>&1 & MP=$!
 wait_port $DATA || { echo "  (data-server failed)"; cat .cttest/data.log; }
 wait_port $META || { echo "  (meta-server failed)"; cat .cttest/meta.log; }

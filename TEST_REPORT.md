@@ -210,28 +210,28 @@
 
   ```
   ##### [构建产物] md5 对账 #####
-  8d5bd979f9b026fd6248c23f3971739a  /data/grovefs/grovefs/target/release/grovefs
+  d2a3b2620245aa228bf3dee45752a716  /data/grovefs/grovefs/target/release/grovefs
   ```
 
   ```
   $ md5sum target/release/grovefs
-  8d5bd979f9b026fd6248c23f3971739a  target/release/grovefs
+  d2a3b2620245aa228bf3dee45752a716  target/release/grovefs
   $ for h in gfs1 gfs2 gfs-client; do ssh -n $h "md5sum /usr/local/bin/grovefs"; done
-  8d5bd979f9b026fd6248c23f3971739a  /usr/local/bin/grovefs
-  8d5bd979f9b026fd6248c23f3971739a  /usr/local/bin/grovefs
-  8d5bd979f9b026fd6248c23f3971739a  /usr/local/bin/grovefs
+  d2a3b2620245aa228bf3dee45752a716  /usr/local/bin/grovefs
+  d2a3b2620245aa228bf3dee45752a716  /usr/local/bin/grovefs
+  d2a3b2620245aa228bf3dee45752a716  /usr/local/bin/grovefs
   ```
 
   运行体级核对（`sudo md5sum /proc/<MainPID>/exe`，四个单元逐个重启后）：
 
   ```
-  gfs1 grovefs-data-server   -> active pid=22652 exe=8d5bd979f9b026fd6248c23f3971739a
-  gfs2 grovefs-data-server   -> active pid=16903 exe=8d5bd979f9b026fd6248c23f3971739a
-  gfs-client grovefs-meta-server  -> active pid=43302 exe=8d5bd979f9b026fd6248c23f3971739a
-  gfs-client grovefs-mount-alice  -> active pid=43390 exe=8d5bd979f9b026fd6248c23f3971739a
+  gfs1 grovefs-data-server   -> active pid=23281 exe=d2a3b2620245aa228bf3dee45752a716
+  gfs2 grovefs-data-server   -> active pid=17542 exe=d2a3b2620245aa228bf3dee45752a716
+  gfs-client grovefs-meta-server  -> active pid=44448 exe=d2a3b2620245aa228bf3dee45752a716
+  gfs-client grovefs-mount-alice  -> active pid=44531 exe=d2a3b2620245aa228bf3dee45752a716
   ```
 
-- **结论**：通过。三台文件与运行体均为 `8d5bd979…`（在上一轮 `2f373afb` 的 du 行为 + POSIX 锁 close-release 修复之上，叠加本轮显示/使用方式修复：致命错误改走 Display、连不上服务点名地址、`view list` 去自相矛盾、`view rm --base` 补上下文、别名/建视图提示填实路径；均不改动运行时逻辑或协议）。四个单元已逐个 `systemctl restart` 到该产物，排除了“文件已换新但进程还跑旧二进制”的中间态。
+- **结论**：通过。三台文件与运行体均为 `d2a3b262…`（在上一轮 `2f373afb` 的 du 行为 + POSIX 锁 close-release 修复、`8d5bd979` 的显示/使用方式修复（致命错误改走 Display、连不上服务点名地址、`view list` 去自相矛盾、`view rm --base` 补上下文、别名/建视图提示填实路径）之上，叠加本轮 §5-10 悬空别名校验：`view alias` 在定义时拒绝指向不存在物理视图的目标）。四个单元已逐个 `systemctl restart` 到该产物，排除了“文件已换新但进程还跑旧二进制”的中间态。
 - **一个需要如实说明的取证细节**：首次落地时的 `ss -ltn | grep -c :50100` 在两台数据服务器上返回 `0`（`/tmp/vm_phase3.log`：`gfs1 data-server=active 端口=0 env权限=600 root:root`），当时单元已 `active` 但轮询窗口不够长；重启新二进制后的核对为 `端口=1`（`/tmp/redeploy_newbin.log`），§2.1/§7.5 的 audit 也稳定报 `监听: 0.0.0.0:50100`。本报告的监听断言引自后两轮，不拿 `端口=0` 那一轮当作通过证据。
 
 ---
@@ -343,7 +343,7 @@
   可读
   ```
 
-- **结论**：**通过（本轮修复 close-release 泄漏后）**。非阻塞互斥（退出码 245 = `1013 & 255`，即 `EACCES`）、同 fd 重入、显式 `F_UNLCK` 释放、`F_SETLK`/`F_GETLK`/`F_UNLCK` 均符合预期。曾存在的缺陷——阻塞式 POSIX 锁在对方以 `close`/进程退出隐式释放时不唤醒（调用者停在 `request_wait_answer`，`SIGKILL` 不可投递，需重启挂载才 abort）——已定位确定性根因并修复（见下“根因与修复”），在当前 `8d5bd979` 集群上复验：close 释放后新进程非阻塞 `F_SETLK` 由泄漏 `EACCES` 变为 `GRANTED`，阻塞 `F_SETLKW` 在持有者 3s 处 close 后 `2.53s` 唤醒。
+- **结论**：**通过（本轮修复 close-release 泄漏后）**。非阻塞互斥（退出码 245 = `1013 & 255`，即 `EACCES`）、同 fd 重入、显式 `F_UNLCK` 释放、`F_SETLK`/`F_GETLK`/`F_UNLCK` 均符合预期。曾存在的缺陷——阻塞式 POSIX 锁在对方以 `close`/进程退出隐式释放时不唤醒（调用者停在 `request_wait_answer`，`SIGKILL` 不可投递，需重启挂载才 abort）——已定位确定性根因并修复（见下“根因与修复”），在当前 `d2a3b262` 集群上复验：close 释放后新进程非阻塞 `F_SETLK` 由泄漏 `EACCES` 变为 `GRANTED`，阻塞 `F_SETLKW` 在持有者 3s 处 close 后 `2.74s` 唤醒。
 
 **根因确证（本轮新证据）**：用两条对照实验把触发条件收窄到「POSIX 记录锁 + 隐式（close/exit）释放」这一组合：
 
@@ -361,7 +361,7 @@
 
   源码定位：`fuser` 0.18 `ll/request.rs:798` 的 `Release::lock_owner()` **仅当 `FUSE_RELEASE_FLOCK_UNLOCK` 置位才返回 `Some(owner)`**，而该标志只有 **flock(2)** 路径由内核置位；**POSIX 记录锁（`fcntl F_SETLK`）走 close 时内核不置该标志**，于是 `release` 收到 `lock_owner=None`，[src/fs_impl.rs](file:///data/grovefs/grovefs/src/fs_impl.rs) 的 `if let Some(o) = lock_owner { release_locks_of_owner(o.0) }` 永不触发 → `locks` 表的行不被删除；又因续租心跳按 **sid 整片** 刷新（`renew_locks`，`LOCK_LEASE_SECS=15`、每 5s 一次），未删的幽灵行被无限续期，阻塞等待方只能挂到 `BLOCKING_WAIT_MAX_MS=600_000`（10 分钟）上限。USAGE.md 声称的“同步轮询（100ms/次，上限 10 分钟）”与此一致——轮询确实生效，只是被一条永不消失的冲突行挡住。**影响范围**：仅 `fcntl` POSIX 记录锁的 close/exit 隐式释放；显式 `F_UNLCK`、flock(2)、以及持有者仍在线的正常互斥不受影响。
 
-  **本轮修复**（已入 release `8d5bd979`，实机复验见上）：既然内核不给 POSIX 锁的 `release` 交 `lock_owner`，就不依赖它——`setlk` 授予 Read/Write 时按 `(fh → ino, owner)` 记账（[src/fs_impl.rs](file:///data/grovefs/grovefs/src/fs_impl.rs) `note_posix_lock`），`release(fh)` 据记账找到 `(ino, owner)`，当该 pair 的最后一个锁定描述符关闭时用一次全区间 `lock_op(..., Unlock, ...)` 精确删除其行（`drop_posix_lock_on_release`）。不改动 sid 续租模型：行既已删除，续租心跳自然不再刷新它，阻塞等待方在下一个 100ms 轮询周期即获授权；若 meta 调用失败仍退化为“一个租期内自然过期”，不劣于修复前。该回收仅在最后一个锁定描述符关闭时触发，故进程对同一文件保持多 fd 时不会被提前释放（与 POSIX “末次 close 释放”一致）。flock(2) 与显式 `F_UNLCK` 走原有路径不变，重复删除为幂等 no-op。
+  **本轮修复**（已入 release `d2a3b262`，实机复验见上）：既然内核不给 POSIX 锁的 `release` 交 `lock_owner`，就不依赖它——`setlk` 授予 Read/Write 时按 `(fh → ino, owner)` 记账（[src/fs_impl.rs](file:///data/grovefs/grovefs/src/fs_impl.rs) `note_posix_lock`），`release(fh)` 据记账找到 `(ino, owner)`，当该 pair 的最后一个锁定描述符关闭时用一次全区间 `lock_op(..., Unlock, ...)` 精确删除其行（`drop_posix_lock_on_release`）。不改动 sid 续租模型：行既已删除，续租心跳自然不再刷新它，阻塞等待方在下一个 100ms 轮询周期即获授权；若 meta 调用失败仍退化为“一个租期内自然过期”，不劣于修复前。该回收仅在最后一个锁定描述符关闭时触发，故进程对同一文件保持多 fd 时不会被提前释放（与 POSIX “末次 close 释放”一致）。flock(2) 与显式 `F_UNLCK` 走原有路径不变，重复删除为幂等 no-op。
 
 ### 3.3 xattr 与 O_DIRECT
 
@@ -487,26 +487,24 @@
   针对 `pub-c` 这一行（标签写的是「链式别名拒绝」却成功）补做的定向探针 `bash .build-bin/vm_probe_alias.sh`：
 
   ```
-  ===== X1 链式别名(目标仍是活的别名) =====
-    第一个: defined pure alias 'x-alias1' -> real view 'pv'
-    第一个: note: no local <db-path>/meta/pv.db yet — create it with `grovefs --home ... init --view pv` (or `view create`) first
-    链式: Error: "alias target 'x-alias1' is itself an alias (-> 'pv') — chains are not supported; alias the physical view instead"
+  ===== X1 链式别名(目标仍是活的别名)，均在运行 d2a3b262 的本地 home 上重跑 =====
+    先建物理视图 pv，第一个: defined pure alias 'x-alias1' -> real view 'pv'
+    链式: error: alias target 'x-alias1' is itself an alias (-> 'pv') — chains are not supported; alias the physical view instead
     同一真实视图的第二个别名:
-      Error: "real view 'pv' is already governed by alias 'x-alias1' — one public name per real view; to rotate it gaplessly use `grovefs view alias --name x-alias3 --real pv --retire x-alias1`
-  ===== X2 悬空目标别名(既无物理树也无定义) 的挂载结果 =====
-    alias: defined pure alias 'x-dangle' -> real view 'no-such-tree'
-    alias: note: no local <db-path>/meta/no-such-tree.db yet — create it with `grovefs --home ... init --view no-such-tree` (or `view create`) first
-      [挂载 x-dangle -> /tmp/gft_dang: 未挂载]
+      error: real view 'pv' is already governed by alias 'x-alias1' — one public name per real view; to rotate it gaplessly use `grovefs view alias --name x-alias3 --real pv --retire x-alias1`
+  ===== X2 悬空目标别名(既无物理树也无定义) —— §5-10 修复后在定义时即拒 =====
+    alias: error: alias target 'no-such-tree' has no physical view tree in /tmp/s510home (local files): no local tree /tmp/s510home/meta/no-such-tree.db yet — create it with `grovefs --home /tmp/s510home init --view no-such-tree` (or `view create`) first
+      rc=1  [定义被拒，控制面未写入该别名；不再能进入“先定义后挂载”的悬空态]
   ```
 
-  经 meta-server 模式挂载悬空别名的报错原文（`bash .build-bin/vm_probe_alias.sh` 之后的定向复测，回显 `/tmp/vm_evidence/probe_alias_mount2.log`）：
+  经 meta-server 挂载一个未知视图名（无任何树/定义）的报错原文（§6-5 修复后用实路径、§5-12 后走 Display；`--view no-such-tree-xyz`，回显取自运行 `d2a3b262` 的集群）：
 
   ```
-  -- 经 meta-server 挂载悬空别名(--meta 模式):
-    rc=1 报错原文: Error: Custom { kind: Other, error: "view 'no-such-tree' does not exist on this meta-server (sqlite; mounted as alias 'x-dangle3' -> 'no-such-tree'): no tree and no definition — views are created explicitly, so unknown names are refused instead of becoming an empty tree; create it first: `grovefs view --db-path <db-path> create --view <name>` (or `grovefs --home <db-path> init --view <name>`, or seed it with `grovefs view import`)" }
+  -- 经 meta-server 挂载未知视图名(--meta 模式):
+    rc=1 报错原文: error: view 'no-such-tree-xyz' does not exist on this meta-server (sqlite): no tree and no definition — views are created explicitly, so unknown names are refused instead of becoming an empty tree; create it first: `grovefs view --db-path /home/hanjun/meta create --view no-such-tree-xyz` (or `grovefs --home /home/hanjun/meta init --view no-such-tree-xyz`, or seed it with `grovefs view import`)
   ```
 
-- **结论**：通过。`--retire` 无空档轮换、老别名失效、真实名被拒、撤别名后恢复可挂，全部对上；链式别名与「一视图一别名」的拒绝文案与文档一致（先前那行「链式别名拒绝: defined pure alias 'pub-c' ...」是**用例顺序造成的假象**——彼时 `pub-a` 已被 retire，不再是别名，故不构成链；已在报告中以 X1 探针的正确用例替换结论）。同时确认两处显示问题：`alias` 会接受指向不存在的真实视图（仅在挂载时报错），且提示里的 `<db-path>`/`<name>` 是未替换的占位符（§6-5、§6-6）。
+- **结论**：通过。`--retire` 无空档轮换、老别名失效、真实名被拒、撤别名后恢复可挂，全部对上；链式别名与「一视图一别名」的拒绝文案与文档一致（先前那行「链式别名拒绝: defined pure alias 'pub-c' ...」是**用例顺序造成的假象**——彼时 `pub-a` 已被 retire，不再是别名，故不构成链；已在报告中以 X1 探针的正确用例替换结论）。先前记录的两处问题**本轮均已修复**：`alias` 不再接受指向不存在的真实视图（§5-10 已在定义时硬拒），提示里的 `<db-path>`/`<name>` 已换成实路径（§6-5）。
 
 #### 3.4.4 fork（结构可写/内容只读）与 `--empty`
 
@@ -710,7 +708,7 @@
   sudo sh -c "... grovefs du --view alice --meta 127.0.0.1:50053 --data gfs2:50100,gfs1:50100 --total"             # 顺序倒置(两台都对但顺序反了)
   ```
 
-- **回显**（release `8d5bd979` 实机定点，四条均在运行 8d5bd979 的集群上取得；本轮致命错误改走 Display，故前缀由 `Error: "…"` 变为 `error: …`（不再带外层引号）；注意倒置例报的 object UUID 随实机重跑而变，为新鲜结果）：
+- **回显**（release `d2a3b262` 实机定点，四条均在运行 d2a3b262 的集群上取得；本轮致命错误改走 Display，故前缀由 `Error: "…"` 变为 `error: …`（不再带外层引号）；注意倒置例报的 object UUID 随实机重跑而变，为新鲜结果）：
 
   ```
   === --data gfs1:50100,gfs2:50100 ===            # 正确列表
@@ -1373,20 +1371,20 @@
 |---|---|---|---|---|
 | 5-1 | `chmod` 权限位不强制 | `chmod 444` 后同 uid 写入 `rc=0` 并落盘 | 挂载不做 mode 强制（当前版本行为） | 未修，列入遗留；建议写入 USAGE/docs 的能力边界表 |
 | 5-2 | 稀疏洞不省盘 | `st_size=1048576` 且 `st_blocks*512=1048576` | 后端按完整对象存字节 | 未修，列入遗留 |
-| 5-3 | **POSIX 记录锁 close/退出隐式释放时漏清，阻塞等待方不唤醒** | 修复前的对照实验：显式 `F_UNLCK` 释放 → 等待方 3.01s 唤醒；只 `close(fd)`/进程退出释放 → 新进程非阻塞加锁仍 `EACCES`（锁泄漏），阻塞等待方卡 `request_wait_answer` 直至 600s 上限 | 根因已定位（§3.2）：`fuser` 0.18 `Release::lock_owner()` 仅在 `FUSE_RELEASE_FLOCK_UNLOCK`（只有 flock(2) 路径置位）时返回 `Some`；POSIX 锁走 close 时返回 `None`，`release_locks_of_owner` 不触发，幽灵锁行又被按 sid 的续租心跳（`LOCK_LEASE_SECS=15`）无限 刷新 | **已修复**（release `8d5bd979`，实机复验）：`setlk` 按 `(fh→ino,owner)` 记账、`release` 在末次锁定描述符关闭时用全区间 Unlock 精确回收；close 后新进程加锁由 `EACCES` 变 `GRANTED`、阻塞 `F_SETLKW` 于持有者 close 后 `2.53s` 唤醒（见 §3.2、§6-2a） |
-| 5-4 | `view rm --base` 在数据根不可用时只给裸 `Permission denied` | 修复前：`Error: Os { code: 13, kind: PermissionDenied, message: "Permission denied" }`，不报路径、不给下一步，且发生在元数据树已删之后 | 回收阶段直接上抛 `io::Error`，未经包装 | **已修复**（release `8d5bd979`，实机复验）：回收 `open_local` 失败时 `map_err` 补上数据根路径、视图名与“树已删/字节未收”上下文及离线 `gc` 提示；连同 §5-12 改走 Display，实机报 `error: cannot open data root …`（见 §6-4） |
+| 5-3 | **POSIX 记录锁 close/退出隐式释放时漏清，阻塞等待方不唤醒** | 修复前的对照实验：显式 `F_UNLCK` 释放 → 等待方 3.01s 唤醒；只 `close(fd)`/进程退出释放 → 新进程非阻塞加锁仍 `EACCES`（锁泄漏），阻塞等待方卡 `request_wait_answer` 直至 600s 上限 | 根因已定位（§3.2）：`fuser` 0.18 `Release::lock_owner()` 仅在 `FUSE_RELEASE_FLOCK_UNLOCK`（只有 flock(2) 路径置位）时返回 `Some`；POSIX 锁走 close 时返回 `None`，`release_locks_of_owner` 不触发，幽灵锁行又被按 sid 的续租心跳（`LOCK_LEASE_SECS=15`）无限 刷新 | **已修复**（release `d2a3b262`，实机复验）：`setlk` 按 `(fh→ino,owner)` 记账、`release` 在末次锁定描述符关闭时用全区间 Unlock 精确回收；close 后新进程加锁由 `EACCES` 变 `GRANTED`、阻塞 `F_SETLKW` 于持有者 close 后 `2.74s` 唤醒（见 §3.2、§6-2a） |
+| 5-4 | `view rm --base` 在数据根不可用时只给裸 `Permission denied` | 修复前：`Error: Os { code: 13, kind: PermissionDenied, message: "Permission denied" }`，不报路径、不给下一步，且发生在元数据树已删之后 | 回收阶段直接上抛 `io::Error`，未经包装 | **已修复**（release `d2a3b262`，实机复验）：回收 `open_local` 失败时 `map_err` 补上数据根路径、视图名与“树已删/字节未收”上下文及离线 `gc` 提示；连同 §5-12 改走 Display，实机报 `error: cannot open data root …`（见 §6-4） |
 | 5-5 | **条带对象真丢分块时 du 仍静默短报（本类中数据源真缺字节的形态；错配/瞬时故障形态已修）** | 中间分块缺失：`67108869 → 16777221`（无 warning）；首分块真缺：`--total` 给极小值、挂载 `stat size=0` 且读 rc=0 | `ShardedBackend::len` 假定分块连续，指数+二分把“第一个缺失分块”当 EOF（chunk#0 真缺时 `chunk0_elsewhere` 在其它成员也探不到 `{base}#0` → `Ok(0)`） | 未修，列入遗留；可执行方案见 §6-2。区分：同一命令对“列表长度不符”与“列表顺序倒置”现已分别前置拒绝/报错（见 §3.6.2），对超时/拒连不再误报为“对象不在数据源”（现进入 `could not be confirmed` 硬报错） |
 | 5-6 | 非条带路径的挂载读丢失对象也不出声 | 重挂后读丢失对象：`rc=0`、`stat size=0`（无 `EIO`） | 同上：`len` 给 0 而非错误 | 未修，列入遗留 |
 | 5-7 | `apikey set-ro` 回到 rw 后同一挂载仍拒写 | `is now rw (read-write)` 后紧接追加写 `errno=30` | 服务端复检窗口/客户端缓存时机，文档声称 ≤1s | 未修，列入遗留（建议回显明记生效时刻而非窗口上限） |
 | 5-8 | `set-ro` 后回读内容尾部多 7 个零字节 | `'first\n\x00\x00\x00\x00\x00\x00\x00'` | 本轮探针用固定长缓冲区读回所致，非产品写入；作为取证脚本缺陷记录 | 已确认非产品缺陷（取证手段问题） |
 | 5-9 | HA 切换瞬间首次写存在瞬时 `EIO` | 上一轮观察到一次 `EIO` 且文件未生成；本轮为 `rc=0`（0.76 s） | 转接窗口内旧主连接失效 | 状态相关，不作稳定性断言；建议文档写明重试要求 |
-| 5-10 | `view alias` 接受指向不存在视图的目标 | `defined pure alias 'x-dangle' -> real view 'no-such-tree'`，直到挂载才拒 | 定义时无树存在性校验 | 未修，列入遗留（§6-5） |
+| 5-10 | `view alias` 接受指向不存在视图的目标 | 修复前：`defined pure alias 'x-dangle' -> real view 'no-such-tree'`，直到挂载才拒 | 定义时无树存在性校验 | **已修复**（release `d2a3b262`，实机复验）：`alias_view` 在排除别名/派生/分叉目标后，用 `store.has_physical(real)` 检查目标物理树（SQLite 查 `<base>/meta/<view>.db`、PG 查 schema）是否存在，不存在则拒绝并给出可敲的 create/import 命令（接 §6-5） |
 | 5-11 | `grovefs import` 不接受 `--meta`/`--data`，无法向远端/条带存储批量导入 | `grovefs import --meta … --data …` 报 Usage；只能导入到本地 `--db-path`/`--home` 存储根 | import 子命令未暴露远端定位参数（与 du/view import 的远端能力不对称） | 未修，列入遗留（接口缺口；需先本地导入再 `view export/import` 迁机） |
-| 5-12 | CLI 致命错误以 Debug 形式打印 | 修复前：挂载单元在 data-server 未起时报 `Error: Os { code: 111, kind: ConnectionRefused, message: "Connection refused" }`（不指哪个地址）；du 报错带外层双引号 `Error: "…"` | `fn main() -> Result<(), Box<dyn Error>>` 使错误走 Debug 而非 Display | **已修复**（release `8d5bd979`，实机复验）：`main()` 拆出 `real_main()`、致命错误改走 Display（`error: <人话>`，与 clap 前缀一致）；meta/data/du 连接失败均点名 `cannot reach meta-server/data-server <addr>`（保留 `ErrorKind` 不影响 failover，见 §6-1） |
+| 5-12 | CLI 致命错误以 Debug 形式打印 | 修复前：挂载单元在 data-server 未起时报 `Error: Os { code: 111, kind: ConnectionRefused, message: "Connection refused" }`（不指哪个地址）；du 报错带外层双引号 `Error: "…"` | `fn main() -> Result<(), Box<dyn Error>>` 使错误走 Debug 而非 Display | **已修复**（release `d2a3b262`，实机复验）：`main()` 拆出 `real_main()`、致命错误改走 Display（`error: <人话>`，与 clap 前缀一致）；meta/data/du 连接失败均点名 `cannot reach meta-server/data-server <addr>`（保留 `ErrorKind` 不影响 failover，见 §6-1） |
 
 已当场修正的取证脚本缺陷（不属于产品遗留）：C5 漏 `mv`、误挑 0 字节分块；B4 基视图残留 `newdir`/`b4-renamed.txt` 导致结构写探针假失败；`> target 2>/tmp/err` 重定向顺序导致报错为空；battery_1 输出文件被自身 `rm -rf /tmp/gft_*` 删成 `(deleted)` 导致 ssh 挂死；`vm_audit.sh` 的嵌套单引号、`cut` 无 sudo、把整个多行 env 值当 grep pattern 导致的“单元文本命中密钥 4 处”假阳性、崩溃拉起验证的 `pgrep` 模式被吞。
 
-本轮专业复核当场修复的产品缺陷（均已入 release `8d5bd979` 并在实机复验，见 §3.6.2/§3.2）：
+本轮专业复核当场修复的产品缺陷（均已入 release `d2a3b262` 并在实机复验，见 §3.6.2/§3.2）：
 
 - **du 把任何错误当“对象不在数据源”**（`src/du.rs`）：旧逻辑将超时/拒连/EIO/布局错配一律计入 `lost` 并静默少算。现区分 `confirmed_missing`（仅 `NotFound`）与未确认：未确认一律硬报错不出数；新增 `check_server_count` 探测前门控，列表过长/过短按方向分别给建议（旧文案对“多给了”却建议“补齐全部”——方向相反）。新增 5 个纯逻辑单测。
 - **反序列化列表使整树静默报 `0B`**（`src/backend/sharded.rs`）：新增 `chunk0_elsewhere` 用 `{uuid}#0` 归属做确定性错序检测（顺序错配的唯一签名），stat/du 层报错；`order_verified: AtomicBool` 保证健康树/空对象零额外探测成本。新增 2 个单测（反序列必须报错、空条带对象仍为 0）。
@@ -1407,10 +1405,10 @@
    - `ShardedBackend::len` 在二分定界后多探一个分块（探 `A+1`）：若存在则说明是内部空洞，返回 `io::Error`(kind=`Other`, 文案 `striped object <uuid> has a gap at chunk #A (present after an absent one) — content is damaged, not short`)；`du` 侧现有 `lost` 计数会自动报出 warning，挂载侧 getattr 得 `EIO` 而不是假 EOF（成本：每对象 +1 次 RPC，与现有 `Probe::Unknown` 失败原则一致，见 `src/backend/sharded.rs:401` 注释）。
    - chunk#0 缺失目前返回 `Ok(0)`，与空对象不可区分；建议同路报 `ENOENT`，使 `du` 进 `lost` 分支。
    - 文档同步：`docs.html` 的 du 字节来源说明（目前只讲了非条带的 `warning: N of M …`）需补上“条带对象分块缺失时的行为”。
-2a. ★**POSIX 记录锁 close/退出隐式释放泄漏（§5-3）——本轮已实现**。原建议：既然 `fuser` 0.18 仅在 `FUSE_RELEASE_FLOCK_UNLOCK`（只有 flock(2) 路径置位）时向 `release` 交 `lock_owner`，POSIX 锁走 close 拿到 `None`，旧回收不触发。**已采用的改法**：在 `setlk`（已不再忽略 `fh`）按 `(fh → ino, owner)` 记账，`release(fh)` 据此在某个 `(ino,owner)` 的最后一个锁定描述符关闭时，用一次全区间 `lock_op(..., Unlock, ...)` 精确删除其行（`src/fs_impl.rs` 的 `note_posix_lock`/`drop_posix_lock_on_release`）。采用“删除行”而非“收窄 `renew_locks` 到仍打开的描述符”，是为了不动 meta 协议与跨机续租模型：行一旦删除，按 sid 的续租心跳自然不再刷新它，效果与“只刷新存活行”等价，且失败时仍退化为一个租期内自然过期。已配套集成测（`test_locks.sh` §4c：跨进程持有/释放 + 阻塞唤醒延时），本地 17/17、三机实机复验通过（close 后 `GRANTED`、阻塞 `2.53s` 唤醒）。
+2a. ★**POSIX 记录锁 close/退出隐式释放泄漏（§5-3）——本轮已实现**。原建议：既然 `fuser` 0.18 仅在 `FUSE_RELEASE_FLOCK_UNLOCK`（只有 flock(2) 路径置位）时向 `release` 交 `lock_owner`，POSIX 锁走 close 拿到 `None`，旧回收不触发。**已采用的改法**：在 `setlk`（已不再忽略 `fh`）按 `(fh → ino, owner)` 记账，`release(fh)` 据此在某个 `(ino,owner)` 的最后一个锁定描述符关闭时，用一次全区间 `lock_op(..., Unlock, ...)` 精确删除其行（`src/fs_impl.rs` 的 `note_posix_lock`/`drop_posix_lock_on_release`）。采用“删除行”而非“收窄 `renew_locks` 到仍打开的描述符”，是为了不动 meta 协议与跨机续租模型：行一旦删除，按 sid 的续租心跳自然不再刷新它，效果与“只刷新存活行”等价，且失败时仍退化为一个租期内自然过期。已配套集成测（`test_locks.sh` §4c：跨进程持有/释放 + 阻塞唤醒延时），本地 17/17、三机实机复验通过（close 后 `GRANTED`、阻塞 `2.74s` 唤醒）。
 3. ★**fork/只读 key 的 `EROFS` 在 shell 里假成功**。`>>` 追加 `rc=0` 而字节未落盘（§3.4.4、§3.9），用户只会看到“写了但没变”。建议：把内容写门从 `fsync` 提前到首次 `write` 就返回 `EROFS`（至少对 `O_WRONLY`/`O_APPEND` 的开写路径做前置检查）；若保留现状，`USAGE.md`/`docs.html` 的 fork 语义行必须明写：“追加写的失败只在 fsync/close 可见，shell 重定向会报 0” 并给出验证命令（`sync; < cmd; echo $?` 或 `python3 -c` 逐 open 探针）。
 4. ★**`view rm --base` 的 `Permission denied` 裸文案——本轮已实现**。原建议：按同文件内其他守卫的写法包上上下文。**已采用的改法**：`src/main.rs` 的回收阶段 `backend::open_local(&droot)` 失败时 `map_err` 补上“cannot open data root <路径> to free view '<name>' objects … 元数据树 meta/'<name>'.db 已删除 … 可用 `grovefs gc --db-path … --data-root …` 离线回收”的上下文，把“树已删、字节未收”分开陈述并给出下一条可执行命令。连同 §5-12 的 Display 改动，实机不再报裸 `Permission denied`（见 §2.3）。
-5. ★**提示里的占位符未替换——文案部分本轮已实现**（悬空目标校验仍遗留）。原建议：`note: no local <db-path>/meta/pv.db yet` 与 meta-server 错误里的 `--db-path <db-path>`/`--view <name>` 应填实值。**已采用的改法**：`src/mcp.rs` 的 `base_tree_missing_note` 用 `self.db(view).display()`+`self.base.display()` 填实树路径与存储根；`src/remote/meta/server_ext.rs` 的“view does not exist”create-hint 用 `rt.base.display()`+具体 `view` 填实（file/PG 两分支），配套收紧 `tests/meta_roundtrip.rs` 断言到具体视图名。实机复验见 §2.3。**仍未做**：`view alias` 在定义时校验目标物理树存在（属行为校验改动，见下条注）。
+5. ★**提示里的占位符未替换 + 悬空目标校验——均已实现**（§6-5 文案 + §5-10 行为）。原建议：`note: no local <db-path>/meta/pv.db yet` 与 meta-server 错误里的 `--db-path <db-path>`/`--view <name>` 应填实值；`view alias` 应在定义时检查目标物理树存在。**已采用的改法**：（文案）`src/mcp.rs` 的 `base_tree_missing_note` 用 `self.db(view).display()`+`self.base.display()` 填实树路径与存储根；`src/remote/meta/server_ext.rs` 的“view does not exist”create-hint 用 `rt.base.display()`+具体 `view` 填实（file/PG 两分支），配套收紧 `tests/meta_roundtrip.rs` 断言到具体视图名。（行为）`src/mcp.rs` 的 `alias_view` 在排除别名/派生/分叉目标后新增 `has_physical(real)` 硬拒绝悬空目标，错误文案复用上述已填实的 note。实机复验见 §2.3。
 6. ★**拒绝文案的“下一步命令”完备性巡检——du 部分本轮已实现**。本轮已对上文案的命令均为好例（`--skip-existing`、`--replace`、`--retire`、`--force`、`umount -m`）。**已采用的改法**：`src/du.rs` 的 `path not found: {}` 现回显规范化后的视图相对路径（`normalize_path` 会自动补前导 `/`）并提示 `--path takes a view-relative path such as /<top-dir>/...`；`gather_via_meta` 连不上 meta-server 时点名地址。其余（`apikey set-ro` 生效时点、`gc` 的 `objects: 0 (0 B)` 行）仍未改。
 7. **单位与计数口径**。`import` 同时给 `blocks/ 路径数: 8` 与 `distinct inode 数: 4`、`holders 台账: 8,8`，而磁盘字节为 8388620；建议统一为三行带单位的陈述：`objects(path names) 8`、`distinct blobs 4`、`bytes on disk 8388620 (8.0 MiB)`，并把 `holders 8,8` 这类裸 SQL 元组改为 `ledger: 8 rows, 16 holders`。`du` 侧 `8.0M` 与 `-b` 字节值、`55B` 这种尾差值建议统一后缀（与 GNU du 一致用 `K/M/G` 十进制或明确标注 `MiB`）。
 8. **`gc` 对在用存储的输出应区分“无字节”与“无垃圾”**。现为 `objects: 0 (0 B)` + `dry run: nothing deleted. Re-run with --apply … to reclaim 0 object(s), 0 B.`，而实际是 9 个条带对象全在远端。建议：当 `striped layout(s) > 0` 且 `objects == 0` 时改打 `objects: 0 visible here (9 striped object(s) live on data-servers; gc only audits local blocks/)`，并将 `--apply` 提示置灰而不是邀请重跑。位置：`src/main.rs:3543` 的汇总行。
@@ -1509,7 +1507,7 @@ bash .build-bin/vm_audit.sh        # 重启后拿一次全量复核
      存活挂载仍可用: 可读 ; 写入 after-kill
 
   ##### [构建产物] md5 对账（最终交付态，与 §2.3 一致） #####
-  8d5bd979f9b026fd6248c23f3971739a  /data/grovefs/grovefs/target/release/grovefs
+  d2a3b2620245aa228bf3dee45752a716  /data/grovefs/grovefs/target/release/grovefs
   ```
 
 - **结论**：通过。崩溃拉起为第二次独立复现（`NRestarts` 1→2，监听在 14×0.25 s = 3.5 s 内恢复，与 `RestartSec=3` 相符；§2.2 贴的是首次 0→1）。本轮 audit 会在 gfs-client 上 SIGKILL 一次 meta-server 主进程（由 systemd 自动重起，不留现场），因此它属于只读复核而非零开销动作；若需完全不动运行体，可只看 §3.17 的清场回显。
@@ -1529,53 +1527,37 @@ bash .build-bin/vm_audit.sh        # 重启后拿一次全量复核
 ## 8 最终 `git status` 与改动清单
 
 ```
-$ git log --oneline -3
+$ git log --oneline -4
+1d624dd fix(cli,mcp,du,meta): route fatal errors through Display and make messages actionable
 63f8c8f test(du): add du integration tests to version control
 08a5c4d fix(du,sharded,fs): correct du error handling, striped order detection, POSIX lock release
 9e9607f docs: 清除历史叙述并立「只写当前版本」口径，配 doccheck 收口脚本
 
-$ git show --stat 08a5c4d       # 本轮产品+文档修复（9 个已跟踪文件）
- .build-bin/test_locks.sh    |  62 ++++++++
- .build-bin/test_striping.sh |  22 ++++
- README.md                   |   2 +-
- USAGE.md                    |  19 ++--
- docs.html                   |  31 +++---
- src/backend/sharded.rs      | 110 +++++++++++++++++++-
- src/du.rs                   | 504 +++++++++++++++++++++++++++++++++++++++++++++++++++++++----
- src/fs_impl.rs              |  93 +++++++++++++++--
- src/main.rs                 |  13 ++-
- 9 files changed, 805 insertions(+), 51 deletions(-)
+$ git show --stat 1d624dd       # 显示/使用方式修复轮（11 个已跟踪文件 + 本报告，已入库）
+ .build-bin/test_layout.sh     |    4 +-
+ README.md                     |   32 +-
+ TEST_REPORT.md                | 1635 +++++++++++++++++++++++++++++++++++++++++
+ USAGE.md                      |   46 +-
+ docs.html                     |   32 +-
+ src/du.rs                     |   15 +-
+ src/main.rs                   |   31 +-
+ src/mcp.rs                    |   39 +-
+ src/remote/client.rs          |    9 +-
+ src/remote/meta.rs            |   10 +-
+ src/remote/meta/server_ext.rs |    9 +-
+ tests/meta_roundtrip.rs       |    4 +-
+ 12 files changed, 1787 insertions(+), 79 deletions(-)
 
-$ git show --stat 63f8c8f       # 补入 du 集成测（使 fresh checkout 能跑 §4.2 的 tests/du.rs）
- tests/du.rs | 142 ++++++++++++++++++
- 1 file changed, 142 insertions(+)
+$ git diff --stat               # §5-10 悬空别名校验轮（产品+回归+本报告，待确认入库）
+ .build-bin/test_control.sh | 21 +++++++++++++++++----
+ TEST_REPORT.md             | 74 ++++++++++++++++++++++------------------------
+ src/mcp.rs                 | 63 ++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 116 insertions(+), 42 deletions(-)
 
-$ git diff --stat               # 本轮显示/使用方式修复（11 个已跟踪文件，尚未提交）
- .build-bin/test_layout.sh     |  4 ++--
- README.md                     | 32 ++++++++++++++++----------------
- USAGE.md                      | 46 +++++++++++++++++++++++-----------------------
- docs.html                     | 32 ++++++++++++++++----------------
- src/du.rs                     | 15 +++++++++++++--
- src/main.rs                   | 31 +++++++++++++++++++++++++++++--
- src/mcp.rs                    | 39 +++++++++++++++++++++++++++------------
- src/remote/client.rs          |  9 ++++++++-
- src/remote/meta.rs            | 10 +++++++++-
- src/remote/meta/server_ext.rs |  9 +++++++--
- tests/meta_roundtrip.rs       |  4 ++--
- 11 files changed, 152 insertions(+), 79 deletions(-)
-
-$ git status --short            # 工作区：本轮 11 个已跟踪文件为 M（待确认是否入库）+ 未跟踪的报告与取证/编排脚本
- M .build-bin/test_layout.sh
- M README.md
- M USAGE.md
- M docs.html
- M src/du.rs
- M src/main.rs
+$ git status --short            # 工作区：§5-10 两个产品/回归文件为 M + 未跟踪的取证/编排脚本
+ M .build-bin/test_control.sh
+ M TEST_REPORT.md
  M src/mcp.rs
- M src/remote/client.rs
- M src/remote/meta.rs
- M src/remote/meta/server_ext.rs
- M tests/meta_roundtrip.rs
 ?? .build-bin/gfs_provision.sh
 ?? .build-bin/probe_posix_lock.py
 ?? .build-bin/vm_audit.sh
@@ -1608,11 +1590,11 @@ $ git status --short            # 工作区：本轮 11 个已跟踪文件为 M�
 | `docs.html` | 同步上述表格与措辞 | §4.4 |
 
 | `src/backend/sharded.rs` | 本轮复核新增：`layout_server_count`（供 du 前置门控只约束有 `s<N>` 前缀的键）与 `chunk0_elsewhere`（用 `{uuid}#0` 归属确定性检出反序列列表）+ `order_verified` 零成本门控；新增 2 个单测 | §3.6.2（倒置列表由静默 `0B` 改为报错的实机回显）、§4.2（`a_reversed_server_list_is_reported_not_read_as_empty`、`an_empty_striped_object_still_measures_zero`） |
-| `src/fs_impl.rs` | 本轮修复 §5-3：新增 `posix_lock_fh_owner`/`posix_lock_owner_fds` 两表与 `note_posix_lock`/`drop_posix_lock_on_release`，`setlk` 授予时记账、`release` 末次锁定时全区间 Unlock 精确回收 POSIX 锁（不依赖内核不交的 `lock_owner`） | §3.2（根因+修复说明与实机 `GRANTED`/`2.53s` 唤醒回显）、§5-3行、§4.2（`tests/locks.rs` 11 passed） |
+| `src/fs_impl.rs` | 本轮修复 §5-3：新增 `posix_lock_fh_owner`/`posix_lock_owner_fds` 两表与 `note_posix_lock`/`drop_posix_lock_on_release`，`setlk` 授予时记账、`release` 末次锁定时全区间 Unlock 精确回收 POSIX 锁（不依赖内核不交的 `lock_owner`） | §3.2（根因+修复说明与实机 `GRANTED`/`2.74s` 唤醒回显）、§5-3行、§4.2（`tests/locks.rs` 11 passed） |
 | `.build-bin/test_locks.sh` | 本轮新增 §4c：跨进程 POSIX `fcntl` 整文件锁的 close 释放（新进程非阻塞加锁）+ 阻塞 `F_SETLKW` 唤醒延时两个回归用例 | 本地 `bash .build-bin/test_locks.sh` SUMMARY `pass=17 fail=0`（含新增两项），实机集群复验同结果 |
-| `.build-bin/probe_posix_lock.py` | 本轮新增：三机集群挂载点上的 §5-3 实机探针（holder close 后 asker、blocker 唤醒），取证用 | §3.2 实机回显（`ask:GRANTED`、`block:WAKE 2.53s`、`RESULT: PASS`） |
+| `.build-bin/probe_posix_lock.py` | 本轮新增：三机集群挂载点上的 §5-3 实机探针（holder close 后 asker、blocker 唤醒），取证用 | §3.2 实机回显（`ask:GRANTED`、`block:WAKE 2.74s`、`RESULT: PASS`） |
 
-本轮显示/使用方式修复（§5-12/§6-1/§5-4·§6-4/§6-5/§6-6，均不改运行时逻辑或协议，已入运行体 `8d5bd979` 并在实机复验，见 §2.3/§3.6.2）：
+本轮显示/使用方式修复（§5-12/§6-1/§5-4·§6-4/§6-5/§6-6，均不改运行时逻辑或协议，已入运行体 `d2a3b262` 并在实机复验，见 §2.3/§3.6.2）：
 
 | 文件 | 改动内容 | 证据 |
 |---|---|---|
@@ -1626,10 +1608,13 @@ $ git status --short            # 工作区：本轮 11 个已跟踪文件为 M�
 | `.build-bin/test_layout.sh` | §5-12 连带修正：治理拒绝改走 Display 后人话消息不含旧 Debug 的 `Permission` 字样，grep 关键字表补 `governed by an alias\|mount the alias name` | §4.3（`run_all.sh` RESULT: GREEN） |
 | `README.md` / `USAGE.md` / `docs.html` | 与 Display 新形态同步：所有 CLI 输出示例 `Error: "X"`/`Error: Custom {…, error: "X"}`→`error: X`；`Error: … "permission denied: bound to view"` 手工补改；typo1 实测块与建视图表行填实 create-hint 路径 | §4.4 doccheck、§4.3 GREEN |
 
-本轮共 11 个已跟踪文件改动（`+152/-79`），连同本报告尚未提交（工作区为 `M` + 未跟踪脚本），是否入库待与作者确认。
+上述显示/使用方式修复已提交为 `1d624dd`（11 个已跟踪文件 + 本报告，`+1787/-79`）。
 
-本轮专业复核（含上一轮）已提交的两 commit：`08a5c4d`（产品+文档修复，9 files, +805/-51）与 `63f8c8f`（将 `tests/du.rs` 3 个 du 集成测纳入版本，使 fresh checkout 能跑 §4.2 引用的 tests/du.rs）。上述修复均已在运行 `8d5bd979` 的实机集群上复验（§3.6.2 四条 du 定点、§3.2 POSIX 锁 close 释放与阻塞唤醒、§4.3 `run_all.sh` GREEN、§4.2 `cargo test` 全绿）。
+本轮 §5-10 悬空别名校验（行为级校验改动，经作者批准后实现；已入运行体 `d2a3b262` 并在实机复验，见 §3.4.3 X2）：
 
-仍为未跟踪、**未**进任何 commit 的产物（如实列出）：`TEST_REPORT.md`（本报告）；`.build-bin/probe_posix_lock.py` 与 `.build-bin/vm_*.sh`/`gfs_provision.sh`（实机取证/编排脚本，不属于产品代码）。
+| 文件 | 改动内容 | 证据 |
+|---|---|---|
+| `src/mcp.rs` | §5-10：`alias_view` 在排除别名/派生/分叉三类目标后，用 `store.has_physical(real)` 校验别名目标指向的物理视图树确实存在；不存在则在**定义时**硬拒，并用 `base_tree_missing_note`（file 侧）或自造 create/import 文案（PG 侧）填实提示。一处改动同时覆盖 CLI（`main.rs` 经同一 `alias_view`）与 MCP 两入口、file 与 PG 两 store。新增单测 `alias_refuses_a_dangling_physical_target` | §3.4.3 X2（悬空别名 `rc=1` 定义被拒、控制面未写入）、§4.2（`cargo test` 全绿含该单测）、§4.3 `run_all.sh` GREEN |
+| `.build-bin/test_control.sh` | §5-10 配套：PG 别名目标改用独立物理视图 `AREAL`（避免治理 `$BASE` 致 §3 真实名挂载被拒），并新增悬空别名定义被拒的回归用例（断言报错含 `no physical view tree`） | §4.3（`run_all.sh` RESULT: GREEN，control 套件 16/0） |
 
 本次未做的改动（如实列出）：§5 遗留项中除上述当场修复外均未改代码；§5-3（POSIX 锁 close 释放泄漏）本轮已定位确定性根因并实现修复（`setlk` 记账 + `release` 精确回收，不改 sid 续租模型），配套集成测与实机复验均通过（见 §3.2、§6-2a）；§5-5 中“数据源真丢字节”的内部空洞/首块真丢形态仍需 §6-2 方案。
