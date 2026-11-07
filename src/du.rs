@@ -7,11 +7,16 @@
 //! 3. Aggregating subtree totals per directory and printing du-compatible
 //!    output.
 //!
+//! The data source is resolved explicitly ([`data_source`]): a size sweep
+//! either has a place to read bytes from, or the command refuses. An unset
+//! `--data`/`--data-root` never yields a report of all zeros.
+//!
 //! For 15k files this typically runs in <50 ms vs ~25 s via FUSE.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 /// A flat node from the metadata tree (both backends normalize to this).
 pub struct FlatNode {
@@ -53,7 +58,16 @@ pub fn run(opts: &DuOpts) -> io::Result<()> {
         .collect();
 
     // 3. Batch-get sizes.
-    let sizes = resolve_sizes(opts, &refs)?;
+    let (sizes, lost) = resolve_sizes(opts, &refs)?;
+    if lost > 0 {
+        // Numbers that quietly omit something are the failure mode this
+        // command exists to avoid, so the gap is announced, not folded in.
+        eprintln!(
+            "warning: {lost} of {} object(s) are not in the data source and count as 0 bytes \
+             (objects on other storage roots need their own --data/--data-root)",
+            refs.len()
+        );
+    }
 
     // 4. Build id→size map and id→node map.
     let mut size_map: HashMap<i64, u64> = HashMap::with_capacity(refs.len());
@@ -275,24 +289,329 @@ fn gather_via_meta(
 
 // --- Size resolution ---
 
-fn resolve_sizes(opts: &DuOpts, refs: &[String]) -> io::Result<Vec<u64>> {
+/// Where the content bytes behind `data_ref` live for one invocation.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DataSource {
+    /// One or more data-server endpoints, in the order the writer used. A
+    /// single address answers every size in one batch RPC; a list means the
+    /// store is striped, so sizes come back per object from the shard map.
+    Remote(Vec<String>),
+    /// A storage root that already holds `blocks/`, stat'ed directly.
+    Local(PathBuf),
+}
+
+/// Split a `--data`/`GROVEFS_DATA` value into addresses (same trimming the
+/// mount uses, so one string form means the same thing in both commands).
+fn split_addrs(list: &str) -> Vec<String> {
+    list.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Decide where to read object sizes from. Precedence is
+/// `--data` > `--data-root` > the local store root the tree itself came from.
+///
+/// The last step is what makes `grovefs du --home R --view V` self-contained:
+/// `grovefs init` puts `meta/<view>.db` and `blocks/` under the same root R.
+/// A tree that came from a meta-server or a PostgreSQL store has no local
+/// counterpart to infer from, so the source stays unresolvable and this
+/// returns an error instead of measuring nothing.
+pub fn data_source(opts: &DuOpts) -> io::Result<DataSource> {
+    let data = opts.data.clone().or_else(|| {
+        std::env::var("GROVEFS_DATA")
+            .ok()
+            .filter(|s| !s.is_empty())
+    });
+    data_source_at(
+        data.as_deref(),
+        opts.data_root.as_deref(),
+        opts.meta.as_deref(),
+        resolve_store(&opts.store).as_deref(),
+        opts.db_path.as_deref(),
+    )
+}
+
+/// The decision itself, with flags and environment already folded together.
+fn data_source_at(
+    data: Option<&str>,
+    data_root: Option<&std::path::Path>,
+    meta: Option<&str>,
+    store: Option<&str>,
+    db_path: Option<&std::path::Path>,
+) -> io::Result<DataSource> {
+    if let Some(list) = data {
+        let addrs = split_addrs(list);
+        if !addrs.is_empty() {
+            return Ok(DataSource::Remote(addrs));
+        }
+    }
+    if let Some(root) = data_root {
+        return Ok(DataSource::Local(root.to_path_buf()));
+    }
+    let remote_tree = meta.is_some() || store.is_some();
+    if !remote_tree {
+        if let Some(root) = db_path {
+            return Ok(DataSource::Local(root.to_path_buf()));
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "no data source to measure: pass --data <host:port> for a data-server \
+         (or set GROVEFS_DATA), or --data-root <dir holding blocks/>",
+    ))
+}
+
+/// Sizes of `refs`, plus how many refs could not be located (each of those
+/// counted as 0 bytes, which the caller must say out loud). Only a confirmed
+/// miss is counted: an answer nobody gave is an error, not a number.
+fn resolve_sizes(opts: &DuOpts, refs: &[String]) -> io::Result<(Vec<u64>, usize)> {
     if refs.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
-    if let Some(addr) = &opts.data {
-        // Remote: one batch RPC to data-server.
-        let token = opts.token.as_deref().unwrap_or("");
-        let api_key = opts.api_key.as_deref().unwrap_or("");
-        let backend = crate::remote::client::RemoteBackend::new_with_creds(addr, token, api_key)?;
-        backend.batch_len(refs)
-    } else if let Some(root) = &opts.data_root {
-        // Local: open_local expects the root dir that CONTAINS blocks/.
-        let backend = crate::backend::open_local(root)?;
-        Ok(refs.iter().map(|k| backend.len(k).unwrap_or(0)).collect())
+    match data_source(opts)? {
+        DataSource::Remote(addrs) => resolve_remote(opts, &addrs, refs),
+        DataSource::Local(root) => {
+            // Local: open_local expects the root dir that CONTAINS blocks/.
+            // Opening a backend creates its bucket tree, and a reporting
+            // command has no business writing into the namespace it measures,
+            // so a root without blocks/ is refused rather than trusted.
+            if !root.join("blocks").is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "no blocks/ under {} — objects are not here; point --data at \
+                         the data-server, or --data-root at the storage root holding \
+                         blocks/",
+                        root.display()
+                    ),
+                ));
+            }
+            let backend = crate::backend::open_local(&root)?;
+            let mut missing = 0usize;
+            let mut unconfirmed: Option<String> = None;
+            let mut sizes = Vec::with_capacity(refs.len());
+            for k in refs {
+                match backend.len(k) {
+                    Ok(n) => sizes.push(n),
+                    Err(e) if confirmed_missing(&e) => {
+                        missing += 1;
+                        sizes.push(0);
+                    }
+                    // A bucket we could not open (permissions, EIO under a
+                    // failing disk) says nothing about the bytes, so it cannot
+                    // be summed as if it did.
+                    Err(e) => {
+                        unconfirmed.get_or_insert_with(|| format!("{k}: {e}"));
+                        sizes.push(0);
+                    }
+                }
+            }
+            if let Some(why) = unconfirmed {
+                return Err(io::Error::other(format!(
+                    "object(s) under {} could not be read to confirm their size (first \
+                     failure: {why}); no total is reported rather than one that omits them",
+                    root.display()
+                )));
+            }
+            Ok((sizes, missing))
+        }
+    }
+}
+
+/// Whether an error is the data source *saying* the bytes are absent.
+///
+/// The distinction is not cosmetic: `not in the data source` is a statement
+/// about the user's data, and a timeout, a refused connection, an `EIO` from a
+/// chunk probe that kept failing, or a permission error has not earned it. The
+/// striped path already keeps these apart internally (`Probe::Absent` versus
+/// `Probe::Unknown`, which [`crate::backend::ShardedBackend`] deliberately
+/// refuses to conflate because doing so once left permanent GC orphans); a
+/// reporting command may not merge them back together.
+fn confirmed_missing(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::NotFound
+}
+
+/// Refuse an address list that cannot describe this tree, before asking any
+/// server a single question.
+///
+/// `data_ref` carries the server count the writer used, so the mismatch is
+/// known from the metadata alone. Which way it is wrong matters: chunks map to
+/// `i % n`, so a shorter list means chunks pointed at servers that never held
+/// them and a longer one means chunks spread over a different set — either way
+/// the objects are NOT missing, they are simply not addressable under this
+/// list. Saying "pass every data-server" to someone who passed one too many
+/// sends them the wrong way, so the two cases get opposite advice here.
+///
+/// Keys with no `s<N>` prefix state no count and constrain nothing: a whole
+/// object is looked up on member 0 whatever the list length, so a store whose
+/// objects predate striping stays measurable under a striped list.
+fn check_server_count(addrs: &[String], refs: &[String]) -> io::Result<()> {
+    let counts: BTreeSet<usize> = refs
+        .iter()
+        .filter_map(|k| crate::backend::sharded::layout_server_count(k))
+        .collect();
+    let m = addrs.len();
+    let err = |why: String| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{why}; no sizes are reported"),
+        )
+    };
+    match counts.len() {
+        // Nothing to check, or every object names the count of this list.
+        0 => Ok(()),
+        1 if counts.contains(&m) => Ok(()),
+        1 => {
+            let n = *counts.iter().next().unwrap();
+            if n > m {
+                Err(err(format!(
+                    "this tree was written across {n} data-servers but --data names {m}: the \
+                     stripe map needs every address in the writer's order, so pass the full \
+                     list as one comma-separated value (e.g. --data host1:port,host2:port)"
+                )))
+            } else {
+                Err(err(format!(
+                    "this tree was written across {n} data-servers but --data names {m}: extra \
+                     addresses move logical chunks onto servers that never held them, so pass \
+                     exactly the {n} addresses in the order the writer used"
+                )))
+            }
+        }
+        // More than one generation in one tree: no single list is right for it.
+        _ => {
+            let list = counts
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(" and ");
+            Err(err(format!(
+                "this tree holds objects written across {list} different numbers of \
+                 data-servers (a store that was expanded after some of it was written): one \
+                 --data list cannot measure both generations, so measure each with the list \
+                 it was written with"
+            )))
+        }
+    }
+}
+
+/// Sizes pulled from one or more data-servers.
+///
+/// One server answers the whole tree in a single `OP_BATCH_LEN`, but that batch
+/// replies `0` for a key it does not have — indistinguishable from an empty
+/// object. So every zero is confirmed by a single-key probe, where a real miss
+/// answers ENOENT, and confirmed misses are counted as lost.
+///
+/// Several servers mean the store is striped: `data_ref` carries the
+/// `s<N>:<stripe>:` layout, no member holds a whole object, and the only
+/// honest measure is the same chunk probe a mounted read uses
+/// ([`crate::backend::ShardedBackend::len`]), fanned out over a few threads so
+/// a large tree still finishes in one pass. A list that cannot describe the
+/// tree is refused up front from the layout in `data_ref` — see
+/// [`check_server_count`] — because waiting for the probes would turn that
+/// mistake into a row of failures this function would then have to explain.
+fn resolve_remote(
+    opts: &DuOpts,
+    addrs: &[String],
+    refs: &[String],
+) -> io::Result<(Vec<u64>, usize)> {
+    check_server_count(addrs, refs)?;
+    let token = opts.token.as_deref().unwrap_or("");
+    let api_key = opts.api_key.as_deref().unwrap_or("");
+    let concrete: Vec<Arc<crate::remote::client::RemoteBackend>> = addrs
+        .iter()
+        .map(|a| {
+            crate::remote::client::RemoteBackend::new_with_creds(a, token, api_key).map(Arc::new)
+        })
+        .collect::<io::Result<_>>()?;
+    let members: Vec<Arc<dyn crate::backend::StorageBackend>> = concrete
+        .iter()
+        .cloned()
+        .map(|b| b as Arc<dyn crate::backend::StorageBackend>)
+        .collect();
+    let single = concrete.len() == 1;
+    let sharded: Arc<dyn crate::backend::StorageBackend> =
+        Arc::new(crate::backend::ShardedBackend::with_default_stripe(members));
+
+    // One server can answer the whole sweep in a single RPC; a striped store
+    // cannot, so those sizes come back from the per-object probe below.
+    let mut sizes = if single {
+        concrete[0].batch_len(refs)?
     } else {
-        // Fallback: all zeros (no data access configured).
-        Ok(vec![0; refs.len()])
+        vec![0u64; refs.len()]
+    };
+
+    // Which objects still need a per-key answer: striped stores need one for
+    // every object, a single server only for the zeros the batch guessed at.
+    let todo: Vec<usize> = (0..refs.len())
+        .filter(|i| !single || sizes[*i] == 0)
+        .collect();
+    if !todo.is_empty() {
+        // One probe result per object: its index into `refs` and the answer.
+        type Probes = Vec<(usize, io::Result<u64>)>;
+        let out: Arc<Mutex<Probes>> = Arc::new(Mutex::new(Vec::new()));
+        let width = todo.len().div_ceil(todo.len().min(8));
+        std::thread::scope(|s| {
+            for part in todo.chunks(width) {
+                let sharded = sharded.clone();
+                let out = out.clone();
+                let part = part.to_vec();
+                s.spawn(move || {
+                    let done: Probes = part
+                        .into_iter()
+                        .map(|i| (i, sharded.len(&refs[i])))
+                        .collect();
+                    out.lock().unwrap().extend(done);
+                });
+            }
+        });
+        let mut missing = 0usize;
+        let mut unconfirmed = 0usize;
+        let mut first_missing: Option<String> = None;
+        let mut first_unconfirmed: Option<String> = None;
+        for (i, res) in out.lock().unwrap().drain(..) {
+            match res {
+                Ok(n) => sizes[i] = n,
+                Err(e) if confirmed_missing(&e) => {
+                    missing += 1;
+                    first_missing.get_or_insert_with(|| e.to_string());
+                }
+                Err(e) => {
+                    unconfirmed += 1;
+                    first_unconfirmed.get_or_insert_with(|| e.to_string());
+                }
+            }
+        }
+        if unconfirmed > 0 {
+            // A size nobody answered is not a size of zero: folding it in would
+            // print a total that quietly omits objects, which is the failure
+            // this command exists to avoid. The data source's own reason is
+            // quoted because it is the only part that says what went wrong.
+            return Err(io::Error::other(format!(
+                "{unconfirmed} of {} object(s) could not be confirmed against the data \
+                 source (first failure: {}); their sizes are unknown, so no total is \
+                 reported",
+                refs.len(),
+                first_unconfirmed.unwrap_or_default()
+            )));
+        }
+        if missing == refs.len() {
+            // The list matched the layout, so these are bytes that are really
+            // not where they were told to be: name the store, not the stripe.
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "no object of this tree is on the listed data source (first miss: {}); \
+                     check that --data names the store this view was written to, or pass \
+                     --data-root for a local blocks/",
+                    first_missing.unwrap_or_default()
+                ),
+            ));
+        }
+        return Ok((sizes, missing));
     }
+    Ok((sizes, 0))
 }
 
 // --- Tree operations ---
@@ -422,5 +741,156 @@ fn human(bytes: u64) -> String {
         format!("{}B", bytes)
     } else {
         format!("{:.1}{}", sz, UNITS[u])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(s: &str) -> PathBuf {
+        PathBuf::from(s)
+    }
+
+    #[test]
+    fn an_explicit_data_server_wins() {
+        assert_eq!(
+            data_source_at(Some("h:1"), Some(&p("/r")), Some("m:2"), Some("pg"), Some(&p("/r")))
+                .unwrap(),
+            DataSource::Remote(vec!["h:1".into()])
+        );
+    }
+
+    /// A comma-separated list is kept in order and intact: dropping members
+    /// would silently remap which server each chunk belongs to.
+    #[test]
+    fn a_data_server_list_keeps_every_address_in_order() {
+        assert_eq!(
+            data_source_at(Some("a:1, b:2 ,c:3,"), None, None, None, None).unwrap(),
+            DataSource::Remote(vec!["a:1".into(), "b:2".into(), "c:3".into()])
+        );
+    }
+
+    /// An empty or comma-only list names no server, so it must not become a
+    /// zero-address data source.
+    #[test]
+    fn a_blank_data_list_falls_through_to_the_refusal() {
+        let err = data_source_at(Some(", ,"), None, Some("m:2"), None, None)
+            .expect_err("a list without addresses is no source");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("--data"), "{err}");
+    }
+
+    #[test]
+    fn an_explicit_data_root_beats_any_inference() {
+        assert_eq!(
+            data_source_at(None, Some(&p("/disks/2")), None, None, Some(&p("/store"))).unwrap(),
+            DataSource::Local(p("/disks/2"))
+        );
+    }
+
+    /// `--home`/`--db-path` names the root that holds both meta/ and blocks/,
+    /// so measuring a local store needs no second flag.
+    #[test]
+    fn a_local_sqlite_tree_infers_its_own_root() {
+        assert_eq!(
+            data_source_at(None, None, None, None, Some(&p("/store"))).unwrap(),
+            DataSource::Local(p("/store"))
+        );
+    }
+
+    /// A tree pulled from a meta-server or from PG has no bytes next to the
+    /// client's config file: refusing beats reporting a subtree of zeros.
+    #[test]
+    fn a_remote_tree_without_a_data_source_is_refused() {
+        for (label, res) in [
+            ("--meta", data_source_at(None, None, Some("m:2"), None, Some(&p("/store")))),
+            ("--store", data_source_at(None, None, None, Some("postgres://x"), Some(&p("/store")))),
+        ] {
+            let err = res.expect_err(&format!("{label} must not infer a local root"));
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{label}");
+            assert!(err.to_string().contains("--data"), "{label}: {err}");
+        }
+    }
+
+    fn stripe(n: usize, keys: &[&str]) -> Vec<String> {
+        keys.iter()
+            .map(|k| format!("s{n}:16777216:{k}"))
+            .collect()
+    }
+
+    fn addrs(n: usize) -> Vec<String> {
+        (1..=n).map(|i| format!("h{i}:1")).collect()
+    }
+
+    /// A list shorter than the layout is a wrong list, and the fix is the other
+    /// list: the check must say so from the metadata, without a probe.
+    #[test]
+    fn a_shorter_list_is_told_to_pass_the_whole_one() {
+        let err = check_server_count(&addrs(1), &stripe(2, &["a", "b"])).unwrap_err();
+        let msg = err.to_string();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(msg.contains("written across 2 data-servers but --data names 1"), "{msg}");
+        assert!(msg.contains("host1:port,host2:port"), "{msg}");
+    }
+
+    /// A list longer than the layout is the same mistake in the other
+    /// direction, so telling the operator to pass MORE addresses here would
+    /// send them away from the answer.
+    #[test]
+    fn a_longer_list_is_not_told_to_add_more() {
+        let err = check_server_count(&addrs(3), &stripe(2, &["a", "b"])).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("extra addresses"), "{msg}");
+        assert!(msg.contains("pass exactly the 2 addresses"), "{msg}");
+        assert!(!msg.contains("host1:port,host2:port"), "wrong direction: {msg}");
+    }
+
+    /// Matching counts pass, including a legacy key with no layout prefix, which
+    /// states no count and so stays measurable under any list.
+    #[test]
+    fn a_list_that_matches_the_layout_is_allowed() {
+        assert!(check_server_count(&addrs(2), &stripe(2, &["a"])).is_ok());
+        let legacy = "550e8400-e29b-41d4-a716-446655440000".to_string();
+        for n in 1..=3 {
+            assert!(check_server_count(&addrs(n), std::slice::from_ref(&legacy)).is_ok(), "{n} addrs");
+        }
+        // A striped tree plus legacy objects is measured by the striped list.
+        let mut mixed = vec![legacy];
+        mixed.extend(stripe(2, &["a"]));
+        assert!(check_server_count(&addrs(2), &mixed).is_ok());
+        assert!(check_server_count(&addrs(1), &[]).is_ok());
+    }
+
+    /// A store expanded after part of it was written holds two generations, and
+    /// no list fits both. Averaging them into "missing objects" would hide the
+    /// one fact the operator needs.
+    #[test]
+    fn two_generations_are_named_not_folded_into_missing() {
+        let mut refs = stripe(1, &["old"]);
+        refs.extend(stripe(2, &["new"]));
+        let err = check_server_count(&addrs(2), &refs).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("1 and 2 different numbers"), "{msg}");
+        assert!(msg.contains("expanded"), "{msg}");
+        assert!(!msg.contains("not in the data source"), "{msg}");
+    }
+
+    /// Only a definitive ENOENT may be counted as absent bytes. Everything
+    /// else leaves the size unknown, and an unknown is not a zero.
+    #[test]
+    fn an_unconfirmed_answer_is_not_a_missing_object() {
+        use io::ErrorKind as K;
+        let miss = io::Error::from_raw_os_error(2); // ENOENT
+        assert!(confirmed_missing(&miss));
+        for e in [
+            io::Error::from_raw_os_error(111), // ECONNREFUSED
+            io::Error::from_raw_os_error(5),   // EIO: a chunk probe that kept failing
+            io::Error::from_raw_os_error(13),  // EACCES
+            io::Error::new(K::TimedOut, "slow data-server"),
+            io::Error::other("refusing to remap"),
+        ] {
+            assert!(!confirmed_missing(&e), "{:?} is not an absent object", e.kind());
+        }
     }
 }

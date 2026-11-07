@@ -124,6 +124,28 @@ chk "$(T cat .striping/mnt_legacy/leg.txt)" "legacy-single" "single-address moun
 # single-address RemoteBackend never emits one) on server A
 if find .striping/sA/blocks -type f 2>/dev/null | grep -qv '#'; then ok "legacy object stored under a bare uuid key (no '#' stripe marker)"; else bad "single-address mount wrote a striped key"; fi
 
+echo "===== 8) du across a striped store ====="
+# The tree's data_refs carry the s<N> layout, so sizes only come back when
+# every server is named: one address must refuse, the list must total exactly
+# what the mounted tree reports as file sizes.
+sync "$M" 2>/dev/null
+exp=$(T sh -c "find $M -type f -printf '%s\\n'" | T awk '{s+=$1} END{print s+0}')
+T fusermount -u .striping/mnt_legacy 2>/dev/null
+got=$($Y du --view alice --data "$A,$B" -b --total 2>/dev/null | awk '$2=="/"{print $1}')
+chk "$got" "$exp" "du --data a,b totals every striped object ($exp bytes)"
+if $Y du --view alice --data $A -b --total >.striping/du_one.log 2>&1; then
+  bad "single-address du returned success instead of refusing"
+else
+  if grep -q 'written across 2 data-servers but --data names 1' .striping/du_one.log && grep -q 'host1:port,host2:port' .striping/du_one.log; then
+    ok "single-address du refuses and names the list to pass"
+  else
+    bad "single-address du refused without guidance: $(tail -2 .striping/du_one.log)"
+  fi
+fi
+# a pre-striping (bare uuid) tree is still measurable from the one server it lives on
+got_bob=$($Y du --view bob --data $A -b --total 2>/dev/null | awk '$2=="/"{print $1}')
+chk "$got_bob" "$(T printf 'legacy-single' | wc -c)" "single-address du reads a bare-uuid store"
+
 echo
 echo "==================== SUMMARY: pass=$pass fail=$fail ===================="
 [ "$fail" -eq 0 ] && echo "ALL STRIPING CHECKS PASSED" || echo "SOME STRIPING CHECKS FAILED"

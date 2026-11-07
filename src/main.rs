@@ -739,11 +739,18 @@ NOTES
         /// Metadata root for SQLite mode (meta/<view>.db lives under here).
         #[arg(long)]
         db_path: Option<PathBuf>,
-        /// Data-server endpoint (host:port) for remote batch stat; omit for
-        /// local mode (stat blocks/ directly from --data-root).
+        /// Data-server endpoint(s) for batch stat: `host:port`, or a
+        /// comma-separated list in the same order the mount used. Needed when
+        /// the tree comes through `--meta`/`--store`, which imply no local
+        /// storage root to stat. A striped store (`s<N>` data_refs) can only
+        /// be measured with exactly the `N` addresses the writer used: a list
+        /// of any other length is refused in either direction, not zeroed.
         #[arg(long)]
         data: Option<String>,
-        /// Local data root holding blocks/ (for local-mode du).
+        /// Local data root holding blocks/; defaults to the store root named
+        /// by `--db-path`/`--home` (same convention as `grovefs import
+        /// --data-root`). Without either a local root or `--data`, sizes would
+        /// be guessed at zero, so the command refuses.
         #[arg(long)]
         data_root: Option<PathBuf>,
         /// API key for data-server authentication.

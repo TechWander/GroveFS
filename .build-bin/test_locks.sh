@@ -218,6 +218,68 @@ kill -9 $HP2 2>/dev/null; wait $HP2 2>/dev/null
 if python3 .locks/ask.py "$M2/seed/f2.bin" >/dev/null 2>&1; then ok "lock released once live holder killed"; else bad "lock still held after holder killed"; fi
 
 # ---------------------------------------------------------------------------
+echo "===== 4c) POSIX fcntl close/exit releases the lock (no sid-renewal leak) ====="
+# Regression for §5-3: fuser only hands `release` a lock_owner for flock(2)
+# (FUSE_RELEASE_FLOCK_UNLOCK), so a POSIX fcntl lock dropped by close()/exit
+# used to be left behind and the per-mount sid heartbeat renewed the ghost row
+# forever — a fresh non-blocking F_SETLK kept returning EACCES and a blocked
+# F_SETLKW hung to the 10-min cap. The mount now tracks (fh -> ino, owner) and
+# deletes the rows on the last locking close. Note the lock-renewal heartbeat
+# runs for the life of the MOUNT, not the app, so lease expiry (3s) can NOT
+# rescue these cases on its own: without the fix they hang regardless.
+cat > .locks/posix_hold.py <<'PY'
+import fcntl, os, sys, struct, time
+# whole-file write lock: l_type=F_WRLCK, whence=SEEK_SET, start=0, len=0 (to EOF)
+lock = struct.pack('hhqqi', fcntl.F_WRLCK, 0, 0, 0, 0)
+fd = os.open(sys.argv[1], os.O_RDWR)
+fcntl.fcntl(fd, fcntl.F_SETLK, lock)
+print('acquired', flush=True)
+secs = float(sys.argv[2]) if len(sys.argv) > 2 else 0.0
+time.sleep(secs)         # hold while alive...
+os.close(fd)            # ...then release via close ONLY (no explicit F_UNLCK)
+PY
+cat > .locks/posix_ask.py <<'PY'
+import fcntl, os, sys, struct, errno
+lock = struct.pack('hhqqi', fcntl.F_WRLCK, 0, 0, 0, 0)
+fd = os.open(sys.argv[1], os.O_RDWR)
+try:
+    fcntl.fcntl(fd, fcntl.F_SETLK, lock)   # non-blocking
+    print('posix:granted')
+except OSError as ex:
+    print('posix:refused errno=%d' % ex.errno)
+finally:
+    os.close(fd)
+PY
+cat > .locks/posix_block.py <<'PY'
+import fcntl, os, sys, struct, time
+lock = struct.pack('hhqqi', fcntl.F_WRLCK, 0, 0, 0, 0)
+fd = os.open(sys.argv[1], os.O_RDWR)
+t0 = time.time()
+fcntl.fcntl(fd, fcntl.F_SETLKW, lock)      # blocking: only returns once granted
+print('posix:WAKE %.2fs' % (time.time() - t0))
+os.close(fd)
+PY
+# (a) holder acquires on M1, then closes+exits; a fresh process must get the lock.
+python3 .locks/posix_hold.py "$M1/seed/f1.bin" 0 > .locks/ph.out 2>&1
+grep -q acquired .locks/ph.out && ok "posix holder acquired whole-file W" || bad "posix holder failed to acquire"
+ra=$(python3 .locks/posix_ask.py "$M2/seed/f1.bin" 2>&1 | tail -1)
+case "$ra" in
+  posix:granted) ok "fresh F_SETLK granted after holder close (leak fixed)" ;;
+  *) bad "POSIX lock leaked on close (ask got: $ra)" ;;
+esac
+# (b) a blocked F_SETLKW waiter must wake when the holder closes at ~3s.
+python3 .locks/posix_hold.py "$M1/seed/f1.bin" 3 > .locks/ph2.out 2>&1 &
+HPB=$!
+for _ in $(seq 1 60); do grep -q acquired .locks/ph2.out 2>/dev/null && break; sleep 0.05; done
+# timeout 8: without the fix the waiter hangs to the 10-min cap and never prints.
+wl=$(timeout 8 python3 .locks/posix_block.py "$M2/seed/f1.bin" 2>&1 | tail -1)
+wait $HPB 2>/dev/null
+case "$wl" in
+  posix:WAKE*) ok "blocked F_SETLKW released when holder closed ($wl)" ;;
+  *) bad "blocked F_SETLKW did not wake on holder close (got: $wl)" ;;
+esac
+
+# ---------------------------------------------------------------------------
 echo "===== 5) HA: locks table replicates to standby via existing backup channel ====="
 META_A=127.0.0.1:15116
 META_B=127.0.0.1:15117
