@@ -1415,7 +1415,7 @@
 2. ★**条带对象丢分块时的静默 0 / 静默短报（最严重的一条）**。建议分两步：
    - `ShardedBackend::len` 在二分定界后多探一个分块（探 `A+1`）：若存在则说明是内部空洞，返回 `io::Error`(kind=`Other`, 文案 `striped object <uuid> has a gap at chunk #A (present after an absent one) — content is damaged, not short`)；`du` 侧现有 `lost` 计数会自动报出 warning，挂载侧 getattr 得 `EIO` 而不是假 EOF（成本：每对象 +1 次 RPC，与现有 `Probe::Unknown` 失败原则一致，见 `src/backend/sharded.rs:401` 注释）。
    - chunk#0 缺失目前返回 `Ok(0)`，与空对象不可区分；建议同路报 `ENOENT`，使 `du` 进 `lost` 分支。
-   - 文档同步：`docs.html` 的 du 字节来源说明（目前只讲了非条带的 `warning: N of M …`）需补上“条带对象分块缺失时的行为”。
+   - 文档同步：`docs.html` 的 du 字节来源说明（原本只讲了非条带的 `warning: N of M …`）——**本轮已补上“条带对象分块丢失时的行为”**：在字节来源 note 内加一句——中间分块缺失时 `len` 把首个缺失分块当 EOF、静默短报，首分块缺失时给一个错位的极小值，与挂载读不到丢失对象一样不出声，属已知缺陷，并指向下方“会不会出声”表（表(b) 本轮 §6-12 已落）。上述两条**行为改动**（多探一分块报 gap / chunk#0 缺失改报 ENOENT）仍属待议，需实测与逐项征询，本轮未动代码。
 2a. ★**POSIX 记录锁 close/退出隐式释放泄漏（§5-3）——本轮已实现**。原建议：既然 `fuser` 0.18 仅在 `FUSE_RELEASE_FLOCK_UNLOCK`（只有 flock(2) 路径置位）时向 `release` 交 `lock_owner`，POSIX 锁走 close 拿到 `None`，旧回收不触发。**已采用的改法**：在 `setlk`（已不再忽略 `fh`）按 `(fh → ino, owner)` 记账，`release(fh)` 据此在某个 `(ino,owner)` 的最后一个锁定描述符关闭时，用一次全区间 `lock_op(..., Unlock, ...)` 精确删除其行（`src/fs_impl.rs` 的 `note_posix_lock`/`drop_posix_lock_on_release`）。采用“删除行”而非“收窄 `renew_locks` 到仍打开的描述符”，是为了不动 meta 协议与跨机续租模型：行一旦删除，按 sid 的续租心跳自然不再刷新它，效果与“只刷新存活行”等价，且失败时仍退化为一个租期内自然过期。已配套集成测（`test_locks.sh` §4c：跨进程持有/释放 + 阻塞唤醒延时），本地 17/17、三机实机复验通过（close 后 `GRANTED`、阻塞 `2.74s` 唤醒）。
 3. ★**fork/只读 key 的 `EROFS` 在 shell 里假成功**。`>>` 追加 `rc=0` 而字节未落盘（§3.4.4、§3.9），用户只会看到“写了但没变”。建议：把内容写门从 `fsync` 提前到首次 `write` 就返回 `EROFS`（至少对 `O_WRONLY`/`O_APPEND` 的开写路径做前置检查）；若保留现状，`USAGE.md`/`docs.html` 的 fork 语义行必须明写：“追加写的失败只在 fsync/close 可见，shell 重定向会报 0” 并给出验证命令（`sync; < cmd; echo $?` 或 `python3 -c` 逐 open 探针）。
 4. ★**`view rm --base` 的 `Permission denied` 裸文案——本轮已实现**。原建议：按同文件内其他守卫的写法包上上下文。**已采用的改法**：`src/main.rs` 的回收阶段 `backend::open_local(&droot)` 失败时 `map_err` 补上“cannot open data root <路径> to free view '<name>' objects … 元数据树 meta/'<name>'.db 已删除 … 可用 `grovefs gc --db-path … --data-root …` 离线回收”的上下文，把“树已删、字节未收”分开陈述并给出下一条可执行命令。连同 §5-12 的 Display 改动，实机不再报裸 `Permission denied`（见 §2.3）。
@@ -1539,27 +1539,24 @@ bash .build-bin/vm_audit.sh        # 重启后拿一次全量复核
 
 ```
 $ git log --oneline -4
+50f1564 docs(cli): add two ops-semantics tables (§6-12)
 07e24d8 fix(cli,stats): clarify gc and --stats output (§6-8/§6-9)
 74c765b fix(mcp): refuse aliases whose target has no physical view tree (§5-10)
 1d624dd fix(cli,mcp,du,meta): route fatal errors through Display and make messages actionable
-63f8c8f test(du): add du integration tests to version control
 
-$ git show --stat 07e24d8       # §6-8/§6-9 gc/stats 显示改动（已入库）
- TEST_REPORT.md | 101 ++++++++++++++++++++++++++++++++-------------------------
- USAGE.md       |   2 +-
- docs.html      |   3 ++
- src/main.rs    |  46 ++++++++++++++++++++------
- src/stats.rs   |   3 ++
- 5 files changed, 100 insertions(+), 55 deletions(-)
+$ git show --stat 50f1564       # §6-12 两张运维语义表（已入库，纯文档）
+ TEST_REPORT.md | 37 +++++++++++++++++++++++--------------
+ USAGE.md       | 28 ++++++++++++++++++++++++++++
+ docs.html      | 40 ++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 86 insertions(+), 19 deletions(-)
 
-$ git diff --stat               # 本轮 §6-12 两张运维语义表（纯文档，待确认入库；本报告除外）
- USAGE.md  | 28 ++++++++++++++++++++++++++++
- docs.html | 40 ++++++++++++++++++++++++++++++++++++++++
- 2 files changed, 68 insertions(+)
+$ git diff --stat               # 本轮 §6-2 文档同步子项（du 字节来源说明补条带分块丢失行为；本报告除外）
+ TEST_REPORT.md | 2 +-
+ docs.html      | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
 
-$ git status --short            # 工作区：本轮 §6-12 两份文档 + 本报告为 M + 未跟踪的取证/编排脚本（无产品代码改动）
+$ git status --short            # 工作区：§6-2 文档同步（docs.html）+ 本报告为 M + 未跟踪的取证/编排脚本（无产品代码改动）
  M TEST_REPORT.md
- M USAGE.md
  M docs.html
 ?? .build-bin/gfs_provision.sh
 ?? .build-bin/probe_posix_lock.py
