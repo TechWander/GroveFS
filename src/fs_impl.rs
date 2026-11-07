@@ -435,6 +435,13 @@ impl fuser::Filesystem for GroveFS {
         //   so those late writebacks still land correctly — and resolve under
         //   the RwLock, so a worker flushing one inode never races a lookup of
         //   another.
+        //   NOT requested on a CONTENT-read-only (fork) mount: with the page
+        //   cache in play the kernel answers write(2) from cache and the EROFS
+        //   our `write` gate returns only surfaces at fsync/close — a shell `>>`
+        //   exits 0 having written nothing. Without writeback every write is a
+        //   synchronous FUSE_WRITE, so the refusal lands on the first write(2)
+        //   and the failure point matches the truncate-at-open one. Forks have
+        //   no write throughput to lose: every write is refused regardless.
         // - PARALLEL_DIROPS: allow concurrent directory-entry (lookup/readdir) ops.
         // - POSIX_LOCKS + FLOCK_LOCKS: negotiate remote-aware advisory locking.
         //   Without these the kernel short-circuits `fcntl F_SETLK` and `flock(2)`
@@ -446,10 +453,14 @@ impl fuser::Filesystem for GroveFS {
         //   the HA standby and survives failover.
         let caps = InitFlags::FUSE_ASYNC_READ
             | InitFlags::FUSE_BIG_WRITES
-            | InitFlags::FUSE_WRITEBACK_CACHE
             | InitFlags::FUSE_PARALLEL_DIROPS
             | InitFlags::FUSE_POSIX_LOCKS
-            | InitFlags::FUSE_FLOCK_LOCKS;
+            | InitFlags::FUSE_FLOCK_LOCKS
+            | if self.content_ro {
+                InitFlags::empty()
+            } else {
+                InitFlags::FUSE_WRITEBACK_CACHE
+            };
         // Ignore which exact bits the kernel rejected; use whatever it supports.
         let _ = config.add_capabilities(caps);
         // AUTO_INVAL_DATA (kernel >= 3.15): when a cached attr is refreshed and

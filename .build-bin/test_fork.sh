@@ -168,6 +168,27 @@ T rm $L/photos/private/x.jpg && ok "unlink allowed" || bad "fork refused unlink"
 [ ! -e "$L/photos/private/x.jpg" ] && ok "fork no longer sees the deleted name" || bad "fork delete did not take effect"
 T chmod 600 $L/docs/2026/empty.md && ok "chmod allowed (attribute update)" || bad "fork refused chmod"
 
+# §6-3: the SAME contract under a DEFAULT (page-cached) mount. With
+# FUSE_WRITEBACK_CACHE the kernel answers write(2) from cache and EROFS only
+# surfaced at fsync/close — a shell `>>` exited 0 having written nothing. A
+# content-read-only mount no longer requests writeback, so the refusal must
+# land on the first write here too (old behavior: rc=0 and no stderr).
+echo "===== 4b) LOCAL fork mount WITHOUT --strict: refusal lands on write(2) ====="
+$Y mount --view lab -m .ftest/mnt_lab2 --foreground > .ftest/lab2.log 2>&1 &
+LP2=$!
+sleep 1.5
+L2=.ftest/mnt_lab2
+T bash -c "printf 'late-body' >> $L2/docs/newdir/moved.md" 2>.ftest/w3.err \
+  && bad "cached mount falsely accepted an append" || { rofs .ftest/w3.err && ok "append refused at write time on a cached mount" || bad "wrong append errno: $(cat .ftest/w3.err)"; }
+chk "$(T cat $L2/docs/newdir/moved.md)" "report-body" "refused append left the shared bytes intact"
+T bash -c "echo payload > $L2/fresh.bin" 2>.ftest/w4.err \
+  && bad "cached mount falsely accepted a create+write" || { rofs .ftest/w4.err && ok "new-file write refused at write time" || bad "wrong fresh errno: $(cat .ftest/w4.err)"; }
+chk "$(T stat -c %s $L2/fresh.bin)" "0" "create itself stays structural (empty file)"
+T touch $L2/struct-only.md && ok "touch still allowed under the cached mount" || bad "cached fork refused an empty create"
+# leave the fork tree exactly as the later remote-section listings expect
+T rm $L2/fresh.bin $L2/struct-only.md
+fusermount -u .ftest/mnt_lab2 2>/dev/null; kill $LP2 2>/dev/null; wait $LP2 2>/dev/null
+
 echo "===== 5) the base is untouched: deletes/renames stay inside the fork ====="
 fusermount -u .ftest/mnt_lab 2>/dev/null; kill $LP 2>/dev/null; wait $LP 2>/dev/null
 $Y mount --view team -m .ftest/mnt_base --strict --foreground > .ftest/base2.log 2>&1 &

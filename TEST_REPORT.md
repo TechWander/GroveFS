@@ -571,7 +571,63 @@
     撤: note: a live mount of a removed fork keeps its already-resolved names until it remounts; new mounts are refused
   ```
 
-- **结论**：通过。内容面只读的精确形状为：`O_TRUNC` 在 open 即 `EROFS`；`O_WRONLY`/`O_APPEND`/`O_RDWR` 的 write 调用不报错，`EROFS` 在 fsync 时暴露；因此 shell `>>` 追加会假成功（`rc=0`）而 `>` 截断失败（`rc=1`）——这是真实行为，已列为显示/文档优化项（§6-3）。结构写（mkdir/rename）本轮干净回显为成功（基线已先清除同名残留）。
+- **结论**（探针当时的观察）：内容面只读的精确形状为：`O_TRUNC` 在 open 即 `EROFS`；`O_WRONLY`/`O_APPEND`/`O_RDWR` 的 write 调用不报错，`EROFS` 在 fsync 时暴露；因此 shell `>>` 追加会假成功（`rc=0`）而 `>` 截断失败（`rc=1`）——当时列为显示/文档优化项（§6-3）。结构写（mkdir/rename）本轮干净回显为成功（基线已先清除同名残留）。**当前版本已修复 §6-3**：内容只读（fork）挂载不再申请 `FUSE_WRITEBACK_CACHE`，追加/普通写的 `EROFS` 提前到首次 `write(2)` 即返，上述“write 不报错、拖到 fsync”阶梯不复存在——修复前后逐字对照见 §3.4.4b。
+
+#### 3.4.4b §6-3 修复前后对照：fork 挂载关闭 writeback 后 `EROFS` 落在首次 `write(2)`
+
+- **改动**：`src/fs_impl.rs` 的 `init()` 协商 flags 时 `if self.content_ro { InitFlags::empty() } else { FUSE_WRITEBACK_CACHE }`——内容只读的挂载不向内核申请页缓存写回，每个 `write(2)` 都是同步 FUSE 写请求，`write()` 里的 content_ro 门因此在第一次写就把 `EROFS` 拒回用户态。排除的替代方案：open() 前置检查拒写意图——create 不走 open 写门（新建文件+写仍会漏），且 `test_fork.sh` 钉住“touch（空建）allowed”，拒写意图 create 会破既有语义；fork 挂载本就没有写吞吐可损失（所有写都被拒），可写基视图不受影响。
+- **修复前复现**（本机 `--home` fork 挂载，修复前二进制下 `/tmp/repro_f63c.out` 逐字回显；可重跑脚本为修复后形态 `.build-bin/repro_fork_fsync.sh`）：
+
+  ```
+  --- 1) shell append to EXISTING file (expect rc=0 FALSE SUCCESS, bytes NOT landed):
+  rc=0
+      content after append:
+  first
+  second
+  --- 2) python: write then fsync then close (failure timing ladder):
+    write() returned 10   <-- kernel page cache accepted it
+    fsync() errno=30 Read-only file system   <-- first visible failure
+    close() errno=5 Input/output error
+  --- 3) O_TRUNC open on EXISTING file:
+    O_TRUNC open errno=30 Read-only file system   <-- fails at open
+  --- 4) bytes actually on the object (blocks side):
+  first
+  second
+  ```
+
+- **修复后同机同脚本**（`/tmp/repro_f63d.out`，旧二进制产物为上方对照）：
+
+  ```
+  --- 1) shell append to EXISTING file (expect rc=0 FALSE SUCCESS, bytes NOT landed):
+  sh: 1: echo: echo: I/O error
+  rc=1
+      content after append:
+  first
+  second
+  --- 2) python: write then fsync then close (failure timing ladder):
+    write() errno=30 Read-only file system
+    fsync() ok  <-- UNEXPECTED
+    close() ok
+  --- 3) O_TRUNC open on EXISTING file:
+    O_TRUNC open errno=30 Read-only file system   <-- fails at open
+  --- 4) bytes actually on the object (blocks side):
+  first
+  second
+  ```
+
+  （`sh:` 那行是 dash 内建 echo 把写失败报成 “I/O error” 的文案怪癖；bash 下同一操作报 `写错误: 只读文件系统`、`rc=1`——见 `/tmp/repro_f63b.out`。`fsync() ok` 是“UNEXPECTED”标签的遗留：写已在首次 `write(2)` 被拒、无脏页可刷，fsync/close 本来就应 ok。）
+- **逐 open 形态探针**（修复后当前版本，`/tmp/probe_forms.out` 逐字）：
+
+  ```
+  O_WRONLY         : open+write(1B) : errno=30 Read-only file system
+  O_WRONLY|O_APPEND: open+write(1B) : errno=30 Read-only file system
+  O_RDWR|O_TRUNC   : open : errno=30 Read-only file system
+  os.truncate      :  : errno=30 Read-only file system
+  fsync after failed write fd : ok (UNEXPECTED)
+  ```
+
+- **结构写与新文件语义回归**（修复后，`/tmp/repro_f63b.out`）：新建文件+写在首次 write 即拒且新文件保持 0 字节（`B) ... rc=1`、`new.txt size after: 0`）；`touch rc=0 OK`、`mkdir rc=0 OK`；读正常；base（可写）视图经自己的挂载追加落盘 `rc=0`——可写挂载的 writeback 未受影响。
+- **固化**：`.build-bin/test_fork.sh` 新增 4b 段（默认非 `--strict` fork 挂载上 5 条断言：追加当场拒且字节未变、新文件写当场拒保持 0 字节、touch 仍放行），fork 套件 `SUMMARY: pass=75 fail=0`；`run_all.sh` 全板 GREEN（logs/20261107-140349，见 §4.3）。
 
 #### 3.4.5 `view graft` 选择性接枝与拒绝原文
 
@@ -1027,6 +1083,7 @@
 
 - **结论**：基本通过。明文一次性、list 不回发明文（含 secret 行数 0）、scope 门禁、视图绑定、set-ro 原地生效（不重连不重挂，≤1s 复检窗口）、revoke 自动卸载已建挂载、调用审计均对上。
   两处未对上文档的地方：① `set-ro` 后回显 `'first\n\x00\x00\x00\x00\x00\x00\x00'`（尾部多出 7 个零字节，与写前内容不等长）；② **`set-ro` 回到 `rw` 后追加仍 `errno=30`**（日志已打印 “is now rw ... resumes admitting writes”，但同一挂载在探针窗口内仍拒写）。②列为遗留项（§5-7，属复检窗口/缓存时机，文档声称 ≤1s）；①列为遗留项（§5-8）。
+  当前版本补注（§6-3 修复后）：本节回显取自集群 meta-server/data-server + `--require-api-key` 形态，服务端门禁与复验 tick 只存在于这种形态。本机 `--home` 形态经实测（`.build-bin/` 探针，set-ro 后 shell 追加 `rc=0` 且字节**照落盘**）确认：`src/main.rs` 本地分支无服务端凭据门（注释明写 “access control is the OS's”），`set-ro` 对本机已建挂载完全不生效——文档中“已挂载被 set-ro 原地切换”的例外表述需限定为经服务端挂载（已同步 `docs.html`/`USAGE.md` 表(a)）。另：上方“(shell 追加的假成功) rc=0”回显产生于 §6-3 修复前的二进制；修复后**经服务端挂载**的 content_ro 分支（fork）已关 writeback、首次 write 即拒（§3.4.4b），而普通 rw key 被 set-ro 原地切换的挂载仍保留“失败在 fsync 往返可见”形态（服务端门禁翻转不改变本会话已协商的内核 flags）。
 
 ### 3.10 MCP 全方法面（10 工具 + 资源 + 模板 + 提示 + 补全 + 日志 + 协议错误）
 
@@ -1342,9 +1399,9 @@
 
   ```
   ==================================================================
-   grovefs test board   (2026-11-07 13:34:05)
+   grovefs test board   (2026-11-07 14:03:49)
    suites: build unit posix edge e2e remote errors resilience concurrent metasrv ha striping locks freshness disp_fresh layout fork viewrm gc bwlimit migrate import govcheck govtime grovesci mcp apikey mountkey config pg pg_parallel control bench
-   logs:   .build-bin/logs/20261107-133405
+   logs:   .build-bin/logs/20261107-140349
   ==================================================================
   ### build — cargo build --release
     OK
@@ -1378,7 +1435,7 @@
   RESULT: GREEN (all gating suites passed)
   ```
 
-- **结论**：通过（`bench` 为 INFO 非门禁项；§6-2 改动后全板重跑仍 GREEN）。
+- **结论**：通过（`bench` 为 INFO 非门禁项；§6-3 改动后全板重跑仍 GREEN）。fork 套件含新 4b 段后 `pass=75 fail=0`；bench 写 392.0 MB/s（与上轮同量级，可写挂载 writeback 未受影响）。
 
 ### 4.4 `bash skills/grovefs-docs/scripts/doccheck.sh`
 
@@ -1447,7 +1504,7 @@
    - 诚实边界：strict 只捕获“搜索停在缺失块、其后仍有存在块”的短报症状；完全埋在连续存在块内部的洞不改变测得尺寸，属读路径完整性（错字节读），需 O(分块数) 全扫，本轮不做。挂载侧静默形态（§5-6）按取舍保持不动。
    - 文档同步：`docs.html` 的 du 字节来源 note 与“会不会出声”表(b)、`USAGE.md` §12.6 表(b) 的条带丢块行同步为新行为（du 出声：damaged warning；挂载读仍不出声）。本机端到端复验（中间块出声/尾块不误报）见 §3.6.5；单测 + `cargo test --release` 全绿见 §4.2。
 2a. ★**POSIX 记录锁 close/退出隐式释放泄漏（§5-3）——本轮已实现**。原建议：既然 `fuser` 0.18 仅在 `FUSE_RELEASE_FLOCK_UNLOCK`（只有 flock(2) 路径置位）时向 `release` 交 `lock_owner`，POSIX 锁走 close 拿到 `None`，旧回收不触发。**已采用的改法**：在 `setlk`（已不再忽略 `fh`）按 `(fh → ino, owner)` 记账，`release(fh)` 据此在某个 `(ino,owner)` 的最后一个锁定描述符关闭时，用一次全区间 `lock_op(..., Unlock, ...)` 精确删除其行（`src/fs_impl.rs` 的 `note_posix_lock`/`drop_posix_lock_on_release`）。采用“删除行”而非“收窄 `renew_locks` 到仍打开的描述符”，是为了不动 meta 协议与跨机续租模型：行一旦删除，按 sid 的续租心跳自然不再刷新它，效果与“只刷新存活行”等价，且失败时仍退化为一个租期内自然过期。已配套集成测（`test_locks.sh` §4c：跨进程持有/释放 + 阻塞唤醒延时），本地 17/17、三机实机复验通过（close 后 `GRANTED`、阻塞 `2.74s` 唤醒）。
-3. ★**fork/只读 key 的 `EROFS` 在 shell 里假成功**。`>>` 追加 `rc=0` 而字节未落盘（§3.4.4、§3.9），用户只会看到“写了但没变”。建议：把内容写门从 `fsync` 提前到首次 `write` 就返回 `EROFS`（至少对 `O_WRONLY`/`O_APPEND` 的开写路径做前置检查）；若保留现状，`USAGE.md`/`docs.html` 的 fork 语义行必须明写：“追加写的失败只在 fsync/close 可见，shell 重定向会报 0” 并给出验证命令（`sync; < cmd; echo $?` 或 `python3 -c` 逐 open 探针）。
+3. ★**fork/只读 key 的 `EROFS` 在 shell 里假成功——本轮已实现（fork 挂载关 writeback）**。原建议：把内容写门从 `fsync` 提前到首次 `write`（至少对 `O_WRONLY`/`O_APPEND` 做 open 前置检查），否则文档必须明写假成功。**实测取证后采用了不同的改法**：不在 `open()` 前置检查（create 不走 open 写门，新建文件+写的漏洞仍在；且 `test_fork.sh` 钉住“touch（空建）allowed”，拒写意图 create 会破既有语义），而是在 `src/fs_impl.rs` 的 `init()` 协商时按 `content_ro` 条件化 `FUSE_WRITEBACK_CACHE`：内容只读挂载不申请页缓存写回，每个 `write(2)` 都是同步 FUSE 写请求，`EROFS` 在首次 write 即返；fork 无写吞吐可损失，可写基视图不受影响（bench 写 392.0 MB/s 无回归）。验证：修复前后逐字对照与逐 open 探针见 §3.4.4b；`test_fork.sh` 新增 4b 段固化（套件 75/0）；`docs.html` 表(a) 与 `USAGE.md` §3.0 已同步为新行为。**保留的延迟暴露场景只剩一个**：经服务端挂载的普通 rw key 被 `set-ro` 原地切换（内核标志无法中途改变，服务端门禁翻转不改变本会话已协商 flags，失败在 fsync 往返可见）。另经本机 `--home` 探针确证一个文档口径缺陷：“set-ro 原地切换 ≤1s 生效”只对经 meta/data-server 的挂载成立，对本机 `--home` 挂载完全不生效（本地分支无服务端凭据门，set-ro 后追加 `rc=0` 且字节照落盘），表(a) 与 ⚠ 告警已据此限定表述。
 4. ★**`view rm --base` 的 `Permission denied` 裸文案——本轮已实现**。原建议：按同文件内其他守卫的写法包上上下文。**已采用的改法**：`src/main.rs` 的回收阶段 `backend::open_local(&droot)` 失败时 `map_err` 补上“cannot open data root <路径> to free view '<name>' objects … 元数据树 meta/'<name>'.db 已删除 … 可用 `grovefs gc --db-path … --data-root …` 离线回收”的上下文，把“树已删、字节未收”分开陈述并给出下一条可执行命令。连同 §5-12 的 Display 改动，实机不再报裸 `Permission denied`（见 §2.3）。
 5. ★**提示里的占位符未替换 + 悬空目标校验——均已实现**（§6-5 文案 + §5-10 行为）。原建议：`note: no local <db-path>/meta/pv.db yet` 与 meta-server 错误里的 `--db-path <db-path>`/`--view <name>` 应填实值；`view alias` 应在定义时检查目标物理树存在。**已采用的改法**：（文案）`src/mcp.rs` 的 `base_tree_missing_note` 用 `self.db(view).display()`+`self.base.display()` 填实树路径与存储根；`src/remote/meta/server_ext.rs` 的“view does not exist”create-hint 用 `rt.base.display()`+具体 `view` 填实（file/PG 两分支），配套收紧 `tests/meta_roundtrip.rs` 断言到具体视图名。（行为）`src/mcp.rs` 的 `alias_view` 在排除别名/派生/分叉目标后新增 `has_physical(real)` 硬拒绝悬空目标，错误文案复用上述已填实的 note。实机复验见 §2.3。
 6. ★**拒绝文案的“下一步命令”完备性巡检——du 部分本轮已实现**。本轮已对上文案的命令均为好例（`--skip-existing`、`--replace`、`--retire`、`--force`、`umount -m`）。**已采用的改法**：`src/du.rs` 的 `path not found: {}` 现回显规范化后的视图相对路径（`normalize_path` 会自动补前导 `/`）并提示 `--path takes a view-relative path such as /<top-dir>/...`；`gather_via_meta` 连不上 meta-server 时点名地址。其余中，`gc` 的 `objects: 0 (0 B)` 行已于本轮 §6-8 改掉（见下条）；`apikey set-ro` 生效时点（§5-7）仍未改。
@@ -1569,10 +1626,20 @@ bash .build-bin/vm_audit.sh        # 重启后拿一次全量复核
 
 ```
 $ git log --oneline -4
+7aec76b docs(report): refresh §8 git snapshot for the §6-2 fix commit
 507e3f2 fix(du,sharded): announce damaged striped objects instead of silent under-report (§6-2)
 ca6c358 docs(report): refresh §8 git snapshot for §6-12/§6-2 commits
 20308e2 docs(du): describe striped chunk-loss behavior in byte-source note (§6-2 doc sync)
-50f1564 docs(cli): add two ops-semantics tables (§6-12)
+
+$ git status --short            # §6-3 待提交形态（本段随 §6-3 commit 后再次刷新）
+ M .build-bin/test_fork.sh      # 4b 段：非 strict fork 挂载 5 条断言
+ M USAGE.md                     # 表(a) write 即拒 + set-ro 例外限定为经服务端挂载
+ M docs.html                    # 同上
+ M src/fs_impl.rs               # init() 按 content_ro 条件化 FUSE_WRITEBACK_CACHE
+?? .build-bin/repro_fork_fsync.sh   # §6-3 本机复现脚本（取证用，不入库）
+?? .build-bin/repro_setro_local.sh  # 本机 --home set-ro 口径探针（取证用，不入库）
+?? .build-bin/repro_du_damage.sh    # §6-2 本机端到端复现（取证用，不入库）
+?? （其余 vm_*.sh / gfs_provision.sh / probe_posix_lock.py 同上轮，均为未跟踪取证脚本）
 
 $ git show --stat 507e3f2       # §6-2 行为修复（len_strict + du damaged 三档分类 + 文档/报告同步，已入库）
  TEST_REPORT.md       | 49 +++++++++++++++++++++++++++++-----------------
@@ -1581,25 +1648,6 @@ $ git show --stat 507e3f2       # §6-2 行为修复（len_strict + du damaged �
  src/backend/sharded.rs | 137 +++++++++++++++++++++++++++++++++++++++++++++++
  src/du.rs            | 102 ++++++++++++++++++++++++++-------------
  5 files changed, 303 insertions(+), 101 deletions(-)
-
-$ git status --short            # 跟踪文件已全部入库，仅剩未跟踪的取证/编排脚本（本报告快照随最后一次内容改动一起提交）
-?? .build-bin/gfs_provision.sh
-?? .build-bin/probe_posix_lock.py
-?? .build-bin/repro_du_damage.sh
-?? .build-bin/vm_audit.sh
-?? .build-bin/vm_battery_1.sh
-?? .build-bin/vm_battery_2.sh
-?? .build-bin/vm_battery_3.sh
-?? .build-bin/vm_battery_4.sh
-?? .build-bin/vm_cleanup_verify.sh
-?? .build-bin/vm_evidence_run.sh
-?? .build-bin/vm_probe_alias.sh
-?? .build-bin/vm_probe_lostchunk.sh
-?? .build-bin/vm_probe_lostlocal.sh
-?? .build-bin/vm_probe_lostobj.sh
-?? .build-bin/vm_redeploy.sh
-?? .build-bin/vm_repocheck.sh
-?? .build-bin/vm_verify_striping.sh
 ```
 
 改动逐项对应实测证据（无一项是无据声称）：
@@ -1613,10 +1661,11 @@ $ git status --short            # 跟踪文件已全部入库，仅剩未跟踪�
 | `README.md` | `--root /d1,/d2` 行写明“落盘位置是 key 哈希 mod 根数现场重算，列表与对象都不记录盘序号”的口径 | 机内多根落盘实测在 §3.11（回显 `同机双根的放置由 key 哈希决定`）；条带侧根数不对必须拒的实测在 §3.6.2（`refusing to remap` 原文）；§4.4 doccheck 结论 OK |
 | `USAGE.md` | `--data-root` 的适用命令加 `du` 与默认取值说明；§12.3/§14.1/部署案例表同步多根布局口径 | du 的默认数据根取值见 §3.6.1，三种缺数据源硬拒绝见 §3.6.2，丢对象出声见 §3.6.3；§4.4 doccheck 参数对账“非外部工具/非负空间 0 项” |
 | `docs.html` | 同步上述表格与措辞 | §4.4 |
-| `docs.html` + `USAGE.md`（§6-12、本轮待入库） | 新增两张运维语义表：（a）fork/透镜/别名/key-ro 四种写意图的失败时点（结构写 / 内容写截断类 open 即 `EROFS` / 内容写追加类 `EROFS` 拖到 fsync-close / shell `>>` 假成功），含逐 `open` 探针 errno 回显（`docs.html` 放 §12、`USAGE.md` 放 §3.0）；（b）“对象丢失/数据源不对时各命令会不会出声” 9 行矩阵（`docs.html` 放 §11.5、`USAGE.md` 放 §12.6），未出声的条带丢分块与挂载读标为已知缺陷 | 逐形态失败时点实测在 §3.4.4/§3.9；丢对象出声矩阵逐行取自 §3.6（du 整对象缺失→warning、无数据源/布局不符→拒）与 §5-5/§5-6（条带中/首分块丢失静默、挂载读 size=0 无 EIO）；§6-12 行、本轮 doccheck 退出码 0 |
+| `docs.html` + `USAGE.md`（§6-12；表(a) 已随 §6-3 同步为新行为） | 新增两张运维语义表：（a）fork/透镜/别名/key-ro 四种写意图的失败时点（结构写 / 内容写截断类 open 即 `EROFS` / 内容写追加类当前版本首次 `write(2)` 即 `EROFS`、shell `>>` rc 可靠；唯一延迟暴露形态是经服务端挂载被 `set-ro` 原地切换；本机 `--home` 无服务端凭据门，set-ro 不影响已建挂载），含逐 `open` 探针 errno 回显（`docs.html` 放 §12、`USAGE.md` 放 §3.0）；（b）“对象丢失/数据源不对时各命令会不会出声” 9 行矩阵（`docs.html` 放 §11.5、`USAGE.md` 放 §12.6），未出声的挂载读形态标为已知缺陷 | 逐形态失败时点实测在 §3.4.4/§3.4.4b/§3.9（含本机 `--home` set-ro 探针）；丢对象出声矩阵逐行取自 §3.6（du 整对象缺失→warning、无数据源/布局不符→拒）与 §5-5/§5-6（挂载读 size=0 无 EIO）；§6-12 行、本轮 doccheck 退出码 0 |
 
 | `src/backend/sharded.rs` | 本轮复核新增：`layout_server_count`（供 du 前置门控只约束有 `s<N>` 前缀的键）与 `chunk0_elsewhere`（用 `{uuid}#0` 归属确定性检出反序列列表）+ `order_verified` 零成本门控；新增 2 个单测 | §3.6.2（倒置列表由静默 `0B` 改为报错的实机回显）、§4.2（`a_reversed_server_list_is_reported_not_read_as_empty`、`an_empty_striped_object_still_measures_zero`） |
 | `src/fs_impl.rs` | 本轮修复 §5-3：新增 `posix_lock_fh_owner`/`posix_lock_owner_fds` 两表与 `note_posix_lock`/`drop_posix_lock_on_release`，`setlk` 授予时记账、`release` 末次锁定时全区间 Unlock 精确回收 POSIX 锁（不依赖内核不交的 `lock_owner`） | §3.2（根因+修复说明与实机 `GRANTED`/`2.74s` 唤醒回显）、§5-3行、§4.2（`tests/locks.rs` 11 passed） |
+| `src/fs_impl.rs` + `.build-bin/test_fork.sh`（§6-3，本轮待入库） | `init()` 协商 flags 按 `content_ro` 条件化 `FUSE_WRITEBACK_CACHE`：内容只读挂载不申请页缓存写回，追加/普通写的 `EROFS` 从 fsync 提前到首次 `write(2)` 即返，shell `>>` 无假成功；`test_fork.sh` 新增 4b 段（非 strict fork 挂载 5 条断言）固化该行为 | §3.4.4b（修复前后逐字对照 + 逐 open 探针）、§4.3（fork 套件 75/0、全板 GREEN logs/20261107-140349、bench 写 392.0 MB/s 无回归） |
 | `.build-bin/test_locks.sh` | 本轮新增 §4c：跨进程 POSIX `fcntl` 整文件锁的 close 释放（新进程非阻塞加锁）+ 阻塞 `F_SETLKW` 唤醒延时两个回归用例 | 本地 `bash .build-bin/test_locks.sh` SUMMARY `pass=17 fail=0`（含新增两项），实机集群复验同结果 |
 | `.build-bin/probe_posix_lock.py` | 本轮新增：三机集群挂载点上的 §5-3 实机探针（holder close 后 asker、blocker 唤醒），取证用 | §3.2 实机回显（`ask:GRANTED`、`block:WAKE 2.74s`、`RESULT: PASS`） |
 
