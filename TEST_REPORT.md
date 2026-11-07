@@ -1656,21 +1656,18 @@ bash .build-bin/vm_audit.sh        # 重启后拿一次全量复核
 
 ```
 $ git log --oneline -4
+d4617e1 docs(display): split interior-gap mount-read silence into its own row in tables (b)
+15ca356 docs(report): refresh §8 git snapshot for the §6-10 commit
 1fc8c99 feat(display): data-server startup banner echoes host + root list (§6-10)
 b35536d docs(report): refresh §8 git snapshot for the §6-3 fix commit
-f90ae9e fix(fuse): refuse content writes at first write(2) on content-ro mounts (§6-3)
-7aec76b docs(report): refresh §8 git snapshot for the §6-2 fix commit
 
-$ git show --stat 1fc8c99       # §6-10 显示改动（banner 回显 host+根列表、test_remote 断言、文档示例、报告同步）
- TEST_REPORT.md            |  8 ++++----
- USAGE.md                  |  4 ++--
- docs.html                 |  2 +-
- src/main.rs               |  3 +++
- src/remote/server.rs      | 44 ++++++++++++++++++++++++++++++++++++++++++-
- .build-bin/test_remote.sh |  6 ++++++
- 6 files changed, 59 insertions(+), 8 deletions(-)
+$ git show --stat d4617e1       # 表(b) 补“条带中间分块丢失→挂载读静默短报”行 + §3.6.6 证据 + §5-6 口径对齐（纯文档）
+ TEST_REPORT.md | 37 ++++++++++++++++++++++++++++++++++---
+ USAGE.md       |  1 +
+ docs.html      |  1 +
+ 3 files changed, 36 insertions(+), 3 deletions(-)
 
-$ git status --short            # 跟踪文件已全部入库，仅剩未跟踪的取证/编排脚本（本报告快照随 §6-10 commit 刷新）
+$ git status --short            # 跟踪文件已全部入库，仅剩未跟踪的取证/编排脚本（本报告快照随表(b) 补行 commit 刷新）
 ?? .build-bin/gfs_provision.sh
 ?? .build-bin/probe_posix_lock.py
 ?? .build-bin/repro_du_damage.sh      # §6-2 本机端到端复现（取证用，不入库）
