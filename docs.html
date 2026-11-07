@@ -591,7 +591,7 @@
         <tr><td>能否重组路径</td><td>不能（形状与 <code>R</code> 一致）</td><td>能（<code>map</code>/<code>link</code>）</td></tr>
         <tr><td>key 的粒度</td><td>只有「绑定视图 + ro/rw」两档</td><td>规则本身是<b>路径级</b></td></tr>
         <tr><td>数量与名字</td><td>一个真实视图<b>只能有一个别名</b>，期间真名不能挂</td><td>数量不限，基视图照旧可挂</td></tr>
-        <tr><td>只读的性质</td><td><b>权限</b>：可原地 <code>set-ro</code> 热切换（rw→ro 热生效；ro→rw 必须重挂）</td><td><b>契约</b>：换 rw key 挂载仍 <code>EROFS</code></td></tr>
+        <tr><td>只读的性质</td><td><b>权限</b>：可原地 <code>set-ro</code> 热切换（服务端门禁双向热生效，各 ≤1s 复检窗；仅握手时 key 已 ro、内核已落只读的挂载解除需重挂）</td><td><b>契约</b>：换 rw key 挂载仍 <code>EROFS</code></td></tr>
       </tbody>
     </table>
     <p><b>结论：</b>只是「别让人写」→ 只读 key 足够（连别名都不需要）；还要「别让人看见全部」或「换个路径给他」→ 必须用派生（或独立视图）；两者可叠加。安全边界始终是 key/视图，<code>.layout</code> 只是呈现规则。</p>

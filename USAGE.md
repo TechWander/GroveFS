@@ -254,10 +254,10 @@ $Y --home $BASE init --view alice --manifest ./seed.txt
 | 能否重组路径 | 不能(形状与 `R` 完全一致) | 能(`map`/`link` 把 `/raw` 挂到 `/archive/raw`) |
 | key 的粒度 | 只有「绑定某个视图 + ro/rw」两档(`apikey create --view`,没有路径参数) | 规则本身是**路径级**的,可以精确到子目录 |
 | 数量与名字 | 一个真实视图**只能有一个别名**,且别名存在期间真名不能挂(第二个别名被拒,原文:`one public name per real view`,轮换用 `--retire`) | 数量不限,每个派生各占一个名字,基视图照旧可挂 |
-| 只读的性质 | **权限**:经服务端挂载时可原地 `set-ro` 热切换(恢复写要重挂,见下) | **契约**:换成无限制 rw key 挂载,`mkdir` 仍是 `EROFS` |
+| 只读的性质 | **权限**:经服务端挂载时可原地 `set-ro` 热切换(双向热生效;仅握手时已落内核只读的挂载解除需重挂,见下) | **契约**:换成无限制 rw key 挂载,`mkdir` 仍是 `EROFS` |
 | 分发成本 | 要发密钥、要轮换/吊销 | 服务端一份文本,改一行 ≤2s 生效,不用发东西 |
 
-实测的只读 key 热切换方向(重要,均指**经 meta/data-server 的挂载**——切换靠服务端活会话复验 tick,本机 `--home` 挂载没有服务端凭据门,`set-ro` 不影响已建挂载):**rw → ro 是热生效的**(挂载中 `set-ro` 后 `mkdir` 变 `EPERM`,不用重挂);**ro → rw 不能热生效**——以 ro key 挂载的挂载点内核就是只读,`set-ro --rw` 之后 `mkdir` 仍 `EROFS`,必须重挂。命令输出里「no reconnect, no remount」这句话只对前一个方向成立:以 ro key 挂载后想恢复写,必须重挂(或直接用 rw key 重挂)。
+实测的只读 key 热切换方向(重要,均指**经 meta/data-server 的挂载**——切换靠服务端活会话复验 tick,本机 `--home` 挂载没有服务端凭据门,`set-ro` 不影响已建挂载):**rw → ro 是热生效的**(挂载中 `set-ro` 后 `mkdir` 变 `EPERM`,不用重挂);**以 rw key 建立的挂载被 `set-ro` 后再 `--rw` 切回,恢复写同样热生效**——本机实测(`.build-bin/repro_setro_resume.sh`):切换后复检窗内仍有至多一个 tick 的残留拒绝(`EROFS`),tick 过后同一挂载直接 `write+fsync ok`,无需重挂,失败的写尝试不留字节。**只有握手时 key 已是 ro、内核已落只读的挂载**,`set-ro --rw` 改不了内核标志、`mkdir` 仍 `EROFS`,必须重挂(或直接用 rw key 重挂)。命令输出里「no reconnect, no remount」对服务端门禁的双向切换成立,对内核只读的解除不成立。
 
 **结论**:对外分享只有两种诉求时——
 - 只是「别让人写」→ 只读 key 足够,连别名都不需要(直接把 ro key 发给对方挂 `R`);

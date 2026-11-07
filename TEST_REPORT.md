@@ -1115,6 +1115,33 @@
   两处未对上文档的地方：① `set-ro` 后回显 `'first\n\x00\x00\x00\x00\x00\x00\x00'`（尾部多出 7 个零字节，与写前内容不等长）；② **`set-ro` 回到 `rw` 后追加仍 `errno=30`**（日志已打印 “is now rw ... resumes admitting writes”，但同一挂载在探针窗口内仍拒写）。②列为遗留项（§5-7，属复检窗口/缓存时机，文档声称 ≤1s）；①列为遗留项（§5-8）。
   当前版本补注（§6-3 修复后）：本节回显取自集群 meta-server/data-server + `--require-api-key` 形态，服务端门禁与复验 tick 只存在于这种形态。本机 `--home` 形态经实测（`.build-bin/` 探针，set-ro 后 shell 追加 `rc=0` 且字节**照落盘**）确认：`src/main.rs` 本地分支无服务端凭据门（注释明写 “access control is the OS's”），`set-ro` 对本机已建挂载完全不生效——文档中“已挂载被 set-ro 原地切换”的例外表述需限定为经服务端挂载（已同步 `docs.html`/`USAGE.md` 表(a)）。另：上方“(shell 追加的假成功) rc=0”回显产生于 §6-3 修复前的二进制；修复后**经服务端挂载**的 content_ro 分支（fork）已关 writeback、首次 write 即拒（§3.4.4b），而普通 rw key 被 set-ro 原地切换的挂载仍保留“失败在 fsync 往返可见”形态（服务端门禁翻转不改变本会话已协商的内核 flags）。
 
+#### 3.9.1 §5-7 本机复测：`set-ro` 恢复 rw 对同一挂载是热生效的（原判为探针时序）
+
+- **命令**（`bash .build-bin/repro_setro_resume.sh`，本机门禁栈 `meta-server`/`data-server --require-api-key` + 以 **rw key** 建立的 FUSE 挂载；探针为 `O_WRONLY|O_APPEND` 写+`fsync` 阶梯）：基线写 → `set-ro`（等 1.5s 后探针确认拒写）→ `set-ro --rw` 后立即探针，再于 +0.5s/+1.5s/+2.5s 各探针一次，最后 `od` 核对内容。
+- **回显**：
+
+  ```
+    === baseline rw write:
+    write+fsync ok
+    apikey: id='c33dc6a66d644ba686d5373e86670116' (label 's7') is now ro (read-only)
+    === after set-ro (ro in effect):
+    fsync errno=30 (Read-only file system)
+    apikey: id='c33dc6a66d644ba686d5373e86670116' (label 's7') is now rw (read-write)
+    === immediately after resume-rw (same tick may still be stale):
+    fsync errno=30 (Read-only file system)
+    === +0.5s:
+    fsync errno=30 (Read-only file system)
+    === +1.5s:
+    write+fsync ok
+    === +2.5s:
+    write+fsync ok
+    === content now:
+    0000000   f   i   r   s   t  \n   x  \n   x  \n   x  \n
+    0000014
+  ```
+
+- **结论**：**§5-7 复测为非产品缺陷（探针时序）**。以 rw key 建立的挂载（内核可写、writeback 协商不变）被 `set-ro` 后再 `--rw` 切回，恢复写是**热生效**的：切换后至多再有一个复检 tick 的残留拒绝（复验按到站流量触发、每会话 ≤1s 一次，`src/remote/server.rs:458-492` 数据面 `EROFS` 门与 `server_ext.rs:1412-1433` 控制面同路），tick 过后同一挂载直接放行，无需重挂；三次失败探针**未留下任何字节**（内容仅含基线 + 两次成功探针的 3 行，无脏页迟到刷出）。原集群探针在 `is now rw` 回显后**立即**追加，正落在尚存的复检窗内，`errno=30` 与文档声称的 ≤1s 窗一致。真正需重挂的只有握手时 key 已 ro、内核已落只读的挂载（`client_ro` → `-o ro`，服务端门禁改不了内核标志）——文档原句“ro → rw 不能热生效”未区分这两种形态，属过度泛化，已限定（`USAGE.md` §2.2 对比表与方向段、`docs.html` 同表；与 `mountkey` 套件既有断言“ro→rw 放行·免重连免重挂”对齐）。
+
 ### 3.10 MCP 全方法面（10 工具 + 资源 + 模板 + 提示 + 补全 + 日志 + 协议错误）
 
 - **命令**：向 `grovefs mcp --db-path /tmp/gft_gate --require-api-key` 的 stdio 依次注入 JSON-RPC 请求（文件式回放，回显 `/tmp/vm_evidence/battery_3.log` D5 段）。
@@ -1502,7 +1529,7 @@
 | 5-4 | `view rm --base` 在数据根不可用时只给裸 `Permission denied` | 修复前：`Error: Os { code: 13, kind: PermissionDenied, message: "Permission denied" }`，不报路径、不给下一步，且发生在元数据树已删之后 | 回收阶段直接上抛 `io::Error`，未经包装 | **已修复**（release `d2a3b262`，实机复验）：回收 `open_local` 失败时 `map_err` 补上数据根路径、视图名与“树已删/字节未收”上下文及离线 `gc` 提示；连同 §5-12 改走 Display，实机报 `error: cannot open data root …`（见 §6-4） |
 | 5-5 | **条带对象真丢分块时 du 仍静默短报（本类中数据源真缺字节的形态；错配/瞬时故障形态已修）** | 修复前探针：中间分块缺失 `67108869 → 16777221`（无 warning）；首分块真缺：`--total` 给极小值 | `ShardedBackend::len` 假定分块连续，指数+二分把“第一个缺失分块”当 EOF（chunk#0 真缺时 `chunk0_elsewhere` 在其它成员也探不到 `{base}#0` → `Ok(0)`） | **已修复（du 诊断路径）**：`du` 改走 `len_strict`，二分停在首个缺失块后多探一块、首块缺失而后续存在也同样检测，命中即归入独立 `damaged` 计数并单独 warning（字节不计入总数）；本机端到端复验见 §3.6.5，单测 `len_strict_flags_interior_and_leading_gaps_but_not_a_short_tail`。挂载侧静默形态（stat size 短/0、读无 EIO）属 §5-6，未改（len 是 getattr 热路径且 `build_attr` 会回退元数据 size，改 len 既拖热路径又不会让挂载出声）；同一命令对“列表长度不符/倒置/超时拒连”的既有拒绝与硬报错不变（见 §3.6.2） |
 | 5-6 | 挂载读丢失对象不出声：非条带路径整对象丢（size=0 空读）与条带路径中间分块丢（size 截短到缺口偏移、内容纯前缀、后续存活块不可见）两形态均无 `EIO` | 重挂后读丢失对象：`rc=0`、`stat size=0`；条带中间块丢：`stat size=16777216`、整读 rc=0 且 md5==chunk#0（本机复验见 §3.6.6） | 同上：`len` 给短报/0 而非错误，`read()` 将缺失块 `NotFound` 当 EOF | 未修，列入遗留；两形态均已在表(b) 分行诚实标注 |
-| 5-7 | `apikey set-ro` 回到 rw 后同一挂载仍拒写 | `is now rw (read-write)` 后紧接追加写 `errno=30` | 服务端复检窗口/客户端缓存时机，文档声称 ≤1s | 未修，列入遗留（建议回显明记生效时刻而非窗口上限） |
+| 5-7 | ~~`apikey set-ro` 回到 rw 后同一挂载仍拒写~~ | 原集群探针：`is now rw (read-write)` 后紧接追加写 `errno=30` | 探针落在尚存的 ≤1s 复检窗内（复验按到站流量触发） | **复测确证非产品缺陷**：本机同栈以 rw key 挂载复现，tick 过后同一挂载 `write+fsync ok`、不留字节，失败仅出现在窗内（见 §3.9.1）；文档“恢复写要重挂”的过度泛化已限定为仅指内核已落只读的挂载 |
 | 5-8 | `set-ro` 后回读内容尾部多 7 个零字节 | `'first\n\x00\x00\x00\x00\x00\x00\x00'` | 本轮探针用固定长缓冲区读回所致，非产品写入；作为取证脚本缺陷记录 | 已确认非产品缺陷（取证手段问题） |
 | 5-9 | HA 切换瞬间首次写存在瞬时 `EIO` | 上一轮观察到一次 `EIO` 且文件未生成；本轮为 `rc=0`（0.76 s） | 转接窗口内旧主连接失效 | 状态相关，不作稳定性断言；建议文档写明重试要求 |
 | 5-10 | `view alias` 接受指向不存在视图的目标 | 修复前：`defined pure alias 'x-dangle' -> real view 'no-such-tree'`，直到挂载才拒 | 定义时无树存在性校验 | **已修复**（release `d2a3b262`，实机复验）：`alias_view` 在排除别名/派生/分叉目标后，用 `store.has_physical(real)` 检查目标物理树（SQLite 查 `<base>/meta/<view>.db`、PG 查 schema）是否存在，不存在则拒绝并给出可敲的 create/import 命令（接 §6-5） |
@@ -1537,7 +1564,7 @@
 3. ★**fork/只读 key 的 `EROFS` 在 shell 里假成功——本轮已实现（fork 挂载关 writeback）**。原建议：把内容写门从 `fsync` 提前到首次 `write`（至少对 `O_WRONLY`/`O_APPEND` 做 open 前置检查），否则文档必须明写假成功。**实测取证后采用了不同的改法**：不在 `open()` 前置检查（create 不走 open 写门，新建文件+写的漏洞仍在；且 `test_fork.sh` 钉住“touch（空建）allowed”，拒写意图 create 会破既有语义），而是在 `src/fs_impl.rs` 的 `init()` 协商时按 `content_ro` 条件化 `FUSE_WRITEBACK_CACHE`：内容只读挂载不申请页缓存写回，每个 `write(2)` 都是同步 FUSE 写请求，`EROFS` 在首次 write 即返；fork 无写吞吐可损失，可写基视图不受影响（bench 写 392.0 MB/s 无回归）。验证：修复前后逐字对照与逐 open 探针见 §3.4.4b；`test_fork.sh` 新增 4b 段固化（套件 75/0）；`docs.html` 表(a) 与 `USAGE.md` §3.0 已同步为新行为。**保留的延迟暴露场景只剩一个**：经服务端挂载的普通 rw key 被 `set-ro` 原地切换（内核标志无法中途改变，服务端门禁翻转不改变本会话已协商 flags，失败在 fsync 往返可见）。另经本机 `--home` 探针确证一个文档口径缺陷：“set-ro 原地切换 ≤1s 生效”只对经 meta/data-server 的挂载成立，对本机 `--home` 挂载完全不生效（本地分支无服务端凭据门，set-ro 后追加 `rc=0` 且字节照落盘），表(a) 与 ⚠ 告警已据此限定表述。
 4. ★**`view rm --base` 的 `Permission denied` 裸文案——本轮已实现**。原建议：按同文件内其他守卫的写法包上上下文。**已采用的改法**：`src/main.rs` 的回收阶段 `backend::open_local(&droot)` 失败时 `map_err` 补上“cannot open data root <路径> to free view '<name>' objects … 元数据树 meta/'<name>'.db 已删除 … 可用 `grovefs gc --db-path … --data-root …` 离线回收”的上下文，把“树已删、字节未收”分开陈述并给出下一条可执行命令。连同 §5-12 的 Display 改动，实机不再报裸 `Permission denied`（见 §2.3）。
 5. ★**提示里的占位符未替换 + 悬空目标校验——均已实现**（§6-5 文案 + §5-10 行为）。原建议：`note: no local <db-path>/meta/pv.db yet` 与 meta-server 错误里的 `--db-path <db-path>`/`--view <name>` 应填实值；`view alias` 应在定义时检查目标物理树存在。**已采用的改法**：（文案）`src/mcp.rs` 的 `base_tree_missing_note` 用 `self.db(view).display()`+`self.base.display()` 填实树路径与存储根；`src/remote/meta/server_ext.rs` 的“view does not exist”create-hint 用 `rt.base.display()`+具体 `view` 填实（file/PG 两分支），配套收紧 `tests/meta_roundtrip.rs` 断言到具体视图名。（行为）`src/mcp.rs` 的 `alias_view` 在排除别名/派生/分叉目标后新增 `has_physical(real)` 硬拒绝悬空目标，错误文案复用上述已填实的 note。实机复验见 §2.3。
-6. ★**拒绝文案的“下一步命令”完备性巡检——du 部分本轮已实现**。本轮已对上文案的命令均为好例（`--skip-existing`、`--replace`、`--retire`、`--force`、`umount -m`）。**已采用的改法**：`src/du.rs` 的 `path not found: {}` 现回显规范化后的视图相对路径（`normalize_path` 会自动补前导 `/`）并提示 `--path takes a view-relative path such as /<top-dir>/...`；`gather_via_meta` 连不上 meta-server 时点名地址。其余中，`gc` 的 `objects: 0 (0 B)` 行已于本轮 §6-8 改掉（见下条）；`apikey set-ro` 生效时点（§5-7）仍未改。
+6. ★**拒绝文案的“下一步命令”完备性巡检——du 部分本轮已实现**。本轮已对上文案的命令均为好例（`--skip-existing`、`--replace`、`--retire`、`--force`、`umount -m`）。**已采用的改法**：`src/du.rs` 的 `path not found: {}` 现回显规范化后的视图相对路径（`normalize_path` 会自动补前导 `/`）并提示 `--path takes a view-relative path such as /<top-dir>/...`；`gather_via_meta` 连不上 meta-server 时点名地址。其余中，`gc` 的 `objects: 0 (0 B)` 行已于本轮 §6-8 改掉（见下条）；`apikey set-ro` 生效时点（§5-7）经本机复测确认为复检窗时序而非缺陷，回显文案“on its next re-check window (≤1s)”与实测一致，未改（见 §3.9.1）。
 7. **单位与计数口径——本轮复核定性：属取证脚本产物，非产品输出，不动**。`import` 同时给 `blocks/ 路径数: 8` 与 `distinct inode 数: 4`、`holders 台账: 8,8` 这类裸 SQL 元组，经定位均来自 `.build-bin/` 取证/编排脚本的 `psql`/`find` 探针输出，不是 `grovefs` 产品命令的打印。产品 `grovefs import` 的汇总行本就统一且人话：`imported into view 'X' under /: N dir(s), M object(s) (H hardlinked zero-copy, C copied), S skipped, F failed`；`du` 默认后缀已是 `K/M/G`。故本项无需产品侧改动。
 8. ★**`gc` 对在用存储的输出区分“无字节”与“无垃圾”——本轮已实现**（release `c8d68580`，实机复验见 §2.3）。原建议：`striped layout(s) > 0` 且 `objects == 0` 时不应让裸 `0` 读成“无字节”，且不应邀请对 0 字节重跑 `--apply`。**已采用的改法**（`src/main.rs` 的 `print_gc_report`）：当 `objects == 0 && striped_layouts > 0` 时，objects 行改打 `objects: 0 local block(s) — N striped layout(s) place their chunks on data-servers, which gc does not audit (use \`grovefs du\` for their bytes)`；dry-run 汇总保留稳定前缀 `dry run: nothing deleted.`，再按三态给尾句——有可回收项才邀请 `--apply`，`orphans` 为空打 `No unreferenced objects were found.`，全在宽限期内打 `N orphan(s) are all within the <grace> grace; re-run after it elapses.`。实机条带 meta 存储 `gc` 回显见 §2.3，`test_gc.sh` 41/0 仍绿（clean-store 用例断言的 `dry run: nothing deleted` 前缀未破）。
 9. ★**`--stats` 表的字节口径——本轮已实现**（表头说明方案，不改定宽列；release `c8d68580`，本机挂载复验）。原建议：`read.op_total bytes=0` 与 `read.backend_total bytes=…` 并存易误读为“没读到数据”；`p50=0` 这类静默 0 易误读为漏采样。**已采用的改法**（`src/stats.rs` 的 `report_text` 表头，未动表格列宽以免破坏对齐与 CSV）：新增两行——`bytes= is tallied only on the backend-boundary stages (read/write.backend_total, io.*); a 0 there is expected on op_total lines and means "not counted at this stage", not "no data"`、`a latency of 0 is sub-µs (below the histogram's µs resolution), not a missing sample`。同步 `docs.html` §8 的真实回显样本与 `USAGE.md` §8.1 口径说明。`test_stats.sh` E2E 通过（表头 `per-stage latency telemetry` 断言未受影响）。
