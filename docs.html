@@ -1561,25 +1561,25 @@ b97be2d6    1</code></pre>
       </tbody>
     </table>
 
-    <div class="note"><b>字节来源的判定</b>：先看 <code>--data</code>（含 <code>GROVEFS_DATA</code>），再看 <code>--data-root</code>，最后退回<b>树所在的 store root</b>——本地 SQLite 部署的 <code>meta/</code> 与 <code>blocks/</code> 同在一个根下，所以 <code>--db-path</code>/<code>--home</code> 一个参数就够。经 <code>--meta</code>/<code>--store</code> 取树时本机没有对应的字节，两个地址都没给就直接拒绝统计：<code>no data source to measure: pass --data &lt;host:port&gt; … or --data-root &lt;dir holding blocks/&gt;</code>。部分对象不在选中的根里（多盘放置、事后搬盘）时照常出数，但在 stderr 报 <code>warning: N of M object(s) are not in the data source and count as 0 bytes</code>——少算了多少要看得见。这句警告只给服务端明确回答 <code>ENOENT</code> 的对象：超时、拒连、读失败、<code>EIO</code> 都是“没人回答”而不是“字节不在”，一律报错不出数。地址列表的台数与对象 <code>s&lt;N&gt;</code> 布局不符（包括同一棵树里混有扩容前后的两代布局）在任何探测之前就按方向拒绝：少了提示“把整列表一次给全”，多了提示“只按写入时那 N 个地址、原顺序给”，绝不把布局错配说成对象丢失。但条带对象<b>分块真丢</b>与整对象丢失不同，当前版本不报：中间分块缺失时 <code>len</code> 把“第一个缺失分块”当 EOF、静默把对象短报，首分块缺失时返回一个错位的极小值（属已知缺陷，与挂载读不到丢失对象一样不出声，详见下方“会不会出声”表）。<code>du</code> 是只读命令，不会为了测量去创建 <code>blocks/</code>。</div>
+    <div class="note"><b>字节来源的判定</b>：先看 <code>--data</code>（含 <code>GROVEFS_DATA</code>），再看 <code>--data-root</code>，最后退回<b>树所在的 store root</b>——本地 SQLite 部署的 <code>meta/</code> 与 <code>blocks/</code> 同在一个根下，所以 <code>--db-path</code>/<code>--home</code> 一个参数就够。经 <code>--meta</code>/<code>--store</code> 取树时本机没有对应的字节，两个地址都没给就直接拒绝统计：<code>no data source to measure: pass --data &lt;host:port&gt; … or --data-root &lt;dir holding blocks/&gt;</code>。部分对象不在选中的根里（多盘放置、事后搬盘）时照常出数，但在 stderr 报 <code>warning: N of M object(s) are not in the data source and count as 0 bytes</code>——少算了多少要看得见。这句警告只给服务端明确回答 <code>ENOENT</code> 的对象：超时、拒连、读失败、<code>EIO</code> 都是“没人回答”而不是“字节不在”，一律报错不出数。地址列表的台数与对象 <code>s&lt;N&gt;</code> 布局不符（包括同一棵树里混有扩容前后的两代布局）在任何探测之前就按方向拒绝：少了提示“把整列表一次给全”，多了提示“只按写入时那 N 个地址、原顺序给”，绝不把布局错配说成对象丢失。但条带对象<b>分块真丢</b>与整对象丢失不同：<code>du</code> 的诊断扫描走严格长度，二分停在首个缺失分块后会多探一块——若其后仍有存在的分块，说明对象是<b>损坏</b>而非截短，单独报 <code>warning: N of M object(s) are damaged striped objects and are excluded from the total (their true size is unknown)</code>，不可确认的字节不计入总数；首分块缺失而后续分块存在也同样判损坏，不再给出错位的极小总值；尾块丢失仍按 EOF 静默短报（那是止于末尾，不是洞）。挂载侧的 <code>len</code> 保持普通路径：读丢失对象依旧 <code>stat size</code> 变短/变 0 而不报 <code>EIO</code>（属已知缺陷，与 du 不同路，详见下方“会不会出声”表）。<code>du</code> 是只读命令，不会为了测量去创建 <code>blocks/</code>。</div>
 
     <h4>对象丢失 / 数据源不对时，各命令会不会出声（运维查阅矩阵）</h4>
-    <p class="lead">“字节不在了”不是一个单一事件，不同命令对它的反响不同。下表逐情形标明“会 / 不会出声”，以便运维知道该拿哪个命令去探。未出声的条带丢分块与挂载读属<b>当前版本已知缺陷（未实现、诚实标注）</b>。</p>
+    <p class="lead">“字节不在了”不是一个单一事件，不同命令对它的反响不同。下表逐情形标明“会 / 不会出声”，以便运维知道该拿哪个命令去探。未出声的挂载读丢失属<b>当前版本已知缺陷（未实现、诚实标注）</b>。</p>
     <table>
       <thead><tr><th>情形</th><th>命令 / 路径</th><th>会出声吗</th><th>具体表现（逐字回显关键词）</th></tr></thead>
       <tbody>
         <tr><td>整个对象不在选中的根里（多盘放置、事后搬盘）</td><td><code>du --data-root R</code> / <code>du --data A</code></td><td><b>会</b></td><td>stderr：<code>warning: N of M object(s) are not in the data source and count as 0 bytes (…)</code>；总数偏小但可见</td></tr>
         <tr><td>数据源根本没给（经 <code>--meta</code>/<code>--store</code> 取树、无本机字节）</td><td><code>du</code></td><td><b>会（拒统计）</b></td><td><code>no data source to measure: pass --data &lt;host:port&gt; … or --data-root &lt;dir holding blocks/&gt;</code>，不出数</td></tr>
         <tr><td>地址列表台数与对象 <code>s&lt;N&gt;</code> 布局不符（少给 / 倒序 / 混两代）</td><td><code>du --data</code></td><td><b>会（拒统计）</b></td><td>探测前按方向拒绝（如 <code>this tree was written across N data-servers but --data names M …</code>）；绝不把布局错配说成对象丢失</td></tr>
-        <tr><td>条带对象的<b>中间分块</b>真丢</td><td><code>du</code></td><td><b>不会（当前缺陷）</b></td><td>静默把对象短报（如 <code>64.0M → 16.0M</code>）且无 warning；机制：<code>len</code> 把“第一个缺失分块”当 EOF，内部空洞不可区分</td></tr>
-        <tr><td>条带对象的<b>首分块</b>真丢</td><td><code>du</code></td><td><b>不会（当前缺陷）</b></td><td><code>len</code> 返回 <code>Ok(0)</code>，du 给 <code>55B</code> 这种完全错位的极小值，不拒也不出声</td></tr>
+        <tr><td>条带对象的<b>中间分块</b>真丢</td><td><code>du</code></td><td><b>会（判损坏）</b></td><td>stderr：<code>warning: N of M object(s) are damaged striped objects and are excluded from the total (their true size is unknown); first: … has a gap at chunk #K …</code>；损坏字节不计入总数，不再静默短报</td></tr>
+        <tr><td>条带对象的<b>首分块</b>真丢（后续分块仍在）</td><td><code>du</code></td><td><b>会（判损坏）</b></td><td>同上进 <code>damaged</code> 告警（<code>missing its leading chunk #0 but a later chunk is present</code>），不再给 <code>55B</code> 这种错位的极小总值</td></tr>
         <tr><td>读一个对象已丢的文件（fd 缓存已清 / 重挂后）</td><td>挂载内 <code>read</code> / <code>stat</code></td><td><b>不会（当前缺陷）</b></td><td><code>stat size=0</code>、整文件读 rc=0 空内容，不报 <code>EIO</code>；需靠 <code>du</code> 的 warning 或离线 <code>gc</code> 发现</td></tr>
         <tr><td>对象被外部 <code>mv</code>/<code>rm</code>，但挂载进程已建立</td><td>挂载内旧 fd</td><td><b>不会（且不可观察）</b></td><td>data-server 按 key 长期缓存原始 fd，旧 inode 仍可读写；统计上“无变化”是假象，要清缓存/重启后才可测</td></tr>
         <tr><td><code>view rm --base</code> 时数据根打不开</td><td><code>view rm --base</code></td><td><b>会（拒后出声）</b></td><td>元数据树已删、字节未收时：<code>error: cannot open data root &lt;路径&gt; …</code> 并给出离线 <code>gc</code> 回收提示（把“树已删”与“字节未收”分开陈述）</td></tr>
         <tr><td>条带对象全在远端、本机无 <code>blocks/</code></td><td><code>gc --db-path D</code>（审计）</td><td><b>会（不误报为空）</b></td><td><code>objects: 0 local block(s) — N striped layout(s) … which gc does not audit (use \`grovefs du\` for their bytes)</code>；不会邀请对 0 字节重跑 <code>--apply</code></td></tr>
       </tbody>
     </table>
-    <div class="note"><b>一句话选型：</b>要“发现字节丢了”用 <code>du</code>（整对象不在数据源、列表不符都会出声；但条带内部分块丢失与挂载读丢失仍会静默——属未实现项）；要“回收无人引用的页”用离线 <code>gc</code>；要“把账本归位”用 <code>refs rebuild</code>。挂载读本身不担当完整性校验。</div>
+    <div class="note"><b>一句话选型：</b>要“发现字节丢了”用 <code>du</code>（整对象不在数据源、列表不符、条带分块损坏都会出声；但挂载读丢失仍静默——属未实现项）；要“回收无人引用的页”用离线 <code>gc</code>；要“把账本归位”用 <code>refs rebuild</code>。挂载读本身不担当完整性校验。</div>
 
     <h4>命令例（与真实回显）</h4>
     <pre><code><span class="cmt"># 1. 本地单机模式：直接报目录树各级字节数</span>

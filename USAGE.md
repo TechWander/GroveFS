@@ -1881,14 +1881,14 @@ HA 拓扑滚动升级(写不中断,切换瞬间除外):
 | 整个对象不在选中的根里 | `du --data-root`/`--data` | **会**：stderr `warning: N of M object(s) are not in the data source and count as 0 bytes` |
 | 数据源根本没给 | `du` | **会（拒统计）**：`no data source to measure: pass --data … or --data-root …` |
 | 地址列表台数/顺序与 `s<N>` 布局不符 | `du --data` | **会（拒统计）**：探测前按方向拒绝，绝不把布局错配说成对象丢失 |
-| 条带对象**中间分块**真丢 | `du` | **不会（已知缺陷）**：静默短报（如 `64.0M→16.0M`）且无 warning |
-| 条带对象**首分块**真丢 | `du` | **不会（已知缺陷）**：`len` 返 `Ok(0)`，给 `55B` 这种错位极小值，不拒也不吭 |
+| 条带对象**中间分块**真丢 | `du` | **会（判损坏）**：stderr `warning: N of M object(s) are damaged striped objects and are excluded from the total (their true size is unknown)`，损坏字节不计入总数 |
+| 条带对象**首分块**真丢（后续分块仍在） | `du` | **会（判损坏）**：同上进 `damaged` 告警（`missing its leading chunk #0 …`），不再给错位极小值 |
 | 读一个对象已丢的文件（重挂后/fd 缓存已清） | 挂载内 `read`/`stat` | **不会（已知缺陷）**：`stat size=0`、整读 rc=0 空内容，不报 `EIO` |
 | 对象被外部 `mv`/`rm`，但挂载已建立 | 挂载内旧 fd | **不会（且不可观察）**：data-server 按 key 缓存旧 fd，需清缓存/重启后才可测 |
 | `view rm --base` 时数据根打不开 | `view rm --base` | **会**：`error: cannot open data root …` + 离线 `gc` 回收提示（分开陈述“树已删”与“字节未收”） |
 | 条带对象全在远端、本机无 `blocks/` | `gc --db-path D`（审计） | **会（不误报为空）**：`objects: 0 local block(s) — N striped layout(s) … use \`grovefs du\` for their bytes` |
 
-> 一句话选型：要“发现字节丢了”用 `du`（整对象不在数据源、列表不符都会出声；但条带内部分块丢失与挂载读丢失仍会静默——属未实现项）；要“回收无人引用的页”用离线 `gc`；要“把账本归位”用 `refs rebuild`。挂载读本身不担当完整性校验。
+> 一句话选型：要“发现字节丢了”用 `du`（整对象不在数据源、列表不符、条带分块损坏都会出声；但挂载读丢失仍静默——属未实现项）；要“回收无人引用的页”用离线 `gc`；要“把账本归位”用 `refs rebuild`。挂载读本身不担当完整性校验。
 
 ### 12.7 变更后的回归验证
 

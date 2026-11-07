@@ -58,7 +58,7 @@ pub fn run(opts: &DuOpts) -> io::Result<()> {
         .collect();
 
     // 3. Batch-get sizes.
-    let (sizes, lost) = resolve_sizes(opts, &refs)?;
+    let (sizes, lost, damaged, damaged_sample) = resolve_sizes(opts, &refs)?;
     if lost > 0 {
         // Numbers that quietly omit something are the failure mode this
         // command exists to avoid, so the gap is announced, not folded in.
@@ -66,6 +66,18 @@ pub fn run(opts: &DuOpts) -> io::Result<()> {
             "warning: {lost} of {} object(s) are not in the data source and count as 0 bytes \
              (objects on other storage roots need their own --data/--data-root)",
             refs.len()
+        );
+    }
+    if damaged > 0 {
+        // A damaged striped object is bytes that ARE present but not in the
+        // contiguous run the size depends on — a different problem from a plain
+        // miss, and one a bare shorter total would hide. Announce it on its own
+        // line so "content is corrupt" is never mistaken for "pass --data-root".
+        eprintln!(
+            "warning: {damaged} of {} object(s) are damaged striped objects and are excluded \
+             from the total (their true size is unknown); first: {}",
+            refs.len(),
+            damaged_sample.unwrap_or_else(|| "(reason unavailable)".to_string())
         );
     }
 
@@ -375,11 +387,16 @@ fn data_source_at(
 }
 
 /// Sizes of `refs`, plus how many refs could not be located (each of those
-/// counted as 0 bytes, which the caller must say out loud). Only a confirmed
-/// miss is counted: an answer nobody gave is an error, not a number.
-fn resolve_sizes(opts: &DuOpts, refs: &[String]) -> io::Result<(Vec<u64>, usize)> {
+/// counted as 0 bytes, which the caller must say out loud), how many are
+/// damaged striped objects (present-but-not-contiguous, size unknown), and a
+/// sample damage reason for the warning line. Only a confirmed miss is counted
+/// as lost: an answer nobody gave is an error, not a number.
+fn resolve_sizes(
+    opts: &DuOpts,
+    refs: &[String],
+) -> io::Result<(Vec<u64>, usize, usize, Option<String>)> {
     if refs.is_empty() {
-        return Ok((Vec::new(), 0));
+        return Ok((Vec::new(), 0, 0, None));
     }
     match data_source(opts)? {
         DataSource::Remote(addrs) => resolve_remote(opts, &addrs, refs),
@@ -426,7 +443,9 @@ fn resolve_sizes(opts: &DuOpts, refs: &[String]) -> io::Result<(Vec<u64>, usize)
                     root.display()
                 )));
             }
-            Ok((sizes, missing))
+            // The local (single-root) path never strips across servers, so an
+            // interior chunk gap cannot arise here; damaged is always 0.
+            Ok((sizes, missing, 0, None))
         }
     }
 }
@@ -526,7 +545,7 @@ fn resolve_remote(
     opts: &DuOpts,
     addrs: &[String],
     refs: &[String],
-) -> io::Result<(Vec<u64>, usize)> {
+) -> io::Result<(Vec<u64>, usize, usize, Option<String>)> {
     check_server_count(addrs, refs)?;
     let token = opts.token.as_deref().unwrap_or("");
     let api_key = opts.api_key.as_deref().unwrap_or("");
@@ -542,7 +561,7 @@ fn resolve_remote(
         .map(|b| b as Arc<dyn crate::backend::StorageBackend>)
         .collect();
     let single = concrete.len() == 1;
-    let sharded: Arc<dyn crate::backend::StorageBackend> =
+    let sharded: Arc<crate::backend::ShardedBackend> =
         Arc::new(crate::backend::ShardedBackend::with_default_stripe(members));
 
     // One server can answer the whole sweep in a single RPC; a striped store
@@ -571,15 +590,17 @@ fn resolve_remote(
                 s.spawn(move || {
                     let done: Probes = part
                         .into_iter()
-                        .map(|i| (i, sharded.len(&refs[i])))
+                        .map(|i| (i, sharded.len_strict(&refs[i])))
                         .collect();
                     out.lock().unwrap().extend(done);
                 });
             }
         });
         let mut missing = 0usize;
+        let mut damaged = 0usize;
         let mut unconfirmed = 0usize;
         let mut first_missing: Option<String> = None;
+        let mut first_damaged: Option<String> = None;
         let mut first_unconfirmed: Option<String> = None;
         for (i, res) in out.lock().unwrap().drain(..) {
             match res {
@@ -587,6 +608,18 @@ fn resolve_remote(
                 Err(e) if confirmed_missing(&e) => {
                     missing += 1;
                     first_missing.get_or_insert_with(|| e.to_string());
+                }
+                // A damaged striped object is NOT "absent from the data source":
+                // chunks are present, just not the contiguous run the size
+                // depends on, so its true size is unknown. Count it as 0 in the
+                // total (bytes that cannot be confirmed are not summed) but
+                // announce it apart from a plain miss, so "content is corrupt"
+                // is never read as "move the root / pass --data-root".
+                Err(e) if crate::backend::ShardedBackend::is_damaged(&e) => {
+                    damaged += 1;
+                    first_damaged.get_or_insert_with(|| {
+                        crate::backend::ShardedBackend::damage_reason(&e)
+                    });
                 }
                 Err(e) => {
                     unconfirmed += 1;
@@ -620,9 +653,9 @@ fn resolve_remote(
                 ),
             ));
         }
-        return Ok((sizes, missing));
+        return Ok((sizes, missing, damaged, first_damaged));
     }
-    Ok((sizes, 0))
+    Ok((sizes, 0, 0, None))
 }
 
 // --- Tree operations ---
