@@ -619,27 +619,27 @@
     </details>
     <p><b>报错对照：</b><code>EROFS</code> = 只读文件系统（派生挂载、fork 内容写）；<code>EPERM</code> = 操作不允许（向合成目录新建、服务端派生写门禁）。</p>
     <h4>四种写意图在哪一步失败（open / write / fsync 时点对照）</h4>
-    <p class="lead">同一句“写不进去”，四种形态报错的<b>步骤</b>不同；尤其内容只读的两种（fork、只读 key），普通追加写的 <code>EROFS</code> 到 <b>fsync/close</b> 才暴露，shell 的 <code>&gt;&gt;</code> 重定向因此会<b>假成功（rc=0）而字节未落盘</b>。下表逐形态标明失败时点，逐 <code>open</code> 探针回显见下方代码块。</p>
+    <p class="lead">同一句“写不进去”，四种形态报错的<b>步骤</b>不同。内容只读的挂载不再申请内核页缓存写回（writeback），追加/普通写的 <code>EROFS</code> <b>在首次 <code>write(2)</code> 即返回</b>，与截断类的 open 即拒同档；shell 的 <code>&gt;&gt;</code> 会当场报错退出，不再有假成功。唯一保留的例外是<b>经服务端（<code>meta-server</code>/<code>data-server</code>）挂载运行中的视图被 <code>apikey set-ro</code> 原地切换</b>（内核挂载标志无法中途改变）：失败要等服务端门禁在 fsync 往返时才可见；本机 <code>--home</code> 挂载没有服务端凭据门（准入由文件系统权限把关），<code>set-ro</code> 不影响已建挂载。下表逐形态标明失败时点，逐 <code>open</code> 探针回显见下方代码块。</p>
     <table>
       <thead><tr><th>形态</th><th>结构写<br><span class="cmt">mkdir / rename / unlink</span></th><th>内容写·截断类<br><span class="cmt">open(<code>O_RDWR|O_TRUNC</code>)、<code>truncate</code></span></th><th>内容写·追加/普通写<br><span class="cmt"><code>O_WRONLY</code> / <code>O_APPEND</code> / <code>O_RDWR</code> 的 <code>write()</code></span></th><th>shell <code>&gt;&gt;</code> 追加的观感</th></tr></thead>
       <tbody>
         <tr><td><b>基视图</b>（可写 key）</td><td>放行</td><td>放行</td><td>放行</td><td>rc=0，字节确实落盘</td></tr>
         <tr><td><b>纯别名</b> A→R（底层可写）</td><td>放行（同一棵树）</td><td>放行</td><td>放行</td><td>rc=0；写在 A 即写在 R（同一 inode）</td></tr>
         <tr><td><b>派生透镜</b> D over B</td><td><code>EROFS</code>（挂载整树只读，<code>mkdir</code> 当场报错）</td><td><code>EROFS</code></td><td><code>EROFS</code></td><td>写不过去；<code>&gt;&gt;</code> 也报错，无假成功</td></tr>
-        <tr><td><b>fork</b>（结构可写 / 内容只读）</td><td>放行（整理目录自由）</td><td><code>EROFS</code> <b>在 open 即拒</b>（<code>shell &gt;</code> 截断 rc=1）</td><td>write() 本身不报错，<code>EROFS</code> <b>在 fsync/close 才暴露</b></td><td><b>rc=0 假成功</b>，字节未落盘</td></tr>
-        <tr><td><b>只读 API key</b>（<code>set-ro</code> 的基视图挂载）</td><td>写门禁在内容面，结构写同样被拒</td><td><code>EROFS</code></td><td>同 fork：内容写被拒，追加类的失败在落盘点可见</td><td><b>rc=0 假成功</b>；ro 生效有 ≤1s 复检窗口，ro→rw 恢复亦需该窗口（挂载内不重连）</td></tr>
+        <tr><td><b>fork</b>（结构可写 / 内容只读）</td><td>放行（整理目录自由）</td><td><code>EROFS</code> <b>在 open 即拒</b>（<code>shell &gt;</code> 截断 rc=1）</td><td><code>EROFS</code> <b>在首次 <code>write(2)</code> 即返</b>（无页缓存缓冲；新建空文件后的第一个写同样当场拒）</td><td>rc=1 并报 <code>只读文件系统</code>，无假成功</td></tr>
+        <tr><td><b>只读 API key</b></td><td><b>重新挂载</b>时与派生透镜同路（<code>client_ro</code> → 内核 RO）：全部 open 即拒；<b>经服务端挂载被 <code>set-ro</code> 原地切换</b>时：写门禁在服务端，本地无内核标志可改（本机 <code>--home</code> 无凭据门，<code>set-ro</code> 不影响已建挂载）</td><td>重挂：open 即拒；set-ro 切换：服务端拒，失败在 fsync 往返可见</td><td>同左两分支</td><td>重挂后无假成功；<code>set-ro</code> 切换瞬间已有挂载内 <code>&gt;&gt;</code> 仍可能 rc=0（≤ 复检窗口 + 脏页未刷），ro 生效/恢复各有 ≤1s 复检窗口（挂载内不重连）</td></tr>
       </tbody>
     </table>
-    <pre><code><span class="cmt"># 逐 open 形态单独看 errno（fork 挂载，实测；shell 重定向另跑一次对照）</span>
-O_WRONLY         : open+write(1B) 成功 -&gt; fsync errno=30 (Read-only file system)
-O_WRONLY|O_APPEND: open+write(1B) 成功 -&gt; fsync errno=30 (Read-only file system)
+    <pre><code><span class="cmt"># 逐 open 形态单独看 errno（fork 挂载，当前版本实测；shell 重定向另跑一次对照）</span>
+O_WRONLY         : open+write(1B) -&gt; errno=30 (Read-only file system)   <span class="cmt"># 首次 write 即拒</span>
+O_WRONLY|O_APPEND: open+write(1B) -&gt; errno=30 (Read-only file system)
 O_RDWR|O_TRUNC   : open 即被拒 errno=30 (Read-only file system)
 os.truncate      : errno=30 (Read-only file system)
-shell 追加 &gt;&gt;    : rc=0（bash 吞掉 fsync 的 EROFS，字节未落盘 → 假成功）
-shell 截断 &gt;     : rc=1（open 阶段即 EROFS，bash 能看到失败）
-<span class="cmt"># 验证是否真落盘，别信重定向的 rc；显式同步后再查：</span>
-python3 -c "import os; f=open('t','ab'); f.write(b'x'); f.flush(); os.fsync(f.fileno())"   <span class="cmt"># 这里才会抛 EROFS</span></code></pre>
-    <div class="note"><b>为什么截断类在 open 就拒、追加类拖到 fsync：</b><code>O_TRUNC</code> 的截断是打开语义的一部分，元数据层可在 open 判定内容面只读直接回 <code>EROFS</code>；而 <code>O_WRONLY</code>/<code>O_APPEND</code> 的 <code>write()</code> 走的是页缓存，落盘（fsync/close 刷脏页）才触到后端的只读门。故对“内容只读”的 fork 与只读 key，<b>不能拿 shell <code>&gt;&gt;</code> 的 rc 判断是否写入成功</b>；要可靠检查就显式 <code>fsync</code>（或逐 <code>open</code> 探针）。（把失败提前到首次 write 是待议的行为改动，尚未实现。）</div>
+shell 追加 &gt;&gt;    : rc=1，bash 报“写错误: 只读文件系统”
+shell 截断 &gt;     : rc=1（open 阶段即 EROFS）
+<span class="cmt"># 结构写不受影响：touch（空建）、mkdir、rename、unlink、chmod 均放行；</span>
+<span class="cmt"># 新建文件后的写同样在首次 write 即拒，新文件保持 0 字节</span></code></pre>
+    <div class="note"><b>为什么截断类在 open 就拒、追加类在首次 write 就拒：</b><code>O_TRUNC</code> 的截断是打开语义的一部分，元数据层可在 open 判定内容面只读直接回 <code>EROFS</code>；追加/普通写本是数据操作，而内容只读的挂载<b>不向内核申请 <code>WRITEBACK_CACHE</code></b>，每个 <code>write(2)</code> 都是同步的 FUSE 写请求，文件系统层的只读门因此能在第一次写就把它拒回用户态（fork 挂载本就没有写吞吐可损失：所有写都会被拒）。可写基视图的挂载仍然启用 writeback 合并，顺序写吞吐不受影响。</div>
     <p class="cmt">四种形态的完整命令走读（建树→派生→fork→别名→清理）见 <a href="#quick">§4</a> 与 <a href="#s15-5">§12.5</a>–<a href="#s15-8-1">§12.8.1</a> 各节案例。</p>
      <h3>常用参数速查</h3>
     <p class="lead">每项一句话说清「干什么 + 怎么写」，详细语义见各章节。</p>
