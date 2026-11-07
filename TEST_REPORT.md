@@ -321,6 +321,22 @@
   ```
 
 - **结论**：读写/mkdir/rename/unlink/软链/硬链/时间戳通过。两点边界如实记录：① **权限位不强制**——`chmod 444` 之后同一 uid 写入仍 `rc=0` 且内容落地；② 稀疏洞不省盘——`st_size` 1 MiB 时 `st_blocks*512` 同样 1 MiB（A5 回显）。均列为遗留项（见 §5-1、§5-2）。
+  当前版本本机复测（`.build-bin/probe_51_52.sh`，`--home` 挂载）两态未变，并已写入文档能力边界（`USAGE.md` §7.1、`docs.html` 部署节 note）：
+
+  ```
+    --- 5-1 chmod 444 then same-uid write:
+    -r--r--r-- 1 fs fs 6 .s12test/mnt/a.txt
+    append rc=0
+    hello
+    more
+    --- cross-uid read as nobody:
+    cat: .s12test/mnt/a.txt: 权限不够
+    --- 5-2 sparse hole:
+    size=1048576 blocks=2048
+    allocated=1048576
+  ```
+
+  （跨 uid 拒读是 FUSE 未开 `allow_other` 的挂载可见性拒绝，非 mode 强制生效，不构成反例；文档已注明此区分。）
 
 ### 3.2 POSIX 建议锁（flock / fcntl）
 
@@ -1523,17 +1539,17 @@
 
 | # | 条目 | 实测现象 | 机制定位 | 处置 |
 |---|---|---|---|---|
-| 5-1 | `chmod` 权限位不强制 | `chmod 444` 后同 uid 写入 `rc=0` 并落盘 | 挂载不做 mode 强制（当前版本行为） | 未修，列入遗留；建议写入 USAGE/docs 的能力边界表 |
-| 5-2 | 稀疏洞不省盘 | `st_size=1048576` 且 `st_blocks*512=1048576` | 后端按完整对象存字节 | 未修，列入遗留 |
+| 5-1 | `chmod` 权限位不强制 | `chmod 444` 后同 uid 写入 `rc=0` 并落盘（集群 A 系列与本机 `--home` 复测两态一致） | 挂载不做 mode 强制（当前版本行为，设计取舍） | 行为不变；**已写入能力边界文档**（`USAGE.md` §7.1 + `docs.html` 部署节 note，含“不要把 chmod 当隔离手段”与 allow_other 可见性的区分） |
+| 5-2 | 稀疏洞不省盘 | `st_size=1048576` 且 `st_blocks*512=1048576`（本机复测同值） | 后端按完整对象存字节 | 行为不变；**已写入能力边界文档**（同上，含“稀疏镜像不省空间”提示） |
 | 5-3 | **POSIX 记录锁 close/退出隐式释放时漏清，阻塞等待方不唤醒** | 修复前的对照实验：显式 `F_UNLCK` 释放 → 等待方 3.01s 唤醒；只 `close(fd)`/进程退出释放 → 新进程非阻塞加锁仍 `EACCES`（锁泄漏），阻塞等待方卡 `request_wait_answer` 直至 600s 上限 | 根因已定位（§3.2）：`fuser` 0.18 `Release::lock_owner()` 仅在 `FUSE_RELEASE_FLOCK_UNLOCK`（只有 flock(2) 路径置位）时返回 `Some`；POSIX 锁走 close 时返回 `None`，`release_locks_of_owner` 不触发，幽灵锁行又被按 sid 的续租心跳（`LOCK_LEASE_SECS=15`）无限 刷新 | **已修复**（release `d2a3b262`，实机复验）：`setlk` 按 `(fh→ino,owner)` 记账、`release` 在末次锁定描述符关闭时用全区间 Unlock 精确回收；close 后新进程加锁由 `EACCES` 变 `GRANTED`、阻塞 `F_SETLKW` 于持有者 close 后 `2.74s` 唤醒（见 §3.2、§6-2a） |
 | 5-4 | `view rm --base` 在数据根不可用时只给裸 `Permission denied` | 修复前：`Error: Os { code: 13, kind: PermissionDenied, message: "Permission denied" }`，不报路径、不给下一步，且发生在元数据树已删之后 | 回收阶段直接上抛 `io::Error`，未经包装 | **已修复**（release `d2a3b262`，实机复验）：回收 `open_local` 失败时 `map_err` 补上数据根路径、视图名与“树已删/字节未收”上下文及离线 `gc` 提示；连同 §5-12 改走 Display，实机报 `error: cannot open data root …`（见 §6-4） |
 | 5-5 | **条带对象真丢分块时 du 仍静默短报（本类中数据源真缺字节的形态；错配/瞬时故障形态已修）** | 修复前探针：中间分块缺失 `67108869 → 16777221`（无 warning）；首分块真缺：`--total` 给极小值 | `ShardedBackend::len` 假定分块连续，指数+二分把“第一个缺失分块”当 EOF（chunk#0 真缺时 `chunk0_elsewhere` 在其它成员也探不到 `{base}#0` → `Ok(0)`） | **已修复（du 诊断路径）**：`du` 改走 `len_strict`，二分停在首个缺失块后多探一块、首块缺失而后续存在也同样检测，命中即归入独立 `damaged` 计数并单独 warning（字节不计入总数）；本机端到端复验见 §3.6.5，单测 `len_strict_flags_interior_and_leading_gaps_but_not_a_short_tail`。挂载侧静默形态（stat size 短/0、读无 EIO）属 §5-6，未改（len 是 getattr 热路径且 `build_attr` 会回退元数据 size，改 len 既拖热路径又不会让挂载出声）；同一命令对“列表长度不符/倒置/超时拒连”的既有拒绝与硬报错不变（见 §3.6.2） |
 | 5-6 | 挂载读丢失对象不出声：非条带路径整对象丢（size=0 空读）与条带路径中间分块丢（size 截短到缺口偏移、内容纯前缀、后续存活块不可见）两形态均无 `EIO` | 重挂后读丢失对象：`rc=0`、`stat size=0`；条带中间块丢：`stat size=16777216`、整读 rc=0 且 md5==chunk#0（本机复验见 §3.6.6） | 同上：`len` 给短报/0 而非错误，`read()` 将缺失块 `NotFound` 当 EOF | 未修，列入遗留；两形态均已在表(b) 分行诚实标注 |
 | 5-7 | ~~`apikey set-ro` 回到 rw 后同一挂载仍拒写~~ | 原集群探针：`is now rw (read-write)` 后紧接追加写 `errno=30` | 探针落在尚存的 ≤1s 复检窗内（复验按到站流量触发） | **复测确证非产品缺陷**：本机同栈以 rw key 挂载复现，tick 过后同一挂载 `write+fsync ok`、不留字节，失败仅出现在窗内（见 §3.9.1）；文档“恢复写要重挂”的过度泛化已限定为仅指内核已落只读的挂载 |
 | 5-8 | `set-ro` 后回读内容尾部多 7 个零字节 | `'first\n\x00\x00\x00\x00\x00\x00\x00'` | 本轮探针用固定长缓冲区读回所致，非产品写入；作为取证脚本缺陷记录 | 已确认非产品缺陷（取证手段问题） |
-| 5-9 | HA 切换瞬间首次写存在瞬时 `EIO` | 上一轮观察到一次 `EIO` 且文件未生成；本轮为 `rc=0`（0.76 s） | 转接窗口内旧主连接失效 | 状态相关，不作稳定性断言；建议文档写明重试要求 |
+| 5-9 | HA 切换瞬间首次写存在瞬时 `EIO` | 上一轮观察到一次 `EIO` 且文件未生成；本轮 E3 为 `rc=0`（0.76 s） | 转接窗口内旧主连接失效 | 状态相关，不作稳定性断言；**重试要求已写入文档**（`USAGE.md` §12.4 切换窗口写重试 note + `docs.html` HA 滚动升级行：窗口内首次写可能 `EIO`/`EROFS`/`EPERM`，调用方应带重试） |
 | 5-10 | `view alias` 接受指向不存在视图的目标 | 修复前：`defined pure alias 'x-dangle' -> real view 'no-such-tree'`，直到挂载才拒 | 定义时无树存在性校验 | **已修复**（release `d2a3b262`，实机复验）：`alias_view` 在排除别名/派生/分叉目标后，用 `store.has_physical(real)` 检查目标物理树（SQLite 查 `<base>/meta/<view>.db`、PG 查 schema）是否存在，不存在则拒绝并给出可敲的 create/import 命令（接 §6-5） |
-| 5-11 | `grovefs import` 不接受 `--meta`/`--data`，无法向远端/条带存储批量导入 | `grovefs import --meta … --data …` 报 Usage；只能导入到本地 `--db-path`/`--home` 存储根 | import 子命令未暴露远端定位参数（与 du/view import 的远端能力不对称） | 未修，列入遗留（接口缺口；需先本地导入再 `view export/import` 迁机） |
+| 5-11 | `grovefs import` 不接受 `--meta`/`--data`，无法向远端/条带存储批量导入 | `grovefs import --meta … --data …` 报 Usage；只能导入到本地 `--db-path`/`--home` 存储根 | import 子命令未暴露远端定位参数（与 du/view import 的远端能力不对称） | 未修，列入遗留（接口缺口；需先本地导入再 `view export/import` 迁机）。本轮终审定性：不是不对称缺陷而是设计边界——import 直接写权威 `meta/<view>.db` 与 `blocks/`，零拷贝靠源与 blocks 同盘硬链接，远程协议里没有“批量提交整棵树”的对应操作；跨机批量走 §14.2 备选路（挂载点 rsync 经 FUSE 写路径，大文件可条带）。**未实现口径已写入负空间清单**（`USAGE.md` §14.4、`docs.html` §12.1.1/§12.6） |
 | 5-12 | CLI 致命错误以 Debug 形式打印 | 修复前：挂载单元在 data-server 未起时报 `Error: Os { code: 111, kind: ConnectionRefused, message: "Connection refused" }`（不指哪个地址）；du 报错带外层双引号 `Error: "…"` | `fn main() -> Result<(), Box<dyn Error>>` 使错误走 Debug 而非 Display | **已修复**（release `d2a3b262`，实机复验）：`main()` 拆出 `real_main()`、致命错误改走 Display（`error: <人话>`，与 clap 前缀一致）；meta/data/du 连接失败均点名 `cannot reach meta-server/data-server <addr>`（保留 `ErrorKind` 不影响 failover，见 §6-1） |
 
 已当场修正的取证脚本缺陷（不属于产品遗留）：C5 漏 `mv`、误挑 0 字节分块；B4 基视图残留 `newdir`/`b4-renamed.txt` 导致结构写探针假失败；`> target 2>/tmp/err` 重定向顺序导致报错为空；battery_1 输出文件被自身 `rm -rf /tmp/gft_*` 删成 `(deleted)` 导致 ssh 挂死；`vm_audit.sh` 的嵌套单引号、`cut` 无 sudo、把整个多行 env 值当 grep pattern 导致的“单元文本命中密钥 4 处”假阳性、崩溃拉起验证的 `pgrep` 模式被吞。
@@ -1569,7 +1585,7 @@
 8. ★**`gc` 对在用存储的输出区分“无字节”与“无垃圾”——本轮已实现**（release `c8d68580`，实机复验见 §2.3）。原建议：`striped layout(s) > 0` 且 `objects == 0` 时不应让裸 `0` 读成“无字节”，且不应邀请对 0 字节重跑 `--apply`。**已采用的改法**（`src/main.rs` 的 `print_gc_report`）：当 `objects == 0 && striped_layouts > 0` 时，objects 行改打 `objects: 0 local block(s) — N striped layout(s) place their chunks on data-servers, which gc does not audit (use \`grovefs du\` for their bytes)`；dry-run 汇总保留稳定前缀 `dry run: nothing deleted.`，再按三态给尾句——有可回收项才邀请 `--apply`，`orphans` 为空打 `No unreferenced objects were found.`，全在宽限期内打 `N orphan(s) are all within the <grace> grace; re-run after it elapses.`。实机条带 meta 存储 `gc` 回显见 §2.3，`test_gc.sh` 41/0 仍绿（clean-store 用例断言的 `dry run: nothing deleted` 前缀未破）。
 9. ★**`--stats` 表的字节口径——本轮已实现**（表头说明方案，不改定宽列；release `c8d68580`，本机挂载复验）。原建议：`read.op_total bytes=0` 与 `read.backend_total bytes=…` 并存易误读为“没读到数据”；`p50=0` 这类静默 0 易误读为漏采样。**已采用的改法**（`src/stats.rs` 的 `report_text` 表头，未动表格列宽以免破坏对齐与 CSV）：新增两行——`bytes= is tallied only on the backend-boundary stages (read/write.backend_total, io.*); a 0 there is expected on op_total lines and means "not counted at this stage", not "no data"`、`a latency of 0 is sub-µs (below the histogram's µs resolution), not a missing sample`。同步 `docs.html` §8 的真实回显样本与 `USAGE.md` §8.1 口径说明。`test_stats.sh` E2E 通过（表头 `per-stage latency telemetry` 断言未受影响）。
 10. **`ls -d /data/gfs*/grove` 的展示歧义——本轮已实现（启动 banner 回显 host + 根列表）**。两台机器上都存在 `/data/gfs1/grove` 与 `/data/gfs2/grove` 两个同名目录（分块落点看似“在 gfs1 上”实际在 gfs2 的盘），本轮 E1/D2 回显已造成多次误读。**已采用的改法**（纯显示，不动放置逻辑）：`src/remote/server.rs` 的 `DataServer` 新增展示字段 `roots`（`with_roots()` 由 CLI 注入）与 best-effort `node_hostname()`（`libc::gethostname`，退回 `HOSTNAME` env，再退 `<unknown>`，不因此拒绝启动），启动行由裸 `data-server listening on <addr>` 改为 `data-server listening on <addr> (host <h>, N data root(s): <p1>, <p2>)`——翻日志先认 host 再认路径。未采纳“根名从主机名推导”（`/data/<host>/grove`）：那会改变既有存储的根路径布局，与“root 列表必须固定”的口径冲突，属部署惯例而非产品缺陷。本机冒烟：`data-server listening on 127.0.0.1:59977 (host lc, 2 data root(s): /tmp/ds_a, /tmp/ds_b)`；`test_remote.sh` 新增 banner 断言（套件 19/0）；`docs.html` §13.11 终端实录与 `USAGE.md` §13.3/部署走读的 banner 示例同步为新形。
-11. **静默 0 值的通用约束**。建议约定：任何统计命令的 0 值必须区分三种情况——真零、无法测（数据源不对）、部分丢失，分别给 `0`、`0 (not measurable here: …)`、`<N> (excluding M lost object(s))`。本轮命中的四处：`du --total: 55B`、`stat size=0`、`gc objects: 0 (0 B)`、`--stats bytes=0`。
+11. **静默 0 值的通用约束——本轮终审收口**。约定：任何统计命令的 0 值必须区分三种情况——真零、无法测（数据源不对）、部分丢失，分别给 `0`、`0 (not measurable here: …)`、`<N> (excluding M lost object(s))`。本轮命中的四处：`du --total: 55B`、`stat size=0`、`gc objects: 0 (0 B)`、`--stats bytes=0`。终审结果：四处命中面全部处置完毕——du 丢字节已出声（`not in the data source and count as 0 bytes` + 独立 `damaged` 告警，硬报错拒数并存，见 §3.6）；`gc` 条带存储行区分“无字节/无垃圾”（§6-8，`objects: 0 local block(s) — N striped layout(s)…`）；`--stats bytes=0` 与 `p50=0` 已由表头两行说明定性（§6-9）；`stat size=0` 属 §5-6 挂载侧设计取舍，不动，已在表(b) 逐形态诚实标注。该约束无需单独写入产品文档：其覆盖面已由具体输出与表(b) 逐行承载，另立抽象条款反而无可操作性；后续新命令的 0 值输出按本约定逐条对表(b) 巡检即可。
 12. ★**`docs.html`/`USAGE.md` 两张运维语义表——本轮已实现**（纯文档，无代码改动）。原建议：添加（a）fork/透镜/别名/key-ro 四种“写意图”的失败时点对比，（b）“对象丢失时各命令的声音”矩阵。**已采用的改法**：（a）写入 `docs.html` §12“报错对照”后（含逐 `open` 探针 errno 的 `<pre>` 与“为何截断类在 open 拒、追加类拖到 fsync”的 note）与 `USAGE.md` §3.0（写契约 note 后的精简表 + “不能拿 shell `>>` 的 rc 判断写成功”的告警）；（b）写入 `docs.html` §11.5（du 字节来源 note 后，逐情形×会/不会出声×逐字回显关键词）与 `USAGE.md` §12.6（同矩阵精简版 + 一句话选型），现为 10 行——后续轮按 §3.6.6 取证增补了“条带中间分块丢失→经挂载读”独立一行（此前只有“整对象丢失→size=0”行，两种静默形态不互相蕴含）。未出声的条带丢分块与挂载读均标为“当前版本已知缺陷（未实现、诚实标注）”，与 §5-5/§5-6 遗留项一致。doccheck 退出码 0（标签闭合无错、参数对账非负空间差集 0、新增汉字均为正当用字）。
 
 ---
