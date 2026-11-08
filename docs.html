@@ -965,6 +965,7 @@ WantedBy=multi-user.target
 <span class="cmt"># 拉起</span>
 sudo systemctl start grove-mount@alice          <span class="cmt"># 视图名已先在中心 `view create --view alice` 建好;名字不存在会被拒</span>
 findmnt -T /mnt/alice                           <span class="cmt"># 期望:grovefs:alice,FUSE</span></code></pre>
+    <div class="note"><b>视图先在哪建、客户端才能挂</b>：<code>grovefs mount --view alice</code> 只认<b>已存在</b>的视图，挂载从不替你立视图（名字不存在直接被拒）。所以每个 <code>grove-mount@alice</code> 启动前，<code>alice</code> 必须已在元数据后端建好——SQLite 部署在中心节点跑 <code>grovefs view --meta-dir /data/cluster create --view alice</code>（该命令直写 <code>/data/cluster/meta/alice.db</code>，必须在能碰该文件系统的那台机器上执行，<b>不是</b>发给 meta-server 进程代建）；PG 部署把 <code>--meta-dir</code> 换为 <code>--meta-store postgres://…</code>，在任何连得上 PG 的机器上建皆可。详见 <a href="#create-base">§12.0.1</a>。</div>
     <div class="note"><b>uid 两件事</b>(见 <a href="#share">§9.1</a>):systemd 默认以 root 起挂载,上报 uid=<b>0</b>——无白名单约束时 root 放行即可访问;要其他用户也能访问挂点,加 <code>--o allow_other</code> 并在 <code>/etc/fuse.conf</code> 打开 <code>user_allow_other</code>。</div>
     <div class="note"><b>两处「看起来是 POSIX 但不是」的边界(实测确证)</b>:① <b>权限位存储、显示、不强制</b>——<code>chmod</code>/<code>ls -l</code> 如实记录 <code>node.mode</code>,但挂载准入不看树内 mode:同 uid 对 <code>chmod 444</code> 的文件追加写仍 <code>rc=0</code> 且字节落盘;真正的访问控制是 token/API key、<code>--ro</code> 挂载、<code>allow_other</code> 可见性与本机 OS 权限,不要把 <code>chmod</code> 当视图内隔离手段。② <b>稀疏洞不省盘</b>——后端按完整对象存字节,<code>truncate -s 1M</code> 后 <code>st_blocks*512 == st_size</code>(<code>size=1048576 blocks=2048</code>,无洞);稀疏镜像文件不会少占网络/磁盘。均为设计取舍,见 USAGE.md §7.1。</div>
     <div class="note"><b>改成逐调用方可撤销凭据</b>（踢掉一台机不再需要轮换共享 token 并断全部人）：两个 server 的 <code>ExecStart</code> 各加 <code>--require-api-key</code>（data 侧另需 <code>--meta-dir</code> 指到元数据根，若它不等于首个 <code>--data-dir</code>），客户端把 <code>--token ${GROVE_TOKEN}</code> 换成 <code>--api-key ${GROVE_API_KEY}</code>，并用 <code>grovefs apikey create --label &lt;主机名&gt; --for mount</code> 铸造后写进同一份 root-owned 0600 的 <code>grovefs.env</code>（密钥因而进不了 <code>ps</code> 可见的 unit 文本）。撤销后的真实行为（实测）：该挂载在首个服务端往返上打印服务端拒因、<b>干净自卸载并以退出码 0 结束</b>——一次有意的收手而不是崩溃，所以 <code>Restart=on-failure</code> <b>不会</b>重拉，unit 落 <code>inactive (dead)</code>（要辨"被踢"请看 journal 里那行拒因，或挂 <code>OnFailure=</code>/<code>ExecStopPost=</code> 告警）；拿被撤销的 key 重挂则 fail-fast。若希望被踢后自动重试（运维会重新铸一把），改用 <code>Restart=always</code>。其他主机的挂载全程不受波及。</div>
@@ -1761,6 +1762,23 @@ grovefs du --view main --depth 1</code></pre>
 
     <div class="note"><b>一句话判据</b>：只有<b>基视图</b>的删名会在跨视图账本 <code>refs.db</code> 归零时真正回收对象。<code>fork</code> 虽有自己的一棵 <code>meta/F.db</code>，但字节所有权仍记在基视图名下——它 reshape / 复制目录项，不 own 物理回收。故「有没有一棵 <code>.db</code>」≠「是不是基视图」；要看删除会不会掉字节。</div>
     <div class="note"><b>MCP 不建基视图</b>：治理工具只做 <code>define / alias / fork / graft / remove</code> 等 reshape；立基视图需要文件系统落盘，是 <code>init</code> / <code>view create</code> / <code>import</code> 的 CLI 专属动作。</div>
+
+    <h4>在哪台机器执行：命令直连元数据后端，不经 meta-server 转发</h4>
+    <p>建基视图不是一条“发给 <code>meta-server</code> 进程代建”的远程 RPC——<code>meta-server</code> 只服务挂载/FUSE 读写，MCP 治理工具也只 <code>define/alias/fork/graft/rm</code>，都不建正本。<code>init</code>/<code>view create</code>/<code>import</code>/<code>view import</code> 都是<b>直接对元数据后端动手</b>的：能不能在任意机器跑，取决于元数据后端是哪种。</p>
+    <table>
+      <thead><tr><th>元数据后端</th><th>基视图实体</th><th>在哪台机器跑建视图命令</th></tr></thead>
+      <tbody>
+        <tr><td>SQLite（本地文件，默认）</td><td><code>meta/&lt;V&gt;.db</code> 一个文件</td><td><b>必须</b>在 <code>--meta-dir</code>/<code>--home</code> 所指文件系统所在的那台机器（集群里通常是元数据/控制节点）上执行；客户端那台无法远程让它建</td></tr>
+        <tr><td>PostgreSQL（<code>--meta-store postgres://…</code>）</td><td>PG 里的 <code>grovefs_v_&lt;hex&gt;</code> schema</td><td><b>任意</b>能连上该 PG URI 的机器都可执行——它连的是共享 PG，不要求坐在元数据服务器上</td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li><b><code>init</code> 特例</b>：只走本地文件，无 <code>--meta-store</code>/<code>--meta-server</code>，故 <code>init</code> 永远在元数据目录那台机器上跑。集群里要显式立基视图用 <code>view create</code>（可指 PG）。</li>
+      <li><b>顶层 <code>import --source DIR</code></b>：除元数据落点外字节也有落点——它把 <code>DIR</code> 零拷贝/硬链进数据根 <code>blocks/</code>，故跑 import 的机器要同时能碰元数据后端、且 <code>--source DIR</code> 与数据根可达。</li>
+      <li><b>客户端只挂载不建视图</b>：远程客户端用 <code>--meta-server</code> 挂载既有视图；建视图这一步要么在元数据节点本地做（SQLite），要么在有 PG 可达的机器上做（PG）。</li>
+    </ul>
+    <div class="note"><b>一句话</b>：<b>SQLite 部署 → 去元数据那台机器建；PG 部署 → 哪台连得上 PG 就在哪建</b>。两者都是 CLI 直连后端，而非让 meta-server 代建。</div>
+
     <h4>最小创建示例（形式与 §4 / §12.7 一致）</h4>
     <pre><code><span class="cmt"># 单机：建一棵空基视图（--home 本地根，--view 视图名），挂上即见空根</span>
 $ grovefs --home $BASE init --view team
