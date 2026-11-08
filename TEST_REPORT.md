@@ -1751,18 +1751,25 @@ bash .build-bin/vm_audit.sh        # 重启后拿一次全量复核
 
 ```
 $ git log --oneline -4
+41613ad feat(fuse): per-bit capability negotiation, ATOMIC_O_TRUNC, kernel-aware clone_fd
+10f5f1a docs(report): refresh §8 git snapshot for the §5/§6 close-out commit
 be7c237 docs(display): close out remaining §5/§6 items with honest-boundary notes
 5e624e8 docs(report): refresh §8 git snapshot for the §5-7 reclassification commit
-c7bb45c docs(display): scope the set-ro resume-write claim to kernel-RO mounts (§5-7)
-d4617e1 docs(display): split interior-gap mount-read silence into its own row in tables (b)
 
-$ git show --stat be7c237       # §5-1/§5-2 能力边界 + §5-9 重试要求 + §5-11/§6-11 终审（纯文档）
- TEST_REPORT.md | 26 +++++++++++++++++++++-----
- USAGE.md       | 12 +++++++++++-
- docs.html      |  7 ++++---
- 3 files changed, 36 insertions(+), 9 deletions(-)
+$ git show --stat 41613ad       # 本轮三项：内核能力协商 / ATOMIC_O_TRUNC / clone_fd 兜底（代码）+ 混版本、splice 文档口径 + §4.5 取证
+ TEST_REPORT.md |  79 ++++++++++++++++++++++++++++++----
+ USAGE.md       |  15 +++++--
+ docs.html      |  12 +++---
+ src/fs_impl.rs | 131 ++++++++++++++++++++++++++++++++++++++++-----------------
+ src/main.rs    |  30 ++++++++++++-
+ 5 files changed, 208 insertions(+), 59 deletions(-)
 
-$ git status --short            # 跟踪文件已全部入库，仅剩未跟踪的取证/编排脚本（本报告快照随 §5/§6 遗留收口 commit 刷新）
+$ git status --short            # 5 个跟踪文件已随本轮 commit（41613ad）入库，仅剩未跟踪的取证/编排探针脚本（本报告快照随本轮 commit 刷新）
+?? .build-bin/probe_kernel_caps.sh    # §4.5(a) 内核能力矩阵（5.4/6.8 caps echo + O_TRUNC A/B），不入库
+?? .build-bin/probe_atomic_o_trunc.sh # §4.5(a) ATOMIC_O_TRUNC 复验，不入库
+?? .build-bin/probe_fork_erofs.sh     # §4.5(a) fork content_ro EROFS + 内容保留复验，不入库
+?? .build-bin/probe_mixver_cell.sh    # §4.5(b) 混版本五格矩阵，不入库
+?? .build-bin/probe_splice_upper.sh   # §4.5(c) splice 收益上限，不入库
 ?? .build-bin/gfs_provision.sh
 ?? .build-bin/probe_posix_lock.py
 ?? .build-bin/probe_51_52.sh         # §3.1 §5-1/§5-2 本机复测探针（取证用，不入库）
