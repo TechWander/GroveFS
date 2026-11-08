@@ -114,7 +114,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Initialize a view (creates meta DB, optional seed manifest)
+    /// Initialize a BASE (physical) view (creates its meta DB; optional seed manifest)
     Init {
         /// View to create (its metadata DB is initialized if absent).
         #[arg(long)]
@@ -776,6 +776,7 @@ NOTES
 }
 
 #[derive(Subcommand)]
+#[command(after_help = "Four view kinds - the verb that creates each:\n  base     -> view create --view V                 (or: grovefs init --view V)\n  derived  -> view define  --base B --name D --rules F   (read-only lens)\n  alias    -> view alias   --real R --name A             (public name, writable)\n  fork     -> view fork    --base B --name F             (fill it with: view graft)\nOnly a BASE view owns physical deletion; derived/alias/fork reshape or rename one.")]
 enum ViewAction {
     /// Create a NEW BASE (physical) view named `--view`, seeding its empty tree
     /// root (optionally from `--manifest`). This is the deliberate, explicit
@@ -1262,7 +1263,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                 std::fs::create_dir_all(dir)?;
             }
             let meta = MetaEngine::open(&mp)?;
-            println!("initialized view '{view}' at {}", mp.display());
+            println!("initialized BASE view '{view}' at {}", mp.display());
             if let Some(mf) = manifest {
                 let backend = backend::open_local(&base)?;
                 seed_manifest(&meta, backend.as_ref(), &mf)?;
@@ -2195,8 +2196,9 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     let st = meta::import_view(&vbase, &view, &input, replace)?;
+                    let kind_word = if as_fork.is_some() { "view" } else { "BASE view" };
                     println!(
-                        "imported view '{view}' from {}: {} node(s), {} blob reference(s){}; cross-view ledger rebuilt",
+                        "imported {kind_word} '{view}' from {}: {} node(s), {} blob reference(s){}; cross-view ledger rebuilt",
                         input.display(),
                         st.nodes,
                         st.blobs,
@@ -2668,6 +2670,9 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
             let mp = meta_path(&mbase, &view);
+            // A view DB that is absent here gets created by MetaEngine::open below,
+            // which stands up a new physical BASE view as a side effect of the import.
+            let created_base = !mp.exists();
             if let Some(dir) = mp.parent() {
                 std::fs::create_dir_all(dir)?;
             }
@@ -2698,6 +2703,12 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                 &mut dirs,
                 &mut st,
             )?;
+            if created_base {
+                println!(
+                    "created BASE view '{view}' (target was absent); imported {} object(s)",
+                    st.linked + st.copied
+                );
+            }
             println!(
                 "imported into view '{view}' under {}: {} dir(s), {} object(s) \
                  ({} hardlinked zero-copy, {} copied), {} skipped, {} failed",
