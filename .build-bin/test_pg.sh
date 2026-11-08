@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # PostgreSQL metadata backend end-to-end over real FUSE mounts against a
-# central meta-server started with `--store postgres://…`. Proves:
+# central meta-server started with `--meta-store postgres://…`. Proves:
 #   - the meta-server boots and mounts a client against PG (the view's
 #     `grovefs_v_<hex(view)>` schema is provisioned explicitly by
-#     `view create --store`, never by a mount);
+#     `view create --meta-store`, never by a mount);
 #   - CRUD (mkdir/touch/cat/ls), rename, hardlink and symlink all round-trip
 #     through the PG-backed MetaProvider;
 #   - two clients on the same view converge on one authoritative PG tree
@@ -59,10 +59,10 @@ psql_in_docker(){
     fi
 }
 
-echo "===== 1) refuse --role standby + --store postgres://… at serve() time ====="
+echo "===== 1) refuse --role standby + --meta-store postgres://… at serve() time ====="
 $Y meta-server --listen 127.0.0.1:15055 --home .pgtest/refuse \
     --role standby --peer 127.0.0.1:1 \
-    --store "$PGURI" > .pgtest/refuse.log 2>&1
+    --meta-store "$PGURI" > .pgtest/refuse.log 2>&1
 RRC=$?
 [ "$RRC" != 0 ] && ok "PG + HA refused at startup (rc=$RRC)" \
     || bad "PG + HA should have failed but returned 0"
@@ -71,12 +71,12 @@ grep -qi "cannot be combined\|incompatible" .pgtest/refuse.log \
     || bad "startup error unclear: $(cat .pgtest/refuse.log)"
 
 echo "===== 2) start data-server and PG-backed meta-server ====="
-$Y data-server --listen $DATA --root .pgtest/central/data > .pgtest/data.log 2>&1 &
+$Y data-server --listen $DATA --data-dir .pgtest/central/data > .pgtest/data.log 2>&1 &
 DP=$!
 # Views are explicit: provision the PG schema up front, before any mount.
-$Y view --store "$PGURI" --db-path .pgtest/home create --view "$VIEW" > .pgtest/create.log 2>&1 \
-    || { echo "FAIL: view create --store failed"; cat .pgtest/create.log; exit 1; }
-$Y meta-server --listen $META --home .pgtest/home --store "$PGURI" > .pgtest/meta.log 2>&1 &
+$Y view --meta-store "$PGURI" --meta-dir .pgtest/home create --view "$VIEW" > .pgtest/create.log 2>&1 \
+    || { echo "FAIL: view create --meta-store failed"; cat .pgtest/create.log; exit 1; }
+$Y meta-server --listen $META --home .pgtest/home --meta-store "$PGURI" > .pgtest/meta.log 2>&1 &
 MP=$!
 wait_port $DATA || { echo "data-server failed"; cat .pgtest/data.log; }
 wait_port $META || { echo "meta-server failed"; cat .pgtest/meta.log; }
@@ -86,7 +86,7 @@ RAP=0; RBP=0
 trap cleanup EXIT
 
 echo "===== 3) mount A against the pre-created grovefs_v_<hex> schema ====="
-$Y --home .pgtest/m1 mount --view "$VIEW" --mountpoint .pgtest/mnt_a --meta $META --data $DATA --foreground > .pgtest/mnt_a.log 2>&1 &
+$Y --home .pgtest/m1 mount --view "$VIEW" --mountpoint .pgtest/mnt_a --meta-server $META --data-servers $DATA --foreground > .pgtest/mnt_a.log 2>&1 &
 RAP=$!
 sleep 1.5
 A=.pgtest/mnt_a
@@ -117,7 +117,7 @@ else
 fi
 
 echo "===== 5) mount B on same view: cross-client convergence (shared PG tree) ====="
-$Y --home .pgtest/m2 mount --view "$VIEW" --mountpoint .pgtest/mnt_b --meta $META --data $DATA --foreground > .pgtest/mnt_b.log 2>&1 &
+$Y --home .pgtest/m2 mount --view "$VIEW" --mountpoint .pgtest/mnt_b --meta-server $META --data-servers $DATA --foreground > .pgtest/mnt_b.log 2>&1 &
 RBP=$!
 sleep 2.5
 B=.pgtest/mnt_b

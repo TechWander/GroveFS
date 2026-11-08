@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Throughput bench for the P5 STRIPING data path: writes/reads a large file
-# across ONE data server vs TWO striped data servers (client --data a,b), to see
+# across ONE data server vs TWO striped data servers (client --data-servers a,b), to see
 # whether splitting a file's chunks over multiple server sockets raises aggregate
 # bandwidth. Run alongside (not inside) run_all.sh's bench suite.
 #
@@ -45,14 +45,14 @@ secs(){ local t0 t1 rc e; t0=$(date +%s.%N); "$@" >/dev/null 2>&1; rc=$?; t1=$(d
 rate(){ awk -v s="$1" -v t="$2" 'BEGIN{ if(t>0) printf "%.1f", s/t; else print "n/a" }'; }
 
 # ---- single-server mount ----
-$Y data-server --listen $S1 --root $PWD/.bs/r1 > .bs/s1.log 2>&1 & P1=$!
+$Y data-server --listen $S1 --data-dir $PWD/.bs/r1 > .bs/s1.log 2>&1 & P1=$!
 $Y init --view perf1 >/dev/null
-$Y mount --view perf1 --mountpoint .bs/mnt1 --data $S1 --foreground > .bs/mnt1.log 2>&1 & M1=$!
+$Y mount --view perf1 --mountpoint .bs/mnt1 --data-servers $S1 --foreground > .bs/mnt1.log 2>&1 & M1=$!
 sleep 1.0
 # ---- two-server striped mount ----
-$Y data-server --listen $S2 --root $PWD/.bs/r2 > .bs/s2.log 2>&1 & P2=$!
+$Y data-server --listen $S2 --data-dir $PWD/.bs/r2 > .bs/s2.log 2>&1 & P2=$!
 $Y init --view perf2 >/dev/null
-$Y mount --view perf2 --mountpoint .bs/mnt2 --data "$S1,$S2" --foreground > .bs/mnt2.log 2>&1 & M2=$!
+$Y mount --view perf2 --mountpoint .bs/mnt2 --data-servers "$S1,$S2" --foreground > .bs/mnt2.log 2>&1 & M2=$!
 sleep 1.0
 
 cleanup(){ fusermount -u .bs/mnt1 .bs/mnt2 2>/dev/null; kill $M1 $M2 $P1 $P2 2>/dev/null; }

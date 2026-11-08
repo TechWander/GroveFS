@@ -77,7 +77,7 @@ pub struct GroveFS {
     /// read file data straight through (`FopenFlags::FOPEN_DIRECT_IO`, bypassing
     /// the page cache). Chosen for multi-client mounts that share a `meta-server`, where
     /// one client's write must be visible to another immediately rather than
-    /// after the default cache TTL. Costs the caching benefit; opt-in via `--strict`.
+    /// after the default cache TTL. Costs the caching benefit; opt-in via `--no-cache`.
     strict: bool,
     /// Negotiate FUSE_READDIRPLUS (kernel >= 4.6): READDIR replies then carry
     /// per-entry dentry+attr, so `ls -l` on a big dir costs one metadata
@@ -86,11 +86,11 @@ pub struct GroveFS {
     /// ever offers it if the provider also pages in its own store — see
     /// `MetaProvider::supports_paged_readdir`.
     readdirplus: bool,
-    /// Base kernel attr/dentry cache TTL used when *not* `--strict`. Defaults to
-    /// 2 s (unchanged behavior). `--tune-cache <secs>` raises it for read-heavy /
+    /// Base kernel attr/dentry cache TTL used when *not* `--no-cache`. Defaults to
+    /// 2 s (unchanged behavior). `--cache-ttl <secs>` raises it for read-heavy /
     /// immutable trees (e.g. the astronomy "data never lands" read-once pattern):
     /// fewer LOOKUP/GETATTR round-trips. Cross-client freshness is still
-    /// preserved by the default notify-invalidation push, and `--strict` pins
+    /// preserved by the default notify-invalidation push, and `--no-cache` pins
     /// this to 0, so this knob only ever widens caching for callers who opt in.
     cache_ttl: Duration,
     /// GCRA shapers for CONTENT bytes of THIS mount (`--bw-read` /
@@ -260,7 +260,7 @@ impl GroveFS {
     }
 
     /// Entry/attribute cache lifetime for lookups that could go stale from a
-    /// peer's write: full caching normally, zero under `--strict`.
+    /// peer's write: full caching normally, zero under `--no-cache`.
     fn ttl(&self) -> Duration {
         if self.strict {
             Duration::ZERO
@@ -280,7 +280,7 @@ impl GroveFS {
         }
     }
 
-    /// `open` flags: bypass the page cache under `--strict` so reads see other
+    /// `open` flags: bypass the page cache under `--no-cache` so reads see other
     /// clients' writes; otherwise let the kernel cache normally.
     fn open_flags(&self) -> FopenFlags {
         if self.strict {
@@ -327,7 +327,7 @@ impl GroveFS {
 
     /// Debounce gate for the write-path mtime touch: takes the timestamp lock
     /// only to decide/record, and NEVER calls into `meta` while holding it —
-    /// with --meta that would serialize every concurrent writer behind one
+    /// with --meta-server that would serialize every concurrent writer behind one
     /// synchronous RPC inside our own lock.
     fn should_touch_write(&self, ino: u64) -> bool {
         should_touch_write(&mut self.last_write_touch.write(), ino, SystemTime::now())
@@ -491,7 +491,7 @@ impl fuser::Filesystem for GroveFS {
         }
         // AUTO_INVAL_DATA (kernel >= 3.15): when a cached attr is refreshed and
         // mtime/size changed, the kernel also drops the file's cached page data.
-        // This is what makes a raised `--tune-cache` TTL safe: a remote write that
+        // This is what makes a raised `--cache-ttl` TTL safe: a remote write that
         // bumps size/mtime still invalidates a peer's stale pages on next access,
         // complementing our notify-invalidation push. Its own call so an older
         // kernel that lacks it drops only this bit.
@@ -1044,7 +1044,7 @@ impl fuser::Filesystem for GroveFS {
         self.bw_write.acquire(n as u64);
         // Debounced mtime touch: a streaming writer fires one write
         // callback per 1MiB chunk, and each unhedged touch is a full
-        // metadata write (a local tx, or — with --meta — a synchronous
+        // metadata write (a local tx, or — with --meta-server — a synchronous
         // RPC round-trip and one row in the HA replication stream).
         // One touch per WRITE_TOUCH_DEBOUNCE window per inode bounds
         // that amplification. Honest cost: mtime granularity degrades

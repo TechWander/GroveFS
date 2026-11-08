@@ -1,7 +1,7 @@
 //! Offline orphan-object audit and reclaim for a LOCAL store.
 //!
 //! An object is an ORPHAN when nothing names its bytes anymore: the page
-//! `<data-root>/blocks/<2hex>/<key>` exists, no surviving view tree carries a
+//! `<data-dir>/blocks/<2hex>/<key>` exists, no surviving view tree carries a
 //! `node.data_ref = key`, and the cross-view ledger (`meta/refs.db`) does not
 //! book it either. That residue is produced by two documented accidents:
 //!
@@ -56,7 +56,7 @@ pub struct Candidate {
     pub key: String,
     /// Exact on-disk page that would be removed.
     pub path: PathBuf,
-    /// The `--data-root` this page was found under.
+    /// The `--data-dir` this page was found under.
     pub data_root: PathBuf,
     pub size: u64,
     pub mtime: SystemTime,
@@ -371,7 +371,7 @@ fn scan_root(
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             rep.skipped.push(format!(
-                "{}: no blocks/ directory under this data root (wrong --data-root?)",
+                "{}: no blocks/ directory under this data root (wrong --data-dir?)",
                 data_root.display()
             ));
             return Ok(());

@@ -23,9 +23,9 @@ rm -rf .msrv; mkdir -p .msrv/central .msrv/m1 .msrv/m2 .msrv/m3 .msrv/m4 .msrv/m
 wait_port(){ local a=$1; for _ in $(seq 1 100); do (echo >/dev/tcp/${a%%:*}/${a##*:}) 2>/dev/null && return 0; sleep 0.05; done; return 1; }
 
 # ---- central services ----
-$Y data-server --listen $DATA --root .msrv/central/data > .msrv/data.log 2>&1 &
+$Y data-server --listen $DATA --data-dir .msrv/central/data > .msrv/data.log 2>&1 &
 DP=$!
-$Y meta-server --db-path .msrv/central --listen $META > .msrv/meta.log 2>&1 &
+$Y meta-server --meta-dir .msrv/central --listen $META > .msrv/meta.log 2>&1 &
 MP=$!
 wait_port $DATA || true
 if wait_port $META; then MP_OK=1; else MP_OK=0; fi
@@ -34,13 +34,13 @@ if wait_port $META; then MP_OK=1; else MP_OK=0; fi
 # ---- three client mounts, each with its own --home (no local authority) ----
 # Views are created EXPLICITLY: `M_OPEN` refuses a name with no tree or
 # definition, so mounting a fresh name would fail (nothing is materialized).
-$Y view --db-path .msrv/central create --view alice > .msrv/create.log 2>&1
-$Y view --db-path .msrv/central create --view bob  >> .msrv/create.log 2>&1
-$Y --home .msrv/m1 mount --view alice --mountpoint .msrv/mnt_a --meta $META --data $DATA --foreground > .msrv/a.log 2>&1 &
+$Y view --meta-dir .msrv/central create --view alice > .msrv/create.log 2>&1
+$Y view --meta-dir .msrv/central create --view bob  >> .msrv/create.log 2>&1
+$Y --home .msrv/m1 mount --view alice --mountpoint .msrv/mnt_a --meta-server $META --data-servers $DATA --foreground > .msrv/a.log 2>&1 &
 AP=$!
-$Y --home .msrv/m2 mount --view alice --mountpoint .msrv/mnt_b --meta $META --data $DATA --foreground > .msrv/b.log 2>&1 &
+$Y --home .msrv/m2 mount --view alice --mountpoint .msrv/mnt_b --meta-server $META --data-servers $DATA --foreground > .msrv/b.log 2>&1 &
 BP=$!
-$Y --home .msrv/m3 mount --view bob   --mountpoint .msrv/mnt_bob --meta $META --data $DATA --foreground > .msrv/bob.log 2>&1 &
+$Y --home .msrv/m3 mount --view bob   --mountpoint .msrv/mnt_bob --meta-server $META --data-servers $DATA --foreground > .msrv/bob.log 2>&1 &
 OP=$!
 sleep 1.5
 
@@ -62,7 +62,7 @@ echo "===== 1) server started cleanly ====="
 # views are created explicitly above, so the central db exists BEFORE any mount
 test -f .msrv/central/meta/alice.db && ok "central holds alice's authoritative view db" || bad "central alice.db missing"
 
-echo "===== 2) clients keep NO local copy of the view (proves --meta is central) ====="
+echo "===== 2) clients keep NO local copy of the view (proves --meta-server is central) ====="
 [ ! -f .msrv/m1/meta/alice.db ] && ok "client m1 has no local view db" || bad "client m1 wrongly created a local copy"
 [ ! -f .msrv/m2/meta/alice.db ] && ok "client m2 has no local view db" || bad "client m2 wrongly created a local copy"
 
@@ -101,13 +101,13 @@ blk=$(find .msrv/central/data/blocks -type f 2>/dev/null | wc -l)   # fan-out bu
 [ "$blk" -ge 1 ] && ok "objects stored on central data-server ($blk)" || bad "no objects in central blocks"
 [ ! -d .msrv/m1/blocks ] && ok "client m1 has no local blocks dir" || bad "client m1 unexpectedly holds blocks"
 
-echo "===== 8) --strict coherence: peer overwrite visible on an already-read file ====="
+echo "===== 8) --no-cache coherence: peer overwrite visible on an already-read file ====="
 # This is exactly the case the default (cached) mounts get wrong (see step 4
 # note): a file the peer already looked up once is not re-read until the TTL.
-# Two MORE clients of the same user, mounted --strict, bypass that cache.
-$Y --home .msrv/m4 mount --view alice --mountpoint .msrv/mnt_s1 --meta $META --data $DATA --strict --foreground > .msrv/s1.log 2>&1 &
+# Two MORE clients of the same user, mounted --no-cache, bypass that cache.
+$Y --home .msrv/m4 mount --view alice --mountpoint .msrv/mnt_s1 --meta-server $META --data-servers $DATA --no-cache --foreground > .msrv/s1.log 2>&1 &
 SP1=$!
-$Y --home .msrv/m5 mount --view alice --mountpoint .msrv/mnt_s2 --meta $META --data $DATA --strict --foreground > .msrv/s2.log 2>&1 &
+$Y --home .msrv/m5 mount --view alice --mountpoint .msrv/mnt_s2 --meta-server $META --data-servers $DATA --no-cache --foreground > .msrv/s2.log 2>&1 &
 SP2=$!
 sleep 1.5
 S1=.msrv/mnt_s1; S2=.msrv/mnt_s2
@@ -119,14 +119,14 @@ chk "$(T cat $S2/doc.txt)" "v2-overwritten" "strict: S1 overwrite immediately vi
 
 echo "===== 9) real-time invalidation push: NON-strict cached mounts converge ====="
 # The default cached mounts A,B used to serve a stale read of an already-opened
-# file after a peer overwrote it (the very reason --strict existed). The
+# file after a peer overwrote it (the very reason --no-cache existed). The
 # meta-server now pushes inval_inode/inval_entry the instant a peer mutates, so
-# the CACHED mounts converge on their own -- no --strict, no waiting a full TTL.
+# the CACHED mounts converge on their own -- no --no-cache, no waiting a full TTL.
 T sh -c "printf 'one' > $A/live.txt"; sleep 0.3
 chk "$(T cat $B/live.txt)" "one" "B reads A's new file (cached mount)"
 T cat $B/live.txt >/dev/null                 # B now caches inode live.txt
 T sh -c "printf 'two-overwritten' > $A/live.txt"; sleep 0.5   # A overwrite -> push
-chk "$(T cat $B/live.txt)" "two-overwritten" "B sees A's overwrite on a cached file WITHOUT --strict (inval_inode push)"
+chk "$(T cat $B/live.txt)" "two-overwritten" "B sees A's overwrite on a cached file WITHOUT --no-cache (inval_inode push)"
 # structural push: a new file A creates appears in B's listing with no TTL wait
 T sh -c "printf x > $A/pushed.txt"; sleep 0.5
 if T ls "$B" | grep -qx pushed.txt; then ok "B lists A's newly created file immediately (inval_entry push)"; else bad "pushed.txt missing from B"; fi

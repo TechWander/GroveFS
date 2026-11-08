@@ -27,17 +27,17 @@ rm -rf .dfresh; mkdir -p .dfresh/central .dfresh/mA .dfresh/mB .dfresh/mntA .dfr
 wait_port(){ local a=$1; for _ in $(seq 1 100); do (echo >/dev/tcp/${a%%:*}/${a##*:}) 2>/dev/null && return 0; sleep 0.05; done; return 1; }
 
 # ---- central services ----
-$Y data-server --listen $DATA --root .dfresh/central/data > .dfresh/data.log 2>&1 &
+$Y data-server --listen $DATA --data-dir .dfresh/central/data > .dfresh/data.log 2>&1 &
 DP=$!
-$Y meta-server --db-path .dfresh/central --listen $META > .dfresh/meta.log 2>&1 &
+$Y meta-server --meta-dir .dfresh/central --listen $META > .dfresh/meta.log 2>&1 &
 MP=$!
 wait_port $DATA && wait_port $META || { echo "servers failed to start"; exit 1; }
 
 # ---- seed the base view 'alice' with /data/raw as a real dir ----
 # Strict view gate is the default: create the base view explicitly first (the
 # derived definition below also requires its base tree to exist).
-$Y view --db-path .dfresh/central create --view alice > .dfresh/create.log 2>&1
-$Y --home .dfresh/mA mount --view alice --mountpoint .dfresh/mntA --meta $META --data $DATA --foreground > .dfresh/a.log 2>&1 &
+$Y view --meta-dir .dfresh/central create --view alice > .dfresh/create.log 2>&1
+$Y --home .dfresh/mA mount --view alice --mountpoint .dfresh/mntA --meta-server $META --data-servers $DATA --foreground > .dfresh/a.log 2>&1 &
 AP=$!
 sleep 1
 mkdir -p .dfresh/mntA/data/raw
@@ -54,7 +54,7 @@ EOF
 sleep 0.5
 
 # ---- B mounts the derived view 'dview' ----
-$Y --home .dfresh/mB mount --view dview --mountpoint .dfresh/mntB --meta $META --data $DATA --foreground > .dfresh/b.log 2>&1 &
+$Y --home .dfresh/mB mount --view dview --mountpoint .dfresh/mntB --meta-server $META --data-servers $DATA --foreground > .dfresh/b.log 2>&1 &
 BP=$!
 sleep 2
 

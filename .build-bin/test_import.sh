@@ -45,7 +45,7 @@ grep -q "3 object(s) (3 hardlinked zero-copy, 0 copied)" .itest/imp.log \
 hl=$(find .itest/home/blocks -type f -links 2 2>/dev/null | wc -l | tr -d ' ')
 chk "$hl" "3" "3 blocks objects share their source inodes"
 
-$Y mount --view legacy -m .itest/mnt --strict --foreground > .itest/mnt.log 2>&1 &
+$Y mount --view legacy -m .itest/mnt --no-cache --foreground > .itest/mnt.log 2>&1 &
 MP=$!
 sleep 1.5
 cleanup(){ fusermount -u .itest/mnt .itest/mnt_r .itest/mnt_v 2>/dev/null; kill $MP $MSP $DSP $RP $VP 2>/dev/null; }
@@ -91,9 +91,9 @@ T ls $M/legacy/docs | grep -q fresh.txt && ok "incremental pick-up visible on th
 echo "===== 6) server topology: import + meta-server + derived view over imported bytes ====="
 META=127.0.0.1:15230; DATA=127.0.0.1:15231
 wait_port(){ local a=$1; for _ in $(seq 1 100); do (echo >/dev/tcp/${a%%:*}/${a##*:}) 2>/dev/null && return 0; sleep 0.05; done; return 1; }
-$Y meta-server --db-path .itest/home --listen $META > .itest/meta_srv.log 2>&1 &
+$Y meta-server --meta-dir .itest/home --listen $META > .itest/meta_srv.log 2>&1 &
 MSP=$!
-$Y data-server --listen $DATA --root .itest/home > .itest/data_srv.log 2>&1 &
+$Y data-server --listen $DATA --data-dir .itest/home > .itest/data_srv.log 2>&1 &
 DSP=$!
 wait_port $META && wait_port $DATA || bad "import-suite servers failed to start"
 
@@ -102,13 +102,13 @@ cat > .itest/album.layout <<'EOF'
 # one logical album dir, physically living under /legacy/photos
 map /legacy/photos /album
 EOF
-$Y view --db-path .itest/home define --name albumview --base legacy --rules .itest/album.layout > .itest/def.log 2>&1 \
+$Y view --meta-dir .itest/home define --name albumview --base legacy --rules .itest/album.layout > .itest/def.log 2>&1 \
   && ok "define derived view over the imported base" || bad "define failed: $(cat .itest/def.log)"
 
 mkdir -p .itest/mnt_r .itest/mnt_v
-$Y mount --view legacy   -m .itest/mnt_r --meta $META --data $DATA --foreground > .itest/r.log 2>&1 &
+$Y mount --view legacy   -m .itest/mnt_r --meta-server $META --data-servers $DATA --foreground > .itest/r.log 2>&1 &
 RP=$!
-$Y mount --view albumview -m .itest/mnt_v --meta $META --data $DATA --foreground > .itest/v.log 2>&1 &
+$Y mount --view albumview -m .itest/mnt_v --meta-server $META --data-servers $DATA --foreground > .itest/v.log 2>&1 &
 VP=$!
 sleep 2
 R=.itest/mnt_r; V=.itest/mnt_v

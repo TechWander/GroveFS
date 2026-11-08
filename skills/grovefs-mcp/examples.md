@@ -21,7 +21,7 @@ never guessed from the source directory layout.**
 ## 1. One read-only lens: look → write rules → publish → verify
 
 ```bash
-python3 scripts/mcp_call.py --db-path <D>/store call list_view_tree '{"view":"team"}'
+python3 scripts/mcp_call.py --meta-dir <D>/store call list_view_tree '{"view":"team"}'
 ```
 ```
 [stderr] [handshake] grovefs 0.1.0, protocol 2025-06-18
@@ -53,7 +53,7 @@ explicitly; mount and `stat` for real sizes, and never use this field for usage
 or checksums.
 
 ```bash
-python3 scripts/mcp_call.py --db-path <D>/store --quiet \
+python3 scripts/mcp_call.py --meta-dir <D>/store --quiet \
   call define_derived_view '{"name":"release","base":"team","rules":"hide /seeds/photos/private"}'
 ```
 ```
@@ -62,7 +62,7 @@ note: mounts of 'release' are read-only (virtual shape) — write to base view '
 ```
 
 ```bash
-python3 scripts/mcp_call.py --db-path <D>/store --quiet call list_view_tree '{"view":"release"}'
+python3 scripts/mcp_call.py --meta-dir <D>/store --quiet call list_view_tree '{"view":"release"}'
 ```
 ```
 {
@@ -119,7 +119,7 @@ printf '%s\n%s\n%s\n' \
  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}' \
  '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_views","arguments":{}}}' \
- | grovefs mcp --db-path <D>/store
+ | grovefs mcp --meta-dir <D>/store
 ```
 
 Only two frames come back — `notifications/initialized` **gets no reply**, by
@@ -219,7 +219,7 @@ the public name never has a gap):
 ## 6. The gate (`--require-api-key`) and the audit
 
 ```bash
-python3 scripts/mcp_call.py --db-path <D>/store --server-arg --require-api-key list
+python3 scripts/mcp_call.py --meta-dir <D>/store --server-arg --require-api-key list
 ```
 ```
 [stderr] JSON-RPC error -32001: authentication required: present a valid apiKey in the initialize params (or export GROVEFS_MCP_API_KEY for the server)
@@ -230,9 +230,9 @@ Presenting a credential works (mint the key via the CLI; the plaintext appears
 once):
 
 ```bash
-grovefs apikey --db-path <D>/store create --label agent --for mcp     # → "<id>:<secret>"
-python3 scripts/mcp_call.py --db-path <D>/store --server-arg --require-api-key --api-key '<id>:<secret>' list   # normal 10-tool answer
-grovefs apikey --db-path <D>/store calls                              # the refused tools/list is in the audit too
+grovefs apikey --meta-dir <D>/store create --label agent --for mcp     # → "<id>:<secret>"
+python3 scripts/mcp_call.py --meta-dir <D>/store --server-arg --require-api-key --api-key '<id>:<secret>' list   # normal 10-tool answer
+grovefs apikey --meta-dir <D>/store calls                              # the refused tools/list is in the audit too
 ```
 
 ## 7. Wiring self-test

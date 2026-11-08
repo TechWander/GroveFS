@@ -2762,7 +2762,7 @@ impl MetaProvider for MetaEngine {
 /// branch on the store.
 ///
 /// GroveFS-native HA (`VACUUM INTO` snapshot shipping) is SQLite-only; under the
-/// PG variant `backup_to_bytes` reports unsupported and a `--store postgres://…`
+/// PG variant `backup_to_bytes` reports unsupported and a `--meta-store postgres://…`
 /// meta-server rejects the `--role/--peer/--witness` flags at CLI time.
 ///
 /// Every server-side holder keeps this in an `Arc<MetaStore>` and picks the

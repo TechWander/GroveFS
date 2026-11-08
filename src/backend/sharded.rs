@@ -109,7 +109,7 @@ impl ShardedBackend {
     /// `i % n` mapping in [`Self::chunk`] would silently route logical chunks to
     /// the wrong member — reading or overwriting a different object. Fail loudly
     /// at every dispatch entry instead of corrupting data on a misconfigured
-    /// shrink/grow of the `--data` list.
+    /// shrink/grow of the `--data-servers` list.
     fn check_layout(&self, l: &Layout) -> io::Result<()> {
         if l.n != self.servers.len() {
             return Err(io::Error::other(format!(
@@ -163,7 +163,7 @@ impl ShardedBackend {
     /// Every non-empty striped object has `{base}#0`, and the contiguity
     /// invariant puts it on member 0 — so if a DIFFERENT member holds it, the
     /// bytes are real and only the list order disagrees with the writer's.
-    /// Answering `0` there is the worst possible output: a reversed `--data`
+    /// Answering `0` there is the worst possible output: a reversed `--data-servers`
     /// list reported every file in the tree as empty, in the mount and in `du`
     /// alike, with nothing on stderr. Detection costs one probe per member and
     /// only runs on the chunk-0-absent branch: empty files and misordered
@@ -180,7 +180,7 @@ impl ShardedBackend {
             match self.probe(i, &ck) {
                 Probe::Present(_) => {
                     return Err(io::Error::other(format!(
-                        "object {} keeps chunk #0 on data-server #{i}, but this --data list \
+                        "object {} keeps chunk #0 on data-server #{i}, but this --data-servers list \
                          orders it at #0: the servers are right and their order is not, so \
                          sizes and reads would be attributed to the wrong member",
                         l.base
@@ -800,7 +800,7 @@ mod tests {
         }
     }
 
-    /// A reversed `--data` list used to answer `0` for every striped file, the
+    /// A reversed `--data-servers` list used to answer `0` for every striped file, the
     /// "whole tree looks empty" failure: the bytes are real and only the list
     /// order disagrees, which has to come back as an error, not a size.
     #[test]

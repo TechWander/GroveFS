@@ -1,11 +1,11 @@
 //! Shared plumbing for the PostgreSQL CONTROL plane — the home of API keys,
 //! the call-audit log and view definitions when the metadata backend is
-//! PostgreSQL (`--store postgres://…`).
+//! PostgreSQL (`--meta-store postgres://…`).
 //!
 //! Why this exists: view TREES already lived in PG (one `grovefs_v_<hex>`
 //! schema per view, see [`crate::pg_store`]), but the control-plane state was
-//! deliberately file/SQLite-local (`<db-path>/meta/api_keys.db`,
-//! `<db-path>/meta/views/*.layout`). A PG deployment then had TWO systems of
+//! deliberately file/SQLite-local (`<meta-dir>/meta/api_keys.db`,
+//! `<meta-dir>/meta/views/*.layout`). A PG deployment then had TWO systems of
 //! record: governance reads and writes had to hit the meta-server's local disk
 //! as well as Postgres, and a second meta-server (or a HA standby) never saw
 //! either file. Under PG everything now lives in one `grovefs_control` schema,

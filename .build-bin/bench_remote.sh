@@ -24,10 +24,10 @@ SIZE_MB=${SIZE_MB:-512}
 
 rm -rf .br; mkdir -p .br/home .br/srv .br/mnt
 export GROVEFS_HOME=$PWD/.br/home
-$Y data-server --listen $ADDR --root $PWD/.br/srv > .br/srv.log 2>&1 &
+$Y data-server --listen $ADDR --data-dir $PWD/.br/srv > .br/srv.log 2>&1 &
 SP=$!
 $Y init --view perf >/dev/null
-$Y mount --view perf --mountpoint .br/mnt --data $ADDR --foreground > .br/mnt.log 2>&1 &
+$Y mount --view perf --mountpoint .br/mnt --data-servers $ADDR --foreground > .br/mnt.log 2>&1 &
 MP=$!
 sleep 1.0
 cleanup(){ fusermount -u .br/mnt 2>/dev/null; kill $MP $SP 2>/dev/null; }

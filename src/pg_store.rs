@@ -40,7 +40,7 @@
 //! shipping, built on SQLite `VACUUM INTO`) is NOT offered on the PG path —
 //! Postgres replicates itself (streaming replication / PITR), which is strictly
 //! better than the file-snapshot mechanism. So [`PgEngine::backup_to_bytes`]
-//! reports unsupported and a `meta-server --store postgres://...` refuses the HA
+//! reports unsupported and a `meta-server --meta-store postgres://...` refuses the HA
 //! flags. Everything else is a drop-in.
 
 use crate::meta::{LockConflict, LockType, MetaError, MetaProvider, NodeInfo, NodeKind};
@@ -133,7 +133,7 @@ fn parse_node(r: &postgres::Row) -> RawNode {
 /// own SSI (Ports & O'Neil, OSDI'12) instead of a bespoke FoundationDB stack.
 ///
 /// The SQLite [`crate::meta::MetaEngine`] keeps its single-writer mutex
-/// unchanged: a `meta-server` running without `--store` still serialises all
+/// unchanged: a `meta-server` running without `--meta-store` still serialises all
 /// writes for its one view's `.db`, so this change is strictly opt-in and
 /// never regress the embedded path.
 pub struct PgEngine {
@@ -1223,7 +1223,7 @@ impl PgEngine {
     /// GroveFS-native HA snapshot is not offered on PG — Postgres replicates
     /// via its own mechanisms (streaming replication / PITR), and a `VACUUM
     /// INTO`-equivalent (a whole-database dump per view) is not worth
-    /// duplicating here. `meta-server --store postgres://...` therefore rejects
+    /// duplicating here. `meta-server --meta-store postgres://...` therefore rejects
     /// `--role/--peer/--witness` at CLI parse time and never reaches this
     /// method; the impl is only present to satisfy the MetaStore enum's
     /// uniform interface.

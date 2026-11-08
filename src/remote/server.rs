@@ -233,7 +233,7 @@ impl Fence {
 
 pub struct DataServer {
     listen: String,
-    /// Display-only copy of the `--root` list, echoed at startup so an operator
+    /// Display-only copy of the `--data-dir` list, echoed at startup so an operator
     /// reading one node's log can tell WHICH disks this node serves and on
     /// WHICH host they live — root paths repeat across machines (the same
     /// `/data/gfs1/grove` name exists on several nodes), so a bare listen line
@@ -305,7 +305,7 @@ impl DataServer {
         self
     }
 
-    /// Record the `--root` list for the startup banner (display only; the
+    /// Record the `--data-dir` list for the startup banner (display only; the
     /// backend already owns the real roots).
     pub fn with_roots(mut self, roots: &[PathBuf]) -> Self {
         self.roots = roots.to_vec();

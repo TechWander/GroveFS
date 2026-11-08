@@ -25,15 +25,15 @@ rm -rf .striping; mkdir -p .striping/home .striping/sA .striping/sB .striping/mn
 export GROVEFS_HOME=$PWD/.striping/home    # view DBs (data_ref) live client-side
 
 echo "=== start two data-servers (distinct roots) ==="
-$Y data-server --listen $A --root $PWD/.striping/sA > .striping/sA.log 2>&1 &
+$Y data-server --listen $A --data-dir $PWD/.striping/sA > .striping/sA.log 2>&1 &
 PA=$!
-$Y data-server --listen $B --root $PWD/.striping/sB > .striping/sB.log 2>&1 &
+$Y data-server --listen $B --data-dir $PWD/.striping/sB > .striping/sB.log 2>&1 &
 PB=$!
 sleep 0.8
 
 echo "=== init alice view + mount across BOTH servers ==="
 $Y init --view alice > /dev/null
-$Y mount --view alice --mountpoint .striping/mnt --data "$A,$B" --foreground > .striping/mnt.log 2>&1 &
+$Y mount --view alice --mountpoint .striping/mnt --data-servers "$A,$B" --foreground > .striping/mnt.log 2>&1 &
 PM=$!
 sleep 1.2
 
@@ -111,11 +111,11 @@ done
 if [ "$afterB" -lt "$beforeB" ]; then ok "rm freed server B chunk ($beforeB -> $afterB)"; else bad "server B not GC'd ($beforeB -> $afterB)"; fi
 if [ "$afterA" -lt "$beforeA" ]; then ok "rm freed server A chunk ($beforeA -> $afterA)"; else bad "server A not GC'd ($beforeA -> $afterA)"; fi
 
-echo "===== 7) backward compat: single --data mount uses bare-uuid keys ====="
+echo "===== 7) backward compat: single --data-servers mount uses bare-uuid keys ====="
 # a single address must NOT emit the s-prefix layout (old objects keep working).
 # use a distinct user so its local view DB never contends with the sharded mount.
 $Y init --view bob > /dev/null
-$Y mount --view bob --mountpoint .striping/mnt_legacy --data $A --foreground > .striping/mnt_legacy.log 2>&1 &
+$Y mount --view bob --mountpoint .striping/mnt_legacy --data-servers $A --foreground > .striping/mnt_legacy.log 2>&1 &
 PL=$!
 sleep 1.2
 T sh -c "printf 'legacy-single' > .striping/mnt_legacy/leg.txt"
@@ -131,19 +131,19 @@ echo "===== 8) du across a striped store ====="
 sync "$M" 2>/dev/null
 exp=$(T sh -c "find $M -type f -printf '%s\\n'" | T awk '{s+=$1} END{print s+0}')
 T fusermount -u .striping/mnt_legacy 2>/dev/null
-got=$($Y du --view alice --data "$A,$B" -b --total 2>/dev/null | awk '$2=="/"{print $1}')
-chk "$got" "$exp" "du --data a,b totals every striped object ($exp bytes)"
-if $Y du --view alice --data $A -b --total >.striping/du_one.log 2>&1; then
+got=$($Y du --view alice --data-servers "$A,$B" -b --total 2>/dev/null | awk '$2=="/"{print $1}')
+chk "$got" "$exp" "du --data-servers a,b totals every striped object ($exp bytes)"
+if $Y du --view alice --data-servers $A -b --total >.striping/du_one.log 2>&1; then
   bad "single-address du returned success instead of refusing"
 else
-  if grep -q 'written across 2 data-servers but --data names 1' .striping/du_one.log && grep -q 'host1:port,host2:port' .striping/du_one.log; then
+  if grep -q 'written across 2 data-servers but --data-servers names 1' .striping/du_one.log && grep -q 'host1:port,host2:port' .striping/du_one.log; then
     ok "single-address du refuses and names the list to pass"
   else
     bad "single-address du refused without guidance: $(tail -2 .striping/du_one.log)"
   fi
 fi
 # a pre-striping (bare uuid) tree is still measurable from the one server it lives on
-got_bob=$($Y du --view bob --data $A -b --total 2>/dev/null | awk '$2=="/"{print $1}')
+got_bob=$($Y du --view bob --data-servers $A -b --total 2>/dev/null | awk '$2=="/"{print $1}')
 chk "$got_bob" "$(T printf 'legacy-single' | wc -c)" "single-address du reads a bare-uuid store"
 
 echo

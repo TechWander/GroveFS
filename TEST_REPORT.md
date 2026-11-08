@@ -5,17 +5,17 @@
 - 报告只陈述当前版本的行为，不写演变史。
 - 所有回显均为脚本原样输出，未做任何润色；失败与未实现的条目同样原样贴出。
 - 证据文件位置：仓库侧 `/tmp/repo_*.log`，集群侧 `/tmp/vm_evidence/*.log`；驱动脚本在 `.build-bin/`（`vm_evidence_run.sh` 串行跑 `vm_audit.sh` + `vm_battery_{1..4}.sh`，各探针为 `vm_probe_*.sh`）。
-- 三机拓扑与运行参数（`/etc/grovefs/cluster.env`，0600 `root:root`，内含 `GROVEFS_TOKEN`/`GROVEFS_DB_PATH`/`GROVEFS_META`/`GROVEFS_DATA`，本报告不抄 token 值）：
+- 三机拓扑与运行参数（`/etc/grovefs/cluster.env`，0600 `root:root`，内含 `GROVEFS_TOKEN`/`GROVEFS_META_DIR`/`GROVEFS_META_SERVER`/`GROVEFS_DATA_SERVERS`，本报告不抄 token 值）：
 
   | 主机 | 地址 | 角色 |
   |---|---|---|
-  | gfs1 | 192.168.122.124 | `data-server --root /data/gfs1/grove,/data/gfs2/grove --listen 0.0.0.0:50100` |
+  | gfs1 | 192.168.122.124 | `data-server --data-dir /data/gfs1/grove,/data/gfs2/grove --listen 0.0.0.0:50100` |
   | gfs2 | 192.168.122.193 | 同上 |
   | gfs-client | 192.168.122.137 | `meta-server --listen 0.0.0.0:50053` + `mount --view alice -m /home/hanjun/mnt --foreground` |
 
 - 被验收的二进制：`target/release/grovefs`，md5 `2fa8ff6498a3b0390c796c79cad8eaab`。
 - 本文档是测试报告，不是产品文档；§4.4 的 `doccheck.sh` 只检 `README.md`/`USAGE.md`/`docs.html` 三份（脚本内 `DOCS` 列表），本报告不在其口径范围内。
-- 下文命令中出现的变量取值：`$HOME=/home/hanjun`（gfs-client 上的执行身份 `hanjun`，uid=1000）、`$M=/home/hanjun/mnt`、`$GV="grovefs view --db-path $HOME/meta"`、`$S=$HOME/gftstore`。
+- 下文命令中出现的变量取值：`$HOME=/home/hanjun`（gfs-client 上的执行身份 `hanjun`，uid=1000）、`$M=/home/hanjun/mnt`、`$GV="grovefs view --meta-dir $HOME/meta"`、`$S=$HOME/gftstore`。
 
 ---
 
@@ -91,8 +91,8 @@
 
   ```
   ======== [gfs-client] ========
-     pid=21541 argv=[/usr/local/bin/grovefs meta-server --db-path /tmp/gft_ha/B --listen 12] exe_md5=66c4aabce299ecf9f2c4950cade9a4ad
-     pid=21694 argv=[/usr/local/bin/grovefs meta-server --db-path /tmp/gft_ha/A --listen 12] exe_md5=66c4aabce299ecf9f2c4950cade9a4ad
+     pid=21541 argv=[/usr/local/bin/grovefs meta-server --meta-dir /tmp/gft_ha/B --listen 12] exe_md5=66c4aabce299ecf9f2c4950cade9a4ad
+     pid=21694 argv=[/usr/local/bin/grovefs meta-server --meta-dir /tmp/gft_ha/A --listen 12] exe_md5=66c4aabce299ecf9f2c4950cade9a4ad
      pid=23311 argv=[/usr/local/bin/grovefs meta-server --listen 0.0.0.0:50053 ] exe_md5=2fa8ff6498a3b0390c796c79cad8eaab
      pid=23316 argv=[/usr/local/bin/grovefs mount --view alice -m /home/hanjun/mnt --foregr] exe_md5=2fa8ff6498a3b0390c796c79cad8eaab
     构建产物 md5: 2fa8ff6498a3b0390c796c79cad8eaab
@@ -142,14 +142,14 @@
   -- 单元清单: grovefs-data-server.service enabled enabled 
   -- is-enabled / is-active: enabled / active
   -- ExecStart: ExecStartPre=/bin/mkdir -p /data/gfs1/grove /data/gfs2/grove
-  ExecStart=/usr/local/bin/grovefs data-server --root /data/gfs1/grove,/data/gfs2/grove --listen 0.0.0.0:50100
+  ExecStart=/usr/local/bin/grovefs data-server --data-dir /data/gfs1/grove,/data/gfs2/grove --listen 0.0.0.0:50100
   -- Restart/LimitNOFILE: LimitNOFILE=65536 Restart=on-failure RestartSec=3 
   -- 单元文本里是否出现 token: 0 处
   -- EnvironmentFile: EnvironmentFile=/etc/grovefs/cluster.env
   -- env 文件权限: 600 root:root /etc/grovefs/cluster.env
   -- 密钥是否出现在 ps/argv: 0
   -- grovefs 进程(全路径 argv): 
-  /usr/local/bin/grovefs data-server --root /data/gfs1/grove,/data/gfs2/grove --listen 0.0.0.0:50100  [cgroup: /system.slice/grovefs-data-server.service]
+  /usr/local/bin/grovefs data-server --data-dir /data/gfs1/grove,/data/gfs2/grove --listen 0.0.0.0:50100  [cgroup: /system.slice/grovefs-data-server.service]
   -- 监听: 0.0.0.0:50100
   -- 数据根: /data/gfs1/grove /data/gfs2/grove 
   -- 二进制 md5: 2fa8ff6498a3b0390c796c79cad8eaab
@@ -172,7 +172,7 @@
      /etc/systemd/system/grovefs-meta-server.service
      /etc/systemd/system/grovefs-mount-alice.service
   -- 是否有 disabled 的并行单元: [空=无]
-  -- env 文件: 600 root:root /etc/grovefs/cluster.env ; 变量名(只取名字, 不取值): GROVEFS_TOKEN GROVEFS_DB_PATH GROVEFS_META GROVEFS_DATA 
+  -- env 文件: 600 root:root /etc/grovefs/cluster.env ; 变量名(只取名字, 不取值): GROVEFS_TOKEN GROVEFS_META_DIR GROVEFS_META_SERVER GROVEFS_DATA_SERVERS 
   -- GROVEFS_TOKEN 值在 ps/argv 中出现次数: 0 (0 = 不进 argv)
   -- GROVEFS_TOKEN 值在单元文本中出现次数: 0
   -- 进程与归属: 
@@ -234,7 +234,7 @@
   本轮 §6-8 在条带 meta 存储上的 `gc` 只读审计回显（正是“objects=0 但字节都在远端”的形态）：
 
   ```
-  $ sudo grovefs gc --db-path /home/hanjun/meta      # 运行 c8d68580 的 gfs-client
+  $ sudo grovefs gc --meta-dir /home/hanjun/meta      # 运行 c8d68580 的 gfs-client
     views: 1 tree(s), 7 referenced key(s), 7 striped layout(s)
     objects: 0 local block(s) — 7 striped layout(s) place their chunks on data-servers, which gc does not audit (use `grovefs du` for their bytes)
   dry run: nothing deleted. No unreferenced objects were found.
@@ -415,7 +415,7 @@
   ===== B1 基视图: view list 与物理树 =====
     no view definitions in the control plane store /home/hanjun/meta (local files) (every view name maps to its own tree)
     base view 'alice' -> own tree meta/alice.db (read-write; deletes free a shared object only when no view holds it)
-    view keys: `grovefs apikey --db-path /home/hanjun/meta list [--view NAME]` (add --view to see only that view's keys)
+    view keys: `grovefs apikey --meta-dir /home/hanjun/meta list [--view NAME]` (add --view to see only that view's keys)
     meta/ 目录: alice.db alice.db-shm alice.db-wal api_keys.db refs.db refs.db-shm refs.db-wal views 
     views/ 目录: 
   ```
@@ -527,11 +527,11 @@
   经 meta-server 挂载一个未知视图名（无任何树/定义）的报错原文（§6-5 修复后用实路径、§5-12 后走 Display；`--view no-such-tree-xyz`，回显取自运行 `d2a3b262` 的集群）：
 
   ```
-  -- 经 meta-server 挂载未知视图名(--meta 模式):
-    rc=1 报错原文: error: view 'no-such-tree-xyz' does not exist on this meta-server (sqlite): no tree and no definition — views are created explicitly, so unknown names are refused instead of becoming an empty tree; create it first: `grovefs view --db-path /home/hanjun/meta create --view no-such-tree-xyz` (or `grovefs --home /home/hanjun/meta init --view no-such-tree-xyz`, or seed it with `grovefs view import`)
+  -- 经 meta-server 挂载未知视图名(--meta-server 模式):
+    rc=1 报错原文: error: view 'no-such-tree-xyz' does not exist on this meta-server (sqlite): no tree and no definition — views are created explicitly, so unknown names are refused instead of becoming an empty tree; create it first: `grovefs view --meta-dir /home/hanjun/meta create --view no-such-tree-xyz` (or `grovefs --home /home/hanjun/meta init --view no-such-tree-xyz`, or seed it with `grovefs view import`)
   ```
 
-- **结论**：通过。`--retire` 无空档轮换、老别名失效、真实名被拒、撤别名后恢复可挂，全部对上；链式别名与「一视图一别名」的拒绝文案与文档一致（先前那行「链式别名拒绝: defined pure alias 'pub-c' ...」是**用例顺序造成的假象**——彼时 `pub-a` 已被 retire，不再是别名，故不构成链；已在报告中以 X1 探针的正确用例替换结论）。先前记录的两处问题**本轮均已修复**：`alias` 不再接受指向不存在的真实视图（§5-10 已在定义时硬拒），提示里的 `<db-path>`/`<name>` 已换成实路径（§6-5）。
+- **结论**：通过。`--retire` 无空档轮换、老别名失效、真实名被拒、撤别名后恢复可挂，全部对上；链式别名与「一视图一别名」的拒绝文案与文档一致（先前那行「链式别名拒绝: defined pure alias 'pub-c' ...」是**用例顺序造成的假象**——彼时 `pub-a` 已被 retire，不再是别名，故不构成链；已在报告中以 X1 探针的正确用例替换结论）。先前记录的两处问题**本轮均已修复**：`alias` 不再接受指向不存在的真实视图（§5-10 已在定义时硬拒），提示里的 `<meta-dir>`/`<name>` 已换成实路径（§6-5）。
 
 #### 3.4.4 fork（结构可写/内容只读）与 `--empty`
 
@@ -643,7 +643,7 @@
   ```
 
 - **结构写与新文件语义回归**（修复后，`/tmp/repro_f63b.out`）：新建文件+写在首次 write 即拒且新文件保持 0 字节（`B) ... rc=1`、`new.txt size after: 0`）；`touch rc=0 OK`、`mkdir rc=0 OK`；读正常；base（可写）视图经自己的挂载追加落盘 `rc=0`——可写挂载的 writeback 未受影响。
-- **固化**：`.build-bin/test_fork.sh` 新增 4b 段（默认非 `--strict` fork 挂载上 5 条断言：追加当场拒且字节未变、新文件写当场拒保持 0 字节、touch 仍放行），fork 套件 `SUMMARY: pass=75 fail=0`；`run_all.sh` 全板 GREEN（logs/20261107-140349，见 §4.3）。
+- **固化**：`.build-bin/test_fork.sh` 新增 4b 段（默认非 `--no-cache` fork 挂载上 5 条断言：追加当场拒且字节未变、新文件写当场拒保持 0 字节、touch 仍放行），fork 套件 `SUMMARY: pass=75 fail=0`；`run_all.sh` 全板 GREEN（logs/20261107-140349，见 §4.3）。
 
 #### 3.4.5 `view graft` 选择性接枝与拒绝原文
 
@@ -705,7 +705,7 @@
   同一命令的完整形式与实际使用的参数（`vm_battery_1.sh` B6）：
 
   ```bash
-  $GV rm --name pv --base --data-root /nonexistent
+  $GV rm --name pv --base --data-dir /nonexistent
   # Error: Os { code: 13, kind: PermissionDenied, message: "Permission denied" }
   ```
 
@@ -716,12 +716,12 @@
 - **命令**（`vm_battery_2.sh` C3，本地共置存储根 `$S=$HOME/gftstore`）：
 
   ```bash
-  grovefs import --db-path "$S" --view imp --source /tmp/gft_src --dry-run
-  grovefs import --db-path "$S" --view imp --source /tmp/gft_src
-  grovefs import --db-path "$S" --view imp --source /tmp/gft_src   # 重跑
+  grovefs import --meta-dir "$S" --view imp --source /tmp/gft_src --dry-run
+  grovefs import --meta-dir "$S" --view imp --source /tmp/gft_src
+  grovefs import --meta-dir "$S" --view imp --source /tmp/gft_src   # 重跑
   printf 'ccc\n' > /tmp/gft_src/docs/c.md
-  grovefs import --db-path "$S" --view imp --source /tmp/gft_src   # 新增后重跑
-  grovefs import --db-path "$S" --view imp2 --source /tmp/gft_src  # 两视图共享
+  grovefs import --meta-dir "$S" --view imp --source /tmp/gft_src   # 新增后重跑
+  grovefs import --meta-dir "$S" --view imp2 --source /tmp/gft_src  # 两视图共享
   ```
 
 - **回显**：
@@ -752,24 +752,24 @@
 
 ### 3.6 `du` 的两条路径、缺数据源拒绝与丢对象出声
 
-#### 3.6.1 本地路径（`--db-path` / `--home`）
+#### 3.6.1 本地路径（`--meta-dir` / `--home`）
 
 - **命令**：
 
   ```bash
-  grovefs du --db-path "$S" --view imp --total
+  grovefs du --meta-dir "$S" --view imp --total
   grovefs du --home "$S" --view imp --depth 1
-  grovefs du --db-path "$S" --view imp -b --total
-  grovefs du --db-path "$S" --view imp --path /gft_src/docs
-  grovefs du --db-path "$S" --view imp --path docs
-  grovefs du --db-path "$S" --view imp --path nosuchdir
+  grovefs du --meta-dir "$S" --view imp -b --total
+  grovefs du --meta-dir "$S" --view imp --path /gft_src/docs
+  grovefs du --meta-dir "$S" --view imp --path docs
+  grovefs du --meta-dir "$S" --view imp --path nosuchdir
   ```
 
 - **回显**：
 
   ```
-  ===== C4 du 本地路径(--db-path / --home, 自含数据根) =====
-    --db-path --total: 8.0M	/
+  ===== C4 du 本地路径(--meta-dir / --home, 自含数据根) =====
+    --meta-dir --total: 8.0M	/
     --home --depth 1: 8.0M	/
     --home --depth 1: 8.0M	/gft_src
     与源目录字节和核对: 期望=8388620 实测=8388620 (OK)
@@ -780,28 +780,28 @@
 
 - **结论**：通过。两个入口一致且与源字节和完全相符；`--path` 只接绝对视图路径（裸相对名被拒，文案可读）。
 
-#### 3.6.2 远程路径（`--meta` + `--data` 逗号列表）与拓扑错配的四个方向性拒绝
+#### 3.6.2 远程路径（`--meta-server` + `--data-servers` 逗号列表）与拓扑错配的四个方向性拒绝
 
 - **命令**：
 
   ```bash
-  sudo sh -c "set -a; . /etc/grovefs/cluster.env; set +a; grovefs du --view alice --meta 127.0.0.1:50053 --data gfs1:50100,gfs2:50100 --total"
-  sudo sh -c "... grovefs du --view alice --meta 127.0.0.1:50053 --data gfs1:50100 --total"                        # 列表过短(2写1测)
-  sudo sh -c "... grovefs du --view alice --meta 127.0.0.1:50053 --data gfs1:50100,gfs2:50100,gfs1:50100 --total"  # 列表过长(顺序保留)
-  sudo sh -c "... grovefs du --view alice --meta 127.0.0.1:50053 --data gfs2:50100,gfs1:50100 --total"             # 顺序倒置(两台都对但顺序反了)
+  sudo sh -c "set -a; . /etc/grovefs/cluster.env; set +a; grovefs du --view alice --meta-server 127.0.0.1:50053 --data-servers gfs1:50100,gfs2:50100 --total"
+  sudo sh -c "... grovefs du --view alice --meta-server 127.0.0.1:50053 --data-servers gfs1:50100 --total"                        # 列表过短(2写1测)
+  sudo sh -c "... grovefs du --view alice --meta-server 127.0.0.1:50053 --data-servers gfs1:50100,gfs2:50100,gfs1:50100 --total"  # 列表过长(顺序保留)
+  sudo sh -c "... grovefs du --view alice --meta-server 127.0.0.1:50053 --data-servers gfs2:50100,gfs1:50100 --total"             # 顺序倒置(两台都对但顺序反了)
   ```
 
 - **回显**（release `d2a3b262` 实机定点，四条均在运行 d2a3b262 的集群上取得；本轮致命错误改走 Display，故前缀由 `Error: "…"` 变为 `error: …`（不再带外层引号）；注意倒置例报的 object UUID 随实机重跑而变，为新鲜结果）：
 
   ```
-  === --data gfs1:50100,gfs2:50100 ===            # 正确列表
+  === --data-servers gfs1:50100,gfs2:50100 ===            # 正确列表
   64.0M	/
-  === --data gfs1:50100 ===                        # 过短: 方向性建议“补齐全部”
-  error: this tree was written across 2 data-servers but --data names 1: the stripe map needs every address in the writer's order, so pass the full list as one comma-separated value (e.g. --data host1:port,host2:port); no sizes are reported
-  === --data gfs1:50100,gfs2:50100,gfs1:50100 ===  # 过长: 方向相反, 建议“只留 2 个”
-  error: this tree was written across 2 data-servers but --data names 3: extra addresses move logical chunks onto servers that never held them, so pass exactly the 2 addresses in the order the writer used; no sizes are reported
-  === --data gfs2:50100,gfs1:50100 ===             # 顺序倒置: 不再静默 0B, 而是报错
-  error: 7 of 7 object(s) could not be confirmed against the data source (first failure: object 29f9d81c-8ff9-4fe0-afaa-1092e93623e4 keeps chunk #0 on data-server #1, but this --data list orders it at #0: the servers are right and their order is not, so sizes and reads would be attributed to the wrong member); their sizes are unknown, so no total is reported
+  === --data-servers gfs1:50100 ===                        # 过短: 方向性建议“补齐全部”
+  error: this tree was written across 2 data-servers but --data-servers names 1: the stripe map needs every address in the writer's order, so pass the full list as one comma-separated value (e.g. --data-servers host1:port,host2:port); no sizes are reported
+  === --data-servers gfs1:50100,gfs2:50100,gfs1:50100 ===  # 过长: 方向相反, 建议“只留 2 个”
+  error: this tree was written across 2 data-servers but --data-servers names 3: extra addresses move logical chunks onto servers that never held them, so pass exactly the 2 addresses in the order the writer used; no sizes are reported
+  === --data-servers gfs2:50100,gfs1:50100 ===             # 顺序倒置: 不再静默 0B, 而是报错
+  error: 7 of 7 object(s) could not be confirmed against the data source (first failure: object 29f9d81c-8ff9-4fe0-afaa-1092e93623e4 keeps chunk #0 on data-server #1, but this --data-servers list orders it at #0: the servers are right and their order is not, so sizes and reads would be attributed to the wrong member); their sizes are unknown, so no total is reported
   ```
 
 - **结论**：通过。正确列表与挂载点字节和相符（64.0M）；三种错配均为硬拒绝且**方向正确**——过短建议“pass the full list”、过长建议“pass exactly the N addresses”（旧文案对过长场景给相反建议已修）、顺序倒置不再静默输出 `0B`（由 `chunk0_elsewhere` 在 stat 层检出，见 §5-5）。拒绝均发生在探测前（长度）或首块定位时（顺序），不输出部分总数。
@@ -810,16 +810,16 @@
 
 **情形一：本地存储根，整个对象被 unlink。**
 
-- **命令**（`bash .build-bin/vm_probe_lostobj.sh` L1）：先 `grovefs --home "$P" init --view probe` + `grovefs import --db-path "$P" --view probe --source /tmp/gft_probe_src` 建 2 对象，取 `data_ref` 后 `rm $path`，再跑 `grovefs du --db-path "$P" --view probe -b --total`。
+- **命令**（`bash .build-bin/vm_probe_lostobj.sh` L1）：先 `grovefs --home "$P" init --view probe` + `grovefs import --meta-dir "$P" --view probe --source /tmp/gft_probe_src` 建 2 对象，取 `data_ref` 后 `rm $path`，再跑 `grovefs du --meta-dir "$P" --view probe -b --total`。
 - **回显**：
 
   ```
     import: imported into view 'probe' under /gft_probe_src: 1 dir(s), 2 object(s) (2 hardlinked zero-copy, 0 copied), 0 skipped, 0 failed
     blocks 对象数: 2
-    du --db-path 基线: 1000000    /|
+    du --meta-dir 基线: 1000000    /|
     视图树 data_ref: two.bin=1344177d-a81e-4c63-a7c6-d5955301fb99
     将 unlink: /home/hanjun/gftprobe/blocks/9e/1344177d-a81e-4c63-a7c6-d5955301fb99  (700000 字节)
-    unlink 后 du --db-path: warning: 1 of 2 object(s) are not in the data source and count as 0 bytes (objects on other storage roots need their own --data/--data-root)|300000  /|
+    unlink 后 du --meta-dir: warning: 1 of 2 object(s) are not in the data source and count as 0 bytes (objects on other storage roots need their own --data-servers/--data-dir)|300000  /|
   ```
 
 - **结论**：**通过**——丢对象确实出声（stderr 的 `warning: N of M object(s) are not in the data source and count as 0 bytes`），且总数从 1000000 降到 300000（缺的那个按 0 计入并被报出）。
@@ -835,7 +835,7 @@
   sudo cp <chunk#1> /dev/shm/hidden.obj && sudo rm <chunk#1>       # 跨设备复制后真正 unlink
   sudo systemctl restart grovefs-data-server                       # 清掉服务端 fd 缓存
   echo 3 | sudo tee /proc/sys/vm/drop_caches                        # 清客户端页缓存
-  sudo sh -c "set -a; . /etc/grovefs/cluster.env; set +a; grovefs du --view alice --meta 127.0.0.1:50053 --data gfs1:50100,gfs2:50100 -b --path /datasets"
+  sudo sh -c "set -a; . /etc/grovefs/cluster.env; set +a; grovefs du --view alice --meta-server 127.0.0.1:50053 --data-servers gfs1:50100,gfs2:50100 -b --path /datasets"
   md5sum /home/hanjun/mnt/datasets/big.bin
   ```
 
@@ -882,7 +882,7 @@
     unlink 后 du -b --path /datasets: 5   /datasets|
     挂载 stat size: 0
     挂载整文件读: rc=0 报错=[]
-    du 单地址(列表长度与 2 代布局不符)必须拒绝: Error: "this tree was written across 2 data-servers but --data names 1: the stripe map needs every address in the writer's order ...; no sizes are reported"|
+    du 单地址(列表长度与 2 代布局不符)必须拒绝: Error: "this tree was written across 2 data-servers but --data-servers names 1: the stripe map needs every address in the writer's order ...; no sizes are reported"|
       已复原 /data/gfs1/grove/blocks/19/48505e88-94b4-4906-8c3c-1029578fba5e#0 16777216 字节
     复原后 du --total: 64.0M      /|
     复原后挂载 md5: 1304cb5a5f3e8b534c5bda7ee4e107b4  /home/hanjun/mnt/datasets/big.bin
@@ -900,7 +900,7 @@
     unlink 后(旧挂载进程, 服务端 fd 缓存仍在):
       stat size: size=700000
       整文件读: rc=0 报错=[]
-      du -b --total: warning: 1 of 2 object(s) are not in the data source and count as 0 bytes (objects on other storage roots need their own --data/--data-root)|300000 /|
+      du -b --total: warning: 1 of 2 object(s) are not in the data source and count as 0 bytes (objects on other storage roots need their own --data-servers/--data-dir)|300000 /|
       du -b --path /gft_probe_src/docs: warning: 1 of 2 object(s) are not in the data source and count as 0 bytes (...)|300000      /gft_probe_src/docs|
     重挂后(fd 缓存已清):
       整文件读: rc=0 报错=[]
@@ -911,7 +911,7 @@
 
 #### 3.6.5 条带对象损坏的 du 出声（§6-2 修复后，本机端到端复现）
 
-- **命令**（`bash .build-bin/repro_du_damage.sh`，本机两台 data-server + 本地 meta）：`mount --data A,B` 下 `dd` 一个 40 MiB 文件（跨分块 #0/#1/#2，#1 在 B）；基线 du → umount、停服、`rm` 掉 B 上的 `{uuid}#1` → 重启两 server → 再跑 du。对照变体同法拔掉**尾块** `#2`（在 A）。
+- **命令**（`bash .build-bin/repro_du_damage.sh`，本机两台 data-server + 本地 meta）：`mount --data-servers A,B` 下 `dd` 一个 40 MiB 文件（跨分块 #0/#1/#2，#1 在 B）；基线 du → umount、停服、`rm` 掉 B 上的 `{uuid}#1` → 重启两 server → 再跑 du。对照变体同法拔掉**尾块** `#2`（在 A）。
 - **回显**（中间块 #1 缺失）：
 
   ```
@@ -938,7 +938,7 @@
 
 #### 3.6.6 条带中间分块丢失的挂载读形态（本机复现，表(b) 补行的证据）
 
-- **命令**（`bash .build-bin/repro_read_gap.sh`，本机两台 data-server + 本地 meta，与 §3.6.5 同拓扑）：`mount --data A,B` 下 `dd` 一个 40 MiB 文件（跨分块 #0/#1/#2，#1 在 B）；记录 md5 → umount、停服（按端口 `ss -ltn` 确认已释）、`rm` 掉 B 上的 `{uuid}#1` → 重启两 server → 重挂后 `stat`、整读、比对 md5；控组再跑 `du`。
+- **命令**（`bash .build-bin/repro_read_gap.sh`，本机两台 data-server + 本地 meta，与 §3.6.5 同拓扑）：`mount --data-servers A,B` 下 `dd` 一个 40 MiB 文件（跨分块 #0/#1/#2，#1 在 B）；记录 md5 → umount、停服（按端口 `ss -ltn` 确认已释）、`rm` 掉 B 上的 `{uuid}#1` → 重启两 server → 重挂后 `stat`、整读、比对 md5；控组再跑 `du`。
 - **回显**：
 
   ```
@@ -971,10 +971,10 @@
 - **命令**：
 
   ```bash
-  grovefs view --db-path "$S" export --view imp --out /tmp/imp.export.jsonl
+  grovefs view --meta-dir "$S" export --view imp --out /tmp/imp.export.jsonl
   tar -C "$S" -cf - blocks | ssh gfs1 'sudo tar -xf - -C /tmp/gft_recv'   # 字节随行
-  ssh -n gfs1 "sudo grovefs view --db-path /tmp/gft_recv import --view moved --in /tmp/imp.export.jsonl"
-  ssh -n gfs1 "sudo grovefs du --view moved --db-path /tmp/gft_recv --data-root /tmp/gft_recv -b --total"
+  ssh -n gfs1 "sudo grovefs view --meta-dir /tmp/gft_recv import --view moved --in /tmp/imp.export.jsonl"
+  ssh -n gfs1 "sudo grovefs du --view moved --meta-dir /tmp/gft_recv --data-dir /tmp/gft_recv -b --total"
   ```
 
 - **回显**：
@@ -1014,11 +1014,11 @@
 - **命令**：
 
   ```bash
-  grovefs gc --db-path "$S"                       # 干跑
-  grovefs gc --db-path "$S" --apply
-  grovefs gc --db-path $HOME/meta                  # 在用存储、字节在远端
-  grovefs refs rebuild --db-path "$S"
-  $GV rm --name c8base --base --data-root $HOME/meta
+  grovefs gc --meta-dir "$S"                       # 干跑
+  grovefs gc --meta-dir "$S" --apply
+  grovefs gc --meta-dir $HOME/meta                  # 在用存储、字节在远端
+  grovefs refs rebuild --meta-dir "$S"
+  $GV rm --name c8base --base --data-dir $HOME/meta
   ```
 
 - **回显**：
@@ -1059,8 +1059,8 @@
   丢对象后的 `view rm --base` 部分回收文案（来自 §3.6.4 同一轮）：
 
   ```
-    收尾: removed base view 'probe': 5 node(s) gone, 2 blob reference(s) dropped, 1 object(s) freed from /home/hanjun/gftprobe/blocks, 0 still held by other views, 1 not found under that data root (wrong --data-root? they live on another store)
-    收尾: note: 1 unreferenced blob(s) were NOT deleted — re-run with --data-root pointing at the store that holds them (default: this metadata root)
+    收尾: removed base view 'probe': 5 node(s) gone, 2 blob reference(s) dropped, 1 object(s) freed from /home/hanjun/gftprobe/blocks, 0 still held by other views, 1 not found under that data root (wrong --data-dir? they live on another store)
+    收尾: note: 1 unreferenced blob(s) were NOT deleted — re-run with --data-dir pointing at the store that holds them (default: this metadata root)
   ```
 
 - **结论**：通过。干跑/`--apply` 回收数量与磁盘实际一致；`refs rebuild` 能从存活视图重建台账（8 holder entries）；三道守卫逐条对上。唯一显示缺陷：对**在用**存储做 gc 时，因字节全在远端 data-server，输出 `objects: 0 (0 B)` + `dry run: nothing deleted`，把「本根无字节」说成「无对象可回收」（§6-8）。
@@ -1072,13 +1072,13 @@
 - **命令**：
 
   ```bash
-  grovefs apikey --db-path /tmp/gft_gate create --label d-sample
-  grovefs apikey --db-path /tmp/gft_gate list
-  grovefs apikey --db-path /tmp/gft_gate list --view keyed
-  grovefs apikey --db-path /tmp/gft_gate create --label x --for both   # 非法 scope
-  grovefs apikey --db-path /tmp/gft_gate set-ro --id <ID>
-  grovefs apikey --db-path /tmp/gft_gate revoke --id <ID>
-  grovefs apikey --db-path /tmp/gft_gate calls
+  grovefs apikey --meta-dir /tmp/gft_gate create --label d-sample
+  grovefs apikey --meta-dir /tmp/gft_gate list
+  grovefs apikey --meta-dir /tmp/gft_gate list --view keyed
+  grovefs apikey --meta-dir /tmp/gft_gate create --label x --for both   # 非法 scope
+  grovefs apikey --meta-dir /tmp/gft_gate set-ro --id <ID>
+  grovefs apikey --meta-dir /tmp/gft_gate revoke --id <ID>
+  grovefs apikey --meta-dir /tmp/gft_gate calls
   ```
 
 - **回显**（明文已截短，不落报告）：
@@ -1160,7 +1160,7 @@
 
 ### 3.10 MCP 全方法面（10 工具 + 资源 + 模板 + 提示 + 补全 + 日志 + 协议错误）
 
-- **命令**：向 `grovefs mcp --db-path /tmp/gft_gate --require-api-key` 的 stdio 依次注入 JSON-RPC 请求（文件式回放，回显 `/tmp/vm_evidence/battery_3.log` D5 段）。
+- **命令**：向 `grovefs mcp --meta-dir /tmp/gft_gate --require-api-key` 的 stdio 依次注入 JSON-RPC 请求（文件式回放，回显 `/tmp/vm_evidence/battery_3.log` D5 段）。
 - **回显**（节选）：
 
   ```
@@ -1226,7 +1226,7 @@
     分块总数/总字节(两台相加应等于文件大小): 13 块, 209715200 字节
       写回校验(已清 后重读): 7e560838af743f2900381b908fad98a0 vs 写入时 7e560838af743f2900381b908fad98a0 (一致 OK)
       48MiB 文件的分块分布: gfs1=2 个, gfs2=1 个
-    同机双根的放置由 key 哈希决定(data-server --root a,b), 跳机由条带决定
+    同机双根的放置由 key 哈希决定(data-server --data-dir a,b), 跳机由条带决定
   ```
 
 - **结论**：通过。13 个分块奇偶分布在两机，总字节与文件大小精确相符（209715200）；清缓存后重读 md5 一致；同机两个数据根由 key 哈希分桶（回显中 `/data/gfs1/grove` 行本文件分块为空属正常，因该对象 13 块全部落在同名的 `/data/gfs2/grove` 根）。
@@ -1343,7 +1343,7 @@
   -- 挂载清单: grovefs:alice /home/hanjun/mnt|
   -- 探针目录残留 /tmp/gft_*: ls: cannot access '/tmp/gft_*': No such file or directory 
   -- 探针存储根/临时文件残留: ls: cannot access '/home/hanjun/gftstore': No such file or directory ls: cannot access '/home/hanjun/gftprobe': No such file or directory ls: cannot access '/tmp/b2.rules': No such file or directory ls: cannot access '/tmp/bogus.rules': No such file or directory ls: cannot access '/tmp/vm_b*.out': No such file or directory 
-  -- 视图定义清单: no view definitions in the control plane store /home/hanjun/meta (local files) (every view name maps to its own tree)|base view 'alice' -> own tree meta/alice.db (read-write; deletes free a shared object only when no view holds it)|view keys: `grovefs apikey --db-path /home/hanjun/meta list [--view NAME]` (add --view to see only that view's keys)|
+  -- 视图定义清单: no view definitions in the control plane store /home/hanjun/meta (local files) (every view name maps to its own tree)|base view 'alice' -> own tree meta/alice.db (read-write; deletes free a shared object only when no view holds it)|view keys: `grovefs apikey --meta-dir /home/hanjun/meta list [--view NAME]` (add --view to see only that view's keys)|
   -- 基视图内容(应为 P0 记录的水位基线): [datasets lockf onlyme.txt private vis.txt ]
   -- datasets: [big.bin t1.txt ]
   -- du 复原对账(基线 64.0M): 64.0M	/
@@ -1367,15 +1367,15 @@
   两处数值口径如实说明：`--对象数` 是用 `find` 统计的**磁盘文件数**，普通对象与条带分块（`<uuid>#<i>`）混在一起，且两个数据根的使用量按 key 哈希分布（故一台 34M/31 个、另一台 1.1M/2 个），该计数不能当作“条带对象数”读；基视图内容与 §3.0 的 P0 基线 `[a1b.txt datasets onlyme.txt private vis.txt ]` 相比，少了 `a1b.txt`（在 §3.4.4 的 fork 用例里被 `unlink`）、多了 `lockf`（§3.2 的锁用例创建）；本轮另把 §3.4.4/§3.8 遗留在基视图里的 `b4.txt`/`b4del.txt` 两个测试名删掉（因此第一台的计数从 33 降到 31），删除后 `du --total` 仍为 `64.0M`，与 §3.0/§3.6 的水位一致。
   首次运行该脚本时还现场删掉了上一轮遗留的 `/tmp/gft_pva`、`/tmp/gft_src`、`/tmp/gft_stats.log`、`/home/hanjun/gftstore`（日志首行 `removed ...`），上面贴的是清场完成后的终态回显。
 
-### 3.18 本地挂载（`--home`）与远程挂载（`--meta` + `--data`）的对照
+### 3.18 本地挂载（`--home`）与远程挂载（`--meta-server` + `--data-servers`）的对照
 
-- **目的**：任务书要求“本地与远程挂载”都实测。远程挂载是部署态的 `grovefs-mount-alice` 单元（`--meta` 走 meta-server，字节走 `--data` 条带），它不依赖任何本地存储根；本条目补的是另一种形态——元数据与 `blocks/` 都在本机的 `mount --home`（不经 meta-server）。
+- **目的**：任务书要求“本地与远程挂载”都实测。远程挂载是部署态的 `grovefs-mount-alice` 单元（`--meta-server` 走 meta-server，字节走 `--data-servers` 条带），它不依赖任何本地存储根；本条目补的是另一种形态——元数据与 `blocks/` 都在本机的 `mount --home`（不经 meta-server）。
 - **命令**（`bash .build-bin/vm_probe_lostlocal.sh` 的挂载段；另跑了一次现场形式对账探针，回显 `/tmp/vm_evidence/probe_import_forms.log`）：
 
   ```bash
   P=$HOME/gftprobe
   grovefs --home "$P" init --view probe
-  grovefs import --db-path "$P" --view probe --source /tmp/gft_probe_src
+  grovefs import --meta-dir "$P" --view probe --source /tmp/gft_probe_src
   sudo systemd-run --unit=gft-probe --collect --quiet -p User=hanjun \
     /usr/local/bin/grovefs mount --view probe --home "$P" -m /tmp/gft_probe --foreground
   ls /tmp/gft_probe /tmp/gft_probe/gft_probe_src/docs
@@ -1394,11 +1394,11 @@
     unlink 前读: rc=0 md5=257ccc870d737ac121380e61c5a7bc09
   ```
 
-- **结论**：通过。本地挂载与远程挂载都可用：同一视图在 `--home` 形态下字节落在本机 `$P/blocks/<2hex>/<key>`（回显给出了完整落点路径），目录项与读均正常；而在部署态的 `--meta`+`--data` 形态下，同一个名字的对象字节在两台 data-server 上（§3.11）。两种形态的字节来源不同，因此 du 也必须用不同的数据源表达（§3.6.1 vs §3.6.2）。
+- **结论**：通过。本地挂载与远程挂载都可用：同一视图在 `--home` 形态下字节落在本机 `$P/blocks/<2hex>/<key>`（回显给出了完整落点路径），目录项与读均正常；而在部署态的 `--meta-server`+`--data-servers` 形态下，同一个名字的对象字节在两台 data-server 上（§3.11）。两种形态的字节来源不同，因此 du 也必须用不同的数据源表达（§3.6.1 vs §3.6.2）。
   一个实测踩到的命令形态错误已单独重跑取证（`/tmp/vm_evidence/probe_import_forms.log`）：
 
   ```
-  -- 正确形式: grovefs import --db-path D --view V --source DIR
+  -- 正确形式: grovefs import --meta-dir D --view V --source DIR
     initialized view 'imp1' at /home/hanjun/gftimp/meta/imp1.db
     imported into view 'imp1' under /gft_imp_src: 1 dir(s), 2 object(s) (2 hardlinked zero-copy, 0 copied), 0 skipped, 0 failed
   -- 错误形式(view import --in 指目录)的报错原文:
@@ -1581,7 +1581,7 @@ buffered wall: 2.061 s, daemon ticks +116
 direct wall: 0.751 s, daemon ticks +61
 ```
 
-冷读下 grovefs 缓冲读与 ext4 墙钟几乎相同（2.061 vs 2.068s，差 ~0.3%，磁盘吞吐主导），拷贝开销根本不体现在墙钟上；warm 64MiB 读 grovefs 1446 MB/s vs ext4 1095（5.4，grovefs 反超因页缓存命中）。fuser 0.18 的回复侧只有 `writev`（channel.rs），`ReplyData` 仅收 `&[u8]`，无 `splice`/`sendfile`/`vmsplice` 入口。收益上限只在“本机 warm 大块读”这一窄路径 ≤6%，且要 fork fuser + 处理页缓存一致性/`--strict` 强一致/`WRITEBACK_CACHE`，远程与条带后端完全不受益也可能被拖累。三选一取“不实现、写负空间”：已在 `USAGE.md` §14.4 与 `docs.html` §12.6 的“未实现（诚实标注）”清单登记，附适用边界（本机 warm 大块读、需上游零拷贝 API）。
+冷读下 grovefs 缓冲读与 ext4 墙钟几乎相同（2.061 vs 2.068s，差 ~0.3%，磁盘吞吐主导），拷贝开销根本不体现在墙钟上；warm 64MiB 读 grovefs 1446 MB/s vs ext4 1095（5.4，grovefs 反超因页缓存命中）。fuser 0.18 的回复侧只有 `writev`（channel.rs），`ReplyData` 仅收 `&[u8]`，无 `splice`/`sendfile`/`vmsplice` 入口。收益上限只在“本机 warm 大块读”这一窄路径 ≤6%，且要 fork fuser + 处理页缓存一致性/`--no-cache` 强一致/`WRITEBACK_CACHE`，远程与条带后端完全不受益也可能被拖累。三选一取“不实现、写负空间”：已在 `USAGE.md` §14.4 与 `docs.html` §12.6 的“未实现（诚实标注）”清单登记，附适用边界（本机 warm 大块读、需上游零拷贝 API）。
 
 
 ---
@@ -1600,7 +1600,7 @@ direct wall: 0.751 s, daemon ticks +61
 | 5-8 | `set-ro` 后回读内容尾部多 7 个零字节 | `'first\n\x00\x00\x00\x00\x00\x00\x00'` | 本轮探针用固定长缓冲区读回所致，非产品写入；作为取证脚本缺陷记录 | 已确认非产品缺陷（取证手段问题） |
 | 5-9 | HA 切换瞬间首次写存在瞬时 `EIO` | 上一轮观察到一次 `EIO` 且文件未生成；本轮 E3 为 `rc=0`（0.76 s） | 转接窗口内旧主连接失效 | 状态相关，不作稳定性断言；**重试要求已写入文档**（`USAGE.md` §12.4 切换窗口写重试 note + `docs.html` HA 滚动升级行：窗口内首次写可能 `EIO`/`EROFS`/`EPERM`，调用方应带重试） |
 | 5-10 | `view alias` 接受指向不存在视图的目标 | 修复前：`defined pure alias 'x-dangle' -> real view 'no-such-tree'`，直到挂载才拒 | 定义时无树存在性校验 | **已修复**（release `d2a3b262`，实机复验）：`alias_view` 在排除别名/派生/分叉目标后，用 `store.has_physical(real)` 检查目标物理树（SQLite 查 `<base>/meta/<view>.db`、PG 查 schema）是否存在，不存在则拒绝并给出可敲的 create/import 命令（接 §6-5） |
-| 5-11 | `grovefs import` 不接受 `--meta`/`--data`，无法向远端/条带存储批量导入 | `grovefs import --meta … --data …` 报 Usage；只能导入到本地 `--db-path`/`--home` 存储根 | import 子命令未暴露远端定位参数（与 du/view import 的远端能力不对称） | 未修，列入遗留（接口缺口；需先本地导入再 `view export/import` 迁机）。本轮终审定性：不是不对称缺陷而是设计边界——import 直接写权威 `meta/<view>.db` 与 `blocks/`，零拷贝靠源与 blocks 同盘硬链接，远程协议里没有“批量提交整棵树”的对应操作；跨机批量走 §14.2 备选路（挂载点 rsync 经 FUSE 写路径，大文件可条带）。**未实现口径已写入负空间清单**（`USAGE.md` §14.4、`docs.html` §12.1.1/§12.6） |
+| 5-11 | `grovefs import` 不接受 `--meta-server`/`--data-servers`，无法向远端/条带存储批量导入 | `grovefs import --meta-server … --data-servers …` 报 Usage；只能导入到本地 `--meta-dir`/`--home` 存储根 | import 子命令未暴露远端定位参数（与 du/view import 的远端能力不对称） | 未修，列入遗留（接口缺口；需先本地导入再 `view export/import` 迁机）。本轮终审定性：不是不对称缺陷而是设计边界——import 直接写权威 `meta/<view>.db` 与 `blocks/`，零拷贝靠源与 blocks 同盘硬链接，远程协议里没有“批量提交整棵树”的对应操作；跨机批量走 §14.2 备选路（挂载点 rsync 经 FUSE 写路径，大文件可条带）。**未实现口径已写入负空间清单**（`USAGE.md` §14.4、`docs.html` §12.1.1/§12.6） |
 | 5-12 | CLI 致命错误以 Debug 形式打印 | 修复前：挂载单元在 data-server 未起时报 `Error: Os { code: 111, kind: ConnectionRefused, message: "Connection refused" }`（不指哪个地址）；du 报错带外层双引号 `Error: "…"` | `fn main() -> Result<(), Box<dyn Error>>` 使错误走 Debug 而非 Display | **已修复**（release `d2a3b262`，实机复验）：`main()` 拆出 `real_main()`、致命错误改走 Display（`error: <人话>`，与 clap 前缀一致）；meta/data/du 连接失败均点名 `cannot reach meta-server/data-server <addr>`（保留 `ErrorKind` 不影响 failover，见 §6-1） |
 
 已当场修正的取证脚本缺陷（不属于产品遗留）：C5 漏 `mv`、误挑 0 字节分块；B4 基视图残留 `newdir`/`b4-renamed.txt` 导致结构写探针假失败；`> target 2>/tmp/err` 重定向顺序导致报错为空；battery_1 输出文件被自身 `rm -rf /tmp/gft_*` 删成 `(deleted)` 导致 ssh 挂死；`vm_audit.sh` 的嵌套单引号、`cut` 无 sudo、把整个多行 env 值当 grep pattern 导致的“单元文本命中密钥 4 处”假阳性、崩溃拉起验证的 `pgrep` 模式被吞。
@@ -1624,13 +1624,13 @@ direct wall: 0.751 s, daemon ticks +61
 1. ★**`view list` 首行与列表自相矛盾——本轮已实现**。无定义时先打 `no view definitions in the control plane store …`，紧接着又列出 `base view 'alice' -> …`。**已采用的改法**：`src/mcp.rs` 的 `list_views_text` 先算出 bare（基视图）数量，`defined` 为空时按 bare 是否为空分两支——两者皆空才打“无任何视图定义”，仅 `defined` 空而 bare 非空时打“无别名/分叉/透镜定义 —— 下面 N 个基视图各映射自己的树”，不再与列表矛盾。实机复验见 §2.3。
 2. ★**条带对象丢分块时的静默 0 / 静默短报（最严重的一条）——本轮已实现（du 诊断路径）**。原建议分两步（给 `len` 加严、chunk#0 缺失改报 ENOENT）；实测取证后**采用了不同的改法**：取证发现 `build_attr`（`src/fs_impl.rs`）对每个普通文件的 getattr 都调 `backend.len(k).unwrap_or(node.size)` —— len 是热路径且错误会被静默回退到元数据 size，直接改 `len()` 既拖慢 stat/readdirplus 又不会让挂载侧真正出声。故：
    - `src/backend/sharded.rs` 新增 `len_with(key, strict)`：普通 `len` 委托 `strict=false`（零行为/零成本变化）；`len_strict()`（仅 `du` 调用）在二分停在首个缺失块后多探一块（探 `hi+1`）、并检测首块缺失而后续存在/首块短报而 #1 存在两种形态，命中即返回带稳定前缀 `grovefs:striped-damaged:` 的 `io::Error::other`（`is_damaged`/`damage_reason` 供调用方类型化识别，不做散文串匹配）。
-   - `src/du.rs` 分类改为三档：`NotFound` → lost（既有 warning）；`is_damaged` → **独立 `damaged` 计数 + 独立 warning 行**（原句引用首个损坏原因，字节不计入总数）——损坏不再被读成“对象不在数据源/该传 --data-root”；其它 Err → 仍硬报错不出数。本地单根路径永不跨机条带，damaged 恒 0。
+   - `src/du.rs` 分类改为三档：`NotFound` → lost（既有 warning）；`is_damaged` → **独立 `damaged` 计数 + 独立 warning 行**（原句引用首个损坏原因，字节不计入总数）——损坏不再被读成“对象不在数据源/该传 --data-dir”；其它 Err → 仍硬报错不出数。本地单根路径永不跨机条带，damaged 恒 0。
    - 诚实边界：strict 只捕获“搜索停在缺失块、其后仍有存在块”的短报症状；完全埋在连续存在块内部的洞不改变测得尺寸，属读路径完整性（错字节读），需 O(分块数) 全扫，本轮不做。挂载侧静默形态（§5-6）按取舍保持不动。
    - 文档同步：`docs.html` 的 du 字节来源 note 与“会不会出声”表(b)、`USAGE.md` §12.6 表(b) 的条带丢块行同步为新行为（du 出声：damaged warning；挂载读仍不出声）。本机端到端复验（中间块出声/尾块不误报）见 §3.6.5；单测 + `cargo test --release` 全绿见 §4.2。
 2a. ★**POSIX 记录锁 close/退出隐式释放泄漏（§5-3）——本轮已实现**。原建议：既然 `fuser` 0.18 仅在 `FUSE_RELEASE_FLOCK_UNLOCK`（只有 flock(2) 路径置位）时向 `release` 交 `lock_owner`，POSIX 锁走 close 拿到 `None`，旧回收不触发。**已采用的改法**：在 `setlk`（已不再忽略 `fh`）按 `(fh → ino, owner)` 记账，`release(fh)` 据此在某个 `(ino,owner)` 的最后一个锁定描述符关闭时，用一次全区间 `lock_op(..., Unlock, ...)` 精确删除其行（`src/fs_impl.rs` 的 `note_posix_lock`/`drop_posix_lock_on_release`）。采用“删除行”而非“收窄 `renew_locks` 到仍打开的描述符”，是为了不动 meta 协议与跨机续租模型：行一旦删除，按 sid 的续租心跳自然不再刷新它，效果与“只刷新存活行”等价，且失败时仍退化为一个租期内自然过期。已配套集成测（`test_locks.sh` §4c：跨进程持有/释放 + 阻塞唤醒延时），本地 17/17、三机实机复验通过（close 后 `GRANTED`、阻塞 `2.74s` 唤醒）。
 3. ★**fork/只读 key 的 `EROFS` 在 shell 里假成功——本轮已实现（fork 挂载关 writeback）**。原建议：把内容写门从 `fsync` 提前到首次 `write`（至少对 `O_WRONLY`/`O_APPEND` 做 open 前置检查），否则文档必须明写假成功。**实测取证后采用了不同的改法**：不在 `open()` 前置检查（create 不走 open 写门，新建文件+写的漏洞仍在；且 `test_fork.sh` 钉住“touch（空建）allowed”，拒写意图 create 会破既有语义），而是在 `src/fs_impl.rs` 的 `init()` 协商时按 `content_ro` 条件化 `FUSE_WRITEBACK_CACHE`：内容只读挂载不申请页缓存写回，每个 `write(2)` 都是同步 FUSE 写请求，`EROFS` 在首次 write 即返；fork 无写吞吐可损失，可写基视图不受影响（bench 写 392.0 MB/s 无回归）。验证：修复前后逐字对照与逐 open 探针见 §3.4.4b；`test_fork.sh` 新增 4b 段固化（套件 75/0）；`docs.html` 表(a) 与 `USAGE.md` §3.0 已同步为新行为。**保留的延迟暴露场景只剩一个**：经服务端挂载的普通 rw key 被 `set-ro` 原地切换（内核标志无法中途改变，服务端门禁翻转不改变本会话已协商 flags，失败在 fsync 往返可见）。另经本机 `--home` 探针确证一个文档口径缺陷：“set-ro 原地切换 ≤1s 生效”只对经 meta/data-server 的挂载成立，对本机 `--home` 挂载完全不生效（本地分支无服务端凭据门，set-ro 后追加 `rc=0` 且字节照落盘），表(a) 与 ⚠ 告警已据此限定表述。
-4. ★**`view rm --base` 的 `Permission denied` 裸文案——本轮已实现**。原建议：按同文件内其他守卫的写法包上上下文。**已采用的改法**：`src/main.rs` 的回收阶段 `backend::open_local(&droot)` 失败时 `map_err` 补上“cannot open data root <路径> to free view '<name>' objects … 元数据树 meta/'<name>'.db 已删除 … 可用 `grovefs gc --db-path … --data-root …` 离线回收”的上下文，把“树已删、字节未收”分开陈述并给出下一条可执行命令。连同 §5-12 的 Display 改动，实机不再报裸 `Permission denied`（见 §2.3）。
-5. ★**提示里的占位符未替换 + 悬空目标校验——均已实现**（§6-5 文案 + §5-10 行为）。原建议：`note: no local <db-path>/meta/pv.db yet` 与 meta-server 错误里的 `--db-path <db-path>`/`--view <name>` 应填实值；`view alias` 应在定义时检查目标物理树存在。**已采用的改法**：（文案）`src/mcp.rs` 的 `base_tree_missing_note` 用 `self.db(view).display()`+`self.base.display()` 填实树路径与存储根；`src/remote/meta/server_ext.rs` 的“view does not exist”create-hint 用 `rt.base.display()`+具体 `view` 填实（file/PG 两分支），配套收紧 `tests/meta_roundtrip.rs` 断言到具体视图名。（行为）`src/mcp.rs` 的 `alias_view` 在排除别名/派生/分叉目标后新增 `has_physical(real)` 硬拒绝悬空目标，错误文案复用上述已填实的 note。实机复验见 §2.3。
+4. ★**`view rm --base` 的 `Permission denied` 裸文案——本轮已实现**。原建议：按同文件内其他守卫的写法包上上下文。**已采用的改法**：`src/main.rs` 的回收阶段 `backend::open_local(&droot)` 失败时 `map_err` 补上“cannot open data root <路径> to free view '<name>' objects … 元数据树 meta/'<name>'.db 已删除 … 可用 `grovefs gc --meta-dir … --data-dir …` 离线回收”的上下文，把“树已删、字节未收”分开陈述并给出下一条可执行命令。连同 §5-12 的 Display 改动，实机不再报裸 `Permission denied`（见 §2.3）。
+5. ★**提示里的占位符未替换 + 悬空目标校验——均已实现**（§6-5 文案 + §5-10 行为）。原建议：`note: no local <meta-dir>/meta/pv.db yet` 与 meta-server 错误里的 `--meta-dir <meta-dir>`/`--view <name>` 应填实值；`view alias` 应在定义时检查目标物理树存在。**已采用的改法**：（文案）`src/mcp.rs` 的 `base_tree_missing_note` 用 `self.db(view).display()`+`self.base.display()` 填实树路径与存储根；`src/remote/meta/server_ext.rs` 的“view does not exist”create-hint 用 `rt.base.display()`+具体 `view` 填实（file/PG 两分支），配套收紧 `tests/meta_roundtrip.rs` 断言到具体视图名。（行为）`src/mcp.rs` 的 `alias_view` 在排除别名/派生/分叉目标后新增 `has_physical(real)` 硬拒绝悬空目标，错误文案复用上述已填实的 note。实机复验见 §2.3。
 6. ★**拒绝文案的“下一步命令”完备性巡检——du 部分本轮已实现**。本轮已对上文案的命令均为好例（`--skip-existing`、`--replace`、`--retire`、`--force`、`umount -m`）。**已采用的改法**：`src/du.rs` 的 `path not found: {}` 现回显规范化后的视图相对路径（`normalize_path` 会自动补前导 `/`）并提示 `--path takes a view-relative path such as /<top-dir>/...`；`gather_via_meta` 连不上 meta-server 时点名地址。其余中，`gc` 的 `objects: 0 (0 B)` 行已于本轮 §6-8 改掉（见下条）；`apikey set-ro` 生效时点（§5-7）经本机复测确认为复检窗时序而非缺陷，回显文案“on its next re-check window (≤1s)”与实测一致，未改（见 §3.9.1）。
 7. **单位与计数口径——本轮复核定性：属取证脚本产物，非产品输出，不动**。`import` 同时给 `blocks/ 路径数: 8` 与 `distinct inode 数: 4`、`holders 台账: 8,8` 这类裸 SQL 元组，经定位均来自 `.build-bin/` 取证/编排脚本的 `psql`/`find` 探针输出，不是 `grovefs` 产品命令的打印。产品 `grovefs import` 的汇总行本就统一且人话：`imported into view 'X' under /: N dir(s), M object(s) (H hardlinked zero-copy, C copied), S skipped, F failed`；`du` 默认后缀已是 `K/M/G`。故本项无需产品侧改动。
 8. ★**`gc` 对在用存储的输出区分“无字节”与“无垃圾”——本轮已实现**（release `c8d68580`，实机复验见 §2.3）。原建议：`striped layout(s) > 0` 且 `objects == 0` 时不应让裸 `0` 读成“无字节”，且不应邀请对 0 字节重跑 `--apply`。**已采用的改法**（`src/main.rs` 的 `print_gc_report`）：当 `objects == 0 && striped_layouts > 0` 时，objects 行改打 `objects: 0 local block(s) — N striped layout(s) place their chunks on data-servers, which gc does not audit (use \`grovefs du\` for their bytes)`；dry-run 汇总保留稳定前缀 `dry run: nothing deleted.`，再按三态给尾句——有可回收项才邀请 `--apply`，`orphans` 为空打 `No unreferenced objects were found.`，全在宽限期内打 `N orphan(s) are all within the <grace> grace; re-run after it elapses.`。实机条带 meta 存储 `gc` 回显见 §2.3，`test_gc.sh` 41/0 仍绿（clean-store 用例断言的 `dry run: nothing deleted` 前缀未破）。
@@ -1785,12 +1785,12 @@ $ git status --short            # 5 个跟踪文件已随本轮 commit（41613ad
 
 | 文件 | 改动内容 | 证据 |
 |---|---|---|
-| `src/du.rs` | du 的远程条带路径重写：`--data` 接受逗号列表并按 `s<N>` 逐对象探测；缺数据源时硬拒绝而不是静默计 0；丢失对象计入 `lost` 并发出 `warning: N of M object(s) are not in the data source and count as 0 bytes (...)`；本地路径默认取 `--db-path`/`--home` 同一根 | §3.6.1（本地两路径）、§3.6.2（三种必须拒绝）、§3.6.3（四种丢对象情形的完整回显，含探针 `probe_lostobj.log` 的出声原文） |
-| `src/main.rs` | `du --data`/`--data-root` 的 `///` 帮助文本同步上述语义（逗号列表、条带需全列表、无本地根且无 `--data` 则拒绝） | `grovefs du --help` 与 §4.4 doccheck（真实参数 68 / 文档 87 / 非外部非负空间 0） |
+| `src/du.rs` | du 的远程条带路径重写：`--data-servers` 接受逗号列表并按 `s<N>` 逐对象探测；缺数据源时硬拒绝而不是静默计 0；丢失对象计入 `lost` 并发出 `warning: N of M object(s) are not in the data source and count as 0 bytes (...)`；本地路径默认取 `--meta-dir`/`--home` 同一根 | §3.6.1（本地两路径）、§3.6.2（三种必须拒绝）、§3.6.3（四种丢对象情形的完整回显，含探针 `probe_lostobj.log` 的出声原文） |
+| `src/main.rs` | `du --data-servers`/`--data-dir` 的 `///` 帮助文本同步上述语义（逗号列表、条带需全列表、无本地根且无 `--data-servers` 则拒绝） | `grovefs du --help` 与 §4.4 doccheck（真实参数 68 / 文档 87 / 非外部非负空间 0） |
 | `tests/du.rs` | 新增 3 个集成单测，其中 `an_object_that_is_not_found_is_announced_not_silently_zero` 直接盯住“丢对象必须出声” | §4.2（`tests/du.rs` 3 passed） |
 | `.build-bin/test_striping.sh` | 补充落盘位置核验步骤（不靠 key 前缀推桶，改用 `find -name`） | §4.3（`run_all.sh` RESULT: GREEN，22 套件 PASS） |
-| `README.md` | `--root /d1,/d2` 行写明“落盘位置是 key 哈希 mod 根数现场重算，列表与对象都不记录盘序号”的口径 | 机内多根落盘实测在 §3.11（回显 `同机双根的放置由 key 哈希决定`）；条带侧根数不对必须拒的实测在 §3.6.2（`refusing to remap` 原文）；§4.4 doccheck 结论 OK |
-| `USAGE.md` | `--data-root` 的适用命令加 `du` 与默认取值说明；§12.3/§14.1/部署案例表同步多根布局口径 | du 的默认数据根取值见 §3.6.1，三种缺数据源硬拒绝见 §3.6.2，丢对象出声见 §3.6.3；§4.4 doccheck 参数对账“非外部工具/非负空间 0 项” |
+| `README.md` | `--data-dir /d1,/d2` 行写明“落盘位置是 key 哈希 mod 根数现场重算，列表与对象都不记录盘序号”的口径 | 机内多根落盘实测在 §3.11（回显 `同机双根的放置由 key 哈希决定`）；条带侧根数不对必须拒的实测在 §3.6.2（`refusing to remap` 原文）；§4.4 doccheck 结论 OK |
+| `USAGE.md` | `--data-dir` 的适用命令加 `du` 与默认取值说明；§12.3/§14.1/部署案例表同步多根布局口径 | du 的默认数据根取值见 §3.6.1，三种缺数据源硬拒绝见 §3.6.2，丢对象出声见 §3.6.3；§4.4 doccheck 参数对账“非外部工具/非负空间 0 项” |
 | `docs.html` | 同步上述表格与措辞 | §4.4 |
 | `docs.html` + `USAGE.md`（§6-12；表(a) 已随 §6-3 同步为新行为） | 新增两张运维语义表：（a）fork/透镜/别名/key-ro 四种写意图的失败时点（结构写 / 内容写截断类 open 即 `EROFS` / 内容写追加类当前版本首次 `write(2)` 即 `EROFS`、shell `>>` rc 可靠；唯一延迟暴露形态是经服务端挂载被 `set-ro` 原地切换；本机 `--home` 无服务端凭据门，set-ro 不影响已建挂载），含逐 `open` 探针 errno 回显（`docs.html` 放 §12、`USAGE.md` 放 §3.0）；（b）“对象丢失/数据源不对时各命令会不会出声” 10 行矩阵（`docs.html` 放 §11.5、`USAGE.md` 放 §12.6；含按 §3.6.6 取证增补的“条带中间分块丢失→挂载读截短到缺口偏移”行），未出声的挂载读形态标为已知缺陷 | 逐形态失败时点实测在 §3.4.4/§3.4.4b/§3.9（含本机 `--home` set-ro 探针）；丢对象出声矩阵逐行取自 §3.6（du 整对象缺失→warning、无数据源/布局不符→拒、条带中间块丢挂载读→§3.6.6）与 §5-5/§5-6（挂载读 size=0/截短 无 EIO）；§6-12 行、本轮 doccheck 退出码 0 |
 
@@ -1807,10 +1807,10 @@ $ git status --short            # 5 个跟踪文件已随本轮 commit（41613ad
 |---|---|---|
 | `src/main.rs` | §5-12：`main()` 拆出 `real_main()`，致命错误由 `Box<dyn Error>` 的 Debug 打印改走 Display（`error: <人话>`，与 clap 前缀一致）；§5-4/§6-4：`view rm --base` 打不开数据根时补上下文并给出离线 `gc` 回收提示 | §2.3 结论、§3.6.2（`error: …` 新前缀实机回显） |
 | `src/du.rs` | §6-6：`--path` 找不到时回显规范化后的视图相对路径并给出格式提示；`gather_via_meta` 连不上 meta-server 时点名地址 | §2.3 实机复验（`cannot reach meta-server 127.0.0.1:59999`）、§3.6.2 |
-| `src/mcp.rs` | §6-1：`view list` 去掉首行与列表自相矛盾的措辞（区分“无任何视图定义”与“无别名/分叉/透镜定义”）；§6-5：`base_tree_missing_note` 用真实存储根与树路径替换 `<db-path>` 占位符 | §2.3 实机复验（非矛盾行、填实路径提示） |
+| `src/mcp.rs` | §6-1：`view list` 去掉首行与列表自相矛盾的措辞（区分“无任何视图定义”与“无别名/分叉/透镜定义”）；§6-5：`base_tree_missing_note` 用真实存储根与树路径替换 `<meta-dir>` 占位符 | §2.3 实机复验（非矛盾行、填实路径提示） |
 | `src/remote/meta.rs` | §5-12：meta 面 `connect_fresh` TCP 失败包 `cannot reach meta-server {addr}: {e}`，保留 `ErrorKind` 不影响 failover | §2.3 实机复验 |
 | `src/remote/client.rs` | §5-12：数据面 `connect_fresh` TCP 失败包 `cannot reach data-server {self.addr}: {e}`，保留 `ErrorKind` | §2.3 实机复验 |
-| `src/remote/meta/server_ext.rs` | §6-5：meta-server “view does not exist” 的 create-hint 用 `rt.base.display()` 与具体 `view` 填实 `--db-path`/`--view`（file 与 PG 两分支） | §2.3 实机复验（`--db-path /home/hanjun/meta … create --view nosuchprobe`）、`tests/meta_roundtrip.rs` |
+| `src/remote/meta/server_ext.rs` | §6-5：meta-server “view does not exist” 的 create-hint 用 `rt.base.display()` 与具体 `view` 填实 `--meta-dir`/`--view`（file 与 PG 两分支） | §2.3 实机复验（`--meta-dir /home/hanjun/meta … create --view nosuchprobe`）、`tests/meta_roundtrip.rs` |
 | `tests/meta_roundtrip.rs` | §6-5 配套：断言从模板占位 `create --view <name>` 收紧为具体视图名 `create --view ghost` | §4.2（`meta_roundtrip` 6 passed） |
 | `.build-bin/test_layout.sh` | §5-12 连带修正：治理拒绝改走 Display 后人话消息不含旧 Debug 的 `Permission` 字样，grep 关键字表补 `governed by an alias\|mount the alias name` | §4.3（`run_all.sh` RESULT: GREEN） |
 | `README.md` / `USAGE.md` / `docs.html` | 与 Display 新形态同步：所有 CLI 输出示例 `Error: "X"`/`Error: Custom {…, error: "X"}`→`error: X`；`Error: … "permission denied: bound to view"` 手工补改；typo1 实测块与建视图表行填实 create-hint 路径 | §4.4 doccheck、§4.3 GREEN |

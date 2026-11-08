@@ -4,12 +4,12 @@
 #       ~/.config/grovefs/grovefs.conf) without
 #       clobbering live env — the chain is flag > env > file > default;
 #   (2) the repeat-heavy knobs resolve from it: GROVEFS_HOME (init/mount),
-#       GROVEFS_META / GROVEFS_DATA / GROVEFS_TOKEN (mount + servers),
-#       GROVEFS_DB_PATH (meta-server);
+#       GROVEFS_META_SERVER / GROVEFS_DATA_SERVERS / GROVEFS_TOKEN (mount + servers),
+#       GROVEFS_META_DIR (meta-server);
 #   (3) parser edge cases: comments, `export` lines, quoted values, non-
 #       GROVEFS_* keys (warn + ignore), malformed lines (warn), an unreadable
 #       explicit $GROVEFS_CONFIG (warn + proceed with env/defaults);
-#   (4) a real FUSE mount with NO --meta/--data/--token on the command line —
+#   (4) a real FUSE mount with NO --meta-server/--data-servers/--token on the command line —
 #       only --view and --mountpoint — served entirely from the file.
 # Assertion-based (pass/fail counters + a real exit code) like the other
 # suites; emits a SUMMARY line run_all reads.
@@ -72,26 +72,26 @@ BOGUS_KEY=should_be_ignored
 BAD LINE WITHOUT EQUALS
 EOF
 cat > .cfgtest/c_mount.conf <<EOF
-GROVEFS_META=$META
-GROVEFS_DATA=$DATA
+GROVEFS_META_SERVER=$META
+GROVEFS_DATA_SERVERS=$DATA
 GROVEFS_TOKEN=$TOK
 EOF
 cat > .cfgtest/c_envtok.conf <<EOF
-GROVEFS_META=$META
-GROVEFS_DATA=$DATA
+GROVEFS_META_SERVER=$META
+GROVEFS_DATA_SERVERS=$DATA
 GROVEFS_TOKEN=WRONGTOKEN_from_file
 EOF
 cat > .cfgtest/c_quoted.conf <<EOF
 GROVEFS_HOME="$PWD/.cfgtest/homeC"
 EOF
 cat > .cfgtest/c_badtok.conf <<EOF
-GROVEFS_META=$META
-GROVEFS_DATA=$DATA
+GROVEFS_META_SERVER=$META
+GROVEFS_DATA_SERVERS=$DATA
 GROVEFS_TOKEN=WRONGTOKEN
 EOF
 cat > .cfgtest/c_srv.conf <<EOF
 GROVEFS_TOKEN=$TOK
-GROVEFS_DB_PATH=$PWD/.cfgtest/srv_db
+GROVEFS_META_DIR=$PWD/.cfgtest/srv_db
 EOF
 
 echo "===== 1) GROVEFS_HOME: file < env < flag ====="
@@ -131,13 +131,13 @@ $Y --help 2>&1 | grep -q "grovefs.conf" && ok "grovefs --help documents the conf
 
 echo "===== 5) token-gated servers: file serves mount defaults ====="
 # ---- token-gated servers: the data-server serves the SAME store the local
-# seed mount wrote into. `--root` is the store ROOT (the backend appends its own
+# seed mount wrote into. `--data-dir` is the store ROOT (the backend appends its own
 # blocks/ under it), so pointing at central/ makes the server see central/blocks. ----
-$Y data-server --listen $DATA --root .cfgtest/central --token $TOK > .cfgtest/data.log 2>&1 & srv $!
-$Y meta-server --db-path .cfgtest/central --listen $META --token $TOK > .cfgtest/meta.log 2>&1 & srv $!
+$Y data-server --listen $DATA --data-dir .cfgtest/central --token $TOK > .cfgtest/data.log 2>&1 & srv $!
+$Y meta-server --meta-dir .cfgtest/central --listen $META --token $TOK > .cfgtest/meta.log 2>&1 & srv $!
 wait_port $DATA || bad "data-server not up"; wait_port $META || bad "meta-server not up"
 
-# mount with NO --meta/--data/--token on the command line — all three from the file
+# mount with NO --meta-server/--data-servers/--token on the command line — all three from the file
 GROVEFS_CONFIG=$PWD/.cfgtest/c_mount.conf \
   $Y --home .cfgtest/homeA mount --view team --mountpoint .cfgtest/mnt1 --foreground > .cfgtest/m1.log 2>&1 & srv $!
 mrc=0; for _ in $(seq 1 60); do ismnt .cfgtest/mnt1 && break; sleep 0.25; done
@@ -151,12 +151,12 @@ else
   bad "write-through from file-served mount failed"
 fi
 
-# flag beats the file: a wrong --meta on the command line must override GROVEFS_META
+# flag beats the file: a wrong --meta-server on the command line must override GROVEFS_META_SERVER
 GROVEFS_CONFIG=$PWD/.cfgtest/c_mount.conf \
-  timeout 6 $Y --home .cfgtest/homeA mount --view team --mountpoint .cfgtest/mnt2 --meta 127.0.0.1:59999 --foreground > .cfgtest/m2.log 2>&1
+  timeout 6 $Y --home .cfgtest/homeA mount --view team --mountpoint .cfgtest/mnt2 --meta-server 127.0.0.1:59999 --foreground > .cfgtest/m2.log 2>&1
 rc=$?
 [ "$rc" != 0 ] && grep -q "127.0.0.1:59999" .cfgtest/m2.log \
-  && ok "explicit --meta flag overrides GROVEFS_META from the file" || bad "flag-vs-meta override not observable (rc=$rc)"
+  && ok "explicit --meta-server flag overrides GROVEFS_META_SERVER from the file" || bad "flag-vs-meta override not observable (rc=$rc)"
 
 # env beats the file: WRONGTOKEN in the file, right token exported live
 GROVEFS_TOKEN=$TOK GROVEFS_CONFIG=$PWD/.cfgtest/c_envtok.conf \
@@ -173,22 +173,22 @@ rc=$?
 grep -qi "permission\|auth\|token" .cfgtest/m4.log && ok "refusal is attributed to the token" || bad "no token refusal reason in m4.log: $(head -3 .cfgtest/m4.log)"
 
 echo "===== 6) servers read their own defaults from the file ====="
-# meta-server with NO --token and NO --db-path flag: both come from c_srv.conf;
+# meta-server with NO --token and NO --meta-dir flag: both come from c_srv.conf;
 # the mount side needs neither --token nor the token env — its token also comes
 # from the file (c_mount.conf), and a WRONG one would fail the mount.
 mnt_srv=.cfgtest/mnt2
 # Strict view gate: create the view before any mount. Seeding it in srv_db
 # (the dir the config file names) also makes the successful mount below proof
-# that the file's GROVEFS_DB_PATH was consumed by the server.
-$Y view --db-path .cfgtest/srv_db create --view srvview > .cfgtest/srv_seed.log 2>&1
+# that the file's GROVEFS_META_DIR was consumed by the server.
+$Y view --meta-dir .cfgtest/srv_db create --view srvview > .cfgtest/srv_seed.log 2>&1
 GROVEFS_CONFIG=$PWD/.cfgtest/c_srv.conf \
   $Y meta-server --listen 127.0.0.1:15084 > .cfgtest/meta_srv2.log 2>&1 & srv $!
 wait_port 127.0.0.1:15084 || bad "file-configured meta-server not up"
 GROVEFS_CONFIG=$PWD/.cfgtest/c_mount.conf \
-  $Y --home .cfgtest/homeA mount --view srvview --mountpoint $mnt_srv --meta 127.0.0.1:15084 --foreground > .cfgtest/m5.log 2>&1 & srv $!
+  $Y --home .cfgtest/homeA mount --view srvview --mountpoint $mnt_srv --meta-server 127.0.0.1:15084 --foreground > .cfgtest/m5.log 2>&1 & srv $!
 m5=0; for _ in $(seq 1 60); do ismnt $mnt_srv && { m5=1; break; }; sleep 0.25; done
 [ "$m5" = 1 ] && ok "mount authenticates with a file-served token against a file-configured server" || bad "$mnt_srv not mounted (m5)"
-[ -f .cfgtest/srv_db/meta/srvview.db ] && ok "GROVEFS_DB_PATH from the file steered meta-server (the mount resolved its tree in srv_db)" || { bad "srv_db/meta/srvview.db missing — file db-path not consumed by meta-server"; cat .cfgtest/meta_srv2.log .cfgtest/m5.log; }
+[ -f .cfgtest/srv_db/meta/srvview.db ] && ok "GROVEFS_META_DIR from the file steered meta-server (the mount resolved its tree in srv_db)" || { bad "srv_db/meta/srvview.db missing — file db-path not consumed by meta-server"; cat .cfgtest/meta_srv2.log .cfgtest/m5.log; }
 
 echo
 echo "SUMMARY: pass=$pass fail=$fail"

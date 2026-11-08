@@ -7,7 +7,7 @@
 #      process, `locks` table sits on the same SQLite WAL as the node tree,
 #      FUSE_LK lands in-process. Expected: dominated by SQLite BEGIN
 #      IMMEDIATE + INSERT + DELETE. Should be well under a network RTT.
-#   B) meta-server (`mount --view alice --meta 127.0.0.1:...`): MetaEngine
+#   B) meta-server (`mount --view alice --meta-server 127.0.0.1:...`): MetaEngine
 #      lives in the meta-server process, FUSE_LK goes kernel->mount->loopback
 #      TCP->meta-server->SQLite and back. Expected: adds ~2 loopback RTTs.
 #
@@ -73,20 +73,20 @@ baseline "$F" "open+close only"
 bench    "$F" "flock -x cycle"
 
 # ---- B) meta-server path ----
-$Y data-server --listen $DATA --root .blk/central/data > .blk/data.log 2>&1 &
+$Y data-server --listen $DATA --data-dir .blk/central/data > .blk/data.log 2>&1 &
 DP=$!
-$Y meta-server --db-path .blk/centralmeta --listen $META_A > .blk/meta.log 2>&1 &
+$Y meta-server --meta-dir .blk/centralmeta --listen $META_A > .blk/meta.log 2>&1 &
 AMP=$!
 wait_port $DATA; wait_port $META_A
 # Strict view gate is the default: create the view on the central meta root.
-$Y view --db-path .blk/centralmeta create --view alice > .blk/create.log 2>&1
-$Y --home .blk/chome mount --view alice --mountpoint .blk/mnt_meta --meta "$META_A" --data $DATA --foreground > .blk/mnt_meta.log 2>&1 &
+$Y view --meta-dir .blk/centralmeta create --view alice > .blk/create.log 2>&1
+$Y --home .blk/chome mount --view alice --mountpoint .blk/mnt_meta --meta-server "$META_A" --data-servers $DATA --foreground > .blk/mnt_meta.log 2>&1 &
 MPM=$!
 sleep 2
 MF=.blk/mnt_meta/bench.lk
 : > "$MF"   # ensure it exists in the fresh on-demand view
 
-echo "-- B) meta-server (--meta 127.0.0.1:15126, loopback TCP) --"
+echo "-- B) meta-server (--meta-server 127.0.0.1:15126, loopback TCP) --"
 baseline "$MF" "open+close only"
 bench    "$MF" "flock -x cycle"
 

@@ -46,7 +46,7 @@ $Y init --view team --manifest .ftest/team.manifest > .ftest/init.log 2>&1 \
   && ok "seeded physical base view 'team'" || { bad "init failed: $(cat .ftest/init.log)"; exit 1; }
 
 # Real content must exist BEFORE the fork: bytes are what a fork shares.
-$Y mount --view team -m .ftest/mnt_base --strict --foreground > .ftest/base.log 2>&1 &
+$Y mount --view team -m .ftest/mnt_base --no-cache --foreground > .ftest/base.log 2>&1 &
 BP=$!
 sleep 1.5
 T sh -c "printf 'report-body' > .ftest/mnt_base/docs/2026/a.md" \
@@ -56,92 +56,92 @@ T sh -c "printf 'rawdata123' > .ftest/mnt_base/data/raw/big.bin"
 fusermount -u .ftest/mnt_base 2>/dev/null; kill $BP 2>/dev/null; wait $BP 2>/dev/null
 
 echo "===== 1) view fork: independent tree, own definition slot ====="
-$Y view --db-path .ftest/home fork --name lab --base team > .ftest/fork.log 2>&1 \
+$Y view --meta-dir .ftest/home fork --name lab --base team > .ftest/fork.log 2>&1 \
   && ok "view fork --name lab --base team" || bad "fork failed: $(cat .ftest/fork.log)"
 grep -q "forked view 'lab' from base 'team'" .ftest/fork.log \
   && ok "fork reports entry + shared-object counts" || bad "fork output: $(cat .ftest/fork.log)"
 [ -f .ftest/home/meta/lab.db ] && ok "fork owns meta/lab.db" || bad "fork tree missing"
 [ "$(cat .ftest/home/meta/views/lab.layout 2>/dev/null)" = "fork team" ] \
   && ok "definition slot records 'fork team'" || bad "lab.layout wrong: $(cat .ftest/home/meta/views/lab.layout 2>/dev/null)"
-$Y view --db-path .ftest/home list > .ftest/list.log 2>&1
+$Y view --meta-dir .ftest/home list > .ftest/list.log 2>&1
 grep -q "fork 'lab' of base 'team'" .ftest/list.log \
   && ok "view list explains the fork's mount semantics" || bad "fork line missing: $(cat .ftest/list.log)"
 grep -q "base view 'team' -> own tree meta/team.db" .ftest/list.log \
   && ok "view list also names the BARE base view" || bad "bare base line missing: $(cat .ftest/list.log)"
 
 echo "===== 1b) curated fork: --empty + graft, one transaction, no bytes ====="
-$Y view --db-path .ftest/home fork --name cur --base team --empty > .ftest/cur.log 2>&1 \
+$Y view --meta-dir .ftest/home fork --name cur --base team --empty > .ftest/cur.log 2>&1 \
   && ok "view fork --empty" || bad "empty fork failed: $(cat .ftest/cur.log)"
 grep -q "as an EMPTY tree: root only" .ftest/cur.log \
   && ok "empty fork reports a root-only tree" || bad "empty fork output: $(cat .ftest/cur.log)"
 [ "$(cat .ftest/home/meta/views/cur.layout 2>/dev/null)" = "fork team" ] \
   && ok "an empty fork records the same 'fork team' definition" || bad "cur.layout wrong"
-$Y view --db-path .ftest/home export --view cur --out .ftest/cur0.jsonl > /dev/null 2>&1
+$Y view --meta-dir .ftest/home export --view cur --out .ftest/cur0.jsonl > /dev/null 2>&1
 grep -q '"nodes":1' .ftest/cur0.jsonl \
   && ok "empty fork exports exactly one row (the root)" || bad "empty fork not empty: $(head -1 .ftest/cur0.jsonl)"
 cat > .ftest/graft.tsv <<'EOF'
 docs/2026/a.md	reports/2026-annual.md
 data/raw	tables/raw
 EOF
-$Y view --db-path .ftest/home graft --name cur --src team --map - < .ftest/graft.tsv > .ftest/graft.log 2>&1 \
+$Y view --meta-dir .ftest/home graft --name cur --src team --map - < .ftest/graft.tsv > .ftest/graft.log 2>&1 \
   && ok "view graft --map - (plan piped on stdin)" || bad "graft failed: $(cat .ftest/graft.log)"
 grep -q "^grafted .* from 'team' into 'cur'" .ftest/graft.log \
   && ok "graft reports entries, source and destination" || bad "graft output: $(cat .ftest/graft.log)"
-$Y view --db-path .ftest/home export --view cur --out .ftest/cur1.jsonl --force > /dev/null 2>&1
+$Y view --meta-dir .ftest/home export --view cur --out .ftest/cur1.jsonl --force > /dev/null 2>&1
 grep -q '"name":"reports"' .ftest/cur1.jsonl \
   && ok "a missing destination directory is created" || bad "reports dir missing: $(head -1 .ftest/cur1.jsonl)"
 grep -q '"name":"2026-annual.md"' .ftest/cur1.jsonl \
   && ok "the grafted entry landed under its NEW name" || bad "rename did not land"
 grep -q '"name":"raw"' .ftest/cur1.jsonl \
   && ok "a directory source brought its subtree" || bad "subtree missing"
-$Y view --db-path .ftest/home graft --name cur --src team --map .ftest/graft.tsv > .ftest/graft2.log 2>&1 \
+$Y view --meta-dir .ftest/home graft --name cur --src team --map .ftest/graft.tsv > .ftest/graft2.log 2>&1 \
   && bad "re-grafting the same plan was accepted" || ok "a colliding name refuses the WHOLE plan"
 grep -q "already exists in the destination" .ftest/graft2.log \
   && ok "the refusal names the collision and the way out" || bad "collision text: $(cat .ftest/graft2.log)"
-$Y view --db-path .ftest/home graft --name cur --src team --map .ftest/graft.tsv --skip-existing > .ftest/graft3.log 2>&1 \
+$Y view --meta-dir .ftest/home graft --name cur --src team --map .ftest/graft.tsv --skip-existing > .ftest/graft3.log 2>&1 \
   && ok "--skip-existing merges instead of refusing" || bad "skip-existing failed: $(cat .ftest/graft3.log)"
 grep -qE "grafted 0 entries .*, [0-9]+ skipped" .ftest/graft3.log \
   && ok "nothing new landed; collisions counted as skipped" || bad "skip count: $(cat .ftest/graft3.log)"
-$Y view --db-path .ftest/home graft --name team --map .ftest/graft.tsv > .ftest/graft4.log 2>&1 \
+$Y view --meta-dir .ftest/home graft --name team --map .ftest/graft.tsv > .ftest/graft4.log 2>&1 \
   && bad "a base view accepted a graft without --src" || ok "grafting into a base view without --src refused"
 grep -q "is a base view — pass --src" .ftest/graft4.log \
   && ok "the refusal explains how to name the source" || bad "base-target text: $(cat .ftest/graft4.log)"
 
 echo "===== 2) guards: duplicates, self-fork, governed/missing bases, alias target ====="
-$Y view --db-path .ftest/home fork --name lab --base team > .ftest/g1.log 2>&1
+$Y view --meta-dir .ftest/home fork --name lab --base team > .ftest/g1.log 2>&1
 [ $? -ne 0 ] && grep -q "already has a definition" .ftest/g1.log \
   && ok "re-forking an existing name refused" || bad "duplicate fork guard: $(cat .ftest/g1.log)"
-$Y view --db-path .ftest/home fork --name team --base team > .ftest/g2.log 2>&1
+$Y view --meta-dir .ftest/home fork --name team --base team > .ftest/g2.log 2>&1
 [ $? -ne 0 ] && grep -q "must differ from its base" .ftest/g2.log \
   && ok "fork name == base refused" || bad "self-fork guard: $(cat .ftest/g2.log)"
 echo "only /docs" > .ftest/docs.layout
-$Y view --db-path .ftest/home define --name lens --base team --rules .ftest/docs.layout > .ftest/g3.log 2>&1
-$Y view --db-path .ftest/home fork --name lab2 --base lens > .ftest/g4.log 2>&1
+$Y view --meta-dir .ftest/home define --name lens --base team --rules .ftest/docs.layout > .ftest/g3.log 2>&1
+$Y view --meta-dir .ftest/home fork --name lab2 --base lens > .ftest/g4.log 2>&1
 [ $? -ne 0 ] && grep -q "is governed by a definition" .ftest/g4.log \
   && ok "forking a governed (lens) name refused" || bad "governed-base guard: $(cat .ftest/g4.log)"
-$Y view --db-path .ftest/home alias --name labpub --real lab > .ftest/g5.log 2>&1
+$Y view --meta-dir .ftest/home alias --name labpub --real lab > .ftest/g5.log 2>&1
 [ $? -ne 0 ] && grep -q "is a fork" .ftest/g5.log \
   && ok "alias pointing at a fork refused (fork is a tree, not a public name)" || bad "alias-to-fork guard: $(cat .ftest/g5.log)"
-$Y view --db-path .ftest/home fork --name lab3 --base ghost > .ftest/g6.log 2>&1
+$Y view --meta-dir .ftest/home fork --name lab3 --base ghost > .ftest/g6.log 2>&1
 [ $? -ne 0 ] && grep -q "no physical base tree" .ftest/g6.log \
   && ok "fork of a view with no local tree refused (+ PG caveat)" || bad "missing-base guard: $(cat .ftest/g6.log)"
-$Y view --db-path .ftest/home rm --name lens > /dev/null 2>&1
+$Y view --meta-dir .ftest/home rm --name lens > /dev/null 2>&1
 
 echo "===== 3) apikey list --view filters by the view a key can open ====="
-$Y apikey --db-path .ftest/home create --label lab-agent --view lab > .ftest/ak1.log 2>&1
-$Y apikey --db-path .ftest/home create --label base-agent --view team > .ftest/ak2.log 2>&1
-$Y apikey --db-path .ftest/home list --view lab > .ftest/akl.log 2>&1
+$Y apikey --meta-dir .ftest/home create --label lab-agent --view lab > .ftest/ak1.log 2>&1
+$Y apikey --meta-dir .ftest/home create --label base-agent --view team > .ftest/ak2.log 2>&1
+$Y apikey --meta-dir .ftest/home list --view lab > .ftest/akl.log 2>&1
 if grep -q "lab-agent" .ftest/akl.log && ! grep -q "base-agent" .ftest/akl.log; then
   ok "list --view lab shows only the fork-bound key"
 else bad "view-filtered list wrong: $(cat .ftest/akl.log)"; fi
 grep -q "1 bound key(s) for view 'lab' of 2 total" .ftest/akl.log \
   && ok "filtered list reports the bound/total counts" || bad "count line missing: $(cat .ftest/akl.log)"
-$Y apikey --db-path .ftest/home list > .ftest/akall.log 2>&1
+$Y apikey --meta-dir .ftest/home list > .ftest/akall.log 2>&1
 grep -q "lab-agent" .ftest/akall.log && grep -q "base-agent" .ftest/akall.log \
   && ok "unfiltered list still shows every key" || bad "unfiltered list wrong: $(cat .ftest/akall.log)"
 
 echo "===== 4) LOCAL fork mount: structure writable, content EROFS ====="
-$Y mount --view lab -m .ftest/mnt_lab --strict --foreground > .ftest/lab.log 2>&1 &
+$Y mount --view lab -m .ftest/mnt_lab --no-cache --foreground > .ftest/lab.log 2>&1 &
 LP=$!
 sleep 1.5
 grep -q "structure writable, content read-only" .ftest/lab.log \
@@ -173,7 +173,7 @@ T chmod 600 $L/docs/2026/empty.md && ok "chmod allowed (attribute update)" || ba
 # surfaced at fsync/close — a shell `>>` exited 0 having written nothing. A
 # content-read-only mount no longer requests writeback, so the refusal must
 # land on the first write here too (old behavior: rc=0 and no stderr).
-echo "===== 4b) LOCAL fork mount WITHOUT --strict: refusal lands on write(2) ====="
+echo "===== 4b) LOCAL fork mount WITHOUT --no-cache: refusal lands on write(2) ====="
 $Y mount --view lab -m .ftest/mnt_lab2 --foreground > .ftest/lab2.log 2>&1 &
 LP2=$!
 sleep 1.5
@@ -191,7 +191,7 @@ fusermount -u .ftest/mnt_lab2 2>/dev/null; kill $LP2 2>/dev/null; wait $LP2 2>/d
 
 echo "===== 5) the base is untouched: deletes/renames stay inside the fork ====="
 fusermount -u .ftest/mnt_lab 2>/dev/null; kill $LP 2>/dev/null; wait $LP 2>/dev/null
-$Y mount --view team -m .ftest/mnt_base --strict --foreground > .ftest/base2.log 2>&1 &
+$Y mount --view team -m .ftest/mnt_base --no-cache --foreground > .ftest/base2.log 2>&1 &
 BP2=$!
 sleep 1.5
 B=.ftest/mnt_base
@@ -203,14 +203,14 @@ chk "$(T cat $B/photos/private/x.jpg)" "priv" "base name still reads x.jpg (fork
 echo "===== 6) REMOTE fork mount: same split through the governance server ====="
 META=127.0.0.1:15362; DATA=127.0.0.1:15363
 wait_port(){ local a=$1; for _ in $(seq 1 100); do (echo >/dev/tcp/${a%%:*}/${a##*:}) 2>/dev/null && return 0; sleep 0.05; done; return 1; }
-$Y meta-server --db-path .ftest/home --listen $META > .ftest/meta_srv.log 2>&1 &
+$Y meta-server --meta-dir .ftest/home --listen $META > .ftest/meta_srv.log 2>&1 &
 MSP=$!
-$Y data-server --listen $DATA --root .ftest/home > .ftest/data_srv.log 2>&1 &
+$Y data-server --listen $DATA --data-dir .ftest/home > .ftest/data_srv.log 2>&1 &
 DSP=$!
 wait_port $META && wait_port $DATA || bad "fork servers failed to start"
-$Y mount --view lab -m .ftest/mnt_srv_lab --meta $META --data $DATA --foreground > .ftest/srv_lab.log 2>&1 &
+$Y mount --view lab -m .ftest/mnt_srv_lab --meta-server $META --data-servers $DATA --foreground > .ftest/srv_lab.log 2>&1 &
 SLP=$!
-$Y mount --view team -m .ftest/mnt_srv_base --meta $META --data $DATA --foreground > .ftest/srv_base.log 2>&1 &
+$Y mount --view team -m .ftest/mnt_srv_base --meta-server $META --data-servers $DATA --foreground > .ftest/srv_base.log 2>&1 &
 SBP=$!
 sleep 2
 SL=.ftest/mnt_srv_lab; SB=.ftest/mnt_srv_base
@@ -241,23 +241,23 @@ chk "$(T cat $B/docs/2026/a.md)" "report-body" "base still intact after the remo
 fusermount -u .ftest/mnt_base 2>/dev/null; kill $BP2 2>/dev/null; wait $BP2 2>/dev/null
 
 echo "===== 7) view rm deletes the fork tree only ====="
-$Y view --db-path .ftest/home rm --name lab > .ftest/rm.log 2>&1 \
+$Y view --meta-dir .ftest/home rm --name lab > .ftest/rm.log 2>&1 \
   && ok "view rm --name lab" || bad "fork rm failed: $(cat .ftest/rm.log)"
 grep -q "removed fork view 'lab' of base 'team'" .ftest/rm.log \
   && ok "removal says the fork's own tree is gone" || bad "rm output: $(cat .ftest/rm.log)"
 [ ! -e .ftest/home/meta/lab.db ] && ok "meta/lab.db deleted (with its wal/shm)" || bad "fork tree left behind"
 [ -f .ftest/home/meta/team.db ] && ok "base tree untouched" || bad "base tree vanished"
-$Y view --db-path .ftest/home list > .ftest/list2.log 2>&1
+$Y view --meta-dir .ftest/home list > .ftest/list2.log 2>&1
 grep -q "fork 'lab'" .ftest/list2.log && bad "removed fork still listed" || ok "removed fork no longer listed"
 grep -q "base view 'team' -> own tree meta/team.db" .ftest/list2.log \
   && ok "base view remains the only entry" || bad "base view missing after rm: $(cat .ftest/list2.log)"
 # Base content survives the fork removal (the ledger rebuild must not free it).
-$Y mount --view team -m .ftest/mnt_base --strict --foreground > .ftest/base3.log 2>&1 &
+$Y mount --view team -m .ftest/mnt_base --no-cache --foreground > .ftest/base3.log 2>&1 &
 BP3=$!
 sleep 1.5
 chk "$(T cat .ftest/mnt_base/docs/2026/a.md)" "report-body" "base content readable after the fork is gone"
 chk "$(T cat .ftest/mnt_base/photos/private/x.jpg)" "priv" "base blob the fork deleted still lives (ledger hold kept)"
-$Y view --db-path .ftest/home rm --name lab > .ftest/rm2.log 2>&1
+$Y view --meta-dir .ftest/home rm --name lab > .ftest/rm2.log 2>&1
 [ $? -ne 0 ] && ok "removing the fork twice is refused" || bad "second rm should fail"
 fusermount -u .ftest/mnt_base 2>/dev/null; kill $BP3 2>/dev/null; wait $BP3 2>/dev/null
 

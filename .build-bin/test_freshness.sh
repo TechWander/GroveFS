@@ -2,7 +2,7 @@
 # Non-strict cross-client FRESHNESS e2e (L3). This suite proves that the
 # existing push-based invalidation model (EventBus + inval_inode/inval_entry)
 # already gives immediate visibility between clients sharing a `meta-server`,
-# WITHOUT `--strict`. The `--strict` flag (FOPEN_DIRECT_IO + zero attr TTL) is
+# WITHOUT `--no-cache`. The `--no-cache` flag (FOPEN_DIRECT_IO + zero attr TTL) is
 # a conservative fallback for the writeback-cache race window; it is NOT
 # required for the normal "A writes → B reads fresh data" scenario.
 #
@@ -40,18 +40,18 @@ cleanup(){
 trap cleanup EXIT
 
 # ---- central services ----
-$Y data-server --listen $DATA --root .fresh/central/data > .fresh/data.log 2>&1 &
+$Y data-server --listen $DATA --data-dir .fresh/central/data > .fresh/data.log 2>&1 &
 DP=$!
-$Y meta-server --db-path .fresh/central --listen $META > .fresh/meta.log 2>&1 &
+$Y meta-server --meta-dir .fresh/central --listen $META > .fresh/meta.log 2>&1 &
 MP=$!
 wait_port $DATA && wait_port $META || { echo "servers failed"; tail -3 .fresh/data.log .fresh/meta.log; exit 1; }
 
 # ---- two NON-STRICT client mounts of the same user ----
 # Views are explicit: create the base view first.
-$Y view --db-path .fresh/central create --view alice > .fresh/create.log 2>&1
-$Y --home .fresh/m1 mount --view alice --mountpoint .fresh/mnt_a --meta $META --data $DATA --foreground > .fresh/a.log 2>&1 &
+$Y view --meta-dir .fresh/central create --view alice > .fresh/create.log 2>&1
+$Y --home .fresh/m1 mount --view alice --mountpoint .fresh/mnt_a --meta-server $META --data-servers $DATA --foreground > .fresh/a.log 2>&1 &
 AP=$!
-$Y --home .fresh/m2 mount --view alice --mountpoint .fresh/mnt_b --meta $META --data $DATA --foreground > .fresh/b.log 2>&1 &
+$Y --home .fresh/m2 mount --view alice --mountpoint .fresh/mnt_b --meta-server $META --data-servers $DATA --foreground > .fresh/b.log 2>&1 &
 BP=$!
 sleep 2
 
@@ -88,7 +88,7 @@ sync "$A" 2>/dev/null
 sleep 0.3
 
 size_b=$(T stat --format='%s' "$B/shared.log" 2>/dev/null || echo "-1")
-chk "$size_b" "0" "B sees truncated file (size=0) after A's :> (no --strict)"
+chk "$size_b" "0" "B sees truncated file (size=0) after A's :> (no --no-cache)"
 
 # ---------------------------------------------------------------------------
 echo "===== 3) Reverse-read-after-append: A sees B's new bytes ====="

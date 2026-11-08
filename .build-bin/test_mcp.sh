@@ -44,7 +44,7 @@ $Y init --view team --manifest .mcptest/team.manifest > .mcptest/init.log 2>&1 \
 echo "===== 1) MCP handshake + tool discovery ====="
 MCPOUT=.mcptest/stdio.out
 mkfifo .mcptest/in
-$Y mcp --db-path "$BASE" < .mcptest/in > "$MCPOUT" 2> .mcptest/mcp.err &
+$Y mcp --meta-dir "$BASE" < .mcptest/in > "$MCPOUT" 2> .mcptest/mcp.err &
 MCPPID=$!
 exec 3>.mcptest/in            # held-open writer: the server stays alive
 say(){ printf '%s\n' "$1" >&3; }
@@ -361,7 +361,7 @@ if have 68 '.result.content[0].text|test("removed fork view .pick.")'; then
 else bad "pick rm: $(resp 68 || echo NO-RESPONSE)"; fi
 
 # One contract, two entrances: the CLI sees the agent's state verbatim.
-$Y view --db-path "$BASE" list > .mcptest/cli_list.log 2>&1
+$Y view --meta-dir "$BASE" list > .mcptest/cli_list.log 2>&1
 grep -q "view 'release' -> base 'team': 1 hide, 0 only, 0 reloc rule(s) (read-only)" .mcptest/cli_list.log \
   && ok "CLI 'grovefs view list' shows the agent-defined lens verbatim" || bad "CLI view list: $(cat .mcptest/cli_list.log)"
 

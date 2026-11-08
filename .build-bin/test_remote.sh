@@ -13,7 +13,7 @@ export GROVEFS_HOME=$PWD/.test/rhome      # meta (view DBs) live client-side
                                           # physical objects live server-side (.test/rsrv)
 
 echo "=== start data-server (bg) ==="
-$Y data-server --listen $ADDR --root $PWD/.test/rsrv > .test/srv.log 2>&1 &
+$Y data-server --listen $ADDR --data-dir $PWD/.test/rsrv > .test/srv.log 2>&1 &
 SP=$!
 sleep 0.8
 
@@ -21,7 +21,7 @@ echo "=== init alice view (empty tree) ==="
 $Y init --view alice > /dev/null
 
 echo "=== mount alice against REMOTE backend ==="
-$Y mount --view alice --mountpoint .test/mnt_r --data $ADDR --foreground > .test/mnt_r.log 2>&1 &
+$Y mount --view alice --mountpoint .test/mnt_r --data-servers $ADDR --foreground > .test/mnt_r.log 2>&1 &
 MP=$!
 sleep 1.0
 

@@ -154,9 +154,9 @@ cat > .govcheck/map.layout <<'EOF'
 map /docs/hold /docs/renamed
 EOF
 
-$Y mount --view gov --mountpoint .govcheck/mnt_base --strict --foreground > .govcheck/base.log 2>&1 &
+$Y mount --view gov --mountpoint .govcheck/mnt_base --no-cache --foreground > .govcheck/base.log 2>&1 &
 BASEP=$!
-$Y mount --view gov --mountpoint .govcheck/mnt_lens --strict --layout .govcheck/link.layout --foreground > .govcheck/lens.log 2>&1 &
+$Y mount --view gov --mountpoint .govcheck/mnt_lens --no-cache --layout .govcheck/link.layout --foreground > .govcheck/lens.log 2>&1 &
 LENP=$!
 PIDS=$(jobs -p)
 cleanup(){ fusermount -u .govcheck/mnt_base .govcheck/mnt_lens .govcheck/mnt_map 2>/dev/null; kill $PIDS 2>/dev/null; }
@@ -189,7 +189,7 @@ fi
 echo "===== B3) map relocation keeps a single object and vacates the source spot ====="
 # Fresh tree for map: rebuild the file (docs/f was deleted above).
 T sh -c "printf 'ren' > $BASE/docs/hold" && ok "seed a file for the map check" || bad "seed hold failed"
-$Y mount --view gov --mountpoint .govcheck/mnt_map --strict --layout .govcheck/map.layout --foreground > .govcheck/map.log 2>&1 &
+$Y mount --view gov --mountpoint .govcheck/mnt_map --no-cache --layout .govcheck/map.layout --foreground > .govcheck/map.log 2>&1 &
 MAPP=$!
 sleep 1.5
 MAP=.govcheck/mnt_map
@@ -199,11 +199,11 @@ fusermount -u $MAP 2>/dev/null; kill $MAPP 2>/dev/null; wait $MAPP 2>/dev/null
 
 echo "===== B4) zero-copy import: the view and the source share ONE inode, source is never hurt ====="
 mkdir -p .govcheck/src && printf 'LEGACY' > .govcheck/src/legacy.bin
-$Y import --db-path "$HOME_DIR" --view gov --source .govcheck/src > .govcheck/import.log 2>&1 \
+$Y import --meta-dir "$HOME_DIR" --view gov --source .govcheck/src > .govcheck/import.log 2>&1 \
   && ok "import legacy tree into view gov" || bad "import failed: $(cat .govcheck/import.log)"
 # Re-mount base so imported entries are visible fresh.
 fusermount -u $BASE 2>/dev/null; kill $BASEP 2>/dev/null; wait $BASEP 2>/dev/null
-$Y mount --view gov --mountpoint .govcheck/mnt_base --strict --foreground > .govcheck/base2.log 2>&1 &
+$Y mount --view gov --mountpoint .govcheck/mnt_base --no-cache --foreground > .govcheck/base2.log 2>&1 &
 BASEP=$!; trap 'cleanup' EXIT; sleep 1.5
 BASE=.govcheck/mnt_base
 if [ -e "$BASE/src/legacy.bin" ]; then

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # PostgreSQL parallel-write path e2e (paper Sec. 5 I3 + Sec. 9 scalability
-# boundary). Drives a real FUSE mount stack against a `meta-server --store
+# boundary). Drives a real FUSE mount stack against a `meta-server --meta-store
 # postgres://…` whose write engine now uses per-op SERIALIZABLE transactions
 # checked out from an 8-connection writer pool (HopsFS route on top of
 # PostgreSQL SSI). Proves:
@@ -47,12 +47,12 @@ chk(){ if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got '$1' want '$2')"; fi;
 T(){ timeout 12 "$@"; }
 
 echo "===== 1) start data-server + PG-backed meta-server ====="
-$Y data-server --listen $DATA --root .pgpar/central/data > .pgpar/data.log 2>&1 &
+$Y data-server --listen $DATA --data-dir .pgpar/central/data > .pgpar/data.log 2>&1 &
 DP=$!
 # Views are explicit: provision the PG schema up front, before any mount.
-$Y view --store "$PGURI" --db-path .pgpar/home create --view "$VIEW" > .pgpar/create.log 2>&1 \
-    || { bad "view create --store failed"; cat .pgpar/create.log; exit 1; }
-$Y meta-server --listen $META --home .pgpar/home --store "$PGURI" > .pgpar/meta.log 2>&1 &
+$Y view --meta-store "$PGURI" --meta-dir .pgpar/home create --view "$VIEW" > .pgpar/create.log 2>&1 \
+    || { bad "view create --meta-store failed"; cat .pgpar/create.log; exit 1; }
+$Y meta-server --listen $META --home .pgpar/home --meta-store "$PGURI" > .pgpar/meta.log 2>&1 &
 MP=$!
 wait_port $DATA || { bad "data-server did not bind"; exit 1; }
 wait_port $META || { bad "meta-server did not bind"; cat .pgpar/meta.log; exit 1; }
@@ -67,11 +67,11 @@ RA=0; RB=0; RC=0
 trap cleanup EXIT
 
 echo "===== 2) mount three independent clients on the same PG-backed view ====="
-$Y --home .pgpar/m1 mount --view "$VIEW" --mountpoint .pgpar/mnt_a --meta $META --data $DATA --foreground > .pgpar/mnt_a.log 2>&1 &
+$Y --home .pgpar/m1 mount --view "$VIEW" --mountpoint .pgpar/mnt_a --meta-server $META --data-servers $DATA --foreground > .pgpar/mnt_a.log 2>&1 &
 RA=$!
-$Y --home .pgpar/m2 mount --view "$VIEW" --mountpoint .pgpar/mnt_b --meta $META --data $DATA --foreground > .pgpar/mnt_b.log 2>&1 &
+$Y --home .pgpar/m2 mount --view "$VIEW" --mountpoint .pgpar/mnt_b --meta-server $META --data-servers $DATA --foreground > .pgpar/mnt_b.log 2>&1 &
 RB=$!
-$Y --home .pgpar/m3 mount --view "$VIEW" --mountpoint .pgpar/mnt_c --meta $META --data $DATA --foreground > .pgpar/mnt_c.log 2>&1 &
+$Y --home .pgpar/m3 mount --view "$VIEW" --mountpoint .pgpar/mnt_c --meta-server $META --data-servers $DATA --foreground > .pgpar/mnt_c.log 2>&1 &
 RC=$!
 sleep 2.5
 A=.pgpar/mnt_a; B=.pgpar/mnt_b; C=.pgpar/mnt_c

@@ -12,9 +12,9 @@ fn gv(args: &[&str]) -> (bool, String, String) {
         .args(args)
         .env("GROVEFS_CONFIG", "/nonexistent/grovefs.conf")
         .env_remove("GROVEFS_HOME")
-        .env_remove("GROVEFS_META")
-        .env_remove("GROVEFS_DATA")
-        .env_remove("GROVEFS_STORE")
+        .env_remove("GROVEFS_META_SERVER")
+        .env_remove("GROVEFS_DATA_SERVERS")
+        .env_remove("GROVEFS_META_STORE")
         .env_remove("GROVEFS_TOKEN")
         .env_remove("GROVEFS_API_KEY")
         .output()
@@ -89,12 +89,12 @@ fn objects(home: &Path) -> Vec<std::path::PathBuf> {
 fn the_store_root_alone_is_enough_to_count_bytes() {
     let dir = tempfile::tempdir().unwrap();
     let home = populated(dir.path());
-    assert_eq!(total(&home, &[]), 3500, "du --home --view, no --data-root");
+    assert_eq!(total(&home, &[]), 3500, "du --home --view, no --data-dir");
     // Naming the data root explicitly measures the same colocated layout.
     assert_eq!(
-        total(&home, &["--data-root", home.to_str().unwrap()]),
+        total(&home, &["--data-dir", home.to_str().unwrap()]),
         3500,
-        "du --home --data-root"
+        "du --home --data-dir"
     );
 }
 

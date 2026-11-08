@@ -9,7 +9,7 @@
 //!
 //! The data source is resolved explicitly ([`data_source`]): a size sweep
 //! either has a place to read bytes from, or the command refuses. An unset
-//! `--data`/`--data-root` never yields a report of all zeros.
+//! `--data-servers`/`--data-dir` never yields a report of all zeros.
 //!
 //! For 15k files this typically runs in <50 ms vs ~25 s via FUSE.
 
@@ -64,7 +64,7 @@ pub fn run(opts: &DuOpts) -> io::Result<()> {
         // command exists to avoid, so the gap is announced, not folded in.
         eprintln!(
             "warning: {lost} of {} object(s) are not in the data source and count as 0 bytes \
-             (objects on other storage roots need their own --data/--data-root)",
+             (objects on other storage roots need their own --data-servers/--data-dir)",
             refs.len()
         );
     }
@@ -72,7 +72,7 @@ pub fn run(opts: &DuOpts) -> io::Result<()> {
         // A damaged striped object is bytes that ARE present but not in the
         // contiguous run the size depends on — a different problem from a plain
         // miss, and one a bare shorter total would hide. Announce it on its own
-        // line so "content is corrupt" is never mistaken for "pass --data-root".
+        // line so "content is corrupt" is never mistaken for "pass --data-dir".
         eprintln!(
             "warning: {damaged} of {} object(s) are damaged striped objects and are excluded \
              from the total (their true size is unknown); first: {}",
@@ -167,7 +167,7 @@ fn gather_nodes(opts: &DuOpts) -> io::Result<Vec<FlatNode>> {
         let db_path = opts.db_path.as_ref().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "need --meta, --store or --db-path",
+                "need --meta-server, --meta-store or --meta-dir",
             )
         })?;
         gather_sqlite(db_path, &opts.view)
@@ -177,7 +177,7 @@ fn gather_nodes(opts: &DuOpts) -> io::Result<Vec<FlatNode>> {
 fn resolve_store(explicit: &Option<String>) -> Option<String> {
     explicit
         .clone()
-        .or_else(|| std::env::var("GROVEFS_STORE").ok())
+        .or_else(|| std::env::var("GROVEFS_META_STORE").ok())
 }
 
 fn gather_pg(uri: &str, view: &str) -> io::Result<Vec<FlatNode>> {
@@ -323,7 +323,7 @@ pub enum DataSource {
     Local(PathBuf),
 }
 
-/// Split a `--data`/`GROVEFS_DATA` value into addresses (same trimming the
+/// Split a `--data-servers`/`GROVEFS_DATA_SERVERS` value into addresses (same trimming the
 /// mount uses, so one string form means the same thing in both commands).
 fn split_addrs(list: &str) -> Vec<String> {
     list.split(',')
@@ -334,7 +334,7 @@ fn split_addrs(list: &str) -> Vec<String> {
 }
 
 /// Decide where to read object sizes from. Precedence is
-/// `--data` > `--data-root` > the local store root the tree itself came from.
+/// `--data-servers` > `--data-dir` > the local store root the tree itself came from.
 ///
 /// The last step is what makes `grovefs du --home R --view V` self-contained:
 /// `grovefs init` puts `meta/<view>.db` and `blocks/` under the same root R.
@@ -343,7 +343,7 @@ fn split_addrs(list: &str) -> Vec<String> {
 /// returns an error instead of measuring nothing.
 pub fn data_source(opts: &DuOpts) -> io::Result<DataSource> {
     let data = opts.data.clone().or_else(|| {
-        std::env::var("GROVEFS_DATA")
+        std::env::var("GROVEFS_DATA_SERVERS")
             .ok()
             .filter(|s| !s.is_empty())
     });
@@ -381,8 +381,8 @@ fn data_source_at(
     }
     Err(io::Error::new(
         io::ErrorKind::InvalidInput,
-        "no data source to measure: pass --data <host:port> for a data-server \
-         (or set GROVEFS_DATA), or --data-root <dir holding blocks/>",
+        "no data source to measure: pass --data-servers <host:port> for a data-server \
+         (or set GROVEFS_DATA_SERVERS), or --data-dir <dir holding blocks/>",
     ))
 }
 
@@ -409,8 +409,8 @@ fn resolve_sizes(
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     format!(
-                        "no blocks/ under {} — objects are not here; point --data at \
-                         the data-server, or --data-root at the storage root holding \
+                        "no blocks/ under {} — objects are not here; point --data-servers at \
+                         the data-server, or --data-dir at the storage root holding \
                          blocks/",
                         root.display()
                     ),
@@ -497,13 +497,13 @@ fn check_server_count(addrs: &[String], refs: &[String]) -> io::Result<()> {
             let n = *counts.iter().next().unwrap();
             if n > m {
                 Err(err(format!(
-                    "this tree was written across {n} data-servers but --data names {m}: the \
+                    "this tree was written across {n} data-servers but --data-servers names {m}: the \
                      stripe map needs every address in the writer's order, so pass the full \
-                     list as one comma-separated value (e.g. --data host1:port,host2:port)"
+                     list as one comma-separated value (e.g. --data-servers host1:port,host2:port)"
                 )))
             } else {
                 Err(err(format!(
-                    "this tree was written across {n} data-servers but --data names {m}: extra \
+                    "this tree was written across {n} data-servers but --data-servers names {m}: extra \
                      addresses move logical chunks onto servers that never held them, so pass \
                      exactly the {n} addresses in the order the writer used"
                 )))
@@ -519,7 +519,7 @@ fn check_server_count(addrs: &[String], refs: &[String]) -> io::Result<()> {
             Err(err(format!(
                 "this tree holds objects written across {list} different numbers of \
                  data-servers (a store that was expanded after some of it was written): one \
-                 --data list cannot measure both generations, so measure each with the list \
+                 --data-servers list cannot measure both generations, so measure each with the list \
                  it was written with"
             )))
         }
@@ -614,7 +614,7 @@ fn resolve_remote(
                 // depends on, so its true size is unknown. Count it as 0 in the
                 // total (bytes that cannot be confirmed are not summed) but
                 // announce it apart from a plain miss, so "content is corrupt"
-                // is never read as "move the root / pass --data-root".
+                // is never read as "move the root / pass --data-dir".
                 Err(e) if crate::backend::ShardedBackend::is_damaged(&e) => {
                     damaged += 1;
                     first_damaged.get_or_insert_with(|| {
@@ -647,8 +647,8 @@ fn resolve_remote(
                 io::ErrorKind::NotFound,
                 format!(
                     "no object of this tree is on the listed data source (first miss: {}); \
-                     check that --data names the store this view was written to, or pass \
-                     --data-root for a local blocks/",
+                     check that --data-servers names the store this view was written to, or pass \
+                     --data-dir for a local blocks/",
                     first_missing.unwrap_or_default()
                 ),
             ));
@@ -822,7 +822,7 @@ mod tests {
         let err = data_source_at(Some(", ,"), None, Some("m:2"), None, None)
             .expect_err("a list without addresses is no source");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-        assert!(err.to_string().contains("--data"), "{err}");
+        assert!(err.to_string().contains("--data-servers"), "{err}");
     }
 
     #[test]
@@ -833,7 +833,7 @@ mod tests {
         );
     }
 
-    /// `--home`/`--db-path` names the root that holds both meta/ and blocks/,
+    /// `--home`/`--meta-dir` names the root that holds both meta/ and blocks/,
     /// so measuring a local store needs no second flag.
     #[test]
     fn a_local_sqlite_tree_infers_its_own_root() {
@@ -848,12 +848,12 @@ mod tests {
     #[test]
     fn a_remote_tree_without_a_data_source_is_refused() {
         for (label, res) in [
-            ("--meta", data_source_at(None, None, Some("m:2"), None, Some(&p("/store")))),
-            ("--store", data_source_at(None, None, None, Some("postgres://x"), Some(&p("/store")))),
+            ("--meta-server", data_source_at(None, None, Some("m:2"), None, Some(&p("/store")))),
+            ("--meta-store", data_source_at(None, None, None, Some("postgres://x"), Some(&p("/store")))),
         ] {
             let err = res.expect_err(&format!("{label} must not infer a local root"));
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{label}");
-            assert!(err.to_string().contains("--data"), "{label}: {err}");
+            assert!(err.to_string().contains("--data-servers"), "{label}: {err}");
         }
     }
 
@@ -874,7 +874,7 @@ mod tests {
         let err = check_server_count(&addrs(1), &stripe(2, &["a", "b"])).unwrap_err();
         let msg = err.to_string();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-        assert!(msg.contains("written across 2 data-servers but --data names 1"), "{msg}");
+        assert!(msg.contains("written across 2 data-servers but --data-servers names 1"), "{msg}");
         assert!(msg.contains("host1:port,host2:port"), "{msg}");
     }
 

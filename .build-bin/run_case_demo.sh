@@ -8,10 +8,10 @@ echo '### [存储机] $ grep -o "=.*" /etc/grovefs/grovefs.env | cut -d= -f2'
 TOK=$(grep -o '=.*' $S/etc/grovefs.env | cut -d= -f2)
 echo "$TOK"
 echo '### [存储机] $ grovefs data-server ...(前台)'
-nohup ./bin/grovefs data-server --listen 127.0.0.1:15100 --root $S/data --token "$TOK" >$S/ds.log 2>&1 &
+nohup ./bin/grovefs data-server --listen 127.0.0.1:15100 --data-dir $S/data --token "$TOK" >$S/ds.log 2>&1 &
 sleep 0.7
-echo '### [存储机] $ grovefs meta-server --db-path /data ...(前台)'
-nohup ./bin/grovefs meta-server --db-path $S/data --listen 127.0.0.1:15110 --token "$TOK" >$S/ms.log 2>&1 &
+echo '### [存储机] $ grovefs meta-server --meta-dir /data ...(前台)'
+nohup ./bin/grovefs meta-server --meta-dir $S/data --listen 127.0.0.1:15110 --token "$TOK" >$S/ms.log 2>&1 &
 sleep 1.0
 echo "--- data-server 终端回显 ---"; cat $S/ds.log
 echo "--- meta-server 终端回显 ---"; cat $S/ms.log
@@ -22,8 +22,8 @@ ls $S/data; find $S/data/blocks -type f | wc -l
 echo
 echo '### [客户端A] $ grovefs ... mount ... -m /mnt/da (前台,远程挂载不需要 --home)'
 # Strict view gate: the view is created explicitly before the first mount.
-./bin/grovefs view --db-path $S/data create --view share >$S/create.log 2>&1
-nohup ./bin/grovefs mount --view share --data 127.0.0.1:15100 --meta 127.0.0.1:15110 --token "$TOK" -m $S/mnt_da --foreground >$S/mntA.log 2>&1 &
+./bin/grovefs view --meta-dir $S/data create --view share >$S/create.log 2>&1
+nohup ./bin/grovefs mount --view share --data-servers 127.0.0.1:15100 --meta-server 127.0.0.1:15110 --token "$TOK" -m $S/mnt_da --foreground >$S/mntA.log 2>&1 &
 sleep 1.2
 echo "--- A 挂载进程回显 ---"; cat $S/mntA.log
 echo '### [客户端A] $ findmnt -T /mnt/da'
@@ -39,7 +39,7 @@ echo "### [存储机] 写完 blocks 对象数: $(find $S/data/blocks -type f | w
 find $S/data/blocks -type f | head -4; ls $S/data/meta
 echo
 echo '### [客户端B] $ grovefs ... --ro -m /mnt/db (前台)'
-nohup ./bin/grovefs mount --view share --data 127.0.0.1:15100 --meta 127.0.0.1:15110 --token "$TOK" --ro -m $S/mnt_db --foreground >$S/mntB.log 2>&1 &
+nohup ./bin/grovefs mount --view share --data-servers 127.0.0.1:15100 --meta-server 127.0.0.1:15110 --token "$TOK" --ro -m $S/mnt_db --foreground >$S/mntB.log 2>&1 &
 sleep 1.2
 echo "--- B 挂载进程回显 ---"; cat $S/mntB.log
 echo '### [客户端B] $ findmnt -T /mnt/db'
@@ -60,12 +60,12 @@ echo "round2-$(date +%s)" > $S/mnt_da/round2.txt
 sleep 0.3
 cat $S/mnt_db/round2.txt
 echo
-echo '### [存储机] $ grovefs apikey --db-path /data create --label reader --for mount --view share --ro'
-./bin/grovefs apikey --db-path $S/data create --label reader --for mount --view share --ro 2>&1
-echo '### [存储机] $ grovefs apikey --db-path /data create --label writer --for mount --view share'
-./bin/grovefs apikey --db-path $S/data create --label writer --for mount --view share 2>&1
-echo '### [存储机] $ grovefs apikey --db-path /data list'
-./bin/grovefs apikey --db-path $S/data list 2>&1
+echo '### [存储机] $ grovefs apikey --meta-dir /data create --label reader --for mount --view share --ro'
+./bin/grovefs apikey --meta-dir $S/data create --label reader --for mount --view share --ro 2>&1
+echo '### [存储机] $ grovefs apikey --meta-dir /data create --label writer --for mount --view share'
+./bin/grovefs apikey --meta-dir $S/data create --label writer --for mount --view share 2>&1
+echo '### [存储机] $ grovefs apikey --meta-dir /data list'
+./bin/grovefs apikey --meta-dir $S/data list 2>&1
 echo '# (a --view-bound key only opens that view; --ro is enforced server-side when the'
 echo '#  meta-server runs --require-api-key — the credential is the per-caller gate)'
 echo

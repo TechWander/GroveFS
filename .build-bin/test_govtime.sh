@@ -55,18 +55,18 @@ only /photos
 EOF
 
 META=127.0.0.1:15172; DATA=127.0.0.1:15173
-$Y meta-server --db-path "$GROVEFS_HOME" --listen $META > .govtime/meta.log 2>&1 &
+$Y meta-server --meta-dir "$GROVEFS_HOME" --listen $META > .govtime/meta.log 2>&1 &
 MSP=$!
-$Y data-server --listen $DATA --root "$GROVEFS_HOME" > .govtime/data.log 2>&1 &
+$Y data-server --listen $DATA --data-dir "$GROVEFS_HOME" > .govtime/data.log 2>&1 &
 DSP=$!
 cleanup(){ fusermount -u .govtime/mnt_base .govtime/mnt_dv .govtime/mnt_al 2>/dev/null; kill $MSP $DSP $(jobs -p) 2>/dev/null; }
 trap cleanup EXIT
 wait_port $META && wait_port $DATA && ok "meta/data servers up" || { bad "servers failed to start"; exit 1; }
 
 # writable base mount + a derived viewer mounted BY NAME, non-strict (kernel TTL caching on)
-$Y mount --view team -m .govtime/mnt_base --meta $META --data $DATA --foreground > .govtime/base.log 2>&1 &
-$Y view --db-path "$GROVEFS_HOME" define --name dv --base team --rules .govtime/narrow.rules > .govtime/def.log 2>&1
-$Y mount --view dv -m .govtime/mnt_dv --meta $META --data $DATA --foreground > .govtime/dv.log 2>&1 &
+$Y mount --view team -m .govtime/mnt_base --meta-server $META --data-servers $DATA --foreground > .govtime/base.log 2>&1 &
+$Y view --meta-dir "$GROVEFS_HOME" define --name dv --base team --rules .govtime/narrow.rules > .govtime/def.log 2>&1
+$Y mount --view dv -m .govtime/mnt_dv --meta-server $META --data-servers $DATA --foreground > .govtime/dv.log 2>&1 &
 sleep 2
 SB=.govtime/mnt_base; SV=.govtime/mnt_dv
 chk "$(T ls $SV | tr '\n' ' ')" "docs " "derived viewer starts narrowed to /docs"
@@ -75,10 +75,10 @@ chk "$(T ls $SV | tr '\n' ' ')" "docs " "derived viewer starts narrowed to /docs
 echo "===== 1) derived-view hot reload convergence ====="
 widen=(); narrow=()
 for i in 1 2 3; do
-  $Y view --db-path "$GROVEFS_HOME" define --name dv --base team --rules .govtime/broad.rules >/dev/null 2>&1
+  $Y view --meta-dir "$GROVEFS_HOME" define --name dv --base team --rules .govtime/broad.rules >/dev/null 2>&1
   el=$(poll 6000 "T ls $SV | grep -q photos"); rc=$?
   [ $rc -ne 0 ] && bad "hot reload widen #i did not converge in >6000ms" || widen+=("$el")
-  $Y view --db-path "$GROVEFS_HOME" define --name dv --base team --rules .govtime/narrow.rules >/dev/null 2>&1
+  $Y view --meta-dir "$GROVEFS_HOME" define --name dv --base team --rules .govtime/narrow.rules >/dev/null 2>&1
   el=$(poll 6000 "! T ls $SV | grep -q photos"); rc=$?
   [ $rc -ne 0 ] && bad "hot reload narrow #i did not converge in >6000ms" || narrow+=("$el")
 done
@@ -104,20 +104,20 @@ done
 
 # ---- 3) pure-alias gapless name rotation (--retire) latency ------------------
 echo "===== 3) alias --retire rotation latency (atomic, no gap) ====="
-$Y view --db-path "$GROVEFS_HOME" alias --name pub --real team > .govtime/al1.log 2>&1 \
+$Y view --meta-dir "$GROVEFS_HOME" alias --name pub --real team > .govtime/al1.log 2>&1 \
   && ok "alias pub -> team defined" || bad "alias create: $(cat .govtime/al1.log)"
 # measure the rotation command wall-clock (single atomic definition swap)
-rt0=$(ns); $Y view --db-path "$GROVEFS_HOME" alias --name pubnew --real team --retire pub > .govtime/rot.log 2>&1; rrc=$?
+rt0=$(ns); $Y view --meta-dir "$GROVEFS_HOME" alias --name pubnew --real team --retire pub > .govtime/rot.log 2>&1; rrc=$?
 rt=$(( ($(ns)-rt0)/1000000 ))
 [ $rrc -eq 0 ] && grep -q gapless .govtime/rot.log && ok "gapless rotation pub -> pubnew" || bad "rotation failed: $(cat .govtime/rot.log)"
 echo "  INFO --retire command latency: ${rt}ms"
 # the retired old name must NOT resolve to the real tree (zero window)
-$Y mount --view pub -m .govtime/mnt_al --meta $META --data $DATA --foreground > .govtime/old.log 2>&1 &
+$Y mount --view pub -m .govtime/mnt_al --meta-server $META --data-servers $DATA --foreground > .govtime/old.log 2>&1 &
 OLDP=$!; sleep 1.5
 [ ! -d .govtime/mnt_al/docs ] && ok "retired alias does not reach the real tree (no leak window)" || bad "old alias still served team"
 kill $OLDP 2>/dev/null; wait $OLDP 2>/dev/null; fusermount -u .govtime/mnt_al 2>/dev/null; rm -rf .govtime/mnt_al; mkdir -p .govtime/mnt_al
 # the new name serves the full tree immediately
-$Y mount --view pubnew -m .govtime/mnt_al --meta $META --data $DATA --foreground > .govtime/new.log 2>&1 &
+$Y mount --view pubnew -m .govtime/mnt_al --meta-server $META --data-servers $DATA --foreground > .govtime/new.log 2>&1 &
 NEWP=$!; sleep 2
 chk "$(T ls .govtime/mnt_al | tr '\n' ' ')" "docs photos " "rotated alias pubnew serves the tree"
 T rm .govtime/mnt_al/docs/a.md 2>/dev/null; fusermount -u .govtime/mnt_al 2>/dev/null; kill $NEWP 2>/dev/null; wait $NEWP 2>/dev/null

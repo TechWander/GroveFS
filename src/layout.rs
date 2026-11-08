@@ -123,7 +123,7 @@ pub struct LayoutRules {
     pub reloc: Vec<Reloc>,
 }
 
-/// What a server-side `<db-path>/meta/views/<name>.layout` declares. The
+/// What a server-side `<meta-dir>/meta/views/<name>.layout` declares. The
 /// shapes share one file slot and are mutually exclusive per entry:
 /// - [`ViewDef::Derived`]: first line `base <physical view>` plus rule verbs
 ///   — a centrally defined virtual shape; mounts are READ-ONLY (every write
@@ -135,7 +135,7 @@ pub struct LayoutRules {
 ///   exposing storage identity).
 /// - [`ViewDef::Fork`]: a lone `fork <physical view>` line, no rules — an
 ///   INDEPENDENT metadata tree seeded from the base view at creation time
-///   (`<db-path>/meta/<name>.db`, content bytes shared through the cross-view
+///   (`<meta-dir>/meta/<name>.db`, content bytes shared through the cross-view
 ///   ledger). Structure (mkdir/rename/unlink) is writable; CONTENT writes are
 ///   refused, and a delete removes only this view's names — the base's tree
 ///   and the shared bytes are untouched.
@@ -273,7 +273,7 @@ impl LayoutRules {
     /// Parse a server-side **named view** definition: the same rule verbs as
     /// [`LayoutRules::parse`] plus exactly one `base <view>` line naming the
     /// physical view tree the lens reads. Such a file lives at
-    /// `<db-path>/meta/views/<name>.layout`; the meta-server resolves it at
+    /// `<meta-dir>/meta/views/<name>.layout`; the meta-server resolves it at
     /// `M_OPEN`, so a client just mounts `--view <name>` and gets its own
     /// presentation of one shared tree — no rules file on the client.
     pub fn parse_view(text: &str) -> Result<(String, Self), String> {

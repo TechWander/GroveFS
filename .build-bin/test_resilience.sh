@@ -35,7 +35,7 @@ trap cleanup EXIT
 wait_port(){ for _ in $(seq 1 50); do (exec 3<>"/dev/tcp/$HOST/$PORT") 2>/dev/null && { exec 3>&- 3<&-; return 0; }; sleep 0.1; done; return 1; }
 start_server(){ # $1=tag ; retries ride out a transient EADDRINUSE right after a restart
   for _try in 1 2 3; do
-    $Y data-server --listen $ADDR --root "$PWD/.rtest/rsrv" > ".rtest/srv_$1.log" 2>&1 & SP=$!
+    $Y data-server --listen $ADDR --data-dir "$PWD/.rtest/rsrv" > ".rtest/srv_$1.log" 2>&1 & SP=$!
     if wait_port; then return 0; fi
     kill $SP 2>/dev/null; wait $SP 2>/dev/null || true; sleep 0.5
   done
@@ -50,7 +50,7 @@ echo "===== A) server up: mount alice + seed ====="
 start_server 1
 $Y init --view alice >/dev/null
 $Y init --view bob   >/dev/null
-$Y mount --view alice --mountpoint $A --data $ADDR --foreground > .rtest/a.log 2>&1 & MA=$!
+$Y mount --view alice --mountpoint $A --data-servers $ADDR --foreground > .rtest/a.log 2>&1 & MA=$!
 sleep 1.2
 timeout 10 sh -c "printf 'persistent payload\n' > $A/seed.txt" && sync
 chk "$(timeout 5 cat $A/seed.txt)" "persistent payload" "seed written+read on live server"
@@ -79,7 +79,7 @@ chk "$rc" "0" "op over a stale pooled socket recovers with NO error surfaced"
 chk "$(timeout 5 cat $A/transparent.txt)" "transparent" "transparently-recovered write is readable"
 
 echo "===== E) two client mounts vs one server: concurrent + isolated ====="
-$Y mount --view bob --mountpoint $B --data $ADDR --foreground > .rtest/b.log 2>&1 & MB=$!
+$Y mount --view bob --mountpoint $B --data-servers $ADDR --foreground > .rtest/b.log 2>&1 & MB=$!
 sleep 1.2
 p1=""; p2=""
 timeout 30 sh -c "for n in \$(seq 1 200); do echo a-\$n > $A/mc.txt; done" & p1=$!

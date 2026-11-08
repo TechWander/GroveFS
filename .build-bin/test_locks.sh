@@ -13,7 +13,7 @@
 #      lease to 3s via `GROVEFS_LOCK_LEASE_SECS` (internal knob) so the sleep
 #      stays bounded.
 #   5. HA path: a primary meta-server + a standby, client mounts through
-#      `--meta primary,standby`; the `locks` table lives inside the SAME view
+#      `--meta-server primary,standby`; the `locks` table lives inside the SAME view
 #      DB that backup_to_bytes snapshots onto the standby, so a client pointed
 #      only at the standby sees the replicated lock rows (proves locks survive
 #      failover without any additional WAL channel).
@@ -287,19 +287,19 @@ DATA=127.0.0.1:15118
 rm -rf .locks/ha; mkdir -p .locks/ha/a .locks/ha/b .locks/ha/data .locks/ha/chome .locks/ha/mnt
 wait_port(){ local a=$1; for _ in $(seq 1 100); do (echo >/dev/tcp/${a%%:*}/${a##*:}) 2>/dev/null && return 0; sleep 0.05; done; return 1; }
 
-$Y data-server --listen $DATA --root .locks/ha/data > .locks/ha/data.log 2>&1 &
+$Y data-server --listen $DATA --data-dir .locks/ha/data > .locks/ha/data.log 2>&1 &
 DP=$!
-$Y meta-server --db-path .locks/ha/a --listen $META_A --peer $META_B > .locks/ha/a.log 2>&1 &
+$Y meta-server --meta-dir .locks/ha/a --listen $META_A --peer $META_B > .locks/ha/a.log 2>&1 &
 AP=$!
-$Y meta-server --db-path .locks/ha/b --listen $META_B --role standby --peer $META_A > .locks/ha/b.log 2>&1 &
+$Y meta-server --meta-dir .locks/ha/b --listen $META_B --role standby --peer $META_A > .locks/ha/b.log 2>&1 &
 BP=$!
 wait_port $DATA && wait_port $META_A && wait_port $META_B || bad "HA ports did not come up"
 
 # Strict view gate: create the view on the primary (the standby replicates it).
-$Y view --db-path .locks/ha/a create --view alice > .locks/ha/create.log 2>&1
+$Y view --meta-dir .locks/ha/a create --view alice > .locks/ha/create.log 2>&1
 
 # Client mounts via failover list against the HA pair.
-$Y --home .locks/ha/chome mount --view alice --mountpoint .locks/ha/mnt --meta "$META_A,$META_B" --data $DATA --foreground > .locks/ha/mnt.log 2>&1 &
+$Y --home .locks/ha/chome mount --view alice --mountpoint .locks/ha/mnt --meta-server "$META_A,$META_B" --data-servers $DATA --foreground > .locks/ha/mnt.log 2>&1 &
 CP=$!
 sleep 2
 # The explicitly created view is empty, so it only has / (no seed/). Make the

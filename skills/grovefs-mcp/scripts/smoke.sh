@@ -54,7 +54,7 @@ code() { # code DESC EXPECTED_EXIT CMD...
     if [ "$got" = "$want" ]; then pass=$((pass+1)); note "  OK:   $desc (exit $got)";
     else fail=$((fail+1)); note "  FAIL: $desc (want exit $want, got $got)"; fi
 }
-mcp() { python3 "$CALL" --bin "$BIN" --quiet --timeout 20 --db-path "$STORE" "$@" 2>/dev/null; }
+mcp() { python3 "$CALL" --bin "$BIN" --quiet --timeout 20 --meta-dir "$STORE" "$@" 2>/dev/null; }
 # jpick TEXT SUFFIX — the first rendered display path ending in SUFFIX.
 # Rules are written against paths the store actually shows, never guessed ones.
 jpick() { printf '%s' "$1" | python3 -c '
@@ -132,7 +132,7 @@ ok "one public name per real view"  "$DUP" "already governed by alias 'team-publ
 ROT="$(mcp call alias_view '{"name":"team-public2","real":"team","retire":"team-public"}')"
 ok "rotation retires the old name"  "$ROT" "team-public"
 code "rotation refuses a non-alias retire" 3 \
-    python3 "$CALL" --bin "$BIN" --quiet --db-path "$STORE" call alias_view \
+    python3 "$CALL" --bin "$BIN" --quiet --meta-dir "$STORE" call alias_view \
     '{"name":"team-public3","real":"team","retire":"release"}'
 
 note "[6] fork (independent tree, shared bytes) — local SQLite base only"
@@ -141,7 +141,7 @@ ok "fork seeded from the base"      "$FK" "forked view 'lab' from base 'team'"
 NOF="$(mcp call fork_view '{"name":"lab2","base":"release"}')"
 ok "a governed base cannot be forked" "$NOF" "release"
 code "get_view on a fork reports its own tree" 0 \
-    python3 "$CALL" --bin "$BIN" --quiet --db-path "$STORE" call get_view '{"name":"lab"}'
+    python3 "$CALL" --bin "$BIN" --quiet --meta-dir "$STORE" call get_view '{"name":"lab"}'
 ok "fork owns meta/lab.db"          "$( $BIN --home "$STORE" view list )" "lab"
 
 note "[6b] empty fork + graft (a curated, renamed subset in one batch plan)"
@@ -163,17 +163,17 @@ RD="$(mcp read grovefs://view/release/tree)"
 ok "resource bytes match the tool"  "$RD" '"contents"'
 no "pruned path absent in resource" "$RD" "$PRIV"
 code "unknown resource URI is a protocol error" 2 \
-    python3 "$CALL" --bin "$BIN" --quiet --db-path "$STORE" read grovefs://view/ghost/tree
+    python3 "$CALL" --bin "$BIN" --quiet --meta-dir "$STORE" read grovefs://view/ghost/tree
 PR="$(mcp prompt reshape-view '{"base":"team"}')"
 ok "reshape playbook instantiated"  "$PR" "validate_definition"
 CP="$(mcp complete base 'r')"
 ok "completion offers real view names" "$CP" "release"
 
 note "[8] logging: setLevel warning -> a refused call pushes notifications/message (a successful one does not)"
-python3 "$CALL" --bin "$BIN" --quiet --db-path "$STORE" setlevel warning call list_view_tree '{"view":"ghost"}' > /dev/null 2>"$TMP/notes"
+python3 "$CALL" --bin "$BIN" --quiet --meta-dir "$STORE" setlevel warning call list_view_tree '{"view":"ghost"}' > /dev/null 2>"$TMP/notes"
 ok "a warning push was received"    "$(cat "$TMP/notes")" "[push] notifications/message"
 ok "pushed severity is warning"     "$(cat "$TMP/notes")" '"level": "warning"'
-python3 "$CALL" --bin "$BIN" --quiet --db-path "$STORE" setlevel warning call list_views '{}' > /dev/null 2>"$TMP/notes2"
+python3 "$CALL" --bin "$BIN" --quiet --meta-dir "$STORE" setlevel warning call list_views '{}' > /dev/null 2>"$TMP/notes2"
 no "a successful call stays quiet"  "$(cat "$TMP/notes2")" "[push] notifications/message"
 
 note "[9] cleanup (removing a fork deletes its own tree, bytes stay held)"
@@ -190,18 +190,18 @@ no "no definitions left"            "$FINAL" '"kind": "derived"'
 ok "base view survives"             "$FINAL" '"team"'
 
 note "[10] the API-key gate (--require-api-key)"
-KEY="$($BIN apikey --db-path "$STORE" create --label smoke --for mcp | grep -oE '[0-9a-zA-Z_-]+:[0-9a-fA-F]+' | head -1)"
+KEY="$($BIN apikey --meta-dir "$STORE" create --label smoke --for mcp | grep -oE '[0-9a-zA-Z_-]+:[0-9a-fA-F]+' | head -1)"
 if [ -z "$KEY" ]; then
     fail=$((fail+1)); note "  FAIL: could not mint an api key"
 else
     gated=(--server-arg --require-api-key)
     code "tools/list without a key is refused (-32001)" 2 \
-        python3 "$CALL" --bin "$BIN" --quiet --db-path "$STORE" "${gated[@]}" list
+        python3 "$CALL" --bin "$BIN" --quiet --meta-dir "$STORE" "${gated[@]}" list
     code "tools/list with a key is admitted" 0 \
-        python3 "$CALL" --bin "$BIN" --quiet --db-path "$STORE" "${gated[@]}" --api-key "$KEY" list
+        python3 "$CALL" --bin "$BIN" --quiet --meta-dir "$STORE" "${gated[@]}" --api-key "$KEY" list
     code "wrong key is refused" 2 \
-        python3 "$CALL" --bin "$BIN" --quiet --db-path "$STORE" "${gated[@]}" --api-key "nope:deadbeef" list
-    AUDIT="$($BIN apikey --db-path "$STORE" calls)"
+        python3 "$CALL" --bin "$BIN" --quiet --meta-dir "$STORE" "${gated[@]}" --api-key "nope:deadbeef" list
+    AUDIT="$($BIN apikey --meta-dir "$STORE" calls)"
     ok "refused calls land in the audit log" "$AUDIT" "tools/list"
 fi
 

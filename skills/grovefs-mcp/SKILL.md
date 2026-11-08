@@ -11,9 +11,9 @@ remove view definitions (read-only lenses, writable public aliases, standalone
 forks).
 
 **This entrance is the control plane**, and its home follows the metadata
-backend: on embedded SQLite it writes `<db-path>/meta/views/*.layout` (a fork
+backend: on embedded SQLite it writes `<meta-dir>/meta/views/*.layout` (a fork
 additionally writes `meta/<name>.db` and rebuilds the `refs.db` ledger); when
-the server runs with `--store postgres://…` definitions write to the PG table
+the server runs with `--meta-store postgres://…` definitions write to the PG table
 `grovefs_control.view_defs` instead and nothing control-plane lands on local
 disk (fork is not implemented on PG — it refuses). It **never mounts and never
 reads object bytes**. Mounting and data I/O belong to the CLI/ops plane, not
@@ -39,9 +39,9 @@ The server is spawned as a child process by the MCP client; frames go in on
 stdin and come out on stdout:
 
 ```bash
-grovefs mcp --db-path <DB_PATH>          # metadata root (contains meta/ and meta/views/); falls back to --home
-grovefs mcp --db-path <DB_PATH> --require-api-key   # add the gate for multiple callers (see "Authentication")
-grovefs mcp --db-path <DB_PATH> --store postgres://user:pw@host:5432/db  # PG control plane (definitions/keys/audit in grovefs_control; env GROVEFS_STORE also works)
+grovefs mcp --meta-dir <DB_PATH>          # metadata root (contains meta/ and meta/views/); falls back to --home
+grovefs mcp --meta-dir <DB_PATH> --require-api-key   # add the gate for multiple callers (see "Authentication")
+grovefs mcp --meta-dir <DB_PATH> --meta-store postgres://user:pw@host:5432/db  # PG control plane (definitions/keys/audit in grovefs_control; env GROVEFS_META_STORE also works)
 ```
 
 MCP client configuration (the generic `mcpServers` shape; Claude Desktop and
@@ -50,7 +50,7 @@ IDE agents work the same way):
 ```json
 { "mcpServers": { "grovefs": {
   "command": "grovefs",
-  "args": ["mcp", "--db-path", "/abs/path/to/store"],
+  "args": ["mcp", "--meta-dir", "/abs/path/to/store"],
   "env": { "GROVEFS_MCP_API_KEY": "ID:SECRET" }
 } } }
 ```
@@ -62,10 +62,10 @@ exporting it pre-authenticates the whole server.
 with the dependency-free script in this directory (see `scripts/mcp_call.py`):
 
 ```bash
-python3 scripts/mcp_call.py --db-path <D> list                    # tools/list
-python3 scripts/mcp_call.py --db-path <D> call list_views '{}'
-python3 scripts/mcp_call.py --db-path <D> call define_derived_view '{"name":"release","base":"team","rules":"hide /photos/private"}'
-python3 scripts/mcp_call.py --db-path <D> --api-key ID:SECRET list # through a --require-api-key gate
+python3 scripts/mcp_call.py --meta-dir <D> list                    # tools/list
+python3 scripts/mcp_call.py --meta-dir <D> call list_views '{}'
+python3 scripts/mcp_call.py --meta-dir <D> call define_derived_view '{"name":"release","base":"team","rules":"hide /photos/private"}'
+python3 scripts/mcp_call.py --meta-dir <D> --api-key ID:SECRET list # through a --require-api-key gate
 ```
 
 Check the wiring with a self-test first (it uses a throwaway store root and
@@ -105,7 +105,7 @@ bash scripts/smoke.sh
   `notifications/cancelled`).
 - Every tool accepts an optional `db_path` that overrides the server default,
   so one process can serve several store roots — **except** `preview_rules`
-  (parser-only, no store) and except under a `--store postgres://…` server,
+  (parser-only, no store) and except under a `--meta-store postgres://…` server,
   where the control plane is URI-bound and `db_path` is ignored (verified:
   the reply's `store` still names the URI).
 - A PG-bound server answers against PG even with no local `meta/` directory at
@@ -140,8 +140,8 @@ bash scripts/smoke.sh
 
 Neither read-only probe touches data bytes: `list_view_tree` opens the view's
 tree read-only **through the backend the server is bound to** — the local
-`<db-path>/meta/<view>.db` under `--db-path`, or the `grovefs_v_<hex>` PG
-schema under `--store postgres://…` — and renders it through the same
+`<meta-dir>/meta/<view>.db` under `--meta-dir`, or the `grovefs_v_<hex>` PG
+schema under `--meta-store postgres://…` — and renders it through the same
 `LayoutMeta` lens a mount uses; `get_view` only reads the definition's text.
 A tree the served store cannot reach is refused with the exact wording
 (verified against the current build):
@@ -285,7 +285,7 @@ lines interpolates your own names/paths.
 | `retire` removing an alias of a different view | `--retire '<old>' currently aliases a different real view ('<r>'), not '<real>' — rotation must retire the previous name of the same view` |
 | `retire` equal to the new name | `--retire must name a DIFFERENT (previous) alias, not the one being created` |
 | Forking a base with no local tree | `no physical base tree for '<base>' in <store> — \`fork\` copies a LOCAL SQLite tree; … A PostgreSQL-backed view cannot be forked (…)` |
-| Forking through a `--store postgres://…` server even when the base schema exists | `fork is not implemented on the PostgreSQL backend yet (the tree copy needs a per-view snapshot path; PG-backed views are served through a meta-server or a mount)` |
+| Forking through a `--meta-store postgres://…` server even when the base schema exists | `fork is not implemented on the PostgreSQL backend yet (the tree copy needs a per-view snapshot path; PG-backed views are served through a meta-server or a mount)` |
 | Forking a base that is itself governed | `base '<base>' is governed by a definition (alias/derived/fork) — fork the physical base tree instead` |
 | Fork name == base name | `fork name must differ from its base` |
 | Forking a name that already has a definition | `view '<name>' already has a definition — remove it first (\`grovefs view rm --name <name>\`) before forking` |
@@ -310,7 +310,7 @@ lines interpolates your own names/paths.
   `completion/complete`. Measured open (never gated): `initialize`, `ping`,
   `prompts/list`, **`prompts/get`** (so a playbook is readable pre-auth — it is
   static text, not store state), `logging/setLevel`, and all notifications.
-- Credentials: `grovefs apikey --db-path <D> create --label L --for mcp`
+- Credentials: `grovefs apikey --meta-dir <D> create --label L --for mcp`
   (or `--for any`). The MCP entrance asks for scope `mcp`, so a `--for mount`
   key is refused with `this api key is scoped to 'mount', not 'mcp'`.
   `--view`/`--ro` are **mount-plane** dimensions (see the boundary below).
@@ -336,9 +336,9 @@ lines interpolates your own names/paths.
 - Revocation is immediate: after `apikey revoke` that key fails `initialize`
   authentication on the next connection (verified → the gated methods return
   `-32001` again and the audit gets `this api key has been revoked`).
-- On a `--store postgres://…` server the keys and the audit rows are the PG
+- On a `--meta-store postgres://…` server the keys and the audit rows are the PG
   tables `grovefs_control.api_keys` / `grovefs_control.mcp_calls` (mint with
-  `grovefs apikey --store <URI> create …`); no local `api_keys.db` is created —
+  `grovefs apikey --meta-store <URI> create …`); no local `api_keys.db` is created —
   verified. So a key minted anywhere gates every server pointed at that URI.
 - If the control-plane backend is unreachable the server **does not start**: it
   exits with `Error: … "postgres connect error connecting to server"` (verified

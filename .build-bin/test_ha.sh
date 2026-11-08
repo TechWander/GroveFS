@@ -2,7 +2,7 @@
 # MetaServer HIGH-AVAILABILITY e2e over real FUSE mounts: a primary + a standby
 # (two separate meta-server processes, each with its OWN --home so neither shares
 # the other's authoritative files), a client mounted through a comma-separated
-# failover list `--meta primary,standby`, and a kill of the primary proving the
+# failover list `--meta-server primary,standby`, and a kill of the primary proving the
 # standby promotes and the client keeps reading and writing.
 #
 # Honest scope (MVP two-node HA, mirrored in the code comments):
@@ -32,11 +32,11 @@ rm -rf .ha; mkdir -p .ha/a .ha/b .ha/data .ha/chome .ha/sbhome .ha/mnt .ha/mnt_s
 wait_port(){ local a=$1; for _ in $(seq 1 100); do (echo >/dev/tcp/${a%%:*}/${a##*:}) 2>/dev/null && return 0; sleep 0.05; done; return 1; }
 
 # ---- data server + the HA meta pair ----
-$Y data-server --listen $DATA --root .ha/data > .ha/data.log 2>&1 &
+$Y data-server --listen $DATA --data-dir .ha/data > .ha/data.log 2>&1 &
 DP=$!
-$Y meta-server --db-path .ha/a --listen $META_A --peer $META_B > .ha/a.log 2>&1 &
+$Y meta-server --meta-dir .ha/a --listen $META_A --peer $META_B > .ha/a.log 2>&1 &
 AP=$!
-$Y meta-server --db-path .ha/b --listen $META_B --role standby --peer $META_A > .ha/b.log 2>&1 &
+$Y meta-server --meta-dir .ha/b --listen $META_B --role standby --peer $META_A > .ha/b.log 2>&1 &
 BP=$!
 wait_port $DATA || true
 wait_port $META_A || true
@@ -44,11 +44,11 @@ wait_port $META_B || true
 
 # Strict view gate: the view is created EXPLICITLY on the primary (the standby
 # learns it through replication — that is exactly what section 2 asserts).
-$Y view --db-path .ha/a create --view alice > .ha/create.log 2>&1
+$Y view --meta-dir .ha/a create --view alice > .ha/create.log 2>&1
 
 # ---- client mounts ----
 # main client: failover list primary,standby
-$Y --home .ha/chome mount --view alice --mountpoint .ha/mnt --meta "$META_A,$META_B" --data $DATA --foreground > .ha/c.log 2>&1 &
+$Y --home .ha/chome mount --view alice --mountpoint .ha/mnt --meta-server "$META_A,$META_B" --data-servers $DATA --foreground > .ha/c.log 2>&1 &
 CP=$!
 sleep 2
 
@@ -75,7 +75,7 @@ echo "===== 2) replication: standby received a snapshot of alice.db ====="
 [ -f .ha/b/meta/alice.db ] && ok "standby replicated alice.db exists" || bad "standby alice.db missing (no replication)"
 # a client pointed ONLY at the standby reads the replicated view (proves the
 # snapshot is complete + readable, not a torn file copy)
-$Y --home .ha/sbhome mount --view alice --mountpoint .ha/mnt_sb --meta $META_B --data $DATA --foreground > .ha/sb.log 2>&1 &
+$Y --home .ha/sbhome mount --view alice --mountpoint .ha/mnt_sb --meta-server $META_B --data-servers $DATA --foreground > .ha/sb.log 2>&1 &
 SP=$!
 sleep 2
 chk "$(T cat .ha/mnt_sb/p1.txt)" "p1-bytes" "standby-only client reads a primary-written file (replicated view)"
@@ -111,7 +111,7 @@ awk "BEGIN{exit !($FT < 12)}" && ok "failover+recovery completed in ${FT}s (<12s
 echo "===== 6) recovered old primary demotes itself (no double-primary) ====="
 # bring the old primary back; its replicator sees the peer's higher epoch and
 # must step down to standby rather than resume writing.
-$Y meta-server --db-path .ha/a --listen $META_A --peer $META_B > .ha/a2.log 2>&1 &
+$Y meta-server --meta-dir .ha/a --listen $META_A --peer $META_B > .ha/a2.log 2>&1 &
 AP2=$!
 # reassign cleanup to also reap the restarted node
 trap 'for d in .ha/mnt .ha/mnt_sb; do fusermount -u "$d" 2>/dev/null; done; kill $CP $SP $DP $AP2 $BP 2>/dev/null' EXIT
@@ -129,20 +129,20 @@ SYNC_D=127.0.0.1:15138
 rm -rf .ha/sync_a .ha/sync_b .ha/sync_data .ha/sync_chome .ha/sync_mnt
 mkdir -p .ha/sync_a .ha/sync_b .ha/sync_data .ha/sync_chome .ha/sync_mnt
 
-$Y data-server --listen $SYNC_D --root .ha/sync_data > .ha/sync_data.log 2>&1 &
+$Y data-server --listen $SYNC_D --data-dir .ha/sync_data > .ha/sync_data.log 2>&1 &
 SDP=$!
-$Y meta-server --db-path .ha/sync_a --listen $SYNC_A --peer $SYNC_B --sync-repl > .ha/sync_a.log 2>&1 &
+$Y meta-server --meta-dir .ha/sync_a --listen $SYNC_A --peer $SYNC_B --sync-repl > .ha/sync_a.log 2>&1 &
 SAP=$!
-$Y meta-server --db-path .ha/sync_b --listen $SYNC_B --role standby --peer $SYNC_A > .ha/sync_b.log 2>&1 &
+$Y meta-server --meta-dir .ha/sync_b --listen $SYNC_B --role standby --peer $SYNC_A > .ha/sync_b.log 2>&1 &
 SBP=$!
 wait_port $SYNC_D; wait_port $SYNC_A; wait_port $SYNC_B
 # Views are explicit: create the view on the sync primary before the first mount.
-$Y view --db-path .ha/sync_a create --view alice > .ha/sync_create.log 2>&1
+$Y view --meta-dir .ha/sync_a create --view alice > .ha/sync_create.log 2>&1
 # Confirm the server logged sync-repl activation.
 grep -q 'synchronous replication ON' .ha/sync_a.log \
   && ok "--sync-repl logged activation" || bad "--sync-repl not activated"
 
-$Y --home .ha/sync_chome mount --view alice --mountpoint .ha/sync_mnt --meta "$SYNC_A,$SYNC_B" --data $SYNC_D --foreground > .ha/sync_mnt.log 2>&1 &
+$Y --home .ha/sync_chome mount --view alice --mountpoint .ha/sync_mnt --meta-server "$SYNC_A,$SYNC_B" --data-servers $SYNC_D --foreground > .ha/sync_mnt.log 2>&1 &
 SCP=$!
 sleep 2
 SM=.ha/sync_mnt
@@ -163,7 +163,7 @@ sleep 4
 
 # Mount a fresh client pointing ONLY at the (now-promoted) standby.
 rm -rf .ha/sync_mnt2; mkdir -p .ha/sync_mnt2
-$Y --home .ha/sync_chome mount --view alice --mountpoint .ha/sync_mnt2 --meta $SYNC_B --data $SYNC_D --foreground > .ha/sync_mnt2.log 2>&1 &
+$Y --home .ha/sync_chome mount --view alice --mountpoint .ha/sync_mnt2 --meta-server $SYNC_B --data-servers $SYNC_D --foreground > .ha/sync_mnt2.log 2>&1 &
 SCP2=$!
 sleep 2
 
@@ -189,17 +189,17 @@ PART_D=127.0.0.1:15148
 rm -rf .ha/part_a .ha/part_b .ha/part_data .ha/part_chome .ha/part_mnt
 mkdir -p .ha/part_a .ha/part_b .ha/part_data .ha/part_chome .ha/part_mnt
 
-$Y data-server --listen $PART_D --root .ha/part_data > .ha/part_data.log 2>&1 &
+$Y data-server --listen $PART_D --data-dir .ha/part_data > .ha/part_data.log 2>&1 &
 PDP=$!
-$Y meta-server --db-path .ha/part_a --listen $PART_A --peer $PART_B --sync-repl > .ha/part_a.log 2>&1 &
+$Y meta-server --meta-dir .ha/part_a --listen $PART_A --peer $PART_B --sync-repl > .ha/part_a.log 2>&1 &
 PAP=$!
-$Y meta-server --db-path .ha/part_b --listen $PART_B --role standby --peer $PART_A > .ha/part_b.log 2>&1 &
+$Y meta-server --meta-dir .ha/part_b --listen $PART_B --role standby --peer $PART_A > .ha/part_b.log 2>&1 &
 PBP=$!
 wait_port $PART_D; wait_port $PART_A; wait_port $PART_B
 # Strict view gate: create the view on the partition-test primary.
-$Y view --db-path .ha/part_a create --view alice > .ha/part_create.log 2>&1
+$Y view --meta-dir .ha/part_a create --view alice > .ha/part_create.log 2>&1
 
-$Y --home .ha/part_chome mount --view alice --mountpoint .ha/part_mnt --meta $PART_A --data $PART_D --foreground > .ha/part_mnt.log 2>&1 &
+$Y --home .ha/part_chome mount --view alice --mountpoint .ha/part_mnt --meta-server $PART_A --data-servers $PART_D --foreground > .ha/part_mnt.log 2>&1 &
 PCP=$!
 sleep 2
 # Kill the standby so the next sync push cannot get an ACK.
@@ -235,12 +235,12 @@ W_B=127.0.0.1:15157
 W_D=127.0.0.1:15158
 rm -rf .ha/w_a .ha/w_b .ha/w_data; mkdir -p .ha/w_a .ha/w_b .ha/w_data
 
-$Y data-server --listen $W_D --root .ha/w_data > .ha/w_data.log 2>&1 &
+$Y data-server --listen $W_D --data-dir .ha/w_data > .ha/w_data.log 2>&1 &
 WD=$!
 wait_port $W_D   # arbiter must be up BEFORE the primary registers, or it fail-safe-boots as standby
-$Y meta-server --db-path .ha/w_a --listen $W_A --peer $W_B --witness $W_D > .ha/w_a.log 2>&1 &
+$Y meta-server --meta-dir .ha/w_a --listen $W_A --peer $W_B --witness $W_D > .ha/w_a.log 2>&1 &
 WA=$!
-$Y meta-server --db-path .ha/w_b --listen $W_B --role standby --peer $W_A --witness $W_D > .ha/w_b.log 2>&1 &
+$Y meta-server --meta-dir .ha/w_b --listen $W_B --role standby --peer $W_A --witness $W_D > .ha/w_b.log 2>&1 &
 WB=$!
 wait_port $W_A; wait_port $W_B
 
@@ -266,7 +266,7 @@ grep -qx '1' .ha/w_data/.fence_token 2>/dev/null \
 
 # Restart the OLD primary (same --home, still stale on-disk epoch). The witness
 # now carries the promoted node's higher epoch, so it must refuse primary.
-$Y meta-server --db-path .ha/w_a --listen $W_A --peer $W_B --witness $W_D > .ha/w_a2.log 2>&1 &
+$Y meta-server --meta-dir .ha/w_a --listen $W_A --peer $W_B --witness $W_D > .ha/w_a2.log 2>&1 &
 WA2=$!
 wait_port $W_A || true
 sleep 2
@@ -294,12 +294,12 @@ F_B=127.0.0.1:15167
 F_D=127.0.0.1:15168
 rm -rf .ha/f_a .ha/f_b .ha/f_data; mkdir -p .ha/f_a .ha/f_b .ha/f_data
 
-$Y data-server --listen $F_D --root .ha/f_data > .ha/f_data.log 2>&1 &
+$Y data-server --listen $F_D --data-dir .ha/f_data > .ha/f_data.log 2>&1 &
 FD=$!
 wait_port $F_D   # arbiter up before the primary registers (else it fail-safe-boots standby)
-$Y meta-server --db-path .ha/f_a --listen $F_A --peer $F_B --witness $F_D > .ha/f_a.log 2>&1 &
+$Y meta-server --meta-dir .ha/f_a --listen $F_A --peer $F_B --witness $F_D > .ha/f_a.log 2>&1 &
 FA=$!
-$Y meta-server --db-path .ha/f_b --listen $F_B --role standby --peer $F_A --witness $F_D > .ha/f_b.log 2>&1 &
+$Y meta-server --meta-dir .ha/f_b --listen $F_B --role standby --peer $F_A --witness $F_D > .ha/f_b.log 2>&1 &
 FB=$!
 wait_port $F_A; wait_port $F_B
 sleep 1
@@ -320,7 +320,7 @@ grep -q 'fail-safe refusing to promote' .ha/f_b.log \
   || bad "standby promoted without arbiter proof (log: $(tr '\n' ' ' < .ha/f_b.log))"
 
 # (c) bring the arbiter back; exactly one node may seize primary.
-$Y data-server --listen $F_D --root .ha/f_data > .ha/f_data2.log 2>&1 &
+$Y data-server --listen $F_D --data-dir .ha/f_data > .ha/f_data2.log 2>&1 &
 FD=$!
 wait_port $F_D || true
 sleep 5
@@ -363,12 +363,12 @@ Q_D3=127.0.0.1:15180
 Q_DC=127.0.0.1:15181   # the client's CONTENT store: separate from the fencing quorum
 rm -rf .ha/q_a .ha/q_b .ha/q_d1 .ha/q_d2 .ha/q_d3 .ha/q_dc
 mkdir -p .ha/q_a .ha/q_b .ha/q_d1 .ha/q_d2 .ha/q_d3 .ha/q_dc
-$Y data-server --listen $Q_D1 --root .ha/q_d1 > .ha/q_d1.log 2>&1 & QD1=$!
-$Y data-server --listen $Q_D2 --root .ha/q_d2 > .ha/q_d2.log 2>&1 & QD2=$!
-$Y data-server --listen $Q_D3 --root .ha/q_d3 > .ha/q_d3.log 2>&1 & QD3=$!
+$Y data-server --listen $Q_D1 --data-dir .ha/q_d1 > .ha/q_d1.log 2>&1 & QD1=$!
+$Y data-server --listen $Q_D2 --data-dir .ha/q_d2 > .ha/q_d2.log 2>&1 & QD2=$!
+$Y data-server --listen $Q_D3 --data-dir .ha/q_d3 > .ha/q_d3.log 2>&1 & QD3=$!
 wait_port $Q_D1; wait_port $Q_D2; wait_port $Q_D3
-$Y meta-server --db-path .ha/q_a --listen $Q_A --peer $Q_B --witness "$Q_D1,$Q_D2,$Q_D3" > .ha/q_a.log 2>&1 & QA=$!
-$Y meta-server --db-path .ha/q_b --listen $Q_B --role standby --peer $Q_A --witness "$Q_D1,$Q_D2,$Q_D3" > .ha/q_b.log 2>&1 & QB=$!
+$Y meta-server --meta-dir .ha/q_a --listen $Q_A --peer $Q_B --witness "$Q_D1,$Q_D2,$Q_D3" > .ha/q_a.log 2>&1 & QA=$!
+$Y meta-server --meta-dir .ha/q_b --listen $Q_B --role standby --peer $Q_A --witness "$Q_D1,$Q_D2,$Q_D3" > .ha/q_b.log 2>&1 & QB=$!
 wait_port $Q_A; wait_port $Q_B
 sleep 1
 
@@ -380,10 +380,10 @@ grep -q 'registered fencing epoch' .ha/q_a.log && grep -q 'quorum (2/3' .ha/q_a.
 # Mount a client through the quorum-guarded pair and confirm a write lands.
 # Its CONTENT store $Q_DC is a distinct node, so killing an ARBITER below does not
 # also delete the bytes the client is writing (arbiter quorum != data plane).
-$Y data-server --listen $Q_DC --root .ha/q_dc > .ha/q_dc.log 2>&1 & QDC=$!
+$Y data-server --listen $Q_DC --data-dir .ha/q_dc > .ha/q_dc.log 2>&1 & QDC=$!
 wait_port $Q_DC || true
 rm -rf .ha/qmnt; mkdir -p .ha/qmnt
-$Y --home .ha/qhome mount --view alice --mountpoint .ha/qmnt --meta "$Q_A,$Q_B" --data $Q_DC --foreground > .ha/qc.log 2>&1 & QC=$!
+$Y --home .ha/qhome mount --view alice --mountpoint .ha/qmnt --meta-server "$Q_A,$Q_B" --data-servers $Q_DC --foreground > .ha/qc.log 2>&1 & QC=$!
 sleep 2
 T sh -c "printf hi > .ha/qmnt/probe.txt" && [ "$(T cat .ha/qmnt/probe.txt)" = hi ] \
   && ok "client write succeeds under a healthy 3-arbiter quorum" \
@@ -420,17 +420,17 @@ kill $QC $QA $QB $QD3 $QDC 2>/dev/null || true
 # indistinguishable from a real partition. serve() must warn at startup, and a
 # well-formed ODD list must stay quiet (no false alarms).
 mkdir -p .ha/vm
-$Y meta-server --db-path .ha/vm --listen 127.0.0.1:15220 --witness "127.0.0.1" > .ha/v_bad.log 2>&1 & VM1=$!
+$Y meta-server --meta-dir .ha/vm --listen 127.0.0.1:15220 --witness "127.0.0.1" > .ha/v_bad.log 2>&1 & VM1=$!
 sleep 0.6; kill $VM1 2>/dev/null; wait $VM1 2>/dev/null || true
 grep -q 'are not host:port' .ha/v_bad.log \
   && ok "malformed --witness entry warned fail-loud (not mistaken for a partition)" \
   || bad "malformed --witness entry produced no warning (log: $(tr '\n' ' ' < .ha/v_bad.log))"
-$Y meta-server --db-path .ha/vm --listen 127.0.0.1:15221 --witness "127.0.0.1:15192,127.0.0.1:15193" > .ha/v_even.log 2>&1 & VM2=$!
+$Y meta-server --meta-dir .ha/vm --listen 127.0.0.1:15221 --witness "127.0.0.1:15192,127.0.0.1:15193" > .ha/v_even.log 2>&1 & VM2=$!
 sleep 0.6; kill $VM2 2>/dev/null; wait $VM2 2>/dev/null || true
 grep -q '(even) arbiters' .ha/v_even.log \
   && ok "even-N --witness list warned with an odd-count recommendation" \
   || bad "even-N --witness list produced no warning (log: $(tr '\n' ' ' < .ha/v_even.log))"
-$Y meta-server --db-path .ha/vm --listen 127.0.0.1:15222 --witness "127.0.0.1:15195,127.0.0.1:15196,127.0.0.1:15197" > .ha/v_ok.log 2>&1 & VM3=$!
+$Y meta-server --meta-dir .ha/vm --listen 127.0.0.1:15222 --witness "127.0.0.1:15195,127.0.0.1:15196,127.0.0.1:15197" > .ha/v_ok.log 2>&1 & VM3=$!
 sleep 0.6; kill $VM3 2>/dev/null; wait $VM3 2>/dev/null || true
 { grep -q 'are not host:port' .ha/v_ok.log || grep -q '(even) arbiters' .ha/v_ok.log; } \
   && bad "healthy odd-N witness list emitted a spurious warning" \

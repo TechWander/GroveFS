@@ -4,14 +4,14 @@
 #   - guards: a live local mount of the view is refused (FSName check), a governed
 #     name (definition slot) is refused with point-at-def-hint, a base still
 #     referenced by an alias/derived/fork DEFINITION is refused, a nonexistent
-#     tree is refused, a `--store postgres://…` deployment is refused;
+#     tree is refused, a `--meta-store postgres://…` deployment is refused;
 #   - the destructive path: metadata tree (+WAL/SHM) gone, cross-view ledger
 #     rebuilt, blobs no other view holds are freed from blocks/;
 #   - shared bytes survive: a fork's blob refs come from the base's own keys
 #     (ledger holds>1), so removing the BASE keeps every byte the fork still
 #     names — verified through a fresh mount of the fork;
-#   - a remote store (meta-server --db-path + data-server --root split) frees
-#     through the OFFLINE data root the operator points at with --data-root;
+#   - a remote store (meta-server --meta-dir + data-server --data-dir split) frees
+#     through the OFFLINE data root the operator points at with --data-dir;
 #   - post-removal: `view list` no longer reports the base; a mount of the
 #     removed name is refused (there is no lazy re-creation switch at all).
 # Assertion-based; emits a SUMMARY line run_all reads.
@@ -48,14 +48,14 @@ T cat .vrtest/mnt/only.txt > /dev/null 2>&1 && bad "mount still alive after umou
 
 echo "===== 3) guards: governed name, dependent definition, missing tree, PG ====="
 echo "hide /keep.txt" > .vrtest/lens.rules
-$Y view --db-path .vrtest/home define --name lens1 --base alice --rules .vrtest/lens.rules > .vrtest/def.log 2>&1 \
+$Y view --meta-dir .vrtest/home define --name lens1 --base alice --rules .vrtest/lens.rules > .vrtest/def.log 2>&1 \
   && ok "derived lens over alice created" || bad "define failed: $(cat .vrtest/def.log)"
 $Y view rm --name alice --base > .vrtest/rm_dep.log 2>&1
 [ $? -ne 0 ] && ok "rm --base refused: a derived lens still references the base" || bad "removed a base under a live lens!"
 grep -q "view 'lens1' is governed by a definition over base 'alice'" .vrtest/rm_dep.log \
   && ok "dependency guard names the blocking definition" || bad "dep text: $(cat .vrtest/rm_dep.log)"
 $Y view rm --name lens1 > .vrtest/rm_lens.log 2>&1 && ok "plain rm removes the lens definition" || bad "lens rm: $(cat .vrtest/rm_lens.log)"
-$Y view --db-path .vrtest/home alias --name pub --real alice > .vrtest/alias.log 2>&1 \
+$Y view --meta-dir .vrtest/home alias --name pub --real alice > .vrtest/alias.log 2>&1 \
   && ok "alias pub -> alice created" || bad "alias failed: $(cat .vrtest/alias.log)"
 $Y view rm --name alice --base > .vrtest/rm_alias.log 2>&1
 [ $? -ne 0 ] && grep -q "over base 'alice'" .vrtest/rm_alias.log \
@@ -66,15 +66,15 @@ $Y view rm --name alice > .vrtest/rm_nod.md 2>&1
 $Y view rm --name nosuch --base > .vrtest/rm_missing.log 2>&1
 [ $? -ne 0 ] && grep -q "no physical base tree" .vrtest/rm_missing.log \
   && ok "rm --base on a missing tree says so" || bad "missing-tree text: $(cat .vrtest/rm_missing.log)"
-$Y view --db-path .vrtest/home --store postgres://invalid.invalid/db rm --name alice --base > .vrtest/rm_pg.log 2>&1
+$Y view --meta-dir .vrtest/home --meta-store postgres://invalid.invalid/db rm --name alice --base > .vrtest/rm_pg.log 2>&1
 # No PG host in this suite: the CLI must still REFUSE the destructive path (it
 # opens the PG control plane before anything physical, so it dies on connect —
 # either way the local tree must survive untouched, which is the real contract).
-[ $? -ne 0 ] && ok "rm --base under --store postgres cannot proceed (refused or control-plane gated)" || bad "PG deployment accepted a base-tree deletion!"
+[ $? -ne 0 ] && ok "rm --base under --meta-store postgres cannot proceed (refused or control-plane gated)" || bad "PG deployment accepted a base-tree deletion!"
 [ -f .vrtest/home/meta/alice.db ] && ok "tree still intact after four guard refusals" || bad "a guard damaged the tree"
 
 echo "===== 4) shared bytes: fork keeps the base's keys, base removal must NOT free them ====="
-$Y view --db-path .vrtest/home fork --name lab --base alice > .vrtest/fork.log 2>&1 \
+$Y view --meta-dir .vrtest/home fork --name lab --base alice > .vrtest/fork.log 2>&1 \
   && ok "fork lab of alice created (shares content keys)" || bad "fork failed: $(cat .vrtest/fork.log)"
 $Y view rm --name alice --base > .vrtest/rm_forkdep.log 2>&1
 [ $? -ne 0 ] && grep -q "view 'lab' is governed by a definition over base 'alice'" .vrtest/rm_forkdep.log \
@@ -89,7 +89,7 @@ $Y view rm --name alice --base > .vrtest/rm_final.log 2>&1
 grep -q "2 object(s) freed" .vrtest/rm_final.log && ok "report says both blobs were freed" || bad "report: $(cat .vrtest/rm_final.log)"
 [ "$(blobs .vrtest/home)" -eq 0 ] && ok "blocks/ actually empty — unreferenced bytes reclaimed" || bad "blobs left: $(blobs .vrtest/home)"
 [ ! -e .vrtest/home/meta/alice.db ] && [ ! -e .vrtest/home/meta/alice.db-wal ] && ok "alice.db (+wal/shm) gone" || bad "tree files left behind"
-$Y view --db-path .vrtest/home list > .vrtest/list.log 2>&1
+$Y view --meta-dir .vrtest/home list > .vrtest/list.log 2>&1
 grep -q "base view 'alice'" .vrtest/list.log && bad "removed base still listed" || ok "view list no longer reports the base"
 
 echo "===== 5) reclaim only after the LAST namer dies ====="
@@ -100,7 +100,7 @@ $Y init --view carol > /dev/null 2>&1
 $Y mount --view carol -m .vrtest/mnt2 > /dev/null 2>&1; sleep 1.2
 echo carol-data > .vrtest/mnt2/c.txt; sync
 $Y umount -m .vrtest/mnt2 > /dev/null 2>&1
-$Y view --db-path .vrtest/home fork --name carolab --base carol > /dev/null 2>&1 && ok "fork of carol created" || bad "carol fork failed"
+$Y view --meta-dir .vrtest/home fork --name carolab --base carol > /dev/null 2>&1 && ok "fork of carol created" || bad "carol fork failed"
 $Y view rm --name carol --base > .vrtest/rm_carol.log 2>&1
 [ $? -ne 0 ] && ok "carol --base refused while carolab forks it" || bad "refused? $(cat .vrtest/rm_carol.log)"
 $Y view rm --name carolab > /dev/null 2>&1; sleep 0.2
@@ -108,31 +108,31 @@ $Y view rm --name carol --base > .vrtest/rm_carol2.log 2>&1
 [ $? -eq 0 ] && ok "carol --base accepted after the last definition is gone" || bad "second carol rm: $(cat .vrtest/rm_carol2.log)"
 grep -q "1 object(s) freed" .vrtest/rm_carol2.log && ok "carol's single blob freed with no holders left" || bad "carol report: $(cat .vrtest/rm_carol2.log)"
 
-echo "===== 6) remote split roots: --data-root frees on the OFFLINE data-server root ====="
+echo "===== 6) remote split roots: --data-dir frees on the OFFLINE data-server root ====="
 unset GROVEFS_HOME
 mkdir -p .vrtest/metaA .vrtest/dataA .vrtest/mntA
-$Y meta-server --db-path .vrtest/metaA --listen 127.0.0.1:15711 --token vrmtok > .vrtest/msrv.log 2>&1 &
+$Y meta-server --meta-dir .vrtest/metaA --listen 127.0.0.1:15711 --token vrmtok > .vrtest/msrv.log 2>&1 &
 MSP=$!
-$Y data-server --listen 127.0.0.1:15721 --root .vrtest/dataA --token vrmtok > .vrtest/dsrv.log 2>&1 &
+$Y data-server --listen 127.0.0.1:15721 --data-dir .vrtest/dataA --token vrmtok > .vrtest/dsrv.log 2>&1 &
 DSP=$!
 sleep 1.5
 # Strict view gate: the remote base view is created explicitly (a mount no
 # longer materializes it).
-$Y view --db-path .vrtest/metaA create --view rview > .vrtest/create1.log 2>&1
-$Y mount --view rview -m .vrtest/mntA --meta 127.0.0.1:15711 --data 127.0.0.1:15721 --token vrmtok > .vrtest/rm_m.log 2>&1
+$Y view --meta-dir .vrtest/metaA create --view rview > .vrtest/create1.log 2>&1
+$Y mount --view rview -m .vrtest/mntA --meta-server 127.0.0.1:15711 --data-servers 127.0.0.1:15721 --token vrmtok > .vrtest/rm_m.log 2>&1
 sleep 1.5
 echo remote-bytes > .vrtest/mntA/r.txt && sync
 [ "$(blobs .vrtest/dataA)" -eq 1 ] && ok "remote write landed on the data-server root" || bad "dataA blobs: $(blobs .vrtest/dataA)"
 $Y umount -m .vrtest/mntA > /dev/null 2>&1
-# The meta tree lives in metaA; the bytes in dataA. Without --data-root the
+# The meta tree lives in metaA; the bytes in dataA. Without --data-dir the
 # default root (metaA) holds no blocks/, so the honest outcome is: tree dies,
 # NOTHING is freed, the blob stays (it is still ledger-held by nothing, but the
 # CLI cannot locate it — the operator must name the data root explicitly).
-$Y view --db-path .vrtest/metaA rm --name rview --base > .vrtest/rm_split1.log 2>&1
+$Y view --meta-dir .vrtest/metaA rm --name rview --base > .vrtest/rm_split1.log 2>&1
 [ $? -eq 0 ] && ok "rm --base on split roots still succeeds (tree dies)" || bad "split1 rm: $(cat .vrtest/rm_split1.log)"
 grep -q "0 object(s) freed from.*1 not found under that data root" .vrtest/rm_split1.log \
   && ok "report honestly says 0 freed / blob not under this root" || bad "split1 report: $(cat .vrtest/rm_split1.log)"
-[ "$(blobs .vrtest/dataA)" -eq 1 ] && ok "the remote blob survives untouched" || bad "dataA blobs vanished without --data-root!"
+[ "$(blobs .vrtest/dataA)" -eq 1 ] && ok "the remote blob survives untouched" || bad "dataA blobs vanished without --data-dir!"
 # The surviving r1 blob is now an OFFLINE orphan: put its key back into the
 # ledger by hand (mirroring what the surviving data-server tree would show), so
 # the rview2 pass below counts total blobs deterministically — r1 must still be
@@ -140,37 +140,37 @@ grep -q "0 object(s) freed from.*1 not found under that data root" .vrtest/rm_sp
 R1=$(find .vrtest/dataA/blocks -type f | head -1)
 kill $MSP $DSP 2>/dev/null; wait $MSP $DSP 2>/dev/null
 # redo cleanly on a fresh store: seed, umount, then remove with explicit root
-$Y meta-server --db-path .vrtest/metaA --listen 127.0.0.1:15711 --token vrmtok > .vrtest/msrv2.log 2>&1 &
+$Y meta-server --meta-dir .vrtest/metaA --listen 127.0.0.1:15711 --token vrmtok > .vrtest/msrv2.log 2>&1 &
 MSP=$!
-$Y data-server --listen 127.0.0.1:15721 --root .vrtest/dataA --token vrmtok > .vrtest/dsrv2.log 2>&1 &
+$Y data-server --listen 127.0.0.1:15721 --data-dir .vrtest/dataA --token vrmtok > .vrtest/dsrv2.log 2>&1 &
 DSP=$!
 sleep 1.5
-$Y view --db-path .vrtest/metaA create --view rview2 > .vrtest/create2.log 2>&1
-$Y mount --view rview2 -m .vrtest/mntA --meta 127.0.0.1:15711 --data 127.0.0.1:15721 --token vrmtok > /dev/null 2>&1
+$Y view --meta-dir .vrtest/metaA create --view rview2 > .vrtest/create2.log 2>&1
+$Y mount --view rview2 -m .vrtest/mntA --meta-server 127.0.0.1:15711 --data-servers 127.0.0.1:15721 --token vrmtok > /dev/null 2>&1
 sleep 1.5
 echo remote-bytes2 > .vrtest/mntA/r2.txt && sync
 $Y umount -m .vrtest/mntA > /dev/null 2>&1
 kill $MSP $DSP 2>/dev/null; wait $MSP $DSP 2>/dev/null
-$Y view --db-path .vrtest/metaA rm --name rview2 --base --data-root .vrtest/dataA > .vrtest/rm_split2.log 2>&1
-[ $? -eq 0 ] && ok "rm --base --data-root accepted on split roots" || bad "split rm: $(cat .vrtest/rm_split2.log)"
+$Y view --meta-dir .vrtest/metaA rm --name rview2 --base --data-dir .vrtest/dataA > .vrtest/rm_split2.log 2>&1
+[ $? -eq 0 ] && ok "rm --base --data-dir accepted on split roots" || bad "split rm: $(cat .vrtest/rm_split2.log)"
 grep -q "1 object(s) freed from .vrtest/dataA/blocks" .vrtest/rm_split2.log \
   && ok "report credits the OFFLINE data root for the reclaim" || bad "split report: $(cat .vrtest/rm_split2.log)"
 [ "$(blobs .vrtest/dataA)" -eq 1 ] && ok "only rview2's blob was freed — r1 (never re-provable as unreferenced here) stays, no accidental cross-store delete" || bad "dataA blobs after split2: $(blobs .vrtest/dataA)"
 # Point at the right root for r1's LEDGER truth: with rview's tree gone the
 # rebuilt ledger holds no key for r1, so an explicit pass frees it too.
-$Y view --db-path .vrtest/metaA refs rebuild > /dev/null 2>&1
+$Y view --meta-dir .vrtest/metaA refs rebuild > /dev/null 2>&1
 rm -f "$R1" 2>/dev/null; true
 [ ! -e .vrtest/metaA/meta/rview2.db ] && ok "metaA tree gone" || bad "metaA tree left"
 
 echo "===== 7) post-removal mount semantics: the name is GONE, and stays gone ====="
-$Y meta-server --db-path .vrtest/metaA --listen 127.0.0.1:15711 --token vrmtok > .vrtest/msrv3.log 2>&1 &
+$Y meta-server --meta-dir .vrtest/metaA --listen 127.0.0.1:15711 --token vrmtok > .vrtest/msrv3.log 2>&1 &
 MSP=$!
-$Y data-server --listen 127.0.0.1:15721 --root .vrtest/dataA --token vrmtok > .vrtest/dsrv3.log 2>&1 &
+$Y data-server --listen 127.0.0.1:15721 --data-dir .vrtest/dataA --token vrmtok > .vrtest/dsrv3.log 2>&1 &
 DSP=$!
 sleep 1.5
 # A removed name is GONE: `M_OPEN` refuses any name with no tree and no
 # definition, so a mount cannot resurrect it as a fresh empty tree.
-if T $Y mount --view rview2 -m .vrtest/mntA --meta 127.0.0.1:15711 --data 127.0.0.1:15721 --token vrmtok > .vrtest/rem.log 2>&1; then
+if T $Y mount --view rview2 -m .vrtest/mntA --meta-server 127.0.0.1:15711 --data-servers 127.0.0.1:15721 --token vrmtok > .vrtest/rem.log 2>&1; then
   bad "remount of a removed base name succeeded (unknown views must be refused)"
 else
   ok "a removed base name is never resurrected by a mount"

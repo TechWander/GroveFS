@@ -17,7 +17,7 @@
 #   concurrent  same-user multi-process metadata consistency (WAL busy_timeout + tx GC)
 #   metasrv     central meta-server: one authoritative view shared across clients
 #   ha          meta-server primary/standby: replication + failover + event relay
-#   striping    deterministic cross-server data striping (multi --data)
+#   striping    deterministic cross-server data striping (multi --data-servers)
 #   locks       POSIX advisory lock e2e: flock/fcntl/lease/HA-replication
 #   freshness   non-strict cross-client push-invalidation visibility e2e
 #   disp_fresh  display-coordinate freshness e2e: relocated entry under synth parent
