@@ -10,6 +10,7 @@ physical base views):
 
 ```bash
 grovefs --home <D>/store import --view team --source <D>/seeds
+# created BASE view 'team' (target was absent); imported 3 object(s)
 # imported into view 'team' under /seeds: 4 dir(s), 3 object(s) (3 hardlinked zero-copy, 0 copied), 0 skipped, 0 failed
 ```
 

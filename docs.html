@@ -340,6 +340,7 @@
     <li><a href="#customize"><b>12</b>定制与显示</a>
       <ol class="sub">
         <li><a href="#three-questions">12.0 视图三问速览</a></li>
+        <li><a href="#create-base">12.0.1 哪些操作生成基视图</a></li>
         <li><a href="#s15-1">12.1 目录旋钮与存量导入</a></li>
         <li><a href="#s15-3">12.2 显示机制与裁剪</a></li>
         <li><a href="#s15-5">12.5 显示透镜</a></li>
@@ -387,7 +388,11 @@
 
   <h2>附录<span class="goal">查阅用，不必通读</span></h2>
   <ol>
-    <li><a href="#ref"><b>19</b>命令速查</a></li>
+    <li><a href="#ref"><b>19</b>命令速查</a>
+      <ol class="sub">
+        <li><a href="#ref-practice">19 按功能分组·学习/练习清单</a></li>
+      </ol>
+    </li>
     <li><a href="#config"><b>20</b>命令瘦身与配置</a>
       <ol class="sub">
         <li><a href="#s-config-rule">20.1 取值链与优先级</a></li>
@@ -569,7 +574,7 @@
       <tr><td>给审计员一个只读视图，隐藏 <code>/tmp</code> 和内部文档</td><td><b>派生视图</b></td><td>写一条规则 <code>hide /tmp</code>，他看不见，你照常可写</td><td><code>view define --name audit --base team --rules hide.txt</code></td></tr>
       <tr><td>公开数据集换个好记名字，不让外部看到内部真名</td><td><b>别名</b></td><td>外部挂 <code>public</code>，内部 <code>raw-data-2024</code> 暂不可挂</td><td><code>view alias --name public --real raw-data-2024</code></td></tr>
       <tr><td>把摄取的乱目录重新整理成人能读的结构，不上传新文件</td><td><b>fork</b></td><td>复制目录树 → 任意改名/移动 → 内容字节共享不复制</td><td><code>view fork --name lab --base team</code></td></tr>
-      <tr><td>把基视图一小部分装进新结构并改名</td><td><b>fork + graft</b></td><td>建空 fork → 按计划装入指定文件，逐条改名</td><td><code>view fork --empty --name lab</code><br><code>view graft --name lab --map plan.tsv</code></td></tr>
+      <tr><td>把基视图一小部分装进新结构并改名</td><td><b>fork + graft</b></td><td>建空 fork（基视图写在 <code>--base</code>）→ 按计划装入指定文件，逐条改名（<code>graft</code> 省略 <code>--src</code> 时继承该基）</td><td><code>view fork --base team --empty --name lab</code><br><code>view graft --name lab --map plan.tsv</code></td></tr>
     </table>
     <div class="note"><b>三条硬规则：</b>① 派生挂载只读，<code>write</code>/<code>truncate</code> 回 <code>EROFS</code>；fork 结构操作放行、内容写回 <code>EROFS</code>。② 只有全局账本 <code>refs.db</code> 归零，对象才真正回收。③ 派生/别名/fork 都<b>不是安全边界</b>——能挂基名的人仍看到全树；硬隔离用独立视图 + token / API key。</div>
     <h4>三个常见追问（别把「滤镜」当成「复制」）</h4>
@@ -1506,6 +1511,7 @@ CREATE INDEX idx_locks_expire ON locks(expires_at);</code></pre>
     <pre><code>$ mkdir -p /tmp/gvschema2/src/docs &amp;&amp; printf 'hello\n' &gt; /tmp/gvschema2/src/b.txt \
     &amp;&amp; printf 'alpha\n' &gt; /tmp/gvschema2/src/docs/a.md
 $ grovefs import --meta-dir /tmp/gvschema2 --view team --source /tmp/gvschema2/src
+created BASE view 'team' (target was absent); imported 2 object(s)
 imported into view 'team' under /src: 1 dir(s), 2 object(s) (2 hardlinked zero-copy, 0 copied), 0 skipped, 0 failed</code></pre>
     <pre><code>$ sqlite3 -header -column /tmp/gvschema2/meta/team.db \
     "SELECT id,ino,parent_id,name,is_dir,mode,substr(data_ref,1,8) AS ref FROM node ORDER BY id;"
@@ -1704,6 +1710,71 @@ grovefs du --view main --depth 1</code></pre>
     </table>
     <p>M_OPEN/OP_OPEN 按序过门:① token → ② key 门(scope/撤销/绑定) → ③ ro 写门 → ④ view 名→引擎缓存。治理面 <code>grovefs mcp --require-api-key</code> 共用同一份注册表(SQLite:<code>api_keys.db</code>;PG:<code>grovefs_control.api_keys</code>;MCP 加 <code>--meta-store</code> 即接 PG),<code>tools/call</code>/<code>resources/read</code> 全部落审计。<span class="cmt">详章 §9 共享视图与权限模型 / §16 鉴权 / §12.9.1 key 门与审计;USAGE §3.5.1 十步演练、§6.1 绑定/只读实测。</span></p>
 
+    <h3 id="create-base">12.0.1 哪些操作会生成「基视图」：正本的五种入口与三种假象</h3>
+    <p class="lead">「基视图（正本）」是唯一<b>能写内容、删名才真正回收字节</b>的物理树 <code>meta/&lt;V&gt;.db</code>。新人最常见的困惑是分不清哪条命令会立出一棵基视图——尤其 <code>fork</code> 也会生成 <code>meta/&lt;F&gt;.db</code>，但它<b>不是基视图</b>。判据只看一件事：<b>删除语义归谁</b>。</p>
+    <table>
+      <thead><tr><th>命令</th><th>生成什么</th><th>是不是基视图</th></tr></thead>
+      <tbody>
+        <tr><td><code>grovefs init --view V</code></td><td>空基树 <code>meta/V.db</code>（本地 <code>--home</code> 或经 meta-server）</td><td><b>✅ 是</b>——最标准的入口</td></tr>
+        <tr><td><code>grovefs view --meta-dir D create --view V</code></td><td>同上</td><td><b>✅ 是</b>——与 <code>init</code> 完全等价，只是把「立基视图」做成显式一等动作</td></tr>
+        <tr><td><code>init / view create … --manifest M</code></td><td>带目录骨架的基树</td><td><b>✅ 是</b>——<code>--manifest</code> 只决定初始层级，不改变性质（<a href="#manifest">§5</a>）</td></tr>
+        <tr><td><code>grovefs import --view V --source DIR</code></td><td>视图不存在时<b>顺带建</b>一棵基树，再把盘上目录零拷贝纳管</td><td><b>✅ 是</b>——「DB created if absent, like <code>init</code>」；目标若是派生名则拒绝（<a href="#s15-7">§12.7</a>）</td></tr>
+        <tr><td><code>grovefs view --meta-dir D import --view V --in F</code></td><td>把 <code>view export</code> 的 JSONL 装成<b>新的本地基树</b>（保留 id/inode/硬链接）</td><td><b>✅ 是</b>（默认）——但加 <code>--as-fork B</code> 时装成 fork，<b>不是</b>基视图（<a href="#s15-8-2">§12.8.2</a>）</td></tr>
+        <tr class="grp"><td colspan="3">下面几种容易被误当成「建了基视图」，其实没有</td></tr>
+        <tr><td><code>grovefs view --meta-dir D fork --base B --name F</code></td><td>确实生成 <code>meta/F.db</code> 一棵<b>独立元数据树</b></td><td><b>❌ 不是基视图</b>——结构可写、内容 <code>EROFS</code>、字节与 <code>B</code> 共享、删除不拥有物理 GC；且必须先有基 <code>B</code>（<a href="#s15-8-1">§12.8.1</a>）</td></tr>
+        <tr><td><code>grovefs view --meta-dir D define --base B --name D --rules F</code></td><td>不建树，只写 <code>meta/views/D.layout</code></td><td><b>❌ 派生滤镜</b>——挂载只读，写回 <code>B</code>（<a href="#s15-6">§12.6</a>）</td></tr>
+        <tr><td><code>grovefs view --meta-dir D alias --real R --name A</code></td><td>不建树，一行 <code>alias R</code></td><td><b>❌ 别名</b>——只是把可写的 <code>R</code> 换个公开名（<a href="#s15-8">§12.8</a>）</td></tr>
+        <tr><td><code>grovefs mount --view V -m MP</code></td><td>什么都不建</td><td><b>❌</b>——<code>V</code> 不存在直接报错 <code>views are created explicitly; run … create/init first</code>；挂载从不替你立视图</td></tr>
+      </tbody>
+    </table>
+
+    <h4>三问定命令：数据在哪儿 / 单机还是集群 / 要不要骨架</h4>
+    <p>选哪个入口，只由三个当下就能答上来的问题决定；三问覆盖五种入口的全部边界，没有第二套流程。</p>
+    <table>
+      <thead><tr><th>一问 · 起点数据在哪</th><th>二问 · 单机 <code>--home</code> 还是集群 <code>--meta-dir</code>/PG</th><th>三问 · 初始形状</th><th>对应命令</th></tr></thead>
+      <tbody>
+        <tr><td>什么都没有，先立空树</td><td>单机 <code>--home H</code></td><td>空根</td><td><code>grovefs --home H init --view V</code></td></tr>
+        <tr><td>什么都没有，先立空树</td><td>单机 <code>--home H</code></td><td>带目录骨架</td><td><code>grovefs --home H init --view V --manifest M</code>（骨架写法见 <a href="#manifest">§5</a>）</td></tr>
+        <tr><td>什么都没有，先立空树</td><td>集群（meta-server 侧本地 SQLite，或 PG 后端）</td><td>空根 / 骨架</td><td><code>grovefs view --meta-dir D create --view V [--manifest M]</code>——PG 下 <code>--meta-dir</code> 换 <code>--meta-store postgres://…</code>，schema 随之落 PG</td></tr>
+        <tr><td>盘上已有一棵目录，想零拷贝纳管</td><td>任意（<code>--home</code> 或 <code>--meta-dir</code>）</td><td>沿用盘上形状</td><td><code>grovefs … import --view V --source DIR</code>——视图不存在则顺带建；已存在则只追加不重建（<a href="#s15-7">§12.7</a>）</td></tr>
+        <tr><td>另一台机器 <code>view export</code> 出的 JSONL 想装回来</td><td>目标端本地元数据根</td><td>沿用导出形状</td><td><code>grovefs view --meta-dir D import --view V --in F</code>——保留 id/inode/硬链接（<a href="#s15-8-2">§12.8.2</a>）；<code>--as-fork B</code> 换装成 fork 而非 base</td></tr>
+      </tbody>
+    </table>
+    <div class="warn"><b>不在这三问里的情形</b>——<code>fork</code>/<code>define</code>/<code>alias</code> 都不是「建基视图」的动作，它们必须先有一棵已存在的基视图作为 <code>--base B</code>/<code>--real R</code>；<code>graft</code> 只是往已有的 fork/base 里搬条目。三问里没有「起点什么都没有 + 想要 fork/alias/派生」这一格，因为那种东西本来就建不出来。</div>
+
+    <h4>回显即证据：六种入口逐字打出 <code>BASE</code>，一眼辨真伪</h4>
+    <p>不用记忆哪条命令建正本——跑一次，看 stdout 有没有 <code>BASE</code> 三个字母即可。<b>有 → 立了基视图；没有 → 动的不是基视图</b>。下表把五种会建基视图的入口 + 一条<b>反向对照</b>（<code>--as-fork</code> 明确不加 <code>BASE</code>）逐字列出，全部取自当前版本真实回显，非示例伪码。</p>
+    <table>
+      <thead><tr><th>命令（示意）</th><th>关键回显（逐字，含 <code>BASE</code> 即视为主正本）</th></tr></thead>
+      <tbody>
+        <tr><td><code>grovefs --home H init --view team</code></td><td><code>initialized BASE view 'team' at H/meta/team.db</code></td></tr>
+        <tr><td><code>grovefs view --meta-dir D create --view team</code>（本地 SQLite）</td><td><code>created BASE view 'team' at D/team.db</code></td></tr>
+        <tr><td><code>grovefs view --meta-store postgres://… create --view team</code>（PG）</td><td><code>created BASE view 'team' in postgres://… (schema grovefs_v_&lt;hex&gt;)</code></td></tr>
+        <tr><td><code>grovefs --home H import --view team --source /data/x</code>（视图原本不存在）</td><td>首行：<code>created BASE view 'team' (target was absent); imported N object(s)</code><br/>次行：既有统计 <code>imported into view 'team' under …: … object(s) …</code>——目标已存在则首行不出现，不会误报</td></tr>
+        <tr><td><code>grovefs view --meta-dir D import --view b2 --in team.exp</code></td><td><code>imported BASE view 'b2' from team.exp: N node(s), M blob reference(s); cross-view ledger rebuilt</code></td></tr>
+        <tr class="grp"><td colspan="2">反向对照：不是建基视图的两例，回显里就没有 <code>BASE</code></td></tr>
+        <tr><td><code>grovefs view --meta-dir D import --view lab --in team.exp --as-fork team</code></td><td><code>imported view 'lab' from team.exp: N node(s), …</code>（不加 <code>BASE</code>）<br/>紧接 <code>note: recorded `fork team` — mounts of 'lab' are structure-writable, content read-only (EROFS)</code>——明示这是 fork 不是正本</td></tr>
+        <tr><td><code>grovefs view --meta-dir D fork --base team --name lab --empty</code></td><td><code>forked view 'lab' from base 'team' as an EMPTY tree: root only, nothing copied</code>——种类词 <code>forked</code> 自带，无 <code>BASE</code></td></tr>
+      </tbody>
+    </table>
+    <div class="ok"><b>看回显就知道</b>：任何会建基视图的命令都在输出里显式打出 <code>BASE</code>——<code>init</code> 打 <code>initialized BASE view</code>、<code>view create</code> / <code>view import</code> 打 <code>created / imported BASE view</code>、顶层 <code>import</code> 顺带建库时先打 <code>created BASE view … (target was absent)</code>；反之 <code>forked / defined derived / defined pure alias / --as-fork</code> 的回显里<b>就是没有</b> <code>BASE</code>。且 <code>grovefs view --help</code> 末尾自带「四种视图 → 动词」图例。判据统一成一条：<b>跑一次，回显含 BASE 即立了正本，不含即动的不是正本</b>。</div>
+
+    <div class="note"><b>一句话判据</b>：只有<b>基视图</b>的删名会在跨视图账本 <code>refs.db</code> 归零时真正回收对象。<code>fork</code> 虽有自己的一棵 <code>meta/F.db</code>，但字节所有权仍记在基视图名下——它 reshape / 复制目录项，不 own 物理回收。故「有没有一棵 <code>.db</code>」≠「是不是基视图」；要看删除会不会掉字节。</div>
+    <div class="note"><b>MCP 不建基视图</b>：治理工具只做 <code>define / alias / fork / graft / remove</code> 等 reshape；立基视图需要文件系统落盘，是 <code>init</code> / <code>view create</code> / <code>import</code> 的 CLI 专属动作。</div>
+    <h4>最小创建示例（形式与 §4 / §12.7 一致）</h4>
+    <pre><code><span class="cmt"># 单机：建一棵空基视图（--home 本地根，--view 视图名），挂上即见空根</span>
+$ grovefs --home $BASE init --view team
+$ grovefs --home $BASE mount --view team -m $MNT/team
+
+<span class="cmt"># 一上来就带目录骨架（--manifest，见 §5）</span>
+$ grovefs --home $BASE init --view team --manifest seed.txt
+
+<span class="cmt"># 集群：在 meta-server 侧显式立基视图，供各客户端 --meta-server 挂载</span>
+$ grovefs view --meta-dir ~/meta create --view team
+
+<span class="cmt"># 把盘上已有目录零拷贝纳管成新基视图（视图不存在则顺带建）</span>
+$ grovefs --home $BASE import --view team --source /data/existing</code></pre>
+
     <h3 id="s15-1">12.1 服务端两个各自独立的目录旋钮</h3>
     <table>
       <tr><th>旋钮</th><th>存什么</th><th>能放哪</th></tr>
@@ -1813,6 +1884,7 @@ bash: /mnt/lens/docs/new.md: Read-only file system</code></pre>
     <pre><code>$ grovefs --home /data/cluster import --view legacy --source /data/legacy --dry-run
 <span class="cmt">dry run: view 'legacy' under /legacy would mirror 3 dir(s) and 2 file(s) (symlinks/special files and names already in the view are skipped on the real run)</span>
 $ grovefs --home /data/cluster import --view legacy --source /data/legacy
+<span class="cmt">created BASE view 'legacy' (target was absent); imported 2 object(s)</span>
 <span class="cmt">imported into view 'legacy' under /legacy: 3 dir(s), 2 object(s) (2 hardlinked zero-copy, 0 copied), 0 skipped, 0 failed</span>
 $ echo "new" &gt; /mnt/da/legacy/docs/quarter.txt   <span class="cmt"># 客户端挂载内写 → 源路径同 inode 同步可见</span>
 $ cat /data/legacy/docs/quarter.txt
@@ -2105,7 +2177,7 @@ note: metadata only — copy the store's `blocks/` tree (the whole data root) as
 $ rsync -a -H /data/src/blocks/ /data/dst/blocks/
 <span class="cmt"># 目标机：导入成新的基视图</span>
 $ grovefs view --meta-dir /data/dst import --view team --in /tmp/team.jsonl
-imported view 'team' from /tmp/team.jsonl: 42 node(s), 37 blob reference(s); cross-view ledger rebuilt
+imported BASE view 'team' from /tmp/team.jsonl: 42 node(s), 37 blob reference(s); cross-view ledger rebuilt
 $ grovefs --home /data/dst mount --view team -m /mnt/team   <span class="cmt"># 硬链接仍是同一 inode，权限/时间原样</span></code></pre>
     <p class="lead"><b>导入是原子的</b>：先在 <code>D/meta/.V.import-&lt;pid&gt;-&lt;时间&gt;</code> 建临时树，全部行与校验通过、WAL 合并后才 <code>rename</code> 到 <code>D/meta/V.db</code>——坏文件/悬挂父节点/计数不符/失败的 <code>--replace</code> 都不会破坏旧树。<b>守卫</b>：输出已存在需 <code>--force</code>；目标已有定义槽先 <code>view rm</code>；表头 format/version 不符、根不是 <code>id=1</code> 的目录、悬挂父节点、表头计数与正文不符均整单拒绝；<code>--as-fork</code> 要求基视图在目标机已存在且本身无定义。</p>
     <p class="lead"><b>迁移的拓扑约束</b>(数据分布，不是硬件绑定)：多盘 <code>--data-dir</code> 的数量与顺序要一致(等盘克隆原位顶替不影响定位——落盘位置是 key 哈希 mod 根数现场重算、列表与对象都不记录盘序号;增删盘或调序才会重映射;或合并成单 root)；条带 <code>s&lt;N&gt;:</code> 要保留 N 个 data-server 及顺序(数量不符才会被拒)——<b>换机器 / 换 IP 本身不是约束</b>：条带成员按列表<b>下标</b>寻址（<code>i % N</code>），原位替掉 <code>-o data=</code> 里那一项即可自动识别，已写对象不需 rebal，详 §11.1；顺序错位不会被报出来，只会缺文件；整目录拷会把 HA <code>epoch</code> 带过去，旧主必须先停(<code>export/import</code> 与 <code>fork</code> 有意不复制 <code>ctrl</code>/<code>locks</code>)；PG 后端用 <code>pg_dump</code>/逻辑复制，<code>view export/import</code> 目前面向本地 SQLite 树；整目录冷拷不能裸拷运行中的 SQLite(WAL)，用停写或 <code>.backup</code>/<code>VACUUM INTO</code>。<b>多个基视图</b>：可建任意多个基视图(<code>init --view A</code>/<code>view create --view A</code>)，各自一棵 <code>meta/A.db</code>，树/字节/权限/删除互不影响，<code>view list</code> 全部列出；迁移可按视图进行，key 也可按视图分别绑定。回归：<code>migrate</code> 套件 74 条断言(挂载中导出/宿主无关性/虚拟名与覆盖守卫/跨绝对路径导入/硬链接与权限保真/原子替换/损坏输入拒绝/<code>--as-fork</code> 账本共享/多基视图独立)。</p>
@@ -3079,6 +3151,39 @@ MAX_FRAME = 1&lt;&lt;28 (256 MiB)：声明超此值的帧直接拒收而非先�
         <tr><td><code>--base</code>（rm）/ <code>--data-dir R</code></td><td>删整棵基树 + 回收无人持有字节</td><td><code>rm</code></td><td>§12.8.3</td></tr>
       </tbody>
     </table>
+    <h3 id="ref-practice">按功能分组 · 学习 / 练习清单</h3>
+    <p class="lead">上面是全参数速查表；这份按「功能角色」重组，方便从零练手。每条都可在 <a href="#quick">§4</a>（单机 5 分钟）或 <a href="#deploy">§7</a>（三机 systemd）里直接跑；配好 <a href="#config">§20</a> 的环境变量 / 配置文件后，长命令能缩成一行（如 <code>grovefs du --view alice</code>）。</p>
+    <table>
+      <tr><th>功能</th><th>命令</th><th>一句话作用</th></tr>
+      <tr class="grp"><td colspan="3">① 两个守护进程 —— 数据面 / 元数据面</td></tr>
+      <tr><td>起数据服务</td><td><code>grovefs data-server --data-dir DIR[,DIR] --listen IP:PORT [--token T]</code></td><td>把本地磁盘当对象存储对外服务；逗号列表 = 多盘条带</td></tr>
+      <tr><td>起元数据服务</td><td><code>grovefs meta-server --meta-dir D --listen IP:PORT [--token T] [--role primary|standby --peer ADDR [--sync-repl] [--witness ADDR]]</code></td><td>供多个 <code>mount --meta-server</code> 客户端共享的中心元数据；带主备 HA</td></tr>
+      <tr class="grp"><td colspan="3">② 跑起来 —— 建视图 → 挂载 → 卸载</td></tr>
+      <tr><td>建视图（单机）</td><td><code>grovefs init --home H --view V [--manifest F]</code></td><td>建元数据库与可选目录骨架，等价 <code>view create</code></td></tr>
+      <tr><td>挂载</td><td><code>grovefs mount --view V -m MP [--home H｜--meta-server M --data-servers A[,A]] [--ro] [--no-cache] [--cache-ttl S] [--run-as-uid N] [--threads N] [--layout F] [--stats] [--foreground]</code></td><td>把视图挂到挂载点（默认转后台，就绪即返回）；<code>--foreground</code> 供 systemd</td></tr>
+      <tr><td>卸载</td><td><code>grovefs umount -m MP</code></td><td>卸载一个挂载点</td></tr>
+      <tr class="grp"><td colspan="3">③ 视图治理 —— 正本 / 滤镜 / 门牌 / 复印册（都走 <code>view</code>，<code>--meta-dir</code> 须放子命令<b>之前</b>）</td></tr>
+      <tr><td>建基视图（正本）</td><td><code>grovefs view --meta-dir D create --view V [--manifest F]</code></td><td>立一棵真实存储树；<b>只有基视图的删除才真正回收字节</b></td></tr>
+      <tr><td>列视图</td><td><code>grovefs view --meta-dir D list</code></td><td>列出 base / lens / fork / alias 各形态与其读写性</td></tr>
+      <tr><td>fork（复印册）</td><td><code>grovefs view --meta-dir D fork --base B --name N</code></td><td>独立元数据树 + 内容字节共享：结构可写、内容只读（EROFS）</td></tr>
+      <tr><td>define（滤镜 lens）</td><td><code>grovefs view --meta-dir D define --base B --name N --rules F</code></td><td>服务端定义只读形状（<code>hide/only/map/link</code>），挂载即得该形状</td></tr>
+      <tr><td>alias（门牌）</td><td><code>grovefs view --meta-dir D alias --real R --name A [--retire OLD]</code></td><td>公开名全树可写、真实名不可直挂；<code>--retire</code> 零窗口轮换</td></tr>
+      <tr><td>graft（接枝）</td><td><code>grovefs view --meta-dir D graft --name N --src S [--dest DIR] --map PLAN|-</code></td><td>向 fork 装入条目并改名 / 换目录，一个事务、零字节复制</td></tr>
+      <tr><td>导出 / 导入（迁移）</td><td><code>view --meta-dir D export --view V --out F</code> / <code>import --view V --in F [--as-fork B]</code></td><td>单视图元数据 JSONL（宿主无关，不含字节；字节另拷 <code>blocks/</code>）</td></tr>
+      <tr><td>删视图</td><td><code>grovefs view --meta-dir D rm --name N [--base] [--data-dir R]</code></td><td>删定义；<code>--base</code> 连整棵基树并回收无人持有的字节</td></tr>
+      <tr class="grp"><td colspan="3">④ 用量与运维（免 FUSE，直连后端）</td></tr>
+      <tr><td>用量</td><td><code>grovefs du --view V [--total]</code></td><td>子树字节汇总，输出兼容 <code>du</code>；跨节点条带下也准确</td></tr>
+      <tr><td>离线 GC</td><td><code>grovefs gc --meta-dir D [--data-dir R] [--apply] [--older-than 24h]</code></td><td>审计 / 回收孤儿对象（默认只扫描，永不删账本仍持有的键）</td></tr>
+      <tr><td>账本重建</td><td><code>grovefs refs --meta-dir D rebuild</code></td><td>视图库被外部 <code>rm</code> 后重算跨视图引用计数</td></tr>
+      <tr><td>纳管存量目录</td><td><code>grovefs import --view V --source DIR [--data-dir R] [--dry-run]</code></td><td>把盘上已有目录零拷贝纳入某视图（同盘硬链接）</td></tr>
+      <tr class="grp"><td colspan="3">⑤ 权限与智能体接口</td></tr>
+      <tr><td>API key</td><td><code>grovefs apikey --meta-dir D create --label L [--for any|mcp|mount] [--view V] [--ro]</code> / <code>list</code> / <code>revoke --id ID</code> / <code>calls --limit N</code></td><td>铸造 / 列表 / 撤销 / 审计；<code>--view</code> 绑定单视图、<code>--ro</code> 服务端强制只读</td></tr>
+      <tr><td>MCP（供智能体）</td><td><code>grovefs mcp --meta-dir D [--require-api-key]</code></td><td>stdio JSON-RPC 暴露视图治理，与 <code>grovefs view</code> 同校验同文案</td></tr>
+      <tr class="grp"><td colspan="3">⑥ 环境变量 / 配置文件（填默认、不覆盖显式 flag，详见 <a href="#config">§20</a>）</td></tr>
+      <tr><td>客户端默认值</td><td><code>GROVEFS_META_SERVER</code> · <code>GROVEFS_DATA_SERVERS</code> · <code>GROVEFS_META_DIR</code> · <code>GROVEFS_META_STORE</code> · <code>GROVEFS_TOKEN</code></td><td>写在 <code>~/.config/grovefs/grovefs.conf</code>（0600）或 env；<code>mount</code>/<code>du</code> 的地址回退到它们</td></tr>
+      <tr><td>无 env 回退者</td><td><code>grovefs view</code> · <code>grovefs apikey</code></td><td>控制面必须显式给 <code>--meta-dir</code>（或 <code>--home</code>）；交互可用 shell 助手注入</td></tr>
+    </table>
+    <div class="ok"><b>建议练手顺序</b>：① 单机 <code>init</code>→<code>mount</code>→<code>du</code>→<code>umount</code> 建手感 → ② 用 <code>mount --ro/--no-cache/--cache-ttl</code> 体会缓存与一致性 → ③ <code>view fork / define / alias</code> 三种治理的差异（结构可写 / 只读形状 / 全树可写改名）→ ④ <code>du / gc / refs rebuild</code> 运维 → ⑤ <code>apikey / mcp</code> 权限与智能体接入。</div>
     <div class="chnav"><a href="#tuning"><span>← 上一章</span><b>§18 调优方法论</b></a><a class="r" href="#config"><span>下一章 →</span><b>§20 命令瘦身与配置</b></a></div>
   </section>
 
