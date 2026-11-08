@@ -875,7 +875,7 @@ $Y mount --view alice \
     <div class="note"><b>先看哪个？</b>本章是<b>按顺序打勾的标准清单</b>（适合已有 Linux 基础的人对照）；如果你想跟着终端一步步抄、连每步的预期输出都看到，直接跳到 <a href="#case">§8 完整案例</a>（六个场景 + 全程实录）。</div>
 
     <h3>7.0 部署前预检(每台节点)</h3>
-    <pre><code>uname -r                                 <span class="cmt"># 期望 >= 4.5(多线程 clone_fd 依赖)</span>
+    <pre><code>uname -r                                 <span class="cmt"># &gt;= 4.5 才能多线程 clone_fd；低于则挂载自动退回单工作线程</span>
 ls -l /dev/fuse                            <span class="cmt"># 存在且可读写</span>
 which fusermount fusermount3 || true       <span class="cmt"># 至少有一个(运行时只需 libfuse 用户态工具)</span></code></pre>
     <p>数据盘要求:<code>--home</code>(或 <code>blocks/</code> 根)所在文件系统要有真实容量——字节全部以对象形式落盘,<b>不要</b>把数据根建在 tmpfs 上。</p>
@@ -1749,7 +1749,7 @@ rm imported/report.pdf                             <span class="cmt"># 安全：
       <li><b>同 view + 目录约定</b>：B 只进 <code>by_public/</code> 这类发布目录——简单，但约定不是强制。</li>
       <li><b>拆两个 view + 灌两遍</b>：公开部分单独一 view 配只读 key——硬隔离真只读，代价是字节多一份。要真安全隔离选这条。</li>
     </ul>
-    <p class="lead"><b>未实现(诚实标注)</b>：子树挂载 <code>--subpath</code>/<code>--prefix</code>(<code>--layout only/hide</code> 是显示裁剪，不是路径 chroot)；跨 view 硬链接(link 只在树内；跨视图共享字节用 <b>fork 视图</b>——独立元数据树、内容共享，§12.8.1)；导入后源目录的持续自动同步(watcher/定时重扫)——<code>grovefs import</code> 是手动幂等增量命令；<b>远程直连导入</b>（<code>grovefs import</code> 经 <code>--meta</code>/<code>--data</code> 向远端集群批量导入）——只在存储机执行，跨机走挂载点 rsync（§12.1.1）；per-directory 强制权限（现有机制的粒度是 view × 调用方凭据；<code>--layout</code> 可做目录级显示裁剪但不构成强制隔离）。</p>
+    <p class="lead"><b>未实现(诚实标注)</b>：子树挂载 <code>--subpath</code>/<code>--prefix</code>(<code>--layout only/hide</code> 是显示裁剪，不是路径 chroot)；跨 view 硬链接(link 只在树内；跨视图共享字节用 <b>fork 视图</b>——独立元数据树、内容共享，§12.8.1)；导入后源目录的持续自动同步(watcher/定时重扫)——<code>grovefs import</code> 是手动幂等增量命令；<b>远程直连导入</b>（<code>grovefs import</code> 经 <code>--meta</code>/<code>--data</code> 向远端集群批量导入）——只在存储机执行，跨机走挂载点 rsync（§12.1.1）；<b>splice/zero-copy 读回</b>——fuser 0.18 回复面只有 <code>writev</code>、<code>ReplyData</code> 只收 <code>&amp;[u8]</code>，无 <code>splice</code>/<code>sendfile</code>/<code>vmsplice</code> 入口，要做需 fork fuser；实测收益上限仅本机 warm 大块读（~6%），cold 受盘速主导、远程/条带不受益，不够覆盖 fork+页缓存一致性的复杂度与风险；per-directory 强制权限（现有机制的粒度是 view × 调用方凭据；<code>--layout</code> 可做目录级显示裁剪但不构成强制隔离）。</p>
 
     <h3 id="s15-5">12.5 显示透镜：<code>mount --layout rules.txt</code></h3>
     <p class="lead">同一棵存储树、同一份字节，不同客户端挂载时各自套一层显示规则(源路径 = 存储树坐标，<code>#</code> 注释，绝对路径)：</p>
@@ -2563,7 +2563,7 @@ ps aux | grep grovefs                  <span class="cmt"># 查看在跑的 serve
     <h3>13.3 性能监控：用实测数据代替猜测</h3>
     <ul>
       <li><b>即时体检（opt-in 遥测）</b>：挂载时加 <code>--stats</code>，长驻采样加 <code>--stats-interval 60 --stats-file /var/log/grovefs-alice-stats.log</code>；运行中 <code>cat &lt;挂载点&gt;/.grove-stats</code> 即当前报告（仅开启时存在此控制节点）。报告按 <code>[op]</code>/<code>[io]</code>/<code>[meta]</code>/<code>[counters]</code> 四节分组，每行给出一个阶段的 <code>ops/p50/p90/p99/max/mean/total_s/bytes</code>（µs）；阶段命名即定位：<code>read.backend_total</code> 慢→数据面/网络，<code>meta.create</code> 慢→元数据库，<code>io.remote.pool_wait</code> 慢→连接池不够，<code>db.pg_ssi_retry</code> 高→PG 序列化冲突。完整字段清单与真实回显见 <a href="#security">§16</a> 与 <a href="USAGE.md">USAGE.md §8.1</a>；端到端验收由 <code>.build-bin/test_stats.sh</code> 证明。</li>
-      <li><b>内核协商看得见</b>：<code>--stats</code> 下挂载日志会打印 <code>grovefs negotiated caps: …</code>，显示本机内核实际授予了哪些能力位（READDIRPLUS/AUTO_INVAL_DATA/WRITEBACK…）——新老内核行为差异先查这里。</li>
+      <li><b>内核协商看得见</b>：每次挂载（无论是否 <code>--stats</code>）都会无条件打印 <code>grovefs FUSE caps granted: …</code>，逐位列出本机内核实际授予的能力位（<code>ASYNC_READ</code>/<code>BIG_WRITES</code>/<code>WRITEBACK</code>/<code>ATOMIC_O_TRUNC</code>/<code>READDIRPLUS</code>…）——新老内核行为差异先查这里，不会静默按最优假设跑。</li>
       <li><b>系统层健康判断</b>：没有集中 metrics 接口（未实现，诚实标注）；判据是：进程 active + 端口在听 + <code>findmnt</code> 在挂 + 日志无新增异常行 + <code>df</code>（经 <code>statvfs</code> 聚合真实容量）无异常增长。</li>
       <li><b>A/B 基准</b>：<code>.build-bin/</code> 下的 <code>bench.sh</code>/<code>bench_threads.sh</code>/<code>bench_striping.sh</code>/<code>bench_remote.sh</code>/<code>bench_locks.sh</code> 可复跑（同一套件也可用 <code>SKIP_BENCH=1 run_all.sh</code> 跳过）；调优方法论与实测地板见 <a href="#tuning">§18</a>。</li>
     </ul>
@@ -2909,7 +2909,7 @@ bash: ... Read-only file system</code></pre>
       <tr><td>后台 WAL checkpoint</td><td>每个可写视图引擎起一条后台 <code>wal_checkpoint(PASSIVE)</code> 线程（每 1s，~30s 一次 <code>TRUNCATE</code>），写连接 <code>wal_autocheckpoint=0</code>——把提交里的同步 checkpoint 停顿移出写热路径；随引擎 <code>Drop</code> 关停，只读/备机引擎不启动。实测（同一 3000 文件建目录）：<code>meta.create</code> total <b>0.38s</b>、max <b>33ms</b>；<code>lookup</code> p50 17µs、<code>getattr</code> p50 36µs。</td></tr>
       <tr><td><code>--tune-cache &lt;秒&gt;</code> 读缓存 TTL</td><td>把内核 attr/dentry 缓存 TTL 从默认 2s 放大，适合读多/不可变树（天文“数据不落地”一次性流读）。安全边界：跨端新鲜度仍由默认 <code>notify</code> 实时失效推送保证，且新内核（≥ 3.15）协商到 <code>FUSE_AUTO_INVAL_DATA</code>（size/mtime 变则丢陈旧页数据）；<code>--strict</code> 恒把 TTL 钉为 0。能力位按各自组协商，<code>AUTO_INVAL_DATA</code> 单独成组→老内核只丢此位不伤其余。见 <code>run_all.sh</code> <code>freshness</code>/<code>disp_fresh</code>。</td></tr>
       <tr><td><code>--bw-read &lt;速率&gt;</code> / <code>--bw-write &lt;速率&gt;</code> 内容带宽整形</td><td>给本次挂载的内容读、写各上一道客户端 GCRA 令牌槽，按实际交付字节铺开互不重叠的时间槽（长跑速率精确等于上限；单个大于 1 秒额度的 op 最多提前 1 秒放行）：读在回复前、写在落盘后，超额 op 只睡到自己的时间槽，绝不丢字节/截断，写侧延迟天然形成背压。语法支持 <code>K</code>/<code>M</code>/<code>G</code>（1024 进制）与纯字节数，<code>0</code>/缺省 = 不限（热路径仅一次 <code>rate == 0</code> 分支）；env 回退 <code>GROVEFS_BW_READ</code>/<code>GROVEFS_BW_WRITE</code>，非法速率在解析处即拒。<code>--stats</code> 的 <code>bytes read</code>/<code>bytes written</code> 可核对实际吞吐（整形开启时 <code>op_total</code> 含蓄意等待、<code>backend_total</code> 不含）。诚实边界：客户端自限速，不是隔离——绕开 FUSE 直连 data-server、或多挂载同视图各自拿满额度；服务端也无法把内容寻址的字节归到某棵视图上。见 <code>run_all.sh</code> <code>bwlimit</code>。</td></tr>
-      <tr><td>内核自适应大块 IO</td><td><code>max_write</code>/<code>max_readahead</code> 申请 4MiB，由 fuser 与内核按 <code>FUSE_MAX_MAX_PAGES</code> 各自截断：老内核（5.4）自动降到页上限，6.x+ 更大块=更少往返；<code>PARALLEL_DIROPS</code>、<code>WRITEBACK_CACHE</code>、<code>MAX_PAGES</code> 均能力协商。<code>--stats</code> 下会打印 <code>grovefs negotiated caps: …</code> 显示本机实际授予位。大块读写已贴近底层地板，实测 FUSE 每 op 仅加 ~50–70µs。</td></tr>
+      <tr><td>内核自适应大块 IO</td><td><code>max_write</code>/<code>max_readahead</code> 申请 4MiB，由 fuser 与内核按 <code>FUSE_MAX_MAX_PAGES</code> 各自截断：老内核（5.4）自动降到页上限，6.x+ 更大块=更少往返。能力位在 <code>INIT</code> 阶段<b>逐位</b>申请（<code>add_capabilities</code> 每组 all-or-nothing，逐位使内核缺某一位时只掉那一位、不连累其余）：大 <code>PARALLEL_DIROPS</code>、<code>WRITEBACK_CACHE</code>、<code>MAX_PAGES</code> 等均能力协商，<code>ATOMIC_O_TRUNC</code> 命中时 <code>O_TRUNC</code> 截断在 <code>open</code> 内完成、省掉一次 <code>FUSE_SETATTR</code> 往返（实测 <code>O_WRONLY|O_TRUNC</code> 从 5.4 的 131µs/op 降到 84µs/op）。每次挂载日志都无条件打印 <code>grovefs FUSE caps granted: …</code> 显示本机实际授予位（<code>clone_fd</code> 依赖的 <code>FUSE_DEV_IOC_CLONE</code> 是 4.5+，低于则退回单工作线程）。大块读写已贴近底层地板，实测 FUSE 每 op 仅加 ~50–70µs。</td></tr>
     </table>
     <div class="note">这些加速均为排障/调优观测，<b>不构成吞吐或可扩展性声明</b>（与论文边界一致）；上表数字是本机单进程 <code>--stats</code> 实测分布，存在 run-to-run 抖动但机制可归因。远程/PG 后端瓶颈是网络 RTT，须另用 <code>bench_remote.sh</code> 量测。</div>
     <div class="note"><b>真实回显</b>(本地 SQLite 挂载加 <code>--stats</code>,做了若干读写 / mkdir / readdir 后 <code>cat &lt;mnt&gt;/.grove-stats</code> 的 <code>[op]</code> 节选,单位 µs;<code>[data-io]</code>/<code>[meta]</code>/<code>[counters]</code> 同形,完整清单见 <code>USAGE.md</code> §8.1):
@@ -2960,7 +2960,7 @@ MAX_FRAME = 1&lt;&lt;28 (256 MiB)：声明超此值的帧直接拒收而非先�
       <tr><td><b>数据面</b>（<code>proto.rs</code>，客户端↔data-server）</td><td><code>OP_CREATE=1 OP_READ=2 OP_WRITE=3 OP_LEN=4 OP_FSYNC=5 OP_TRUNC=6 OP_REMOVE=7 OP_STATFS=8 OP_OPEN=9 OP_FENCE=10</code>；<code>OP_OPEN</code> 是 TCP accept 后强制首帧（body 递 token，可选再递 <code>&lt;id&gt;:&lt;secret&gt;</code>；拒时把拒因原文放进响应 payload 回客户端）；<code>OP_FENCE</code> 为 HA 仲裁 claim（递 epoch、回折入前的 prev）；<b>写意图五帧</b>（create/write/trunc/remove/fsync，<code>is_data_write</code>）body 带头部 <code>[u64 epoch]</code> 前缀供 witness 门控，读与握手帧不带</td></tr>
       <tr><td><b>元数据面</b>（<code>remote/meta.rs</code>，客户端↔meta-server）</td><td><code>M_OPEN=16 M_LOOKUP=17 M_GETATTR=18 M_READDIR=19 M_CREATE=20 M_SYMLINK=21 M_LINK=22 M_UNLINK=23 M_RENAME=24 M_SETMODE=25 M_SETUIDGID=26 M_SETTIMES=27 M_TOUCH=28 M_SUBSCRIBE=29 M_PING=30 M_PUSH=31 M_FORWARD=32 M_SETLK=33 M_GETLK=34 M_RELEASE_LOCKS=35 M_RENEW=36 M_READDIRP=37</code>；<code>M_OPEN</code> 回包携带解析后的视图身份与标志字节（派生只读/fork 内容门/别名治理…）；<code>M_SUBSCRIBE</code> 是实时失效推送的长连接订阅通道；<code>M_PUSH/M_FORWARD</code> 为 HA 快照复制/写转发内部帧，客户端不发</td></tr>
     </table>
-    <div class="note"><b>扩展规则（改协议前必读）</b>：新能力一律走 opt-in 协商而非版本号大改：<code>M_READDIRP</code> 只在 <code>M_OPEN</code> ack 报出分页能力时才启用；<code>OP_OPEN</code> 的 api-key 字段只在服务端要求时才需呈现；条带 key 靠 <code>s&lt;N&gt;:</code> 前缀自描述，无前缀 = 单对象。客户端与服务端必须是同版本构建（ack 缺能力字节会直接报错，不再兼容旧服务端）。帧格式变更的回归门：Rust 集成测试 <code>tests/proto.rs</code>、<code>tests/remote_roundtrip.rs</code> 与 bash 板 <code>remote/resilience</code> 套件。</div>
+    <div class="note"><b>扩展规则（改协议前必读）</b>：新能力一律走 opt-in 协商而非版本号大改：<code>M_READDIRP</code> 只在 <code>M_OPEN</code> ack 报出分页能力时才启用；<code>OP_OPEN</code> 的 api-key 字段只在服务端要求时才需呈现；条带 key 靠 <code>s&lt;N&gt;:</code> 前缀自描述，无前缀 = 单对象。客户端与服务端需同版本（或同为三字节时代）：<code>M_OPEN</code> ack 固定携三个能力字节，新客户端严格校验三字节齐全、缺任一（对端为只发两字节的早期代）直接报错，不兜底。实测：三个字节都齐的同代部署任意方向都握手一致、读写都通；唯一需提醒的是“两字节时代的旧客户端连当代服务端”会宽容解析而忽略第三个字节（内容只读），挂 <b>fork 视图</b>时不会在 FUSE 层给出内容只读的 <code>EROFS</code>（服务端不 gate 字节流）——升级顺序先把服务/存储端升到三字节代。帧格式变更的回归门：Rust 集成测试 <code>tests/proto.rs</code>、<code>tests/remote_roundtrip.rs</code> 与 bash 板 <code>remote/resilience</code> 套件。</div>
 
     <h3 id="ext-newback">17.3 接入一个新后端：步骤、契约测试与取舍</h3>
     <ol class="steps">
@@ -2988,7 +2988,7 @@ MAX_FRAME = 1&lt;&lt;28 (256 MiB)：声明超此值的帧直接拒收而非先�
     <h3>18.1 调优回路：五步闭环</h3>
     <ol class="steps">
       <li><b>基线</b>：未动的挂载/服务先跑一遍目标负载，留 <code>--stats-file</code> 报告作对照（差异方向比绝对值可靠：回环实测存在 run-to-run 抖动）。</li>
-      <li><b>定位</b>：看报告四节（<code>[op]</code>/<code>[io]</code>/<code>[meta]</code>/<code>[counters]</code>）里哪个阶段占住 <code>total_s</code>，再对照 <a href="#ops">§13.3</a> 的阶段→子系统映射；同步看 <code>grovefs negotiated caps</code> 确认本机内核给了哪些快路。</li>
+      <li><b>定位</b>：看报告四节（<code>[op]</code>/<code>[io]</code>/<code>[meta]</code>/<code>[counters]</code>）里哪个阶段占住 <code>total_s</code>，再对照 <a href="#ops">§13.3</a> 的阶段→子系统映射；同步看每次挂载日志里的 <code>grovefs FUSE caps granted</code> 确认本机内核给了哪些快路。</li>
       <li><b>单变量</b>：一次只拧一个旋钮（下表），重跑同一负载；<code>--stats-file</code> 输出是 diff 友好格式，适合 A/B 机判。</li>
       <li><b>验证</b>：收益方向与预期一致且可归因到机制才采纳；存疑时跑 <code>.build-bin/bench*.sh</code> 同定负载复现（<code>bench_threads.sh</code> 把 <code>--threads 0</code> 当遗留单线程对照组、<code>bench_striping.sh</code> 验条带聚合、<code>bench_remote.sh</code> 量网络链路）。</li>
       <li><b>回归</b>：任何改变默认行为的调优（如放大 TTL、关 READDIRPLUS）都要重跑相关专项套件（freshness/disp_fresh 验新鲜度契约不被调优破坏）。</li>

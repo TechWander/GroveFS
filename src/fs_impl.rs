@@ -16,7 +16,8 @@ use crate::backend::StorageBackend;
 use crate::meta::{LockType, MetaError, MetaProvider, NodeInfo, NodeKind};
 use fuser::{
     AccessFlags, BsdFileFlags, Errno, FileAttr, FileHandle, FileType, FopenFlags, Generation,
-    INodeNo, InitFlags, IoctlFlags, KernelConfig, LockOwner, OpenFlags, RenameFlags, ReplyAttr,
+    INodeNo, InitFlags, IoctlFlags, KernelConfig, LockOwner, OpenAccMode, OpenFlags, RenameFlags,
+    ReplyAttr,
     ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyIoctl,
     ReplyLock, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
@@ -451,59 +452,85 @@ impl fuser::Filesystem for GroveFS {
         //   every LK request here and we arbitrate via the `locks` table in
         //   `MetaEngine` — the single authoritative state that WAL-replicates to
         //   the HA standby and survives failover.
-        let caps = InitFlags::FUSE_ASYNC_READ
-            | InitFlags::FUSE_BIG_WRITES
-            | InitFlags::FUSE_PARALLEL_DIROPS
-            | InitFlags::FUSE_POSIX_LOCKS
-            | InitFlags::FUSE_FLOCK_LOCKS
-            | if self.content_ro {
+        // Negotiate kernel-side optimizations ONE BIT AT A TIME: fuser's
+        // `add_capabilities` is all-or-nothing per call, so lumping these into a
+        // single group would silently drop EVERY acceleration if the running
+        // kernel lacked just one of them. Requesting each on its own degrades to
+        // only the missing bit. `enabled` tracks the bits the kernel ACTUALLY
+        // granted (`add_capabilities` returns Ok only when the bit is supported),
+        // which the mount echo below reports verbatim, so an operator on an
+        // unknown kernel sees what is live vs silently degraded instead of a
+        // silent best-case assumption.
+        let mut enabled = InitFlags::empty();
+        let core: [InitFlags; 6] = [
+            InitFlags::FUSE_ASYNC_READ,
+            InitFlags::FUSE_BIG_WRITES,
+            InitFlags::FUSE_PARALLEL_DIROPS,
+            InitFlags::FUSE_POSIX_LOCKS,
+            InitFlags::FUSE_FLOCK_LOCKS,
+            if self.content_ro {
                 InitFlags::empty()
             } else {
                 InitFlags::FUSE_WRITEBACK_CACHE
-            };
-        // Ignore which exact bits the kernel rejected; use whatever it supports.
-        let _ = config.add_capabilities(caps);
+            },
+        ];
+        for flag in core {
+            if !flag.is_empty() && config.add_capabilities(flag).is_ok() {
+                enabled |= flag;
+            }
+        }
+        // ATOMIC_O_TRUNC: apply O_TRUNC inside `open` (see below) instead of
+        // letting the kernel follow the open with a separate FUSE_SETATTR
+        // round-trip. Measured cost of NOT having it: +82µs/op on 5.4 and
+        // +407µs/op on 6.8 for an `O_WRONLY|O_TRUNC` open (cp / shell `>` / editor
+        // save). If an old kernel denies this bit `open` never fires the truncate
+        // because the kernel still sends SETATTR, so this is safe-degrade only and
+        // both truncate paths coexist correctly.
+        if config.add_capabilities(InitFlags::FUSE_ATOMIC_O_TRUNC).is_ok() {
+            enabled |= InitFlags::FUSE_ATOMIC_O_TRUNC;
+        }
         // AUTO_INVAL_DATA (kernel >= 3.15): when a cached attr is refreshed and
         // mtime/size changed, the kernel also drops the file's cached page data.
         // This is what makes a raised `--tune-cache` TTL safe: a remote write that
         // bumps size/mtime still invalidates a peer's stale pages on next access,
-        // complementing our notify-invalidation push. Negotiated as its OWN
-        // all-or-nothing group so an older kernel that lacks it drops only this
-        // bit (the core caps above stay applied) — behavior degrades to the
-        // pre-existing notify-only path, never regressing the rest.
-        let _ = config.add_capabilities(InitFlags::FUSE_AUTO_INVAL_DATA);
+        // complementing our notify-invalidation push. Its own call so an older
+        // kernel that lacks it drops only this bit.
+        if config.add_capabilities(InitFlags::FUSE_AUTO_INVAL_DATA).is_ok() {
+            enabled |= InitFlags::FUSE_AUTO_INVAL_DATA;
+        }
         // READDIRPLUS (kernel >= 4.6): reply a directory listing with per-entry
         // dentry+attr already filled in, so `ls -l` on a big dir costs one metadata
-        // round-trip instead of N LOOKUP+GETATTR. Negotiated as its own
-        // all-or-nothing group (add_capabilities is per-group): on a kernel without
-        // it we simply keep plain READDIR — the other caps above stay applied.
-        // Only offered when the provider can page in its own store: PLUS records are
-        // ~4x fatter, so they split the same listing into ~4x more kernel buffers,
-        // and a provider that re-fetches the whole listing per buffer would pay that
-        // multiplier in full round trips instead of saving the per-entry LOOKUPs.
+        // round-trip instead of N LOOKUP+GETATTR. Only offered when the provider can
+        // page its own store: PLUS records are ~4x fatter, so they split the same
+        // listing into ~4x more kernel buffers, and a provider that re-fetches the
+        // whole listing per buffer would pay that multiplier in full round trips.
         if self.readdirplus && self.meta.supports_paged_readdir() {
-            let _ = config.add_capabilities(
-                InitFlags::FUSE_DO_READDIRPLUS | InitFlags::FUSE_READDIRPLUS_AUTO,
-            );
+            let plus = InitFlags::FUSE_DO_READDIRPLUS | InitFlags::FUSE_READDIRPLUS_AUTO;
+            if config.add_capabilities(plus).is_ok() {
+                enabled |= plus;
+            }
         }
         // Advertise a 4 MiB max write/readahead; fuser clamps each to its own
         // MAX_WRITE_SIZE ceiling and the kernel further clamps to FUSE_MAX_MAX_PAGES,
         // so this is the auto-degrade point (5.4 -> 1 MiB/page-capped, 6.x+ -> more).
         let _ = config.set_max_write(4 << 20);
         let _ = config.set_max_readahead(4 << 20);
-        // Report the bits the kernel actually granted (config.capabilities() is the
-        // kernel-supported mask) so `--stats` operators can see which new-kernel
-        // accelerations are live vs silently degraded on this host.
-        if crate::stats::enabled() {
-            let g = config.capabilities();
-            eprintln!(
-                "grovefs negotiated caps: PARALLEL_DIROPS={} AUTO_INVAL_DATA={} WRITEBACK={} MAX_PAGES={} (max_write req 4 MiB)",
-                g.contains(InitFlags::FUSE_PARALLEL_DIROPS),
-                g.contains(InitFlags::FUSE_AUTO_INVAL_DATA),
-                g.contains(InitFlags::FUSE_WRITEBACK_CACHE),
-                g.contains(InitFlags::FUSE_MAX_PAGES),
-            );
-        }
+        // Report the bits the kernel ACTUALLY granted, unconditionally (not only
+        // under `--stats`), so every mount log shows which new-kernel accelerations
+        // are live vs silently degraded on this host instead of assuming the best.
+        eprintln!(
+            "grovefs FUSE caps granted: ASYNC_READ={} BIG_WRITES={} PARALLEL_DIROPS={} POSIX_LOCKS={} FLOCK={} WRITEBACK={} ATOMIC_O_TRUNC={} AUTO_INVAL_DATA={} READDIRPLUS={} MAX_PAGES={}; max_write req 4 MiB",
+            enabled.contains(InitFlags::FUSE_ASYNC_READ),
+            enabled.contains(InitFlags::FUSE_BIG_WRITES),
+            enabled.contains(InitFlags::FUSE_PARALLEL_DIROPS),
+            enabled.contains(InitFlags::FUSE_POSIX_LOCKS),
+            enabled.contains(InitFlags::FUSE_FLOCK_LOCKS),
+            enabled.contains(InitFlags::FUSE_WRITEBACK_CACHE),
+            enabled.contains(InitFlags::FUSE_ATOMIC_O_TRUNC),
+            enabled.contains(InitFlags::FUSE_AUTO_INVAL_DATA),
+            enabled.contains(InitFlags::FUSE_READDIRPLUS_AUTO),
+            config.capabilities().contains(InitFlags::FUSE_MAX_PAGES),
+        );
         Ok(())
     }
 
@@ -863,7 +890,7 @@ impl fuser::Filesystem for GroveFS {
         }
     }
 
-    fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         if stats::enabled() && ino.0 == STATS_INO {
             // Read-only virtual handle; no backend object is bound to it.
             reply.opened(FileHandle(STATS_INO), FopenFlags::empty());
@@ -873,6 +900,32 @@ impl fuser::Filesystem for GroveFS {
             Some(node) if !node.is_dir() => {
                 if let Some(k) = &node.data_ref {
                     self.cache_key(ino.0, k);
+                }
+                // ATOMIC_O_TRUNC: when the bit was negotiated (see `init`) the
+                // kernel does NOT follow an `O_TRUNC` open with a separate
+                // FUSE_SETATTR, so we must apply the truncation here. Do exactly
+                // what the SETATTR size branch would (truncate to 0 + bump mtime),
+                // and honour the same gates so a read-only / CONTENT-read-only
+                // (fork) mount still refuses the content change. O_TRUNC is only
+                // meaningful for a write-open; POSIX ignores it under O_RDONLY and
+                // the kernel never carries it there, but gate on acc_mode anyway.
+                if flags.0 & libc::O_TRUNC != 0
+                    && matches!(
+                        flags.acc_mode(),
+                        OpenAccMode::O_WRONLY | OpenAccMode::O_RDWR
+                    )
+                {
+                    if self.readonly || self.content_ro {
+                        reply.error(Errno::EROFS);
+                        return;
+                    }
+                    if let Some(k) = &node.data_ref {
+                        if let Err(e) = self.backend.truncate(k, 0) {
+                            reply.error(errno_of(&e));
+                            return;
+                        }
+                        self.meta.touch_mtime(ino.0 as i64);
+                    }
                 }
                 // Handle is the inode; read/write resolve the object from it.
                 reply.opened(FileHandle(ino.0), self.open_flags());

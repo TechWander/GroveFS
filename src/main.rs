@@ -1622,8 +1622,34 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             }
             // Concurrent dispatch: n_threads worker event loops, each with its own
             // cloned /dev/fuse fd. `threads = 0` maps to single-threaded mode.
-            cfg.n_threads = if threads > 1 { Some(threads) } else { None };
-            cfg.clone_fd = threads > 1;
+            // The clone ioctl (FUSE_DEV_IOC_CLONE) is Linux 4.5+, and fuser
+            // propagates its failure out of `Session::run()` instead of falling
+            // back — so on an older kernel asking for cloning would make the mount
+            // die, not degrade. Probe the running kernel release first and drop to
+            // a single worker (with a visible note) when the ioctl is unavailable.
+            // An unreadable / unparseable osrelease (non-Linux, exotic string) is
+            // treated as supported so a normal mount never loses parallelism.
+            let mut clone_ok = true;
+            if threads > 1 {
+                if let Ok(s) = std::fs::read_to_string("/proc/sys/kernel/osrelease") {
+                    let mut it = s.trim().split('.');
+                    let major = it.next().and_then(|x| x.parse::<u32>().ok());
+                    let minor = it.next().and_then(|x| x.parse::<u32>().ok());
+                    if let (Some(maj), Some(mnr)) = (major, minor) {
+                        clone_ok = maj > 4 || (maj == 4 && mnr >= 5);
+                    }
+                }
+            }
+            let effective_threads = if threads > 1 && !clone_ok {
+                eprintln!(
+                    "note: running kernel < 4.5 lacks FUSE_DEV_IOC_CLONE; using a single FUSE worker thread (was --threads {threads})"
+                );
+                1
+            } else {
+                threads
+            };
+            cfg.n_threads = if effective_threads > 1 { Some(effective_threads) } else { None };
+            cfg.clone_fd = effective_threads > 1;
             // Only print `base` when the mount actually reads/writes under it:
             // a fully remote mount (`--data` + `--meta`) touches no local store
             // at all, so naming a base there would mislead (mirrors the
