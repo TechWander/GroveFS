@@ -8,7 +8,7 @@ down. Useful whenever the agent's runtime does not manage MCP servers itself
 (shell work, CI, smoke tests) — the frames are the same ones any MCP client sends.
 
 Usage:
-  mcp_call.py [--bin PATH] [--db-path D] [--api-key ID:SECRET]
+  mcp_call.py [--bin PATH] [--meta-dir D] [--api-key ID:SECRET]
               [--server-arg FLAG]... [--timeout SECS] [--json] [--quiet] CMD
 
 Commands:
@@ -270,7 +270,7 @@ def parse_args():
         if t == "--bin":
             opt["bin"] = a[i + 1]
             i += 2
-        elif t == "--db-path":
+        elif t == "--meta-dir":
             opt["db_path"] = a[i + 1]
             i += 2
         elif t == "--api-key":
@@ -311,7 +311,7 @@ def main():
 
     server_args = list(opt["server_args"])
     if opt["db_path"]:
-        server_args += ["--db-path", opt["db_path"]]
+        server_args += ["--meta-dir", opt["db_path"]]
 
     mcp = Mcp(find_binary(opt["bin"]), server_args, opt["timeout"])
     try:

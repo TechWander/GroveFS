@@ -150,7 +150,7 @@ impl OutLine {
     }
 }
 
-/// What `<db-path>/meta/views/<name>.layout` declares, resolved for machines
+/// What `<meta-dir>/meta/views/<name>.layout` declares, resolved for machines
 /// (the MCP `list_views` tool answers with these, not just prose).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ViewEntry {
@@ -167,7 +167,7 @@ pub struct ViewEntry {
 /// Everything a store exposes: physical view DBs plus governed definitions.
 #[derive(Debug, Default)]
 pub struct StoreViews {
-    /// Physical view trees (the storage identities): `<db-path>/meta/<view>.db`
+    /// Physical view trees (the storage identities): `<meta-dir>/meta/<view>.db`
     /// files under SQLite, `grovefs_v_<hex>` schemas under PostgreSQL.
     pub physical: Vec<String>,
     /// The governed definitions (derived / alias / fork), sorted by name:
@@ -184,8 +184,8 @@ pub struct StoreViews {
 /// the API-key/audit store) actually live. The rule is simple: the control
 /// plane follows the metadata backend —
 /// - **SQLite** (default): definitions are plain-text slots under
-///   `<db-path>/meta/views/<name>.layout`, keys stay in `<db-path>/meta/api_keys.db`;
-/// - **PostgreSQL** (`--store postgres://…`): definitions are rows of
+///   `<meta-dir>/meta/views/<name>.layout`, keys stay in `<meta-dir>/meta/api_keys.db`;
+/// - **PostgreSQL** (`--meta-store postgres://…`): definitions are rows of
 ///   `grovefs_control.view_defs`, keys and audit rows land in
 ///   `grovefs_control.api_keys` / `grovefs_control.mcp_calls` — a single
 ///   system of record, shared by every meta-server / MCP / CLI pointing at
@@ -247,7 +247,7 @@ pub trait ControlStore: Send + Sync {
     fn list_physical(&self) -> Result<Vec<String>, String>;
     /// Is `name` a physical tree (its own db file / PG schema)?
     fn has_physical(&self, name: &str) -> Result<bool, String>;
-    /// `--db-path`-style roots only make sense for a file store; the PG store
+    /// `--meta-dir`-style roots only make sense for a file store; the PG store
     /// is bound to its URI and ignores an override (reported honestly in the
     /// tool result rather than silently reading another store).
     fn store_for_db_path(&self, db: &Path) -> Arc<dyn ControlStore>;
@@ -486,7 +486,7 @@ impl ControlStore for FileControlStore {
             None
         } else {
             // Name the concrete tree path the caller is missing rather than a
-            // `<db-path>` placeholder, so the note is copy-paste actionable and
+            // `<meta-dir>` placeholder, so the note is copy-paste actionable and
             // tells the user exactly which file `init`/`create` must produce (§6-5).
             Some(format!(
                 "note: no local tree {} yet — create it with `grovefs --home {} init --view {view}` (or `view create`) first",
@@ -688,7 +688,7 @@ impl ControlStore for PgControlStore {
 
 /// Build the control-plane store for a metadata backend selection: `None` /
 /// `"sqlite"` → the local file store under `base`; a `postgres[ql]://` URI →
-/// the shared PG control tables. Same URI grammar as `meta-server --store`.
+/// the shared PG control tables. Same URI grammar as `meta-server --meta-store`.
 pub fn control_store_for(
     base: &Path,
     store_uri: Option<&str>,
@@ -804,7 +804,7 @@ fn check_derived_definition(
 }
 
 /// Every governance op is a flat function over the control-plane store — the
-/// same backend the metadata tree uses (local files under `--db-path`/
+/// same backend the metadata tree uses (local files under `--meta-dir`/
 /// `--home`, or the `grovefs_control` schema under a `postgres://` URI).
 /// Errors are the exact CLI strings, so an agent sees precisely what a human
 /// would.
@@ -2088,7 +2088,7 @@ pub fn tool_defs() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "db_path": str_prop("Metadata root holding meta/*.db and meta/views/*.layout; defaults to the server's --db-path/--home. Ignored when the server is bound to a `--store postgres://…` URI — the control plane is URI-bound there")
+                    "db_path": str_prop("Metadata root holding meta/*.db and meta/views/*.layout; defaults to the server's --meta-dir/--home. Ignored when the server is bound to a `--meta-store postgres://…` URI — the control plane is URI-bound there")
                 }
             },
             "outputSchema": views_output_schema()
@@ -2104,7 +2104,7 @@ pub fn tool_defs() -> Value {
                     "name": str_prop("Derived view name (one safe path element, must differ from base)"),
                     "base": str_prop("Physical view whose tree this lens displays"),
                     "rules": str_prop("Layout rules text, e.g. \"# only docs\\nonly /docs\""),
-                    "db_path": str_prop("Metadata root; defaults to the server's --db-path/--home (ignored under a PG-bound server — one URI-bound control plane serves every slot)")
+                    "db_path": str_prop("Metadata root; defaults to the server's --meta-dir/--home (ignored under a PG-bound server — one URI-bound control plane serves every slot)")
                 },
                 "required": ["name", "base", "rules"]
             }
@@ -2120,7 +2120,7 @@ pub fn tool_defs() -> Value {
                     "name": str_prop("Public alias name (must differ from the real view name)"),
                     "real": str_prop("Physical view the alias maps onto"),
                     "retire": str_prop("Previous alias name of the same real view to retire atomically (optional)"),
-                    "db_path": str_prop("Metadata root; defaults to the server's --db-path/--home (ignored under a PG-bound server — one URI-bound control plane serves every slot)")
+                    "db_path": str_prop("Metadata root; defaults to the server's --meta-dir/--home (ignored under a PG-bound server — one URI-bound control plane serves every slot)")
                 },
                 "required": ["name", "real"]
             }
@@ -2129,14 +2129,14 @@ pub fn tool_defs() -> Value {
             "name": "fork_view",
             "title": "Fork view",
             "annotations": annot("Fork view", false, false, false),
-            "description": "Create a FORK: an INDEPENDENT metadata tree named `name`, seeded as a point-in-time copy of the physical view `base` (`<db-path>/meta/<name>.db`). Content bytes are SHARED through the cross-view ledger (no copies), so the fork costs metadata only. Structure (mkdir/rename/unlink/symlink/link) is WRITABLE; content writes (write/truncate) are refused with EROFS client-side. Deleting a name in the fork removes only the fork's own metadata — the base tree is untouched, and a shared object is freed only when no view holds a name for it. With `seed: false` the fork's tree starts EMPTY (root only) so a curated subset can be placed with `graft_view`. Requires a local SQLite base tree (a PostgreSQL-bound control store refuses forks — its trees are PG schemas, not files).",
+            "description": "Create a FORK: an INDEPENDENT metadata tree named `name`, seeded as a point-in-time copy of the physical view `base` (`<meta-dir>/meta/<name>.db`). Content bytes are SHARED through the cross-view ledger (no copies), so the fork costs metadata only. Structure (mkdir/rename/unlink/symlink/link) is WRITABLE; content writes (write/truncate) are refused with EROFS client-side. Deleting a name in the fork removes only the fork's own metadata — the base tree is untouched, and a shared object is freed only when no view holds a name for it. With `seed: false` the fork's tree starts EMPTY (root only) so a curated subset can be placed with `graft_view`. Requires a local SQLite base tree (a PostgreSQL-bound control store refuses forks — its trees are PG schemas, not files).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "name": str_prop("Fork view name (one safe path element, must differ from base)"),
                     "base": str_prop("Physical base view whose tree seeds the fork"),
                     "seed": json!({"type":"boolean","description":"Copy the base's names into the fork (default true). false creates an EMPTY fork tree (root only) to fill with graft_view — nothing is copied, so a curated subset costs nothing extra."}),
-                    "db_path": str_prop("Metadata root; defaults to the server's --db-path/--home (ignored under a PG-bound server — one URI-bound control plane serves every slot)")
+                    "db_path": str_prop("Metadata root; defaults to the server's --meta-dir/--home (ignored under a PG-bound server — one URI-bound control plane serves every slot)")
                 },
                 "required": ["name", "base"]
             }
@@ -2154,7 +2154,7 @@ pub fn tool_defs() -> Value {
                     "map": str_prop("Graft plan text: one '<src>' or '<src>TAB<dst>' per line, '#' comments allowed"),
                     "dest": str_prop("Directory inside `name` to place everything under (default '/')"),
                     "skip_existing": json!({"type":"boolean","description":"Leave a conflicting destination entry alone and keep going (merge into an existing directory; skip colliding files). Default false = any conflict refuses the whole plan."}),
-                    "db_path": str_prop("Metadata root; defaults to the server's --db-path/--home (ignored under a PG-bound server — one URI-bound control plane serves every slot)")
+                    "db_path": str_prop("Metadata root; defaults to the server's --meta-dir/--home (ignored under a PG-bound server — one URI-bound control plane serves every slot)")
                 },
                 "required": ["name", "map"]
             }
@@ -2168,7 +2168,7 @@ pub fn tool_defs() -> Value {
                 "type": "object",
                 "properties": {
                     "name": str_prop("Definition name to remove"),
-                    "db_path": str_prop("Metadata root; defaults to the server's --db-path/--home (ignored under a PG-bound server — one URI-bound control plane serves every slot)")
+                    "db_path": str_prop("Metadata root; defaults to the server's --meta-dir/--home (ignored under a PG-bound server — one URI-bound control plane serves every slot)")
                 },
                 "required": ["name"]
             }
@@ -2197,7 +2197,7 @@ pub fn tool_defs() -> Value {
                     "name": str_prop("Candidate derived view name to validate"),
                     "base": str_prop("Physical base view the candidate lens sits over"),
                     "rules": str_prop("Candidate layout rules text (inline, same as define_derived_view)"),
-                    "db_path": str_prop("Metadata root; defaults to the server's --db-path/--home (ignored under a PG-bound server — one URI-bound control plane serves every slot)")
+                    "db_path": str_prop("Metadata root; defaults to the server's --meta-dir/--home (ignored under a PG-bound server — one URI-bound control plane serves every slot)")
                 },
                 "required": ["name", "base", "rules"]
             },
@@ -2217,7 +2217,7 @@ pub fn tool_defs() -> Value {
                     "path": str_prop("Display subtree to start from (default '/', e.g. '/photos')"),
                     "depth": json!({"type":"integer","description":"Max subtree depth (default 6)","minimum":0}),
                     "max": json!({"type":"integer","description":"Max entries to render (default 800; sets truncated=true when cut)"}),
-                    "db_path": str_prop("Metadata root; defaults to the server's --db-path/--home")
+                    "db_path": str_prop("Metadata root; defaults to the server's --meta-dir/--home")
                 }
             },
             "outputSchema": tree_output_schema()
@@ -2231,7 +2231,7 @@ pub fn tool_defs() -> Value {
                 "type": "object",
                 "properties": {
                     "name": str_prop("View name to describe (definition slot or physical view db)"),
-                    "db_path": str_prop("Metadata root; defaults to the server's --db-path/--home")
+                    "db_path": str_prop("Metadata root; defaults to the server's --meta-dir/--home")
                 },
                 "required": ["name"]
             },
@@ -2951,7 +2951,7 @@ impl Session {
 /// the stdout channel a clean protocol stream. With `require_key`, `tools/list`
 /// and `tools/call` are refused until an API key authenticates; every tool call
 /// is appended to the audit log either way — `<db>/meta/api_keys.db` under
-/// SQLite, `grovefs_control.mcp_calls` under a `postgres://` `--store` URI.
+/// SQLite, `grovefs_control.mcp_calls` under a `postgres://` `--meta-store` URI.
 pub fn serve(
     default_db: PathBuf,
     store_uri: Option<&str>,

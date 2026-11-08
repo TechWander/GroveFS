@@ -487,7 +487,7 @@ impl RemoteMeta {
     }
 
     /// Like [`RemoteMeta::new_with_token`], but presents an explicit `uid` on the
-    /// handshake (the `mount --as-uid` override) instead of the process euid, so
+    /// handshake (the `mount --run-as-uid` override) instead of the process euid, so
     /// a shared meta-server can be exercised/used under a chosen presenting uid.
     pub fn new_with_token_uid(addr: &str, view: &str, token: &str, uid: u32) -> io::Result<Self> {
         Self::new_with_creds(addr, view, token, uid, "")
@@ -1019,7 +1019,7 @@ impl MetaProvider for RemoteMeta {
     }
 }
 
-/// Split a `--meta` value into a failover address list. Empty/whitespace-only
+/// Split a `--meta-server` value into a failover address list. Empty/whitespace-only
 /// inputs collapse to the original string so behavior never silently vanishes.
 /// Shared by the client ([`RemoteMeta`] failover) and the native `MetaServer`
 /// half (via `use super::*;`), so it lives in the always-compiled client file.
@@ -1042,7 +1042,7 @@ mod client_tests {
 
     #[test]
     fn split_addrs_parses_failover_list() {
-        // The client's `--meta a,b` parsing that drives failover.
+        // The client's `--meta-server a,b` parsing that drives failover.
         assert_eq!(
             split_addrs("10.0.0.1:1,10.0.0.2:1"),
             vec!["10.0.0.1:1", "10.0.0.2:1"]

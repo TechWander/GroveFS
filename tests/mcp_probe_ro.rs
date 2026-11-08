@@ -97,7 +97,7 @@ fn probe_of_existing_pg_view_walks_it_without_mutating_the_view_set() {
     let view = phantom_view("bb");
     let before = store.list_physical().unwrap();
 
-    // Provision the tree the way `view create --store` does; the probe then
+    // Provision the tree the way `view create --meta-store` does; the probe then
     // reads it and changes nothing.
     drop(grovefs::pg_store::PgEngine::open(&uri, &view, false).expect("create PG tree"));
     let after_create = store.list_physical().unwrap();

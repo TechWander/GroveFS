@@ -457,7 +457,7 @@ impl MetaServer {
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "--store postgres://… cannot be combined with --role standby / --peer / --witness: \n                     GroveFS-native HA snapshot shipping is SQLite-only.\n                     Run PostgreSQL's own streaming / logical replication for HA,\n                     or keep the meta-server single-instance under PG.",
+                "--meta-store postgres://… cannot be combined with --role standby / --peer / --witness: \n                     GroveFS-native HA snapshot shipping is SQLite-only.\n                     Run PostgreSQL's own streaming / logical replication for HA,\n                     or keep the meta-server single-instance under PG.",
             ));
         }
         // SQLite trees live under `<base>/meta`; a PG store writes nothing
@@ -881,7 +881,7 @@ fn is_fork_def(store: &dyn crate::mcp::ControlStore, view: &str) -> io::Result<b
 
 /// A pending kernel-cache invalidation the server pushes to a view's other
 /// mounts after a successful mutating op, so peers converge without waiting a
-/// TTL and without `--strict`.
+/// TTL and without `--no-cache`.
 #[derive(Clone)]
 enum Event {
     /// Drop the cached dentry `(parent, name)` so the next lookup re-fetches
@@ -1278,13 +1278,13 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
         Ok(false) => {
             // Fill the placeholders with the concrete store root and the real
             // view name, so a remote operator gets a command they can paste on
-            // the meta-server host rather than `--db-path <db-path> --view
+            // the meta-server host rather than `--meta-dir <meta-dir> --view
             // <name>` (which they must mentally expand) (§6-5).
             let root = rt.base.display();
             let hint = if rt.control.backend() == "postgres" {
-                format!("a PG base view is a schema: create it first with `grovefs view --store postgres://… --db-path {root} create --view {view}`, or restore the schema from a dump")
+                format!("a PG base view is a schema: create it first with `grovefs view --meta-store postgres://… --meta-dir {root} create --view {view}`, or restore the schema from a dump")
             } else {
-                format!("create it first: `grovefs view --db-path {root} create --view {view}` (or `grovefs --home {root} init --view {view}`, or seed it with `grovefs view import`)")
+                format!("create it first: `grovefs view --meta-dir {root} create --view {view}` (or `grovefs --home {root} init --view {view}`, or seed it with `grovefs view import`)")
             };
             // `view` is the POST-ALIAS real name; name the alias the caller
             // actually mounted too, so "pub does not exist" never reads as
@@ -2571,17 +2571,17 @@ fn try_open_event_stream(
     Ok(s)
 }
 
-// Split a `--meta` value into a failover address list. Lives in the client
+// Split a `--meta-server` value into a failover address list. Lives in the client
 // half (`super::split_addrs`, always compiled); re-exported here via
 // `use super::*;` so the meta-server failover paths keep calling it.
 
-/// Keep this mount's kernel cache coherent with peers WITHOUT `--strict`: connect
+/// Keep this mount's kernel cache coherent with peers WITHOUT `--no-cache`: connect
 /// an event stream to the meta-server and translate each pushed frame into a
 /// [`Notifier`] call (`inval_entry` / `inval_inode`), so a peer's create/delete/
 /// rename and even an overwrite of an already-cached file become visible right
 /// away. Reconnects with a small bounded backoff across a server restart; stops
 /// permanently only on a fatal token rejection. Spawned by the mount process for
-/// `--meta` mounts; abandoned harmlessly when the process exits at unmount.
+/// `--meta-server` mounts; abandoned harmlessly when the process exits at unmount.
 ///
 /// `display`: when the client wraps its provider in a local `LayoutMeta` lens
 /// (`--layout FILE`), passing it here lets the listener ALSO translate

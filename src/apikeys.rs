@@ -38,7 +38,7 @@
 //! Storage FOLLOWS the metadata backend — one system of record, never two:
 //! - under SQLite (the default) keys live in one local file,
 //!   `<base>/meta/api_keys.db`;
-//! - under PostgreSQL (`--store postgres://…`) the SAME two tables live in the
+//! - under PostgreSQL (`--meta-store postgres://…`) the SAME two tables live in the
 //!   shared `grovefs_control` schema ([`crate::control`]) — a key minted or
 //!   revoked against the URI is authoritative for every meta-server, MCP
 //!   server and CLI pointing at it, with no per-node file to colocate.
@@ -48,7 +48,7 @@
 //! routes like the view backend). Both backends expose identical columns,
 //! semantics and refusal strings.
 //! Mount gating reuses one store per metadata root (or per URI); a
-//! `data-server` on a node without the control plane sets `--keys-from
+//! `data-server` on a node without the control plane sets `--meta-dir
 //! <base>` (see the CLI help).
 //!
 //! Honest boundary: a key answers WHO may connect and — via its optional

@@ -15,7 +15,7 @@
 //! schedule booked under one mutex cannot double-count: slots never overlap.
 //!
 //! Deliberately CLIENT-side and per-mount (`--bw-read` / `--bw-write`), the
-//! same layer as `--tune-cache`: one mount opens exactly one view, so this is
+//! same layer as `--cache-ttl`: one mount opens exactly one view, so this is
 //! the natural "cap this view" granularity. Honest boundary: it is
 //! self-discipline, not isolation — a raw data-plane client that skips the
 //! FUSE layer, or N mounts of the same view, each get their own budget, and
