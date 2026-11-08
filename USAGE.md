@@ -579,6 +579,7 @@ bash: /mnt/lens/docs/new.md: Read-only file system
 $ grovefs --home /data/cluster import --view legacy --source /data/legacy --dry-run
 dry run: view 'legacy' under /legacy would mirror 3 dir(s) and 2 file(s) (symlinks/special files and names already in the view are skipped on the real run)
 $ grovefs --home /data/cluster import --view legacy --source /data/legacy
+created BASE view 'legacy' (target was absent); imported 2 object(s)
 imported into view 'legacy' under /legacy: 3 dir(s), 2 object(s) (2 hardlinked zero-copy, 0 copied), 0 skipped, 0 failed
 $ grovefs mount --view legacy --meta-server 10.0.0.5:50110 --data-servers 10.0.0.5:50100 -m /mnt/da &   # 客户端连接即得
 $ echo "new" > /mnt/da/legacy/docs/quarter.txt   # 经挂载写 → 源路径同 inode 同步可见
@@ -757,6 +758,7 @@ src/calib
 
 ```text
 $ grovefs import --meta-dir /tmp/gv --view team --source /tmp/gv/src
+created BASE view 'team' (target was absent); imported 6 object(s)
 imported into view 'team' under /src: 6 dir(s), 6 object(s) (6 hardlinked zero-copy, 0 copied), 0 skipped, 0 failed
 
 $ grovefs view --meta-dir /tmp/gv fork --name lab --base team --empty
@@ -907,7 +909,7 @@ note: metadata only — copy the store's `blocks/` tree (the whole data root) as
 $ rsync -a -H /data/src/blocks/ /data/dst/blocks/
 # 目标机
 $ grovefs view --meta-dir /data/dst import --view team --in /tmp/team.jsonl
-imported view 'team' from /tmp/team.jsonl: 42 node(s), 37 blob reference(s); cross-view ledger rebuilt
+imported BASE view 'team' from /tmp/team.jsonl: 42 node(s), 37 blob reference(s); cross-view ledger rebuilt
 $ grovefs --home /data/dst mount --view team -m /mnt/team     # 硬链接仍是同一 inode,权限/时间原样
 ```
 
@@ -958,7 +960,7 @@ e2e 见 `viewrm` 套件(42 条断言:种树/挂载守卫/多重守卫/共享字�
 ```
 # 1) 存储机:建一个物理视图(智能体稍后要在它的树上定制列表)
 $ grovefs --home $HOME_DIR init --view team --manifest team.manifest
-initialized view 'team' at /data/xy/grovefs/.demomcp/home/meta/team.db
+initialized BASE view 'team' at /data/xy/grovefs/.demomcp/home/meta/team.db
 applied seed manifest .demomcp/team.manifest
 
 # 2) MCP 客户端配置里登记 stdio 服务器(以通用 mcpServers 写法为例):

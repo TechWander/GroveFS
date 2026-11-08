@@ -597,6 +597,7 @@ $ tree .demo4/legacy
 $ grovefs --home .demo4/home import --view legacy --source .demo4/legacy --dry-run
 dry run: view 'legacy' under /legacy would mirror 3 dir(s) and 2 file(s) (symlinks/special files and names already in the view are skipped on the real run)
 $ grovefs --home .demo4/home import --view legacy --source .demo4/legacy
+created BASE view 'legacy' (target was absent); imported 2 object(s)
 imported into view 'legacy' under /legacy: 3 dir(s), 2 object(s) (2 hardlinked zero-copy, 0 copied), 0 skipped, 0 failed
 
 $ grovefs mount --view legacy -m .demo4/mnt &    # 客户端连接即得这棵树
@@ -1411,6 +1412,7 @@ $ tree .demo4/legacy
 $ grovefs --home .demo4/home import --view legacy --source .demo4/legacy --dry-run
 dry run: view 'legacy' under /legacy would mirror 3 dir(s) and 2 file(s) (symlinks/special files and names already in the view are skipped on the real run)
 $ grovefs --home .demo4/home import --view legacy --source .demo4/legacy
+created BASE view 'legacy' (target was absent); imported 2 object(s)
 imported into view 'legacy' under /legacy: 3 dir(s), 2 object(s) (2 hardlinked zero-copy, 0 copied), 0 skipped, 0 failed
 
 $ grovefs mount --view legacy -m .demo4/mnt &    # a client mount now sees the tree
