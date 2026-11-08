@@ -1431,7 +1431,7 @@
       Finished `release` profile [optimized] target(s) in 2.65s
   ```
 
-- **结论**：通过，clippy 零告警（本轮修的 `src/du.rs` `type_complexity` 已改为命名别名 `type Probes = Vec<(usize, io::Result<u64>)>;`）。
+- **结论**：通过，clippy 零告警。本轮能力协商改动（`src/fs_impl.rs` 的 `init()` 逐位申请 + `ATOMIC_O_TRUNC` 协商 + 无条件全量能力回显、`open()` 内 `O_TRUNC` 自行截断；`src/main.rs` 的 `<4.5` 内核 `clone_fd` 退回单线程）不引入任何 lint。
 
 ### 4.2 `cargo test --release --tests`
 
@@ -1472,9 +1472,9 @@
 
   ```
   ==================================================================
-   grovefs test board   (2026-11-07 14:30:31)
+   grovefs test board   (2026-11-08 04:11:45)
    suites: build unit posix edge e2e remote errors resilience concurrent metasrv ha striping locks freshness disp_fresh layout fork viewrm gc bwlimit migrate import govcheck govtime grovesci mcp apikey mountkey config pg pg_parallel control bench
-   logs:   .build-bin/logs/20261107-143031
+   logs:   .build-bin/logs/20261108-041145
   ==================================================================
   ### build — cargo build --release
     OK
@@ -1508,7 +1508,7 @@
   RESULT: GREEN (all gating suites passed)
   ```
 
-- **结论**：通过（`bench` 为 INFO 非门禁项；§6-3/§6-10 改动后全板重跑仍 GREEN）。fork 套件含新 4b 段后 `pass=75 fail=0`；remote 套件含新 banner 断言后 `pass=19 fail=0`；bench 写 392.0 MB/s（与上轮同量级，可写挂载 writeback 未受影响）。
+- **结论**：通过（`bench` 为 INFO 非门禁项；本轮 `fs_impl.rs`/`main.rs` 能力协商与 `O_TRUNC` 改动后全板重跑仍 GREEN，logs `.build-bin/logs/20261108-041145`）。逐套件：posix `16/0`、errors `23/0`、edge `17/0`、remote `19/0`、fork `75/0`、layout `78/0`、ha `33/0`、striping `19/0`、locks `17/0`、mountkey `76/0`、config `28/0`、mcp `77/0`、migrate `74/0`、gc `41/0`、viewrm `42/0`、govcheck `30/0`、apikey `33/0`、control `16/0`、import `34/0`、metasrv/e2e/resilience/bwlimit/concurrent/govtime/grovesci/disp_fresh/freshness 全 `fail=0`；`pg`/`pg_parallel` 因本机 5432 无 PostgreSQL 而 SKIP（非门禁）。lib 单测 `132 passed; 0 failed`。
 
 ### 4.4 `bash skills/grovefs-docs/scripts/doccheck.sh`
 
@@ -1518,20 +1518,71 @@
   ```
   == 1. 变更史叙述扫描(应为 0 需处理项) ==
     [放行] /data/grovefs/grovefs/README.md:859:**文档口径：只陈述当前版本的行为。** …
-    [放行] /data/grovefs/grovefs/USAGE.md:2460:**文档口径**(README / USAGE / docs.html 共用一条规矩):只陈述当前版本的行为——不…
-    [放行] /data/grovefs/grovefs/docs.html:3154:    <div class="ok"><b>文档口径:只陈述当前版本的行为。</b>不记录已移除的参数/…
+    [放行] /data/grovefs/grovefs/USAGE.md:2510:**文档口径**(README / USAGE / docs.html 共用一条规矩):只陈述当前版本的行为——不…
+    [放行] /data/grovefs/grovefs/docs.html:3199:    <div class="ok"><b>文档口径:只陈述当前版本的行为。</b>不记录已移除的参数/…
   == 2. 参数对账(文档里的 --xxx 是否真存在于 --help) ==
     真实参数 68 个,文档参数 87 个,差集 18 项(其中非外部工具/非负空间 0 项)
   == 3. docs.html 标签闭合 ==
     unclosed: []
     errors: none
   == 4. 新增用字校验(文档历史上没出现过的汉字 = 逐个确认是否错字) ==
-    本次新增行里的生面孔汉字: 克寸尺隆
+    本次新增行里的生面孔汉字: 距风
   == 结论 ==
     OK
   ```
 
-- **结论**：通过。退出码 0；“非外部工具、非占位”的孤立参数 0 项；新增汉字“克/寸/尺/隆”来自「克隆/尺寸」等正常用词，非错字。本报告自身不列入文档口径检查范围。
+- **结论**：通过。退出码 0；“非外部工具、非占位”的孤立参数 0 项；本轮改动 USAGE.md/docs.html 后新增行里的“距/风”来自「差距/风险」等正常用词，非错字。本报告自身不列入文档口径检查范围。
+### 4.5 内核能力协商 / 混版本 / zero-copy 取证（本轮三项）
+
+三项均以 `.build-bin/probe_*.sh` 现场实测回显为据（探针不入库），方法沿用严格 A/B + `.grove-stats`（`O_DIRECT` 读）op 计数增量。
+
+**(a) 内核能力矩阵——逐位协商 + `ATOMIC_O_TRUNC` + 无条件全量回显**
+
+`init()` 现按位申请能力（fuser `add_capabilities` 每组 all-or-nothing，逐位使内核缺某位时只掉该位），并在每次挂载（无论是否 `--stats`）无条件回显内核**实际授予**的组合。5.4 与 6.8 两行的 caps echo 逐字相同：
+
+```
+grovefs FUSE caps granted: ASYNC_READ=true BIG_WRITES=true PARALLEL_DIROPS=true POSIX_LOCKS=true FLOCK=true WRITEBACK=true ATOMIC_O_TRUNC=true AUTO_INVAL_DATA=true READDIRPLUS=true MAX_PAGES=true; max_write req 4 MiB
+```
+
+内容只读（fork）挂载下同一回显把 `WRITEBACK=false`（不申请页缓存写回），其余位不变——实测 `probe_fork_erofs.sh`：`>` 截断与 `>>` 追加均在首个同步 `write()` 即 `EROFS`（`只读文件系统`），失败截断后对象内容保留 `size-after-failed-trunc: 8` 未被截空。
+
+`O_WRONLY|O_TRUNC` 打开的 A/B（1000 次 open+close 的 op 计数增量，5.4 本机）：
+
+| 二进制 | `O_TRUNC` µs/op | `meta.setattr` Δ | `io.local.len` Δ | `db.sqlite_read` Δ | plain `O_WRONLY` µs/op |
+|---|---|---|---|---|---|
+| 旧代 `0e9b9b3`（未协商 `ATOMIC_O_TRUNC`） | 135.7 | **+1000** | +1001 | +3001 | 54.2 |
+| HEAD（协商 `ATOMIC_O_TRUNC`） | 79.3 | **+20** | +21 | +1021 | 56.5 |
+
+旧代每打开一次即由内核补发一发 `FUSE_SETATTR`（`setattr` Δ 恰为 1000 = 每次一发）；HEAD 协商该位后由 `open()` 内部 `backend.truncate(k,0)` 落地，`setattr` Δ 落到背景噪声（+20），单 op 从 135.7µs 降到 79.3µs，最终 size 仍为 0、shell `>` 截断仍生效。6.8 侧同签名：`O_TRUNC` 91.9µs/op、`setattr` Δ=+89（VM 抖动更大，量级一致）。两内核 `/sys/module/fuse/parameters/` 差异：5.4 有 `max_user_bgreq max_user_congthresh`，6.8 另多 `allow_sys_admin_access`；本机申请的两项能力位在两内核都被授予，无“申请了当成给了”。
+
+`--threads`/`clone_fd` 依赖的 `FUSE_DEV_IOC_CLONE` 是 Linux 4.5+：`main.rs` 读 `/proc/sys/kernel/osrelease`，低于 4.5 时把有效工作线程退回 1 并回显一行提示（而非 `?` 硬失败传播）。§11.0 预检“内核 ≥ 4.5”与真实能力面一致：≥4.5 才能多线程，低于则单线程降级。
+
+**(b) 客户端/存储端混版本矩阵**
+
+`M_OPEN` 握手的 ack 能力字节历经三代：2 字节 `[ro, paged]`（`363d3e7`，二进制名 `grove`）→ 3 字节 `[client_ro, paged, content_ro]`（`04d5bb5`/`0e9b9b3`）→ HEAD 仍 3 字节但客户端**严格** `data.get(..3)`，缺字节即 `InvalidData`。旧客户端均按 index 宽松 `unwrap_or(0)`。五格实测（`probe_mixver_cell.sh`，同一 meta-server+data-server+客户端，真实建文件读写）：
+
+| 服务端 | 客户端 | 结果（逐字） |
+|---|---|---|
+| HEAD | HEAD | `[mount] LIVE` / `[write] OK` / `[read]  content=hello-mix` |
+| 3B 旧（`04d5bb5`） | HEAD | `LIVE` / `OK` / `content=hello-mix` |
+| HEAD | 3B 旧（`04d5bb5`） | `LIVE` / `OK` / `content=hello-mix` |
+| 2B 旧（`363d3e7`） | HEAD | `NOT LIVE`：`error: meta-server handshake ack is missing the capability flags — client and server builds must match` |
+| HEAD | 2B 旧（`363d3e7`） | `LIVE` / `OK` / `content=hello-mix` |
+
+定性：3 字节代之间双向同代兼容（LIVE 读写）；HEAD 客户端遇到 2 字节旧服务端**明确拒绝**并给出人话错误（点名缺 capability flags、要求 build 匹配，可运维定位，符合 §6-12 的 Display 口径）；2 字节旧客户端连 HEAD 服务端能挂载读写，但其宽松解析忽略 `byte[2]` `content_ro`——而 `content_ro` 门控只在客户端 FUSE 层生效（服务端不 gate 字节），故旧客户端对 fork 内容只读视图**不会拦写**。结论属“需同代才有完整保证”：升级顺序应先升客户端到 ≥3 字节代、再升服务端（文档已写明），纯混代部署不保证 `content_ro` 语义。
+
+**(c) splice/zero-copy——收益上限不足以覆盖复杂度，不实现**
+
+本机后端大块读 1GiB（`probe_splice_upper.sh`，`clk_tck=100`，1 tick=10000µs CPU）：
+
+```
+ext4 cold read wall: 2.068 s
+buffered wall: 2.061 s, daemon ticks +116
+direct wall: 0.751 s, daemon ticks +61
+```
+
+冷读下 grovefs 缓冲读与 ext4 墙钟几乎相同（2.061 vs 2.068s，差 ~0.3%，磁盘吞吐主导），拷贝开销根本不体现在墙钟上；warm 64MiB 读 grovefs 1446 MB/s vs ext4 1095（5.4，grovefs 反超因页缓存命中）。fuser 0.18 的回复侧只有 `writev`（channel.rs），`ReplyData` 仅收 `&[u8]`，无 `splice`/`sendfile`/`vmsplice` 入口。收益上限只在“本机 warm 大块读”这一窄路径 ≤6%，且要 fork fuser + 处理页缓存一致性/`--strict` 强一致/`WRITEBACK_CACHE`，远程与条带后端完全不受益也可能被拖累。三选一取“不实现、写负空间”：已在 `USAGE.md` §14.4 与 `docs.html` §12.6 的“未实现（诚实标注）”清单登记，附适用边界（本机 warm 大块读、需上游零拷贝 API）。
+
 
 ---
 
@@ -1597,6 +1648,7 @@
 | 位置 | 条目 | 在本次报告中的角色 |
 |---|---|---|
 | 仓库 `.build-bin/` | `vm_redeploy.sh`、`vm_audit.sh`、`vm_battery_{1,2,3,4}.sh`、`vm_evidence_run.sh`、`vm_probe_{lostchunk,lostobj,lostlocal,alias}.sh`、`vm_cleanup_verify.sh`、`vm_repocheck.sh`、`vm_verify_striping.sh`、`gfs_provision.sh` | 部署/复核/取证驱动脚本（可重跑复现全部结论） |
+| 仓库 `.build-bin/` | `probe_kernel_caps.sh`、`probe_splice_upper.sh`、`probe_mixver_cell.sh`、`probe_atomic_o_trunc.sh`、`probe_fork_erofs.sh` | 本轮三项取证探针（内核能力矩阵 / splice 收益上限 / 混版本五格 / ATOMIC_O_TRUNC 复验 / fork EROFS 复验；可重跑，不入库） |
 | 仓库 `tests/` | `tests/du.rs`（3 个单测） | du 条带路径修复的回归单测（§4.2） |
 | 仓库根 | `TEST_REPORT.md` | 本报告 |
 | 本机 `/tmp/` | `repo_{build,clippy,cargo_test,run_all2,doccheck2}.log`、`repo_gates.status`、`vm_phase{1,2,3}.log`、`redeploy_newbin.log` | 仓库侧四门槛原始回显；步骤一的拆旧与分发原始回显 |
@@ -1773,5 +1825,16 @@ $ git status --short            # 跟踪文件已全部入库，仅剩未跟踪�
 | `src/stats.rs` | §6-9：`report_text` 表头新增两行，说明 `bytes=` 列仅在后端边界阶段累计（`op_total` 行为 0 属预期、非“没读到数据”）与 sub-µs 零值含义；不改表格列宽与 CSV | §4.3（run_all stats PASS）、本机 `--stats` 挂载表头回显、`.build-bin/test_stats.sh` E2E PASS |
 | `docs.html` | §6-9 同步：§8 的 `--stats` 真实回显样本补齐三行表头（与当前产物输出一致） | §4.4 doccheck OK |
 | `USAGE.md` | §6-9 同步：§8.1 加一句 `bytes=` 列口径与 sub-µs 零值说明 | §4.4 doccheck OK |
+
+本轮内核能力协商 / 混版本 / zero-copy 三项改动（代码项走 clippy + `cargo test` + `run_all.sh` 全板，见 §4.1–§4.3；文档口径见 §4.4；三项取证逐字回显见 §4.5）：
+
+| 文件 | 改动内容 | 证据 |
+|---|---|---|
+| `src/fs_impl.rs` | `init()` 由 lumped 一次申请改为**逐位** `add_capabilities` 并按 `is_ok()` 累积真正授予位；新增协商 `FUSE_ATOMIC_O_TRUNC`；能力回显改为**无条件**（去掉 `--stats` 门）并打全 10 位；`open()` 在带 `O_TRUNC` 且写模式时按 `readonly`/`content_ro`→`EROFS`、否则 `backend.truncate(k,0)`+`touch_mtime` 自行截断（老内核不授予该位时回落 SETATTR 路径，两条路都正确截断） | §4.5(a)（5.4/6.8 逐字 echo 全 true、fork 挂载 `WRITEBACK=false` 且失败截断后内容保留 8B；`O_TRUNC` `meta.setattr` Δ 由旧代 +1000 降到 +20、单 op 135.7→79.3µs）；§4.3 全板 GREEN（fork 75/0） |
+| `src/main.rs` | `mount` 装配 `cfg.n_threads`/`cfg.clone_fd` 前读 `/proc/sys/kernel/osrelease`，运行内核 <4.5 时把有效线程退回 1 并回显一行提示（避免 `clone_fd()` 的 `?` 硬失败传播导致挂载死） | §4.5(a)（`FUSE_DEV_IOC_CLONE` 4.5+ 说明）；§4.3 全板 GREEN |
+| `USAGE.md` | §8.2 逐位协商 + 无条件全量 echo + `ATOMIC_O_TRUNC` + `clone_fd` 兜底；§11.0 预检 ≥4.5 才多线程；`--threads` 注；客户端/服务端版本一致要求（严格校验三字节、逐字拒绝消息、同代兼容、2 字节旧客户端 fork `content_ro` 窗口、升级顺序）；§14.4 未实现清单加 splice/zero-copy | §4.4 doccheck OK；§4.5(a)/(b) 逐字回显 |
+| `docs.html` | 7.0 uname（<4.5 退回单线程）、13.3 能力协商回显改名、18.1 内核自适应逐位 + `ATOMIC_O_TRUNC`、扩展规则 note（三字节代兼容 + 2 字节窗口 + 升级顺序）、§12.6 未实现清单加 splice/zero-copy | §4.4 doccheck OK；§4.5(b) |
+
+混版本策略定性：3 字节代之间双向兼容；2 字节旧服务端被 HEAD 客户端**明确拒绝**（人话错误）；2 字节旧客户端连 HEAD 服务端可用但静默忽略 `content_ro`——文档已写明“先升客户端再升服务端”的顺序。splice/zero-copy 经实测收益上限（本机 warm 大块读 ≤6%、冷读 ~0.3%、fuser 0.18 无零拷贝入口）不足以覆盖 fork/一致性复杂度，取**不实现**并写负空间。
 
 本次未做的改动（如实列出）：§5 遗留项中除上述当场修复外均未改代码；§5-3（POSIX 锁 close 释放泄漏）已定位确定性根因并实现修复（`setlk` 记账 + `release` 精确回收，不改 sid 续租模型），配套集成测与实机复验均通过（见 §3.2、§6-2a）；§5-5 中“数据源真丢字节”的内部空洞/首块真丢形态仍需 §6-2 方案（行为+RPC 改动，待批）。§6-7 经定位为取证脚本产物，非产品输出，未改。

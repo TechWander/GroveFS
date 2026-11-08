@@ -1413,7 +1413,7 @@ $Y --home $BASE mount --view alice --mountpoint /mnt/alice_ro --ro
 
 ## 8. 性能旋钮
 
-- `--threads N`(默认 4):FUSE 并发派发工作线程,每线程独立 `/dev/fuse` fd(`clone_fd`,Linux 4.5+)。`0` = 单线程模式(可作 A/B 对照)。
+- `--threads N`(默认 4):FUSE 并发派发工作线程,每线程独立 `/dev/fuse` fd(`clone_fd`,Linux 4.5+)。`0` = 单线程模式(可作 A/B 对照)。运行内核低于 4.5 时自动退回单工作线程(不硬失败)。
 - 客户端大 IO 自动分块并行:读 ≥1MiB 按 1MiB 切片并发,写 ≥4MiB 分片并发(零协议改动)。
 - **元数据读并行**(SQLite 写不并行;PG 写并行见 §6.2):每个视图的 `MetaEngine` 除单条写连接外开 `READ_POOL_SIZE = 4` 条附加连接,`lookup`/`getattr`/`readdir` 与 nlink 解析走池,因此同视图并发读不必排在写锁后面;SQLite **写仍串行在同一权威连接上**(单写者语义不变),PG 写则另走 SERIALIZABLE 写池(§6.2)。池连接按 WAL 读事务读已提交数据,自己的写立刻可见(`cargo test` 内 `reads_through_the_pool_observe_committed_writes` 钉住这一点)。HA 备机/只读打开的引擎不预开池,首次读按需建立并归还,同样有界。PG 引擎(`PgEngine`)同样持一条对等的 `PG_READ_POOL_SIZE = 4` 只读连接池(按 PG 事务读已提交数据,取不到只读连接时回退写连接以如实暴露故障);写侧 PG 另由 `PG_WRITE_POOL_SIZE = 8` 的 SERIALIZABLE 写池并行提交(§6.2)。
 - **目录列举分页 + READDIRPLUS**(不带开关即生效):`MetaProvider::readdir_page(parent, offset, limit)` 在 SQLite 与 PG 引擎里都下推成 SQL 页,FUSE 回调按 32→1024 几何块流式填回复缓冲,因此一个内核 READDIR/READDIRPLUS 请求付 `O(缓冲)` 而不是 `O(整棵目录)`;属性随目录项一次带回(内核 ≥4.6 的 `FUSE_DO_READDIRPLUS`,与上面能力位分属不同的 all-or-nothing 协商组,内核不支持则自然回退普通 READDIR)。三处关键实现:① **keyset 续读**——内核在「回复缓冲填满处」续读,偏移量与我们的页边界对不上,所以每 32 行记一个游标 `(parent, n) -> 第 n-1 行的名字`:任意续读先 `WHERE parent_id=? AND name>? ORDER BY name LIMIT n` 定位,再在内存丢掉不足 32 行的前缀;OFFSET 只作没有游标时(seekdir、游标被清)的回落,任何名字变更(create/unlink/rename/link)立即清空游标,绝不返回旧顺序。② **查询计划钉死**——列表 SQL 都带一个恒真的 `name>''`(名字不可能为空),它只负责把计划钉在 `UNIQUE(parent_id,name)` 上;否则 SQLite 会退到 `(parent_id,is_dir)` 前缀索引 + 临时 B 树排序,一次 OFFSET 页 13–55ms。③ **目录 nlink 走覆盖索引**——`getattr` 与 READDIRPLUS 的 `.`/`..` 要算目录 nlink(`2 + 子目录数`),靠 `idx_node_parent_kind(parent_id, is_dir)` 做纯索引扫描,100k 子项 **0.02ms**(逐行回表要 9.6ms/次,而且每个回复都要算)。实测(单机 release,同机同盘):含 10,002 个条目的目录 `ls -f` 基视图 **131ms**、100 规则派生 **105ms**,`ls -l` **162ms**;含 100,002 个条目的目录 `ls -f` 基视图 **1.19s**、fork **1.19s**、100 规则派生 **1.01s**(2s 内重读 **0.12s**)。5001 条目录 `ls -l` 本地 **2.56s**(`--no-readdirplus` 只留分页 5.22s);远端经 `M_READDIRP` 同目录 **2.29s**(只留分页 4.22s),输出均逐字节相同。
@@ -1445,7 +1445,13 @@ GROVEFS_STATS=1 $Y mount --view alice -m /mnt/alice
 
 ### 8.2 读写/元数据加速(内核自适应 + 自动降级)
 
-系统的加速改动都遵循**新内核走快路、老内核自动降级**的能力协商原则:FUSE 能力位由 `INIT` 阶段内核授予,不支持的位只是不生效,绝不影响其余路径;SQLite/PG 侧优化与内核版本无关。本机(5.4)实测 `--stats` 下会打印 `grovefs negotiated caps: PARALLEL_DIROPS=true AUTO_INVAL_DATA=true WRITEBACK=true MAX_PAGES=true`,即本机全部命中。
+系统的加速改动都遵循**新内核走快路、老内核自动降级**的能力协商原则:FUSE 能力位在 `INIT` 阶段**逐位**申请(fuser 的 `add_capabilities` 每组 all-or-nothing,逐位申请使内核缺某一位时只掉那一位、不连累其余),内核不支持的位只是不生效,绝不影响其余路径;SQLite/PG 侧优化与内核版本无关。每次挂载(无论是否 `--stats`)都如实回显内核**实际授予**的能力位组合:
+
+```
+grovefs FUSE caps granted: ASYNC_READ=true BIG_WRITES=true PARALLEL_DIROPS=true POSIX_LOCKS=true FLOCK=true WRITEBACK=true ATOMIC_O_TRUNC=true AUTO_INVAL_DATA=true READDIRPLUS=true MAX_PAGES=true; max_write req 4 MiB
+```
+
+本机 5.4 与集群 6.8(Ubuntu 24.04)实测该行全部 `true`;内容只读(fork)挂载下 `WRITEBACK=false`,使被拒的写落在首个同步 `write()` 上。`ATOMIC_O_TRUNC=true` 时带 `O_TRUNC` 的打开在 `open` 内完成截断,省掉内核随后补发的一次 `FUSE_SETATTR` 往返(实测 `O_WRONLY|O_TRUNC` 打开从 5.4 的 131µs/op 降到 84µs/op);老内核不给该位时截断回落到 SETATTR 路径,两条路都能正确截断,不存在“申请了却当成给了”。多线程 `clone_fd` 依赖的 `FUSE_DEV_IOC_CLONE` 是 Linux 4.5+,运行内核低于该版本时挂载退回单工作线程并回显一行提示(而非硬失败)。
 
 **元数据写尾延迟(P0)**:每个可写视图引擎起一条**后台 `wal_checkpoint(PASSIVE)` 线程**(每 1s 一次,每 ~30s 一次 `TRUNCATE` 收缩 `-wal` 文件),并把写连接的 `wal_autocheckpoint` 置 0——把原本内联在提交里的同步 checkpoint 停顿(实测曾贡献 `create` 单次 **125ms** 尾刺)移出写热路径。线程经 `Arc<StopSignal>` 随引擎 `Drop` 关停(不 join、不阻塞卸载),只读/备机引擎不启动。配合热读路径 `prepare_cached` 复用语句(避免每次重编译 SQL)。同一 3000 文件建目录负载 `--stats` 前后对比:
 
@@ -1532,7 +1538,7 @@ bash .build-bin/run_all.sh fork mcp       # 只跑指定套件(build 自动前�
 
 ### 11.0 部署前预检(每台节点都跑一遍)
 
-内核 ≥ 4.5(多线程 `clone_fd` 依赖)、`/dev/fuse` 存在可读写、`fusermount`/`fusermount3`
+内核 ≥ 4.5 才能用多线程派发(`clone_fd` 依赖 `FUSE_DEV_IOC_CLONE`);低于 4.5 时 `mount` 自动退回单工作线程(并回显一行提示),仍能正常挂载读写,只是不并行。`/dev/fuse` 存在可读写、`fusermount`/`fusermount3`
 在 PATH 里(`umount` 与信号优雅卸载都通过它;运行时只需 libfuse 的用户态工具,**不需要** libfuse 开发包)。
 构建机额外需要 Rust 工具链(edition 2021)。
 
@@ -1836,7 +1842,7 @@ HA 拓扑滚动升级(写不中断,切换瞬间除外):
 # 3) 升级旧主并以 standby 角色拉起 → 见高 epoch 自动降级,回到初始形态
 ```
 
-> 版本一致要求:线协议是自定义帧,中心与客户机必须同版本。`M_OPEN` 的确认包固定携带三个能力字节(只读 / 可分页 / 内容只读),缺任何一个直接报 `InvalidData`,不做旧格式兜底。
+> 版本一致要求:线协议是自定义帧且**不带版本号**——兼容完全取决于 `M_OPEN` 确认包的能力字节宽度与解析宽严。该包固定携带三个能力字节(只读 / 可分页 / 内容只读)。新客户端严格校验三字节齐全,缺任一(对端只发两个字节的早期代)直接报人话错误 `meta-server handshake ack is missing the capability flags — client and server builds must match`,挂载不成立、绝不猜测默认。实测矩阵:三个字节都齐的同代部署(任意方向的 新↔旧 3 字节版)握手一致、读写都通;唯一需提醒的窗口是“两字节时代的旧客户端连当代服务端”——它把确认包按 `get(i).unwrap_or(0)` 宽容解析,会忽略第三个字节(内容只读),因而旧客户端挂载 **fork 视图**时不会在 FUSE 层给出内容只读的 `EROFS`(服务端不 gate 字节流,见 §7)。因此升级顺序:先把所有存储端与服务端升到三字节代,再不要拿两字节代客户端去挂 fork 视图。
 
 > **切换窗口的写重试要求**:stop primary 后到 standby 提升完成(≤3s `PROMOTE_TIMEOUT`)的窗口内,在途/首次的写往返可能失败(`EIO`,或经服务端门禁路径的 `EROFS`/`EPERM`)——这是转接窗口内旧连接失效的正常表现,实测为状态相关(同一操作有时 `rc=0`,耗时 ~0.8s)。调用方对切换窗口内的首次写应带重试(应用级重跑即可,幂等的追加除外——重试前确认上一次未落盘);写不中断的承诺只对切换完成后的新主成立。
 
@@ -2498,6 +2504,7 @@ GC 语义(源码保证):对象只在**最后一个引用它的目录项**消失�
 - 跨 view **可写**硬链接/共享同一对象——没有,`ln` 只在树内,分视图写数据即两份字节;跨视图共享字节只有**内容只读**的 fork 视图(§3.4.1,结构可整理、上传/改内容 `EROFS`);
 - 导入后源目录的**持续自动同步**(watcher/定时重扫)——没有,`grovefs import` 是手动幂等增量命令,重跑才补新文件;rename/替换写类外部更新也靠重跑跟进(§3.3);
 - **远程直连导入**——`grovefs import` 只收 `--db-path`/`--data-root`(本地路径),**不接受 `--meta`/`--data` 远程地址**,没有"在别的机器上把目录灌进远端集群"的入口。原因:import 直接写权威 `meta/<view>.db` 与 `blocks/`(零拷贝=源与 blocks 同盘硬链接),远程协议里没有对应的"批量提交整棵树"操作。跨机批量进存量走 §14.2 备选路(已挂载点 `rsync -a` 经 FUSE 写路径灌入,大文件还能条带),或在存储机上执行 import;
+- **splice/zero-copy 读回**——本机 `LocalBackend` 的大块读回没有零拷贝通道。原因:当前依赖的 fuser 0.18 回复面只有 `writev`(把用户态缓冲拷进 `/dev/fuse`),`ReplyData` 只收 `&[u8]`,无 `splice`/`sendfile`/`vmsplice` 入口——要做必须 fork fuser 自己接管管道。实测收益上限不够覆盖这份复杂度与风险:warm 64MiB 读 1318MB/s vs 同盘 ext4 原生 1402MB/s(差距 ~6%),cold 1GiB 读 2.02s ≈ ext4 2.00s(差距 ~1%,受盘速主导),且远程/条带后端完全不受益;叠加页缓存一致性与 `--strict` 强一致挂载的正确性风险。故不做,保留为负空间。
 - per-directory 强制权限——目录级权限未实现(`--layout` 可做目录级显示裁剪,但如上述不构成强制隔离)。
 
 **文档口径**(README / USAGE / docs.html 共用一条规矩):只陈述当前版本的行为——不写已移除的参数、环境变量或开关,不做版本前后对比与历史基线数字,不写「新增了 / 现已支持 / 与旧版一致 / 退回旧行为」这类变更叙述(演变史归 git 提交记录)。当前版本内的真实回退语义、上面这份未实现清单不在此列,照常保留。
