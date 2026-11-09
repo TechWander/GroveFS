@@ -112,6 +112,7 @@ cargo build --release                                       # 产物:target/rele
 | `GROVEFS_DATA_SERVERS` | `mount --data-servers` | 数据服务地址(含条带列表) |
 | `GROVEFS_TOKEN` | `mount --token`、`meta-server/data-server --token` | 集群准入口令 |
 | `GROVEFS_META_DIR` | `meta-server --meta-dir` | 服务端元数据根(优先级:`--meta-dir` 参数 > 本 env > `--home` > `~/.grovefs`) |
+| `GROVEFS_META_STORE` | `--meta-store`(`view`/`apikey`/`mcp`/`meta-server`/`data-server`/`du`) | PG 后端寻址;未给 flag 时由本 env 回退(源码 `resolve_store()`) |
 | `GROVEFS_API_KEY` | `mount --api-key` | 已有的 per-caller 凭据 env |
 | `GROVEFS_MCP_API_KEY` | MCP `initialize` 握手 | 服务端整体预认证 |
 | `GROVEFS_STATS` | `--stats` | `1/true` 开启遥测 |
@@ -135,6 +136,8 @@ grovefs mount --view alice -m /mnt/alice
 ```
 
 格式细节:支持 `#` 注释、空行、可选 `export ` 前缀(同一文件可兼作 shell 脚本)、单/双引号包裹的值;非 `GROVEFS_*` 键与缺 `=` 的行会打一行带文件名:行号的警告后被忽略;显式指定的 `$GROVEFS_CONFIG` 读不到时警告后继续(不致命)。后台挂载的 re-exec 子进程继承环境,简写同样生效。`--view`/`-m` 刻意不收录——每次挂载都不同,写进默认值是错的。
+
+多集群注意:这些值是一套**进程级全局坐标**,一条命令只读一份文件,不按挂载点/视图自动匹配。切集群用逐次 `GROVEFS_CONFIG=~/grovefs-B.conf grovefs …`(每集群一份文件、`chmod 600`),不要常驻 export——已导出的同名变量会**静默压过**另一集群的配置文件(文件只填尚未设置的键);挂载回显 `using remote metadata service at …` 可核对坐标。控制面的 `--meta-dir` 没有 env 回退、逐集群显式给;`GROVEFS_META_STORE` 是全局键,残留 export 会把治理命令指向另一套 PG,切集群前 unset。
 
 回归覆盖:`bash .build-bin/run_all.sh config`(28 条断言:优先级链、解析边界、纯由文件驱动的真实 FUSE 挂载)。
 
@@ -2655,7 +2658,7 @@ ExecStart=/usr/local/bin/grovefs meta-server --listen 0.0.0.0:50110 \
           --meta-store ${GROVEFS_META_STORE}
 ```
 
-> `--meta-store` 目前没有环境变量回退，`${GROVEFS_META_STORE}` 是 **systemd 的变量展开**（systemd 支持 `${VAR}` 形式），GroveFS 自己读不到这个变量——写在单元里、由 systemd 替换成明文再传给进程。若你的 systemd 版本不展开，直接把连接串写进单元并 `chmod 600` 该单元；**不要**为了省事把它塞进 shell 历史。
+> `GROVEFS_META_STORE` 有双重身份：它既是 systemd `${VAR}` 展开的来源，也是 GroveFS 自己的 `--meta-store` env 回退（`view`/`apikey`/`mcp`/`meta-server`/`data-server`/`du` 未给 flag 时读它，源码 `resolve_store()`）——`ExecStart` 里显式带 `${GROVEFS_META_STORE}` 与省略该参数走 env 回退，取到的是同一份值。若你的 systemd 版本不展开，直接把连接串写进单元并 `chmod 600` 该单元；**不要**为了省事把它塞进 shell 历史。
 
 ```bash
 sudo systemctl daemon-reload && sudo systemctl enable --now grovefs-meta grovefs-data
@@ -2939,7 +2942,8 @@ $G meta-server --listen 0.0.0.0:50110
 
 - 优先级恒为 **flag > 活环境变量 > 配置文件 > 内置默认**；文件只在对应 env 未设置时生效；
 - 查找顺序：`$GROVEFS_CONFIG` → `~/.config/grovefs/grovefs.conf`（第一个存在的生效）；
-- 不进默认值的参数：`--view`/`-m`（每次挂载都不同，写进文件只会害你）、`--meta-store`（目前**没有** env 回退，PG 连接串仍要显式给，见 §15.4）；
+- 不进默认值的参数：`--view`/`-m`（每次挂载都不同，写进文件只会害你）；
+- `--meta-store` 有 env 回退 `GROVEFS_META_STORE`（控制面/服务端/`du` 消费，见 §15.4）——多集群机器上这是最容易残留串值的全局键，切集群前 unset；
 - 文件里放口令与放环境变量等价：`chmod 600`，别进 git；后台挂载会 re-exec 子进程，环境变量与已加载的值都继承。
 
 ### 15.16 场景：报错对症表
