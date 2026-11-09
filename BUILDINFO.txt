@@ -1,0 +1,77 @@
+GroveFS v1.0 构建信息（BUILDINFO）
+===================================================================
+
+发版坐标
+-------------------------------------------------------------------
+源码提交 (commit)   : 1e19dffd2d4ea902a19a8312f39e708b47fb7935
+附注标签 (tag)      : v1.0 -> db18749cef41b771c5856acc833683c7a8d86e6c
+标签解引用指向      : 1e19dff（与 refs/heads/v1.0 同点）
+仓库               : git@gitee.com:techwanderer/grovefs.git
+包名/版本           : grovefs 0.1.0
+
+构建环境
+-------------------------------------------------------------------
+rustc              : 1.99.0 (b940084d7 2026-09-28)
+cargo              : 1.99.0 (5f94df478 2026-08-27)
+host triple        : x86_64-unknown-linux-gnu
+链接器             : GNU ld (GNU Binutils for Ubuntu) 2.34
+glibc              : 2.31 (Ubuntu GLIBC 2.31-0ubuntu9.18)
+构建机内核          : 5.4.0-216-generic (x86_64)
+操作系统            : Ubuntu 20.04 (Focal)
+构建命令            : cargo build --release
+Cargo release 配置  : lto = true, codegen-units = 1, opt-level = 3
+后处理             : strip（仅剥离 .symtab/.strtab，见下方"可诊断性"）
+
+产物
+-------------------------------------------------------------------
+dist/grovefs                                    主二进制（剥离符号表）
+dist/grovefs-v1.0-linux-x86_64                  同上，带版本号的副本
+dist/grovefs-v1.0-linux-x86_64.tar.gz           打包件（内含 grovefs 一个文件）
+
+二进制为动态链接，依赖 glibc >= 2.31 与本机 libfuse3（FUSE 挂载路径需要）；
+不需要额外运行时。
+
+运行环境兼容性
+-------------------------------------------------------------------
+构建机 glibc 为 2.31，故本二进制可在 glibc >= 2.31 的 x86_64 Linux 上运行；
+更低 glibc（如 CentOS 7 的 2.17）不能直接运行，需在目标机自行构建。
+
+可诊断性
+-------------------------------------------------------------------
+strip 只移除 ELF 符号表/字符串表，不影响 panic 信息中的源文件路径与行号
+（这些内容以编译期字符串字面量形式保留，实测产物中仍可检出 333 处
+`src/*.rs` 引用），因此线上崩溃日志仍可定位到源码位置。
+若需完整符号用于 backtrace 符号化，请在同一提交上重新执行
+`cargo build --release` 取未剥离产物，无需随发布包归档。
+
+复现方式
+-------------------------------------------------------------------
+git fetch origin refs/tags/v1.0:refs/tags/v1.0
+git checkout 1e19dff
+cargo build --release
+上述工具链版本（rustc 1.99.0 / GNU ld 2.34 / glibc 2.31）下可复现同一
+源码对应的产物；由于 BuildID 嵌入环境指纹，字节级一致需同版本工具链，
+功能等价只需源码一致。
+
+本版本包含的能力要点
+-------------------------------------------------------------------
+1. 元数据双后端并存：SQLite（默认，每视图单文件）与 PostgreSQL
+   （每视图独立 schema），经 --meta-store scheme 分派；线协议、客户端
+   mount、POSIX 语义不变。
+2. meta-server 空闲引擎驱逐 --engine-idle-secs（默认 300，0 为不驱逐）：
+   长时间无挂载会话且无流量的视图引擎（PG 的 8 写 +4 读连接池 / SQLite
+   句柄）可被回收，空闲视图下次操作透明重开。常驻 PG 连接数随"近期使用
+   过的视图"而非"启动以来打开过的每个视图"伸缩，视图总数上限不再等于
+   max_connections / 12。单视图写并发墙（fsync + SSI）仍在。
+3. FoundationDB 后端 P1 设计：docs/fdb-keyspace.md —— 九类查询形态到
+   subspace/tuple 键的逐条映射（每条附源码行号取证）、id/ino 号段分配器、
+   事务粒度与写集上界、OCC 冲突到 errno 的映射、三后端对照与可归因差异
+   清单。此阶段仅设计，无 FDB 运行时代码。
+
+验证记录（发版点 1e19dff 上执行）
+-------------------------------------------------------------------
+cargo build            : 通过，零警告
+cargo test --lib       : 133 passed
+文档参数对账 doccheck  : EXIT=0
+产物自检               : --version 输出 grovefs 0.1.0；
+                         meta-server --help 含 --engine-idle-secs 条目
