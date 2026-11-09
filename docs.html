@@ -339,6 +339,7 @@
         <li><a href="#s-config-where">9.2 默认位置与指定</a></li>
         <li><a href="#s-config-keys">9.4 可配键对照表</a></li>
         <li><a href="#s-config-scope">9.7 配置生效时机</a></li>
+        <li><a href="#s-config-multi">9.8 多集群与多凭据组织</a></li>
       </ol>
     </li>
   </ol>
@@ -781,7 +782,10 @@ findmnt -T /mnt/alice                           <span class="cmt"># 期望:grove
     <div class="note"><b>视图先在哪建、客户端才能挂</b>：<code>grovefs mount --view alice</code> 只认<b>已存在</b>的视图，挂载从不替你立视图（名字不存在直接被拒）。所以每个 <code>grove-mount@alice</code> 启动前，<code>alice</code> 必须已在元数据后端建好——SQLite 部署在中心节点跑 <code>grovefs view --meta-dir /data/cluster create --view alice</code>（该命令直写 <code>/data/cluster/meta/alice.db</code>，必须在能碰该文件系统的那台机器上执行，<b>不是</b>发给 meta-server 进程代建）；PG 部署把 <code>--meta-dir</code> 换为 <code>--meta-store postgres://…</code>，在任何连得上 PG 的机器上建皆可。详见 <a href="#create-base">§14.0.1</a>。</div>
     <div class="note"><b>uid 两件事</b>(见 <a href="#share">§11.1</a>):systemd 默认以 root 起挂载,上报 uid=<b>0</b>——无白名单约束时 root 放行即可访问;要其他用户也能访问挂点,加 <code>--o allow_other</code> 并在 <code>/etc/fuse.conf</code> 打开 <code>user_allow_other</code>。</div>
     <div class="note"><b>两处「看起来是 POSIX 但不是」的边界(实测确证)</b>:① <b>权限位存储、显示、不强制</b>——<code>chmod</code>/<code>ls -l</code> 如实记录 <code>node.mode</code>,但挂载准入不看树内 mode:同 uid 对 <code>chmod 444</code> 的文件追加写仍 <code>rc=0</code> 且字节落盘;真正的访问控制是 token/API key、<code>--ro</code> 挂载、<code>allow_other</code> 可见性与本机 OS 权限,不要把 <code>chmod</code> 当视图内隔离手段。② <b>稀疏洞不省盘</b>——后端按完整对象存字节,<code>truncate -s 1M</code> 后 <code>st_blocks*512 == st_size</code>(<code>size=1048576 blocks=2048</code>,无洞);稀疏镜像文件不会少占网络/磁盘。均为设计取舍,见 USAGE.md §5.1。</div>
-    <div class="note"><b>改成逐调用方可撤销凭据</b>（踢掉一台机不再需要轮换共享 token 并断全部人）：两个 server 的 <code>ExecStart</code> 各加 <code>--require-api-key</code>（data 侧另需 <code>--meta-dir</code> 指到元数据根，若它不等于首个 <code>--data-dir</code>），客户端把 <code>--token ${GROVE_TOKEN}</code> 换成 <code>--api-key ${GROVE_API_KEY}</code>，并用 <code>grovefs apikey create --label &lt;主机名&gt; --for mount</code> 铸造后写进同一份 root-owned 0600 的 <code>grovefs.env</code>（密钥因而进不了 <code>ps</code> 可见的 unit 文本）。撤销后的真实行为（实测）：该挂载在首个服务端往返上打印服务端拒因、<b>干净自卸载并以退出码 0 结束</b>——一次有意的收手而不是崩溃，所以 <code>Restart=on-failure</code> <b>不会</b>重拉，unit 落 <code>inactive (dead)</code>（要辨"被踢"请看 journal 里那行拒因，或挂 <code>OnFailure=</code>/<code>ExecStopPost=</code> 告警）；拿被撤销的 key 重挂则 fail-fast。若希望被踢后自动重试（运维会重新铸一把），改用 <code>Restart=always</code>。其他主机的挂载全程不受波及。</div>
+    <div class="note"><b>换用可逐台撤销的凭据（API key）</b>：共享 token 要踢掉一台机，得轮换口令并断开所有人；API key 一把只属于一个挂载进程，<code>grovefs apikey revoke</code> 单踢一台。<br>
+    <b>改动共三处</b>：① 两个 server 的 <code>ExecStart</code> 各加 <code>--require-api-key</code>（data-server 若元数据根不等于首个 <code>--data-dir</code>，另加 <code>--meta-dir</code> 指到元数据根，它要知道去哪查 key 注册表）；② 客户端挂载单元把 <code>--token ${GROVE_TOKEN}</code> 换成 <code>--api-key ${GROVE_API_KEY}</code>；③ 在中心节点给每台机铸一把 key：<code>grovefs apikey --meta-dir /data/cluster create --label &lt;主机名&gt; --for mount</code>，把输出的 <code>id:secret</code> 写进与服务端同一份 root-owned 0600 的 <code>grovefs.env</code>——密钥因而进不了 <code>ps</code> 可见的 unit 文本。<br>
+    <b>被踢后的真实行为（实测）</b>：key 被撤销后，该挂载在首个服务端往返上打印服务端拒因，随即<b>干净自卸载并以退出码 0 结束</b>——这是一次有意的收手而不是崩溃，所以 <code>Restart=on-failure</code> <b>不会</b>重拉，unit 落 <code>inactive (dead)</code>；要察觉「被踢」，看 journal 里那行拒因，或给 unit 挂 <code>OnFailure=</code>/<code>ExecStopPost=</code> 告警。拿被撤销的 key 重新挂载则 fail-fast。若希望运维重铸新 key 后该机自动接回，改用 <code>Restart=always</code>。<br>
+    <b>影响范围</b>：只影响被撤销的那一个挂载；服务端逐调用查同一份 key 注册表，其他主机的挂载全程不受波及。</div>
     <h4>挂载多线程与服务端并发模型</h4>
     <table>
       <tr><th>组件</th><th>并发机制</th><th>可调参数</th><th>说明</th></tr>
@@ -814,7 +818,17 @@ $Y meta-server --meta-dir /data/nodeA --listen 10.0.0.5:50110 --role primary --p
 $Y meta-server --meta-dir /data/nodeB --listen 10.0.0.6:50111 --role standby --peer 10.0.0.5:50110 --token $TOK
 <span class="cmt"># 客户端故障转移列表;</span>
 $Y mount --view alice --meta-server 10.0.0.5:50110,10.0.0.6:50111 --data-servers 10.0.0.5:50100 --token $TOK -m /mnt/alice</code></pre>
-    <div class="note"><b>防双写需第三方仲裁</b>:把 <b>3 个(奇数)data-server</b> 写进 <code>--witness</code>,且它们应与客户端实际写入的内容盘<b>同节点部署</b>(数据面门控只对列表内 data-server 生效,见 <a href="#ha">§18</a>)。验收:<code>ssh nodeA systemctl stop grove-meta-server</code> → nodeB 日志出现 <code>meta HA: promoted to primary at epoch N</code>,客户机继续可写;旧主回来自动降级为 standby。</div>
+    <div class="note"><b>为什么要 <code>--witness</code></b>：只有一主一备两台节点时，若它们之间网络割裂，两半会各自认为自己是主、同时往同一批内容盘双写（CAP 硬边界，没有第三方就防不住脑裂）。<code>--witness</code> 指定 <b>奇数个（推荐 3）主备都访问得到的 <code>data-server</code> 作独立仲裁者</b>：每个仲裁者持久持有一个单调递增的 fence token（盘根 <code>.fence_token</code>，重启不清零）；自称为主的 meta-server 必须拿到严格多数派 <code>N/2+1</code> 个仲裁者的有界租约（默认 3s，其间 token 被它顶高）才能写；旧租约未到期别人抢不走，同一时刻至多一份活租约——这就把双写闭合。被 fence 的过期一方（及其旧客户端）的写帧被门控拒 <code>EROFS</code>，封帧会向权威重取 epoch 后自动重试一次。<b>宕掉少数</b>仲裁者仍能组多数续租、不冻写；失去多数才 fail-safe 冻结（宁停写不双写）。<br>
+    <b>为什么必须与内容盘同节点部署</b>：除了元数据面 fence，写数据帧还带着 epoch 由 <code>data-server</code> 按 token 门控——但 token 只会被<b>在 <code>--witness</code> 列表里</b>的那次多数派投票顶高，列表外的盘恒为 0、数据面门控对它永不生效，只剩元数据面一道防线。所以规则是一句话：<b>客户机实际写入的每个 <code>data-server</code>，都要进 <code>--witness</code> 列表</b>，凑不够奇数就在别的机器上加纯仲裁实例。</div>
+    <pre><code><span class="cmt"># 接本节拓扑配成“带仲裁”的主备：nodeA/nodeB 上各跑 data-server(:50100)，
+# nodeC(10.0.0.7) 再加一个纯仲裁用 data-server；primary 与 standby 的启动行都加同一份 --witness</span>
+$Y meta-server --meta-dir /data/nodeA --listen 10.0.0.5:50110 --role primary --peer 10.0.0.6:50111 \
+  --witness 10.0.0.5:50100,10.0.0.6:50100,10.0.0.7:50100 --token $TOK
+$Y meta-server --meta-dir /data/nodeB --listen 10.0.0.6:50111 --role standby --peer 10.0.0.5:50110 \
+  --witness 10.0.0.5:50100,10.0.0.6:50100,10.0.0.7:50100 --token $TOK
+<span class="cmt"># 客户机内容盘 10.0.0.5:50100 在列表内 → 数据面门控生效；多数派=2/3，nodeC 宕掉不冻写</span>
+$Y mount --view alice --meta-server 10.0.0.5:50110,10.0.0.6:50111 --data-servers 10.0.0.5:50100 --token $TOK -m /mnt/alice</code></pre>
+    <div class="ok"><b>验收走查（逐拍）</b>：① 杀主：<code>ssh nodeA systemctl stop grove-meta-server</code>；② 数秒内（旧租约 ≤3s 到期后才可抢占）看备侧日志：<code>ssh nodeB journalctl -u grove-meta-server -n5</code> 出现 <code>meta HA: promoted to primary at epoch N</code>；③ 客户机无感：挂载的 <code>--meta-server</code> 列表自动故障转移到 10.0.0.6:50111，<code>echo ok &gt; /mnt/alice/probe.txt</code> 照常落盘；④ 旧主回来：<code>ssh nodeA systemctl start grove-meta-server</code>——仲裁者 token 已 ≥ 它的 epoch，claim 被 fence，自动降级为 standby，全程始终只有一主。机制推导与回归实证（<code>test_ha.sh</code> 段 9–11）见 <a href="#ha">§18</a>。</div>
 
     <h3>5.9 PostgreSQL 后端（只改 meta-server 一处；逐步演练见 <a href="#case">§6.4</a>）</h3>
     <pre><code><span class="cmt"># 1) 建库并给连接角色建 schema 的权限(视图 schema 由 view create --meta-store 显式建,无需预迁移)</span>
@@ -823,7 +837,19 @@ psql -c "GRANT CREATE,CONNECT ON DATABASE grovefs TO grovefs;"
 <span class="cmt"># 2) --meta-store 与 --role standby/--peer/--witness 互斥,同时给会启动即 fail-fast</span>
 $Y meta-server --meta-dir /data/cluster --listen 0.0.0.0:50110 \
      --meta-store postgres://grove:pw@10.0.0.9:5432/grovefs --token $TOK</code></pre>
-    <p>客户端命令一字不变(<a href="#share">§11.1/§11.2</a>:客户机不装 PG、不持连接串、PG 账密只存在于这台机的启动命令里);每 view 映射 <code>grovefs_v_&lt;hex(view)&gt;</code> schema;控制面随 <code>--meta-store</code> 一起进 PG:key/审计落 <code>grovefs_control.api_keys</code>/<code>mcp_calls</code>、视图定义落 <code>grovefs_control.view_defs</code>(本地不落控制面文件,<code>control</code> 套件实证);备份/HA 改走 PG 工具链(一次 <code>pg_dump</code> 覆盖树+控制面;<code>pg_basebackup</code>/流复制/PITR,见 <a href="#maint">§16.3</a>)。</p>
+    <p>PG 是一次<b>服务端换芯</b>：整套部署只改 meta-server 的启动行，客户端完全不感知。换完了什么、没换什么，对着下表看：</p>
+    <table>
+      <thead><tr><th>东西</th><th>SQLite（默认）</th><th>PostgreSQL（<code>--meta-store</code>）</th></tr></thead>
+      <tbody>
+        <tr><td>客户端挂载命令</td><td colspan="2"><b>一字不变</b>（<a href="#share">§11.1/§11.2</a>）——客户机不装 PG、不持连接串；PG 账密只存在于跑 meta-server 的那一台机上</td></tr>
+        <tr><td>视图树存哪</td><td>一 view 一个 <code>&lt;meta-dir&gt;/meta/&lt;V&gt;.db</code> 文件</td><td>一 view 一个 <code>grovefs_v_&lt;hex(view)&gt;</code> schema（如 <code>alice</code> → <code>grovefs_v_616c696365</code>），由 <code>view --meta-store … create</code> 显式建出</td></tr>
+        <tr><td>内容字节</td><td colspan="2">不变——仍在 data-server 的 <code>blocks/</code> 里，与元数据后端选哪种完全无关</td></tr>
+        <tr><td>控制面（key / 视图定义 / 审计）</td><td>本地 <code>api_keys.db</code> + <code>meta/views/*.layout</code></td><td>共享 schema <code>grovefs_control.api_keys</code>/<code>view_defs</code>/<code>mcp_calls</code>，<b>本地不落任何控制面文件</b>（<code>control</code> 套件实证）</td></tr>
+        <tr><td>高可用</td><td>grovefs 自研快照主备（<code>--role</code>/<code>--peer</code>/<code>--witness</code>，§5.8）</td><td>交给 PG 自身：流复制 / <code>pg_basebackup</code> / PITR（§16.3）。两套是<b>二选一</b>：<code>--meta-store</code> 与 <code>--role standby</code>/<code>--peer</code>/<code>--witness</code> 同时给，启动即 fail-fast</td></tr>
+        <tr><td>备份</td><td>冷拷 <code>&lt;V&gt;.db</code> 或 <code>VACUUM INTO</code>，另备 <code>blocks/</code></td><td>一次 <code>pg_dump</code> 覆盖视图树+锁+控制面；<code>blocks/</code> 仍单独备（§16.2）</td></tr>
+      </tbody>
+    </table>
+    <div class="warn"><b>最容易踩的两个坑</b>：① <b>控制面必须指同一个 URI</b>——PG 部署下跑 <code>view</code>/<code>apikey</code>/<code>mcp</code> 若不带 <code>--meta-store postgres://…</code>（或 env <code>GROVEFS_META_STORE</code>，见 <a href="#s-config-keys">§9.4</a>），治理动作会写进一份 PG 版 meta-server 永不在看的本地文件：铸出来的 key Mount 不认、定义的透镜不成形。② <b>挂载不会替你建 schema</b>——PG 下基视图要显式 <code>grovefs view --meta-store &lt;同一个 URI&gt; create --view V</code>；schema 不存在时 <code>M_OPEN</code> 直接拒绝并提示这条命令。存量 SQLite 树的数据按 <a href="#case">§6.4</a> 的单向搬移步骤迁移。</div>
     <div class="chnav"><a href="#prod"><span>← 上一章</span><b>§4 生产拓扑</b></a><a class="r" href="#case"><span>下一章 →</span><b>§6 六个场景</b></a></div>
   </section>
 
@@ -1282,8 +1308,8 @@ export GROVEFS_API_KEY=05b4b85d:fa2fe75     <span class="cmt"># id:secret，密�
         <tr><td><code>GROVEFS_DATA_SERVERS</code></td><td><code>--data-servers</code></td><td><code>mount</code> / <code>du</code></td></tr>
         <tr><td><code>GROVEFS_TOKEN</code></td><td><code>--token</code> / <code>--data-token</code> / <code>--meta-token</code></td><td><code>mount</code> / <code>data-server</code> / <code>meta-server</code> / <code>du</code>（共享准入口令）</td></tr>
         <tr><td><code>GROVEFS_API_KEY</code></td><td><code>--api-key</code> / <code>--data-api-key</code> / <code>--meta-api-key</code></td><td><code>mount</code> / <code>du</code>（可撤销 per-caller 凭据）</td></tr>
-        <tr><td><code>GROVEFS_META_DIR</code></td><td><code>--meta-dir</code></td><td><code>meta-server</code>（元数据根；控制面命令未显式给时报 <code>--home</code> 回退）</td></tr>
-        <tr><td><code>GROVEFS_META_STORE</code></td><td><code>--meta-store</code></td><td><code>view</code> / <code>apikey</code> / <code>mcp</code> / <code>meta-server</code> / <code>du</code>（PG 控面寻址）</td></tr>
+        <tr><td><code>GROVEFS_META_DIR</code></td><td><code>--meta-dir</code></td><td><code>meta-server</code>（元数据根）；<code>view</code> / <code>apikey</code> / <code>mcp</code> 不读它——控制面未显式给 <code>--meta-dir</code> 时锚点取 <code>--home</code>（其自身回退 <code>GROVEFS_HOME</code>）</td></tr>
+        <tr><td><code>GROVEFS_META_STORE</code></td><td><code>--meta-store</code></td><td><code>view</code> / <code>apikey</code> / <code>mcp</code> / <code>meta-server</code> / <code>data-server</code> / <code>du</code>（PG 控制面寻址；未给 flag 时由本 env 回退，见 <code>resolve_store()</code>）</td></tr>
         <tr><td><code>GROVEFS_MCP_API_KEY</code></td><td>——（无同名 flag）</td><td><code>grovefs mcp</code> 的 key 门专用变量</td></tr>
         <tr><td><code>GROVEFS_STATS</code></td><td><code>--stats</code></td><td><code>mount</code>（=<code>1</code>/<code>true</code> 开启分阶段延迟遥测）</td></tr>
         <tr><td><code>GROVEFS_BW_READ</code> / <code>GROVEFS_BW_WRITE</code></td><td><code>--bw-read</code> / <code>--bw-write</code></td><td><code>mount</code>（带宽整形；<b>非法值直接拒挂，不静默忽略</b>）</td></tr>
@@ -1322,8 +1348,36 @@ ExecStart=/usr/local/bin/grovefs meta-server --listen 0.0.0.0:20053 --require-ap
         <tr><td><code>token</code> / <code>api-key</code></td><td>客户端握手时按当前值校验；key 注册表服务端<b>逐调用查表</b></td><td><code>apikey revoke</code> 后活挂载 ≤1s 封停（无需重启）；token 轮换需重启涉及进程</td></tr>
       </tbody>
     </table>
-    <p class="cmt">按命令面分：<code>token</code>/<code>api-key</code>/<code>--meta-server</code>/<code>--data-servers</code> 在 <b>mount / du</b> 每次执行时重新解析（flag 缺失则回退读 env）；<code>--meta-dir</code>/<code>--meta-store</code> 在 <b>view / apikey / mcp</b> 控制面命令里<b>必须显式给</b>（控制面不回退 env）；服务端侧坐标只在服务进程启动时读一次。优先级恒为 <code>flag &gt; env &gt; 配置文件 &gt; 默认</code>（见 <a href="#s-config-rule">9.1</a>）。</p>
+    <p class="cmt">按命令面分：<code>token</code>/<code>api-key</code>/<code>--meta-server</code>/<code>--data-servers</code> 在 <b>mount / du</b> 每次执行时重新解析（flag 缺失则回退读 env）；<b>view / apikey / mcp</b> 控制面里 <code>--meta-dir</code> <b>没有</b> env 回退、必须显式给（缺省时锚点落 <code>--home</code>，其自身回退 <code>GROVEFS_HOME</code>），而 <code>--meta-store</code> 有回退键 <code>GROVEFS_META_STORE</code>（源码 <code>resolve_store()</code>，见 §9.4 表）——多集群部署时它是最需要警惕的全局键（见 <a href="#s-config-multi">9.8</a>）；服务端侧坐标只在服务进程启动时读一次。优先级恒为 <code>flag &gt; env &gt; 配置文件 &gt; 默认</code>（见 <a href="#s-config-rule">9.1</a>）。</p>
     <div class="note"><b>回归来源</b>：上述行为由 <code>.build-bin/test_config.sh</code>（<code>config</code> 套件 28 断言）端到端钉住：优先级链、注释/<code>export</code>/引号值/非 <code>GROVEFS_*</code> 键忽略/坏行定位警告/读不到的显式 <code>$GROVEFS_CONFIG</code> 不致命、以及一台不带任何坐标纯由文件驱动的真 FUSE 挂载。</div>
+
+    <h3 id="s-config-multi">9.8 一台客户机的多集群 / 多视图 / 多凭据</h3>
+    <p>配置文件与环境变量喂给命令的是<b>一套进程级全局坐标</b>：一条 grovefs 命令只读一份文件（§9.2 的择一关系），每个 <code>GROVEFS_*</code> 键只有一个值，<b>不存在按挂载点、视图名或凭据自动匹配</b>的机制。多集群共存的正确形态 = 每次执行时让命令<b>恰好看到那一个集群的那一套值</b>。</p>
+    <table>
+      <thead><tr><th>形态</th><th>写法</th><th>适用边界</th></tr></thead>
+      <tbody>
+        <tr><td>每集群一份 conf，逐次 <code>$GROVEFS_CONFIG</code></td><td><code>GROVEFS_CONFIG=~/grovefs-gfs.conf grovefs mount --view alice -m ~/mnt/alice</code></td><td>交互机主力形态；两条命令各读各的文件，地址与凭据互不可见，天然不串</td></tr>
+        <tr><td>shell 函数封装</td><td><code>gmnt_gfs() { GROVEFS_CONFIG=~/grovefs-gfs.conf grovefs mount --view "$1" -m "$2"; }</code></td><td>同上，省掉每次的环境前缀；函数名即集群名</td></tr>
+        <tr><td>systemd 每视图实例、各带 <code>EnvironmentFile=</code></td><td>模板 unit（<a href="#deploy">§5.4</a> 的 <code>grove-mount@.service</code>）里用 <code>EnvironmentFile=/etc/grovefs/%i.env</code>，每实例一份 0600 坐标文件</td><td>常驻多集群挂载；凭据按实例隔离，journal 可按实例审计</td></tr>
+        <tr><td>会话内 <code>export</code></td><td><code>export GROVEFS_META_SERVER=…</code></td><td><b>仅限单集群会话</b>——多集群下它是下方串值陷阱的直接来源</td></tr>
+      </tbody>
+    </table>
+    <div class="warn"><b>串值陷阱（实测行为，不是假想）</b>：配置文件<b>只填尚未设置的键</b>（§9.1），所以 shell 里残留的 A 集群 export 会<b>静默压过</b> B 集群配置文件：先导过 <code>GROVEFS_META_SERVER=&lt;A 地址&gt;</code>，再指 <code>GROVEFS_CONFIG=&lt;B 的文件&gt;</code> 执行 mount，回显仍是 <code>using remote metadata service at &lt;A 地址&gt;</code>。规避：常驻做法用<b>每集群 conf + 函数封装</b>而不是 export；切换集群前 <code>unset</code>，或用 <code>env -u GROVEFS_META_SERVER -u GROVEFS_TOKEN grovefs …</code> 起命令；挂载回显的 <code>using remote metadata service at …</code> 是核对坐标的免费手段。</div>
+    <p>两份文件的示例（gfs 三机集群与 §9.3 的 10.3.10.170 集群并存于一台客户机，均 <code>chmod 600</code>）：</p>
+    <pre><code><span class="cmt"># ~/grovefs-gfs.conf —— gfs1/gfs2 存储 + gfs-client 元数据（挂视图 alice）</span>
+GROVEFS_META_SERVER=192.168.122.137:50053
+GROVEFS_DATA_SERVERS=gfs1:50100,gfs2:50100
+GROVEFS_TOKEN=…          <span class="cmt"># 或 GROVEFS_API_KEY=id:secret</span>
+
+<span class="cmt"># ~/grovefs-lab.conf —— 另一套集群</span>
+GROVEFS_META_SERVER=10.3.10.170:20053
+GROVEFS_DATA_SERVERS=10.3.10.170:20100
+GROVEFS_API_KEY=id:secret
+
+<span class="cmt"># 各自挂载，互不干涉；视图名与挂载点仍留在命令行（§9.5）</span>
+GROVEFS_CONFIG=~/grovefs-gfs.conf grovefs mount --view alice -m ~/mnt/alice
+GROVEFS_CONFIG=~/grovefs-lab.conf grovefs mount --view bob -m ~/mnt/bob</code></pre>
+    <div class="note"><b>控制面在多集群下的隔离</b>：<code>view</code>/<code>apikey</code>/<code>mcp</code> 的 <code>--meta-dir</code> <b>没有 env 回退</b>（§9.4），逐集群显式给（gfs-client 上是 <code>--meta-dir ~/meta</code>）是防误改的第一道闸；<code>--meta-store</code> 则回退读全局的 <code>GROVEFS_META_STORE</code>——残留 export 会把治理命令指向<b>另一套 PG</b>，切集群前务必 unset 或走函数封装；<code>GROVEFS_HOME</code> 会经 <code>--home</code> 回退间接挪动控制面锚点，多集群机器上不要长期置它。</div>
     <div class="chnav"><a href="#viewguide"><span>← 上一章</span><b>§8 视图创建与使用</b></a><a class="r" href="#intro"><span>下一章 →</span><b>§10 核心概念</b></a></div>
   </section>
 
@@ -1841,7 +1895,7 @@ grovefs du --view main --depth 1</code></pre>
         <tr><td><code>--view V</code></td><td>——（必填）</td><td>要统计的视图名（基视图名或别名均可）</td></tr>
         <tr><td><code>--meta-server HOST:PORT</code></td><td><code>GROVEFS_META_SERVER</code></td><td>元数据服务地址；走 <code>M_TREE_DUMP</code> RPC，无需直连 PG</td></tr>
         <tr><td><code>--meta-store URI</code></td><td><code>GROVEFS_META_STORE</code></td><td>PG 直连 URI（<code>postgres://user:pw@host/db</code>）</td></tr>
-        <tr><td><code>--meta-dir DIR</code></td><td><code>GROVEFS_META_DIR</code></td><td>本地 SQLite 元数据根（<code>meta/&lt;view&gt;.db</code> 在此下）</td></tr>
+        <tr><td><code>--meta-dir DIR</code></td><td><code>--home</code> 的 store root（<code>du</code> 不读 <code>GROVEFS_META_DIR</code>，见 §9.4）</td><td>本地 SQLite 元数据根（<code>meta/&lt;view&gt;.db</code> 在此下）</td></tr>
         <tr><td><code>--data-servers HOST:PORT</code></td><td><code>GROVEFS_DATA_SERVERS</code></td><td>data-server 地址，一次批量 RPC <code>OP_BATCH_LEN</code> 拿大小</td></tr>
         <tr><td><code>--data-dir DIR</code></td><td><code>--meta-dir</code>/<code>--home</code> 的 store root</td><td>本地模式：<code>blocks/</code> 所在目录，直接 <code>stat()</code>；字节来源优先级为 <code>--data-servers</code> &gt; <code>--data-dir</code> &gt; store root</td></tr>
         <tr><td><code>--meta-token STR</code></td><td><code>GROVEFS_TOKEN</code></td><td>meta-server 的共享 token（开了 <code>--token</code> 时必带）</td></tr>
