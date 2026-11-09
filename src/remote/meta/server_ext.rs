@@ -1,7 +1,8 @@
 //! The `MetaServer` half of [`crate::remote::meta`]: role/HA state, the
 //! central runtime that owns per-view [`MetaEngine`]s, the accept/serve loops,
 //! snapshot replication and the control-plane handlers. Gated behind `native`
-//! — clients (including the Windows `grovefs-win` mount) compile only
+//! — clients (including the Windows `grovefs-win` mount from the sibling
+//! `grovefs-client` repo) compile only
 //! [`RemoteMeta`] from the parent module.
 
 use super::*;

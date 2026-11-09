@@ -15,18 +15,19 @@
 //! - [`mcp`]          : MCP server exposing the view-governance tools to AI agents
 
 // Server-side / control-plane modules: a `remote-only` client build (see the
-// sibling `grovefs-win` crate) drops all of them — they mutually reference the
+// sibling `grovefs-client` repo, members `win/` and `mac/`) drops all of them
+// — they mutually reference the
 // on-disk engines and pull `rusqlite` + `postgres`/`tokio` with them.
 #[cfg(feature = "native")]
 pub mod apikeys;
 pub mod backend;
-#[cfg(feature = "native")]
+#[cfg(feature = "fuse-bridge")]
 pub mod bwlimit;
 #[cfg(feature = "native")]
 pub mod control;
 #[cfg(feature = "native")]
 pub mod du;
-#[cfg(feature = "native")]
+#[cfg(feature = "fuse-bridge")]
 pub mod fs_impl;
 #[cfg(feature = "native")]
 pub mod gc;

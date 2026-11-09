@@ -5,8 +5,9 @@ edition = "2021"
 description = "A user-view FUSE filesystem with pluggable storage backend, no NFS"
 license = "MIT"
 
-# The `[[bin]]` is the Linux FUSE mount + cluster server. A Windows client
-# (see the sibling `grovefs-win` crate) depends on the `lib` only, with the
+# The `[[bin]]` is the Linux FUSE mount + cluster server. The native clients
+# (see the sibling `grovefs-client` repo: `win/` WinFsp, `mac/` macOS skeleton)
+# depend on the `lib` only, with the
 # `remote-only` feature, so it never pulls `fuser`/`libc` and builds without a
 # FUSE or POSIX-libc dependency. The binary needs the full native stack.
 [[bin]]
@@ -19,17 +20,23 @@ name = "grovefs"
 path = "src/lib.rs"
 
 [features]
-# Full build: FUSE mount path + cluster server + local/POSIX storage backend.
+# Full build: fuse-bridge + on-disk metadata engine (rusqlite) + PostgreSQL
+# backend + the cluster servers/control plane. On by default for the Linux
+# `grovefs` binary.
 default = ["native"]
-# Everything that needs `fuser` (kernel FUSE bridge) or POSIX `libc` calls
-# (pread/pwrite/fsync, getuid, kill), or an on-disk metadata engine
-# (`rusqlite`/`postgres`). On by default; disabled for the client-only Windows
-# build, which drops the whole server-side/control-plane subtree.
-native = ["dep:fuser", "dep:libc", "dep:rusqlite", "dep:postgres"]
-# Ergonomic alias for the Windows / headless client build: depend on the
-# remote MetaProvider + StorageBackend + wire protocol only, no fuser/libc.
-# Combine with `--no-default-features` so `native` (and thus fuser/libc) is
-# dropped from the dependency graph: `--no-default-features --features remote-only`.
+# The kernel FUSE bridge and real POSIX shims only: `fuser` (kernel bridge),
+# `libc` (real errno/ids/signals), plus the `fs_impl` mount path and `bwlimit`
+# shaper they need. NO on-disk engine and NO server/control plane. This is what
+# a platform-native client links when it serves a REMOTE view through the same
+# `GroveFS` code as `grovefs mount` — e.g. the macOS client, combining this with
+# `remote-only`: `--no-default-features --features remote-only,fuse-bridge`.
+fuse-bridge = ["dep:fuser", "dep:libc"]
+# Server-side/on-disk stack: everything in fuse-bridge plus the metadata engines
+# and the control plane. Disabled for client builds.
+native = ["fuse-bridge", "dep:rusqlite", "dep:postgres"]
+# Client transport only: remote MetaProvider + StorageBackend + wire protocol,
+# no fuser/libc, no engine. Combine with `--no-default-features` (the Windows
+# WinFsp client's build).
 remote-only = []
 
 [dependencies]
@@ -38,13 +45,13 @@ remote-only = []
 # with per-worker cloned /dev/fuse fds via FUSE_DEV_IOC_CLONE, Linux). The old
 # abi-7-* feature flags are gone; capabilities are negotiated at runtime in
 # `init` (KernelConfig::add_capabilities with InitFlags). OPTIONAL: only the
-# `native` mount/server path needs it, so the client-only build drops it.
+# `fuse-bridge` mount path needs it, so a purely remote client (WinFsp) drops it.
 fuser = { version = "0.18", optional = true }
 # Embedded metadata engine: view tree + inode mapping. bundled = compile SQLite from source, no system dep. OPTIONAL: only the on-disk `native` engine (src/meta/engine.rs + the meta-server) links it; the `remote-only` client build drops it — and with it the bundled-SQLite C compilation.
 rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 # libc for pread/pwrite/fsync (true positional IO, no seek races) and POSIX
 # ids/signals. OPTIONAL: the client-only build uses `src/platform.rs` shims
-# instead, so this is only pulled in under `native`.
+# instead, so this is only pulled in under `fuse-bridge` (or `native`).
 libc = { version = "0.2", optional = true }
 # CLI
 clap = { version = "4", features = ["derive"] }
