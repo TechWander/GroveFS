@@ -87,3 +87,6 @@
 /paper/*.synctex.gz
 /paper/comment.cut
 /paper/*.pdf
+
+# VM  provisioning 脚本含 cloud-init 明文口令，绝不入库（改读环境变量后再纳入）。
+/.build-bin/gfs_provision.sh
