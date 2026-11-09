@@ -1395,6 +1395,7 @@ $Y meta-server --meta-dir /data/cluster --listen 0.0.0.0:50110 \
 
 **注意**：
 - **与自研 HA 不兼容**：`--meta-store postgres://…` + 任一 `--role standby` / `--peer` / `--witness` 会在启动时 fail-fast（`VACUUM INTO` 快照机制仅适用于 SQLite）。PG 高可用请交给 **PostgreSQL 自身的流复制 / logical replication / PITR**——本来就比文件快照更强。
+- **空闲视图自动释放连接**：每个被挂载过的视图在 meta-server 里常驻一套引擎池（8 写 + 4 读连接）。`meta-server --engine-idle-secs N`（默认 300，`0` 关闭）在视图的最后一个挂载会话结束且静默 N 秒后回收引擎，连接随之关闭；下次访问自动重开，客户端无感（`evict` 套件实证：6 视图 76 连接 → 卸载回收后 4）。于是 PG 侧规划公式从「视图总数 × 12 ≤ max_connections」变为「**最近 N 分钟活跃视图数** × 12 + 突发溢出 ≤ max_connections」——视图总数不再被连接数封顶。挂载中的视图永不被回收（会话计数钉住引擎，哪怕无人读写）。
 - 为什么不提供 Redis：K/V+TTL 与视图树不同构（事务/行锁/多列索引都是自然需要,硬塞只会同实例重建一个更弱的 PG）。
 - 分场景的可执行命令（单机验证 / 生产 systemd / 巡检 / 备份恢复 / 删视图 / 能力边界）见 **§15.3–§15.9**。
 
@@ -1793,6 +1794,7 @@ journalctl -u grove-meta-server --since yesterday | grep -E 'meta HA|sync-repl|f
 | `meta HA: promoted to primary at epoch N` | standby 提升成功 | 确认旧主已停/将降级,事后排查主为何失联 |
 | `meta HA: demoted to standby (peer epoch N)` / `(a quorum ... holds ... > our ...)` | 发现对端/仲裁持有更高 epoch,自降级 | 正常收敛行为;若双侧频发查网络抖动 |
 | `meta HA: cannot form lease quorum ... fail-safe self-demote` | witness 多数派不可达超宽限(3s),**写冻结**(fail-safe,宁停写不双写) | 预期保护而非故障:恢复仲裁节点可达即自动解冻 |
+| `meta-server: evicted N idle engine(s) (>Xs idle, no sessions)` | 空闲引擎回收(`--engine-idle-secs`,§6.2):N 个无挂载会话且静默超阈的视图释放了引擎(PG 连接/文件句柄) | 正常回收噪声无需处置;若希望视图热不回落,缩短阈值或确认会话已断;`0` 则关闭驱逐(常驻模型) |
 | `meta HA: promotion refused/deferred` | 提升被否(对端持更高 token 或前任租约尚活) | 正常:绝不双主;若两节点都拒升,查 witness 多数派 |
 | `invalidation listener stopped: token rejected` | 客户端失效推送通道被 token 拒(中心 token 换了) | 用新 token 重启对应 grove-mount@ 实例 |
 
@@ -2711,8 +2713,8 @@ select n.nspname,
                       false, true, '')))[1]::text::bigint as nodes
 from pg_namespace n where n.nspname like 'grovefs_v_%' order by 1;
 
--- 3) 连接数:每个被打开过的视图各自持有 8 写 + 4 读池(共 12 条),N 个视图最多 N×12
---    → 规划 PG max_connections 时按「视图数 × 12 + 你自己的运维连接」留量
+-- 3) 连接数:活跃视图各自持有 8 写 + 4 读池(共 12 条);空闲超 --engine-idle-secs(默认 300s)且无挂载会话的视图会被回收、连接随之释放
+--    → 规划 PG max_connections 按「最近 N 分钟活跃视图数 × 12 + 突发溢出 + 运维连接」留量,不是视图总数;卸载潮后本查询应自己回落
 select state, count(*) from pg_stat_activity where datname='grovefs' group by 1 order by 2 desc;
 
 -- 4) 提交/回滚比:40001/40P01 冲突会在客户端透明重试,PG 侧体现为回滚计数
@@ -2812,7 +2814,7 @@ find /data/cluster/blocks -type f | wc -l; du -sh /data/cluster/blocks
 | `mcp` | 可用(加 `--meta-store`) | 治理与只读探查十工具全走 `grovefs_control`(`list_view_tree` 也能走 PG 树);`fork_view`/`graft_view` 仍拒:`fork is not implemented on the PostgreSQL backend yet…` | 同左;巡检亦可 psql(§15.6) |
 | HA：`--role standby` / `--peer` / `--witness` | 启动即失败 | `--meta-store postgres://… cannot be combined with --role standby / --peer / --witness` | PG 流复制 / 逻辑复制 / PITR |
 | 视图名 > 25 字节 | 拒绝 | 服务端日志：`incompatible with PG schema naming (empty, or longer than 25 bytes)`；客户端只看到 `Input/output error` | 名字控制在 25 字节内（中文约 8 字） |
-| 连接池 | 固定 | 每视图 8 写 + 4 读(共 12 条)，编译期常量，没有环境变量可调；换视图不释放 | 按「视图数 × 12」规划 `max_connections`；写热点先查锁争用，不是加池 |
+| 连接池 | 固定常量 | 每视图 8 写 + 4 读(共 12 条)，编译期常量，没有环境变量可调；挂载会话钉住引擎，卸载且静默 `meta-server --engine-idle-secs`（默认 300s）后回收、下次访问自动重开（`evict` 套件实证） | 按「**活跃视图数** × 12 + 突发溢出」规划 `max_connections`；写热点先查锁争用，不是加池 |
 
 ### 15.10 场景：已有目录零拷贝入库（SQLite 后端）
 

@@ -112,7 +112,12 @@ struct MetaRuntime {
     /// Per-caller credential gate for `M_OPEN` and live sessions; `None` keeps
     /// the static-token/LAN-trusted behavior byte-for-byte.
     keys: Option<Arc<crate::apikeys::ApiKeyStore>>,
-    cache: Arc<Mutex<HashMap<String, Arc<MetaStore>>>>,
+    /// base view → (physical engine, last-resolve ms stamp). Engines are
+    /// opened lazily by [`store_for`] and retired by the idle sweeper
+    /// ([`evict_idle`]) once neither a mounted session nor recent traffic
+    /// pins them; under the PG backend eviction is what releases the
+    /// per-view pooled connections back to `max_connections`.
+    cache: Arc<Mutex<HashMap<String, (Arc<MetaStore>, Arc<AtomicU64>)>>>,
     subs: Subscribers,
     ha: Option<Arc<HaState>>,
     peer: Option<String>,
@@ -173,8 +178,11 @@ struct MetaRuntime {
     /// Server-side **derived views**: client-visible name → resolved provider
     /// (the physical `MetaStore` itself, or a [`LayoutMeta`] lens over another
     /// store's tree, defined by the control store's `<name>` definition). The
-    /// cache the wire loop dispatches against.
-    views: Arc<Mutex<HashMap<String, Arc<dyn MetaProvider>>>>,
+    /// cache the wire loop dispatches against. Each entry carries the same
+    /// last-resolve stamp as [`MetaRuntime::cache`]: a busy lens over a base
+    /// keeps the WHOLE base group resident, so eviction only fires when the
+    /// physical tree and every derived name on it have gone idle together.
+    views: Arc<Mutex<HashMap<String, (Arc<dyn MetaProvider>, Arc<AtomicU64>)>>>,
     /// Derived view name → physical base view name. Physical views map to
     /// themselves, so subscribers and snapshot pushes can always resolve the
     /// tree a name actually reads. Populated by [`view_provider`].
@@ -186,6 +194,10 @@ struct MetaRuntime {
     /// stamp) evicts the cached lens so live mounts converge on the new shape
     /// without a remount. Physical entries are absent here and never re-checked.
     defs: Arc<Mutex<HashMap<String, String>>>,
+    /// Idle window (ms) for the engine sweeper; 0 disables eviction entirely
+    /// (entries stay resident for the process lifetime — the pre-sweeper
+    /// behavior every existing test relies on).
+    engine_idle_ms: u64,
 }
 
 impl MetaRuntime {
@@ -308,7 +320,14 @@ pub struct MetaServer {
     sync_repl: bool,
     witness: Option<String>,
     store: StoreKind,
+    /// Idle engine eviction window (ms); see [`MetaRuntime::engine_idle_ms`].
+    engine_idle_ms: u64,
 }
+
+/// Default idle-engine eviction window for a builder-constructed `MetaServer`
+/// (5 minutes). The CLI passes the parsed `--engine-idle-secs` explicitly;
+/// embedders get this default, `0` via the builder turns the sweeper off.
+const DEFAULT_ENGINE_IDLE_MS: u64 = 300_000;
 
 /// Upper bound on the primary's wait for a standby ACK under `--sync-repl`.
 /// Chosen to comfortably exceed a loopback or LAN `VACUUM INTO` + rename cycle
@@ -330,6 +349,7 @@ impl MetaServer {
             sync_repl: false,
             witness: None,
             store: StoreKind::Sqlite,
+            engine_idle_ms: DEFAULT_ENGINE_IDLE_MS,
         }
     }
 
@@ -347,6 +367,7 @@ impl MetaServer {
             sync_repl: false,
             witness: None,
             store: StoreKind::Sqlite,
+            engine_idle_ms: DEFAULT_ENGINE_IDLE_MS,
         }
     }
 
@@ -447,6 +468,16 @@ impl MetaServer {
         self
     }
 
+    /// Evict idle per-view engines after `secs` seconds without a mounted
+    /// session or traffic (0 = never evict). Under a PG backend this bounds
+    /// resident connections to RECENTLY USED views instead of every view
+    /// opened since start — the difference between "views a server can host"
+    /// and PG's `max_connections`.
+    pub fn with_engine_idle_secs(mut self, secs: u64) -> Self {
+        self.engine_idle_ms = secs.saturating_mul(1000);
+        self
+    }
+
     pub fn serve(&self) -> io::Result<()> {
         // PG mode never exercises the GroveFS-native HA pipeline: the
         // `VACUUM INTO` snapshot mechanism and the fencing-witness lease are
@@ -522,6 +553,7 @@ impl MetaServer {
             views: Arc::new(Mutex::new(HashMap::new())),
             bases: Arc::new(Mutex::new(HashMap::new())),
             defs: Arc::new(Mutex::new(HashMap::new())),
+            engine_idle_ms: self.engine_idle_ms,
         });
         if rt.sync_repl {
             println!("meta-server: synchronous replication ON (RPO=0 for mutating ops, ACK timeout {SYNC_REPL_ACK_TIMEOUT:?})");
@@ -634,11 +666,30 @@ fn serve_on_meta_full(listener: TcpListener, base: PathBuf, token: &str) {
         views: Arc::new(Mutex::new(HashMap::new())),
         bases: Arc::new(Mutex::new(HashMap::new())),
         defs: Arc::new(Mutex::new(HashMap::new())),
+        // Plain LAN-trusted test server: keep engines resident (no sweeper),
+        // exactly the pre-eviction behavior.
+        engine_idle_ms: 0,
     });
     serve_runtime(listener, rt);
 }
 
 fn serve_runtime(listener: TcpListener, rt: Arc<MetaRuntime>) {
+    if rt.engine_idle_ms > 0 {
+        let sw = rt.clone();
+        thread::spawn(move || loop {
+            // Sweep at half the idle window (bounded to 1s–60s) so eviction
+            // lands within ≤1.5× the configured window without a tick storm.
+            let nap = (sw.engine_idle_ms / 2).clamp(1_000, 60_000);
+            thread::sleep(std::time::Duration::from_millis(nap));
+            let gone = evict_idle(&sw);
+            if gone > 0 {
+                println!(
+                    "meta-server: evicted {gone} idle engine(s) (>{}s idle, no sessions)",
+                    sw.engine_idle_ms / 1000
+                );
+            }
+        });
+    }
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
@@ -656,6 +707,81 @@ fn serve_runtime(listener: TcpListener, rt: Arc<MetaRuntime>) {
     }
 }
 
+/// Millisecond epoch clock for the engine-cache idle stamps. Coarse is fine:
+/// the only consumer compares it against a seconds-scale idle window.
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Retire engine cache entries for base views nobody is using: no mounted
+/// session (subscriber) AND no dispatch within `engine_idle_ms`. This is what
+/// lets one meta-server host far more views than the PG backend could keep
+/// CONNECTED: a reclaimed engine closes its pooled writers/readers, and the
+/// next op re-opens against the same tree — the reopen path is the one already
+/// exercised wholesale by the HA/fence `MetaRuntime::evict` flush.
+///
+/// In-flight ops are safe by construction: they hold their own `Arc` clones, so
+/// removing a map entry only releases the CONNECTIONS once the last clone
+/// drops; an op dispatching into a just-evicted view transparently rebuilds
+/// the entry. Returns the number of base views evicted.
+fn evict_idle(rt: &MetaRuntime) -> usize {
+    if rt.engine_idle_ms == 0 {
+        return 0;
+    }
+    let now = now_millis();
+    let idle = rt.engine_idle_ms;
+    let is_idle = |st: &AtomicU64| now.saturating_sub(st.load(Ordering::Relaxed)) >= idle;
+    // One nested scope: no other path holds two of these maps at once (every
+    // dispatch uses statement-scoped guards), so the sweeper cannot deadlock
+    // against it.
+    let subs = rt.subs.lock();
+    let mut cache = rt.cache.lock();
+    let mut views = rt.views.lock();
+    let mut bases = rt.bases.lock();
+    let mut defs = rt.defs.lock();
+    // base → client names resolved onto it (lenses/aliases/forks and, per
+    // `bases` semantics, the physical name itself).
+    let mut groups: HashMap<String, Vec<String>> = HashMap::new();
+    for (name, b) in bases.iter() {
+        groups.entry(b.clone()).or_default().push(name.clone());
+    }
+    let candidates: Vec<String> = cache
+        .iter()
+        .filter(|(_b, (_s, st))| is_idle(st))
+        .map(|(b, _)| b.clone())
+        .collect();
+    let mut gone = 0;
+    for base in candidates {
+        let mut names = groups.remove(&base).unwrap_or_default();
+        if !names.contains(&base) {
+            names.push(base.clone());
+        }
+        // The whole group must be idle: any busy provider entry (a lens being
+        // traversed, a mounted physical view) pins the shared engine.
+        if names
+            .iter()
+            .any(|n| views.get(n.as_str()).is_some_and(|(_p, st)| !is_idle(st)))
+        {
+            continue;
+        }
+        // Mounted sessions pin the tree even when nobody types anything.
+        if subs.get(base.as_str()).is_some_and(|m| !m.is_empty()) {
+            continue;
+        }
+        cache.remove(&base);
+        for n in &names {
+            views.remove(n.as_str());
+            bases.remove(n.as_str());
+            defs.remove(n.as_str());
+        }
+        gone += 1;
+    }
+    gone
+}
+
 /// Open (or reuse) the authoritative PHYSICAL engine for a base view name.
 /// A HA standby opens its replicated copy strictly read-only (so a stray
 /// write is refused at the SQLite layer, not merely discouraged); a primary
@@ -665,7 +791,8 @@ fn serve_runtime(listener: TcpListener, rt: Arc<MetaRuntime>) {
 /// [`MetaRuntime::views`] and are resolved by [`view_provider`].
 fn store_for(rt: &MetaRuntime, view: &str) -> io::Result<Arc<MetaStore>> {
     let mut m = rt.cache.lock();
-    if let Some(e) = m.get(view) {
+    if let Some((e, stamp)) = m.get_mut(view) {
+        stamp.store(now_millis(), Ordering::Relaxed);
         return Ok(e.clone());
     }
     let store = match &rt.store {
@@ -682,7 +809,10 @@ fn store_for(rt: &MetaRuntime, view: &str) -> io::Result<Arc<MetaStore>> {
             .map_err(|e| io::Error::other(format!("pg open for view='{view}' uri='{uri}': {e}")))?,
     };
     let engine = Arc::new(store);
-    m.insert(view.to_string(), engine.clone());
+    m.insert(
+        view.to_string(),
+        (engine.clone(), Arc::new(AtomicU64::new(now_millis()))),
+    );
     Ok(engine)
 }
 
@@ -751,7 +881,14 @@ fn view_provider(rt: &MetaRuntime, view: &str) -> io::Result<Arc<dyn MetaProvide
     // would keep the guard alive through the whole block (temporary lifetime
     // rules), and the eviction path below locks `views` again — a non-reentrant
     // mutex would self-deadlock the connection.
-    let cached = rt.views.lock().get(view).cloned();
+    let cached = rt
+        .views
+        .lock()
+        .get(view)
+        .map(|(p, stamp)| {
+            stamp.store(now_millis(), Ordering::Relaxed);
+            p.clone()
+        });
     if let Some(p) = cached {
         // Hot reload: a cached DERIVED entry is only served while its
         // definition is unchanged in the control store (a file `size:mtime` or
@@ -856,7 +993,10 @@ fn view_provider(rt: &MetaRuntime, view: &str) -> io::Result<Arc<dyn MetaProvide
         }
     };
     rt.bases.lock().insert(view.to_string(), base);
-    rt.views.lock().insert(view.to_string(), provider.clone());
+    rt.views.lock().insert(
+        view.to_string(),
+        (provider.clone(), Arc::new(AtomicU64::new(now_millis()))),
+    );
     Ok(provider)
 }
 
@@ -975,7 +1115,7 @@ fn broadcast_derived_display(rt: &MetaRuntime, phys: &str, events: &[Event]) {
         if !has_subs {
             continue;
         }
-        let prov = rt.views.lock().get(&dname).cloned();
+        let prov = rt.views.lock().get(&dname).map(|(p, _)| p.clone());
         let Some(prov) = prov else { continue };
         let mut extra: Vec<Event> = Vec::new();
         for ev in events {
@@ -2852,6 +2992,7 @@ mod ha_tests {
             standby_push: Mutex::new(()),
             witness: Some(waddr),
             store: StoreKind::Sqlite,
+            engine_idle_ms: 0,
         });
 
         // Witness holds nothing above our epoch: the first proof grants a lease
@@ -2983,5 +3124,82 @@ mod ha_tests {
             !loser.won(q),
             "a same-value collision must NOT re-win the quorum"
         );
+    }
+
+    #[test]
+    fn idle_engines_evict_only_without_sessions_or_traffic() {
+        // A cache entry stamped older than the idle window is swept and
+        // transparently re-opened afterwards; a derived name still fresh on
+        // the base keeps the WHOLE group resident (the connection-relevant
+        // guarantee: nothing is dropped while any live user of the tree can
+        // still dispatch through it).
+        let dir = tempfile::Builder::new()
+            .prefix("yf_evict_")
+            .tempdir()
+            .unwrap();
+        let mut rt = MetaRuntime {
+            base: dir.path().to_path_buf(),
+            token: String::new(),
+            keys: None,
+            cache: Arc::new(Mutex::new(HashMap::new())),
+            views: Arc::new(Mutex::new(HashMap::new())),
+            bases: Arc::new(Mutex::new(HashMap::new())),
+            defs: Arc::new(Mutex::new(HashMap::new())),
+            control: crate::mcp::control_store_for(dir.path(), None)
+                .expect("file control store is infallible"),
+            subs: Arc::new(Mutex::new(HashMap::new())),
+            ha: None,
+            peer: None,
+            forward: Mutex::new(Vec::new()),
+            sync_repl: false,
+            standby_push: Mutex::new(()),
+            witness: None,
+            store: StoreKind::Sqlite,
+            engine_idle_ms: 60_000,
+        };
+        let a = store_for(&rt, "v1").unwrap();
+        assert!(rt.cache.lock().contains_key("v1"));
+        // Age the base stamp to epoch 0: idle under any real window.
+        rt.cache.lock()
+            .get("v1")
+            .unwrap()
+            .1
+            .store(0, Ordering::Relaxed);
+        // A fresh lens provider over the base marks the group busy → skip.
+        rt.bases
+            .lock()
+            .insert("lens1".to_string(), "v1".to_string());
+        rt.views.lock().insert(
+            "lens1".to_string(),
+            (
+                a.clone() as Arc<dyn MetaProvider>,
+                Arc::new(AtomicU64::new(now_millis())),
+            ),
+        );
+        assert_eq!(evict_idle(&rt), 0, "a busy derived name pins its base");
+        assert!(rt.cache.lock().contains_key("v1"));
+        // The lens goes idle too → the whole group is swept in one pass.
+        rt.views
+            .lock()
+            .get("lens1")
+            .unwrap()
+            .1
+            .store(0, Ordering::Relaxed);
+        assert_eq!(evict_idle(&rt), 1);
+        assert!(!rt.cache.lock().contains_key("v1"));
+        assert!(!rt.views.lock().contains_key("lens1"));
+        assert!(!rt.bases.lock().contains_key("lens1"));
+        // Re-open: a fresh engine for the same tree, old handle still usable.
+        let b = store_for(&rt, "v1").unwrap();
+        assert!(!Arc::ptr_eq(&a, &b), "eviction must actually replace");
+        assert!(rt.cache.lock().contains_key("v1"));
+        // `0` disables the sweeper outright (embedder / test-server shape).
+        rt.cache.lock()
+            .get("v1")
+            .unwrap()
+            .1
+            .store(0, Ordering::Relaxed);
+        rt.engine_idle_ms = 0;
+        assert_eq!(evict_idle(&rt), 0, "idle=0 must never evict");
     }
 }

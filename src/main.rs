@@ -464,6 +464,15 @@ enum Cmd {
         /// PostgreSQL's own streaming/logical replication for HA instead.
         #[arg(long = "meta-store", value_name = "URI")]
         store: Option<String>,
+        /// Retire a view's cached metadata engine — its PG connection pool
+        /// (8 writers + 4 readers) or SQLite handle — after this many seconds
+        /// with no mounted session and no traffic; `0` never evicts (engines
+        /// stay resident for the process lifetime). Idle views re-open
+        /// transparently on the next op, so resident PG connections scale
+        /// with RECENTLY USED views instead of every view opened since start:
+        /// the view-count ceiling stops being `max_connections / 12`.
+        #[arg(long = "engine-idle-secs", value_name = "SECS", default_value_t = 300)]
+        engine_idle_secs: u64,
     },
     /// Unmount a mountpoint
     Umount {
@@ -1770,6 +1779,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             sync_repl,
             witness,
             store,
+            engine_idle_secs,
         } => {
             let role = if role.eq_ignore_ascii_case("standby") {
                 grovefs::remote::meta::Role::Standby
@@ -1810,6 +1820,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             }
             srv = srv.with_witness(witness);
             srv = srv.with_store(store);
+            srv = srv.with_engine_idle_secs(engine_idle_secs);
             srv.serve()?;
         }
         Cmd::Umount { mountpoint } => {

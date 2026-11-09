@@ -73,7 +73,7 @@ SKIP_BENCH=${SKIP_BENCH:-0}
 LOGDIR=.build-bin/logs/$(date +%Y%m%d-%H%M%S)
 mkdir -p "$LOGDIR"
 
-CANON="build unit posix edge e2e remote errors resilience concurrent metasrv ha striping locks freshness disp_fresh layout fork viewrm gc bwlimit migrate import govcheck govtime grovesci mcp apikey mountkey config pg pg_parallel control bench"
+CANON="build unit posix edge e2e remote errors resilience concurrent metasrv ha striping locks freshness disp_fresh layout fork viewrm gc bwlimit migrate import govcheck govtime grovesci mcp apikey mountkey config pg pg_parallel evict control bench"
 if [ "$#" -gt 0 ]; then SEL="$*"; else SEL="$CANON"; fi
 [ "$SKIP_BENCH" = "1" ] && SEL=${SEL// bench/}
 
@@ -197,6 +197,7 @@ for s in $CANON; do
     config)   run_mountsuite config .build-bin/test_config.sh 240 ;;
     pg)       run_mountsuite pg .build-bin/test_pg.sh 240 ;;
     pg_parallel) run_mountsuite pg_parallel .build-bin/test_pg_parallel.sh 300 ;;
+    evict)    run_mountsuite evict .build-bin/test_engine_evict.sh 300 ;;
     control)  run_mountsuite control .build-bin/test_control.sh 300 ;;
     bench)  run_bench ;;
   esac
