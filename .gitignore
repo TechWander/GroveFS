@@ -28,6 +28,7 @@
 
 # Runtime / test scratch mounts and data dirs created by the suites
 /.bench/
+/.g3bench/
 /.blk/
 /.br/
 /.ctest/

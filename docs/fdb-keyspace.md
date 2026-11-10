@@ -1001,6 +1001,42 @@ up-to-date，`strip -s` 后得 6,623,152 B（与旧版差 1,952 B 即来自那�
 
 **仍然不动的两件事**：G3 判定资格没有变化——本轮明确「不用考虑介质问题」，宿主 sda/sdb 仍在 MR9361-8i 后面 `queue/rotational=1`、无 NVMe，性能面一个数字都没重测，§15 的 G3 仍是**未通过**；R3 口径一字未改，`fdb` 仍不进 CANON、文档仍不写第三后端承诺。投放包也不动：`fdbbackup`/`backup_agent` 只作为取证工具留在 gitignore 的 `.fdbbin/`，没有进 `dist/`（v2.2「包内无死重」保持）。本轮新增 7 个配方脚本（`fdb3vm_up/down/fault/backup.sh`、`vm_gfs_teardown.sh`、`vm_fdbnode_provision/destroy.sh`）与 `.bneck/vm_rollback.md` 已提交为 `adfee8f`，本节、USAGE §6.3 与 `.bneck/fdb3_up.sh` 头注释的更正是紧随其后的第二笔 docs 提交。
 
+### v2.5（把 G3 门线从人肉判读改成可执行判定）
+
+由一句提问触发（2026-11-10）：「按没有 SSD/NVMe 测的功能，是不是有 NVMe 后可以直接测试？」答案是"能"，
+但当场查出两处不干净，这一节就是把它们钉死。
+
+**① 对照臂的介质必须跟着搬**。`bench_g3.sh` 的 `PGURI` 原先是硬编码，改成
+`${PGURI:-postgres://grove:grovepw@127.0.0.1:5433/grovefs}`，并在其上方写明理由：门线的尺子是
+「不劣于 PG 平台值」，如果只把 FDB 的数据根搬到 NVMe（`FDB3_ROOT=`/`CLUSTER3=` 一条 env 就够）而 PG
+仍留在原盘，那就变成"两个后端在两块盘上比"，过了也不算结论。实测确认默认那把尺子的落点：5433 是宿主
+自己的 PostgreSQL 12（pid 3661526，datadir `/var/lib/postgresql/12/main`，在根 LVM 上、与 FDB 当时
+用的目录同一条 MR9361-8i RAID，`rotational=1`），**所以 §15 记录的那轮同场对照是干净的**，不是巧合。
+
+**② 判定必须有代码和退出码**。以前脚本只打印 ops/s，"过没过"是我读出来再写台账的。现在
+`.bneck/g3_verdict.py` 承担判定，`bench_g3.sh` 末尾直接把它作为自己的退出码：
+`G3_GATE`（默认 4600，NVMe 档传 9000）比 FDB 臂最好单元，`G3_CTRL`（默认 0.8）比**同场 PG 臂**。
+控件下限不是形式主义：`~4.6k 平台值`是宿主的属性而不是本仓库的属性，PG 臂没复现它的轮次**既不能判过
+也不能判不过**，只能报 `G3_INCONCLUSIVE`（退出码 2）。这条被一次 3 秒烟雾轮当场证伪了另一种做法——
+那轮 fdb 287 / pg 1134，若只看 `fdb < gate` 就会把"轮次太短"误读成对门线的判定。
+
+**验证账单**（四种分支都跑过，不是只跑通的那条）：合成行 GREEN(fdb 5200/pg 4700→exit 0)、
+**RED(1601/4900→exit 1，用的就是 §15 记录的历史数字，判出的正是当年那个人肉结论，可当回归基线)**、
+控件失效(pg 900→exit 2)、空行文件(exit 2)；端到端 `.bneck/fdb3_up.sh` 起本机 RF=3 → 标准矩阵 8 单元
+→ `G3_RED` exit 1（PG 控件 4603/4600 复现平台值，FDB 臂最好 414）→ `.bneck/fdb3_down.sh` 收尾，
+端口 4510-4512 释放、跨机集群 `The database is available.` 未受影响。
+
+**一个必须写下的保留**：本轮 FDB 最好 414 ops/s，比 §15 记的 1601 更低，**不要拿它替换观测最好值**。
+原因是负载不可比：跑这轮时宿主上有 17 台 running 虚机（含本项目四故障域集群，其 fdbserver 在客户机内、
+宿主 `pgrep` 只看到本机 4 个）、load 5.9–8.6，全部压在同一个 RAID 上；FDB 臂单元里 wall 已漂到 9.8–13.0s
+（时间盒只有 6s）。这轮的意义只在"判据会自己下正确的结论"，数值本身不是新基线。
+
+**换到 NVMe 之后的动作**（两条命令，不需要改脚本）：
+`FDB3_ROOT=/nvme/fdb3 bash .bneck/fdb3_up.sh`，然后
+`CLUSTER3=/nvme/fdb3/cluster3 PGURI=postgres://…（同盘实例） G3_GATE=9000 bash .bneck/bench_g3.sh`。
+`exit 0` 才有资格谈回 CANON；`exit 2` 先修控件所在的主机；`exit 1` 且 PG 臂正常，就是实现侧的账，
+与介质无关（v1.8 的 `memory` 引擎对照已经把约 3× 的差距从盘上摘掉过一次）。
+
 ## 15. 决策门处置（G1–G4 与 R5，逐门留证）
 
 计划把生死判定放在阶段末的决策门上。每个门的处置只有三种合法写法：**判过并留下证据**、
@@ -1011,6 +1047,6 @@ G3 在 v1.8 前是第三种写法，现在是第二种。逐门如下：
 |---|---|---|---|
 | **G1** 环境门 | P0 末 | **通过** | 三条判据原文见 §14 v1.1 末（`The database is available.`、`cargo build --release --features fdb --example fdb_spike` 链接 `libfdb_c` 成功、spike `P0_SPIKE_VERDICT=PASS`）。环境路径按 Spec 要求"选定一条即写死命令"：发行版 apt 源与 docker 守护进程在本机都不通（前者无源、后者不可达），故走官方 release 资产 + sha256 校验 + 用户态运行——`bash .build-bin/fdb_env.sh fetch && bash .build-bin/fdb_env.sh up`，`eval "$(bash .build-bin/fdb_env.sh vars)"` 导出 `FDB_CLIENT_LIB_PATH` 与 `GROVEFS_FDB_CLUSTER_FILE`；不装系统包、不用 root，头注释里写明了降级次序 |
 | **G2** 设计门 | P1 末 | **未触发** | 三条最难的形态都有表达且已落地：分页 readdir = `'n'` 前缀 range + `start_after` + 步长检查点（§3.3，`FdbStore::supports_paged_readdir()` 返回 `true`，`src/fdb_store.rs:1721`）、目录 nlink = `('k',parent,name)` 仅目录子空间计数（§3.4）、锁区间重叠 = `('l',ino)` 前缀扫 + 事务内过滤（§3.7，C5 另加"二级键须能无歧义重建主键"的硬判据）。P3/P4 的实现与差分对拍是这些映射真正成立的最终证据，不需要退回分片路线 |
-| **G3** 性能门 | P4 末 | **未通过（已实测，2026-11-09）** | 判据是"不劣于 PG 平台值 ~4.6k ops/s"（SATA SSD 三副本档；NVMe 档 ≥9k）。本机两块盘都在 MR9361-8i 后面 `queue/rotational=1`，没有 SSD 介质，gfs1/gfs2/gfs-client 三台 VM 当时跑着本项目的 grovefs 测试集群、且每台各有自己两条 30G 数据盘（原文「他人的集群」「共享同两块盘」两处均失实，更正见 §14 v2.4）——所以按 Spec 的原义改做**同场对照**：同机、同 op 序列（照抄平台值出处 `bench_pg_conc.sh`）、同一 feature 二进制起两臂，RF=3 三副本。结果：FDB 臂 24 个单元最好 1601 ops/s（ssd 引擎；更早三轮顶到 1200），同一场 PG 臂 4100–4900 复现平台值——差 3–6 倍，判为未通过。归因（集群侧 `status json` 80 份快照）：conflicted ≈0（非 OCC）、tx_limit 7 万+ 未饱和（非配额）、tx/op ≈1（非键空间粒度）、durability lag 5.0–18.7s 且 commit 探针 3–600ms 而 read 探针 0.1–0.5ms（提交耐久是直接压力）；但 `memory` 引擎去盘后仍只 1642，说明约 3× 差距不在盘上，实现侧余量未能归因。R3 的处置已执行：`run_all.sh` 的 CANON 去掉 `fdb`（改 `EXPERIMENTAL`，按名可跑，取证 169/0）、USAGE §6.3/§11.10 与 docs.html §5.9/§16 撤下第三后端承诺并写入实测数字、`--meta-store` help 标 EXPERIMENTAL、段数口径 35→34/34→33/32→31。**不执行**"分派处返回实验未就绪"一条——feature 本就默认关闭且 `fdb://` 已被按名拒绝（P2 实证），再返回假错误会让 P3–P8 的证据不可复跑，理由与全部数据见 §14 v1.8。转正条件：SSD/NVMe 介质上 RF=3 重跑 `.bneck/bench_g3.sh` 达 ≥4.6k（SATA）/ ≥9k（NVMe），过线才回 CANON 与承诺面
+| **G3** 性能门 | P4 末 | **未通过（已实测，2026-11-09）** | 判据是"不劣于 PG 平台值 ~4.6k ops/s"（SATA SSD 三副本档；NVMe 档 ≥9k）。本机两块盘都在 MR9361-8i 后面 `queue/rotational=1`，没有 SSD 介质，gfs1/gfs2/gfs-client 三台 VM 当时跑着本项目的 grovefs 测试集群、且每台各有自己两条 30G 数据盘（原文「他人的集群」「共享同两块盘」两处均失实，更正见 §14 v2.4）——所以按 Spec 的原义改做**同场对照**：同机、同 op 序列（照抄平台值出处 `bench_pg_conc.sh`）、同一 feature 二进制起两臂，RF=3 三副本。结果：FDB 臂 24 个单元最好 1601 ops/s（ssd 引擎；更早三轮顶到 1200），同一场 PG 臂 4100–4900 复现平台值——差 3–6 倍，判为未通过。归因（集群侧 `status json` 80 份快照）：conflicted ≈0（非 OCC）、tx_limit 7 万+ 未饱和（非配额）、tx/op ≈1（非键空间粒度）、durability lag 5.0–18.7s 且 commit 探针 3–600ms 而 read 探针 0.1–0.5ms（提交耐久是直接压力）；但 `memory` 引擎去盘后仍只 1642，说明约 3× 差距不在盘上，实现侧余量未能归因。R3 的处置已执行：`run_all.sh` 的 CANON 去掉 `fdb`（改 `EXPERIMENTAL`，按名可跑，取证 169/0）、USAGE §6.3/§11.10 与 docs.html §5.9/§16 撤下第三后端承诺并写入实测数字、`--meta-store` help 标 EXPERIMENTAL、段数口径 35→34/34→33/32→31。**不执行**"分派处返回实验未就绪"一条——feature 本就默认关闭且 `fdb://` 已被按名拒绝（P2 实证），再返回假错误会让 P3–P8 的证据不可复跑，理由与全部数据见 §14 v1.8。转正条件：SSD/NVMe 介质上 RF=3 重跑 `.bneck/bench_g3.sh` 达 ≥4.6k（SATA）/ ≥9k（NVMe），过线才回 CANON 与承诺面；门线判定本身已可执行（`G3_GATE` 传档、`.bneck/g3_verdict.py` 出结论、退出码 0/1/2，并带同场 PG 控件下限），配方与一次自证复跑见 §14 v2.5
 | **G4** 语义等价门 | P5 / P6 | **未触发** | 三后端 `dump_tree()` 差分对拍 identical（P3 建立、P6 复跑）；四套治理套件在 fdb 档逐条通过（§14 v1.3 双档表）；§3 的九类映射与 §10 的冻结前缀集合未因任何一条断言放宽。暴露出的差异全部落进 §12 的可归因清单（硬链接多名下 `name` 取值、秒级时间、`ino IS NULL` 在 FDB 结构上不可能），没有一条需要"改不变量"才通过 |
 | **R5** 台架拖累 | P6 内 | **已封堵** | 集群是外部状态，缺失即 SKIP 而非 FAIL：`GROVEFS_FDB_CLUSTER_FILE=<不存在的文件> bash .build-bin/test_fdb.sh` 打 `SUMMARY: pass=0 fail=0 SKIP=1` 且 rc=0；同一条件加 `FDB_TEST=1` 打 `SUMMARY: pass=0 fail=1 SKIP=0` 且 rc=1（两条均为本轮在同一台机器上实测）。`run_all.sh::run_fdb` 把 `SKIP=1` 登记为 `RESULT[fdb]=SKIP`，不进 FAIL 计数，所以没装 FDB 的机器上全板仍 `RESULT: GREEN` |
