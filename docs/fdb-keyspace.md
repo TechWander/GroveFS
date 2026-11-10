@@ -1195,9 +1195,10 @@ harness 现在在开头 `unset GROVEFS_META_STORE`（套件里每一处真要集
 投放包还指着旧提交**。这一轮把三件事一起做完，并顺手清掉残留。
 
 **全板回归**（2026-11-10，交叉环境预先剥掉 `GROVEFS_META_STORE` 等残留变量）：
-`bash .build-bin/run_all.sh` 34 段 `RESULT: GREEN`，显式计数的那 30 段合计 899 条断言
-`fail=0`（`unit` 与 `bench` 不计入这个和：`unit` 跑的是 `cargo test`，`bench` 按设计只进 INFO）。
-日志 `.build-bin/logs/20261110-232942`。FDB 不进 CANON（R3），单独跑：
+`bash .build-bin/run_all.sh` 34 段 `RESULT: GREEN`。断言数按两个口径记：`unit`（跑 `cargo test --release`，19 个测试二进制）**216 passed / 0 failed**；
+其余 31 段套件里显式打 `SUMMARY` 的 30 段
+合计 **899 条 `fail=0`**（`build` 只编译、`bench` 按设计只进 INFO，两者不打 SUMMARY）——合计
+1,115 条、0 失败。日志 `.build-bin/logs/20261110-232942`。FDB 不进 CANON（R3），单独跑：
 `env -u GROVEFS_META_STORE … bash .build-bin/test_fdb.sh` → **216 OK / 0 FAIL**，
 `ALL FDB-BACKEND CHECKS PASSED`；`cargo test --release --features fdb --test fdb_tree` →
 **4 passed**（含 v2.8 那条分页差分，target-dir 取 `target/fdb`）。跑完 `view scan` 回到
