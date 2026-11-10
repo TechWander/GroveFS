@@ -831,12 +831,14 @@ v2.0 让**构建**不再需要包管理器，v1.x 让**运行期**不再需要 `
 | 运行期（有工具链的机器） | `env -i PATH=/usr/bin:/bin ldd ./grovefs` 把 `libfdb_c.so` 解析到包内 | v1.x 的 RUNPATH 已保证 | 复核通过 |
 | 部署期（**只有二进制**的机器） | 解包 → 起服务 → 挂载 → 读写，全程不 `apt`、不 `cargo`、不 root | **缺**：`dist/` 里只有 v1.0（SQLite/PG 档，不含 fdb feature） | 本轮补 `dist/grovefs-fdb-experimental-linux-x86_64/` |
 
-包内七件：`grovefs`（`--features fdb` 已编入、剥符号表，6,625,104 B）、`lib/libfdb_c.so`（21,027,376 B）、
+包内七件：`grovefs`（`--features fdb` 已编入、剥符号表，当时 6,625,104 B；v2.3 在 clean tree 重编后为
+6,623,152 B）、`lib/libfdb_c.so`（21,027,376 B）、
 `fdb/{fdbserver,fdbcli,fdbmonitor}`（官方 7.1.67，逐件 sha256 与 `.fdbbin` 里原件一致）、`README.md`、
 `BUILDINFO.txt`、`SHA256SUMS.txt`。打包件 `grovefs-fdb-experimental-linux-x86_64.tar.gz`
-60,052,784 B，`sha256 = d5d9a7701b9564abe7d608d735d6be70d4f5284c9e6c8a5332b67dde3cab7d5d`
+60,052,495 B，`sha256 = 66cf9aabddcadc8524dff957aa258dc170ae5e80055e3aa83aab0fdb6eee72cf`
 （指纹写在包**外**的 `.tar.gz.sha256` 里；包内那两份文件不可能固定自己的外层摘要）。上面是**当前在盘上的那一件**：
-本节写下后它又被重打数次，每次都只改包内两份文本、二进制与 `libfdb_c` 字节未动，逐次缘由见 v2.3。
+v2.2 写下时它是 60,052,472 B / `cd8737f6…`（那已是当日第三次打包），之后又重打两次：第四次只改包内两份文本、
+第五次连二进制也换了，逐次缘由见 v2.3。
 
 一次真实执行背书（`.bneck/pkg_final.sh` 与 `.bneck/pkg_verify.sh`，本轮实跑）：
 
@@ -858,7 +860,7 @@ v2.0 让**构建**不再需要包管理器，v1.x 让**运行期**不再需要 `
    （「运行时只需 libfuse 的用户态工具，不需要 libfuse 开发包」），是投放包这一侧新写的句子偏了口径。
    反向的错也在 v1.0 的 BUILDINFO 里（「依赖本机 libfuse3」）：它**既不链 libfuse**（实物 `DT_NEEDED`
    只有 glibc 五件）**又漏了真正需要的 setuid 助手**，已在 `dist/v1.0` 分支上补一个提交修正（只改 BUILDINFO
-   与 SHA256SUMS 里那一行，**二进制与 tar 包字节不变**，`sha256sum -c` 五项全过）；尚未 push。
+   与 SHA256SUMS 里那一行，**二进制与 tar 包字节不变**，`sha256sum -c` 五项全过）；已 push（`a7f7fbc..23f185d`）。
 
 测量过程本身留下两条台架知识（都已写进包 README）：
 
@@ -884,8 +886,9 @@ setuid 助手（有 cap 时直连 `mount(2)`，已实测），这与 SQLite/PG �
 三组实验的脚本都在仓库里：`.bneck/pkg_fusermount_probe.sh`（非 root 对照 + 藏助手）与
 `.bneck/pkg_rootns_probe.sh`（userns 带 cap），每一格都有读数，没有留“按源码应该会”的空位。
 
-口径不变的部分：**这不撤销 G3 的未通过判定，也不构成发布版**。二进制连的是未提交的工作树（32 个路径），
-无 tag、不 push dist 分支；R3 生效——`fdb` 不进默认板、用户文档不写第三后端承诺、`--meta-store` 帮助仍标 EXPERIMENTAL。
+口径不变的部分：**这不撤销 G3 的未通过判定，也不构成发布版**。v2.2 当时二进制连的是未提交的工作树（32 个路径）、
+也无 tag；v2.3 把这批内容提交了并在 clean tree 上重编（见下），但**无 tag、非发布版、G3 未过**这三件事一件没变。
+R3 仍生效——`fdb` 不进默认板、用户文档不写第三后端承诺、`--meta-store` 帮助仍标 EXPERIMENTAL。
 投放包拆视图用的是 `clearrange`，按 §12 第 5 条**必然**在 `(root,'refs')` 留保守多计行：本轮实测该 subspace 共 503 行，
 而 v2.1 修好的 harness 已不再增长（`K2` 三次读数均为 29、带 tag 的计数 0 条）。
 
@@ -932,15 +935,27 @@ v1.0 的 tar 包里**只有二进制一个文件**，所以改 BUILDINFO 不会�
 **仓库卫生**：`/dist/` 加进 `.gitignore`（实测 `dist` 204M、`git ls-files dist/` = 0），否则 `git add -A` 会把
 60MB 的投放包连同二进制一起带进 master 提交——那是个永远修不掉的仓库膨胀。
 
-**投放包重打到第四次**：因为把构建面那条新结论（不需 `pkg-config`/libfuse 开发包）写进了包内的 README 与
-BUILDINFO，文案改了摘要就得跟着改——`.bneck/pkg_repack.sh` 重算 `SHA256SUMS.txt`（七件全“成功”，其中
-`grovefs`/`lib/libfdb_c.so`/`fdb/` 三件**字节未变**，变的只有两份文本）并重打，得
-60,052,784 B / `d5d9a7701b9564abe7d608d735d6be70d4f5284c9e6c8a5332b67dde3cab7d5d`；重打后 `.bneck/pkg_final.sh`（全新位置解包、七件校验、`env -i ldd`、构建机路径命中 0）与
-`.bneck/pkg_verify.sh`（`env -i` 端到端起服务→挂载→读写→包内 fdbcli 直读→clearrange 回 0 键）复跑全绿。
+**投放包重打到第五次，其中一次换了二进制**：前四次只改包内两份文本（挂载面口径、构建面新结论），
+`grovefs`/`lib/libfdb_c.so`/`fdb/` 三件字节未变。第五次不是文案问题：写「本包对应哪个提交」时发现
+包内那份 `grovefs` 是当日 01:59 的产物，而 `Cargo.toml` 与 `vendor/foundationdb-sys/` 在 02:08 还有
+改动——即**它不对应任何一个提交**，而这正是 BUILDINFO 当时只能写「32 个未提交路径」的原因。
+本批内容提交后（见下）在 clean tree 上按**同一条命令**重编：`cargo build` 报 Finished 且判定为
+up-to-date，`strip -s` 后得 6,623,152 B（与旧版差 1,952 B 即来自那批未进旧版的改动），RUNPATH 与
+`--version` 均正常。最终包：`grovefs-fdb-experimental-linux-x86_64.tar.gz` 60,052,495 B /
+`66cf9aabddcadc8524dff957aa258dc170ae5e80055e3aa83aab0fdb6eee72cf`；重打后 `.bneck/pkg_final.sh`（全新位置解包、
+七件校验、`env -i ldd`、构建机路径命中 0）与 `.bneck/pkg_verify.sh`（`env -i` 端到端起服务→挂载→读写→
+包内 fdbcli 直读→clearrange 回 0 键）**用新二进制复跑全绿**。同一份构建还跑过一次 fdb 档套件
+（`bash .build-bin/run_all.sh fdb`：`pass=170 fail=0 SKIP=0`、`RESULT: GREEN`、日志
+`.build-bin/logs/20261110-035628`），因为 `test_fdb.sh` 用的就是 `target/fdb/release/grovefs`——
+也就是投放包里那一份的未剥符号前身。包内「源码坐标」现在写的是 clean 工作树
+与实现提交，不再是一串漂移的路径计数。
 
-一处数字口径提醒：包内 BUILDINFO 与 v2.2 写的「32 个路径」是**打包那一刻**的 `git status` 读数，本轮又补了
-脚本与文档，现在的读数是 33。这个漂移不改产物（`grovefs`/`libfdb_c.so`/`fdb/` 三件字节未变），也不值得为它
-重打第五次——它只说明“未提交”这件事仍在：转正条件依旧是先提交、再打标签、按同一命令重编。
+**本批内容已提交并 push**（用户当轮授权）：`0aebe68` feat(fdb)（实现、vendor 绑定、套件与 `.bneck/` 里
+被文档点名的 52 件配方脚本，共 210 KB）、`3e9c33e` docs（三面口径与段数）、`7601b22` chore(gitignore)；
+`git push origin master` 得 `11e2056..7601b22`，`dist/v1.0` 的修正提交得 `a7f7fbc..23f185d`。
+`.gitignore` 除了 `/dist/`，本轮还堵了两类残渣：`.bneck/` 的**捕获输出**（`central/`、`g3_evidence/`、`raw/`、
+`*.jsonl`、`*.log`、`seghnd.so`）与本机集群目录 `.fdbtest/`、`.fdbtest-build.log`——配方入库、观测不入库。
+提交不等于转正：仍无 tag，G3 仍未过，R3 口径一字未改。
 
 **跑板段数口径**：README 四处还写着「33 段（32 门控 + bench）/30 个功能套件」。核对 `run_all.sh:121` 的 CANON
 实为 **34 段（33 门控 + bench）= build + unit + 31 个功能套件**，`EXPERIMENTAL="fdb"`（:123）不变。段数是一项
@@ -949,8 +964,10 @@ BUILDINFO，文案改了摘要就得跟着改——`.bneck/pkg_repack.sh` 重算
 
 口径不变的部分：G3 仍是**未通过**、R3 仍生效（`fdb` 不进 CANON、文档不写第三后端承诺）；v2.2 的挂载面结论没有被
 推翻，只是补齐了缺的那一格；台账 §12 第 5 条的账也没变——投放包用 `clearrange` 拆视图，`(root,'refs')` 里的保守
-多计行仍在（本轮复核它从 503 行涨到 **507 行**——每一次投放包验证收尾的 `clearrange` 都按定义留下几条，而
-`K2` 仍读作 `\x15\x1d`=**29**，说明 v2.1 修好的 harness 没有复发），补救入口仍是 `grovefs refs rebuild`。仍受硬件阻塞、本轮不具判定资格的
+多计行仍在——本轮它的读数从 v2.2 记的 503 行一直接着往上走：投放包验证每次收尾加几条（到 508 行），
+再跑一次 fdb 套件后到 **525 行**（套件自建的十几个视图各留几条），而 `K2` 始终读作 `\x15\x1d`=**29**，
+即 v2.1 修好的 harness 没有复发（涨的那部分是 `clearrange` 按定义留下的，不是泄漏）。
+补救入口仍是 `grovefs refs rebuild`。仍受硬件阻塞、本轮不具判定资格的
 两件也如实留名：G3 要 SSD/NVMe 介质重跑 `.bneck/bench_g3.sh`，多机房失效恢复要一具可自有的三机集群（本机三台 VM
 跑着他人的集群、且 gfs1/gfs2 共享同两块数据盘）。
 
