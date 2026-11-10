@@ -75,8 +75,12 @@ cleanup(){
   # leave PG as we found it: drop this run's defs, keys, and base schema
   psqlq "DELETE FROM grovefs_control.view_defs WHERE name IN ('$LENS','$ALIAS')" >/dev/null
   psqlq "DELETE FROM grovefs_control.api_keys WHERE label='$KLBL'" >/dev/null
-  psqlq "DROP SCHEMA IF EXISTS grovefs_v_$(printf '%s' "$BASE" | od -An -tx1 | tr -d ' \n') CASCADE" >/dev/null
-  psqlq "DROP SCHEMA IF EXISTS grovefs_v_$(printf '%s' "$AREAL" | od -An -tx1 | tr -d ' \n') CASCADE" >/dev/null
+  # The schemas go through pg_drop_views.sh, not a bare `DROP SCHEMA ... CASCADE`:
+  # the cascade deletes the tree but leaves this view's bookings in the GLOBAL
+  # `grovefs_refs.holders` ledger, which has no view column -- "leave PG as we
+  # found it" is only true once the unbooking happens too.
+  PGURI="$PGURI" bash .bneck/pg_drop_views.sh --yes "$BASE" "$AREAL" \
+    | grep -E '^  (dropped|absent|FAILED)' | sed 's/^/  gc: /'
 }
 trap cleanup EXIT
 

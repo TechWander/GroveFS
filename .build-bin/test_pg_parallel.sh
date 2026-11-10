@@ -11,9 +11,11 @@
 #     with EEXIST on the loser, no duplicated rows, no orphan data_ref;
 #   * the retry loop is transparent: applications see either Ok or a POSIX
 #     errno, never a "serialization failed" internal error.
-# Requires: reachable PostgreSQL at 127.0.0.1:5432 with `grove/grovepw` role
-# on the `grovefs` database. Self-skips cleanly if PG is unreachable, so the
-# run_all board stays GREEN on hosts without PG.
+# Requires: reachable PostgreSQL on 127.0.0.1 (5432 or 5433; set PGPORT to pin
+# one) with `grove/grovepw` role on the `grovefs` database. Self-skips cleanly if
+# PG is unreachable, so the run_all board stays GREEN on hosts without PG -- the
+# reason the port is probed instead of assumed: pinned to 5432 this suite skipped
+# on a host whose PostgreSQL is on 5433, and a skipped suite reads as a PASS.
 set -u
 cd "$(dirname "$0")/.."
 export LC_ALL=C LANG=C
@@ -21,7 +23,15 @@ export PKG_CONFIG="$PWD/.build-bin/pkg-config"
 Y=./target/release/grovefs
 
 PGHOST=${PGHOST:-127.0.0.1}
-PGPORT=${PGPORT:-5432}
+if [ -z "${PGPORT:-}" ]; then
+    for P in 5432 5433; do
+        if (exec 3<>/dev/tcp/${PGHOST}/$P) 2>/dev/null; then
+            exec 3<&- 2>/dev/null; exec 3<&- 2>/dev/null || true
+            PGPORT=$P; break
+        fi
+    done
+    PGPORT=${PGPORT:-5432}
+fi
 PGURI="postgres://grove:grovepw@${PGHOST}:${PGPORT}/grovefs"
 
 # ---- PG reachability probe (skip cleanly if absent) ----

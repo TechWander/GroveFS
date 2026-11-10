@@ -53,10 +53,16 @@ cleanup(){
     for i in $(seq 0 $((N-1))); do fusermount -u $S/mnt$i 2>/dev/null; done
     kill $MP $DP "${MNT_PIDS[@]}" 2>/dev/null
     wait 2>/dev/null
-    for i in $(seq 0 $((N-1))); do
-        vh=$(printf '%s' "${TAG}v$i" | od -An -tx1 | tr -d ' \n')
-        q "DROP SCHEMA IF EXISTS grovefs_v_${vh} CASCADE" >/dev/null
-    done
+    # Unbook, THEN drop. A bare `DROP SCHEMA ... CASCADE` takes the tree but not
+    # the view's rows in the GLOBAL `grovefs_refs.holders` ledger (that table has
+    # no view column), so every run would strand one booking per object it
+    # touched -- rows no tree names anymore, which is exactly how the old residue
+    # grew to 800k. `.bneck/pg_drop_views.sh` owns that rule (and the same tool
+    # the bench teardown calls), so call it rather than re-deriving the SQL here.
+    names=()
+    for i in $(seq 0 $((N-1))); do names+=("${TAG}v$i"); done
+    PGURI="$PGURI" bash .bneck/pg_drop_views.sh --yes "${names[@]}" \
+      | grep -E '^  (dropped|absent|FAILED)' | sed 's/^/  gc: /'
 }
 trap cleanup EXIT
 MNT_PIDS=()
