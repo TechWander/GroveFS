@@ -69,9 +69,9 @@ if [ -x "$BIN" ]; then
     | grep -oE -- '--[a-z][a-z0-9-]*' | sed 's/^--//' | sort -u > "$neg"
   comm -23 "$docf" "$real" > "$orph"
   comm -23 "$orph" "$neg" > "${orph}.2" && mv "${orph}.2" "$orph"
-  # 噪声两类:别家工具的参数(rsync/cargo/systemd/journalctl/firewalld/pg_dump…),
+  # 噪声两类:别家工具的参数(rsync/cargo/systemd/journalctl/firewalld/pg_dump/fdbcli…),
   # 以及文档里的占位与通配写法(--xxx、--bw-*)。
-  FOREIGN='delete-after|delete-before|delete-during|exclude|include|inplace|info|progress|partial|times|whole-file|verbose|release|nocapture|bench|features|ignored|now|since|until|no-pager|reload|enable|disable|status|full|state|format|permanent|add-rich-rule|zone|type|set-profile|daemon-reload|json-pretty|xxx|bw-'
+  FOREIGN='delete-after|delete-before|delete-during|exclude|include|inplace|info|progress|partial|times|whole-file|verbose|release|nocapture|bench|features|ignored|now|since|until|no-pager|reload|enable|disable|status|full|state|format|permanent|add-rich-rule|zone|type|set-profile|daemon-reload|json-pretty|exec|xxx|bw-'
   nf=$(grep -cvE "^($FOREIGN)$" "$orph" || true)
   printf '  真实参数 %d 个,文档参数 %d 个,差集 %d 项(其中非外部工具/非负空间 %d 项)\n' \
     "$(wc -l < "$real")" "$(wc -l < "$docf")" "$(wc -l < "$orph")" "$nf"

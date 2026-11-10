@@ -92,8 +92,9 @@
 ## 1. 环境准备
 
 ```bash
-# 依赖:Linux + fuse3(fusermount)、pkg-config shim(已内置,无需 libfuse 开发包)
-export PKG_CONFIG="$PWD/.build-bin/pkg-config"   # 构建时需要(在仓库根目录执行)
+# 依赖:只需 Rust 工具链(edition 2021);不需要 libfuse 开发包,也不需要 pkg-config
+# (FUSE 客户端是纯 Rust 的 fuser;非 root 挂载时靠发行版的 setuid 助手 fusermount/fusermount3)
+# export PKG_CONFIG="$PWD/.build-bin/pkg-config"   # 历史遗留,现行依赖图无人查 pkg-config,删掉也照样构得成
 export LC_ALL=C LANG=C
 cargo build --release                                       # 产物:target/release/grovefs
 ```
@@ -112,7 +113,7 @@ cargo build --release                                       # 产物:target/rele
 | `GROVEFS_DATA_SERVERS` | `mount --data-servers` | 数据服务地址(含条带列表) |
 | `GROVEFS_TOKEN` | `mount --token`、`meta-server/data-server --token` | 集群准入口令 |
 | `GROVEFS_META_DIR` | `meta-server --meta-dir` | 服务端元数据根(优先级:`--meta-dir` 参数 > 本 env > `--home` > `~/.grovefs`) |
-| `GROVEFS_META_STORE` | `--meta-store`(`view`/`apikey`/`mcp`/`meta-server`/`data-server`/`du`) | PG 后端寻址;未给 flag 时由本 env 回退(源码 `resolve_store()`) |
+| `GROVEFS_META_STORE` | `--meta-store`(`view`/`apikey`/`mcp`/`meta-server`/`data-server`/`du`/`import`) | 非 SQLite 后端寻址;未给 flag 时由本 env 回退(源码 `resolve_store()`)。`import` 只写本地 SQLite 树,故这里给的是 `postgres://…`/`fdb://…` 时**如实拒绝** |
 | `GROVEFS_API_KEY` | `mount --api-key` | 已有的 per-caller 凭据 env |
 | `GROVEFS_MCP_API_KEY` | MCP `initialize` 握手 | 服务端整体预认证 |
 | `GROVEFS_STATS` | `--stats` | `1/true` 开启遥测 |
@@ -322,7 +323,7 @@ $Y --home $BASE init --view alice --manifest ./seed.txt
 | `grovefs view --meta-dir D rm --name X` | 删 `D/meta/views/X.layout`;若 X 是 fork,再删 `D/meta/X.db`(+WAL/SHM)并重建 `refs.db` | 派生/别名不动数据;fork 不动基树与仍被持有的字节 |
 | `grovefs view --meta-dir D rm --name V --base` | 删 `D/meta/V.db`(+WAL/SHM),重建 `refs.db`,从 `--data-dir`(默认 `D`)回收**无人再持有**的对象 | 别的视图仍持有的字节保留 |
 | `grovefs mount --view V --layout F` | 规则文件本身不落盘;若本地 `meta/V.db` 不存在则直接拒绝(与不带 `--layout` 一致) | 不改服务端状态;只影响本次挂载 |
-| `grovefs view export/import` | 导出:一个 JSONL 文件;导入:新建 `D/meta/V.db` | 不搬字节(字节要另拷 `blocks/`) |
+| `grovefs view --meta-dir D export/import --view V` | 导出:一个 JSONL 文件;导入:新建 `D/meta/V.db`(带 `--meta-store fdb://…` 时导入开出一个 subspace,§6.3) | 不搬字节(字节要另拷 `blocks/` 或交给 data-server 的数据根) |
 
 几条容易忽略的规则:
 
@@ -382,7 +383,7 @@ fork team
 | `meta/refs.db` | 共享表 `grovefs_refs.holders` |
 | `meta/api_keys.db` | `grovefs_control.api_keys` + `mcp_calls` |
 
-PG 下 `view define/alias/rm --name` 照常可用(写 `view_defs`);`view create --meta-store postgres://…` 会显式建出该视图的 schema(`grovefs_v_<hex>`),`view fork`/`view rm --base` 仍基于本地文件树、会拒绝。
+PG 下 `view define/alias/rm --name` 照常可用(写 `view_defs`);`view --meta-store postgres://… create` 会显式建出该视图的 schema(`grovefs_v_<hex>`),`view fork`/`view rm --base`/`import` 仍基于本地文件树、会拒绝。
 
 > **PG 建库入口**:`grovefs view --meta-store postgres://… --meta-dir D create --view V` 会显式建出该视图的 `grovefs_v_<hex>` schema 和根行。挂载不会建 schema——schema 不存在时 `M_OPEN` 直接拒绝并提示这条命令;已有的 schema 也可以从 dump 恢复。
 
@@ -392,7 +393,7 @@ PG 下 `view define/alias/rm --name` 照常可用(写 `view_defs`);`view create 
 | --- | --- | --- |
 | `--meta-dir D` | `view`/`apikey`/`mcp`/`refs`/`import`,以及 `meta-server` | 元数据根:下面有 `meta/`;与 `meta-server --meta-dir` 指向同一个目录 |
 | `--home D` | `grovefs` 的全局参数(放在子命令前) | 单机模式的本地根;未显式给 `--meta-dir` 时回退到它 |
-| `--meta-store postgres://…` | `view`/`apikey`/`mcp`/`meta-server` | 控制面改走 PG:`view_defs`/`api_keys`/`mcp_calls`;本地不落 `.layout` |
+| `--meta-store postgres://…` | `view`/`apikey`/`mcp`/`meta-server`/`import` | 控制面改走 PG:`view_defs`/`api_keys`/`mcp_calls`;本地不落 `.layout`。`import` 的产物只能是本地 SQLite 树,给非 SQLite URI 时拒绝并指明替代路径(挂载内 `cp`/`rsync`) |
 | `--view V` | `init`/`mount`/`view create` | 要建/挂的视图名(一个安全路径元素) |
 | `--name X` | `view define/fork/alias/rm` | 新定义的名字(派生名/fork 名/别名/要删的名字) |
 | `--base B` | `view define/fork` | 被引用的**物理基视图**名 |
@@ -575,7 +576,8 @@ bash: /mnt/lens/docs/new.md: Read-only file system
 | --- | --- | --- |
 | `grovefs import --view V --source DIR` | V=目标视图(不存在则创建),DIR=已存在的源目录 | 整棵树镜像进视图(默认前缀 `/<DIR名>`):目录建节点、文件硬链接进 `blocks/` 并登记;mtime/atime/权限/属主保真 |
 | `grovefs import ... --prefix P` | P=视图内目标目录(如 `/legacy`) | 镜像到指定前缀下,`P` 不存在自动建 |
-| `grovefs import ... --meta-dir D [--data-dir R]` | D=meta 根,R=存储根(默认 D) | meta-server 部署下在**存储机**执行,直写权威 `meta/V.db` 与 `R/blocks/`;已挂载客户端靠 TTL(≤2s)收敛 |
+| `grovefs import ... --meta-dir D [--data-dir R]` | D=meta 根,R=存储根(默认 D) | meta-server 部署下在**存储机**执行,直写该部署的权威 SQLite 树 `meta/V.db` 与 `R/blocks/`;已挂载客户端靠 TTL(≤2s)收敛 |
+| `grovefs import ... --meta-store URI`(或 `GROVEFS_META_STORE`) | URI=`postgres://…` / `fdb://…` | **拒绝**:import 只能产出本地 SQLite 树,在 PG/FDB 部署下写下去是服务端读不到的影子树;字节走挂载点灌入(§14.2),报错原文点名这条替代路径 |
 | `grovefs import ... --dry-run` | — | 只报告将导入多少目录/文件,**连视图 db 都不创建** |
 
 ```bash
@@ -591,7 +593,7 @@ new
 $ rm /mnt/da/legacy/photos/2026/y.jpg            # 视图里删名字 → 只摘 blocks/ 链接,源文件毫发无损
 ```
 
-语义要点(`import` 套件 34 条断言):**重跑即增量**(已有名字跳过、新文件补登);**GC 只摘链接**(源路径永不因视图操作被删);导入后的条目与原生写入完全同权(读写/锁/快照/失效推送全适用),并能被 §3.2 派生视图 `map`/`link` 组成任意虚拟目录形状——该形状挂载**只读**(写走导入的原视图,经双播推送穿透到虚拟形状可见);`grovefs import` 也拒绝以派生名为目标(否则写出无人可读的影子 `<view>.db`)。注意三个实现事实:硬链接要求源与 `blocks/` 同盘(跨盘自动发拷贝并如实计数);外部工具以 **rename/替换写**更新源文件(vim 默认行为)时,视图侧看到的是旧 inode 的最后内容,需对新内容重跑 import;symlink/特殊文件有意跳过。PG 后端不支持直写(走 §14.2 挂载灌入)。
+语义要点(`import` 套件 35 条断言;`IMPORT_BACKEND=fdb` 档 47 条):**重跑即增量**(已有名字跳过、新文件补登);**GC 只摘链接**(源路径永不因视图操作被删);导入后的条目与原生写入完全同权(读写/锁/快照/失效推送全适用),并能被 §3.2 派生视图 `map`/`link` 组成任意虚拟目录形状——该形状挂载**只读**(写走导入的原视图,经双播推送穿透到虚拟形状可见);`grovefs import` 也拒绝以派生名为目标(否则写出无人可读的影子 `<view>.db`)。注意三个实现事实:硬链接要求源与 `blocks/` 同盘(跨盘自动发拷贝并如实计数);外部工具以 **rename/替换写**更新源文件(vim 默认行为)时,视图侧看到的是旧 inode 的最后内容,需对新内容重跑 import;symlink/特殊文件有意跳过。非 SQLite 后端(`--meta-store postgres://…` 或 `--meta-store fdb://…`,含 `GROVEFS_META_STORE` 回退)下 `import` **直接拒绝**并给出替代路径(挂上视图后走挂载点灌字节,§14.2)——它只能产出本地 `meta/<view>.db`+`blocks/`,写下去就是服务端看不见的影子树(与 `view fork`/`view rm --base` 同一条拒绝规则,`import`/`govcheck` 套件实证)。FDB 档除了把这条拒绝本身按后端逐条复证(含 `--dry-run` 之前即拒、`GROVEFS_META_STORE` 同拒、拒绝不落任何影子 db),还把拒绝点名的替代路线端到端跑通:本地 `import` 只当暂存,真正入集群的是 `view export` → 交字节 → `view --meta-store fdb://… import`;搬完之后「源文件与视图共享 inode」这一零拷贝性质在两个方向上都不成立(视图读的是部署自己的对象),套件按这点做负向断言而不是回避。
 
 ---
 
@@ -916,6 +918,22 @@ imported BASE view 'team' from /tmp/team.jsonl: 42 node(s), 37 blob reference(s)
 $ grovefs --home /data/dst mount --view team -m /mnt/team     # 硬链接仍是同一 inode,权限/时间原样
 ```
 
+**同一对命令也跨后端**（SQLite ⇄ FDB，不需要第三个工具）：一棵 SQLite 树导出的 JSONL 正是一个 subspace 导入的输入，反向同理——`view --meta-store fdb://… import` 在集群里**开出这个名字的 subspace**（`view create` 之外唯一的建树入口），`view --meta-store fdb://… export` 把一个 subspace 写成同一格式的 JSONL。字节仍各走各的对象存储（`rsync -a` 数据根，或让 data-server 直接服务同一批对象）：
+
+```bash
+S=/data/sqlite-store; C=/data/cluster; CL=fdb:///path/to/fdb.cluster
+grovefs view --meta-dir $S export --view team --out /tmp/team.jsonl
+rsync -a -H $S/blocks/ $C/blocks/                        # 内容字节另走,元数据已在 JSONL 里
+grovefs view --meta-store $CL --meta-dir $C import --view team --in /tmp/team.jsonl
+# 回滚方向:同一个集群 dump 再搬回一棵 SQLite 树
+grovefs view --meta-store $CL --meta-dir $C export --view team --out /tmp/team2.jsonl
+grovefs view --meta-dir $S import --view team_rolledback --in /tmp/team2.jsonl
+```
+
+往返不重写任何行:导入后从 subspace 再导出的 dump 与源 dump **逐行相同**(`diff` 判据),所以 id/ino/硬链接/mode/属主/三个时间/symlink 文本都是原值带过去的,而不是被重新分配;导入时两个分配器水位抬到导出最大值(PG 档 `setval` 的同位动作),迁移后新建的节点 id 严格大于导入侧的最大 id,不会撞号。共享字节账本(FDB 是集群里的 `refs` subspace)在同一事务里随导入/`--replace` 更新,失败则整体不生效——一棵树要么原样、要么完整是新树。迁移窗口内**源存储不被写入**,原树仍在,回滚就是同一对命令反向跑一遍。PG 档没有这条通道:它的权威树在 schema 里,走 `pg_dump`/逻辑复制(§15.9)。
+
+e2e:`fdb` 套件第 12 节(SQLite→subspace→SQLite 全链,含逐行 `diff`、水位抬升、守卫与源不动)、`migrate` 套件(`MIGRATE_BACKEND=fdb` 档)、`import` 套件(`IMPORT_BACKEND=fdb` 档,把这条拒绝之外的替代路线端到端跑通)。
+
 **导入的原子性**:先在 `D/meta/.V.import-<pid>-<时间>` 建临时树,全部行与校验通过、WAL 合并后才 `rename` 到 `D/meta/V.db`——坏文件/悬挂父节点/计数不符/失败的 `--replace` 都不会破坏旧树(旧树要么原样、要么完整换成新树,没有中间态)。
 
 **守卫**:虚拟名(别名/派生)没有自己的树,`export` 直接拒绝并提示导出其物理基;输出文件已存在需 `--force`;导入目标已有定义槽先 `view rm`;表头 format/version 不符、根节点不是 `id=1` 的目录、悬挂父节点、表头计数与正文不符均整单拒绝;`--as-fork` 要求基视图在**目标机上**已存在、且基名本身没有定义。
@@ -925,7 +943,7 @@ $ grovefs --home /data/dst mount --view team -m /mnt/team     # 硬链接仍是�
 - 多盘 `--data-dir`:对象按 `FNV1a(key) % root 数量` 选盘,目标机 root **数量与顺序要一致**;也可合并成单 root(把各盘 `blocks/` 合并)。
 - 跨 server 条带(`s<N>:...`)：第 i 块在 `servers[i % N]`，目标必须保留 **N 个 data-server 及顺序**；台数不符直接被拒（报 `laid out across N servers but this mount has M; refusing to remap`），**顺序不符会被 stat 检出**：非空条带对象的 `{uuid}#0` 必在成员 0，落在别的成员上就报“服务器对、顺序不对”而不是出一个 0（否则整棵树会被读成一堆空文件）；`read` 路径本身仍只按分块定位，不做这层回溯（不会读到别人的数据，对象名带全局 `#i`）。**换机器 / 换 IP 本身不是约束**：成员按下标寻址，在 `-o data=` 里**原位替换**那一项就能自动识别，元数据不改、已写对象不需 `rebal`（轮转放置 `i % N` 只决定新写入对象落哪台）。
 - HA `epoch`(每个视图的 `ctrl` 表):整目录拷贝会带过去,迁移后旧主必须停;`view export/import` 与 `view fork` 有意不复制 `ctrl` 与 `locks`。
-- PG 后端不能用文件拷贝,用 `pg_dump`/逻辑复制;`view export/import` 目前只面向本地 SQLite 树。
+- PG 后端不能用文件拷贝,用 `pg_dump`/逻辑复制——`view export/import` 面向本地 SQLite 树与 FDB subspace 两种权威,PG 的树在 schema 里不走这对命令(§15.9)。
 - `uid/gid` 是数值元数据(advisory),按数字保留;symlink 目标文本是用户数据,原样保留。
 - 整目录冷拷时先停所有挂载与 `meta-server`;不能停机就 `sqlite3 <db> ".backup"` / `VACUUM INTO`,**不要裸拷运行中的 DB**(WAL)。
 - **`st_ino` 随库走、迁机器不变**(`node.ino` 是 GroveFS 自己的编号),但 **`st_dev` 是 FUSE 每次挂载新分配的**:按 `(dev, ino)` 二元组去重的备份/同步工具在重挂或迁库后要重建映射,只按 ino 查(`find -inum`、`stat -c %i`)不受影响。
@@ -933,7 +951,7 @@ $ grovefs --home /data/dst mount --view team -m /mnt/team     # 硬链接仍是�
 
 **多个基视图**:可建任意多个基视图(`init --view A` / `view create --view A`),各自一棵 `meta/A.db`,树、字节、权限、删除互不影响;`view list` 会列出全部裸基视图。`view export/import` 按视图进行,迁移时可以只搬其中一棵,也可以给不同基视图绑定不同 key(`apikey create --view A`)。
 
-e2e 见 `migrate` 套件(74 条断言:挂载中导出/宿主无关性/虚拟名与覆盖守卫/跨绝对路径导入/硬链接与权限保真/原子替换/损坏输入拒绝/`--as-fork` 账本共享/多基视图独立)。
+e2e 见 `migrate` 套件(SQLite 档 74 条断言;`MIGRATE_BACKEND=fdb` 把同一套断言对着集群复跑,71 条)。断言覆盖:挂载中导出/宿主无关性/虚拟名与覆盖守卫/跨绝对路径导入/硬链接与权限保真/原子替换/损坏输入拒绝/`--as-fork` 账本共享/多基视图独立(`--as-fork` 与「两个存储根」两事在 FDB 档按各自边界改判,见 §15.9)。
 
 **规模实测**(单机、默认 IO,`bash .build-bin/perf_migrate_scale.sh` 可复跑):迁移一棵 5052 节点、5000 个对象的视图——`export` 0.19s 产出 1.16 MB JSONL(是视图库的 1.16 倍,约 230 B/节点);`import` 到新存储路径 0.56s(含账本重建);挂载后 0.23s 枚举完 5000 个文件,内容逐字节一致、权限与属主保留。同一批文件当初注册进源视图(零拷贝导入)花了 83s——那部分逐对象的存储开销完全不在导出/导入路径上。**迁移代价由命名空间大小决定,不由数据量决定**;字节另走 `rsync -a -H blocks/`。
 
@@ -1401,6 +1419,46 @@ $Y meta-server --meta-dir /data/cluster --listen 0.0.0.0:50110 \
 
 ---
 
+### 6.3 FoundationDB 元数据后端（实验性，不构成支持声明）
+
+> **这一档的状态：功能面全部判过，容量面判为未通过，因此不进 CANON、不进承诺面。**
+> 支持的元数据后端仍是嵌入式 SQLite 与 PostgreSQL（§6.2）；元数据面的写并行只在单个 PG 集群内，跨集群分区元数据权威不在本轮承诺面；
+> 口径出处是决策门 G3 的实测（2026-11-09，同机同场同 op 序列、RF=3 三副本）：FoundationDB 臂
+> **24 个单元里最好一条 1601 ops/s**（`ssd` 引擎，多数单元 133–998），把盘从提交路径整个拿掉
+> （`memory` 引擎）也只有 **1642 ops/s**，
+> 而同一次运行里 PostgreSQL 臂达到 **4100–4900 ops/s**——门槛是"不劣于 PG 平台值 ~4.6k ops/s"，
+> 实测最好一条仍差 2.9×、多数单元差 5–15×。且这台机器没有 SSD 介质（两块阵列卡后 `queue/rotational=1`），
+> 计划里的 SATA/NVMe 档位无法在此复现。但归因数据提醒一句：光换盘不够——把盘移出提交路径
+> 也只到 1642 ops/s，剩下约 3× 在实现侧。归因、复跑配方与转正条件都在
+> `docs/fdb-keyspace.md` §14 v1.8/§15；SSD 介质重跑是必要前提，不是充分条件。
+>
+> 下面是这一档**当前真实的行为**（实验用途）：`meta-server` 也能把权威 view 树放进 FoundationDB——
+> 一 view 一 subspace（键编码与事务粒度的逐项设计见 `docs/fdb-keyspace.md`）：
+
+```bash
+# 这一臂是 Cargo 可选 feature，默认关闭：不链 libfdb_c 的构建完全不进这段代码
+# 客户端库不在系统路径时给一个目录即可（无需装包，见 §11.10 第 1 步）；
+# 绑定已预生成（`vendor/foundationdb-sys`），所以构建期也不需 libclang
+FDB_CLIENT_LIB_PATH=/path/to/lib cargo build --release --features fdb
+
+$Y meta-server --meta-dir /data/cluster --listen 0.0.0.0:50110 \
+     --meta-store fdb:///etc/foundationdb/fdb.cluster --token $TOK
+```
+
+- **依赖面**：这一臂**不依赖任何系统安装包**，运行与构建两面都是（指的是 `libfdb_c` 与 FDB 制品这一面；`mount` 对 setuid `fusermount` 助手的需求与后端无关，§1/§11.0）。运行：`libfdb_c.so` 是一个被 sha256 校验过的官方制品（§11.10 第 1 步），构建时 `build.rs` 把 `$ORIGIN/lib`、`$ORIGIN/../lib` 与那个目录一并写进 ELF 的 RUNPATH，所以二进制自己找得到它，**不需要 `LD_LIBRARY_PATH`、不需要 `ldconfig`**；把 `grovefs` 与 `lib/libfdb_c.so` 放进同一个目录（或 `dist/` 那种子在上一级的布局）就是一份自足的投放。构建：`foundationdb-sys` 默认会在构建期跑 bindgen（那就得装 libclang），本仓库用 `[patch.crates-io]` 把它换成 `vendor/foundationdb-sys`——同一份代码，只是把绑定预生成后签进仓库（来源、sha256、刷新与回退步骤见 `vendor/foundationdb-sys/VENDOR.md`）；因此 `--features fdb` 只需要一个 `libfdb_c.so` 所在的目录，不需要任何包管理器动作。
+- **投放面**：上面两面仓库里已有一份现成的实体可验——`dist/grovefs-fdb-experimental-linux-x86_64/`（主二进制 + `lib/libfdb_c.so` + 官方 7.1.67 的 `fdbserver`/`fdbcli`/`fdbmonitor` + `README.md`/`BUILDINFO.txt`/`SHA256SUMS.txt`，外层 `…tar.gz.sha256` 固定打包件指纹），目标机只需 glibc >= 2.31、内核 FUSE，以及非 root 挂载时发行版自带的 setuid 助手 `fusermount`/`fusermount3`（有 `CAP_SYS_ADMIN` 时 `fuser` 直连 `mount(2)`、不需助手，已在 user namespace 里实测；与 §1/§11.0 同一句话：需要的是 libfuse 的用户态工具，不是开发包；这一条与后端无关，SQLite/PG 档同样如此）。它**仍是实验档的取证产物而不是发布版**（二进制连未提交的工作树、无 tag），端到端 `env -i` 的证明脚本是 `.bneck/pkg_verify.sh`，逐项坐标见 `docs/fdb-keyspace.md` §14 v2.2–v2.3（v2.3 补上了 root/`CAP_SYS_ADMIN` 那一格与“构建也不需 `pkg-config`/libfuse 开发包”的实测）。
+- **URI 形态**：`fdb://<集群文件路径>` 或 `fdb://?cluster=<路径>`；两者都给空时回退 `$GROVEFS_FDB_CLUSTER_FILE`，仍为空则拒绝启动（不猜默认路径）。集群文件是 FDB 自己的寻址凭证，grovefs 不解析其内容。
+- **客户端零变化**：`mount --meta-server host:port --view NAME` 一字不变，线协议不变。只有 meta-server 需要能链接 `libfdb_c`；客户机不装 FDB、不持集群文件、不感知后端。
+- **树是显式建的**：`grovefs view --meta-store fdb://… create --view NAME` 开出一个 subspace（写根行与两个分配器键）。`view create --manifest` 在此档**拒绝**——manifest 种的是 SQLite 文件；要内容就挂载后直接写文件。
+- **迁移与回滚走同一对命令**：`view export` / `view import` 在此档可用，且与 SQLite 档产出**同一种**宿主无关 JSONL——一个 subspace 能被导出，一份 dump 能在 `view create` 之外开出一个 subspace，导入后从集群再导出的 dump 与源 dump 逐行相同（id/ino/硬链接/权限/属主/时间一律保留原值），两个分配器水位抬到导出最大值。回滚到 SQLite 就是同一份 dump 反向导入，迁移窗口内源存储不被写入、原树保留。字节不在这条通道上：它们归 data-server 的数据根（§3.4.2 有整条命令序列）。
+- **控制面留在本地文件**：view 定义/别名写 `<meta-dir>/meta/views/*.layout`，API key 与审计写 `<meta-dir>/meta/api_keys.db`。`fdb://` 只换数据面，所以一个 FDB 部署的 `--meta-dir` 是控制面的**唯一权威**（多台 meta-server 各持一份本地定义目录不等于共享），治理命令（`view`/`apikey`/`mcp`）也不需要集群可达。`--meta-store postgres://…` 则把控制面一并搬进 `grovefs_control` schema（§6.2）。
+- **编码口径**：意图 = RecordLayer 式（分层键空间、记录整体入值、二级索引以独立键区间表达）；载体 = Rust `foundationdb` crate 的 tuple layer + subspace layer。官方 RecordLayer 是 Python/Java 侧的遗留绑定，本后端**不使用**它，也只如此表述——不得写成“用了 RecordLayer”。
+- **`--engine-idle-secs` 在此档只管内存**：FDB 没有“每视图 12 条连接”可回收（一个集群文件共享一个 handle，socket 状态在客户端自己的网络线程里），驱逐释放的是进程内引擎（号段、分页游标、last-touch 戳）。挂载中的视图仍永不被回收，客户端无感（§12.1）。这三条都在 `fdb` 套件第 13 节实测：把阈值压到 3s，挂载期间静默 8s ⇒ 服务端日志里 0 条驱逐；卸载会话后 ⇒ `meta-server: evicted 1 idle engine(s) (>3s idle, no sessions)`；同一个视图重挂 ⇒ 读回同一个对象（重开对客户端透明）。PG 的连接数规划公式在此档不适用，容量看集群的 proxy/GRV 与 log 副本写吞吐。
+- **高可用与备份归集群**：FoundationDB 自带三副本与协调层，快照用 `fdbbackup`。grovefs 自研主备（`--role standby` / `--peer` / `--witness`）与 `--meta-store fdb://…` 同时给会启动即 fail-fast，文案专指 FDB（§15.9）。
+- **功能面与容量面的取证范围不同**：全部**功能**判据（`fdb` 套件 170 断言 + 四套治理套件的 fdb 档）跑在本机单节点、副本因子 1 的集群上；本节开头那一组**吞吐**数字只有一个来源——决策门 G3 的同场对照（同一台机器、同一份 feature 构建的二进制、照抄平台值出处的 op 序列、`configure new triple ssd` 三副本）。因此这组数字回答的是「FDB 臂相对 PG 臂差多少」，不是可外推的部署容量。**未测**的是副本失效、恢复与跨故障域拓扑行为（本机没有可用的自有 VM 集群，那三台跑着他人的 grovefs），这些必须在真集群上另测通过后才能写进本文档。
+
+---
+
 ## 7. 只读挂载
 
 ```bash
@@ -1517,18 +1575,19 @@ ps aux | grep grovefs                     # 查看在跑的 server / mount
 
 ## 10. 验证与回归
 
-全板一共 **33 段**:`build` → `unit` → **30 个套件** → `bench`。**前 32 段门控 GREEN,`bench` 只打吞吐参考值、永不门控**(只要纯功能回归就 `SKIP_BENCH=1`)。`pg`/`pg_parallel`/`control` 在无可达 PostgreSQL 的主机上自动 SKIP,不拉低 GREEN。
+全板一共 **34 段**:`build` → `unit` → **31 个套件** → `bench`。**前 33 段门控 GREEN,`bench` 只打吞吐参考值、永不门控**(只要纯功能回归就 `SKIP_BENCH=1`)。`pg`/`pg_parallel`/`control` 在无可达 PostgreSQL 的主机上自动 SKIP,不拉低 GREEN。`fdb` **不在这 34 段里**:它是实验档(§6.3),按名 `bash .build-bin/run_all.sh fdb` 才跑,跑成什么都不影响默认全板的颜色;显式跑时主机上无可达 FoundationDB 集群则整套 SKIP,置 `FDB_TEST=1` 时缺集群即判 FAIL(不允许把没跑过的后端算作通过)。
 
 ```bash
-export PKG_CONFIG="$PWD/.build-bin/pkg-config" LC_ALL=C LANG=C   # 仓库根目录下执行
-bash .build-bin/run_all.sh                # 全板 33 段(32 门控 + bench)
+export LC_ALL=C LANG=C                                 # 仓库根目录下执行(PKG_CONFIG 不必设:无 crate 查 pkg-config,§1)
+bash .build-bin/run_all.sh                # 全板 34 段(33 门控 + bench)
                                           #   build unit
                                           #   posix edge e2e remote errors resilience concurrent
                                           #   metasrv ha striping locks freshness disp_fresh
                                           #   layout fork viewrm gc bwlimit migrate import
                                           #   govcheck govtime grovesci mcp apikey mountkey
-                                          #   config pg pg_parallel control
+                                          #   config pg pg_parallel evict control
                                           #   bench(只打吞吐,不门控)
+bash .build-bin/run_all.sh fdb            # 实验档 FoundationDB,不在 CANON(§6.3)
 SKIP_BENCH=1 bash .build-bin/run_all.sh   # 同上,去掉 bench
 bash .build-bin/run_all.sh fork mcp       # 只跑指定套件(build 自动前置)
 ```
@@ -1545,8 +1604,8 @@ bash .build-bin/run_all.sh fork mcp       # 只跑指定套件(build 自动前�
 ### 11.0 部署前预检(每台节点都跑一遍)
 
 内核 ≥ 4.5 才能用多线程派发(`clone_fd` 依赖 `FUSE_DEV_IOC_CLONE`);低于 4.5 时 `mount` 自动退回单工作线程(并回显一行提示),仍能正常挂载读写,只是不并行。`/dev/fuse` 存在可读写、`fusermount`/`fusermount3`
-在 PATH 里(`umount` 与信号优雅卸载都通过它;运行时只需 libfuse 的用户态工具,**不需要** libfuse 开发包)。
-构建机额外需要 Rust 工具链(edition 2021)。
+在 PATH 里或可从绝对路径命中(**非 root 的挂载与卸载都走这个 setuid 助手**;运行时只需 libfuse 的用户态工具,**不需要** libfuse 开发包;有 `CAP_SYS_ADMIN` 时直连 `mount(2)`,不需助手)。
+构建机额外需要 Rust 工具链(edition 2021)——**不需要 pkg-config、也不需要 libfuse 开发包**(实测 `PKG_CONFIG=/nonexistent cargo build --release` 全量通过,产物 `DT_NEEDED` 不含 fuse 库)。
 
 ```bash
 uname -r                                   # 期望 >= 4.5
@@ -1565,7 +1624,7 @@ sudo install -m 755 target/release/grovefs /usr/local/bin/grovefs
 grovefs --version
 ```
 
-> 无系统 `pkg-config` 的环境按 §1 挂仓库自带 shim(`export PKG_CONFIG=.../.build-bin/pkg-config`)。
+> 仓库自带的 `.build-bin/pkg-config` shim 是**历史遗留**(早期 fuser 走 libfuse 后端时才用),现行依赖图里没有 crate 查 pkg-config,挂不挂它都照样构得成。
 > 每台节点(中心 + 客户机)装同一个二进制即可,子命令决定角色。
 
 ### 11.2 规划:节点、目录、端口
@@ -1724,7 +1783,7 @@ sudo systemctl restart grove-data-server && cat /mnt/alice/from_a.txt
 sudo systemctl stop grove-mount@alice && findmnt -T /mnt/alice | grep -q grovefs && echo "残留!" || echo "已卸载"
 ```
 
-全部通过即部署完成。想跑整套回归(31 个门控阶段)见 §10 与 §12.7。
+全部通过即部署完成。想跑整套回归(33 个门控阶段)见 §10 与 §12.7。
 
 ### 11.8 HA 主备拓扑(在 §11.4 基础上改)
 
@@ -1760,7 +1819,41 @@ $Y meta-server --meta-dir /data/cluster --listen 0.0.0.0:50110 \
      --meta-store postgres://grove:pw@10.0.0.9:5432/grovefs --token $TOK
 ```
 
-客户端命令一字不变(见 §4.1:客户机不装 PG、不持连接串、不感知后端)。每个 view 的 `grovefs_v_<hex(view)>` schema 必须先用 `view create --meta-store …` 显式建好(挂载只打开已存在的 schema,不会就地创建),无需预迁移脚本;控制面随 `--meta-store` 一起进 PG:key 与审计落 `grovefs_control.api_keys`/`mcp_calls`、视图定义落 `grovefs_control.view_defs`,`grovefs view`/`apikey`/`mcp` 加同一 `--meta-store`(或 env `GROVEFS_META_STORE`)即接同一份记录,本地不落任何控制面文件(`control` 套件逐节实证)。备份/HA 改走 PG 自己的工具链(一次 `pg_dump` 同时覆盖树+锁+控制面;`pg_basebackup`/流复制/PITR),见 §12.3。为什么上/不上 PG 的诚实边界见 §4.1。**巡检 SQL、备份恢复、删视图与 PG 下的能力边界（含实测拒绝原文）见 §15.6–§15.9。**
+客户端命令一字不变(见 §4.1:客户机不装 PG、不持连接串、不感知后端)。每个 view 的 `grovefs_v_<hex(view)>` schema 必须先用 `view --meta-store … create` 显式建好(挂载只打开已存在的 schema,不会就地创建),无需预迁移脚本;控制面随 `--meta-store` 一起进 PG:key 与审计落 `grovefs_control.api_keys`/`mcp_calls`、视图定义落 `grovefs_control.view_defs`,`grovefs view`/`apikey`/`mcp` 加同一 `--meta-store`(或 env `GROVEFS_META_STORE`)即接同一份记录,本地不落任何控制面文件(`control` 套件逐节实证)。备份/HA 改走 PG 自己的工具链(一次 `pg_dump` 同时覆盖树+锁+控制面;`pg_basebackup`/流复制/PITR),见 §12.3。为什么上/不上 PG 的诚实边界见 §4.1。**巡检 SQL、备份恢复、删视图与 PG 下的能力边界（含实测拒绝原文）见 §15.6–§15.9。**
+
+### 11.10 FDB 实验档复跑配方（不是部署承诺，状态见 §6.3）
+
+> 下面这串命令是**怎样把这一档跑起来**（用于实验与复测），不是推荐部署。容量面已判为未通过，
+> 受支持的元数据后端仍是 SQLite 与 PostgreSQL（§11.9）：
+
+```bash
+# 0) 不构建、不装包的跳板：直接用仓库里那份自足投放包（§6.3 「投放面」）
+#    dist/grovefs-fdb-experimental-linux-x86_64/：grovefs + lib/libfdb_c.so + fdb/{fdbserver,fdbcli,fdbmonitor}
+#    下面 1)–5) 的每一步都能只靠包内二进制完成（包 README 有逐条命令）；本配方余下部分走源码树
+
+# 1) 先让集群可达(单节点开发集群可用用户态目录,无需 root/系统包):
+bash .build-bin/fdb_env.sh up            # 起 fdbserver、生成集群文件、导出 GROVEFS_FDB_CLUSTER_FILE
+fdbcli -C "$GROVEFS_FDB_CLUSTER_FILE" --exec 'status minimal'   # → The database is available.
+
+# 2) 装一个带 feature 的服务端二进制(客户端不需要)。libfdb_c 不必装包：
+#    第 1 步那个用户态目录里有 .so，指给构建期即可（绑定已预生成，不需 libclang）
+FDB_CLIENT_LIB_PATH=/path/to/lib cargo build --release --features fdb
+#    跑起来不再需要 LD_LIBRARY_PATH——RUNPATH 里已写进 $ORIGIN/lib 与该目录
+
+# 3) meta-server 只多一个参数(与 --role standby/--peer/--witness 互斥,同时给会启动即 fail-fast):
+$Y meta-server --meta-dir /data/cluster --listen 0.0.0.0:50110 \
+     --meta-store fdb:///path/to/fdb.cluster --token $TOK
+
+# 4) 每个要用的视图先开一个 subspace(挂载不建树):
+$Y view --meta-store fdb:///path/to/fdb.cluster --meta-dir /data/cluster create --view team
+
+# 5) 把一棵已有的 SQLite 树搬进集群(不新建工具;目标名不必先 view create,导入即开 subspace):
+$Y view --meta-dir /data/sqlite-store export --view team --out /tmp/team.jsonl
+rsync -a -H /data/sqlite-store/blocks/ /data/cluster/blocks/
+$Y view --meta-store fdb:///path/to/fdb.cluster --meta-dir /data/cluster import --view team --in /tmp/team.jsonl
+```
+
+确认到位看 meta-server 日志第二行横幅:`meta-server: metadata backend foundationdb — one subspace per view in FoundationDB (cluster file …); <base> holds no trees`。客户机命令与 §11.5 完全一致;控制面(视图定义/别名/API key)仍在 `--meta-dir` 的本地文件里,所以 **`--meta-dir` 要备份**(`fdbbackup` 只备树)。data-server 无参数变化,字节仍存 `blocks/` 对象。FDB 下的命令边界见 §15.9。第 4 步的 `view create` 与第 5 步的 `view import` 是此档仅有的两个建树入口(挂载不建树);第 5 步反向跑就是回滚。
 
 ---
 
@@ -1784,6 +1877,10 @@ echo "$(date +%F) $(du -sh /data/cluster/blocks | cut -f1)" >> /var/log/grovefs_
 
 # 昨夜到现在有没有降级/冻结/提升事件
 journalctl -u grove-meta-server --since yesterday | grep -E 'meta HA|sync-repl|fenced|promotion'
+
+# 元数据后端可达性：受支持档只看下面的日志横幅行（它能直接读出树在哪）。
+# 元数据面是否在集群上:meta-server 日志的 backend 横幅行(下表)比任何本地目录都可靠
+journalctl -u grove-meta-server | grep -E 'metadata backend'
 ```
 
 日志关键字 → 含义 → 处置(字串以源码 eprintln 为准):
@@ -1797,6 +1894,11 @@ journalctl -u grove-meta-server --since yesterday | grep -E 'meta HA|sync-repl|f
 | `meta-server: evicted N idle engine(s) (>Xs idle, no sessions)` | 空闲引擎回收(`--engine-idle-secs`,§6.2):N 个无挂载会话且静默超阈的视图释放了引擎(PG 连接/文件句柄) | 正常回收噪声无需处置;若希望视图热不回落,缩短阈值或确认会话已断;`0` 则关闭驱逐(常驻模型) |
 | `meta HA: promotion refused/deferred` | 提升被否(对端持更高 token 或前任租约尚活) | 正常:绝不双主;若两节点都拒升,查 witness 多数派 |
 | `invalidation listener stopped: token rejected` | 客户端失效推送通道被 token 拒(中心 token 换了) | 用新 token 重启对应 grove-mount@ 实例 |
+| `meta-server: metadata backend foundationdb — one subspace per view in FoundationDB (cluster file …); <base> holds no trees` | 树在集群 subspace 里,`--meta-dir` 只装定义与日志(§6.3) | 正常。排查"我的树跑哪去了"先看这一行:若它写的是 `one db file per view under <base>/meta/`,说明 `--meta-store` 没生效,这个服务端读的是本地 SQLite 树 |
+| `names the FoundationDB backend, but this binary was built without \`--features fdb\`` | 服务端二进制不含该 feature(未链 `libfdb_c`),却给了 `fdb://…` | 预期拒绝而非降级:用 `--features fdb` 重建,或去掉 `--meta-store` 回到默认 SQLite(§6.3) |
+| `--meta-store fdb://… cannot be combined with --role standby / --peer / --witness` | 想用 grovefs 自研主备服务 FDB 部署 | 撤掉 HA 参数:副本与恢复由集群负责(`fdbbackup`),§6.3/§15.9 |
+| `fdb:// uri names no cluster file` | URI 里无路径且 `$GROVEFS_FDB_CLUSTER_FILE` 也未设 | 给 `fdb://<集群文件>` 或 `fdb://?cluster=<路径>`(§6.3) |
+| `meta-server: evicted N idle engine(s) (>Xs idle, no sessions)`（FDB 部署） | 回收的是**进程内**引擎(号段/游标/戳),无连接可关 | 正常回收噪声;此档该阈值只是内存上限(§6.3) |
 
 ### 12.2 日志与可观测
 
@@ -1915,7 +2017,7 @@ HA 拓扑滚动升级(写不中断,切换瞬间除外):
 
 ### 12.7 变更后的回归验证
 
-任何升级/配置变更后,在有构建环境的机器上跑一遍全板(31 个门控阶段),或只跑关心的面:
+任何升级/配置变更后,在有构建环境的机器上跑一遍全板(33 个门控阶段),或只跑关心的面:
 
 ```bash
 bash .build-bin/run_all.sh                    # 全板(build 自动前置)
@@ -1962,7 +2064,7 @@ GroveFS 的元数据引擎**默认就是 SQLite**,而且是用 `rusqlite` 的 `b
 在**构建机**(或存储机本身)编译,然后拷到每台机器:
 
 ```bash
-# 构建机(需 Rust 工具链;无系统 pkg-config 时先 export PKG_CONFIG=…/.build-bin/pkg-config)
+# 构建机(只需 Rust 工具链;无需 pkg-config 与 libfuse 开发包,详见 §1)
 cargo build --release
 # 分发到三台机器并安装
 for H in 192.168.1.10 192.168.1.11 192.168.1.12; do
@@ -2629,7 +2731,7 @@ sudo -u postgres psql -d grovefs -c '\dt grovefs_v_64656d6f.*'
 
 验收：`\dn` 里出现 `grovefs_v_64656d6f` 与 `grovefs_refs`；`cat /mnt/demo/docs/a.txt` 输出 `hi`；`ls /data/cluster/meta` 里**没有** `demo.db`（权威树在 PG，不在文件里）。
 
-> 三个必须知道的行为：① 每个视图的 schema 必须由 `view create --meta-store postgres://…` **显式建好**（挂载不会建）；在 PG 后端上跑不带 `--meta-store` 的 `init`/`view create` 只会在本地造一个用不到的 `<view>.db`；② 视图名超过 **25 字节**会被拒（PG 标识符 63 字符上限，hex 编码后翻倍，中文约 8 个字），客户端只会看到 `Input/output error` + `background mount exited`，真实原因在 meta-server 日志里：`view name '...' incompatible with PG schema naming (empty, or longer than 25 bytes)`；③ `--meta-store` 与 `--role standby`/`--peer`/`--witness` 同时给会启动即失败（见 §15.9）。
+> 三个必须知道的行为：① 每个视图的 schema 必须由 `view --meta-store postgres://… create` **显式建好**（挂载不会建）；在 PG 后端上跑不带 `--meta-store` 的 `init`/`view create` 只会在本地造一个用不到的 `<view>.db`；② 视图名超过 **25 字节**会被拒（PG 标识符 63 字符上限，hex 编码后翻倍，中文约 8 个字），客户端只会看到 `Input/output error` + `background mount exited`，真实原因在 meta-server 日志里：`view name '...' incompatible with PG schema naming (empty, or longer than 25 bytes)`；③ `--meta-store` 与 `--role standby`/`--peer`/`--witness` 同时给会启动即失败（见 §15.9）。
 
 ### 15.4 场景：生产中心用 PG（systemd + 最小权限 + 连接串不落 argv）
 
@@ -2798,13 +2900,15 @@ find /data/cluster/blocks -type f | wc -l; du -sh /data/cluster/blocks
 - `grovefs_refs` **不要随手 DROP**：它是跨视图删除安全的账本，丢了只会让系统保守地多留字节（不会误删对象），但 PG 侧没有 `refs rebuild` 可用（§15.9）；
 - 删完确认：§15.6 的第 1 条 SQL 里那个 schema 消失、客户端不再能挂载该视图名。
 
-### 15.9 场景：PG 下的能力边界（哪些命令不能用、替代做法）
+### 15.9 场景：非 SQLite 后端下的能力边界（哪些命令不能用、替代做法）
 
-下表每行的“实测原文/行为”都在本机 PG 12 + 本仓库当前构建上跑过：
+PG 与 FDB 各一表；每行的“实测原文/行为”都在本机当前构建上跑过：
+
+#### PG 档
 
 | 操作 | PG 后端下 | 失败原文 / 实际行为 | 替代做法 |
 | --- | --- | --- | --- |
-| `init` / `view create`（不带 `--meta-store`） | 不建 PG 树 | 只会在本地造一个用不到的 `meta/<view>.db` | 加 `--meta-store postgres://…`：`view create --meta-store … --view V` 显式建 schema；挂载从不建树 |
+| `init` / `view create`（不带 `--meta-store`） | 不建 PG 树 | 只会在本地造一个用不到的 `meta/<view>.db` | 加 `--meta-store postgres://…`：`view --meta-store … create --view V` 显式建 schema；挂载从不建树 |
 | `view fork` | 拒绝 | `no physical base tree … a PostgreSQL-backed view cannot be forked` | 派生视图（§15.13）或别名 |
 | `view export` | 拒绝 | `no metadata tree … a PostgreSQL-backed view lives in Postgres` | `pg_dump -n grovefs_v_<hex>` |
 | `view list` | 可用(加 `--meta-store`) | `view --meta-store postgres://… list` 读 `grovefs_control.view_defs` + `grovefs_v_*` schema;不带 `--meta-store` 只看本地文件(输出 `no view definitions under …/meta/views`) | 同左,或 §15.6 巡检 SQL |
@@ -2815,6 +2919,25 @@ find /data/cluster/blocks -type f | wc -l; du -sh /data/cluster/blocks
 | HA：`--role standby` / `--peer` / `--witness` | 启动即失败 | `--meta-store postgres://… cannot be combined with --role standby / --peer / --witness` | PG 流复制 / 逻辑复制 / PITR |
 | 视图名 > 25 字节 | 拒绝 | 服务端日志：`incompatible with PG schema naming (empty, or longer than 25 bytes)`；客户端只看到 `Input/output error` | 名字控制在 25 字节内（中文约 8 字） |
 | 连接池 | 固定常量 | 每视图 8 写 + 4 读(共 12 条)，编译期常量，没有环境变量可调；挂载会话钉住引擎，卸载且静默 `meta-server --engine-idle-secs`（默认 300s）后回收、下次访问自动重开（`evict` 套件实证） | 按「**活跃视图数** × 12 + 突发溢出」规划 `max_connections`；写热点先查锁争用，不是加池 |
+
+#### FDB 档
+
+| 操作 | FDB 后端下 | 失败原文 / 实际行为 | 替代做法 |
+| --- | --- | --- | --- |
+| `view --meta-store fdb://… create --view V` | **建树的唯一方式** | 开出一个 subspace（写根行与两个分配器键）；不带 `--meta-store` 只会造一个服务端读不到的本地 `meta/V.db` | 建完挂载写内容 |
+| `view create --manifest` | 拒绝 | `` `view create --manifest` seeds a SQLite db file; under `--meta-store fdb://…` mount the view and write the files instead `` | 挂载后直接写文件；批量入库走挂载点（§14.2） |
+| `view fork` | 拒绝 | ``… `fork` is not implemented on the FoundationDB backend (a fork copies a whole per-view tree, and a view here is one subspace of the cluster with no snapshot path to copy); serve 'NAME' as an alias or derived view instead… `` | 派生视图（§15.13）或别名（§3.4） |
+| `view export` / `view import`（单视图元数据搬运） | **可用**（跨后端与同后端的迁移通道，§3.4.2） | 导出把一个 subspace 写成与 SQLite 档逐行同形的宿主无关 JSONL（表头 + 每节点一行，无绝对路径/主机名/`blocks/` 路径）；导入在集群里**开出这个名字的 subspace**（`view create` 之外唯一的建树入口），保留 id/ino/硬链接/mode/uid/gid/时间/symlink 文本，同事务更新共享字节账本，并把两个分配器水位抬到导出最大值（对位 PG 的 `setval`）；目标已有树需 `--replace`，坏 dump 整体拒绝、不留半成品；`--as-fork` 在此档拒绝（理由同 `view fork` 行） | 字节另走对象存储：`rsync -a` 数据根，或让 data-server 服务同一批对象（§14.2） |
+| `view rm --base`（连字节删整个基视图） | 拒绝 | ``view rm --base operates on a local SQLite view db; under `--meta-store fdb://…` a base tree is a subspace of the FoundationDB cluster (create one with `view create`) and its bytes move through a mounted path — drop --meta-store for a local store`` | 目前没有能删除一个 subspace 的命令；`--meta-dir` 下的定义可先用 `view rm --name` 清 |
+| `import`（零拷贝） | 拒绝 | ``import operates on a local SQLite view db; under a FoundationDB deployment (--meta-store fdb://…, or GROVEFS_META_STORE) a base tree is a subspace of the cluster …`` | 挂载 + `rsync`/`cp` 走挂载点（§14.2）；已有目录批量入库走三步：本地 `import` 暂存 → `view export` → `view --meta-store fdb://… import`（§3.4.2） |
+| `gc --apply` | 拒绝 | `` `gc` audits LOCAL page files under <data-dir>/blocks; a FoundationDB deployment's trees are subspaces in the cluster and its bytes are owned by the data servers — reclaim there with the data-server tooling (and back the cluster up with `fdbbackup`), not this command `` | 字节回收由服务端事务与集群侧工具负责；不要在 fdb 部署上跑离线 `gc` |
+| `refs rebuild` | **别跑** | 与 PG 同口径：它写的是本地 `meta/refs.db`，而 FDB 的字节账本在集群的共享 `refs` subspace（`docs/fdb-keyspace.md` §3.6），这次输出对该部署无意义 | 账本由服务端事务维护 |
+| `view list` / `view define` / `view alias` / `apikey` / `mcp` | 可用，且**不要求集群可达** | 控制面在本地文件：`<meta-dir>/meta/views/*.layout` 与 `<meta-dir>/meta/api_keys.db`；同一目录即同一份记录（`apikey` 套件的 fdb 档与 SQLite 档逐条一致） | 同 SQLite（§15.11/§15.13/§15.14）；代价是 `--meta-dir` 要随服务端一起备份 |
+| `du --meta-server` | 可用 | 走 `M_TREE_DUMP`，总额与挂载所见字节一致（`fdb` 套件实证） | 同 SQLite |
+| 挂载（`mount --meta-server`） | 可用 | 视图未 `view create` 时按名拒绝，不自建空树 | 先建后挂（§4） |
+| HA：`--role standby` / `--peer` / `--witness` | 启动即失败 | `--meta-store fdb://… cannot be combined with --role standby / --peer / --witness: GroveFS-native HA snapshot shipping is SQLite-only.` 后接 FDB 专属建议行 | 副本与恢复交给集群（`fdbbackup`）；单 meta-server 实例即可服务全部 subspace |
+| 视图名 > 25 字节 / 非法字符 | 拒绝 | `view name is N bytes; the backends all cap it at 25 so no view is openable on one engine and unrepresentable on another` / `view name 'X' is not usable as an FDB subspace key` | 名字控制在 25 字节内（中文约 8 字），与 PG 同一口径 |
+| 不带 `--features fdb` 的二进制收到 `fdb://…` | 启动即失败 | `… names the FoundationDB backend, but this binary was built without `--features fdb` … an fdb:// uri is never served by SQLite` | 用带 feature 的构建（§6.3），或去掉 `--meta-store` |
 
 ### 15.10 场景：已有目录零拷贝入库（SQLite 后端）
 
@@ -2953,12 +3076,19 @@ $G meta-server --listen 0.0.0.0:50110
 | 你看到 | 真实原因 | 去哪儿处理 |
 | --- | --- | --- |
 | 客户端 `Input/output error` + `background mount exited (exit status: 1)` | 服务端在 `M_OPEN` 里**解析不出**这棵视图（PG 下名字超 25 字节、元数据库损坏等）。注意：**名字不存在不属于这一类**，那会在握手处收到可读拒绝，不建树 | 看 meta-server 日志的最后一条 `M_OPEN view='…' resolve failed: …`；key 类拒绝不走 EIO，会直接回可读原因 |
-| `error: view 'x' does not exist on this meta-server (sqlite/postgres): … views are created explicitly …` | 视图名还没有树/定义,服务端拒绝未创建的视图名(任何情况下都不会自建) | §4：先建后挂(SQLite `view create --view x` / `init` / `view import`；PG `view create --meta-store postgres://… --view x`) |
+| `error: view 'x' does not exist on this meta-server (sqlite/postgres): … views are created explicitly …` | 视图名还没有树/定义,服务端拒绝未创建的视图名(任何情况下都不会自建) | §4：先建后挂(SQLite `view create --view x` / `init` / `view import`；PG `view --meta-store postgres://… create --view x`) |
 | 挂载**成功**了，但目录是空的 | 视图确实存在,但树里还没有内容——例如刚 `view create` 的空树,或历史上手工遗留的空树 | `ls meta/` 确认；建错了就按 §15.8 清掉重来 |
 | `no physical base tree … cannot be forked` | 在 PG 后端下跑 `view fork` | §15.13 换派生视图/别名 |
 | `no view definition '<v>' under …/views` | 在 PG 下用 CLI 删视图 | §15.8 手工 `DROP SCHEMA` |
 | `no metadata tree … lives in Postgres` | 在 PG 下跑 `view export` | 用 `pg_dump -n`（§15.7） |
-| `--meta-store … cannot be combined with --role standby / --peer / --witness` | PG 与 GroveFS 原生 HA 不能叠 | §15.9 |
+| `--meta-store postgres://… cannot be combined with --role standby / --peer / --witness` | PG 与 GroveFS 原生 HA 不能叠 | §15.9：高可用改走 PG 流复制 |
+| `--meta-store fdb://… cannot be combined with --role standby / --peer / --witness` | 同一条互斥，但 FDB 档的补救话术不同：复制与快照本来就在集群内（`fdbbackup`），原生 HA 在这里没有可交付的东西 | §6.3 / §15.9：去掉 HA 参数单实例起 meta-server |
+| `... names the FoundationDB backend, but this binary was built without --features fdb (it does not link libfdb_c)` | 默认构建里没有 FDB 后端。**它不会降级成 SQLite 服务这条 uri**——服务端带着拒绝标记启动、`serve()` 直接失败，`du`/`view create`/MCP 各入口同样就地报错 | §6.3：`cargo build --release --features fdb`，或去掉 `--meta-store` 用默认 SQLite |
+| `fdb:// uri names no cluster file: give fdb://<path> or set GROVEFS_FDB_CLUSTER_FILE` | scheme 写了但没给集群文件，env 回退也没设（协调器/TLS/machine_class 都在那个文件里，不在 URI 里） | §6.3：`fdb://<集群文件>` 或 `fdb://?cluster=<路径>`；两者都缺时读 `GROVEFS_FDB_CLUSTER_FILE` |
+| `error: fdb open <路径>: No cluster file found in current directory or default location` | `fdb://` 指向的集群文件不存在/不可读（后半句是 `libfdb_c` 自己的原文，grovefs 只加 `fdb open <路径>:` 前缀） | 路径写错是这一类：在**执行命令的那台机器**上给真实存在的集群文件，或设 `GROVEFS_FDB_CLUSTER_FILE`（§6.3） |
+| 命令**挂住不返回**：客户端只打到 `using remote metadata service at …` 就没了，退出只能靠外部超时；`meta-server` 那边横幅照打、端口照听、日志不再新增行 | **集群不可达在这一档不是报错，是无声等待**——`libfdb_c` 对协调器不可达按自己的策略持续重试，本后端没有给这类等待设上限（`docs/fdb-keyspace.md` §11 把 timeout/重试上限列为可后置项）。服务端启动**不探测集群**，所以"起来了"不等于"通" | 判据在集群侧：服务端机上 `fdbcli -C <集群文件> --exec "status minimal"`，`The database is unavailable` 就是这一类（几秒内给出，不像 grovefs 那样等）。恢复可达后卡住的那笔 op 自己走通，挂载不需重挂 |
+| `serialization retry exhausted after 12 attempts (view 'x')` | 一笔 op 连撞 12 次仍未提交（OCC 中止，退避 200µs→25ms 用尽）。**PG 与 FDB 同一条 driver 文案**（`src/pg_store.rs:550`、`src/fdb_store.rs:1523`），FDB 档没有锁等待这一说，出现这行就是重试预算真耗尽 | 查争用面而不是查集群：同一目录内高频 `rename`/同名 `create` 风暴；PG 侧该串由 `pg_parallel` 套件在日志里实测，FDB 侧走的是同一常量与同一分支 |
+| `view name is N bytes; the backends all cap it at 25 so no view is openable on one engine and unrepresentable on another` | 视图名超 25 字节。FDB 本身不需要这个上限，上限是从 PG 的 `schema_for` 跨过来的——为了让视图在三后端间可迁移（P8） | §15.9：换成 ≤25 字节的视图名 |
 | `refs … rebuilt: 0 holder entries`（PG 部署里） | 跑的是本地文件账本重建，与 PG 无关 | 不要依赖这次输出（§15.9）；账本内容看 `grovefs_refs.holders`（§15.6） |
 | 写操作返回 `EPERM` | 只读 key（含 `flock` 类）或派生视图 | §15.11 / §15.13 |
 | 写 fork 内容返回 `EROFS` | fork 内容面只读 | 写基视图；结构整理继续在 fork 里做 |
@@ -2973,7 +3103,7 @@ $G meta-server --listen 0.0.0.0:50110
 
 ### 16.1 扩展点:三个 trait,一个装饰器
 
-- **`MetaProvider`**(`src/meta.rs`,22 方法):元数据层全部契约——`lookup`/`getattr`/`readdir`/`create_node`/`rename`/`lock_op`/`fence_handle`/`fetch_fence_epoch`…带默认实现的扩展点四个:`readdir_page`/`supports_paged_readdir`/`display_targets`/`flush_listing`(后者是“你自己缓存了列表就要能被失效推送 flush”的那一半契约)。实现者五处:`MetaEngine`(本地 SQLite,每视图一库)、`PgEngine`(`src/pg_store.rs`,PG,每视图一 schema)、`MetaStore`(enum,运行期择 Sql/Pg,meta-server 服务端侧)、`RemoteMeta`(客户端)、`LayoutMeta`(治理装饰器)。PG 不是第六种树引擎语义:`MetaEngine::open_sqlite`/`open_pg` 同一方法面换存储内核——所以每个功能都自动"在 PG 上跑"。
+- **`MetaProvider`**(`src/meta.rs`,22 方法):元数据层全部契约——`lookup`/`getattr`/`readdir`/`create_node`/`rename`/`lock_op`/`fence_handle`/`fetch_fence_epoch`…带默认实现的扩展点四个:`readdir_page`/`supports_paged_readdir`/`display_targets`/`flush_listing`(后者是“你自己缓存了列表就要能被失效推送 flush”的那一半契约)。实现者六处：`MetaEngine`(本地 SQLite,每视图一库)、`PgEngine`(`src/pg_store.rs`,PG,每视图一 schema)、`FdbStore`(`src/fdb_store.rs`,FoundationDB,每视图一 subspace;只在 feature `fdb` 的构建里存在)、`MetaStore`(enum,运行期择 Sql/Pg/Fdb,meta-server 服务端侧)、`RemoteMeta`(客户端)、`LayoutMeta`(治理装饰器)。PG 与 FDB 都不是新的树引擎语义:`MetaEngine::open_sqlite`/`open_pg` 与 `MetaStore::open_fdb` 同一方法面换存储内核——所以每个功能都自动在三后端上跑,判据就是把同一套断言换参重跑(§10)。
 - **`StorageBackend`**(`src/backend/mod.rs`,10 方法):数据对象 IO——`new_key`/`create`/`read`/`write`/`len`/`fsync`/`truncate`/`remove`/`import_at`/`statvfs`。实现者:`LocalBackend`/`ShardedBackend`/`PlacementBackend`/`RemoteBackend`。256 桶分片与条带化都在这层后面,FUSE 层不知道对象躺在哪块盘。
 - **`LayoutMeta`**(`src/layout.rs`,治理装饰器):包住任意 `MetaProvider` 做"源路径↔显示路径"翻译,目录项不物化。`mount --layout`(客户端侧)与服务端派生视图两条入口汇到**同一个装饰器实现**——所见形状逐字节一致不是巧合,是同一份代码。
 
@@ -2992,9 +3122,9 @@ $G meta-server --listen 0.0.0.0:50110
 ### 16.3 接入新后端的最小路径
 
 1. 实现对应 trait(元数据换 `MetaProvider`、字节换 `StorageBackend`),方法语义对照 SQLite `MetaEngine` / `LocalBackend` 的注释;**PG 式"换内核不换方法面"**是推荐的解法——功能自动全量可用;
-2. 在工厂处挂类型:数据面参考 `backend::open_local`/`open_local_roots`(`src/backend/mod.rs`),元数据面参考 `MetaEngine::open_sqlite`/`open_pg`(`src/meta.rs`)的接法;
+2. 在工厂处挂类型:数据面参考 `backend::open_local`/`open_local_roots`(`src/backend/mod.rs`),元数据面参考 `MetaEngine::open_sqlite`/`open_pg`(`src/meta.rs`)与 `MetaStore::open_fdb`(`src/meta/engine.rs`)的接法; **元数据面接入新后端的完整实例见 `src/fdb_store.rs`**(feature `fdb`:一个视图一个 subspace、SERIALIZABLE 事务体 + OCC 重试环、无连接池故无 `checkout`/`requeue`,以及为什么这里不需要 `drop_cursors`);
 3. 客户端侧如需新挂载类型,在 `main.rs` 的 mount 分发处接入;协议操作码尽量保持不 变——帧布局与操作码定型于 `src/remote/proto.rs`,改动必须两侧同步升级;
-4. 回归:把 `.build-bin/run_all.sh` 的对应套件换参重跑,判据以脚本输出为准(§10)。
+4. 回归:把 `.build-bin/run_all.sh` 的对应套件换参重跑,判据以脚本输出为准(§10)。FDB 档的换参入口是各脚本顶部的 `*_BACKEND=fdb` + `.build-bin/fdb_scaffold.sh`(它负责起停服务端、且**启动前要求端口空闲**——否则 `wait_port` 会采纳陌生遗留的服务端,让下一套件跑出与代码无关的红断言);语义等价另有**三档差分对拍** `tests/fdb_tree.rs` 兜底:同一条 op 序列分别跑过 `sqlite`/`postgres`/`foundationdb`,先逐 op 比对回包、再比 `dump_tree()` 的结构同型(行号按从根遍历重新编号,故比的是树而不是发号轨迹);某一档不可达就只比剩下的档,两档都没有就自行 SKIP,不拖红全板。
 
 ### 16.4 架构取舍与开发侧边界
 
