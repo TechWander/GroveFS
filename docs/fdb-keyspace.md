@@ -1037,6 +1037,39 @@ up-to-date，`strip -s` 后得 6,623,152 B（与旧版差 1,952 B 即来自那�
 `exit 0` 才有资格谈回 CANON；`exit 2` 先修控件所在的主机；`exit 1` 且 PG 臂正常，就是实现侧的账，
 与介质无关（v1.8 的 `memory` 引擎对照已经把约 3× 的差距从盘上摘掉过一次）。
 
+### v2.6（给基准留下的 PG 视图残留接上一个删除出口）
+
+触发是一次收尾提问：跑完 G3 在两臂各建的视图谁去删。查完的结论是**没人能删**——
+`grovefs view rm --base` 按设计拒绝 `--meta-store postgres://…`，帮助原文是「its tree is a PG
+schema — drop the schema and let PG/data servers own the bytes」。也就是说 PG 档的基础视图**没有
+CLI 删除路径**，而 `bench_g3.sh` 和 `pg` 套件都是"每单元一个视图"的写法，跑一轮就留一轮。
+
+**新配方 `.bneck/pg_drop_views.sh`**，把那条"让操作者自己去删"的路补齐，且删法是全套的：
+
+- 视图的树就是 schema `grovefs_v_<视图名的 hex>`。这条不是猜的：把库里已有的 schema 名逐个
+  `bytes.fromhex` 反解回视图名（`pg_1794293409_r2n4` ↔ `grovefs_v_70675f…`）验证过再照正向写。
+- **必须先删台账再 DROP SCHEMA**。跨视图台账 `grovefs_refs.holders` 是**全局表且没有 view 列**
+  （当时 895,725 行，`data_ref` 全库唯一、`holders` 基本为 1），只删 schema 会把该视图订过的每个
+  对象一行台账永久留下——这正是 SQLite 档 `view rm --base` 靠「从存活树重建台账」避免的状态。
+  零字节文件也订对象：一个 3.7k op 的单元就留 3,700 行，不是边角情况。
+- `grovefs_control.view_defs` 不用动：它只登记 derived/fork/alias，实测 0 行而当时有 29 个基础视图。
+- 护栏：默认 dry-run，`--yes` 才删；不给名字时只命中 `--pattern`（默认 `^pgp?_?[0-9]`，即基准自己
+  造名的三种形态）；非 `grovefs_v_*` 一律拒绝；视图已不存在时是无害 no-op（幂等，可重复跑）。
+
+**`bench_g3.sh` 现在每单元自清理**（`KEEP_VIEWS=1` 可关）。FDB 臂不需要这一步：它的视图住在本机
+`.fdb3` 这个**专门用来扔的**集群里，`.bneck/fdb3_up.sh` 起手就是 `rm -rf $ROOT`。
+
+**本机实测账单**：清掉 29 个视图（今日 1 个烟雾 + 28 个历史基准/`pg` 套件残留），回收 **84,779**
+行台账，库 **242 MB → 148 MB**，`remaining base-view schemas: 0`。端到端复跑证明自清理真的在跑：
+`gc: dropped pg_1794294306_r1n1 (ledger rows removed: 4380)`，整轮跑完仍是 0 个 schema。收尾
+`.bneck/fdb3_down.sh` 后端口 4510-4512 释放，跨机集群 `The database is available.` 未受影响。
+
+**看到但没有动的一件事**（留给有明确结论时再下刀）：清完之后 `grovefs_refs.holders` 里仍有
+**807,246 行，而本库已不存在任何视图 schema** —— 更早轮次用别的路子直接 `DROP SCHEMA`、没配台账
+删除留下的孤儿行。要不要按「从存活树重建台账」的语义一次性清掉未引用行是另一个判断：其中 `KX`、`K2`
+两行 `holders=5`、形态不是对象 UUID（像是控制键），盲目"删除所有未被引用行"会把它们一起清掉，所以
+本层不下这一刀，只把数量和形态记在这里。
+
 ## 15. 决策门处置（G1–G4 与 R5，逐门留证）
 
 计划把生死判定放在阶段末的决策门上。每个门的处置只有三种合法写法：**判过并留下证据**、

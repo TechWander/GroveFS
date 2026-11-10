@@ -15,6 +15,7 @@
 #        N_LIST='1 4' T=8 RUN_SECS=6 REPS=2 bash .bneck/bench_g3.sh
 #        G3_GATE=9000 bash .bneck/bench_g3.sh          # the NVMe tier of the gate
 #        PGURI=postgres://... CLUSTER3=/nvme/fdb3/cluster3   # both arms on one device
+#        KEEP_VIEWS=1 bash .bneck/bench_g3.sh         # keep the PG views instead of dropping them per cell
 # The exit code IS the verdict: 0 G3_GREEN, 1 G3_RED, 2 G3_INCONCLUSIVE (the PG
 # control did not reproduce the platform value, so the round judged nothing).
 set -u
@@ -105,6 +106,15 @@ run_one(){
     END{ printf "G3ROW %s %s N=%d T=%d ops=%d wall=%.2fs agg=%.0f ops/s\n", be, view, N, T, o, max-min, o/(max-min) }' $P/logs/run_${be}_${view}_m*.log | tee -a "$ROWS"
   for p in "${mpids[@]}"; do kill $p 2>/dev/null; wait $p 2>/dev/null; done
   for i in $(seq 1 $N); do fusermount -u "$P/mnt_${be}${i}" 2>/dev/null; rm -rf "$P/mnt_${be}${i}"; done
+  # Leave no residue. A PG-mode base view has NO CLI delete path on purpose (`view
+  # rm --base` refuses postgres:// and tells the operator to drop the schema), and
+  # each cell otherwise strands one grovefs_refs.holders row per booked object in
+  # the global ledger -- see .bneck/pg_drop_views.sh. The FDB arm needs no in-run
+  # step: its views live in the throwaway cluster that .bneck/fdb3_up.sh recreates
+  # from scratch (rm -rf $ROOT), so wiping the cluster is the teardown.
+  if [ "$be" = pg ] && [ "${KEEP_VIEWS:-0}" != 1 ]; then
+    bash .bneck/pg_drop_views.sh --yes "$view" | grep -E '^  (dropped|absent|FAILED)' | sed 's/^/  gc: /'
+  fi
 }
 
 for r in $(seq 1 $REPS); do
