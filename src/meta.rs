@@ -173,9 +173,11 @@ impl NodeInfo {
 //
 // Mechanics: every view engine ATTACHes the sibling `refs.db` as schema `refs`
 // at open, so the ledger row moves inside the SAME IMMEDIATE transaction as the
-// node INSERT/DELETE it books — commit is atomic across both files and a crash
-// can never strand a still-referenced object (the failure mode would be a
-// leaked holder row, i.e. a blob kept too long, never one freed too early).
+// node INSERT/DELETE it books. Both files lock at BEGIN and commit together, but
+// note SQLite's own caveat: with the main db in WAL mode a transaction spanning
+// attached dbs is atomic per database, NOT as a set (no master journal). A crash
+// inside that window can therefore land the node row without the holder row;
+// `grovefs refs rebuild` is the repair path (see docs §13.3).
 // Deadlock control: `BEGIN IMMEDIATE` takes the write lock of EVERY attached
 // db at start, so each ledger-touching txn locks `refs.db` first and its view
 // db second in one fixed global order — cycles are structurally impossible
