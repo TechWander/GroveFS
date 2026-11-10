@@ -169,6 +169,60 @@ fn remote_chunked_read_past_eof_zero_pads() {
     );
 }
 
+/// The chunked read now lands every slice DIRECTLY in its final buffer slot.
+/// It must still agree byte for byte with reading the same range in pieces
+/// through the single-request path: identical slice boundaries, identical
+/// short-read padding, no reordering, at aligned and unaligned offsets.
+#[test]
+fn remote_chunked_read_matches_piecewise_single_reads() {
+    let (addr, _dir) = spawn_server();
+    let c = make_client(&addr);
+
+    let key = "chunked-equiv";
+    c.create(key).unwrap();
+    // Ragged size on purpose: the last chunk is neither full nor zero-length.
+    let size = 5 * (1usize << 20) + 1234;
+    let data: Vec<u8> = (0..size).map(|i| (i % 253) as u8).collect();
+    c.write(key, 0, &data).unwrap();
+
+    // (offset, len): aligned full read, unaligned straddle, and a single-slice-
+    // plus-tail read, all inside the object.
+    for &(off, len) in &[
+        (0usize, size),
+        (777usize, 3 * (1usize << 20)),
+        (1usize << 20, 2 * (1usize << 20) + 7),
+    ] {
+        let chunked = c.read(key, off as u64, len).unwrap();
+        // 256 KiB steps stay below CHUNKED_READ_MIN, so each read is one
+        // ordinary request/response with its own short-read handling.
+        let mut piecewise = Vec::with_capacity(len);
+        let mut done = 0usize;
+        while done < len {
+            let n = (len - done).min(256 << 10);
+            piecewise.extend_from_slice(&c.read(key, (off + done) as u64, n).unwrap());
+            done += n;
+        }
+        assert_eq!(chunked.len(), len, "chunked read len mismatch at {off}+{len}");
+        assert_eq!(chunked, piecewise, "chunked != piecewise at {off}+{len}");
+        assert_eq!(chunked, data[off..off + len], "wrong bytes at {off}+{len}");
+    }
+}
+
+/// A failed slice fails the whole chunked read: no zero-filled "success" and no
+/// partial buffer leaking out. ENOENT must surface like the single-read path.
+#[test]
+fn remote_chunked_read_error_is_not_a_zero_filled_success() {
+    let (addr, _dir) = spawn_server();
+    let c = make_client(&addr);
+
+    let e = c.read("no-such-object", 0, 2 << 20).unwrap_err();
+    assert_eq!(
+        e.raw_os_error(),
+        Some(libc::ENOENT),
+        "chunked read of a missing key must report ENOENT"
+    );
+}
+
 /// P3: writes >= 4MiB take the parallel chunked path; content must land
 /// byte-exact (server does positional pwrite per connection, so slices at
 /// independent offsets can't interleave).
