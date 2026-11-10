@@ -916,6 +916,17 @@ enum ViewAction {
     /// trees, structure writable / content read-only) and pure aliases
     /// (name → real view, writable).
     List,
+    /// Inventory the CLUSTER instead of this meta-dir: every subspace under the
+    /// `grovefs` root, with key count, entry count and prefix hex. `--meta-store
+    /// fdb://…` only.
+    ///
+    /// The two answers differ because view DEFINITIONS are local under `fdb://`
+    /// (they are control-plane files beside `api_keys.db`), while the TREES are
+    /// subspaces in the cluster: `view list` can therefore be complete about
+    /// definitions and silent about a subspace nobody here defines — a test run,
+    /// an abandoned migration. This is the command that makes those visible, and
+    /// the one to run before/after `view rm --base`.
+    Scan,
     /// Remove a view. WITHOUT `--base`: remove the view DEFINITION `--name`
     /// (derived, fork or alias — the file slot is shared). For derived/alias
     /// the underlying data is untouched; already-mounted clients keep their
@@ -2085,6 +2096,74 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         "view keys: `grovefs apikey --meta-dir {} list [--view NAME]` (add --view to see only that view's keys)",
                         vbase.display()
                     );
+                    if store_is_fdb {
+                        // Definitions are LOCAL under fdb://; the trees are not.
+                        // Saying so here is the difference between "no views" and
+                        // "no definitions in this meta-dir".
+                        println!(
+                            "note: this list is the DEFINITIONS in {}, and under `--meta-store fdb://…` a base view has none — the trees in the cluster are `grovefs view --meta-store {} scan`",
+                            vbase.display(),
+                            store.as_deref().unwrap_or("fdb://…")
+                        );
+                    }
+                }
+                ViewAction::Scan => {
+                    // Cluster inventory: deliberately NOT the same question as
+                    // `view list`. Definitions are local files, trees are
+                    // subspaces, and only this command can see a subspace that
+                    // nothing here defines (a test run, an abandoned migration).
+                    let Some(uri) = store.as_deref() else {
+                        return Err("`view scan` reads the metadata CLUSTER; give `--meta-store fdb://<cluster-file>` (for a local SQLite store, `view list` already lists meta/*.db)".into());
+                    };
+                    if !store_is_fdb {
+                        return Err(format!(
+                            "`{uri}` is not an fdb:// cluster — `view scan` inventories FoundationDB subspaces; `view list` is the equivalent for this store"
+                        )
+                        .into());
+                    }
+                    #[cfg(feature = "fdb")]
+                    {
+                        let subs = grovefs::fdb_store::list_subspaces(uri)?;
+                        let ledgers = subs.iter().filter(|s| s.ledger).count();
+                        if subs.is_empty() {
+                            println!("no subspaces under the 'grovefs' root in {uri}");
+                        } else {
+                            println!(
+                                "{:<28} {:>8} {:>8}  {:<7} {}",
+                                "SUBSPACE", "KEYS", "ENTRIES", "KIND", "PREFIX"
+                            );
+                            for s in &subs {
+                                let kind = if s.ledger {
+                                    "ledger"
+                                } else if grovefs::layout::valid_view_name(&s.name) {
+                                    "view"
+                                } else {
+                                    "?"
+                                };
+                                println!(
+                                    "{:<28} {:>8} {:>8}  {:<7} {}",
+                                    s.name, s.keys, s.entries, kind, s.prefix_hex
+                                );
+                            }
+                            println!(
+                                "\n{} subspace(s) under the 'grovefs' root in {uri}: {} tree(s) + {} ledger subspace(s)",
+                                subs.len(),
+                                subs.len() - ledgers,
+                                ledgers
+                            );
+                            println!(
+                                "a subspace is a TREE, not a definition — `view list` shows this meta-dir's definitions, this shows what the cluster holds; remove one with `view rm --name <name> --base` (the PREFIX column is what `fdbcli clearrange` takes for a name this build cannot open)"
+                            );
+                        }
+                        return Ok(());
+                    }
+                    #[cfg(not(feature = "fdb"))]
+                    return Err(format!(
+                        "{uri} names the FoundationDB backend, but this binary was built \
+                         without `--features fdb` (it does not link libfdb_c); rebuild with the \
+                         feature to read the cluster inventory"
+                    )
+                    .into());
                 }
                 ViewAction::Alias { name, real, retire } => {
                     // Same shared implementation as the MCP `alias_view` tool
@@ -2114,8 +2193,11 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         return Ok(());
                     }
                     // Whole BASE view removal: guards first, then tree + ledger,
-                    // then byte reclaim through the store's data root.
-                    require_sqlite("`view rm --base`")?;
+                    // then byte reclaim through the store's data root. The guards
+                    // below read the LOCAL control plane and this machine's mount
+                    // table, so they are backend-independent and run before the
+                    // backend split: an fdb:// removal is refused for exactly the
+                    // same reasons a SQLite one is.
                     if ctrl.has_def(&name)? {
                         return Err(format!(
                             "'{name}' is governed by a view definition — remove it first with `grovefs view rm --name {name}` (without --base)"
@@ -2149,6 +2231,108 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                     if !grovefs::layout::valid_view_name(&name) {
                         return Err(format!("invalid view name '{name}'").into());
                     }
+                    if store_is_fdb {
+                        // Under `fdb://` the tree IS a subspace and the cross-view
+                        // ledger lives in the cluster, so this is the ONE backend
+                        // where teardown is a range clear plus a ledger unwind with
+                        // no file to unlink — and the one where a bookkeeping slip
+                        // has no `refs rebuild` to repair it afterwards. That is
+                        // why the unwind is inside `remove_view` rather than left
+                        // to the caller.
+                        let uri = store.as_deref().expect("fdb:// is a store uri");
+                        #[cfg(feature = "fdb")]
+                        {
+                            use grovefs::fdb_store::FdbStore;
+                            // "No such subspace" is an error, not a cheerful zero:
+                            // a typo would otherwise look like a successful removal
+                            // and the operator would stop looking.
+                            let there = FdbStore::subspace_exists(uri, &name).map_err(|e| {
+                                format!("cannot ask the cluster about view '{name}': {e}")
+                            })?;
+                            if !there {
+                                return Err(format!(
+                                    "no subspace named '{name}' under the 'grovefs' root in {uri} — nothing to remove (`grovefs view --meta-store {uri} scan` lists what is there; a DEFINITION slot is removed by `view rm --name {name}` without --base)"
+                                )
+                                .into());
+                            }
+                            let st = FdbStore::open(uri, &name, true)?;
+                            let rep = st.remove_view()?;
+                            // Bytes: the ledger just took those refs to zero, so no
+                            // view in the cluster names them any more. Freeing them
+                            // needs a data root, which the metadata URI cannot
+                            // carry — same default and the same honest accounting as
+                            // the SQLite arm.
+                            let droot = data_root.clone().unwrap_or_else(|| vbase.clone());
+                            let (mut freed, mut missing, mut failed) = (0usize, 0usize, 0usize);
+                            let mut root_error = None;
+                            match backend::open_local(&droot) {
+                                Ok(be) => {
+                                    for dr in &rep.unbooked_refs {
+                                        // Striped keys live as chunks on the
+                                        // data-servers; a plain local root cannot
+                                        // free them — report, never half-delete.
+                                        if dr.starts_with('s') && dr.matches(':').count() >= 2 {
+                                            failed += 1;
+                                            eprintln!("note: striped object {dr} not freed from a plain local root — reclaim it through a mount or the data-servers");
+                                            continue;
+                                        }
+                                        if be.len(dr).is_err() {
+                                            missing += 1;
+                                            continue;
+                                        }
+                                        match be.remove(dr) {
+                                            Ok(()) => freed += 1,
+                                            Err(e) => {
+                                                failed += 1;
+                                                eprintln!("warning: cannot free blob {dr}: {e}");
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => root_error = Some(e),
+                            }
+                            println!(
+                                "removed base view '{name}' from {uri}: {} key(s) gone, {} node(s), {} object(s) no longer held by any view{}",
+                                rep.keys,
+                                rep.entries,
+                                rep.unbooked,
+                                if rep.still_held > 0 {
+                                    format!(", {} still held by other views", rep.still_held)
+                                } else {
+                                    String::new()
+                                }
+                            );
+                            match root_error {
+                                Some(e) => eprintln!(
+                                    "note: cannot open data root {} to free {} object(s): {e} — the subspace and its bookings are gone and those refs are unreferenced now; free them through the data-server or a mount",
+                                    droot.display(),
+                                    rep.unbooked
+                                ),
+                                None => println!(
+                                    "{} object(s) freed from {}, {} not found under that data root (wrong --data-dir? they live on another store), {} could not be freed",
+                                    freed,
+                                    droot.join("blocks").display(),
+                                    missing,
+                                    failed
+                                ),
+                            }
+                            eprintln!(
+                                "note: new mounts of '{name}' are now refused — `view create` starts over; the definitions this meta-dir holds were not touched (`view scan` confirms the subspace is gone)"
+                            );
+                            return Ok(());
+                        }
+                        #[cfg(not(feature = "fdb"))]
+                        return Err(format!(
+                            "{uri} names the FoundationDB backend, but this binary was built \
+                             without `--features fdb` (it does not link libfdb_c); rebuild with the \
+                             feature to remove a subspace"
+                        )
+                        .into());
+                    }
+                    // SQLite arm; a PG deployment is refused HERE (its tree is a
+                    // schema, and its ledger is a global table a schema drop would
+                    // leave full of orphan rows).
+                    require_sqlite("`view rm --base`")?;
                     let rm = meta::remove_base_view(&vbase, &name)?;
                     let droot = data_root.unwrap_or_else(|| vbase.clone());
                     // The metadata tree is already gone at this point, so a bare

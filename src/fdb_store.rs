@@ -668,30 +668,25 @@ impl FdbConfig {
     /// `/etc/foundationdb/fdb.cluster`, but a user-space test cluster is not there
     /// and installing to `/usr` is not something this build may assume.
     pub fn parse(uri: &str, view: &str) -> Result<Self, std::io::Error> {
-        let rest = uri
-            .strip_prefix("fdb://")
-            .ok_or_else(|| std::io::Error::other(format!("not an fdb uri: {uri}")))?;
-        let mut cluster = rest.split('?').next().unwrap_or("").to_string();
-        for kv in rest.split('?').skip(1).flat_map(|s| s.split('&')) {
-            if let Some(v) = kv.strip_prefix("cluster=") {
-                cluster = v.to_string();
-            }
-        }
-        if cluster.is_empty() {
-            cluster = std::env::var("GROVEFS_FDB_CLUSTER_FILE").unwrap_or_default();
-        }
-        if cluster.is_empty() {
-            return Err(std::io::Error::other(
-                "fdb:// uri names no cluster file: give `fdb://<path>` \
-                 or set GROVEFS_FDB_CLUSTER_FILE",
-            ));
-        }
+        let cluster = Self::parse_cluster(uri)?;
         // Same input gate as PG's `schema_for` (pg_store.rs:71-80): an unusable
         // view name is refused at open, never silently mangled.
         if !crate::layout::valid_view_name(view) {
             return Err(std::io::Error::other(format!(
                 "view name '{view}' is not usable as an FDB subspace key"
             )));
+        }
+        // `refs` is not a view: it is the SHARED cross-view byte ledger (§3.6),
+        // deliberately a sibling of the view prefixes. Opening a view with that
+        // name would put a tree's root row inside the ledger's subspace — the
+        // two would then share keys, and `view rm --base refs` would delete the
+        // booking table of every other view. Refused at the gate, before any key
+        // is written, rather than left as a name an operator can stumble into.
+        if view == TAG_REFS {
+            return Err(std::io::Error::other(
+                "view name 'refs' is reserved: it is the shared cross-view byte \
+                 ledger, not a tree — choose another name",
+            ));
         }
         // §1 also carries PG's 25-byte cap over, even though FDB needs no such
         // limit for itself: a view this backend can open but `schema_for` can
@@ -710,6 +705,31 @@ impl FdbConfig {
             cluster_file: cluster,
             view: view.to_string(),
         })
+    }
+
+    /// The cluster file named by an `fdb://` uri — everything a CLUSTER-WIDE
+    /// operation needs, with no view in hand (`view scan`, which enumerates the
+    /// subspaces that exist rather than opening one).
+    pub fn parse_cluster(uri: &str) -> Result<String, std::io::Error> {
+        let rest = uri
+            .strip_prefix("fdb://")
+            .ok_or_else(|| std::io::Error::other(format!("not an fdb uri: {uri}")))?;
+        let mut cluster = rest.split('?').next().unwrap_or("").to_string();
+        for kv in rest.split('?').skip(1).flat_map(|s| s.split('&')) {
+            if let Some(v) = kv.strip_prefix("cluster=") {
+                cluster = v.to_string();
+            }
+        }
+        if cluster.is_empty() {
+            cluster = std::env::var("GROVEFS_FDB_CLUSTER_FILE").unwrap_or_default();
+        }
+        if cluster.is_empty() {
+            return Err(std::io::Error::other(
+                "fdb:// uri names no cluster file: give `fdb://<path>` \
+                 or set GROVEFS_FDB_CLUSTER_FILE",
+            ));
+        }
+        Ok(cluster)
     }
 }
 
@@ -1288,6 +1308,218 @@ struct Block {
 /// able to read the epoch without touching the store.
 type ArcFence = std::sync::Arc<AtomicU64>;
 
+// ---- cluster inventory (operator surface) -----------------------------------
+//
+// Every key this backend writes lives under ONE root, `(\x01,"grovefs",\x00)`,
+// and the component after it is the view name — except `refs`, which is the
+// shared ledger (§3.6). Nothing else is a sibling, so walking the root's
+// immediate children is the whole inventory: the FDB counterpart of listing
+// `meta/*.db` (SQLite) or `grovefs_v_*` schemas (PG). Before this existed, a
+// subspace could be CREATED (`view create`) but neither listed nor deleted, so a
+// scratch view (a test run, an abandoned migration) was invisible and permanent.
+
+/// Bytes requested per page while walking a prefix.
+///
+/// Rows per page are NOT a knob that can be set here: FoundationDB caps a range
+/// reply by BYTES, so `limit = 1000` does not mean "a thousand rows or the end"
+/// — a 4 KiB batch of these keys is about sixty of them. Measured the hard way:
+/// the first version of this walk stopped when a page came back short of its
+/// `limit` and reported a 2000-key cluster as 58 keys. The walk therefore asks
+/// for more bytes per round trip and stops when the driver says `more() == false`
+/// (`RangeOption::next_range`, the same continuation [`Tx::scan`] uses).
+const PAGE_BYTES: usize = 64 * 1024;
+
+/// One child of the `grovefs` root.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubspaceInfo {
+    /// The tuple component after the root: a view name, or `refs`.
+    pub name: String,
+    /// Every key under the prefix.
+    pub keys: u64,
+    /// `'n'` rows — the entries the tree actually holds (the root row included).
+    pub entries: u64,
+    /// True for the shared cross-view ledger, which is not a mountable tree.
+    pub ledger: bool,
+    /// The prefix in hex, so an operator can hand it to `fdbcli clearrange`
+    /// without re-deriving the tuple encoding.
+    pub prefix_hex: String,
+}
+
+/// What [`FdbStore::remove_view`] did. Reported rather than logged because the
+/// numbers are the operator's only evidence that the ledger was unwound rather
+/// than merely the keys deleted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PurgeReport {
+    pub view: String,
+    /// Keys removed by the range clear.
+    pub keys: u64,
+    /// Entries the tree held when the removal started.
+    pub entries: u64,
+    /// Data refs whose ledger count reached 0: no surviving view names those
+    /// bytes any more, so the data servers may reclaim them.
+    pub unbooked: usize,
+    /// The same refs by name, so a caller that owns a data root can free them
+    /// (the CLI's `view rm --base`) instead of only reporting a number.
+    pub unbooked_refs: Vec<String>,
+    /// Data refs another view still names — booked down by one, kept.
+    pub still_held: usize,
+}
+
+/// Hex spelling of a key prefix, for copy-paste `fdbcli` commands.
+fn hex_bytes(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// The immediate child of `root` that `key` lives under, plus how many bytes that
+/// child's name took: `Some(("alice", 8))` for the key
+/// `root \x02alice\x00 \x02n\x00 \x14\x02 \x00`.
+///
+/// `Subspace::unpack` cannot answer this, and the reason is worth writing down
+/// because the first attempt at this function used it and was wrong on EVERY key:
+/// `unpack` insists on consuming the whole key (`TupleUnpack::unpack_root` returns
+/// `TrailingBytes` otherwise, `foundationdb-tuple-0.11`'s `pack.rs:110-116`), and
+/// a real key carries a family tag and a tuple tail after the name. The crate
+/// has no public partial decode either (`TupleDepth::new` is private), so the
+/// first component is read here and then **checked against the encoder**:
+/// `root.subspace(&name)` must reproduce exactly the bytes consumed. That check
+/// is what makes the hand-decoding safe — a different typecode, a mis-handled
+/// escape or a name this backend could not have written all fail it and are
+/// reported as undecodable instead of being silently filed under a wrong name.
+///
+/// The escape rule is the tuple layer's own (`pack.rs:169-200`, `is_end_of_tuple`):
+/// a literal NUL inside a string is written `\x00\xff`, so a `\x00` followed by
+/// `\xff` is data and anything else after `\x00` means the string ended.
+fn child_name(root: &Subspace, key: &[u8]) -> Option<(String, usize)> {
+    let base = root.bytes();
+    let rest = key.strip_prefix(base)?;
+    // STRING (0x02) is the typecode this backend writes for a view name (§1).
+    if rest.first() != Some(&0x02) {
+        return None;
+    }
+    let mut raw: Vec<u8> = Vec::new();
+    let mut i = 1usize;
+    loop {
+        let b = *rest.get(i)?;
+        i += 1;
+        if b == 0x00 {
+            if rest.get(i) == Some(&0xff) {
+                i += 1;
+                raw.push(0x00);
+                continue;
+            }
+            break;
+        }
+        raw.push(b);
+    }
+    let name = String::from_utf8(raw).ok()?;
+    // The verification that turns a decoder into a fact.
+    if root.subspace(&name).bytes() != &key[..base.len() + i] {
+        return None;
+    }
+    Some((name, i))
+}
+
+/// Both bounds of the whole `grovefs` root: inclusive start, exclusive end.
+fn root_bounds() -> (Vec<u8>, Vec<u8>) {
+    let prefix = Keys::root().bytes().to_vec();
+    let end = prefix_upper_bound(&prefix)
+        .expect("the root prefix is 0x01 \"grovefs\" 0x00 — it never ends in 0xff");
+    (prefix, end)
+}
+
+/// Visit every key in `[begin, end)` once, paging with a fresh read-only
+/// (snapshot) transaction per page. Returns how many keys were visited.
+///
+/// A single transaction would be the tidier code and the wrong one: FDB caps a
+/// transaction's lifetime at five seconds, and "count the keys in a view" is
+/// exactly the query that grows without bound (the whole point of §9's per-entry
+/// size table). Paging by key also means the walk sees a stable order, so a
+/// concurrent writer can add keys but cannot make the walk revisit one.
+fn for_each_key<F>(
+    db: &DbHandle,
+    begin: Vec<u8>,
+    end: Vec<u8>,
+    f: &mut F,
+) -> Result<u64, MetaError>
+where
+    F: FnMut(&[u8]) -> Result<(), MetaError>,
+{
+    let mut visited = 0u64;
+    let mut next: Option<RangeOption> = Some(
+        (
+            KeySelector::first_greater_or_equal(begin),
+            KeySelector::first_greater_or_equal(end),
+        )
+            .into(),
+    );
+    while let Some(mut opt) = next {
+        opt.target_bytes = PAGE_BYTES;
+        let txn = db
+            .create_trx()
+            .map_err(|e| MetaError::Db(format!("fdb scan: {e}")))?;
+        let kvs = futures::executor::block_on(txn.get_range(&opt, 1, true))
+            .map_err(|e| MetaError::Db(format!("fdb scan: {e}")))?;
+        for kv in kvs.as_ref().iter() {
+            f(kv.key())?;
+            visited += 1;
+        }
+        next = opt.next_range(&kvs);
+    }
+    Ok(visited)
+}
+
+/// Every subspace under the `grovefs` root in this cluster, by name.
+///
+/// This is the answer to "what is actually in there", which no other command
+/// could give: the control plane is LOCAL files under `fdb://` (C6), so
+/// `view list` describes the definitions this `--meta-dir` knows about and says
+/// nothing about the cluster. Reading the cluster instead of a directory is what
+/// makes an orphan (a subspace with no definition anywhere) visible at all.
+///
+/// Entries are counted from the `'n'` family, so they mean the same thing the
+/// export header means by `nodes`, and `refs` is reported as a ledger rather than
+/// a tree (`entries` there is meaningless and left at 0).
+pub fn list_subspaces(uri: &str) -> Result<Vec<SubspaceInfo>, MetaError> {
+    let cluster_file = FdbConfig::parse_cluster(uri)
+        .map_err(|e| MetaError::Db(format!("fdb:// inventory: {e}")))?;
+    let db = database(&cluster_file)
+        .map_err(|e| MetaError::Db(format!("fdb:// inventory: {e}")))?;
+    let root = Keys::root();
+    let (begin, end) = root_bounds();
+    let mut found: std::collections::BTreeMap<String, SubspaceInfo> = Default::default();
+    let mut visit = |key: &[u8]| -> Result<(), MetaError> {
+        let base = root.bytes().len();
+        let (name, cut) = match child_name(&root, key) {
+            Some((n, used)) => (n, base + used),
+            // A key this build cannot name is not silently dropped: it is
+            // reported by its own bytes, because "there are keys here whose name
+            // this build cannot reproduce" is exactly what an inventory is for.
+            None => (format!("?{}", hex_bytes(key)), key.len()),
+        };
+        let rest = &key[cut..];
+        let e = found.entry(name.clone()).or_insert_with(|| SubspaceInfo {
+            ledger: name == TAG_REFS,
+            name,
+            keys: 0,
+            entries: 0,
+            prefix_hex: hex_bytes(&key[..cut]),
+        });
+        e.keys += 1;
+        // `\x02n\x00` is the packed family tag (`'n'`), so this counts the same
+        // rows `dump_tree`/`export` call nodes.
+        if rest.starts_with(b"\x02n\x00") {
+            e.entries += 1;
+        }
+        Ok(())
+    };
+    for_each_key(&db, begin, end, &mut visit)?;
+    Ok(found.into_values().collect())
+}
+
 impl FdbStore {
     /// Connect, ensure the root row (id/ino 1, so [`crate::meta::ROOT_INO`]
     /// stays valid), and return the handle. Idempotent: a second meta-server (or a
@@ -1344,6 +1576,21 @@ impl FdbStore {
         let root = futures::executor::block_on(tx.get(&key, true))
             .map_err(|e| TxErr::from(e).hard_or_exhausted().to_string())?;
         Ok(root.is_some())
+    }
+
+    /// Holders booked against `data_ref` in the SHARED ledger, or 0 when no row
+    /// exists (absent and zero are the same state: no view names those bytes).
+    ///
+    /// The diagnostic counterpart of [`PurgeReport`] and the only way to ask
+    /// "how many views still name this content key?" without walking the whole
+    /// `refs` subspace — which is also why it exists: a test that measured the
+    /// ledger by counting keys could not tell a correct unwind from another
+    /// suite's concurrent teardown (measured: 538 expected, 528 observed, purely
+    /// because two sibling tests released their own bookings at the same time).
+    pub fn ledger_holders(&self, data_ref: &str) -> Result<i64, MetaError> {
+        let tx = self.read_tx()?;
+        tx.get_i64(&self.keys.ledger(data_ref))
+            .map_err(TxErr::hard_or_exhausted)
     }
 
     pub fn view(&self) -> &str {
@@ -2467,6 +2714,124 @@ impl FdbStore {
         self.touch();
         let keys = self.keys.clone();
         self.with_serial_retry(move |tx| tx.clear_prefix(keys.view_prefix().bytes()))
+    }
+
+    /// Tear this view's whole subspace down AND unwind the shared byte ledger —
+    /// what `view rm --base` means under `fdb://`.
+    ///
+    /// [`Self::clear_view`] alone is not that: the ledger is cluster-wide (§3.6),
+    /// and a view's bookings are one unit per content key it names, not one per
+    /// name. Deleting the subspace without unbooking would leave every blob it
+    /// referenced booked forever — the conservative direction (bytes kept too
+    /// long, never freed early), but permanent, and with no `refs rebuild` in
+    /// this backend to repair it afterwards. So the unwind is part of the same
+    /// operation, and its result is reported instead of assumed.
+    ///
+    /// Order, and the reason for it — this is a destructive path:
+    /// 1. inventory (read-only): entry count and the DISTINCT data refs the `'r`
+    ///    family books for this view;
+    /// 2. unwind, one transaction per chunk of refs. Each chunk does BOTH halves
+    ///    for every ref in it: deletes this view's `'r` rows for that ref AND
+    ///    decrements the shared ledger row (deleting it at zero);
+    /// 3. the subspace itself, one range clear.
+    ///
+    /// The pair in step 2 is what makes re-running after any crash land on the
+    /// right answer, and it is a correctness property, not tidiness. Progress
+    /// through the work list is measured by the `'r` rows that are still there:
+    /// a chunk that committed has none left for its refs, so a second run's
+    /// inventory does not contain them and cannot decrement them again
+    /// (under-counting the ledger is the UNSAFE direction — it frees bytes a
+    /// surviving name still reads). A crash INSIDE a chunk aborts that whole
+    /// transaction, so no half-chunk can exist. A crash between 2 and 3 leaves a
+    /// tree whose bookings are already released; re-running sees no `'r` rows,
+    /// so it releases nothing and goes straight to the range clear. Running this
+    /// on an already-removed view is therefore a no-op returning zeros, which is
+    /// also why the report describes ONE run rather than the total ever unwound.
+    ///
+    /// The dangerous window is the mirror image of that safety: after step 2 a
+    /// reader under a live mount would still find names whose bytes are no longer
+    /// booked, i.e. free for GC. That window cannot be closed from here — this
+    /// process cannot see another machine's mount table — which is why the order
+    /// is "unbook, then clear" and never the reverse, and why the clear is ONE
+    /// range mutation (its width is a round trip, not the width of the tree).
+    ///
+    /// Callers must have stopped every mount of this view first: FDB is happy to
+    /// serve a mount whose keys are being cleared, and nothing here can see
+    /// another machine's mount table (the same caveat `view rm --base` documents
+    /// for the SQLite arm).
+    pub fn remove_view(&self) -> Result<PurgeReport, MetaError> {
+        self.touch();
+        let keys = self.keys.clone();
+        let prefix = keys.view_prefix().bytes().to_vec();
+        let end = prefix_upper_bound(&prefix).ok_or_else(|| {
+            MetaError::Db("fdb_store: cannot clear a view prefix ending in 0xff".to_string())
+        })?;
+
+        let mut entries = 0u64;
+        let mut blobs: std::collections::BTreeSet<String> = Default::default();
+        let keys_removed = {
+            let mut visit = |key: &[u8]| -> Result<(), MetaError> {
+                let rest = key.get(prefix.len()..).unwrap_or(&[]);
+                if rest.starts_with(b"\x02n\x00") {
+                    entries += 1;
+                } else if rest.starts_with(b"\x02r\x00") {
+                    if let Some(dr) = keys.decode_dataref(key) {
+                        blobs.insert(dr);
+                    }
+                }
+                Ok(())
+            };
+            for_each_key(&self.db, prefix.clone(), end, &mut visit)?
+        };
+
+        // One ledger row per content key per view, so the DISTINCT refs above are
+        // exactly what this view booked. Chunked because each chunk is its own
+        // transaction: a view holding a million blobs would otherwise need one
+        // transaction to touch a million ledger keys.
+        const UNBOOK_CHUNK: usize = 256;
+        let refs: Vec<String> = blobs.into_iter().collect();
+        let (mut unbooked, mut still_held) = (0usize, 0usize);
+        // Refs that reached zero, collected for the caller's byte reclaim.
+        let mut unbooked_refs: Vec<String> = Vec::new();
+        for chunk in refs.chunks(UNBOOK_CHUNK) {
+            let k = keys.clone();
+            let chunk: Vec<String> = chunk.to_vec();
+            let (u, h) = self.with_serial_retry(move |tx| {
+                let (mut u, mut h) = (Vec::new(), 0usize);
+                for dr in &chunk {
+                    // First half of the pair: this view's `'r` rows for `dr` go
+                    // away in the SAME transaction as the ledger decrement below,
+                    // so they are the progress marker a re-run reads.
+                    let rows = k.dataref_prefix_of(dr);
+                    tx.clear_prefix(rows.begin.key().to_vec().as_slice())?;
+                    let left = tx.bump(&k.ledger(dr), -1)?;
+                    if left <= 0 {
+                        // Zero holders is not a count, it is the absence of a
+                        // booking — the same "delete the row at zero" the SQL
+                        // backends do, so the ledger cannot accumulate dead keys.
+                        tx.clear(&k.ledger(dr));
+                        u.push(dr.clone());
+                    } else {
+                        h += 1;
+                    }
+                }
+                Ok((u, h))
+            })?;
+            unbooked += u.len();
+            unbooked_refs.extend(u);
+            still_held += h;
+        }
+
+        let k = keys.clone();
+        self.with_serial_retry(move |tx| tx.clear_prefix(k.view_prefix().bytes()))?;
+        Ok(PurgeReport {
+            view: self.view.clone(),
+            keys: keys_removed,
+            entries,
+            unbooked,
+            unbooked_refs,
+            still_held,
+        })
     }
 
     /// Flat dump for server-side `du` (§3.3's full-prefix scan). The P6

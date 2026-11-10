@@ -454,11 +454,30 @@ fn fdb_tree_ops_match_sqlite_semantics() {
     // test.
     if let MetaStore::Fdb(f) = &fdb {
         release_ledger(&fdb);
-        f.clear_view()
-            .unwrap_or_else(|e| panic!("clear scratch view {view}: {e}"));
+        // …then the subspace itself, through the very operation an operator uses:
+        // `view rm --base` is `remove_view`. `unbooked == 0` here is the point —
+        // `release_ledger` already gave the bookings back through `unlink`, so an
+        // unwind that decremented a second time would be caught on this line
+        // (under-counting the ledger is the direction that frees live bytes).
+        let rep = f
+            .remove_view()
+            .unwrap_or_else(|e| panic!("remove scratch view {view}: {e}"));
+        assert!(
+            rep.keys > 0 && rep.entries > 0,
+            "remove_view found nothing in {view}: {rep:?}"
+        );
+        assert_eq!(
+            (rep.unbooked, rep.still_held),
+            (0, 0),
+            "remove_view re-released bookings that unlink had already released: {rep:?}"
+        );
+        assert!(
+            !grovefs::fdb_store::FdbStore::subspace_exists(&uri, &view).unwrap_or(true),
+            "remove_view left the subspace in {view}"
+        );
         assert!(
             fdb.dump_tree().is_empty(),
-            "clear_view left rows behind in {view}"
+            "remove_view left rows behind in {view}"
         );
     }
     println!(
@@ -566,8 +585,12 @@ fn all_reachable_backends_agree_on_one_op_sequence() {
             arms.push(("foundationdb", script(&fdb, &view), canonical(&fdb)));
             if let MetaStore::Fdb(f) = &fdb {
                 release_ledger(&fdb);
-                f.clear_view()
-                    .unwrap_or_else(|e| panic!("clear scratch view {view}: {e}"));
+                f.remove_view()
+                    .unwrap_or_else(|e| panic!("remove scratch view {view}: {e}"));
+                assert!(
+                    !grovefs::fdb_store::FdbStore::subspace_exists(&uri, &view).unwrap_or(true),
+                    "remove_view left the subspace in {view}"
+                );
             }
         }
         _ => eprintln!("  (no FDB cluster reachable: this run compares the arms that exist)"),
@@ -602,5 +625,158 @@ fn all_reachable_backends_agree_on_one_op_sequence() {
         names.join(", "),
         bt.len(),
         bc.len()
+    );
+}
+
+// ---- teardown: `view rm --base` = `remove_view` ----------------------------
+//
+// The two differential tests above end with `release_ledger` + `remove_view`,
+// which proves the idempotent door. They cannot prove the UNWIND itself: their
+// names are unlinked through the trait first, so by the time the view is removed
+// there is nothing left to unbook. That path — a tree deleted WITHOUT walking its
+// names, which is what an operator does — is what this test measures.
+
+#[test]
+fn fdb_remove_view_unwinds_the_shared_ledger_exactly_once() {
+    use grovefs::fdb_store::{list_subspaces, FdbStore};
+
+    let Some(file) = cluster_file() else {
+        eprintln!("SKIP fdb_remove_view: no FDB cluster file (set GROVEFS_FDB_CLUSTER_FILE)");
+        return;
+    };
+    if !cluster_reachable(&file) {
+        eprintln!("SKIP fdb_remove_view: cluster {} unreachable", file.display());
+        return;
+    }
+    let uri = format!("fdb://{}", file.display());
+    let nanos = std::time::UNIX_EPOCH.elapsed().map(|d| d.as_nanos()).unwrap_or(0);
+    let base: String = format!("rv{:x}{:x}", std::process::id(), nanos)
+        .chars()
+        .take(18)
+        .collect();
+    let (va, vb, vc) = (format!("{base}a"), format!("{base}b"), format!("{base}c"));
+    // A content key unique to this run. The ledger is cluster-wide, so a key some
+    // other view also names would make every count below depend on leftover state
+    // — and this file's other two tests run in PARALLEL with this one, releasing
+    // their own bookings on the same cluster.
+    let dr = format!("RV{:x}", nanos);
+
+    // Three views naming ONE content key. The row must count VIEWS, not names and
+    // not bytes.
+    let stores: Vec<MetaStore> = [&va, &vb, &vc]
+        .iter()
+        .map(|v| {
+            MetaStore::open_fdb(&uri, v, false)
+                .unwrap_or_else(|e| panic!("open fdb view {v} against {}: {e}", file.display()))
+        })
+        .collect();
+    for (i, s) in stores.iter().enumerate() {
+        s.create_node(ROOT_INO, "shared", false, Some(&dr), 0o644, 1000, 1000)
+            .unwrap_or_else(|e| panic!("create in arm {i}: {e}"));
+    }
+    // Asked PER CONTENT KEY, not by counting the whole `refs` subspace: a global
+    // key count cannot tell a correct unwind from a sibling test's concurrent
+    // teardown (that is exactly how the first version of this test failed — 538
+    // expected, 528 observed, nothing wrong with `remove_view`).
+    let holders = |i: usize| -> i64 {
+        match &stores[i] {
+            MetaStore::Fdb(f) => f
+                .ledger_holders(&dr)
+                .unwrap_or_else(|e| panic!("read the ledger for {dr}: {e}")),
+            _ => unreachable!("open_fdb yields MetaStore::Fdb"),
+        }
+    };
+    assert_eq!(holders(0), 3, "one booking per VIEW naming the content key");
+
+    // The inventory sees all three, and counts the root row plus the file.
+    let inv = list_subspaces(&uri).unwrap_or_else(|e| panic!("inventory: {e}"));
+    for v in [&va, &vb, &vc] {
+        let row = inv
+            .iter()
+            .find(|s| &s.name == v)
+            .unwrap_or_else(|| panic!("{v} is missing from the cluster inventory"));
+        assert!(!row.ledger, "{v} reported as a ledger");
+        assert_eq!(row.entries, 2, "{v}: root row + the one file");
+    }
+
+    let remove = |i: usize, why: &str| {
+        match &stores[i] {
+            MetaStore::Fdb(f) => f
+                .remove_view()
+                .unwrap_or_else(|e| panic!("remove view {i} ({why}): {e}")),
+            _ => unreachable!("open_fdb yields MetaStore::Fdb"),
+        }
+    };
+
+    // A goes: two holders are left, so nothing may be released and the row stays.
+    let r1 = remove(0, "first");
+    assert_eq!(
+        r1.entries, 2,
+        "the report describes the tree it found: {r1:?}"
+    );
+    assert_eq!(
+        (r1.unbooked, r1.still_held),
+        (0, 1),
+        "A's removal must not free bytes B and C still name: {r1:?}"
+    );
+    assert_eq!(holders(1), 2, "one view left, so two bookings are left");
+    assert!(
+        !FdbStore::subspace_exists(&uri, &va).unwrap_or(true),
+        "A's subspace survived its own removal"
+    );
+
+    // A AGAIN: this is the idempotency contract. A second decrement here would
+    // leave the row reading 1 while two views still name those bytes, and the
+    // next removal (B) would then wrongly report "unbooked" — the unsafe
+    // direction, because a later GC would free bytes C is still reading.
+    let r2 = remove(0, "again");
+    assert_eq!(
+        (r2.unbooked, r2.still_held, r2.keys, r2.entries),
+        (0, 0, 0, 0),
+        "a re-run on an already-removed view must be a no-op: {r2:?}"
+    );
+    assert_eq!(
+        holders(1),
+        2,
+        "a re-run moved the ledger — the chunk pair (delete 'r rows + decrement) is not atomic"
+    );
+
+    // B goes: C is still a holder, so B's removal must release nothing either.
+    let r3 = remove(1, "only holder left is C");
+    assert_eq!(
+        (r3.unbooked, r3.still_held),
+        (0, 1),
+        "B's removal must not free bytes C still reads: {r3:?}"
+    );
+    assert_eq!(holders(2), 1, "one view left, one booking left");
+
+    // C goes: the last holder. The row is DELETED rather than left at zero, and
+    // the ref is named in the report so a caller that owns a data root can free
+    // the bytes (that is what `view rm --base` does with it).
+    let r4 = remove(2, "last holder");
+    assert_eq!((r4.unbooked, r4.still_held), (1, 0), "{r4:?}");
+    assert_eq!(r4.unbooked_refs, vec![dr.clone()], "{r4:?}");
+    // Zero holders is the absence of a booking, not a count: the row must be
+    // gone, because a ledger full of zero rows is a leak the next GC cannot
+    // distinguish from a live hold.
+    assert_eq!(holders(2), 0, "the ledger still books {dr}");
+
+    // And the three subspaces are out of the cluster inventory. Counted as "these
+    // names are not there" rather than "the total dropped", because the other two
+    // tests in this file share this cluster.
+    let after = list_subspaces(&uri).unwrap_or_else(|e| panic!("inventory: {e}"));
+    for v in [&va, &vb, &vc] {
+        assert!(
+            after.iter().all(|s| &s.name != v),
+            "{v} is still in the cluster inventory after its removal"
+        );
+    }
+    assert!(
+        !FdbStore::subspace_exists(&uri, &vc).unwrap_or(true),
+        "C's subspace survived its own removal"
+    );
+
+    println!(
+        "fdb_remove_view: 3 views sharing one content key — unwind counted 1 holder at a time, deleted the row at zero, re-run was a no-op"
     );
 }
