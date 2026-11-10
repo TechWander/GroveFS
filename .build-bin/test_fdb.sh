@@ -89,6 +89,18 @@ fi
 # working for a `$GROVEFS_FDB_BIN` that predates that change.
 export LD_LIBRARY_PATH="$FDB_HOME/lib:${LD_LIBRARY_PATH:-}"
 
+# Section 10's TWIN is the SQLite DEFAULT (no --meta-store, no env) precisely so
+# the comparison is two backends rather than one backend against itself. An
+# inherited `GROVEFS_META_STORE` silently breaks that: measured with
+# `GROVEFS_META_STORE=fdb://` in the calling shell, the twin's banner came up as
+# `foundationdb (cluster file )` — an fdb:// uri with no cluster file — and the
+# `view --meta-dir <home> export` steps that follow were then interpreted as an
+# FDB export against a subspace nobody had provisioned, cascading into ~25 FAILs
+# that looked like an implementation regression. Every command in this suite that
+# WANTS the cluster already names it with `--meta-store "$FDBURI"`, so the
+# ambient variable is never the intended source.
+unset GROVEFS_META_STORE
+
 META=127.0.0.1:15186
 META_REFUSE=127.0.0.1:15188
 DATA=127.0.0.1:15187

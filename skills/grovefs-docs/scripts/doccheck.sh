@@ -75,6 +75,12 @@ if [ -x "$BIN" ]; then
   else
     for f in "${DOCS[@]}"; do sed '/<style>/,/<\/style>/d' "$f"; done > "$dtxt"
   fi
+  # 同一条规矩用于**别家工具的命令行**:`cargo test --release --test meta_ledger -- --ignored
+  # --nocapture` 里的 `--test`/`--ignored`/`--nocapture` 是 cargo 的接口。`--ignored`/`--nocapture`
+  # 早前在 FOREIGN 里按名字放行,`--test` 一直没有——但 `test` 是通用词,豁免它在语义上等于
+  # 放行今后任何叫 `--test` 的臆造参数。所以这里也按行剥离:含 `cargo test` 的行整行不看。
+  # 已知代价同配方行:与 cargo 命令同行书写的 grovefs 臆造参数不再被这条规则抓到。
+  sed -i '/cargo test/d' "$dtxt"
   grep -oE -- '--[a-z][a-z0-9-]*' "$dtxt" | sed 's/^--//' | sort -u > "$docf"
   # 负空间清单(明说「未实现」的那几行)里点名的参数不算臆造
   grep -hE '未实现|别在当前版本上期待' "${DOCS[@]}" 2>/dev/null \
