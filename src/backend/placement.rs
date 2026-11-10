@@ -68,8 +68,14 @@ impl PlacementBackend {
             ));
         }
         let mut members = Vec::with_capacity(roots.len());
+        // One process-wide fd budget, split across the roots. Each LocalBackend
+        // caches object handles, so letting every disk assume it owns
+        // RLIMIT_NOFILE would make an n-disk node hit EMFILE at n times the
+        // budget it actually has.
+        let per_root = (super::local::fd_limit_default() / roots.len()).max(64);
         for r in roots {
-            let backend = Arc::new(super::local::LocalBackend::new(r)?) as Arc<dyn StorageBackend>;
+            let backend = Arc::new(super::local::LocalBackend::with_fd_limit(r, per_root)?)
+                as Arc<dyn StorageBackend>;
             members.push(Member {
                 root: r.clone(),
                 backend,
