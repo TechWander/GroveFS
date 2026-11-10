@@ -4,6 +4,10 @@
 //! Design goals (LAN, high throughput, zero NFS):
 //! - Fixed-size header + variable body, all integers big-endian (network order)
 //!   so the codec is trivial and cheap.
+//! - Frames are written with `writev` (header + body slices in one call), so a
+//!   bulk payload is copied into the socket exactly once. Building a contiguous
+//!   frame buffer first would add a full user-space copy of every byte on the
+//!   hot path.
 //! - One request → one response per connection; connections are pooled on the
 //!   client and served by a thread per connection on the server, so concurrency
 //!   comes from many sockets rather than in-socket multiplexing. This keeps the
@@ -16,7 +20,7 @@
 //!   response : [u32 MAGIC][i32 STATUS][u64 VAL][u32 data_len][data]
 //! STATUS = 0 means success; otherwise it carries a raw errno.
 
-use std::io::{self, Read, Write};
+use std::io::{self, IoSlice, Read, Write};
 
 pub const MAGIC: u32 = 0x5948_4653; // "YHFS"
 
@@ -151,15 +155,59 @@ fn eproto() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "proto: short frame")
 }
 
-/// Write a full request frame.
-pub fn send_request<W: Write>(w: &mut W, op: u8, body: &[u8]) -> io::Result<()> {
-    let mut frame = Vec::with_capacity(9 + body.len());
-    frame.extend_from_slice(&MAGIC.to_be_bytes());
-    frame.push(op);
-    frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
-    frame.extend_from_slice(body);
-    w.write_all(&frame)?;
+/// Write every byte of `slices`, tolerating short writes. `write_vectored` may
+/// consume only part of the list (and a `Write` that does not override it
+/// consumes just the first non-empty slice), so the remainder is retried until
+/// the whole frame is out — the frame is never split across requests.
+fn write_all_vectored<W: Write>(w: &mut W, mut slices: &mut [IoSlice<'_>]) -> io::Result<()> {
+    while !slices.is_empty() {
+        match w.write_vectored(slices) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "proto: vectored write made no progress",
+                ))
+            }
+            Ok(n) => IoSlice::advance_slices(&mut slices, n),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// One `writev` of `hdr` + `parts`, skipping empty slices (a zero-length iovec
+/// is legal but pointless). Shared by the request and response encoders so both
+/// sides of the wire get the same single-copy behaviour.
+fn send_framed<W: Write>(w: &mut W, hdr: &[u8], parts: &[&[u8]]) -> io::Result<()> {
+    let mut iov: Vec<IoSlice<'_>> = Vec::with_capacity(1 + parts.len());
+    iov.push(IoSlice::new(hdr));
+    for p in parts {
+        if !p.is_empty() {
+            iov.push(IoSlice::new(p));
+        }
+    }
+    write_all_vectored(w, &mut iov)?;
     w.flush()
+}
+
+/// Write a full request frame whose body is supplied as `parts`.
+///
+/// This is the bulk path: `OP_WRITE` ships its payload as a borrowed slice, so
+/// the bytes go straight from the caller's buffer into the socket (one kernel
+/// copy) instead of being copied into a frame `Vec` first.
+pub fn send_request_parts<W: Write>(w: &mut W, op: u8, parts: &[&[u8]]) -> io::Result<()> {
+    let blen: usize = parts.iter().map(|p| p.len()).sum();
+    let mut hdr = [0u8; 9];
+    hdr[0..4].copy_from_slice(&MAGIC.to_be_bytes());
+    hdr[4] = op;
+    hdr[5..9].copy_from_slice(&(blen as u32).to_be_bytes());
+    send_framed(w, &hdr, parts)
+}
+
+/// Write a full request frame from one contiguous body.
+pub fn send_request<W: Write>(w: &mut W, op: u8, body: &[u8]) -> io::Result<()> {
+    send_request_parts(w, op, &[body])
 }
 
 /// Read a full request frame -> (op, body).
@@ -188,20 +236,33 @@ pub fn recv_request<R: Read>(r: &mut R) -> io::Result<(u8, Vec<u8>)> {
     Ok((op, body))
 }
 
-/// Write a full response frame.
-pub fn send_response<W: Write>(w: &mut W, status: i32, val: u64, data: &[u8]) -> io::Result<()> {
-    let mut frame = Vec::with_capacity(20 + data.len());
-    frame.extend_from_slice(&MAGIC.to_be_bytes());
-    frame.extend_from_slice(&status.to_be_bytes());
-    frame.extend_from_slice(&val.to_be_bytes());
-    frame.extend_from_slice(&(data.len() as u32).to_be_bytes());
-    frame.extend_from_slice(data);
-    w.write_all(&frame)?;
-    w.flush()
+/// Write a full response frame whose data is supplied as `parts`. The bulk
+/// case is `OP_READ`, where the data slice is the buffer `pread` just filled:
+/// it reaches the socket without an intermediate frame copy.
+pub fn send_response_parts<W: Write>(
+    w: &mut W,
+    status: i32,
+    val: u64,
+    parts: &[&[u8]],
+) -> io::Result<()> {
+    let dlen: usize = parts.iter().map(|p| p.len()).sum();
+    let mut hdr = [0u8; 20];
+    hdr[0..4].copy_from_slice(&MAGIC.to_be_bytes());
+    hdr[4..8].copy_from_slice(&status.to_be_bytes());
+    hdr[8..16].copy_from_slice(&val.to_be_bytes());
+    hdr[16..20].copy_from_slice(&(dlen as u32).to_be_bytes());
+    send_framed(w, &hdr, parts)
 }
 
-/// Read a full response frame -> (status, val, data).
-pub fn recv_response<R: Read>(r: &mut R) -> io::Result<(i32, u64, Vec<u8>)> {
+/// Write a full response frame from one contiguous data slice.
+pub fn send_response<W: Write>(w: &mut W, status: i32, val: u64, data: &[u8]) -> io::Result<()> {
+    send_response_parts(w, status, val, &[data])
+}
+
+/// Parse one response header -> `(status, val, data_len)` without touching the
+/// payload. The two receive paths below use it so the frame layout is decoded in
+/// exactly one place.
+fn recv_response_hdr<R: Read>(r: &mut R) -> io::Result<(i32, u64, usize)> {
     let mut hdr = [0u8; 20];
     r.read_exact(&mut hdr)?;
     let magic = u32::from_be_bytes(hdr[0..4].try_into().unwrap());
@@ -220,9 +281,42 @@ pub fn recv_response<R: Read>(r: &mut R) -> io::Result<(i32, u64, Vec<u8>)> {
             format!("proto: response data_len {dlen} exceeds cap {MAX_FRAME}"),
         ));
     }
+    Ok((status, val, dlen))
+}
+
+/// Read a full response frame -> (status, val, data).
+pub fn recv_response<R: Read>(r: &mut R) -> io::Result<(i32, u64, Vec<u8>)> {
+    let (status, val, dlen) = recv_response_hdr(r)?;
     let mut data = vec![0u8; dlen];
     if dlen > 0 {
         r.read_exact(&mut data)?;
     }
     Ok((status, val, data))
+}
+
+/// Read one response frame's payload STRAIGHT into `dest`, returning
+/// `(status, val, n)` where `n` is the length landed in `dest[..n]`.
+///
+/// `dest` is the caller's final buffer position (a chunk of the read result),
+/// so the payload goes socket -> destination without an intermediate `Vec` and
+/// without the concatenation copy the old slice-then-stitch path needed. A
+/// short payload (server hit EOF) only fills `dest[..n]`; callers that promise
+/// an exactly-`len` slice zero-pad the tail themselves. A payload LARGER than
+/// `dest` is a protocol violation and errors: the socket is then out of sync,
+/// so the caller must drop it (which the error path of every round-trip does).
+pub fn recv_response_into<R: Read>(r: &mut R, dest: &mut [u8]) -> io::Result<(i32, u64, usize)> {
+    let (status, val, dlen) = recv_response_hdr(r)?;
+    if dlen > dest.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "proto: response data_len {dlen} exceeds the {} destination bytes",
+                dest.len()
+            ),
+        ));
+    }
+    if dlen > 0 {
+        r.read_exact(&mut dest[..dlen])?;
+    }
+    Ok((status, val, dlen))
 }

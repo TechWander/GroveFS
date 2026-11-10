@@ -144,13 +144,24 @@ impl RemoteBackend {
 
     /// Send a write-intent op: prepend the live fencing epoch, and on an `EROFS`
     /// fence verdict refresh the epoch from the authority once and retry. Reads
-    /// never route through here (they carry no epoch). All `payload` bytes are
-    /// exactly the pre-epoch body `dispatch` expects.
+    /// never route through here (they carry no epoch).
     fn round_trip_write(&self, op: u8, payload: &[u8]) -> io::Result<(i32, u64, Vec<u8>)> {
-        let mut body = Vec::with_capacity(8 + payload.len());
-        proto::put_u64(&mut body, self.fence_epoch.load(Ordering::SeqCst));
-        body.extend_from_slice(payload);
-        let first = self.round_trip(op, &body)?;
+        self.round_trip_write_parts(op, &[payload])
+    }
+
+    /// [`Self::round_trip_write`] for a body supplied as slices: the epoch is
+    /// prepended as a separate part, so a bulk `OP_WRITE` payload is never
+    /// copied just to make room for the 8-byte prologue.
+    fn round_trip_write_parts(
+        &self,
+        op: u8,
+        parts: &[&[u8]],
+    ) -> io::Result<(i32, u64, Vec<u8>)> {
+        let epoch = self.fence_epoch.load(Ordering::SeqCst).to_be_bytes();
+        let mut framed: Vec<&[u8]> = Vec::with_capacity(parts.len() + 1);
+        framed.push(&epoch);
+        framed.extend_from_slice(parts);
+        let first = self.round_trip_parts(op, &framed)?;
         if first.0 != EROFS {
             return Ok(first);
         }
@@ -160,10 +171,11 @@ impl RemoteBackend {
         // the caller surfaces a read-only error until it fails over.
         let fresh = (self.fence_refresh)();
         self.fence_epoch.store(fresh, Ordering::SeqCst);
-        let mut body2 = Vec::with_capacity(8 + payload.len());
-        proto::put_u64(&mut body2, fresh);
-        body2.extend_from_slice(payload);
-        self.round_trip(op, &body2)
+        let epoch2 = fresh.to_be_bytes();
+        let mut framed2: Vec<&[u8]> = Vec::with_capacity(parts.len() + 1);
+        framed2.push(&epoch2);
+        framed2.extend_from_slice(parts);
+        self.round_trip_parts(op, &framed2)
     }
 
     /// Borrow a connection: prefer a warm pooled socket (`reused = true`), else
@@ -249,42 +261,81 @@ impl RemoteBackend {
     /// transparently. A failure on a socket we just opened is propagated (there
     /// is nothing left to retry against).
     fn round_trip(&self, op: u8, body: &[u8]) -> io::Result<(i32, u64, Vec<u8>)> {
+        self.round_trip_parts(op, &[body])
+    }
+
+    /// [`Self::round_trip`] with the body supplied as slices, so a bulk payload
+    /// rides in the same `writev` as the header instead of being copied into a
+    /// frame buffer first.
+    fn round_trip_parts(&self, op: u8, parts: &[&[u8]]) -> io::Result<(i32, u64, Vec<u8>)> {
+        self.with_socket(rtt_stage(op), |s| {
+            let r = Self::call_parts(s, op, parts)?;
+            self.note_refusal(&r);
+            Ok(r)
+        })
+    }
+
+    /// [`Self::round_trip_parts`] with the response payload read STRAIGHT into
+    /// `dest`, returning `(status, val, n)` (see
+    /// [`proto::recv_response_into`]). This is the chunked-read path: each slice
+    /// lands in its final position of the caller's buffer, so the payload is
+    /// never staged in a `Vec` and then copied again to be stitched.
+    fn round_trip_parts_into(
+        &self,
+        op: u8,
+        parts: &[&[u8]],
+        dest: &mut [u8],
+    ) -> io::Result<(i32, u64, usize)> {
+        self.with_socket(rtt_stage(op), |s| {
+            let r = Self::call_parts_into(s, op, parts, dest)?;
+            if r.0 == EACCES {
+                // Same live-revoke verdict the Vec path reports; the refusal text
+                // is the short payload we just landed at the front of `dest`.
+                self.note_refusal(&(r.0, r.1, dest[..r.2].to_vec()));
+            }
+            Ok(r)
+        })
+    }
+
+    /// Shared send/recv skeleton for every round trip: borrow a pooled socket,
+    /// run `call`, return the socket on success.
+    ///
+    /// Resilience lives here so all callers inherit it: a *reused* pooled socket
+    /// that fails at the transport level means the data-server restarted and the
+    /// pool is stale — wipe it, reconnect, and retry exactly once. A failure on
+    /// a socket we just opened is propagated (nothing left to retry against).
+    fn with_socket<T>(
+        &self,
+        stage: stats::Stage,
+        mut call: impl FnMut(&mut TcpStream) -> io::Result<T>,
+    ) -> io::Result<T> {
         let (mut s, reused) = {
             let _t = stats::start(stats::Stage::IoRemotePoolWait);
             self.get_conn()?
         };
-        let rtt = match op {
-            proto::OP_WRITE => stats::Stage::IoRemoteWrite,
-            proto::OP_LEN => stats::Stage::IoRemoteLen,
-            _ => stats::Stage::IoRemoteRead,
-        };
         let first = {
-            let _t = stats::start(rtt);
-            Self::call(&mut s, op, body)
+            let _t = stats::start(stage);
+            call(&mut s)
         };
         match first {
             Ok(r) => {
-                self.note_refusal(&r);
                 self.put_conn(s);
                 Ok(r)
             }
             Err(first_err) => {
                 drop(s); // never hand a dead socket back to the pool
                 if !reused {
-                    // Just-opened socket failed: the peer is really down.
                     return Err(first_err);
                 }
                 // Reused socket failed => stale pool. Clear it, reconnect, retry once.
                 self.pool.lock().clear();
                 let (mut s2, _) = self.connect_fresh()?;
-                match Self::call(&mut s2, op, body) {
-                    Ok(r) => {
-                        self.note_refusal(&r);
-                        self.put_conn(s2);
-                        Ok(r)
-                    }
-                    Err(e2) => Err(e2),
-                }
+                let r = {
+                    let _t = stats::start(stage);
+                    call(&mut s2)
+                }?;
+                self.put_conn(s2);
+                Ok(r)
             }
         }
     }
@@ -305,73 +356,94 @@ impl RemoteBackend {
 
     /// One send + one recv on a borrowed socket.
     fn call(s: &mut TcpStream, op: u8, body: &[u8]) -> io::Result<(i32, u64, Vec<u8>)> {
-        proto::send_request(s, op, body)?;
+        Self::call_parts(s, op, &[body])
+    }
+
+    /// One send + one recv on a borrowed socket, body supplied as slices.
+    fn call_parts(
+        s: &mut TcpStream,
+        op: u8,
+        parts: &[&[u8]],
+    ) -> io::Result<(i32, u64, Vec<u8>)> {
+        proto::send_request_parts(s, op, parts)?;
         proto::recv_response(s)
     }
 
-    /// One `OP_READ` slice, on its own pooled connection. Short reads (EOF)
-    /// zero-pad to the full slice length so stitched results keep the same
-    /// exactly-`len` semantics as the single-request path.
-    fn read_slice(&self, key: &str, offset: u64, len: usize) -> io::Result<Vec<u8>> {
-        let mut body = Vec::new();
+    /// One send + one recv on a borrowed socket, landing the payload in `dest`.
+    fn call_parts_into(
+        s: &mut TcpStream,
+        op: u8,
+        parts: &[&[u8]],
+        dest: &mut [u8],
+    ) -> io::Result<(i32, u64, usize)> {
+        proto::send_request_parts(s, op, parts)?;
+        proto::recv_response_into(s, dest)
+    }
+
+    /// One `OP_READ` slice read STRAIGHT into `dest` (its final position in the
+    /// caller's buffer), on its own pooled connection. Short reads (EOF)
+    /// zero-pad `dest[n..]`, preserving the exactly-`len` slice semantics the
+    /// previous Vec-then-resize path had.
+    fn read_into(&self, key: &str, offset: u64, dest: &mut [u8]) -> io::Result<()> {
+        let mut body = Vec::with_capacity(2 + key.len() + 12);
         proto::put_key(&mut body, key);
         proto::put_u64(&mut body, offset);
-        proto::put_u32(&mut body, len as u32);
-        let (status, _, mut data) = self.round_trip(proto::OP_READ, &body)?;
+        proto::put_u32(&mut body, dest.len() as u32);
+        let (status, _, n) = self.round_trip_parts_into(proto::OP_READ, &[&body], dest)?;
         if status != 0 {
             return Err(io::Error::from_raw_os_error(status));
         }
-        data.resize(len, 0);
-        Ok(data)
+        // A stale-pool retry may have left bytes from the failed attempt behind
+        // `n`; a short tail must read as zeros, not as stale payload.
+        dest[n..].fill(0);
+        Ok(())
     }
 
     /// Parallel large read: [offset, offset+len) sliced at READ_CHUNK, each
-    /// slice fetched concurrently over the connection pool via scoped threads,
-    /// concatenated in offset order. Any failed slice fails the whole read
-    /// (each slice already enjoyed its own one-shot stale-pool retry inside
-    /// `round_trip`).
+    /// slice fetched concurrently over the connection pool via scoped threads.
+    /// Every slice is read DIRECTLY into its slot of one `len`-byte result
+    /// buffer — the boundaries are exactly `out.chunks_mut(READ_CHUNK)`, so no
+    /// per-slice `Vec` and no stitching copy exist. Any failed slice fails the
+    /// whole read (each slice already enjoyed its own one-shot stale-pool retry
+    /// inside [`Self::round_trip_parts_into`]).
     fn read_chunked(&self, key: &str, offset: u64, len: usize) -> io::Result<Vec<u8>> {
         let _t = stats::start(stats::Stage::IoRemoteChunked);
-        let slices: Vec<(u64, usize)> = (0..len)
-            .step_by(READ_CHUNK)
-            .map(|i| (offset + i as u64, (len - i).min(READ_CHUNK)))
-            .collect();
-        // Each worker returns its own indexed pieces (stride-partitioned, so
-        // slots are disjoint) — no shared mutable state, no lock on the hot path.
-        let slices = &slices;
-        let stitched = thread::scope(|sc| {
-            let nworkers = slices.len().min(MAX_PARALLEL_SLICES);
+        let mut out = vec![0u8; len];
+        let nslices = len.div_ceil(READ_CHUNK);
+        let nworkers = nslices.min(MAX_PARALLEL_SLICES);
+        // Hand each worker the slots it will fill at its own stride — the same
+        // partition the old slice list used, so per-worker ordering (and which
+        // error surfaces first) is unchanged.
+        let mut groups: Vec<Vec<(usize, &mut [u8])>> = (0..nworkers).map(|_| Vec::new()).collect();
+        for (i, chunk) in out.chunks_mut(READ_CHUNK).enumerate() {
+            groups[i % nworkers].push((i, chunk));
+        }
+        let first_err = thread::scope(|sc| {
             let mut handles = Vec::with_capacity(nworkers);
-            for w in 0..nworkers {
+            for group in groups {
                 handles.push(sc.spawn(move || {
-                    let mut mine: Vec<(usize, Vec<u8>)> = Vec::new();
-                    let mut res: Option<io::Error> = None;
-                    for i in (w..slices.len()).step_by(nworkers) {
-                        let (soff, slen) = slices[i];
-                        match self.read_slice(key, soff, slen) {
-                            Ok(data) => mine.push((i, data)),
-                            Err(e) => {
-                                if res.is_none() {
-                                    res = Some(e);
-                                }
-                            }
+                    let mut first: Option<io::Error> = None;
+                    for (i, dest) in group {
+                        let soff = offset + (i * READ_CHUNK) as u64;
+                        if let Err(e) = self.read_into(key, soff, dest) {
+                            // One bad slice fails the whole read; stop issuing
+                            // the rest of this worker's slices.
+                            first = Some(e);
+                            break;
                         }
                     }
-                    (mine, res)
+                    first
                 }));
             }
             let mut first_err: Option<io::Error> = None;
-            let mut all: Vec<(usize, Vec<u8>)> = Vec::with_capacity(slices.len());
             for h in handles {
                 match h.join() {
-                    Ok((mine, maybe_err)) => {
-                        all.extend(mine);
-                        if let Some(e) = maybe_err {
-                            if first_err.is_none() {
-                                first_err = Some(e);
-                            }
+                    Ok(Some(e)) => {
+                        if first_err.is_none() {
+                            first_err = Some(e);
                         }
                     }
+                    Ok(None) => {}
                     // A worker panicked (outside our control): surface EIO
                     // rather than pretending EOF.
                     Err(_) => {
@@ -381,20 +453,12 @@ impl RemoteBackend {
                     }
                 }
             }
-            match first_err {
-                Some(e) => Err(e),
-                None => Ok(all),
-            }
-        })?;
-        let mut stitched = stitched;
-        // Workers returned their pieces interleaved by their own stride order;
-        // sort by slice index so the concatenation is exactly offset-ordered.
-        stitched.sort_by_key(|(i, _)| *i);
-        let mut out = Vec::with_capacity(len);
-        for (_, d) in stitched {
-            out.extend_from_slice(&d);
+            first_err
+        });
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(out),
         }
-        Ok(out)
     }
 
     /// Parallel large write: data sliced at WRITE_CHUNK, slices shipped
@@ -459,13 +523,14 @@ impl RemoteBackend {
     }
 
     /// Single `OP_WRITE` for one slice (used by the chunked path; the public
-    /// `write` entry routes here directly for small payloads).
+    /// `write` entry routes here directly for small payloads). The key/offset
+    /// prologue is a tiny buffer; the payload slice is shipped as its own
+    /// part, so its bytes are never copied client-side.
     fn write_one(&self, key: &str, offset: u64, data: &[u8]) -> io::Result<usize> {
-        let mut body = Vec::with_capacity(2 + key.len() + 8 + data.len());
-        proto::put_key(&mut body, key);
-        proto::put_u64(&mut body, offset);
-        body.extend_from_slice(data);
-        let (status, val, _) = self.round_trip_write(proto::OP_WRITE, &body)?;
+        let mut head = Vec::with_capacity(2 + key.len() + 8);
+        proto::put_key(&mut head, key);
+        proto::put_u64(&mut head, offset);
+        let (status, val, _) = self.round_trip_write_parts(proto::OP_WRITE, &[&head, data])?;
         if status != 0 {
             return Err(io::Error::from_raw_os_error(status));
         }
@@ -527,15 +592,7 @@ impl StorageBackend for RemoteBackend {
         if data.len() >= CHUNKED_WRITE_MIN {
             return self.write_chunked(key, offset, data);
         }
-        let mut body = Vec::with_capacity(2 + key.len() + 8 + data.len());
-        proto::put_key(&mut body, key);
-        proto::put_u64(&mut body, offset);
-        body.extend_from_slice(data);
-        let (status, val, _) = self.round_trip_write(proto::OP_WRITE, &body)?;
-        if status != 0 {
-            return Err(io::Error::from_raw_os_error(status));
-        }
-        Ok(val as usize)
+        self.write_one(key, offset, data)
     }
 
     fn len(&self, key: &str) -> io::Result<u64> {
@@ -608,6 +665,16 @@ fn status_to_io(status: i32) -> io::Result<()> {
         } else {
             status
         }))
+    }
+}
+
+/// Which `--stats` stage a round trip is booked under, by opcode (the same
+/// mapping every round trip used before the paths were unified).
+fn rtt_stage(op: u8) -> stats::Stage {
+    match op {
+        proto::OP_WRITE => stats::Stage::IoRemoteWrite,
+        proto::OP_LEN => stats::Stage::IoRemoteLen,
+        _ => stats::Stage::IoRemoteRead,
     }
 }
 
