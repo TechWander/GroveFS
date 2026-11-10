@@ -113,12 +113,21 @@ fn probe_of_existing_pg_view_walks_it_without_mutating_the_view_set() {
     );
 
     // Leave the shared database as we found it.
+    //
+    // `DROP SCHEMA ... CASCADE` alone is NOT that: the cross-view ledger
+    // `grovefs_refs.holders` is a global table with no view column, so the
+    // cascade deletes the tree and leaves this view's bookings behind, one row
+    // per object it named (a zero-byte file books too). The rule lives in
+    // `rebuild_ledger` for the SQLite store (src/meta/engine.rs:1174) and in
+    // `.bneck/pg_drop_views.sh` for PG; here it is the same two statements.
+    let schema = schema_name_for(&view);
     Client::connect(&uri, NoTls)
         .expect("connect to drop the test schema")
         .batch_execute(&format!(
-            "DROP SCHEMA IF EXISTS {} CASCADE",
-            schema_name_for(&view)
+            "DELETE FROM grovefs_refs.holders
+               WHERE data_ref IN (SELECT nullif(data_ref, '') FROM \"{schema}\".node);
+             DROP SCHEMA IF EXISTS {schema} CASCADE"
         ))
-        .expect("drop the test schema");
+        .expect("unbook and drop the test schema");
     assert_eq!(store.list_physical().unwrap(), before);
 }

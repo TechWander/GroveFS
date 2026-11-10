@@ -37,8 +37,8 @@ grep -nE '[0-9](\.[0-9]+)?(s|ms|分钟|倍)[^a-zA-Z]{0,3}(→|->|降到|提到)|
 
 # ---------- 2. 参数对账 ----------
 say "2. 参数对账(文档里的 --xxx 是否真存在于 --help)"
-real=$(mktemp); docf=$(mktemp); seen=$(mktemp); dtxt=$(mktemp); neg=$(mktemp)
-trap 'rm -f "$real" "$docf" "$seen" "$dtxt" "$neg"' EXIT
+real=$(mktemp); docf=$(mktemp); seen=$(mktemp); dtxt=$(mktemp); neg=$(mktemp); recs=$(mktemp)
+trap 'rm -f "$real" "$docf" "$seen" "$dtxt" "$neg" "$recs"' EXIT
 orph=/tmp/grovefs-doc-orphan-flags.txt
 : > "$seen"
 # 递归走 help 树:根 → 每个子命令 → 孙命令(view create 之类)。
@@ -61,8 +61,20 @@ walk() {
 if [ -x "$BIN" ]; then
   walk ""
   sort -u -o "$real" "$real"
-  # 文档侧:先剥掉 docs.html 的 <style> 块(CSS 自定义属性 --accent/--card/… 不是参数)
-  for f in "${DOCS[@]}"; do sed '/<style>/,/<\/style>/d' "$f"; done > "$dtxt"
+  # 文档侧:先剥掉 docs.html 的 <style> 块(CSS 自定义属性 --accent/--card/… 不是参数),
+  # 再剥掉**讲运维配方那一行**——配方脚本(`.bneck/*.sh`)的选项(`--yes`/`--list`/
+  # `--rebuild-ledger`/`--no-drop`…)是配方的接口,不是 grovefs 的接口,列进 FOREIGN
+  # 白名单等于放行今后任何同名臆造参数(`yes`、`list` 都是通用词),按行识别比按名字豁免准确。
+  # 识别按脚本 basename 而不是完整路径:散文里常只写短名(如「`pg_drop_views.sh --rebuild-ledger`
+  # 的干跑预演」),写全路径的行只是多数情况。
+  # 已知代价:与配方脚本同行的 grovefs 臆造参数不会被这条规则抓到(同一行才剥)。
+  for s in "$ROOT"/.bneck/*.sh; do [ -e "$s" ] && basename "$s"; done > "$recs"
+  if [ -s "$recs" ]; then
+    for f in "${DOCS[@]}"; do sed '/<style>/,/<\/style>/d' "$f"; done \
+      | grep -vF -f "$recs" > "$dtxt"
+  else
+    for f in "${DOCS[@]}"; do sed '/<style>/,/<\/style>/d' "$f"; done > "$dtxt"
+  fi
   grep -oE -- '--[a-z][a-z0-9-]*' "$dtxt" | sed 's/^--//' | sort -u > "$docf"
   # 负空间清单(明说「未实现」的那几行)里点名的参数不算臆造
   grep -hE '未实现|别在当前版本上期待' "${DOCS[@]}" 2>/dev/null \
@@ -70,7 +82,7 @@ if [ -x "$BIN" ]; then
   comm -23 "$docf" "$real" > "$orph"
   comm -23 "$orph" "$neg" > "${orph}.2" && mv "${orph}.2" "$orph"
   # 噪声两类:别家工具的参数(rsync/cargo/systemd/journalctl/firewalld/pg_dump/fdbcli…),
-  # 以及文档里的占位与通配写法(--xxx、--bw-*)。
+  # 以及文档里的占位与通配写法(--xxx、--bw-*)。运维配方的选项不在这里,见上面的按行剥离。
   FOREIGN='delete-after|delete-before|delete-during|exclude|include|inplace|info|progress|partial|times|whole-file|verbose|release|nocapture|bench|features|ignored|now|since|until|no-pager|reload|enable|disable|status|full|state|format|permanent|add-rich-rule|zone|type|set-profile|daemon-reload|json-pretty|exec|xxx|bw-'
   nf=$(grep -cvE "^($FOREIGN)$" "$orph" || true)
   printf '  真实参数 %d 个,文档参数 %d 个,差集 %d 项(其中非外部工具/非负空间 %d 项)\n' \

@@ -1070,6 +1070,75 @@ CLI 删除路径**，而 `bench_g3.sh` 和 `pg` 套件都是"每单元一个视�
 两行 `holders=5`、形态不是对象 UUID（像是控制键），盲目"删除所有未被引用行"会把它们一起清掉，所以
 本层不下这一刀，只把数量和形态记在这里。
 
+### v2.7（把 v2.6 记下却没下刀的那一事做了，并且顺手把还在漏的龙头关掉）
+
+v2.6 留的那 807,246 行，本轮先按纪律把**语义**查实，再动手，最后回头发现真正的重点不在
+那 80 万行，而在「谁还在往里漏」。
+
+**语义出处**（三处，全部读源码而不是推）：
+
+- `rebuild_ledger()`（`src/meta/engine.rs:1174`，写侧 `:1205-1238`）：一个 IMMEDIATE 事务里
+  **`DELETE FROM holders` 全清**，再逐棵存活树 `SELECT DISTINCT data_ref FROM node WHERE
+  data_ref IS NOT NULL` 并对每个 `data_ref` 计 `+1`。它**不保留任何无树留名的行**，也没有
+  「控制键例外」这一分支——所以 `KX`/`K2` 按定义也该消失。
+- 读侧：`grovefs_refs.holders` 在 `src/pg_store.rs` 只有 4 处引用（建表 + inc/dec/delete），
+  **没有一处 SELECT**；判定只发生在 unlink 时的 decrement。而 `gc` 对 `postgres://` 与
+  `fdb://` 启动即拒（`src/main.rs:2709`），所以没有任何离线路径读这些行。
+- 风险方向：`USAGE.md` §5.3 与 `:2900` 都已写明，过计只会**多留字节**，从不误删；「无行即该
+  视图私有」。⇒ 按存活树 DISTINCT 重算是安全语义，不存在「重算误放」方向。
+
+而 `KX`/`K2` 的来历，**v2.1 已经记对了**（`:804`）：harness 收尾时 `/f0`(K2) 与 `/x`(KX)
+还活着却走 `DROP SCHEMA CASCADE`，删名不销账，每跑一轮 +1。本轮在源码里找不到 `KX`/`K2`
+字面量不是待查的疑点，而是它们本就是测试自造键。
+
+**实现**：`pg_drop_views.sh` 加 `--rebuild-ledger`（等值 SQL，PG 侧没有 CLI 入口）与
+`--no-drop`（只重算不删树）；干跑会报「N 棵存活树订了 M 个对象，现在台账有 K 行，其中 K-M
+行无树留名」，先把结论摆在动手前。
+
+**两个真 bug 是 fixture 抽出来的，不是读代码读出来的**（`.bneck/pg_rebuild_fixture.sh`，自带
+一次性 `initdb` 小集群，因为本机 `grove` 角色无 `CREATEDB`）：
+
+1. `subquery in FROM must have an alias`——预演那条聚合少了外层别名；
+2. `syntax error at or near "-"`——快照表名用 `date +%Y%m%d-%H%M%S`，而未加引号的 PG 标识符
+   不能含 `-`。这一条**本来会直接砸在真库上**，只因两条语句在同一事务里才无损。
+
+fixture 五档全绿（账本故意播错）：`R1=1`（树内两个名字只计一次）、`R2=2`（两树共享）、
+`R3=1`、`ORPHAN` 消失、NULL/`''` 跳过、无树时归 0、重跑幂等。**为什么需要 scratch 集群**：
+真库当时 0 棵存活树，跑重算只能证明「会清空」，证不了那条 `INSERT … count(*) GROUP BY`。
+
+**顺手关掉三处还在漏的龙头**（否则本周就得再清一次）：`test_engine_evict.sh`、
+`test_control.sh`、`tests/mcp_probe_ro.rs` 备注里写的是「leave PG as we found it」，实际各自
+在收尾裸跑 `DROP SCHEMA … CASCADE`，注释与行为不符，每跑一轮漏一批无树行。前两个改为
+调用 `.bneck/pg_drop_views.sh` 并传入视图名（规则只有一份，与 `bench_g3.sh` 同一入口），
+Rust 那个就地先按该 schema 的 `node.data_ref` 删台账行、再 drop。
+`tests/fdb_tree.rs` 早在 v2.1 那轮已用 `release_ledger()` 修过，本轮核对后归为历史残留。
+
+**还挖出一处假绿**：`test_pg.sh`/`test_pg_parallel.sh` 把端口钉在 `PGPORT:-5432`，而本机 PG 在
+5433，于是两轮都是 `SKIP=1 pass=0`，板子却报 `PASS`——上一轮的「功能复验」其实什么都没跑。改成
+像 `test_control.sh` 那样探 5432 再探 5433（显式 `PGPORT` 仍优先），跳过的套件不再能伪装成绿。
+
+**账单**（均本机实测）：真库重算 `807,246 → 0` 行（重算前 `sum(holders)=807,254`，多出的 8
+恰为 `:804` 已归因的 `KX`/`K2` 那两行各计到 5）；四支套件复跑 pg 18/0、pg_parallel 40/0、
+evict 7/0、control 16/0（`RESULT: GREEN` 且 `pass` 非 0）；跑完台账 48 行、存活树恰好 48 个
+DISTINCT 对象，**无树留名 0 行**——这是龙头关掉后唯一需要的判据；再走 pattern 清理后 0/0。
+快照表 `holders_bak_*`（一个 807,246 行 59 MB、一个 0 行）在对账成立后手工 drop：它们记的就是
+泄漏本身，回滚点留着它自己就是新的残留。库 **242 → 148 → 77 MB**。`tests/mcp_probe_ro.rs` 单独
+以 `GROVEFS_TEST_PG_URI` 跑 5433：2/2 通过且留下 schemas=0、rows=0。
+
+**文字同步**：`USAGE.md` 原 §15.8 第 3 步与第 1203 行那两句正在**教人跑会漏账的裸
+ `DROP SCHEMA`**，已改成先销账再 drop 的配方并讲清两步为何必须成对；§5.3 与 §15.9 的「PG 侧没有
+ `refs rebuild`」保留「不是 CLI」的口径，但指向新配方；§3.4.3 的守卫④与 §15.16 报错对症表里
+「手工 `DROP SCHEMA`」那两格同理。`docs.html` 是同一份口径的镜像，它当时仍在教那条裸命令（§5.9
+ 两处表格、§14.8.3 守卫④、§13.3 账本段、§16.8 与顶部导航、报错对症表共八处），按它自己的章节号
+ 体系统一改到 §13.3；引用里不写源码行号（`engine.rs:1174` 改成 `engine.rs` 里的 `rebuild_ledger`）——
+ 行号是最先坏掉的那种精度。判据面：`doccheck.sh` 的参数对账一开始把配方自己的选项
+（`--yes`/`--list`/`--rebuild-ledger`/`--no-drop`）当臆造的 grovefs 参数报红。没把它们塞进 FOREIGN
+ 白名单——`yes`、`list` 都是通用词，豁免一个名字等于放行今后任何同名臆造——而改成**按行剥离讲运维
+ 配方的行**：识别按 `.bneck/*.sh` 的 basename（散文里常只写短名 `pg_drop_views.sh --rebuild-ledger`，
+ 只匹配全路径会漏），已知代价是与配方脚本同行的 grovefs 臆造参数不再被这条规则抓到。改完全板
+ `doccheck.sh` EXIT=0（真实参数 70 / 文档参数 90 / 差集 19 项全部归为外部工具、占位或负空间）。仍然没做：`refs rebuild` 本身没进 CLI
+（R3 口径：不新增后端承诺），它只是一个运维配方。
+
 ## 15. 决策门处置（G1–G4 与 R5，逐门留证）
 
 计划把生死判定放在阶段末的决策门上。每个门的处置只有三种合法写法：**判过并留下证据**、

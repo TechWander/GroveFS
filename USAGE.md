@@ -968,7 +968,7 @@ $ grovefs view --meta-dir .home rm --name alice --base
 removed base view 'alice': 2 node(s) gone, 2 blob reference(s) dropped, 2 object(s) freed from .home/blocks, 0 still held by other views
 ```
 
-**四重守卫**(任一命中即拒,树分毫不删):① 该名字被定义治理(是派生/别名/fork 的定义槽)——先跑不带 `--base` 的 `view rm` 删定义;② 仍有别名/透镜/fork **定义**经此基解析(否则删基会让那棵挂载悬空),报 `view 'lens1' is governed by a definition over base 'alice' — remove it first`;③ 本机 `/proc/mounts` 里有 `grovefs:<V>` 活挂载,报 `view 'alice' is mounted here at …  — unmount it first`(**其他机器**对同一 meta-server 的挂载本机看不到,须自行先停);④ `--meta-store postgres://…` 部署直接拒(基树是 PG schema,字节由 PG/data-server 自持,走 `DROP SCHEMA … CASCADE`)。
+**四重守卫**(任一命中即拒,树分毫不删):① 该名字被定义治理(是派生/别名/fork 的定义槽)——先跑不带 `--base` 的 `view rm` 删定义;② 仍有别名/透镜/fork **定义**经此基解析(否则删基会让那棵挂载悬空),报 `view 'lens1' is governed by a definition over base 'alice' — remove it first`;③ 本机 `/proc/mounts` 里有 `grovefs:<V>` 活挂载,报 `view 'alice' is mounted here at …  — unmount it first`(**其他机器**对同一 meta-server 的挂载本机看不到,须自行先停);④ `--meta-store postgres://…` 部署直接拒(基树是 PG schema,字节由 PG/data-server 自持,删除走 §15.8 的 `bash .bneck/pg_drop_views.sh --yes <视图名>`——它先销账再 `DROP SCHEMA … CASCADE`)。
 
 **最后一个命名者死才释放**:fork 的 blob 引用来自基视图自己的 key、账本 hold>1,删基时那些仍被 fork 命名的字节**一个都不能动**;只有当基与所有依赖定义都消失、账本再无持有者时字节才真正回收。条带 key `s<N>:<stripe>:<uuid>` 活在 data-server 上,普通本地根无法回收——诚实计入 failed 并跳过,绝不半删。**MCP 边界**:`remove_view` 是控制面 only(等价不带 `--base` 的 `view rm`),删整基视图只经 CLI——接口从不碰数据字节。
 
@@ -1200,7 +1200,7 @@ $Y mount --view alice \
 >
 > **正交的另一把锁是把 key 绑到视图**：`apikey create --view team` 的 key 去挂别的名字，在**绑定检查**处就被拒（比存在性检查更早），实测 `permission denied: this api key is bound to view 'team', not 'ghost3'`，同样不建树。分工：存在性检查管「这个名字在不在」，绑定 key 管「这个调用方能开哪一棵」。
 >
-> 清理误建的空树（先 `umount` 所有该名字的挂载）：裸基视图（无定义的物理树）用 `grovefs view --meta-dir D rm --name <base> --base` 一条命令删——它删 `meta/<base>.db`(+WAL/SHM)、`refs rebuild` 重算账本、并回收无其他视图持有的字节（§3.4.3）。手工等价路径：`rm -f meta/<name>.db meta/<name>.db-wal meta/<name>.db-shm` 后 `grovefs refs --meta-dir D rebuild`；PG 后端 `DROP SCHEMA "grovefs_v_<hex>" CASCADE`（§15.8，`--base` 在 PG 部署直接拒绝，字节由 data-server/PG 自持）。
+> 清理误建的空树（先 `umount` 所有该名字的挂载）：裸基视图（无定义的物理树）用 `grovefs view --meta-dir D rm --name <base> --base` 一条命令删——它删 `meta/<base>.db`(+WAL/SHM)、`refs rebuild` 重算账本、并回收无其他视图持有的字节（§3.4.3）。手工等价路径：`rm -f meta/<name>.db meta/<name>.db-wal meta/<name>.db-shm` 后 `grovefs refs --meta-dir D rebuild`；PG 后端走 §15.8 第 3 步的 `bash .bneck/pg_drop_views.sh --yes <视图名>`——它**先销账再** `DROP SCHEMA … CASCADE`（单跑裸 `DROP SCHEMA` 会在无 view 列的全局账本里留下孤儿行；`--base` 在 PG 部署直接拒绝，字节由 data-server/PG 自持）。
 
 ### 4.1 多机共享到底需要 PG 吗？——上手选型
 
@@ -1289,7 +1289,7 @@ $Y mount --view alice \
 ### 5.3 删除 / GC
 
 - `unlink`(删除文件)后,视图解除引用,后端据 key 尽力删全部分块;条带 remove 会展开删所有 chunk,**幂等**(残留块可被 GC 清)。
-- **跨视图共享对象的引用账本 `refs`**:一个 `data_ref` 命名唯一一个底层对象,却可能被多个物理视图同时挂着名字(`view fork` 与 `view export/import --as-fork` 复制同一批 `data_ref`、派生视图/别名共享基视图字节;而 `grovefs import` 把同一源文件导进两个视图时各得一个**独立 key**——两处 `blocks/` 都是源文件的硬链接,字节仍是同一 inode、零额外占用,但账本按 key 分别计数)。视图内的引用计数看不见别的视图,单看它会误删他视图仍在引用的对象。故记账落在 `<base>/meta/refs.db`(PG 后端落共享表 `grovefs_refs.holders`):每个视图 ATTACH 该账本,holder 计数与节点增删进**同一个 IMMEDIATE 事务**,跨文件原子提交。物理删除的准确规则是「**该视图内此 key 的最后一个名字被摘除、且全局账本再无其它视图持有**」——只有此时才 `backend.remove`。视图 db 被 out-of-band 删除(`rm meta/x.db`、新 `--home`)只会让账本**高估**、对象多留不误删;`grovefs refs --meta-dir D rebuild` 按现存视图树重算 holder 归位(SQLite 后端专用)。账本里没有行的键即该视图私有(空账本不需要任何初始化步骤)。
+- **跨视图共享对象的引用账本 `refs`**:一个 `data_ref` 命名唯一一个底层对象,却可能被多个物理视图同时挂着名字(`view fork` 与 `view export/import --as-fork` 复制同一批 `data_ref`、派生视图/别名共享基视图字节;而 `grovefs import` 把同一源文件导进两个视图时各得一个**独立 key**——两处 `blocks/` 都是源文件的硬链接,字节仍是同一 inode、零额外占用,但账本按 key 分别计数)。视图内的引用计数看不见别的视图,单看它会误删他视图仍在引用的对象。故记账落在 `<base>/meta/refs.db`(PG 后端落共享表 `grovefs_refs.holders`):每个视图 ATTACH 该账本,holder 计数与节点增删进**同一个 IMMEDIATE 事务**,跨文件原子提交。物理删除的准确规则是「**该视图内此 key 的最后一个名字被摘除、且全局账本再无其它视图持有**」——只有此时才 `backend.remove`。视图 db 被 out-of-band 删除(`rm meta/x.db`、新 `--home`)只会让账本**高估**、对象多留不误删;`grovefs refs --meta-dir D rebuild` 按现存视图树重算 holder 归位(SQLite 后端专用；PG 后端的等值配方是 `.bneck/pg_drop_views.sh --rebuild-ledger`，逐条对位 `src/meta/engine.rs` 里的 `rebuild_ledger`，见 §15.8)。账本里没有行的键即该视图私有(空账本不需要任何初始化步骤)。
 
 ### 5.4 备份与迁移
 
@@ -2625,7 +2625,7 @@ GC 语义(源码保证):对象只在**最后一个引用它的目录项**消失�
 前面各节按**机制**讲，本节按**你要干的事**给最短可执行序列。约定：
 
 - `G=grovefs`（换成你的二进制路径，如 `/usr/local/bin/grovefs`）；地址统一写 `10.0.0.10`，端口 `50100`（数据）/`50110`（元数据）/`5432`（PG）——换成你的即可；
-- PG 各节在本机 PostgreSQL 12 上**逐条实跑**过（建库、起服务、挂载、巡检 SQL、`pg_dump` + 新库恢复、`DROP SCHEMA`、以及下文引用的每一句拒绝原文），跨挂载 `rsync -aH` 也在两个本地挂载之间验证过硬链接与增量；实测端口 5433，正文写标准 5432，差别只在端口；
+- PG 各节在本机 PostgreSQL 12 上**逐条实跑**过（建库、起服务、挂载、巡检 SQL、`pg_dump` + 新库恢复、`.bneck/pg_drop_views.sh` 的销账 + `DROP SCHEMA`、以及下文引用的每一句拒绝原文），跨挂载 `rsync -aH` 也在两个本地挂载之间验证过硬链接与增量；实测端口 5433，正文写标准 5432，差别只在端口；
 - 每条场景末尾都有一行**验收命令**，跑出预期结果再往下走，别攒到最后一起查；
 - 机制细节不在这里重复，表里给交叉引用。
 
@@ -2888,17 +2888,25 @@ $G umount -m /mnt/demo
 $G view --meta-dir /data/cluster rm --name demo
 #   error: no view definition 'demo' under /data/cluster/meta/views
 
-# 3) 手工 DROP(schema 名 = grovefs_v_ + hex(视图名))
-sudo -u postgres psql -d grovefs -c 'DROP SCHEMA "grovefs_v_64656d6f" CASCADE'
-#   NOTICE: drop cascades to table ...node / ...ctrl / ...locks
+# 3) 删视图 = 先销账、再 DROP，两步必须成对
+#    账本 `grovefs_refs.holders` 是全局表且没有 view 列：单跑 `DROP SCHEMA … CASCADE`
+#    只删树不销账，该视图订过的每个对象留下一行（0 字节的文件也订对象），而树已
+#    经没有任何名字能再删它们。SQLite 档靠 `refs rebuild` 归位，PG 档没有这条 CLI
+#    路径，由 pg_drop_views.sh 这一配方承担（不传 `--yes` 一律干跑）：
+bash .bneck/pg_drop_views.sh --list                   # 列 schema 与解码出的视图名
+bash .bneck/pg_drop_views.sh --yes demo               # 指定视图：销账 + DROP SCHEMA CASCADE
+bash .bneck/pg_drop_views.sh --yes                    # 只清基准/套件留下的 pg<ts> 形态残留
+bash .bneck/pg_drop_views.sh --yes --rebuild-ledger   # 顺带按存活树重算整本账（见下）
+#   dropped demo  (ledger rows removed: 7)
 
 # 4) 字节:node 行没了,blocks/ 里的对象成为孤儿,不会自动回收
 find /data/cluster/blocks -type f | wc -l; du -sh /data/cluster/blocks
 ```
 
-- 第 4 步的空间需要按 §12.6 的取舍手工处理:`grovefs gc` 只审计**本地 page 文件**(SQLite 后端),PG 下树是 schema、字节归 data-server,没有等价命令(`gc` 会明确拒绝);
-- `grovefs_refs` **不要随手 DROP**：它是跨视图删除安全的账本，丢了只会让系统保守地多留字节（不会误删对象），但 PG 侧没有 `refs rebuild` 可用（§15.9）；
-- 删完确认：§15.6 的第 1 条 SQL 里那个 schema 消失、客户端不再能挂载该视图名。
+- 第 4 步的空间需要按 §12.6 的取舍手工处理:`grovefs gc` 只审计**本地 page 文件**(SQLite 后端),PG 下树是 schema、字节归 data-server,没有等价命令(`gc` 会明确拒绝)；
+- `pg_drop_views.sh --rebuild-ledger` 是 `refs rebuild` 的 PG 等值实现，逐条对位 `src/meta/engine.rs` 里的 `rebuild_ledger`：一个事务内清空 `grovefs_refs.holders`，再对每棵**存活** schema 取 `SELECT DISTINCT data_ref`，按留名的视图数计 holder。它不保留任何无树留名的行，而「无行即该视图私有」（§5.3），所以重算只会把越界删树攒下的**过计**归位、不会造成少计——方向永远是多留字节，不是误删。重写前把整表快照为 `grovefs_refs.holders_bak_<ts>`（回滚就是 `insert … select *` 回去）；快照确认无误后要手工 `drop table`，否则它自己就成了新的残留；
+- `grovefs_refs` **不要随手 DROP**：它是跨视图删除安全的账本，丢了只会让系统保守地多留字节（不会误删对象）；要把越界删树攒下的孤儿行归位，用上面第 3 步的 `pg_drop_views.sh --rebuild-ledger`（配方，不是 CLI；PG 侧仍没有 `refs rebuild` 命令，§15.9）；
+- 删完确认：§15.6 的第 1 条 SQL 里那个 schema 消失、客户端不再能挂载该视图名；账本对账看 `pg_drop_views.sh --rebuild-ledger` 的干跑预演，它报的「booked by no tree」应为 0。
 
 ### 15.9 场景：非 SQLite 后端下的能力边界（哪些命令不能用、替代做法）
 
@@ -2913,7 +2921,7 @@ PG 与 FDB 各一表；每行的“实测原文/行为”都在本机当前构�
 | `view export` | 拒绝 | `no metadata tree … a PostgreSQL-backed view lives in Postgres` | `pg_dump -n grovefs_v_<hex>` |
 | `view list` | 可用(加 `--meta-store`) | `view --meta-store postgres://… list` 读 `grovefs_control.view_defs` + `grovefs_v_*` schema;不带 `--meta-store` 只看本地文件(输出 `no view definitions under …/meta/views`) | 同左,或 §15.6 巡检 SQL |
 | `import`（零拷贝） | 不适用 | 会在本地造 `<view>.db`，元数据不进 PG | 挂载 + `rsync`（§15.5 路 B 同法） |
-| `refs rebuild` | **别跑** | 会静默建一个 0 行的本地 `meta/refs.db`（`rebuilt …: 0 holder entries`），PG 账本不受影响 | 无 CLI；账本由服务端事务维护 |
+| `refs rebuild` | **别跑** | 会静默建一个 0 行的本地 `meta/refs.db`（`rebuilt …: 0 holder entries`），PG 账本不受影响 | 日常由服务端事务维护；越界删树后归位走 §15.8 的 `pg_drop_views.sh --yes --rebuild-ledger`（配方，非 CLI） |
 | `apikey` | 可用(加 `--meta-store`) | key 与审计进 `grovefs_control.api_keys`/`mcp_calls`,本地不建 `api_keys.db`(`control` 套件实证) | 同 SQLite(§15.11) |
 | `mcp` | 可用(加 `--meta-store`) | 治理与只读探查十工具全走 `grovefs_control`(`list_view_tree` 也能走 PG 树);`fork_view`/`graft_view` 仍拒:`fork is not implemented on the PostgreSQL backend yet…` | 同左;巡检亦可 psql(§15.6) |
 | HA：`--role standby` / `--peer` / `--witness` | 启动即失败 | `--meta-store postgres://… cannot be combined with --role standby / --peer / --witness` | PG 流复制 / 逻辑复制 / PITR |
@@ -3079,7 +3087,7 @@ $G meta-server --listen 0.0.0.0:50110
 | `error: view 'x' does not exist on this meta-server (sqlite/postgres): … views are created explicitly …` | 视图名还没有树/定义,服务端拒绝未创建的视图名(任何情况下都不会自建) | §4：先建后挂(SQLite `view create --view x` / `init` / `view import`；PG `view --meta-store postgres://… create --view x`) |
 | 挂载**成功**了，但目录是空的 | 视图确实存在,但树里还没有内容——例如刚 `view create` 的空树,或历史上手工遗留的空树 | `ls meta/` 确认；建错了就按 §15.8 清掉重来 |
 | `no physical base tree … cannot be forked` | 在 PG 后端下跑 `view fork` | §15.13 换派生视图/别名 |
-| `no view definition '<v>' under …/views` | 在 PG 下用 CLI 删视图 | §15.8 手工 `DROP SCHEMA` |
+| `no view definition '<v>' under …/views` | 在 PG 下用 CLI 删视图 | §15.8 的 `bash .bneck/pg_drop_views.sh --yes <视图名>`（先销账再 `DROP SCHEMA`） |
 | `no metadata tree … lives in Postgres` | 在 PG 下跑 `view export` | 用 `pg_dump -n`（§15.7） |
 | `--meta-store postgres://… cannot be combined with --role standby / --peer / --witness` | PG 与 GroveFS 原生 HA 不能叠 | §15.9：高可用改走 PG 流复制 |
 | `--meta-store fdb://… cannot be combined with --role standby / --peer / --witness` | 同一条互斥，但 FDB 档的补救话术不同：复制与快照本来就在集群内（`fdbbackup`），原生 HA 在这里没有可交付的东西 | §6.3 / §15.9：去掉 HA 参数单实例起 meta-server |
