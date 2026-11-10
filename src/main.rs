@@ -1985,17 +1985,24 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         let uri = store.as_deref().expect("fdb:// is a store uri");
                         #[cfg(feature = "fdb")]
                         {
-                            // `has_physical` above asks "is there a MOUNTABLE tree",
-                            // which is the root row. A subspace that still holds keys
-                            // but lost its root row answers no there — and seeding a
-                            // root on top of its leftovers would resurrect a corpse as
-                            // a tree whose inode table already had rows. That is the
-                            // one case where "create" must not proceed, so ask the
-                            // other question too and name the command that clears it.
+                            // `has_physical` above already asks the CLUSTER for the root
+                            // row, so a healthy subspace — one restored from a backup, or
+                            // one whose definitions were lost with the control plane — is
+                            // refused above as "already exists" and never reaches here.
+                            // What reaches here is a subspace with keys and NO root row,
+                            // and seeding a root on its leftovers would resurrect a corpse
+                            // as a tree whose inode table already had rows. The condition
+                            // is written as that question (keys AND no root row) rather
+                            // than "any keys", so it cannot contradict its own message if
+                            // the order of the checks ever changes.
                             if grovefs::fdb_store::FdbStore::subspace_has_keys(uri, &view)
                                 .map_err(|e| {
                                     format!("cannot ask the cluster about view '{view}': {e}")
                                 })?
+                                && !grovefs::fdb_store::FdbStore::subspace_exists(uri, &view)
+                                    .map_err(|e| {
+                                        format!("cannot ask the cluster about view '{view}': {e}")
+                                    })?
                             {
                                 return Err(format!(
                                     "a subspace named '{view}' already holds keys in {uri} but has no root row (a corpse — nothing can mount it) — clear it first with `grovefs view --meta-store {uri} rm --name {view} --base`"
