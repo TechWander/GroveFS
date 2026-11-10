@@ -13,13 +13,21 @@
 #
 # usage: bash .bneck/bench_g3.sh
 #        N_LIST='1 4' T=8 RUN_SECS=6 REPS=2 bash .bneck/bench_g3.sh
+#        G3_GATE=9000 bash .bneck/bench_g3.sh          # the NVMe tier of the gate
+#        PGURI=postgres://... CLUSTER3=/nvme/fdb3/cluster3   # both arms on one device
+# The exit code IS the verdict: 0 G3_GREEN, 1 G3_RED, 2 G3_INCONCLUSIVE (the PG
+# control did not reproduce the platform value, so the round judged nothing).
 set -u
 cd "$(dirname "$0")/.."
 export LC_ALL=C LANG=C
 export LD_LIBRARY_PATH=/data/grovefs/.fdbbin/lib:${LD_LIBRARY_PATH:-}
 Y=./target/fdb/release/grovefs
 CLUSTER3=${CLUSTER3:-/data/grovefs/.fdb3/cluster3}
-PGURI="postgres://grove:grovepw@127.0.0.1:5433/grovefs"
+# The PG arm is the control, so its media has to move WITH the FDB data root:
+# giving FDB an NVMe while PG keeps the old spinning datadir would turn "no worse
+# than the PG platform value" into a comparison of two backends on two devices.
+# Override PGURI to an instance whose data dir is on the device under test.
+PGURI=${PGURI:-postgres://grove:grovepw@127.0.0.1:5433/grovefs}
 PG_META=127.0.0.1:15462
 FDB_META=127.0.0.1:15463
 DATA=127.0.0.1:15461
@@ -27,7 +35,11 @@ N_LIST=${N_LIST:-"1 4"}
 T=${T:-8}
 RUN_SECS=${RUN_SECS:-6}
 REPS=${REPS:-2}
+G3_GATE=${G3_GATE:-4600}   # the gate, ops/s: 4600 = SATA-SSD tier, 9000 = NVMe tier (docs §15)
+G3_CTRL=${G3_CTRL:-0.8}    # the PG control must reach this fraction of the gate, or the
+                           # round is reported inconclusive instead of being read as a verdict
 P=.g3bench
+ROWS=$P/g3rows.log   # every G3ROW line, the input to .bneck/g3_verdict.py
 # View names must be unique per session: the load driver writes fixed relative
 # paths, so reusing a view that an earlier run already populated turns the cell
 # into a storm of EEXIST and reports ~0 ops/s instead of steady-state throughput.
@@ -40,6 +52,7 @@ G3_STATUS=${G3_STATUS_SNAP:-}
 [ -f "$CLUSTER3" ] || { echo "no RF=3 cluster file at $CLUSTER3; run .bneck/fdb3_up.sh"; exit 3; }
 
 rm -rf $P; mkdir -p $P/data $P/sql_home $P/pg_home $P/fdb_home $P/logs
+: > "$ROWS"
 pids=()
 cleanup(){
   for m in $P/mnt*; do fusermount -u "$m" 2>/dev/null; done
@@ -89,7 +102,7 @@ run_one(){
   for p in "${pids2[@]}"; do wait $p; done
   awk -v be=$be -v view=$view -v N=$N -v T=$T '
     /RESULT/{ for(kv=1;kv<=NF;kv++){split($kv,a,"="); if(a[1]=="ops")o+=a[2]; if(a[1]=="start"){if(min==""||a[2]<min)min=a[2]} if(a[1]=="end"){if(a[2]>max)max=a[2]} } }
-    END{ printf "G3ROW %s %s N=%d T=%d ops=%d wall=%.2fs agg=%.0f ops/s\n", be, view, N, T, o, max-min, o/(max-min) }' $P/logs/run_${be}_${view}_m*.log
+    END{ printf "G3ROW %s %s N=%d T=%d ops=%d wall=%.2fs agg=%.0f ops/s\n", be, view, N, T, o, max-min, o/(max-min) }' $P/logs/run_${be}_${view}_m*.log | tee -a "$ROWS"
   for p in "${mpids[@]}"; do kill $p 2>/dev/null; wait $p 2>/dev/null; done
   for i in $(seq 1 $N); do fusermount -u "$P/mnt_${be}${i}" 2>/dev/null; rm -rf "$P/mnt_${be}${i}"; done
 }
@@ -104,3 +117,13 @@ for r in $(seq 1 $REPS); do
   done
 done
 echo "===== done ====="
+
+# ---- the verdict is the exit code -------------------------------------------
+# Best FDB cell against the gate, with the SAME-SESSION PG arm as the control.
+# .bneck/g3_verdict.py explains why a round whose control did not reproduce the
+# platform value is reported inconclusive rather than as a pass or a fail.
+echo "===== G3 verdict ====="
+python3 .bneck/g3_verdict.py "$ROWS" "$G3_GATE" "$G3_CTRL"
+rc=$?
+echo "    rows: $ROWS   (exit $rc: 0=G3_GREEN 1=G3_RED 2=G3_INCONCLUSIVE)"
+exit $rc
