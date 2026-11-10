@@ -2,10 +2,14 @@
 # G3 performance gate: bring up a replication-3 FoundationDB cluster and tear it
 # down again.  Spec "SATA（无 NVMe）降级档说明" asks for 3-5 nodes; this host has
 # no SSD media at all (sda/sdb both sit behind an MR9361-8i with queue/rotational=1,
-# and the gfs1/gfs2 qcow2 images live on the same array), and the three VMs are
-# currently serving another team's live grovefs cluster, so the honest topology
-# available here is 3 storage/log servers as separate processes with separate data
-# directories.  That satisfies the replication factor; it does NOT satisfy the disk
+# and every guest image lives on that same array).  An earlier version of this
+# comment claimed the three gfs VMs were "serving another team's live grovefs
+# cluster" — false: they ran THIS project's test cluster, which has since been
+# torn down (.bneck/vm_gfs_teardown.sh) and now hosts the real multi-host cluster
+# of .bneck/fdb3vm_up.sh.  What was never available is a non-rotational disk, so
+# this script stays what it always was: 3 storage/log servers as separate
+# processes with separate data directories on one host.  That satisfies the
+# replication factor; it does NOT satisfy the disk
 # tier, which is why the result is read as a bound, never as a SATA-SSD claim.
 #
 # usage: bash .bneck/fdb3_up.sh                       # RF=3, ports 4510-4512

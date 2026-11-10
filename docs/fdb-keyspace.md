@@ -969,7 +969,37 @@ up-to-date，`strip -s` 后得 6,623,152 B（与旧版差 1,952 B 即来自那�
 即 v2.1 修好的 harness 没有复发（涨的那部分是 `clearrange` 按定义留下的，不是泄漏）。
 补救入口仍是 `grovefs refs rebuild`。仍受硬件阻塞、本轮不具判定资格的
 两件也如实留名：G3 要 SSD/NVMe 介质重跑 `.bneck/bench_g3.sh`，多机房失效恢复要一具可自有的三机集群（本机三台 VM
-跑着他人的集群、且 gfs1/gfs2 共享同两块数据盘）。
+跑着他人的集群、且 gfs1/gfs2 共享同两块数据盘——两条均不准，见 §14 v2.4 的更正）。
+
+### v2.4（把「多机房失效恢复」那一格从「本环境不具资格」改成实测）
+
+用户指令原文：**「把gfs的集群先撤掉，需要的话你可以多创建虚拟机。不用考虑介质问题，先功能跑通」**，随后在选项框里定了拓扑（复用 gfs 三台做 FDB 节点，grovefs 侧的 meta-server/data-server/挂载放宿主）与拆除深度（只停服务 + 清数据根）。这一节的每一条都是执行结果，不是计划。
+
+**先备份再动手，且备份当场发现自己不自足**：`virsh managedsave gfs1 gfs2 gfs-client` + 7 个 qcow2 以 `cp --sparse=always` 收进 `/data/grovefs/vmbak/`（3.8G）配 `SHA256SUMS.txt`。第一批备份记了一条不成立的安全感：三台的 qcow2 全是 `/data/ifuse/vm/hanjun-vm-base.qcow2` 的**薄克隆 overlay**，只 cp overlay 的副本恢复不了任何事——随即补拷 base（621,284,352 B）并把它的 sha256 追加进同一张表。
+回滚入口 `.bneck/vm_rollback.md`；拆除脚本 `.bneck/vm_gfs_teardown.sh` 先 `--dry-run` 再实跑：卸 3 个 fuse 视图 → `systemctl disable --now` 全部 grovefs 单元 → 删 `/data/gfs*/grove` 与 `/home/hanjun/meta`；OS 盘、二进制、unit 文件、cluster.env 一律不动，恢复是一条 systemctl。gfs-client 根盘当时只剩 436M，故热挂一条 30G 数据盘（`mkfs -L fdbdata` + fstab UUID）得到 `/data/fdb` 28G 可用。
+
+**真跨机集群**：`.bneck/fdb3vm_up.sh` / `fdb3vm_down.sh`——四台机器各一个 `fdbserver`，`--locality-zoneid nN --locality-machineid m-nN`，cluster 文件把四个 `ip:port` 写全（省略地址列表会撞 2104），首建 `configure new triple ssd` 再 `coordinators auto`。实测态：`triple`/`ssd-2`、`database_available True`、`full_replication True`、degraded 0、storage 4 / logs 3 / coordinator 3、`fault_domains n1..n4`。
+
+**这一轮最贵的一条发现是三节点给的**：恰好三台机器的 `triple` 集群挂掉一台后数据库**变为不可用**并卡在 `recovery_state: recruiting_transaction_servers`（messages 为 `unreachable_dataDistributor_worker`、`unreachable_ratekeeper_worker`、`unreadable_configuration`），直到把那台手工拉回来才恢复且探针键完好——日志集要 3 个 log，FDB 不允许多个 log 同机，两台幸存者组不出日志集。这条推翻了「三副本 = 挂一台还能用」的直觉，也让 v2.3 那句「要一具可自有的三机集群」成了一句**不够**的要求。
+于是补第 4 故障域：新虚机 `gfs-fdb4`（192.168.122.248）按仓库既有的 `.build-bin/gfs_provision.sh` 路子（薄克隆 + NoCloud seed + virt-install）建，配方固化成 `.bneck/vm_fdbnode_provision.sh` / `vm_fdbnode_destroy.sh`。中途两次走错路各记一笔：`cp` overlay 加手改 `virsh dumpxml` 的机器拿不到 DHCP 租约（base 的 netplan 按建镜像时的 MAC 匹配，seed 不带 network-config 时 cloud-init 不重渲染，于是只有 link-local IPv6 与 mDNS、从不发 DHCP discover）；离线 `qemu-nbd` 改 netplan 也不通。正解是 seed 里写 `/etc/netplan/90-fdbnode.yaml`（`match: {name: "en*"}` + `dhcp4: true`）并在 runcmd 删 50-cloud-init 后 `netplan apply`。补第 4 台后 `fault_tolerance` 才读作 `max_zone_failures_without_losing_availability=1`、`max_zone_failures_without_losing_data=1`。
+
+**功能面跨机重跑**：`GROVEFS_FDB_CLUSTER_FILE=/data/grovefs/.fdb3vm/cluster3vm bash .build-bin/test_fdb.sh` → **`pass=170 fail=0 SKIP=0`**（日志 `.build-bin/fdb_3vm_suite.log`）。这是同一套 170 条断言第一次不跑在单机集群上；`test_fdb.sh` 读的就是这个环境变量，所以复跑不需要改一行代码。
+
+**失效恢复实测**（`.bneck/fdb3vm_fault.sh`，故障窗口内每秒采样一次可用性时间线，判据式而非形容词）：
+
+| 阶段 | 手段 | 最长不可用 | 同场判据 |
+|---|---|---|---|
+| A 进程失效 | `pkill -9` 掉一台的 fdbserver（机器仍在） | **0s**（10 个采样） | degraded 期写入照常提交并读回；+3s 幸存者重排好存储副本、`full_replication` 恢复；进程归队后 4 zone 齐、degraded 0 |
+| B 整机失效 | `virsh destroy` 一台 = 独立内核 + 它的数据盘 + 它的 IP 一起没了 | **0–1s**（两轮分别 0s 与 1s，采样分辨率 1s） | +4s **三台幸存者在死机不回来的情况下**重组出日志集与 3 副本（正是三节点做不到、逼出第 4 台的那条性质）；冷启动归队（ssh 回来 12s，无自启）后 `zones=[n1,n2,n3,n4]`、`noloc=0`、storage 回 4 |
+
+五枚跨故障窗口的探针键（`baseline`/`A_degraded`/`A_recovered`/`B_degraded`/`B_recovered`）事后全部可读；账单 **pass=7 fail=0**、`FDB_FAULT_GREEN`（`.build-bin/fdb_3vm_fault.log`）。脚本自身在这轮修掉三处错：`$SECONDS` 与 `date +%s` 混算使时间戳无意义；`fdbcli get` 输出形如 `` `k' is `v' `` 未解析造成假阴性；以及一条**假阳性**——把「尚无 fault_domain 的进程」按 `str(None)` 计成一个故障域，于是三真域 + 一个未初始化进程就被当成满足 `zones>=4`。表里的数字出自修正后那次完整重跑。
+
+**backup/restore 链**（`.bneck/fdb3vm_backup.sh`）：`fdbbackup` 与 `backup_agent` 都不在既有资产里，从官方 release 的 `foundationdb-clients_7.1.67-1_amd64.deb`（68,734,644 B，sha256 `487c44f0…0ba0`）取出。三个坑记在脚本头注释：这两个二进制**按 argv[0] 判定程序类型**，所以 `.x86_64` 后缀不可用（`Unable to determine program type`）；7.1 仍需 agent，且它是 `backup_agent`（只吃 `-C/--log/--logdir/-m`，没有 `--data-dir`）而不是 `fdbbackup agent`；restore 的目标是 `--dest-cluster-file`（也正是「往非空库里恢复」的合法开关），源是带日期的 BackupURL 而不是容器根，停止版本要从 `status` 的「completed at version」读、`discontinue -w` 自己不打。
+链上四条判据各有独立证据：快照版本 5106287190 < 停止版本 5126221292，故 `bkz01..bkz10` 只能来自日志重放；恢复前先证 60 键真被 `clearrange` 抹掉；按 `-k` 只恢复受损区间到指定版本后 60 键逐字节相同；在停止版本**之后**写的 `post-backup-junk` 恢复后消失、回到 `logonly-01`——时间点恢复的两个方向都测了，只测前一半等于没测。账单 **pass=16 fail=0**、`FDB_BACKUP_GREEN`（`.build-bin/fdb_3vm_backup.log`；容器 88K/16 文件留在盘上不 `expire`，因为被同一个脚本过期的备份证明不了第二次）。判据也修过一次：`LastError: None` 里含 "Error"、而冒号后有空格，所以 `grep -i error` 与 `grep ":None"` 两个方向都会误判，前两跑各中一个；改成只认 `LastError` 的**值**，并用一份合成日志反证「真错误仍能被抓住」。
+
+**就地改掉的三处表述**（被实测推翻的，不是文笔问题）：① §15 G3 行原文「三台 VM 跑着他人的 grovefs 集群且 gfs1/gfs2 共享同两块数据盘」——前半是假的（那是本项目自己的测试集群，本轮已撤），后半也是假的（`virsh domblklist` 与三台各自 `lsblk` 显示每台有自己两条 30G 盘，挂 `/data/gfs1`、`/data/gfs2`，共享的是宿主那条 RAID）；② v2.3 末尾同一句加了更正指向；③ `.bneck/fdb3_up.sh` 头注释里「the three VMs are currently serving another team's live grovefs cluster」同步更正，并注明真正剩下的障碍只有介质。
+
+**仍然不动的两件事**：G3 判定资格没有变化——本轮明确「不用考虑介质问题」，宿主 sda/sdb 仍在 MR9361-8i 后面 `queue/rotational=1`、无 NVMe，性能面一个数字都没重测，§15 的 G3 仍是**未通过**；R3 口径一字未改，`fdb` 仍不进 CANON、文档仍不写第三后端承诺。投放包也不动：`fdbbackup`/`backup_agent` 只作为取证工具留在 gitignore 的 `.fdbbin/`，没有进 `dist/`（v2.2「包内无死重」保持）。本轮新增 7 个配方脚本（`fdb3vm_up/down/fault/backup.sh`、`vm_gfs_teardown.sh`、`vm_fdbnode_provision/destroy.sh`）与 `.bneck/vm_rollback.md` 已提交为 `adfee8f`，本节、USAGE §6.3 与 `.bneck/fdb3_up.sh` 头注释的更正是紧随其后的第二笔 docs 提交。
 
 ## 15. 决策门处置（G1–G4 与 R5，逐门留证）
 
@@ -981,6 +1011,6 @@ G3 在 v1.8 前是第三种写法，现在是第二种。逐门如下：
 |---|---|---|---|
 | **G1** 环境门 | P0 末 | **通过** | 三条判据原文见 §14 v1.1 末（`The database is available.`、`cargo build --release --features fdb --example fdb_spike` 链接 `libfdb_c` 成功、spike `P0_SPIKE_VERDICT=PASS`）。环境路径按 Spec 要求"选定一条即写死命令"：发行版 apt 源与 docker 守护进程在本机都不通（前者无源、后者不可达），故走官方 release 资产 + sha256 校验 + 用户态运行——`bash .build-bin/fdb_env.sh fetch && bash .build-bin/fdb_env.sh up`，`eval "$(bash .build-bin/fdb_env.sh vars)"` 导出 `FDB_CLIENT_LIB_PATH` 与 `GROVEFS_FDB_CLUSTER_FILE`；不装系统包、不用 root，头注释里写明了降级次序 |
 | **G2** 设计门 | P1 末 | **未触发** | 三条最难的形态都有表达且已落地：分页 readdir = `'n'` 前缀 range + `start_after` + 步长检查点（§3.3，`FdbStore::supports_paged_readdir()` 返回 `true`，`src/fdb_store.rs:1721`）、目录 nlink = `('k',parent,name)` 仅目录子空间计数（§3.4）、锁区间重叠 = `('l',ino)` 前缀扫 + 事务内过滤（§3.7，C5 另加"二级键须能无歧义重建主键"的硬判据）。P3/P4 的实现与差分对拍是这些映射真正成立的最终证据，不需要退回分片路线 |
-| **G3** 性能门 | P4 末 | **未通过（已实测，2026-11-09）** | 判据是"不劣于 PG 平台值 ~4.6k ops/s"（SATA SSD 三副本档；NVMe 档 ≥9k）。本机两块盘都在 MR9361-8i 后面 `queue/rotational=1`，没有 SSD 介质，gfs1/gfs2/gfs-client 三台 VM 跑着他人的 grovefs 集群且 gfs1/gfs2 共享同两块数据盘——所以按 Spec 的原义改做**同场对照**：同机、同 op 序列（照抄平台值出处 `bench_pg_conc.sh`）、同一 feature 二进制起两臂，RF=3 三副本。结果：FDB 臂 24 个单元最好 1601 ops/s（ssd 引擎；更早三轮顶到 1200），同一场 PG 臂 4100–4900 复现平台值——差 3–6 倍，判为未通过。归因（集群侧 `status json` 80 份快照）：conflicted ≈0（非 OCC）、tx_limit 7 万+ 未饱和（非配额）、tx/op ≈1（非键空间粒度）、durability lag 5.0–18.7s 且 commit 探针 3–600ms 而 read 探针 0.1–0.5ms（提交耐久是直接压力）；但 `memory` 引擎去盘后仍只 1642，说明约 3× 差距不在盘上，实现侧余量未能归因。R3 的处置已执行：`run_all.sh` 的 CANON 去掉 `fdb`（改 `EXPERIMENTAL`，按名可跑，取证 169/0）、USAGE §6.3/§11.10 与 docs.html §5.9/§16 撤下第三后端承诺并写入实测数字、`--meta-store` help 标 EXPERIMENTAL、段数口径 35→34/34→33/32→31。**不执行**"分派处返回实验未就绪"一条——feature 本就默认关闭且 `fdb://` 已被按名拒绝（P2 实证），再返回假错误会让 P3–P8 的证据不可复跑，理由与全部数据见 §14 v1.8。转正条件：SSD/NVMe 介质上 RF=3 重跑 `.bneck/bench_g3.sh` 达 ≥4.6k（SATA）/ ≥9k（NVMe），过线才回 CANON 与承诺面
+| **G3** 性能门 | P4 末 | **未通过（已实测，2026-11-09）** | 判据是"不劣于 PG 平台值 ~4.6k ops/s"（SATA SSD 三副本档；NVMe 档 ≥9k）。本机两块盘都在 MR9361-8i 后面 `queue/rotational=1`，没有 SSD 介质，gfs1/gfs2/gfs-client 三台 VM 当时跑着本项目的 grovefs 测试集群、且每台各有自己两条 30G 数据盘（原文「他人的集群」「共享同两块盘」两处均失实，更正见 §14 v2.4）——所以按 Spec 的原义改做**同场对照**：同机、同 op 序列（照抄平台值出处 `bench_pg_conc.sh`）、同一 feature 二进制起两臂，RF=3 三副本。结果：FDB 臂 24 个单元最好 1601 ops/s（ssd 引擎；更早三轮顶到 1200），同一场 PG 臂 4100–4900 复现平台值——差 3–6 倍，判为未通过。归因（集群侧 `status json` 80 份快照）：conflicted ≈0（非 OCC）、tx_limit 7 万+ 未饱和（非配额）、tx/op ≈1（非键空间粒度）、durability lag 5.0–18.7s 且 commit 探针 3–600ms 而 read 探针 0.1–0.5ms（提交耐久是直接压力）；但 `memory` 引擎去盘后仍只 1642，说明约 3× 差距不在盘上，实现侧余量未能归因。R3 的处置已执行：`run_all.sh` 的 CANON 去掉 `fdb`（改 `EXPERIMENTAL`，按名可跑，取证 169/0）、USAGE §6.3/§11.10 与 docs.html §5.9/§16 撤下第三后端承诺并写入实测数字、`--meta-store` help 标 EXPERIMENTAL、段数口径 35→34/34→33/32→31。**不执行**"分派处返回实验未就绪"一条——feature 本就默认关闭且 `fdb://` 已被按名拒绝（P2 实证），再返回假错误会让 P3–P8 的证据不可复跑，理由与全部数据见 §14 v1.8。转正条件：SSD/NVMe 介质上 RF=3 重跑 `.bneck/bench_g3.sh` 达 ≥4.6k（SATA）/ ≥9k（NVMe），过线才回 CANON 与承诺面
 | **G4** 语义等价门 | P5 / P6 | **未触发** | 三后端 `dump_tree()` 差分对拍 identical（P3 建立、P6 复跑）；四套治理套件在 fdb 档逐条通过（§14 v1.3 双档表）；§3 的九类映射与 §10 的冻结前缀集合未因任何一条断言放宽。暴露出的差异全部落进 §12 的可归因清单（硬链接多名下 `name` 取值、秒级时间、`ino IS NULL` 在 FDB 结构上不可能），没有一条需要"改不变量"才通过 |
 | **R5** 台架拖累 | P6 内 | **已封堵** | 集群是外部状态，缺失即 SKIP 而非 FAIL：`GROVEFS_FDB_CLUSTER_FILE=<不存在的文件> bash .build-bin/test_fdb.sh` 打 `SUMMARY: pass=0 fail=0 SKIP=1` 且 rc=0；同一条件加 `FDB_TEST=1` 打 `SUMMARY: pass=0 fail=1 SKIP=0` 且 rc=1（两条均为本轮在同一台机器上实测）。`run_all.sh::run_fdb` 把 `SKIP=1` 登记为 `RESULT[fdb]=SKIP`，不进 FAIL 计数，所以没装 FDB 的机器上全板仍 `RESULT: GREEN` |
