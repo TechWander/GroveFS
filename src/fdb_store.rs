@@ -1340,9 +1340,35 @@ pub struct SubspaceInfo {
     pub entries: u64,
     /// True for the shared cross-view ledger, which is not a mountable tree.
     pub ledger: bool,
+    /// Did the subspace still hold its root row, `('n', ROOT_PARENT, '')`?
+    ///
+    /// A mount OPENS the root row, so a subspace that has keys but has lost it can
+    /// never be mounted again — and yet every content key it names is still
+    /// booked in the shared ledger. Measured, not hypothesised: the local cluster
+    /// held `spike` with 7065 keys and 2001 entries but no root row (a partial
+    /// `clearrange` of the `'n` family leaves exactly that shape), which is the
+    /// case that made a removal predicate of "has a root row" wrong.
+    pub root_row: bool,
     /// The prefix in hex, so an operator can hand it to `fdbcli clearrange`
     /// without re-deriving the tuple encoding.
     pub prefix_hex: String,
+}
+
+impl SubspaceInfo {
+    /// `ledger` for the shared `refs` subspace, `corpse` for a tree that can no
+    /// longer be mounted, `view` for a live tree, `?` for a name this build
+    /// cannot reproduce (reported by hex alone rather than hidden).
+    pub fn kind(&self) -> &'static str {
+        if self.ledger {
+            "ledger"
+        } else if !crate::layout::valid_view_name(&self.name) {
+            "?"
+        } else if !self.root_row {
+            "corpse"
+        } else {
+            "view"
+        }
+    }
 }
 
 /// What [`FdbStore::remove_view`] did. Reported rather than logged because the
@@ -1506,6 +1532,7 @@ pub fn list_subspaces(uri: &str) -> Result<Vec<SubspaceInfo>, MetaError> {
             name,
             keys: 0,
             entries: 0,
+            root_row: false,
             prefix_hex: hex_bytes(&key[..cut]),
         });
         e.keys += 1;
@@ -1513,11 +1540,188 @@ pub fn list_subspaces(uri: &str) -> Result<Vec<SubspaceInfo>, MetaError> {
         // rows `dump_tree`/`export` call nodes.
         if rest.starts_with(b"\x02n\x00") {
             e.entries += 1;
+            // Both facts an operator needs come from the same walk: WHICH trees
+            // are there, and which of them can never be mounted again. The root
+            // row is an `'n'` row like any other, so the check costs one packed
+            // key per entry and nothing extra per byte of the tree.
+            if e.name != TAG_REFS
+                && !e.name.starts_with('?')
+                && Keys::for_view(&e.name).name(ROOT_PARENT, "") == key
+            {
+                e.root_row = true;
+            }
         }
         Ok(())
     };
     for_each_key(&db, begin, end, &mut visit)?;
     Ok(found.into_values().collect())
+}
+
+/// What [`rebuild_ledger`] changed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LedgerRebuild {
+    /// Subspaces walked (the shared ledger excluded).
+    pub trees: usize,
+    /// DISTINCT content keys the surviving trees name — the ledger's true size.
+    pub refs: usize,
+    /// Rows that disagreed with the recount, rewritten.
+    pub rows_fixed: usize,
+    /// Rows no surviving tree names any more, deleted.
+    pub rows_deleted: usize,
+    /// Total holder units after the rewrite (the sum of all counts).
+    pub holders: i64,
+}
+
+/// A view name used only to obtain a transaction handle: [`Tx::permits`] allows the
+/// shared ledger for ANY view's `Keys`, and this name is never written to.
+const REBUILD_PROBE_VIEW: &str = "refs-rebuild";
+/// Rows per transaction. A cluster's ledger can be far larger than one
+/// transaction may touch, and each chunk is independently committed, so an
+/// interrupted rebuild is re-runnable: the next run recounts from the trees.
+const REBUILD_CHUNK: usize = 256;
+
+/// Recompute the SHARED ledger from the surviving trees — the fdb:// answer to
+/// `refs rebuild`, which used to be SQLite-only and therefore left a drifted
+/// ledger in this backend with no repair path at all.
+///
+/// The rule is the one the SQLite rebuild states: one holder unit per view per
+/// content key, and a row at zero is not a row ("absent and zero are the same
+/// state"). Two consequences make this worth having beyond tidiness:
+///   * an OVER-count (a subtree cleared out of band, or a view removed by
+///     `fdbcli clearrange`) keeps bytes alive forever, because nothing ever reads
+///     the row again to lower it;
+///   * a LOST row (under-count) is the dangerous direction — the next unlink of
+///     that key sees zero holders and frees bytes a live name still reads. It is
+///     also invisible to every counter, which is why the recount reads the TREES
+///     and never trusts the ledger it is rewriting.
+///
+/// Safety, and the one thing it cannot do for you: the recount is a read of the
+/// whole root followed by a write pass, so it must run QUIESCED — every mount of
+/// every view stopped, exactly as the SQLite arm requires (it refuses a mounted
+/// store outright). A writer that books a key between the read and the write pass
+/// would have that booking overwritten with the pre-booking count, i.e. precisely
+/// the under-count this exists to repair.
+///
+/// A key this build cannot name, or an `'r'` row whose content key does not
+/// decode, ABORTS the rebuild instead of being skipped: skipping one tree would
+/// recompute every ref it names to a lower number, and lowering is the unsafe
+/// direction. Refusing is the only honest answer.
+pub fn rebuild_ledger(uri: &str) -> Result<LedgerRebuild, MetaError> {
+    let cluster_file = FdbConfig::parse_cluster(uri)
+        .map_err(|e| MetaError::Db(format!("fdb:// rebuild: {e}")))?;
+    let db = database(&cluster_file).map_err(|e| MetaError::Db(format!("fdb:// rebuild: {e}")))?;
+    let root = Keys::root();
+    let ledger_root = root.subspace(&TAG_REFS);
+    let (begin, end) = root_bounds();
+
+    // ---- pass 1: what the SURVIVING TREES say, one walk over the root --------
+    let mut computed: std::collections::BTreeMap<String, i64> = Default::default();
+    let mut trees: std::collections::BTreeSet<String> = Default::default();
+    let mut ledger_rows: Vec<String> = Vec::new();
+    {
+        // Keys are ordered by subspace, so a view's `'r'` rows are contiguous:
+        // one distinct-set per subspace is enough to turn "rows" into "views".
+        let mut cur = String::new();
+        let mut seen: std::collections::HashSet<String> = Default::default();
+        let mut visit = |key: &[u8]| -> Result<(), MetaError> {
+            let base = root.bytes().len();
+            let (name, used) = child_name(&root, key).ok_or_else(|| {
+                MetaError::Db(format!(
+                    "fdb:// rebuild: a key under the 'grovefs' root names a subspace this build cannot decode ({}); refusing to recount from a tree that cannot be walked",
+                    hex_bytes(&key[..key.len().min(48)])
+                ))
+            })?;
+            let rest = &key[base + used..];
+            if name == TAG_REFS {
+                let (dr, _) = child_name(&ledger_root, key).ok_or_else(|| {
+                    MetaError::Db(format!(
+                        "fdb:// rebuild: a ledger row's content key does not decode ({})",
+                        hex_bytes(&key[..key.len().min(48)])
+                    ))
+                })?;
+                ledger_rows.push(dr);
+                return Ok(());
+            }
+            if cur != name {
+                for dr in seen.drain() {
+                    *computed.entry(dr).or_insert(0) += 1;
+                }
+                trees.insert(name.clone());
+                cur = name.clone();
+            }
+            if rest.starts_with(b"\x02r\x00") {
+                let dr = Keys::for_view(&name).decode_dataref(key).ok_or_else(|| {
+                    MetaError::Db(format!(
+                        "fdb:// rebuild: view '{}' holds a 'r' row with no decodable content key ({}); refusing to recount",
+                        name,
+                        hex_bytes(&key[..key.len().min(48)])
+                    ))
+                })?;
+                seen.insert(dr);
+            }
+            Ok(())
+        };
+        for_each_key(&db, begin, end, &mut visit)?;
+        for dr in seen.drain() {
+            *computed.entry(dr).or_insert(0) += 1;
+        }
+    }
+
+    // ---- pass 2: what the ledger currently claims ---------------------------
+    let probe = FdbStore::open(uri, REBUILD_PROBE_VIEW, true)
+        .map_err(|e| MetaError::Db(format!("fdb:// rebuild: {e}")))?;
+    let mut current: std::collections::BTreeMap<String, i64> = Default::default();
+    if !ledger_rows.is_empty() {
+        let tx = probe.read_tx()?;
+        let keys: Vec<Vec<u8>> = ledger_rows.iter().map(|dr| probe.keys.ledger(dr)).collect();
+        let vals = tx
+            .get_multi(&keys)
+            .map_err(TxErr::hard_or_exhausted)?;
+        for (dr, v) in ledger_rows.iter().zip(vals) {
+            current.insert(dr.clone(), v.as_deref().and_then(unpack_i64).unwrap_or(0));
+        }
+    }
+
+    // ---- pass 3: rewrite the difference ------------------------------------
+    let mut set_rows: Vec<(String, i64)> = Vec::new();
+    for (dr, want) in &computed {
+        if current.get(dr) != Some(want) {
+            set_rows.push((dr.clone(), *want));
+        }
+    }
+    let del_rows: Vec<String> = current
+        .keys()
+        .filter(|dr| !computed.contains_key(*dr))
+        .cloned()
+        .collect();
+    let k = probe.keys.clone();
+    for chunk in set_rows.chunks(REBUILD_CHUNK) {
+        let chunk: Vec<(String, i64)> = chunk.to_vec();
+        let k = k.clone();
+        probe.with_serial_retry(move |tx| {
+            for (dr, want) in &chunk {
+                tx.set_i64(&k.ledger(dr), *want);
+            }
+            Ok(())
+        })?;
+    }
+    for chunk in del_rows.chunks(REBUILD_CHUNK) {
+        let chunk: Vec<String> = chunk.to_vec();
+        let k = k.clone();
+        probe.with_serial_retry(move |tx| {
+            for dr in &chunk {
+                tx.clear(&k.ledger(dr));
+            }
+            Ok(())
+        })?;
+    }
+    Ok(LedgerRebuild {
+        trees: trees.len(),
+        refs: computed.len(),
+        rows_fixed: set_rows.len(),
+        rows_deleted: del_rows.len(),
+        holders: computed.values().sum(),
+    })
 }
 
 impl FdbStore {
@@ -1576,6 +1780,39 @@ impl FdbStore {
         let root = futures::executor::block_on(tx.get(&key, true))
             .map_err(|e| TxErr::from(e).hard_or_exhausted().to_string())?;
         Ok(root.is_some())
+    }
+
+    /// Does the cluster hold ANY key under `view`'s prefix?
+    ///
+    /// Deliberately a second question, not a replacement for
+    /// [`Self::subspace_exists`]. That one asks "is there a tree a mount can
+    /// open", which is the ROOT ROW; the two answers differ exactly where
+    /// teardown needs them to. A subspace whose root row was cleared out of band
+    /// (measured: `spike`, 7065 keys / 2001 entries / no root row) can never be
+    /// mounted again, so "provisioned" is the wrong word for it — but it still
+    /// books every content key it names, so it is the thing most in need of
+    /// removal. `view rm --base` therefore asks THIS, and a name with nothing
+    /// under it at all is the only "nothing to remove".
+    ///
+    /// One range read with `limit = 1`, on a snapshot transaction that is never
+    /// committed: it neither creates the subspace nor leaves a read conflict.
+    pub fn subspace_has_keys(uri: &str, view: &str) -> Result<bool, String> {
+        let this = Self::open(uri, view, true).map_err(|e| e.to_string())?;
+        let tx = this
+            .db
+            .create_trx()
+            .map_err(|e| TxErr::from(e).hard_or_exhausted().to_string())?;
+        let prefix = this.keys.view_prefix().bytes().to_vec();
+        let end = prefix_upper_bound(&prefix)
+            .ok_or_else(|| "fdb_store: cannot bound a view prefix ending in 0xff".to_string())?;
+        let opt: RangeOption = (
+            KeySelector::first_greater_or_equal(prefix),
+            KeySelector::first_greater_or_equal(end),
+        )
+            .into();
+        let kvs = futures::executor::block_on(tx.get_range(&opt, 1, true))
+            .map_err(|e| MetaError::Db(format!("fdb scan: {e}")).to_string())?;
+        Ok(!kvs.as_ref().is_empty())
     }
 
     /// Holders booked against `data_ref` in the SHARED ledger, or 0 when no row

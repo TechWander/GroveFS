@@ -119,10 +119,13 @@ ls_wait(){ local mp="$1" i
 }
 
 # The cluster's tree inventory, one name per line, sorted. `$4` is the KIND column
-# ("view" for a tree, "ledger" for the shared `refs` subspace); the summary and
-# the trailing note line do not have "view" in that column, so they fall out.
+# ("view" for a live tree, "corpse" for one that kept its keys but lost its root
+# row, "ledger" for the shared `refs` subspace); the summary and the trailing note
+# line do not have one of those in that column, so they fall out. Corpses are
+# candidates too — they are the ones most in need of removal, since nothing can
+# mount them while they keep their objects booked.
 inv_list(){ "$Y" view --meta-store "$FDBURI" --meta-dir "$S/home" scan 2>/dev/null \
-    | awk 'NR>1 && $4=="view"{print $1}' | sort; }
+    | awk 'NR>1 && ($4=="view" || $4=="corpse"){print $1}' | sort; }
 cleanup(){
     # Every mount of this suite lives under `$S/mnt_*`, so the unmount sweep cannot
     # fall behind a section that adds one.
@@ -1067,7 +1070,7 @@ grep -qE "^$V3 " $S/scan2.txt && bad "$V3 is still in the inventory after its re
 $VCLI rm --name "$V3" --base > $S/rm_twice.log 2>&1 \
     && bad "a second rm --base on a removed view reported success" \
     || ok "a second rm --base is refused, not a cheerful zero (a typo and a removed view must look different)"
-grep -q "no subspace named '$V3'" $S/rm_twice.log \
+grep -q "no key under a subspace named '$V3'" $S/rm_twice.log \
     && ok "the refusal names the missing subspace and points at view scan" \
     || bad "unexpected re-run text: $(head -2 $S/rm_twice.log)"
 # The guard set is backend-independent: $V2 still has derived/alias definitions
@@ -1112,6 +1115,133 @@ for v in zb1 zb2; do
     grep -qE "^$v " $S/scan3.txt && bad "$v survived its removal" \
         || ok "$v is gone from the cluster inventory"
 done
+
+
+# 14c) The shape that proved the first teardown asked the wrong question.
+# `subspace_exists` means "there is a ROOT ROW", i.e. a tree a mount can open. A
+# subspace that lost its root row but kept the rest answers NO there while still
+# booking every content key it names — the cluster held `spike` in exactly that
+# state (7065 keys, 2001 entries, no root row; a partial `clearrange` of the `'n'
+# family leaves it), and the first version of the sweep REFUSED to remove it, which
+# would have stranded its objects forever with no `refs rebuild` in this backend.
+# So: `view scan` must call it a corpse, `view create` must refuse to seed a root
+# on top of it, and `rm --base` must both clear it and unwind its bookings.
+echo "-- 14c) a corpse (keys, no root row) is removable and its bookings are unwound"
+ZC="zc$$"; mkdir -p $S/zc/data
+$VCLI import --view "$ZC" --in $S/m_src.jsonl > $S/zc_imp.log 2>&1 \
+    && ok "seeded a tree to damage ($ZC)" || bad "import into $ZC failed: $(head -3 $S/zc_imp.log)"
+$VCLI scan > $S/scan4.txt 2>&1
+ZPX=$(awk -v v="$ZC" '$1==v {print $5}' $S/scan4.txt)
+LKB=$(awk '$4=="ledger"{print $2}' $S/scan4.txt)
+chk "$(awk -v v="$ZC" '$1==v {print $4}' $S/scan4.txt)" "view" "before damage the subspace is an ordinary tree"
+# Clear ONLY the `'n'` family (the packed tag is `\x02n\x00`), which takes the
+# root row with it and leaves every other family alone.
+if [ -n "$ZPX" ]; then
+    ZPFX=$(echo "$ZPX" | sed 's/../\\x&/g')
+    # `writemode on;` is required or fdbcli answers "writemode must be enabled"
+    # and clears nothing (which would make the next three assertions lie).
+    "$FDB_HOME/fdbcli.x86_64" -C "$CLUSTER" \
+        --exec "writemode on; clearrange \"${ZPFX}\\x02\\x6e\\x00\" \"${ZPFX}\\x02\\x6e\\x01\"" > $S/zc_cc.log 2>&1 \
+        && ok "cleared the 'n' family out of band (the root row goes with it)" \
+        || bad "clearrange failed: $(tail -2 $S/zc_cc.log)"
+else
+    bad "no prefix hex for $ZC"
+fi
+$VCLI scan > $S/scan5.txt 2>&1
+ZK=$(awk -v v="$ZC" '$1==v {print $2}' $S/scan5.txt)
+grep -qE "^$ZC +[1-9][0-9]* +0 +corpse" $S/scan5.txt \
+    && ok "the inventory calls it a corpse: keys left, no entries, no root row" \
+    || bad "$ZC is not reported as a corpse: $(grep "^$ZC " $S/scan5.txt | head -1)"
+$VCLI create --view "$ZC" > $S/zc_create.log 2>&1 \
+    && bad "view create seeded a root on top of a corpse's leftovers" \
+    || ok "view create refuses to resurrect a corpse instead of writing a root over its keys"
+grep -q "no root row" $S/zc_create.log \
+    && ok "the refusal says what is wrong and what to run" || bad "unexpected create text: $(head -2 $S/zc_create.log)"
+ZR=$($VCLI rm --name "$ZC" --base --data-dir $S/zc/data 2>&1)
+echo "$ZR" | grep -q "removed base view '$ZC'" \
+    && ok "rm --base removes a corpse (the refusal that started this section is gone)" \
+    || bad "rm --base refused a corpse: $(echo "$ZR" | head -3)"
+echo "$ZR" | grep -qE "$ZK key\\(s\\) gone" \
+    && ok "it reports the $ZK key(s) it cleared, not just the 0 entries the 'n' family still had" \
+    || bad "unexpected key count: $(echo "$ZR" | head -2)"
+echo "$ZR" | grep -qE "[1-9][0-9]* object\\(s\\) no longer held by any view" \
+    && ok "the bookings it held in the shared ledger were unwound by the removal" \
+    || bad "the corpse's objects stayed booked: $(echo "$ZR" | head -2)"
+$VCLI scan > $S/scan6.txt 2>&1
+LKA=$(awk '$4=="ledger"{print $2}' $S/scan6.txt)
+[ -n "$LKB" ] && [ -n "$LKA" ] && [ "$LKA" -lt "$LKB" ] \
+    && ok "the shared ledger actually shrank ($LKB -> $LKA keys), which is the part clearrange alone gets wrong" \
+    || bad "ledger did not shrink (before '$LKB', after '$LKA')"
+grep -qE "^$ZC " $S/scan6.txt && bad "$ZC survived its removal" || ok "$ZC is gone from the inventory"
+
+# 14d) `refs rebuild` under fdb://: the repair path this backend did not have.
+# The recount reads the TREES and never trusts the ledger it rewrites, which is the
+# only way both drift directions can be repaired: a LOST row (under-count — the
+# next unlink would free bytes a live name still reads) comes back, and an
+# over-count row that no tree names goes away. Neither is reachable with
+# `fdbcli clearrange`, and neither has any other CLI path in this backend.
+echo "-- 14d) refs rebuild: the recount comes from the trees, so both drift directions repair"
+VCLIR="$Y refs --meta-store $FDBURI"
+RB0=$($VCLIR rebuild 2>&1)
+echo "$RB0" | grep -q "0 row(s) corrected, 0 row(s) deleted" \
+    && ok "a rebuild on a healthy cluster corrects nothing (and does not churn the ledger)" \
+    || bad "clean rebuild was not a no-op: $(echo "$RB0" | head -2)"
+$VCLI scan > $S/scan7.txt 2>&1
+LK0=$(awk '$4=="ledger"{print $2}' $S/scan7.txt)
+REFSPFX=$(printf '\x01grovefs\x00\x02refs\x00' | od -An -tx1 | tr -d ' \n')
+REFHEX=$(echo "$REFSPFX" | sed 's/../\\x&/g')
+# fdbcli prints a key with its PRINTABLE bytes as themselves and the rest as
+# `\xNN`, so the hex has to be rebuilt by decoding those escapes: a plain
+# `sed 's/\\x//g'` turns `\x67` (the letter "g") into `67`, i.e. it fabricates a
+# key that does not exist (which is exactly how the first version of this section
+# cleared nothing and then reported a healthy ledger). `printf %b` decodes them.
+tohex(){ printf '%b' "$1" | od -An -tx1 | tr -d ' \n'; }
+# The delimiters are never part of a key, so dropping the characters is enough —
+# and it avoids putting a backtick through sed, where `\`` means "start of line".
+unquote(){ tr -d "\`'"; }
+fdbget(){ "$FDB_HOME/fdbcli.x86_64" -C "$CLUSTER" --exec "$1" 2>/dev/null; }
+# The row is taken from the LEDGER side rather than from one view's 'r' family:
+# what this section proves is that a lost row comes back, and the recount finds
+# the owning tree by itself — so choosing "a row some tree names" is the rebuild's
+# job, not the test's.
+LKLINE=$(fdbget "getrangekeys \"$REFHEX\" \"${REFHEX}\\xff\" 1" | grep '^`' | head -1 | unquote)
+LKEY=$(tohex "$LKLINE")
+if [ -n "$LKEY" ]; then
+    LHEX=$(echo "$LKEY" | sed 's/../\\x&/g')
+    # The value the trees currently agree on — captured, not assumed: the no-op
+    # rebuild above is what makes "before" the truth, so the repair must land on
+    # exactly this number rather than on a copied constant.
+    VAL0=$(tohex "$(fdbget "get \"$LHEX\"" | sed -n 's/.* is //p' | unquote)")
+    fdbget "writemode on; clear \"$LHEX\"" >/dev/null 2>&1 \
+        && ok "simulated a LOST booking: one ledger row deleted out of band" \
+        || bad "could not clear the ledger row"
+    $VCLI scan > $S/scan8.txt 2>&1
+    chk "$(awk '$4=="ledger"{print $2}' $S/scan8.txt)" "$((LK0-1))" \
+        "the ledger is now short by exactly the row that was removed"
+    RB1=$($VCLIR rebuild 2>&1)
+    echo "$RB1" | grep -q "1 row(s) corrected, 0 row(s) deleted" \
+        && ok "the rebuild RESTORES a booking the ledger had lost (the unsafe direction)" \
+        || bad "lost row not restored: $(echo "$RB1" | head -2)"
+    $VCLI scan > $S/scan9.txt 2>&1
+    chk "$(awk '$4=="ledger"{print $2}' $S/scan9.txt)" "$LK0" \
+        "the ledger is back to its true size"
+    VAL1=$(tohex "$(fdbget "get \"$LHEX\"" | sed -n 's/.* is //p' | unquote)")
+    chk "$VAL1" "$VAL0" "and the restored count is the one the trees agree on, not a guess"
+    # Over-count: a row that no tree names at all.
+    GHOST="${REFSPFX}0267686f73742d72656600"   # \x02"ghost-ref"\x00
+    GHEX=$(echo "$GHOST" | sed 's/../\\x&/g')
+    fdbget "writemode on; set \"$GHEX\" \"\\x15\\x09\"" >/dev/null 2>&1 \
+        && ok "simulated an OVER-count: a ledger row for a content key no tree names" \
+        || bad "could not write the ghost row"
+    RB2=$($VCLIR rebuild 2>&1)
+    echo "$RB2" | grep -q "[1-9][0-9]* row(s) deleted" \
+        && ok "the rebuild DROPS a row that no surviving tree names" \
+        || bad "ghost row not dropped: $(echo "$RB2" | head -2)"
+    $VCLI scan > $S/scan10.txt 2>&1
+    chk "$(awk '$4=="ledger"{print $2}' $S/scan10.txt)" "$LK0" "the ledger is exactly its true size again, with the ghost gone"
+else
+    bad "could not read a ledger row to damage (refs at '$S/scan7.txt' says '$LK0' keys)"
+fi
 
 
 if [ "$fail" = 0 ]; then echo "ALL FDB-BACKEND CHECKS PASSED"; exit 0; else echo "SOME FDB CHECKS FAILED"; exit 1; fi

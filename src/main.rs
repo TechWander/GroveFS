@@ -646,13 +646,20 @@ NOTES
     /// every create/delete — but a view db removed OUT-OF-BAND (`rm meta/x.db`,
     /// a fresh `--home`) never released its holds, so the ledger over-counts and
     /// keeps bytes too long. `refs rebuild` rewrites it from the trees that
-    /// actually exist. SQLite-backed stores only. See `grovefs view create`.
+    /// actually exist. SQLite-backed stores (and, with `--meta-store fdb://…`,
+    /// the cluster's own shared ledger — the one backend that otherwise had no
+    /// repair path at all). See `grovefs view create`.
     Refs {
         /// The metadata root holding `meta/refs.db` and the per-view trees
         /// `meta/*.db` — same option name and directory as `meta-server
         /// --meta-dir`; falls back to the global `--home`.
         #[arg(long = "meta-dir", value_name = "DIR")]
         db_path: Option<PathBuf>,
+        /// Metadata STORE URI: `fdb://<cluster-file>` rebuilds the ledger that
+        /// lives IN the cluster instead of `meta/refs.db`. Falls back to
+        /// `$GROVEFS_META_STORE`, exactly like `gc`'s backend guards.
+        #[arg(long = "meta-store", value_name = "URI")]
+        store: Option<String>,
         #[command(subcommand)]
         action: RefsAction,
     },
@@ -1978,6 +1985,23 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         let uri = store.as_deref().expect("fdb:// is a store uri");
                         #[cfg(feature = "fdb")]
                         {
+                            // `has_physical` above asks "is there a MOUNTABLE tree",
+                            // which is the root row. A subspace that still holds keys
+                            // but lost its root row answers no there — and seeding a
+                            // root on top of its leftovers would resurrect a corpse as
+                            // a tree whose inode table already had rows. That is the
+                            // one case where "create" must not proceed, so ask the
+                            // other question too and name the command that clears it.
+                            if grovefs::fdb_store::FdbStore::subspace_has_keys(uri, &view)
+                                .map_err(|e| {
+                                    format!("cannot ask the cluster about view '{view}': {e}")
+                                })?
+                            {
+                                return Err(format!(
+                                    "a subspace named '{view}' already holds keys in {uri} but has no root row (a corpse — nothing can mount it) — clear it first with `grovefs view --meta-store {uri} rm --name {view} --base`"
+                                )
+                                .into());
+                            }
                             // An FDB base view is ONE SUBSPACE: `FdbStore::open`
                             // writes the root row plus the two allocator
                             // watermarks, idempotently, which is all "provision a
@@ -2125,6 +2149,11 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                     {
                         let subs = grovefs::fdb_store::list_subspaces(uri)?;
                         let ledgers = subs.iter().filter(|s| s.ledger).count();
+                        // A "corpse" is a subspace that still holds keys but has
+                        // lost its root row, so no mount can open it again while it
+                        // keeps its content keys booked — counting it as a tree
+                        // would hide the only ones that need a decision.
+                        let corpses = subs.iter().filter(|s| s.kind() == "corpse").count();
                         if subs.is_empty() {
                             println!("no subspaces under the 'grovefs' root in {uri}");
                         } else {
@@ -2133,26 +2162,28 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                                 "SUBSPACE", "KEYS", "ENTRIES", "KIND", "PREFIX"
                             );
                             for s in &subs {
-                                let kind = if s.ledger {
-                                    "ledger"
-                                } else if grovefs::layout::valid_view_name(&s.name) {
-                                    "view"
-                                } else {
-                                    "?"
-                                };
                                 println!(
                                     "{:<28} {:>8} {:>8}  {:<7} {}",
-                                    s.name, s.keys, s.entries, kind, s.prefix_hex
+                                    s.name,
+                                    s.keys,
+                                    s.entries,
+                                    s.kind(),
+                                    s.prefix_hex
                                 );
                             }
                             println!(
-                                "\n{} subspace(s) under the 'grovefs' root in {uri}: {} tree(s) + {} ledger subspace(s)",
+                                "\n{} subspace(s) under the 'grovefs' root in {uri}: {} tree(s){} + {} ledger subspace(s)",
                                 subs.len(),
-                                subs.len() - ledgers,
+                                subs.len() - ledgers - corpses,
+                                if corpses > 0 {
+                                    format!(" ({corpses} corpse(s): keys but no root row, unmountable)")
+                                } else {
+                                    String::new()
+                                },
                                 ledgers
                             );
                             println!(
-                                "a subspace is a TREE, not a definition — `view list` shows this meta-dir's definitions, this shows what the cluster holds; remove one with `view rm --name <name> --base` (the PREFIX column is what `fdbcli clearrange` takes for a name this build cannot open)"
+                                "a subspace is a TREE, not a definition — `view list` shows this meta-dir's definitions, this shows what the cluster holds; remove one with `view rm --name <name> --base` (that also works on a corpse, and is the only way to unbook its objects; the PREFIX column is what `fdbcli clearrange` takes for a name this build cannot open)"
                             );
                         }
                         return Ok(());
@@ -2245,13 +2276,17 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                             use grovefs::fdb_store::FdbStore;
                             // "No such subspace" is an error, not a cheerful zero:
                             // a typo would otherwise look like a successful removal
-                            // and the operator would stop looking.
-                            let there = FdbStore::subspace_exists(uri, &name).map_err(|e| {
+                            // and the operator would stop looking. The predicate is
+                            // "any key under the prefix", NOT "a mountable root row":
+                            // a subspace that lost its root row still books content
+                            // keys, and refusing to remove it would leave the bytes
+                            // unreclaimable forever (no `refs rebuild` here).
+                            let there = FdbStore::subspace_has_keys(uri, &name).map_err(|e| {
                                 format!("cannot ask the cluster about view '{name}': {e}")
                             })?;
                             if !there {
                                 return Err(format!(
-                                    "no subspace named '{name}' under the 'grovefs' root in {uri} — nothing to remove (`grovefs view --meta-store {uri} scan` lists what is there; a DEFINITION slot is removed by `view rm --name {name}` without --base)"
+                                    "no key under a subspace named '{name}' in {uri} — nothing to remove (`grovefs view --meta-store {uri} scan` lists what is there; a DEFINITION slot is removed by `view rm --name {name}` without --base)"
                                 )
                                 .into());
                             }
@@ -2862,10 +2897,47 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Cmd::Refs { db_path, action } => {
+        Cmd::Refs {
+            db_path,
+            store,
+            action,
+        } => {
             let rbase = db_path.unwrap_or_else(|| base.clone());
+            let store = resolve_store(store);
             match action {
                 RefsAction::Rebuild => {
+                    // Under fdb:// the ledger is `grovefs/refs` IN the cluster, not
+                    // a file, so the SQLite arm below (which would happily rebuild
+                    // a `meta/refs.db` this deployment never reads) is the wrong
+                    // store rather than a harmless no-op.
+                    if let Some(uri) = store.as_deref().filter(|u| u.starts_with("fdb://")) {
+                        #[cfg(feature = "fdb")]
+                        {
+                            let rep = grovefs::fdb_store::rebuild_ledger(uri)?;
+                            println!(
+                                "refs ledger rebuilt in {uri}: {} tree(s), {} content key(s), {} holder unit(s); {} row(s) corrected, {} row(s) deleted",
+                                rep.trees, rep.refs, rep.holders, rep.rows_fixed, rep.rows_deleted
+                            );
+                            println!(
+                                "  the recount reads the TREES, not the ledger — so a lost booking is restored (the unsafe direction) as well as an over-count dropped; nothing here frees object bytes (that is `gc`, which refuses fdb://)"
+                            );
+                            println!(
+                                "  run it QUIESCED: a booking committed between the read pass and the write pass would be overwritten with the pre-booking count"
+                            );
+                            return Ok(());
+                        }
+                        #[cfg(not(feature = "fdb"))]
+                        return Err(format!(
+                            "{uri} names the FoundationDB backend, but this binary was built without `--features fdb` (it does not link libfdb_c); rebuild with the feature, or drop --meta-store to rewrite a local `meta/refs.db`"
+                        )
+                        .into());
+                    }
+                    if store
+                        .as_deref()
+                        .is_some_and(|u| u.starts_with("postgres://") || u.starts_with("postgresql://"))
+                    {
+                        return Err("`refs rebuild` rewrites a local `meta/refs.db`; a PostgreSQL deployment's ledger is `grovefs_refs.holders` IN the database and there is no rebuild path in this CLI — the ledger belongs to the engine, so repair it where it lives rather than rebuilding a file nothing reads".into());
+                    }
                     let counted = grovefs::meta::rebuild_ledger(&rbase)?;
                     println!(
                         "refs ledger rebuilt at {}: {} holder entries across the surviving views",
