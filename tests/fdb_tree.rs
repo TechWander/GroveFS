@@ -499,6 +499,136 @@ fn fdb_tree_ops_match_sqlite_semantics() {
     }
 }
 
+// ---- readdir paging: the contract the mount's cookies rest on ---------------
+//
+// The differential above compares `readdir` — one whole listing — and therefore
+// cannot see a paging-cursor bug: every directory it builds fits in a page, so a
+// resume that skips or repeats a row is invisible to it. This test drives the
+// SAME resume offsets the FUSE layer derives (arbitrary, from the kernel's 4 KiB
+// reply boundary, NOT from our stride) and holds the FDB arm to the SQLite
+// listing at every one.
+//
+// This is not hypothetical coverage. Measured through a mount, a 6,000-name
+// directory listed 851 names twice and dropped 851 others while the total count
+// stayed exactly 6,000 — a count-only assertion (and every `ls` in the suites)
+// passes that. The bug was the checkpoint key's frame of reference: FDB stored
+// `(parent, block index)` -> "last name returned", so a resume landed
+// `offset % stride` rows late. The fix keys checkpoints by ROW COUNT, the same
+// contract `MetaEngine::readdir_page` states, and this test is what keeps the two
+// engines from drifting apart again.
+#[test]
+fn fdb_readdir_pages_stitch_into_the_sqlite_listing() {
+    let Some(file) = cluster_file() else {
+        eprintln!("SKIP fdb_paging: no FDB cluster file (set GROVEFS_FDB_CLUSTER_FILE)");
+        return;
+    };
+    if !cluster_reachable(&file) {
+        eprintln!("SKIP fdb_paging: cluster {} unreachable", file.display());
+        return;
+    }
+    let uri = format!("fdb://{}", file.display());
+    let nanos = std::time::UNIX_EPOCH.elapsed().map(|d| d.as_nanos()).unwrap_or(0);
+    let view: String = format!("pg{:x}.{:x}", std::process::id(), nanos)
+        .chars()
+        .take(20)
+        .collect();
+    // One content key for every file: the ledger is cluster-wide and shared with
+    // the other tests in this file (which run in parallel), so a bookkeeping
+    // number that is unique to this run is the only one safe to assert on.
+    let dr = format!("PG{:x}", nanos);
+
+    let dir = tempfile::tempdir().expect("sqlite base");
+    let sqlite = MetaStore::open_sqlite(dir.path(), &view, false).expect("open sqlite store");
+    let fdb = MetaStore::open_fdb(&uri, &view, false)
+        .unwrap_or_else(|e| panic!("open fdb view {view} against {}: {e}", file.display()));
+
+    // 700 names = 21.875 strides: the tail page is short and every resume past
+    // 672 crosses a boundary that is not a page boundary of any test chunk.
+    for i in 0..700 {
+        let nm = format!("f{i:04}");
+        for s in [&sqlite, &fdb] {
+            s.create_node(ROOT_INO, &nm, false, Some(&dr), 0o644, 1000, 1000)
+                .unwrap_or_else(|e| panic!("create {nm}: {e}"));
+        }
+    }
+    let listing = |s: &MetaStore| -> Vec<String> {
+        s.readdir(ROOT_INO).into_iter().map(|n| n.name).collect()
+    };
+    let names = |s: &MetaStore, off: usize, lim: usize| -> Vec<String> {
+        s.readdir_page(ROOT_INO, off, lim)
+            .into_iter()
+            .map(|n| n.name)
+            .collect()
+    };
+    let full = listing(&sqlite);
+    assert_eq!(full.len(), 700, "700 files and nothing else");
+
+    // A sequential walk at chunk sizes that do and do not divide the stride (32).
+    // `off` advances by what came back, exactly as the mount's `child_i` does.
+    for chunk in [1usize, 7, 31, 32, 33, 100, 257] {
+        let mut paged: Vec<String> = Vec::new();
+        let mut off = 0usize;
+        loop {
+            let page = names(&fdb, off, chunk);
+            if page.is_empty() {
+                break;
+            }
+            off += page.len();
+            paged.extend(page);
+            assert!(off <= 700, "chunk {chunk} walked past the end of the directory");
+        }
+        assert_eq!(paged, full, "chunk size {chunk} must reassemble the listing");
+    }
+
+    // Lay the checkpoints one big page leaves behind, then resume where the KERNEL
+    // would: every offset here is mid-stride, and several sit inside the window
+    // the checkpoints cover (the fast path) rather than outside it (the fallback
+    // that scanned from row 0 and therefore never had the bug).
+    assert_eq!(names(&fdb, 0, 300).len(), 300);
+    for off in [1usize, 2, 31, 33, 47, 64, 96, 97, 150, 299, 300, 301, 511, 640, 699] {
+        let want = &full[off..(off + 9).min(full.len())];
+        assert_eq!(
+            names(&fdb, off, 9),
+            want,
+            "resume at offset {off} must serve the same window"
+        );
+    }
+
+    // A deletion shifts every later index: the checkpoint that covered it must be
+    // gone, or the resume silently skips the row after the hole.
+    for s in [&sqlite, &fdb] {
+        s.unlink(ROOT_INO, "f0100").unwrap();
+    }
+    let shifted = listing(&sqlite);
+    assert_eq!(shifted.len(), 699);
+    assert_eq!(names(&fdb, 0, 300).len(), 300, "re-lay checkpoints after the delete");
+    for off in [99usize, 100, 101, 350, 698] {
+        let want = &shifted[off..(off + 9).min(shifted.len())];
+        assert_eq!(
+            names(&fdb, off, 9),
+            want,
+            "resume at offset {off} after a delete must follow the new order"
+        );
+    }
+
+    if let MetaStore::Fdb(f) = &fdb {
+        release_ledger(&fdb);
+        let rep = f
+            .remove_view()
+            .unwrap_or_else(|e| panic!("remove scratch view {view}: {e}"));
+        assert_eq!(
+            (rep.unbooked, rep.still_held),
+            (0, 0),
+            "paging test left bookings behind: {rep:?}"
+        );
+        assert!(
+            !grovefs::fdb_store::FdbStore::subspace_exists(&uri, &view).unwrap_or(true),
+            "paging test left the subspace in {view}"
+        );
+    }
+    println!("fdb_readdir_pages_stitch_into_the_sqlite_listing: 700 names, 7 chunk sizes + 20 resumes");
+}
+
 // ---- the third arm --------------------------------------------------------
 //
 // `docs/fdb-keyspace.md` §14 registers the harness P6 asks for as a THREE-way

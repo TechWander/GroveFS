@@ -2152,17 +2152,30 @@ impl FdbStore {
         let Ok(tx) = self.read_tx() else {
             return Vec::new();
         };
-        let base = offset / READDIR_CURSOR_STRIDE;
-        let start_after = self
-            .cursors
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(&(parent, base))
-            .cloned();
+        // The checkpoint contract is the SQLite/PG one, and it has to be: the
+        // mount derives resume offsets from what the KERNEL accepted (a 4 KiB
+        // reply boundary), not from our stride, so both engines must agree on
+        // what a checkpoint means. Key = the row count the page resumes at (a
+        // multiple of STRIDE), value = the name of row `key - 1`. Keying by
+        // BLOCK index instead lands the resume `offset % STRIDE` rows late —
+        // measured on a 6000-name directory: 851 names listed twice and 851
+        // dropped, while the total count stayed right.
+        let base = offset - offset % READDIR_CURSOR_STRIDE;
+        let start_after = if offset == 0 {
+            None
+        } else {
+            self.cursors
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&(parent, base))
+                .cloned()
+        };
         // A checkpoint we no longer need is never wrong, only slower: an expired
         // hint means "re-scan from the start", which is the pre-cursor behaviour.
         let (skip, mut opt) = match &start_after {
-            Some(nm) => (offset % READDIR_CURSOR_STRIDE, self.keys.children_range_after(parent, nm)),
+            // The range starts at row `base` (strictly after the checkpoint's
+            // own name), so only the rows between `base` and `offset` are skipped.
+            Some(nm) => (offset - base, self.keys.children_range_after(parent, nm)),
             None => (offset, self.keys.children_range(parent)),
         };
         // The read is bounded the way PG bounds its `LIMIT`: nothing past
@@ -2171,7 +2184,6 @@ impl FdbStore {
         // (§3.3's cost claim rests on this bound, not on the cursor alone).
         opt.limit = Some(skip + limit + 1);
         let mut out = Vec::with_capacity(limit.min(READDIR_CURSOR_STRIDE));
-        let mut last: Option<String> = None;
         for (idx, (p, n, rec)) in scan_children(&tx, &self.keys, opt).into_iter().enumerate() {
             if idx < skip {
                 continue;
@@ -2183,14 +2195,21 @@ impl FdbStore {
                 Ok(info) => out.push(info),
                 Err(_) => break,
             }
-            last = Some(n);
         }
-        if let (Some(nm), true) = (last, out.len() == limit) {
+        // Checkpoint every stride boundary this page actually crossed, so a
+        // resume at ANY later offset inside the covered window is a keyset seek
+        // (the SQLite/PG loops do the same, one row at a time).
+        if !out.is_empty() {
             let mut cur = self.cursors.lock().unwrap_or_else(|p| p.into_inner());
-            if cur.len() >= READDIR_CURSOR_CAP {
-                cur.clear(); // cap reached: the whole map is a hint, dropping it is safe
+            for (i, info) in out.iter().enumerate() {
+                let next = offset + i + 1;
+                if next.is_multiple_of(READDIR_CURSOR_STRIDE) {
+                    if cur.len() >= READDIR_CURSOR_CAP {
+                        cur.clear(); // cap reached: the whole map is a hint, dropping it is safe
+                    }
+                    cur.insert((parent, next), info.name.clone());
+                }
             }
-            cur.insert((parent, (offset + limit) / READDIR_CURSOR_STRIDE), nm);
         }
         out
     }

@@ -943,15 +943,26 @@ enum ViewAction {
     /// metadata tree and rebuilds the cross-view ledger — the base's names and
     /// any still-held bytes stay.
     ///
-    /// WITH `--base`: remove an entire physical BASE view `--name` from a local
-    /// SQLite store — its metadata tree dies, the cross-view ledger is rebuilt
-    /// from the surviving trees, and every content blob no other view holds is
-    /// freed through the store's data root (`--data-dir`, default `--home`;
-    /// point it at the root/data-server that actually stores the objects).
+    /// WITH `--base`: remove an entire physical BASE view `--name` — its
+    /// metadata tree dies, the cross-view ledger is rebuilt from the surviving
+    /// trees, and every content blob no other view holds is freed through the
+    /// store's data root (`--data-dir`, default `--home`; point it at the
+    /// root/data-server that actually stores the objects).
+    ///
+    /// What "the tree" is depends on the backend the name lives in. A local
+    /// store loses `meta/<name>.db` (+ WAL/SHM); with `--meta-store fdb://…`
+    /// the tree IS one subspace of the cluster, so the command clears the whole
+    /// subspace, recomputes the shared `refs` ledger from the trees that
+    /// survive, and then frees the objects nothing names any more — the same
+    /// one-range operation `docs/fdb-keyspace.md` §3.3 describes. The report
+    /// states both halves separately (keys gone / objects unbooked / objects
+    /// not found under this data root), so "the tree is gone" and "the bytes
+    /// were reclaimed" are never collapsed into one number.
+    ///
     /// Guards: a governed name needs the plain `view rm` first, an actively
-    /// mounted `grovefs:<name>` is refused, a `--meta-store postgres://…` deployment
-    /// is refused (its tree is a PG schema — drop the schema and let PG/data
-    /// servers own the bytes). Other machines' live mounts of the same
+    /// mounted `grovefs:<name>` is refused, a `--meta-store postgres://…`
+    /// deployment is refused (its tree is a PG schema — drop the schema and let
+    /// PG/data servers own the bytes). Other machines' live mounts of the same
     /// meta-server are not visible here — stop them first.
     Rm {
         #[arg(long)]
