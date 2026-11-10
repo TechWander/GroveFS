@@ -113,7 +113,7 @@ GroveFS view governance over ONE control-plane store (local SQLite files, or a P
 - `remove_view` — drop a definition (a fork also drops its own tree; content bytes survive while any view holds them)
 
 ## Curate
-- `fork_view` — independent metadata tree seeded from a base; `seed:false` starts EMPTY (root only). Structure writable, content read-only, bytes shared.
+- `fork_view` — independent metadata tree seeded from a base; `seed:false` starts EMPTY (root only). Structure writable, content read-only, bytes shared. Needs a local SQLite base: a PG-bound store refuses one, and an `fdb://` store always does (a fork copies a whole per-view tree; an `fdb://` view is a subspace — use an alias or a derived view).
 - `graft_view` — place a curated, renamable subset into a fork or base view; plan lines are `<src>` or `<src>TAB<dst>`, the whole plan lands in one transaction.
 
 ## Validate before publishing (writes nothing)
@@ -295,14 +295,37 @@ pub trait ControlStore: Send + Sync {
 /// The local-file control plane: `<base>/meta/views/<name>.layout` slots plus
 /// the physical `<base>/meta/<view>.db` trees (the SQLite system of record,
 /// unchanged from before this abstraction existed).
+///
+/// An `fdb://` deployment reuses this store for its DEFINITIONS — P2's ruling
+/// was that the control plane stays on the file/PG implementations, and a
+/// subspace has no schema to publish a definition into. `fdb_uri` marks that
+/// deployment shape: from it, every question about a PHYSICAL tree has to be
+/// answered against the cluster rather than against `meta/<view>.db`, which is
+/// why it governs existence (`has_physical`), read-only probes
+/// (`open_ro_view`), the operator hints (`base_tree_missing_note`), the
+/// fork/graft verdicts and the store handed out by `store_for_db_path`.
 pub struct FileControlStore {
     base: PathBuf,
+    /// `Some(uri)` only when `--meta-store fdb://…` moves the physical trees
+    /// into the cluster; definitions, stamps and keys stay files beside `base`.
+    fdb_uri: Option<String>,
 }
 
 impl FileControlStore {
     pub fn new(base: &Path) -> Self {
         Self {
             base: base.to_path_buf(),
+            fdb_uri: None,
+        }
+    }
+
+    /// The same file control plane for an `fdb://` deployment: every governance
+    /// record stays a file, but `has_physical` is decided by the cluster.
+    #[cfg(feature = "fdb")]
+    pub fn new_fdb(base: &Path, uri: &str) -> Self {
+        Self {
+            base: base.to_path_buf(),
+            fdb_uri: Some(uri.to_string()),
         }
     }
 
@@ -317,15 +340,33 @@ impl FileControlStore {
     fn db(&self, name: &str) -> PathBuf {
         self.base.join("meta").join(format!("{name}.db"))
     }
+
+    /// Are this deployment's TREES subspaces in a cluster instead of files under
+    /// `<base>/meta`? One predicate, so no method can forget a case: answering it
+    /// from `self.db(..).is_file()` is what made an `fdb://` store look like a
+    /// SQLite one wherever governance touches a tree.
+    fn trees_in_cluster(&self) -> bool {
+        self.fdb_uri.is_some()
+    }
 }
 
 impl ControlStore for FileControlStore {
     fn backend(&self) -> &'static str {
-        "sqlite"
+        // A stable `&'static str` per backend, as P2 requires: the fdb variant is
+        // still a FILE control plane, but reporting "sqlite" here would advertise
+        // a metadata backend the server is not using.
+        if self.fdb_uri.is_some() {
+            "foundationdb"
+        } else {
+            "sqlite"
+        }
     }
 
     fn describe(&self) -> String {
-        format!("{} (local files)", self.base.display())
+        match &self.fdb_uri {
+            Some(uri) => format!("{} (local files; physical trees are subspaces in {uri})", self.base.display()),
+            None => format!("{} (local files)", self.base.display()),
+        }
     }
 
     fn list_defs(&self) -> Result<Vec<(String, String)>, String> {
@@ -408,14 +449,49 @@ impl ControlStore for FileControlStore {
     }
 
     fn has_physical(&self, name: &str) -> Result<bool, String> {
-        Ok(self.db(name).is_file())
+        // A local db file always counts (an operator can run a hybrid store, and
+        // `view rm`'s file bookkeeping still has to see it). Under `fdb://` the
+        // cluster gets the deciding word for names with no local file: the
+        // subspace `view create` provisioned is the tree, and nothing here
+        // creates one on the way past.
+        if self.db(name).is_file() {
+            return Ok(true);
+        }
+        match &self.fdb_uri {
+            #[cfg(feature = "fdb")]
+            Some(uri) => crate::fdb_store::FdbStore::subspace_exists(uri, name),
+            // `control_store_for` refuses an `fdb://` URI in a binary that does
+            // not link libfdb_c, so this arm is unreachable by construction;
+            // staying honest rather than returning a silent `false`.
+            #[cfg(not(feature = "fdb"))]
+            Some(uri) => Err(format!(
+                "{uri} names the FoundationDB backend, but this binary was built without `--features fdb`"
+            )),
+            None => Ok(false),
+        }
     }
 
     fn store_for_db_path(&self, db: &Path) -> Arc<dyn ControlStore> {
-        Arc::new(FileControlStore::new(db))
+        // Re-pointing the ROOT is what a `db_path` override means; the BACKEND is
+        // a property of the deployment. Handing out a URI-less copy here would
+        // give the caller a store that answers `has_physical` from a directory
+        // holding no trees at all.
+        let store = match &self.fdb_uri {
+            #[cfg(feature = "fdb")]
+            Some(uri) => FileControlStore::new_fdb(db, uri),
+            _ => FileControlStore::new(db),
+        };
+        Arc::new(store)
     }
 
     fn has_fork_tree(&self, name: &str) -> Result<bool, String> {
+        if self.trees_in_cluster() {
+            // No fork can have been seeded on this store (`create_fork_tree`
+            // refuses), so there is no fork tree of ours to look for — and
+            // answering from the local directory would call a stale `.db` file a
+            // live fork.
+            return Ok(false);
+        }
         Ok(self.db(name).is_file())
     }
 
@@ -425,6 +501,17 @@ impl ControlStore for FileControlStore {
         name: &str,
         seed: bool,
     ) -> Result<crate::meta::ForkStats, String> {
+        if self.trees_in_cluster() {
+            // Refuse EXPLICITLY rather than fall into the SQLite copy below:
+            // `fork_view_with` reads `<base>/meta/<base>.db`, which an `fdb://`
+            // deployment never has, so the fall-through would surface a "no such
+            // file" from the wrong layer — or, if an operator left an old `.db`
+            // file behind, mint a LOCAL SQLite fork for a cluster-backed base.
+            // That half-working shape is what P5's exit criterion forbids.
+            return Err(format!(
+                "fork is not implemented on the FoundationDB backend (a fork copies a whole per-view tree, and view '{base}' is one subspace of the cluster with no snapshot path to copy; serve '{name}' as an alias or derived view instead, which works on every backend, or keep the SQLite file store if you need real forks)"
+            ));
+        }
         crate::meta::fork_view_with(&self.base, base, name, seed)
     }
 
@@ -436,10 +523,22 @@ impl ControlStore for FileControlStore {
         dest: &str,
         skip_existing: bool,
     ) -> Result<crate::meta::GraftStats, String> {
+        if self.trees_in_cluster() {
+            return Err(
+                "graft is not implemented on the FoundationDB backend (it copies rows between per-view trees, which only the file store keeps as separate databases; an 'fdb://' view's rows live in one subspace of one cluster)"
+                    .to_string(),
+            );
+        }
         crate::meta::graft_view(&self.base, dst, src, items, dest, skip_existing)
     }
 
     fn destroy_fork_tree(&self, name: &str) {
+        if self.trees_in_cluster() {
+            // Nothing was created by `create_fork_tree`, so there is nothing to
+            // roll back — and deleting `meta/{name}.db*` here would remove a
+            // LOCAL tree that has nothing to do with this deployment.
+            return;
+        }
         let meta_dir = self.base.join("meta");
         for ext in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(meta_dir.join(format!("{name}.db{ext}")));
@@ -447,6 +546,15 @@ impl ControlStore for FileControlStore {
     }
 
     fn drop_fork_tree(&self, name: &str) -> Result<(), String> {
+        if self.trees_in_cluster() {
+            // Symmetric with the refusal above: no fork tree was ever written
+            // here, and `rebuild_ledger` would recompute the byte holds from the
+            // LOCAL `.db` files — an `fdb://` deployment keeps its ledger in the
+            // cluster's shared subspace, so running it would mint a stale local
+            // refs.db that nothing reads (and, in a hybrid directory, could
+            // clobber one that is). Same reasoning as PG's no-op, stated.
+            return Ok(());
+        }
         let meta_dir = self.base.join("meta");
         // Definition is gone first: the name stops resolving even if a db file
         // lingers (e.g. a live meta-server still holds its handle open).
@@ -469,6 +577,23 @@ impl ControlStore for FileControlStore {
     }
 
     fn open_ro_view(&self, view: &str) -> Result<Arc<dyn MetaProvider>, String> {
+        // A read-only probe must never create anything, on any backend.
+        #[cfg(feature = "fdb")]
+        if let Some(uri) = &self.fdb_uri {
+            // The tree IS a subspace here, so this is the real capability rather
+            // than a refusal: `list_view_tree` and the other introspection tools
+            // can walk an `fdb://` view exactly as they walk a PG schema.
+            // `FdbStore::open(readonly)` does not seed a root, and the existence
+            // question is asked of the cluster first so a typo cannot mint one.
+            if !crate::fdb_store::FdbStore::subspace_exists(uri, view)? {
+                return Err(format!(
+                    "no metadata tree for view '{view}' (no such subspace in {uri}) — list_view_tree walks this store's own backend; a remote tree not reachable from here is not"
+                ));
+            }
+            return crate::fdb_store::FdbStore::open(uri, view, true)
+                .map(|s| -> Arc<dyn MetaProvider> { Arc::new(s) })
+                .map_err(|e| format!("cannot open view '{view}' from {uri}: {e}"));
+        }
         let p = self.db(view);
         if !p.is_file() {
             return Err(format!(
@@ -482,6 +607,26 @@ impl ControlStore for FileControlStore {
     }
 
     fn base_tree_missing_note(&self, view: &str) -> Result<Option<String>, String> {
+        // Without `--features fdb` no `fdb://` store can be constructed at all
+        // (`new_fdb` and `control_store_for`'s arm are both gated), so `fdb_uri`
+        // is necessarily `None` in that build and the file answer below is the
+        // only one there is.
+        #[cfg(feature = "fdb")]
+        if let Some(uri) = &self.fdb_uri {
+            // Telling an `fdb://` operator to run `init --view` would send them
+            // at a local SQLite file that this deployment does not read; the
+            // actionable form is provisioning the subspace. `uri` already carries
+            // the `fdb://` scheme, so the line below is copy-pasteable as printed.
+            let exists = crate::fdb_store::FdbStore::subspace_exists(uri, view)?;
+            return Ok(if exists {
+                None
+            } else {
+                Some(format!(
+                    "note: view '{view}' has no subspace in {uri} yet — create it with `grovefs view --meta-store {uri} --meta-dir {} create --view {view}` first",
+                    self.base.display()
+                ))
+            });
+        }
         Ok(if self.db(view).is_file() {
             None
         } else {
@@ -696,6 +841,20 @@ pub fn control_store_for(
     match store_uri {
         Some(u) if u.starts_with("postgres://") || u.starts_with("postgresql://") => {
             PgControlStore::new(u).map(|s| Arc::new(s) as Arc<dyn ControlStore>)
+        }
+        // An `fdb://` deployment keeps its definitions and keys in the file
+        // control plane (P2's ruling) but must NOT decide physical existence from
+        // a `<view>.db` file — see `FileControlStore::new_fdb`.
+        Some(u) if u.starts_with("fdb://") => {
+            #[cfg(feature = "fdb")]
+            {
+                Ok(Arc::new(FileControlStore::new_fdb(base, u)) as Arc<dyn ControlStore>)
+            }
+            #[cfg(not(feature = "fdb"))]
+            Err(format!(
+                "{u} names the FoundationDB backend, but this binary was built without \
+                 `--features fdb` (it does not link libfdb_c)"
+            ))
         }
         _ => Ok(Arc::new(FileControlStore::new(base))),
     }
@@ -1028,8 +1187,11 @@ pub fn alias_view(
 /// only the fork's own names — the base's tree stays exactly as it was.
 /// Refused: a name that already has a definition or a physical db, a governed
 /// base (fork a physical tree, not a lens/alias/fork), and any store whose
-/// base tree is not a local SQLite db (PostgreSQL-backed views cannot be
-/// forked yet — the authoritative tree lives in Postgres, not in a file).
+/// base tree is not a local SQLite db — a PostgreSQL-backed view cannot be
+/// forked yet (its authoritative tree lives in Postgres, not in a file), and an
+/// `fdb://` view never can be (one subspace of the cluster, no snapshot path).
+/// Both refusals are explicit errors with the alternative named, never a
+/// silent fall-through to the file-copy path.
 pub fn fork_view(store: &dyn ControlStore, name: &str, base: &str) -> Result<Vec<OutLine>, String> {
     fork_view_seeded(store, name, base, true)
 }
@@ -1071,6 +1233,18 @@ pub fn fork_view_seeded(
         ));
     }
     if !store.has_physical(base)? {
+        // Name the store the operator is actually standing on. The SQLite/PG
+        // wording below is what the docs quote, so it stays byte-for-byte; an
+        // `fdb://` deployment would have been told to create a local `.db` file
+        // next to a `meta/` directory that holds no trees at all — and to do that
+        // for a backend whose real verdict is that `fork` is not implemented
+        // there (see `create_fork_tree`), so the advice could never succeed.
+        if store.backend() == "foundationdb" {
+            return Err(format!(
+                "no physical base tree for '{base}' in {} — `fork` is not implemented on the FoundationDB backend (a fork copies a whole per-view tree, and a view here is one subspace of the cluster with no snapshot path to copy); serve '{name}' as an alias or derived view instead, which works on every backend, or keep the SQLite file store if you need real forks",
+                store.describe()
+            ));
+        }
         return Err(format!(
             "no physical base tree for '{base}' in {} — `fork` copies a LOCAL SQLite tree; create the base first (`grovefs view create --view {base}`). A PostgreSQL-backed view cannot be forked (its authoritative tree lives in Postgres, not in a file)",
             store.describe()
@@ -2129,7 +2303,7 @@ pub fn tool_defs() -> Value {
             "name": "fork_view",
             "title": "Fork view",
             "annotations": annot("Fork view", false, false, false),
-            "description": "Create a FORK: an INDEPENDENT metadata tree named `name`, seeded as a point-in-time copy of the physical view `base` (`<meta-dir>/meta/<name>.db`). Content bytes are SHARED through the cross-view ledger (no copies), so the fork costs metadata only. Structure (mkdir/rename/unlink/symlink/link) is WRITABLE; content writes (write/truncate) are refused with EROFS client-side. Deleting a name in the fork removes only the fork's own metadata — the base tree is untouched, and a shared object is freed only when no view holds a name for it. With `seed: false` the fork's tree starts EMPTY (root only) so a curated subset can be placed with `graft_view`. Requires a local SQLite base tree (a PostgreSQL-bound control store refuses forks — its trees are PG schemas, not files).",
+            "description": "Create a FORK: an INDEPENDENT metadata tree named `name`, seeded as a point-in-time copy of the physical view `base` (`<meta-dir>/meta/<name>.db`). Content bytes are SHARED through the cross-view ledger (no copies), so the fork costs metadata only. Structure (mkdir/rename/unlink/symlink/link) is WRITABLE; content writes (write/truncate) are refused with EROFS client-side. Deleting a name in the fork removes only the fork's own metadata — the base tree is untouched, and a shared object is freed only when no view holds a name for it. With `seed: false` the fork's tree starts EMPTY (root only) so a curated subset can be placed with `graft_view`. Requires a local SQLite base tree (a PostgreSQL-bound control store refuses forks — its trees are PG schemas, not files; an `fdb://` store refuses them outright — a view there is one subspace of the cluster, so an alias or a derived view is the way to serve a subset).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2145,7 +2319,7 @@ pub fn tool_defs() -> Value {
             "name": "graft_view",
             "title": "Graft view",
             "annotations": annot("Graft view", false, false, false),
-            "description": "Copy a CURATED SUBSET of one view's names into `name` (a base view or a fork), renaming as it goes. `map` is a plan, one line per entry: `<src>` or `<src>TAB<dst>`, paths relative to each view's root; blank lines and `#` comments are ignored. A directory source brings its whole subtree (original names); a file/symlink brings just itself; the destination basename is the rename (this is how UUID-named objects become a human-shaped tree). Missing destination directories are created (0755), all entries land in ONE transaction (a bad line writes nothing), and bytes are SHARED via the cross-view ledger — a graft moves metadata, never content. Typical flow: fork_view with `seed: false`, then graft_view the subset you want. `src` defaults to the fork's recorded base.",
+            "description": "Copy a CURATED SUBSET of one view's names into `name` (a base view or a fork), renaming as it goes. `map` is a plan, one line per entry: `<src>` or `<src>TAB<dst>`, paths relative to each view's root; blank lines and `#` comments are ignored. A directory source brings its whole subtree (original names); a file/symlink brings just itself; the destination basename is the rename (this is how UUID-named objects become a human-shaped tree). Missing destination directories are created (0755), all entries land in ONE transaction (a bad line writes nothing), and bytes are SHARED via the cross-view ledger — a graft moves metadata, never content. Typical flow: fork_view with `seed: false`, then graft_view the subset you want. `src` defaults to the fork's recorded base. Like `fork_view`, grafting needs local SQLite per-view trees: a PostgreSQL-bound store and an `fdb://` store both refuse it explicitly.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3019,6 +3193,92 @@ mod tests {
 
     fn fstore(p: &Path) -> Arc<dyn ControlStore> {
         Arc::new(FileControlStore::new(p))
+    }
+
+    /// P5's fork verdict, pinned as a test: on an `fdb://` store a fork must be
+    /// refused **in words**, never half-made. Both shapes the code had before P5
+    /// are silent-half-usable failures — (a) falling through to the SQLite copy
+    /// and reporting "no such file" from the wrong layer, and (b) minting a
+    /// LOCAL `meta/<fork>.db` for a base that lives in the cluster. The URI is
+    /// deliberately an unreachable cluster file, so a refusal that names
+    /// FoundationDB also proves no cluster I/O was attempted.
+    ///
+    /// "Equally explicit as PG" is checked structurally, because a live PG store
+    /// is not available here: the message must say *not implemented*, name the
+    /// backend, name the operation, give the reason and point at the alternative
+    /// — the five things `PgControlStore::create_fork_tree`'s text does.
+    #[cfg(feature = "fdb")]
+    #[test]
+    fn fork_and_graft_refuse_explicitly_on_an_fdb_store() {
+        let home = db();
+        std::fs::create_dir_all(home.join("meta")).unwrap();
+        let uri = "fdb:///nonexistent-cluster-file-for-this-test";
+        let store = FileControlStore::new_fdb(&home, uri);
+
+        let e = store
+            .create_fork_tree("base", "forked", true)
+            .expect_err("an fdb:// store must refuse to fork");
+        assert!(e.contains("not implemented"), "must match PG's verdict form: {e}");
+        assert!(e.contains("FoundationDB"), "must name the backend: {e}");
+        assert!(e.contains("fork"), "must name the operation: {e}");
+        assert!(e.contains("subspace"), "must give the reason: {e}");
+        assert!(
+            e.contains("alias") || e.contains("derived view"),
+            "must point at the alternative that really works: {e}"
+        );
+        // And no half-made state to clean up afterwards.
+        assert!(
+            !home.join("meta/forked.db").exists(),
+            "a refusal must not leave a local SQLite fork tree behind"
+        );
+        assert!(
+            !store.has_def("forked").unwrap(),
+            "a refusal must not record a fork definition"
+        );
+        assert!(
+            !store.has_fork_tree("forked").unwrap(),
+            "the store must not claim a fork tree it never made"
+        );
+
+        let g = store
+            .graft_tree("forked", "base", &[], "", false)
+            .expect_err("an fdb:// store must refuse to graft");
+        assert!(
+            g.contains("not implemented") && g.contains("FoundationDB") && g.contains("graft"),
+            "{g}"
+        );
+
+        // The rollback arms stay inert for the same reason: they delete LOCAL
+        // files, and `drop_fork_tree` would rewrite the local ledger that is not
+        // this deployment's authority.
+        store.destroy_fork_tree("forked");
+        store.drop_fork_tree("forked").unwrap();
+        assert!(
+            !home.join("meta/refs.db").exists(),
+            "an fdb:// fork drop must not mint a local ledger"
+        );
+    }
+
+    /// `store_for_db_path` re-points the root but must not downgrade the backend:
+    /// a URI-less copy would answer `has_physical` from a directory that holds no
+    /// trees, which is the exact bug class P2's "the control plane follows the
+    /// backend" ruling was about.
+    #[cfg(feature = "fdb")]
+    #[test]
+    fn db_path_override_keeps_the_fdb_backend() {
+        let home = db();
+        let other = db();
+        let store = FileControlStore::new_fdb(&home, "fdb:///nonexistent-cluster-file-for-this-test");
+        let pointed = store.store_for_db_path(&other);
+        assert_eq!(pointed.backend(), "foundationdb");
+        // The description answers for both halves of the promise: the root moved
+        // to `other`, and the backend stayed with the deployment.
+        let d = pointed.describe();
+        assert!(d.contains(&other.display().to_string()), "{d}");
+        assert!(
+            d.contains("nonexistent-cluster-file-for-this-test"),
+            "an fdb:// store handed to a db_path override must keep its cluster URI: {d}"
+        );
     }
 
     /// Seed `<home>/meta/team.db` with `/docs/a.md` and `/photos/private/x.jpg`

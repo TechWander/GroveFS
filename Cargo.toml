@@ -15,6 +15,16 @@ name = "grovefs"
 path = "src/main.rs"
 required-features = ["native"]
 
+# P0 ecosystem spike (docs/fdb-keyspace.md is its design reference). An `example`
+# rather than a `tests/` integration test or a `src/bin` target because it must
+# link `libfdb_c`, drive a live cluster, and use the dev-only executor
+# dependencies; `required-features` keeps it out of every normal build so the
+# default tree never grows an FDB dependency.
+[[example]]
+name = "fdb_spike"
+path = "examples/fdb_spike.rs"
+required-features = ["fdb"]
+
 [lib]
 name = "grovefs"
 path = "src/lib.rs"
@@ -38,6 +48,32 @@ native = ["fuse-bridge", "dep:rusqlite", "dep:postgres"]
 # no fuser/libc, no engine. Combine with `--no-default-features` (the Windows
 # WinFsp client's build).
 remote-only = []
+# Optional FoundationDB metadata backend (`meta-server --meta-store fdb://...`).
+# OFF by default on purpose: the crate links `libfdb_c` at build time, so turning
+# this on requires the FDB client library on the build host. Keeping it off means
+# existing build machines (and the `grovefs-win` client, which builds
+# `--no-default-features`) never need `libfdb_c` — the FDB store code is not even
+# compiled into them. Exactly ONE API-version feature may be on: `fdb-gen`
+# defines its `fdb.options` table as a mutually-exclusive `const` per version, so
+# enabling `fdb-5_1` next to `fdb-7_1` fails to compile (E0428, `OPTIONS_DATA`
+# defined multiple times) — the bindings are built for one API level, and 710 is
+# the level the cluster under test runs (7.1.67).
+#
+# Dependency footprint of this feature, stated exactly once: nothing has to be
+# INSTALLED to run it (see `build.rs`: the binary carries an `$ORIGIN`-relative
+# RUNPATH plus the client dir it was linked against), and nothing has to be
+# installed to BUILD it beyond a C toolchain-less `libfdb_c.so` dropped in some
+# directory and named by `FDB_CLIENT_LIB_PATH` (see `.build-bin/fdb_env.sh`). The
+# libclang bindgen would otherwise need is avoided by the `[patch.crates-io]` at
+# the bottom of this file. `embedded-fdb-include` is a no-op for the vendored
+# crate and matters only if that patch is removed — kept so the fallback story
+# (`/usr/include/foundationdb` never being required) stays true either way.
+fdb = [
+    "dep:foundationdb",
+    "dep:futures",
+    "foundationdb/fdb-7_1",
+    "foundationdb/embedded-fdb-include",
+]
 
 [dependencies]
 # FUSE in userspace. 0.18: high-level Filesystem trait is &self + Send/Sync and
@@ -78,6 +114,19 @@ postgres = { version = "0.19", default-features = false, optional = true }
 hdrhistogram = "7"
 serde_json = "1.0.154"
 sha2 = "0.11.1"
+# FoundationDB bindings for the optional FDB metadata backend (feature `fdb`).
+# Pure-Rust over the C API; needs `libfdb_c` present to link, hence OPTIONAL and
+# off by default. `default-features = false` drops `uuid`/`recipes`: the backend
+# stores neither, and the leader-election recipe would import a second
+# coordination mechanism next to grovefs's own epoch fencing.
+foundationdb = { version = "0.11", default-features = false, optional = true }
+# Needed by the FDB store only, and only for `block_on` / `join_all`: the
+# bindings are async-only while the crate's metadata surface (`MetaProvider`) is
+# synchronous and driven straight from a fuser worker. Deliberately NOT an async
+# runtime — an FDB future is a completion callback from the client library's own
+# network thread, so parking the calling thread on a waker is sufficient and no
+# reactor belongs in this process's dependency graph.
+futures = { version = "0.3", optional = true }
 
 [dev-dependencies]
 # Temp dirs for integration tests (metadata DB, remote data-server backing store)
@@ -87,3 +136,21 @@ tempfile = "3"
 lto = true
 codegen-units = 1
 opt-level = 3
+
+# The last "install a package" dependency of `--features fdb` lived here:
+# `foundationdb-sys` is the only bindgen user in this graph and it runs bindgen
+# unconditionally, so building the FDB arm needed libclang on the build host.
+# There is no upstream escape hatch (checked in 0.8.0 / 0.9.0 / 0.9.1 / 0.10.0, and
+# 0.11.0 is the newest published), so this copy is vendored: one build script that
+# installs checked-in API-710 bindings, `src/lib.rs` byte-identical to upstream.
+# Provenance, the exact delta and the refresh procedure: vendor/foundationdb-sys/VENDOR.md.
+#
+# Two boundaries worth knowing before changing anything here:
+#   * `[patch]` is honoured only for builds whose workspace root is this manifest.
+#     A crate that consumes grovefs as a dependency ignores it (cargo warns), which
+#     is fine because `fdb` is off by default and the client builds (`remote-only`)
+#     never enable it.
+#   * the vendored bindings pin API 710; its build script `compile_error!`s on any
+#     other version feature rather than linking the wrong symbols.
+[patch.crates-io]
+foundationdb-sys = { path = "vendor/foundationdb-sys" }

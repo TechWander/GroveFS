@@ -161,17 +161,49 @@ fn gather_nodes(opts: &DuOpts) -> io::Result<Vec<FlatNode>> {
         );
     }
     let store = resolve_store(&opts.store);
-    if let Some(uri) = store {
-        gather_pg(&uri, &opts.view)
-    } else {
-        let db_path = opts.db_path.as_ref().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "need --meta-server, --meta-store or --meta-dir",
-            )
-        })?;
-        gather_sqlite(db_path, &opts.view)
+    match store.as_deref() {
+        #[cfg(feature = "fdb")]
+        Some(uri) if uri.starts_with("fdb://") => gather_fdb(uri, &opts.view),
+        #[cfg(not(feature = "fdb"))]
+        Some(uri) if uri.starts_with("fdb://") => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{uri} names the FoundationDB backend, but this binary was built without \
+                 `--features fdb`; run `du --meta-server` against an FDB meta-server instead, \
+                 or drop --meta-store for a local SQLite view"
+            ),
+        )),
+        Some(uri) => gather_pg(uri, &opts.view),
+        None => {
+            let db_path = opts.db_path.as_ref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "need --meta-server, --meta-store or --meta-dir",
+                )
+            })?;
+            gather_sqlite(db_path, &opts.view)
+        }
     }
+}
+
+/// The FDB counterpart of `gather_pg`: one read-only subspace scan, no meta-server
+/// round trip. Opening read-only matters — `du` must not seed a root row for a
+/// view name that does not exist (the same "a probe must not create" rule
+/// `crate::mcp` applies to its PG probe).
+#[cfg(feature = "fdb")]
+fn gather_fdb(uri: &str, view: &str) -> io::Result<Vec<FlatNode>> {
+    let store = crate::fdb_store::FdbStore::open(uri, view, true)?;
+    Ok(store
+        .dump_tree()
+        .into_iter()
+        .map(|(id, parent_id, name, is_dir, data_ref)| FlatNode {
+            id,
+            parent_id,
+            name,
+            is_dir,
+            data_ref: data_ref.filter(|d| !d.is_empty()),
+        })
+        .collect())
 }
 
 fn resolve_store(explicit: &Option<String>) -> Option<String> {
@@ -213,7 +245,10 @@ fn gather_sqlite(db_path: &std::path::Path, view: &str) -> io::Result<Vec<FlatNo
         .query_map([], |r| {
             Ok(FlatNode {
                 id: r.get(0)?,
-                parent_id: r.get(1)?,
+                // The root's `parent_id` is NULL; read it the way `gather_pg` does
+                // so the local-SQLite gather and the PG/meta-server gathers hand
+                // the tree walk the same set of rows.
+                parent_id: r.get::<_, Option<i64>>(1)?.unwrap_or(0),
                 name: r.get(2)?,
                 is_dir: r.get::<_, i64>(3)? != 0,
                 data_ref: r.get(4)?,

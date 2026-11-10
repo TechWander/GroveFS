@@ -19,6 +19,16 @@
 #      failover without any additional WAL channel).
 #
 # Assertion-based (pass/fail counters + real exit code) like every other suite.
+#
+# The backend is a parameter: `LOCKS_BACKEND=fdb` re-runs every assertion above
+# (1-4c) against a FoundationDB-backed meta-server instead of a local SQLite
+# store. Sections 1-4c only ever touch the two mounts, so the same flock/fcntl
+# probes decide the same things — what changes is HOW two clients end up on one
+# authoritative tree (local mounts vs. two mounts of one remote view) and where
+# the seed files come from (a manifest vs. writing them through the mount).
+# Section 5 is deliberately SQLite-only: it reads a standby's `meta/alice.db`
+# through sqlite3, i.e. it asserts GroveFS-native HA, which an FDB deployment
+# refuses at startup by design (the cluster replicates instead).
 set -u
 cd "$(dirname "$0")/.."
 export LC_ALL=C LANG=C
@@ -27,17 +37,32 @@ export PKG_CONFIG="$PWD/.build-bin/pkg-config"
 # this up through `LockLease::secs()` reading the env at first call.
 export GROVEFS_LOCK_LEASE_SECS=3
 
+BACKEND="${LOCKS_BACKEND:-sqlite}"
 Y=./target/release/grovefs
+
+lport(){ local a=$1; for _ in $(seq 1 100); do (echo >/dev/tcp/${a%%:*}/${a##*:}) 2>/dev/null && return 0; sleep 0.05; done; return 1; }
+
+if [ "$BACKEND" = fdb ]; then
+    FDB_HOME="${FDB_HOME:-/data/grovefs/.fdbbin}"
+    CLUSTER="${GROVEFS_FDB_CLUSTER_FILE:-/data/grovefs/.fdbtest/test.cluster}"
+    FDBURI="fdb://$CLUSTER"
+    export LD_LIBRARY_PATH="$FDB_HOME/lib:${LD_LIBRARY_PATH:-}"
+    if ! ( [ -x "$FDB_HOME/fdbcli.x86_64" ] && [ -f "$CLUSTER" ] \
+           && "$FDB_HOME/fdbcli.x86_64" -C "$CLUSTER" --exec "status minimal" 2>&1 \
+                | grep -q "The database is available" ); then
+        if [ "${FDB_TEST:-0}" = 1 ]; then
+            echo "SUMMARY: pass=0 fail=1 SKIP=0 (FDB_TEST=1 but no cluster at $CLUSTER)"; exit 1
+        fi
+        echo "SUMMARY: pass=0 fail=0 SKIP=1 (no FoundationDB cluster)"; exit 0
+    fi
+    # The lock ops run inside the meta-server process under this backend, so the
+    # lease the sections below reason about has to be the one that process read —
+    # which it is, because GROVEFS_LOCK_LEASE_SECS is exported above and inherited.
+    Y="${GROVEFS_FDB_BIN:-./target/fdb/release/grovefs}"
+fi
 
 rm -rf .locks; mkdir -p .locks/home .locks/m1 .locks/m2
 export GROVEFS_HOME=$PWD/.locks/home
-
-cat > .locks/alice.manifest <<'EOF'
-mkdir seed
-touch seed/f1.bin
-touch seed/f2.bin
-EOF
-$Y init --view alice --manifest .locks/alice.manifest >/dev/null
 
 pass=0; fail=0
 ok(){ echo "  OK: $1"; pass=$((pass+1)); }
@@ -45,22 +70,89 @@ bad(){ echo "  FAIL: $1"; fail=$((fail+1)); }
 chk(){ if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got '$1' want '$2')"; fi; }
 T(){ timeout 10 "$@"; }
 
+# Two mounts of one view, wired per backend; the assertions below never learn
+# which one they are on.
 M1=.locks/m1
 M2=.locks/m2
-
-# Two mounts of the *same* user against the same view DB. Both processes carry
-# GROVEFS_LOCK_LEASE_SECS=3 through the exported env, so their MetaEngine
-# instances agree on lease duration and cross-process visibility is guaranteed
-# by the shared `locks` SQLite table (WAL + busy_timeout already proven by the
-# `concurrent` suite).
-$Y mount --view alice --mountpoint $M1 --foreground > .locks/m1.log 2>&1 &
-P1=$!
-$Y mount --view alice --mountpoint $M2 --foreground > .locks/m2.log 2>&1 &
-P2=$!
-sleep 1.5
-
-cleanup(){ fusermount -u $M1 2>/dev/null; fusermount -u $M2 2>/dev/null; kill $P1 $P2 2>/dev/null; pkill -f '.locks/' 2>/dev/null; }
+# `kill 0` is not "kill nothing": signal 0-carrying PID 0 means the WHOLE process
+# group, i.e. this suite and whoever launched it. GNU timeout hides that by
+# giving the child its own group, so it only shows up as a green summary followed
+# by exit 143. Kill real numbers only.
+kill_pids(){ local p; for p in "$@"; do case "$p" in ''|0|*[!0-9]*) continue ;; esac
+        kill "$p" 2>/dev/null || true; done; }
+# Reap leaked scratch processes by NAME AND DIRECTORY, never with a bare
+# `pkill -f '.locks/'`: that pattern also matches whoever launched this suite
+# (a harness command line carrying the scratch path).
+_reap(){ local p; for p in $(pgrep -f 'grovefs.*[. ]\.locks' 2>/dev/null || true); do
+        case " $$ $PPID " in *" $p "*) continue ;; esac
+        kill "$p" 2>/dev/null || true
+    done; }
+cleanup(){ fusermount -u $M1 2>/dev/null; fusermount -u $M2 2>/dev/null; fusermount -u .locks/ha/mnt 2>/dev/null; kill_pids "${P1:-}" "${P2:-}" "${DP:-}" "${MP:-}"; _reap; }
+# Armed before the first mount: a fail-fast gate below exits non-zero, and
+# without the trap that would leave FUSE mounts and servers behind for the
+# next run of the suite.
 trap cleanup EXIT
+
+if [ "$BACKEND" = fdb ]; then
+    META=127.0.0.1:15406
+    DATA=127.0.0.1:15407
+    SRV=.locks/srv
+    VIEW="lk$(date +%s)"
+    # Ask whether the port is FREE before binding, not just whether something
+    # answers afterwards: `lport` is satisfied by a listener a previous run left
+    # behind, and the suite would then take its lock assertions from a stranger's
+    # deployment (the failure mode that turned `grovesci` red once).
+    for P in $META $DATA; do
+        if (echo >/dev/tcp/${P%%:*}/${P##*:}) 2>/dev/null; then
+            echo "FAIL: port $P is already listening; refusing to lock against a stranger's server"
+            exit 1
+        fi
+    done
+    mkdir -p $SRV/data $SRV/home $SRV/h1 $SRV/h2
+    $Y view --meta-store "$FDBURI" --meta-dir $SRV/home create --view "$VIEW" > .locks/create.log 2>&1 \
+        || { echo "FAIL: view create for the lock suite: $(cat .locks/create.log)"; exit 1; }
+    $Y data-server --listen $DATA --data-dir $SRV/data > .locks/data.log 2>&1 & DP=$!
+    $Y meta-server --listen $META --home $SRV/home --meta-store "$FDBURI" > .locks/meta.log 2>&1 & MP=$!
+    lport $DATA || { echo "FAIL: data-server did not bind"; cat .locks/data.log; exit 1; }
+    lport $META || { echo "FAIL: meta-server did not bind"; cat .locks/meta.log; exit 1; }
+    $Y --home $SRV/h1 mount --view "$VIEW" --mountpoint $M1 --meta-server $META \
+        --data-servers $DATA --foreground > .locks/m1.log 2>&1 &
+    P1=$!
+    $Y --home $SRV/h2 mount --view "$VIEW" --mountpoint $M2 --meta-server $META \
+        --data-servers $DATA --foreground > .locks/m2.log 2>&1 &
+    P2=$!
+    # Fail-fast mount gate: a mount that never came up would let every lock below
+    # be taken on a bare directory and still print green numbers.
+    for mp in $M1 $M2; do
+        gated=0
+        for _ in $(seq 1 60); do
+            findmnt -rn --mountpoint "$PWD/$mp" >/dev/null 2>&1 && { gated=1; break; }
+            sleep 0.25
+        done
+        [ "$gated" = 1 ] || { echo "FAIL: $mp never mounted (no fake lock numbers)"; cat ".locks/$(basename $mp).log"; exit 1; }
+    done
+    # Same seed the manifest gives the SQLite arm, written through the mount.
+    mkdir -p "$M1/seed" && : > "$M1/seed/f1.bin" && : > "$M1/seed/f2.bin" \
+        || { echo "FAIL: seeding the fdb lock view"; exit 1; }
+    sleep 1.0
+else
+    # Two mounts of the *same* user against the same view DB. Both processes
+    # carry GROVEFS_LOCK_LEASE_SECS=3 through the exported env, so their
+    # MetaEngine instances agree on lease duration and cross-process visibility
+    # is guaranteed by the shared `locks` SQLite table (WAL + busy_timeout
+    # already proven by the `concurrent` suite).
+    cat > .locks/alice.manifest <<'EOF'
+mkdir seed
+touch seed/f1.bin
+touch seed/f2.bin
+EOF
+    $Y init --view alice --manifest .locks/alice.manifest >/dev/null
+    $Y mount --view alice --mountpoint $M1 --foreground > .locks/m1.log 2>&1 &
+    P1=$!
+    $Y mount --view alice --mountpoint $M2 --foreground > .locks/m2.log 2>&1 &
+    P2=$!
+    sleep 1.5
+fi
 
 # ---------------------------------------------------------------------------
 echo "===== 1) flock -x: exclusive lock blocks second holder ====="
@@ -120,7 +212,15 @@ try:
         # writer lock [0, 100)
         fcntl.fcntl(fd, fcntl.F_SETLK, mklock(fcntl.F_WRLCK, 0, 100))
         print('holder:acquired', flush=True)
-        time.sleep(3)
+        # Hold until the script lifts the marker, so the disjoint/overlapping
+        # requests below provably run against a LOCKED range. This used to be
+        # `time.sleep(3)`, which the readiness wait raced: on a loaded machine the
+        # wait expired first and the two assertions then measured an already
+        # released lock. The deadline only exists so a wedged mount cannot hang
+        # the suite; living past one 3s lease window is what section 4b asserts.
+        deadline = time.time() + 120
+        while os.path.exists(sys.argv[3]) and time.time() < deadline:
+            time.sleep(0.05)
     elif mode == 'nonoverlap':
         # [101, 200) — POSIX ranges are inclusive, so this touches neither 0 nor 100.
         fcntl.fcntl(fd, fcntl.F_SETLK, mklock(fcntl.F_WRLCK, 101, 200))
@@ -138,11 +238,25 @@ try:
 finally:
     os.close(fd)
 PY
-  python3 .locks/fcntl_test.py holder "$F" > .locks/h.out 2>&1 &
+  HOLD=.locks/hold.marker
+  : > $HOLD                     # the holder releases when this file goes away
+  python3 .locks/fcntl_test.py holder "$F" $HOLD > .locks/h.out 2>&1 &
   HP=$!
-  # Wait for the holder to print 'acquired'.
-  for _ in $(seq 1 40); do grep -q 'holder:acquired' .locks/h.out 2>/dev/null && break; sleep 0.05; done
-  grep -q 'holder:acquired' .locks/h.out && ok "holder fcntl W acquired [0,100)" || bad "holder never acquired"
+  # Wait for the holder to print 'acquired'. The budget is ~10s and the elapsed
+  # time is reported: a grant that takes longer than it used to is a loaded
+  # machine, not a broken lock surface, and the log should say so out loud.
+  t0=$SECONDS
+  for _ in $(seq 1 200); do grep -q 'holder:acquired' .locks/h.out 2>/dev/null && break; sleep 0.05; done
+  took=$((SECONDS - t0))
+  if grep -q 'holder:acquired' .locks/h.out; then
+    if [ $took -ge 2 ]; then
+      echo "  NOTE: the uncontended grant took ${took}s (loaded host); the assertions"
+      echo "        below are no longer time-raced against the holder's lifetime"
+    fi
+    ok "holder fcntl W acquired [0,100)"
+  else
+    bad "holder never acquired after ${took}s: $(cat .locks/h.out 2>/dev/null | tail -3)"
+  fi
   # Disjoint request: [101,200) must be granted.
   ch=$(python3 .locks/fcntl_test.py nonoverlap "$M2/seed/f1.bin" 2>&1 | tail -1)
   chk "$ch" "nonoverlap:granted" "disjoint [101,200) fcntl W granted"
@@ -152,6 +266,7 @@ PY
     overlap:refused*) ok "overlapping [50,150) refused ($ov)" ;;
     *) bad "overlap expected refused, got: $ov" ;;
   esac
+  rm -f $HOLD                   # done asking: let the holder go
   wait $HP 2>/dev/null
 fi
 
@@ -281,6 +396,13 @@ esac
 
 # ---------------------------------------------------------------------------
 echo "===== 5) HA: locks table replicates to standby via existing backup channel ====="
+# SQLite-only by construction: the probe reads the standby's `meta/alice.db`
+# with sqlite3, i.e. it asserts GroveFS-native HA. An FDB deployment has no
+# GroveFS standby (the cluster itself replicates, and the meta-server refuses
+# --peer on an fdb:// store), so there is no equivalent artifact to open here.
+if [ "$BACKEND" != sqlite ]; then
+  echo "  SKIP: section 5 asserts SQLite standby replication (backend=$BACKEND)"
+else
 META_A=127.0.0.1:15116
 META_B=127.0.0.1:15117
 DATA=127.0.0.1:15118
@@ -328,7 +450,8 @@ wait $HAH 2>/dev/null
 
 # ---- teardown only the HA sub-processes; m1/m2 cleanup stays with trap ----
 fusermount -u .locks/ha/mnt 2>/dev/null
-kill $CP $DP $AP $BP 2>/dev/null || true
+kill_pids "$CP" "$DP" "$AP" "$BP"
+fi
 
 echo
 echo "==================== SUMMARY: pass=$pass fail=$fail ===================="

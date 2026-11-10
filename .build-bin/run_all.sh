@@ -22,6 +22,11 @@
 #   freshness   non-strict cross-client push-invalidation visibility e2e
 #   disp_fresh  display-coordinate freshness e2e: relocated entry under synth parent
 #               converges via enriched push (not TTL); exercises display_targets
+#   layout      presentation overlay e2e (`mount --layout`): one stored view, a
+#               different lens per client — hide/only/map/link, write-through to
+#               the real entries, lens-side deletes, the synthesized-dir guard.
+#               `LAYOUT_BACKEND=fdb` re-runs every assertion against an
+#               FDB-backed meta-server instead of the local SQLite tree
 #   import      zero-copy legacy onboarding e2e (hardlink + incremental)
 #   fork        fork views e2e: an independent metadata tree seeded from a physical
 #               base — structure writable, content EROFS, deletes only the fork's
@@ -58,10 +63,43 @@
 #               PG unreachable); drives three concurrent FUSE clients against
 #               one PG-backed meta-server and asserts parallelism + contention
 #               correctness (paper Sec. 5 I3 + Sec. 9 scalability boundary)
+#   evict       idle-engine eviction e2e (`meta-server --engine-idle-secs`): N
+#               mounted views hold N engines, the sweeper retires an engine once
+#               its last session closes, and a remount serves the same tree.
+#               PG-backed (it measures the connection wall); self-skips without PG
+#   control     control-plane unification e2e: under `--meta-store postgres://…`
+#               view definitions AND api keys live in `grovefs_control`, nothing
+#               lands in the meta-server's local dir, and M_OPEN resolves both out
+#               of PostgreSQL. Self-skips without PG
+#
 #   gc          offline orphan-object audit / reclaim (`grovefs gc`): ledger-held
 #               vs orphan, grace window, live-mount and wrong-root guards, --json
 #               (SQLite stores only; a PG deployment is refused)
+#   viewrm      whole base view removal e2e (`view rm --base`): the guard set
+#               (live local mount, governed name, base still named by an
+#               alias/derived/fork definition, missing tree, PG deployment), tree
+#               +WAL removal, ledger rebuild, and shared bytes surviving for the
+#               fork that still names them
+#   bwlimit     per-mount bandwidth shaping e2e: `--bw-read`/`--bw-write` pin a
+#               24 MiB transfer to its floor with no byte lost, the unlimited
+#               mount of the same view stays materially faster,
+#               GROVEFS_BW_READ/GROVEFS_BW_WRITE env fallback
 #   bench   throughput micro-benchmark        (informational; never gates the result)
+#
+# Experimental — selected by name only, never part of the gating board:
+#   fdb         FoundationDB metadata backend e2e (`--meta-store fdb://<cluster
+#               file>`): subspace provisioning, the tree body, the lock surface,
+#               derived/alias governance and an explicit fork verdict, the two-way
+#               `view export`/`view import` migration chain (ids/inodes kept), and
+#               what `--engine-idle-secs` means on this backend. Registers SKIP
+#               when no cluster is reachable; FDB_TEST=1 turns that absence into
+#               a FAIL (CI). OUT OF CANON because the G3 throughput gate measured
+#               fail on this host: best cell 1601 ops/s (RF=3 `ssd`, four repeats;
+#               most cells 133-998) against a 4.6k ops/s bar, while the PG arm run in the same session reached
+#               4.1k-4.9k ops/s (and 1642 ops/s even with the disk taken out of the
+#               commit path, so the shortfall is not only media). The functional
+#               verdict stands, the capacity verdict does not. Run it with:
+#                 bash .build-bin/run_all.sh fdb
 #
 # Each suite is time-boxed; every mount-based suite cleans up its own FUSE mount and
 # this script also force-unmounts any leftover mount before starting and on exit.
@@ -73,19 +111,28 @@ SKIP_BENCH=${SKIP_BENCH:-0}
 LOGDIR=.build-bin/logs/$(date +%Y%m%d-%H%M%S)
 mkdir -p "$LOGDIR"
 
+# `fdb` is NOT in CANON: the G3 performance gate (docs/fdb-keyspace.md §15) measured
+# fail on 2026-11-09 — best cell 1601 ops/s (RF=3 `ssd`, four repeats, most cells
+# 133-998) against a 4.6k ops/s bar, same host and same op sequence as the PG arm,
+# which reached 4.1k-4.9k in the same session; and 1642 ops/s even with the disk
+# taken out of the commit path, so the gap is not only media. Matrix: §14 v1.8.
+# Per the plan's R3 disposition the backend stays a default-off experiment: reachable
+# by name, never part of the gating board, and promised nowhere in the user docs.
 CANON="build unit posix edge e2e remote errors resilience concurrent metasrv ha striping locks freshness disp_fresh layout fork viewrm gc bwlimit migrate import govcheck govtime grovesci mcp apikey mountkey config pg pg_parallel evict control bench"
+# EXPERIMENTAL suites gate nothing but can still be selected explicitly.
+EXPERIMENTAL="fdb"
 if [ "$#" -gt 0 ]; then SEL="$*"; else SEL="$CANON"; fi
 [ "$SKIP_BENCH" = "1" ] && SEL=${SEL// bench/}
 
 # validate names
 for s in $SEL; do
-  case " $CANON " in *" $s "*) ;; *) echo "unknown suite '$s'; valid: $CANON"; exit 2 ;; esac
+  case " $CANON $EXPERIMENTAL " in *" $s "*) ;; *) echo "unknown suite '$s'; valid: $CANON $EXPERIMENTAL"; exit 2 ;; esac
 done
 should(){ case " $SEL " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
 # ensure a fresh binary whenever a code suite is selected
 NEEDS_BUILD=0
-for s in $SEL; do case "$s" in unit|posix|edge|e2e|remote|errors|resilience|concurrent|metasrv|ha|striping|locks|freshness|disp_fresh|layout|fork|viewrm|gc|bwlimit|migrate|import|govcheck|govtime|grovesci|mcp|apikey|mountkey|config|pg|pg_parallel|bench) NEEDS_BUILD=1 ;; esac; done
+for s in $SEL; do case "$s" in unit|posix|edge|e2e|remote|errors|resilience|concurrent|metasrv|ha|striping|locks|freshness|disp_fresh|layout|fork|viewrm|gc|bwlimit|migrate|import|govcheck|govtime|grovesci|mcp|apikey|mountkey|config|pg|pg_parallel|fdb|bench) NEEDS_BUILD=1 ;; esac; done
 if [ "$NEEDS_BUILD" = 1 ] && ! should build; then SEL="build $SEL"; fi
 
 MOUNTS=".test/mnt_alice .test/mnt_bob .test/mnt_r .ptest/mnt .etest/mnt .xtest/mnt .xtest/mnt_ro .rtest/mnt_a .rtest/mnt_b .ctest/m1 .ctest/m2 .msrv/mnt_a .msrv/mnt_b .msrv/mnt_bob .msrv/mnt_s1 .msrv/mnt_s2 .ltest/mnt_base .ltest/mnt_a .ltest/mnt_b .ltest/mnt_c .ltest/mnt_d .ltest/mnt_srv .ltest/mnt_srvbase .ltest/mnt_ld .ftest/mnt_base .ftest/mnt_lab .ftest/mnt_srv_lab .ftest/mnt_srv_base .migtest/mnt_src .migtest/mnt_dst .migtest/mnt_lab .migtest/mnt_alpha .migtest/mnt_beta .migtest/mnt_all .govcheck/mnt_base .govcheck/mnt_lens .govcheck/mnt_map .govtime/mnt_base .govtime/mnt_dv .govtime/mnt_al .grovesci/mnt_dr .grovesci/mnt_al .grovesci/mnt_refused .mcptest/mnt .mcptest/mnt_al .itest/mnt .itest/mnt_r .itest/mnt_v .bench/mnt .bt-t1/mnt .bt-t4/mnt .br/mnt .ha/mnt .ha/mnt_sb .striping/mnt .striping/mnt_legacy .sigtest/mnt .locks/m1 .locks/m2 .locks/ha/mnt .fresh/mnt_a .fresh/mnt_b .dfresh/mntA .dfresh/mntB .mktest/mnt_ok .mktest/mnt_any .mktest/mnt_env .mktest/mnt_denied .mktest/mnt_tok .mktest/mnt_dat .mktest/mnt_plain .mktest/mnt_ign .mktest/mnt_fo .cfgtest/mnt1 .cfgtest/mnt2 .cfgtest/mnt3 .cfgtest/mnt4 .cfgtest/mnt_seed .pgtest/mnt_a .pgtest/mnt_b .pgpar/mnt_a .pgpar/mnt_b .pgpar/mnt_c .vrtest/mnt .vrtest/mnt2 .vrtest/mntA .gctest/mnt .gctest/mnt2 .gctest/mnt3 .bwtest/mnt_cap .bwtest/mnt_free .bwtest/mnt_env .bwtest/mnt_ro"
@@ -130,6 +177,12 @@ run_mountsuite(){ # $1=key $2=script $3=timeout
   # failure (green code, red board). Reap leaked test servers before every run.
   pkill -f '\./target/release/grovefs meta-server' 2>/dev/null || true
   pkill -f '\./target/release/grovefs data-server' 2>/dev/null || true
+  # The FDB suites drive a SEPARATE binary (./target/fdb/release/grovefs, because
+  # only that one links libfdb_c), so a pattern naming target/release alone let a
+  # leaked fdb-backed pair sit on its port and be adopted by the next suite --
+  # which is how `grovesci` once printed five red assertions about nothing.
+  pkill -f '\./target/fdb/release/grovefs meta-server' 2>/dev/null || true
+  pkill -f '\./target/fdb/release/grovefs data-server' 2>/dev/null || true
   sleep 0.2
   if timeout "$to" bash "$script" >"$log" 2>&1; then rc=0; else rc=$?; fi
   sum=$(grep -E 'SUMMARY: pass=' "$log" | tail -1)
@@ -139,6 +192,31 @@ run_mountsuite(){ # $1=key $2=script $3=timeout
     echo "  TIMEOUT after ${to}s (see $log)"; tail -12 "$log" | sed 's/^/  /'; record "$key" TIMEOUT
   else
     echo "  FAILED rc=$rc :: ${sum:-no-summary} (see $log)"; tail -20 "$log" | sed 's/^/  /'; record "$key" FAIL
+  fi
+}
+
+# run_fdb — the FoundationDB backend suite, gated on EXTERNAL infrastructure.
+# The cluster is not part of the build, so its absence is a SKIP that must not
+# gate the board (R5: a host without FDB still goes GREEN). `test_fdb.sh` signals
+# that case by exiting 0 with `SKIP=1` in its SUMMARY; a SKIP is therefore
+# registered straight into RESULT, bypassing record()'s "anything but PASS gates"
+# rule. `FDB_TEST=1` flips the same absence to exit 1, i.e. a real FAIL for CI.
+run_fdb(){
+  local log="$LOGDIR/fdb.log" rc sum
+  echo "### fdb — bash .build-bin/test_fdb.sh (<= ${FDB_TO:-420}s)"
+  pkill -f '\./target/fdb/release/grovefs meta-server' 2>/dev/null || true
+  pkill -f '\./target/fdb/release/grovefs data-server' 2>/dev/null || true
+  if timeout "${FDB_TO:-420}" bash .build-bin/test_fdb.sh >"$log" 2>&1; then rc=0; else rc=$?; fi
+  sum=$(grep -E 'SUMMARY: pass=' "$log" | tail -1)
+  if [ "$rc" -eq 0 ]; then
+    case "$sum" in
+      *"SKIP=1"*) echo "  SKIP (no FoundationDB cluster) :: ${sum:-no-summary}"; RESULT[fdb]=SKIP ;;
+      *) echo "  OK :: ${sum:-completed}"; record fdb PASS ;;
+    esac
+  elif [ "$rc" -eq 124 ]; then
+    echo "  TIMEOUT after ${FDB_TO:-420}s (see $log)"; tail -12 "$log" | sed 's/^/  /'; record fdb TIMEOUT
+  else
+    echo "  FAILED rc=$rc :: ${sum:-no-summary} (see $log)"; tail -20 "$log" | sed 's/^/  /'; record fdb FAIL
   fi
 }
 
@@ -162,7 +240,9 @@ echo " logs:   $LOGDIR"
 echo "=================================================================="
 
 stop=0
-for s in $CANON; do
+# $CANON $EXPERIMENTAL: iterating CANON alone would make `run_all.sh fdb` a no-op
+# that still prints SKIP — the experimental arm is selectable precisely by name.
+for s in $CANON $EXPERIMENTAL; do
   should "$s" || { RESULT[$s]=SKIP; continue; }
   if [ "$stop" = 1 ]; then RESULT[$s]=SKIP; continue; fi
   case "$s" in
@@ -199,6 +279,7 @@ for s in $CANON; do
     pg_parallel) run_mountsuite pg_parallel .build-bin/test_pg_parallel.sh 300 ;;
     evict)    run_mountsuite evict .build-bin/test_engine_evict.sh 300 ;;
     control)  run_mountsuite control .build-bin/test_control.sh 300 ;;
+    fdb)      run_fdb ;;
     bench)  run_bench ;;
   esac
   echo
@@ -209,7 +290,7 @@ if [ "$stop" = 1 ]; then
 fi
 
 echo "========================= BOARD =================================="
-for s in $CANON; do
+for s in $CANON $EXPERIMENTAL; do
   should "$s" || continue
   printf "  %-7s %s\n" "$s" "${RESULT[$s]:-SKIP}"
 done

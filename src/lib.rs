@@ -27,6 +27,11 @@ pub mod bwlimit;
 pub mod control;
 #[cfg(feature = "native")]
 pub mod du;
+// Optional FoundationDB metadata backend. Gated on `fdb` (not just `native`)
+// because the module links `libfdb_c`; a build without the feature does not
+// compile a single line of it, so no FDB client library is needed.
+#[cfg(all(feature = "native", feature = "fdb"))]
+pub mod fdb_store;
 #[cfg(feature = "fuse-bridge")]
 pub mod fs_impl;
 #[cfg(feature = "native")]
