@@ -28,8 +28,15 @@ dist/grovefs                                    主二进制（剥离符号表�
 dist/grovefs-v1.0-linux-x86_64                  同上，带版本号的副本
 dist/grovefs-v1.0-linux-x86_64.tar.gz           打包件（内含 grovefs 一个文件）
 
-二进制为动态链接，依赖 glibc >= 2.31 与本机 libfuse3（FUSE 挂载路径需要）；
-不需要额外运行时。
+二进制为动态链接，运行期只依赖 glibc >= 2.31 的核心库：实测本产物的 DT_NEEDED 仅
+libgcc_s / libpthread / libm / libdl / libc 五项，**不链 libfuse**（FUSE 客户端由内置的
+Rust `fuser` 实现，构建也不需要 libfuse 开发包）。
+FUSE 挂载路径的额外要求与后端无关：非 root 且无 CAP_SYS_ADMIN 时，`fuser` 需要发行版自带的
+setuid 助手 `fusermount` / `fusermount3`（属 `fuse` / `fuse3` 包，只需该二进制，不需开发包）；
+有 CAP_SYS_ADMIN 时直连 `mount(2)`，不需助手。除 glibc 外不需要其他额外运行时。
+（本段原写「依赖本机 libfuse3」不准：既不链该库，又漏了真正需要的 setuid 助手。修正于
+  2026-11-10，依据是对本分支 `dist/grovefs` 实物跑 `ldd`/`objdump -p` 与一组挂载对照实验，
+  过程与读数见 master 上的 `docs/fdb-keyspace.md` §14 v2.2。二进制与 tar 包未动，字节不变。）
 
 运行环境兼容性
 -------------------------------------------------------------------
