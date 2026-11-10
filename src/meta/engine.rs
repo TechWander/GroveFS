@@ -44,9 +44,18 @@ fn attach_refs_ledger(conn: &Connection, path: &Path) -> rusqlite::Result<()> {
     // ATTACH has no `IF NOT EXISTS`; each engine opens a fresh connection and
     // attaches exactly once here, so re-attaching the same alias is not a
     // concern. The table is created idempotently for a brand-new ledger file.
+    conn.execute_batch(&format!("ATTACH DATABASE '{lit}' AS {REFS_SCHEMA};"))?;
+    // Put the ledger in WAL like the view dbs. A bare ATTACH inherits the
+    // rollback journal, and because `BEGIN IMMEDIATE` takes the ledger's write
+    // lock first, every node write then paid a journal fsync on refs.db:
+    // measured ~1.26k create/s with 8 views (rollback) vs ~2.59k once WAL was
+    // set, accounting unchanged (still one row per view, still committed in the
+    // same txn as the node rows; cross-db commit is per-database either way).
+    // Best effort: switching needs a brief exclusive lock, so a busy ledger
+    // (another process converting at the same moment) must not fail the open.
+    let _ = conn.execute_batch(&format!("PRAGMA {REFS_SCHEMA}.journal_mode=WAL;"));
     conn.execute_batch(&format!(
-        "ATTACH DATABASE '{lit}' AS {REFS_SCHEMA};
-         CREATE TABLE IF NOT EXISTS {REFS_SCHEMA}.holders (
+        "CREATE TABLE IF NOT EXISTS {REFS_SCHEMA}.holders (
              data_ref TEXT PRIMARY KEY,
              holders  INTEGER NOT NULL
          );"
