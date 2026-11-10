@@ -118,6 +118,11 @@ ls_wait(){ local mp="$1" i
     echo "ls_wait: $mp never became accessible" >&2; return 1
 }
 
+# The cluster's tree inventory, one name per line, sorted. `$4` is the KIND column
+# ("view" for a tree, "ledger" for the shared `refs` subspace); the summary and
+# the trailing note line do not have "view" in that column, so they fall out.
+inv_list(){ "$Y" view --meta-store "$FDBURI" --meta-dir "$S/home" scan 2>/dev/null \
+    | awk 'NR>1 && $4=="view"{print $1}' | sort; }
 cleanup(){
     # Every mount of this suite lives under `$S/mnt_*`, so the unmount sweep cannot
     # fall behind a section that adds one.
@@ -130,9 +135,28 @@ cleanup(){
         kill "$p" 2>/dev/null || true
     done
     wait 2>/dev/null
-    # No `view rm` exists for this backend yet (that is P5's governance work), so
-    # a run leaves its scratch subspace in the dev cluster on purpose: the name is
-    # unique per run, and deleting keys is not something a test should fake.
+    # Teardown, now that the command exists: `view rm --base` deletes a subspace
+    # AND unwinds the shared ledger in that order, so a run leaves the cluster as
+    # it found it instead of +N subspaces per run forever (the state that made an
+    # inventory necessary: 169 orphan trees had accumulated).
+    #
+    # It removes the SET DIFFERENCE against the inventory this run found, not a
+    # hand-kept list of names: a section that provisions a view the list does not
+    # know about would otherwise leak its subtree forever, and a section that
+    # FAILs halfway never reaches its own teardown at all. Silent on purpose — a
+    # FAIL printed by a trap would contradict the SUMMARY just printed. The control
+    # plane is LOCAL files under fdb:// (C6), and every definition in it belongs to
+    # this run, so dropping it is what satisfies the "others resolve through this
+    # base" guard rather than working around it.
+    if [ -x "$Y" ] && fdb_available 2>/dev/null && [ -f "$S/inv_before.txt" ]; then
+        rm -rf "$S/home" "$S/ev/home"
+        inv_list > "$S/inv_after.txt" 2>/dev/null
+        comm -13 "$S/inv_before.txt" "$S/inv_after.txt" | while read -r v; do
+            [ -n "$v" ] || continue
+            "$Y" view --meta-store "$FDBURI" --meta-dir "$S/home" rm --name "$v" --base \
+                --data-dir "$S/central/data" >/dev/null 2>&1 || true
+        done
+    fi
 }
 MAP=0; MBP=0; MRP=0
 # Backgrounded processes of the later sections register here as well, so one trap
@@ -140,6 +164,11 @@ MAP=0; MBP=0; MRP=0
 BG=""
 bg(){ "$@" & BG="$BG $!"; }
 trap cleanup EXIT
+
+# What the cluster held before this run. Everything above is build/probe only, so
+# this is the baseline a teardown may remove ITSELF down to — no earlier, no later.
+inv_list > $S/inv_before.txt
+echo "  .. cluster held $(wc -l < $S/inv_before.txt) tree(s) before this run"
 
 echo "===== 0b) the feature binary needs no loader environment ====="
 # `libfdb_c` is never a system package here (see .build-bin/fdb_env.sh), so a
@@ -793,15 +822,20 @@ $Y view --meta-store "$FDBURI" --meta-dir $S/home import --view "$V3" --in $S/m_
 grep -q "$NODES node(s)" $S/m_imp1.log && ok "import reports the source's node count ($NODES)" \
     || bad "import output unexpected: $(cat $S/m_imp1.log)"
 # What `view list --meta-store fdb://…` answers, stated rather than assumed:
-# definitions come from the local files (C6) and a BASE tree is a subspace, which
-# this build does not enumerate (PG can, from `information_schema.schemata`; the
-# cluster has no equivalent cheap answer, and guessing one from a strided scan
-# would list whatever the scan happened to reach). Existence is still decided by
-# the cluster — by name, through `has_physical`/`subspace_exists` — which is what
-# the mount below proves.
+# definitions come from the local files (C6), while a BASE tree is a subspace — and
+# the two questions are answered by two different commands on purpose. `view list`
+# keeps answering the DEFINITIONS (that is what a definition slot is for: the
+# derived/alias/fork names, which have no subspace of their own); `view scan`
+# (section 14) walks the cluster and answers what TREES exist. Collapsing them
+# would make a base view and a definition look alike in one listing, and it would
+# hide the case both commands exist for: a subspace nothing here defines (an
+# abandoned run, an import nobody mounted).
+#
+# Existence is still decided by the cluster — by name, through
+# `has_physical`/`subspace_exists` — which is what the mount below proves.
 $Y view --meta-store "$FDBURI" --meta-dir $S/home list 2>/dev/null | grep -q "^$V3\$" \
     && bad "view list NOW enumerates base subspaces — this assertion, and docs.html's 未提供操作 row, both need updating" \
-    || ok "the documented boundary holds: \`view list\` answers the definitions (local files, C6) and does not enumerate subspaces"
+    || ok "the documented boundary holds: \`view list\` answers the definitions (local files, C6) and \`view scan\` answers the subspaces"
 $Y --home $S/h1 mount --view "$V3" --mountpoint $S/mnt_m2 --meta-server $META \
     --data-servers $DATA --foreground > $S/m_mnt2.log 2>&1 &
 MP2=$!; BG="$BG $MP2"
@@ -970,6 +1004,114 @@ chk "$(T cat $S/mnt_ev/f)" "x" "the reopened view serves the same object — evi
 fusermount -u $S/mnt_ev 2>/dev/null; kill $MNE2 2>/dev/null; wait $MNE2 2>/dev/null
 kill $MPE $DPE 2>/dev/null; wait $MPE 2>/dev/null; wait $DPE 2>/dev/null
 
-echo
-echo "==================== SUMMARY: pass=$pass fail=$fail SKIP=0 ===================="
+echo "===== 14) view scan / view rm --base: the cluster inventory and the real teardown ====="
+# C6's split, made operational: definitions are LOCAL files under `--meta-store
+# fdb://…`, trees are SUBSPACES in the cluster. `view list` answers the first and
+# `view scan` the second; neither can answer the other. This section pins both the
+# listing (including that the prefix column addresses the keys it counted) and the
+# removal — tree first is WRONG, so what is asserted here is the order: unwind the
+# shared ledger, then drop the subspace, and a second run is a no-op.
+#
+# Everything below runs against the run's own subspaces, so the assertions hold on
+# a cluster other suites are also using.
+for d in "$S"/mnt_*; do [ -d "$d" ] && fusermount -u "$d" 2>/dev/null; done
+VCLI="$Y view --meta-store $FDBURI --meta-dir $S/home"
+$VCLI scan > $S/scan.txt 2>&1 && ok "view scan reads the cluster inventory" \
+    || bad "view scan failed: $(head -3 $S/scan.txt)"
+head -1 $S/scan.txt | grep -q "SUBSPACE" && ok "the inventory names its columns" \
+    || bad "no header line: $(head -2 $S/scan.txt)"
+grep -qE "^refs +[0-9]+ +0 +ledger" $S/scan.txt \
+    && ok "the shared ledger is listed once, as kind=ledger rather than as a tree" \
+    || bad "refs is missing or mis-typed in the inventory: $(grep refs $S/scan.txt | head -1)"
+for v in "$VIEW" "$V2" "$V3"; do
+    grep -qE "^$v +[0-9]+ +[0-9]+ +view" $S/scan.txt \
+        && ok "run subspace $v is in the inventory with a key and entry count" \
+        || bad "$v missing from the inventory"
+done
+grep -q "subspace(s) under the 'grovefs' root" $S/scan.txt \
+    && ok "the inventory sums trees and ledgers separately" || bad "no summary line"
+# The PREFIX column is the reason an operator can act on this listing without
+# re-deriving the tuple encoding: it must address exactly the keys the KEYS column
+# counted. One `\xNN` per byte, because `fdbcli` reads `\x` as ONE byte.
+PX=$(awk -v v="$VIEW" '$1==v {print $5}' $S/scan.txt)
+PXKEYS=$(awk -v v="$VIEW" '$1==v {print $2}' $S/scan.txt)
+if [ -n "$PX" ]; then
+    PFX=$(echo "$PX" | sed 's/../\\x&/g')
+    RAW=$("$FDB_HOME/fdbcli.x86_64" -C "$CLUSTER" \
+        --exec "getrangekeys \"$PFX\" \"${PFX}\\xff\" 100000" 2>/dev/null | grep -c '^`')
+    chk "$RAW" "$PXKEYS" "the prefix hex addresses exactly the keys the inventory counted for $VIEW"
+else
+    bad "no prefix hex printed for $VIEW"
+fi
+$Y view --meta-dir $S/home scan > $S/scan_nostore.log 2>&1 \
+    && bad "view scan without a cluster reported success" \
+    || ok "view scan without --meta-store is refused (it reads a cluster, not a directory)"
+$Y view --meta-store postgres://nobody@127.0.0.1:1/none --meta-dir $S/home scan > $S/scan_pg.log 2>&1 \
+    && bad "view scan accepted a non-fdb store" \
+    || ok "view scan refuses a store that is not fdb://"
+$VCLI create --view refs > $S/reserved.log 2>&1 \
+    && bad "view create accepted the reserved ledger name 'refs'" \
+    || ok "'refs' is refused as a view name before any key is written (it is the shared ledger)"
+grep -q "reserved" $S/reserved.log && ok "the refusal says why: 'refs' is reserved, not merely taken" \
+    || bad "unexpected refusal text: $(head -2 $S/reserved.log)"
+
+echo "-- 14b) the teardown: ledger unwound, then the subspace, and a re-run is a no-op"
+RM1=$($VCLI rm --name "$V3" --base --data-dir $S/central/data 2>&1)
+echo "$RM1" | grep -q "removed base view '$V3' from $FDBURI" \
+    && ok "view rm --base removed the imported subspace $V3" || bad "rm --base failed: $(echo "$RM1" | head -3)"
+echo "$RM1" | grep -qE "[0-9]+ key\(s\) gone" && ok "the removal reports the key count it removed" \
+    || bad "no key count in the report: $(echo "$RM1" | head -2)"
+$VCLI scan > $S/scan2.txt 2>&1
+grep -qE "^$V3 " $S/scan2.txt && bad "$V3 is still in the inventory after its removal" \
+    || ok "the removed subspace is gone from the inventory"
+$VCLI rm --name "$V3" --base > $S/rm_twice.log 2>&1 \
+    && bad "a second rm --base on a removed view reported success" \
+    || ok "a second rm --base is refused, not a cheerful zero (a typo and a removed view must look different)"
+grep -q "no subspace named '$V3'" $S/rm_twice.log \
+    && ok "the refusal names the missing subspace and points at view scan" \
+    || bad "unexpected re-run text: $(head -2 $S/rm_twice.log)"
+# The guard set is backend-independent: $V2 still has derived/alias definitions
+# resolving through it, so the removal has to be refused for the same reason it is
+# on the SQLite arm. This is the assertion that the fdb branch did not jump the
+# guards by being new.
+$VCLI rm --name "$V2" --base > $S/rm_governed.log 2>&1 \
+    && bad "rm --base removed a base that definitions still resolve through" \
+    || ok "rm --base under fdb:// honours the same dependency guard the SQLite arm does"
+grep -q "governed by a definition over base '$V2'" $S/rm_governed.log \
+    && ok "the guarded refusal names the dependent definition" \
+    || bad "unexpected guard text: $(head -2 $S/rm_governed.log)"
+
+# The ledger half, with two views sharing the SAME content keys: remove one and
+# nothing may be released, remove the other and it must be. This is the part a
+# plain `clear_range` gets wrong (it leaves every blob booked forever, and an FDB
+# deployment has no `refs rebuild` to repair it).
+mkdir -p $S/zb/data
+for v in zb1 zb2; do
+    $Y view --meta-store "$FDBURI" --meta-dir $S/zb/home import --view "$v" --in $S/m_src.jsonl \
+        > $S/zb/$v.log 2>&1 \
+        && ok "imported the same dump into $v (same content keys, so the bookings are shared)" \
+        || bad "import into $v failed: $(head -3 $S/zb/$v.log)"
+done
+ZA=$($Y view --meta-store "$FDBURI" --meta-dir $S/zb/home rm --name zb1 --base --data-dir $S/zb/data 2>&1)
+echo "$ZA" | grep -qE "[1-9][0-9]* still held by other views" \
+    && ok "removing one of two holders releases nothing — it books down and keeps the bytes" \
+    || bad "the shared booking was not preserved: $(echo "$ZA" | head -3)"
+# The report always prints both counts, so "no longer held" alone would match the
+# zero. Only a NON-ZERO release may be read as "the bytes are free" — that is the
+# number which, if it were 1 here, would mean this removal freed a blob the other
+# holder still names.
+echo "$ZA" | grep -qE "[1-9][0-9]* object\(s\) no longer held by any view" \
+    && bad "a view holding a shared content key claimed the bytes were free: $(echo "$ZA" | head -2)" \
+    || ok "and it did NOT report the shared bytes as free (the ledger went 2 -> 1)"
+ZB=$($Y view --meta-store "$FDBURI" --meta-dir $S/zb/home rm --name zb2 --base --data-dir $S/zb/data 2>&1)
+echo "$ZB" | grep -qE "[1-9][0-9]* object\(s\) no longer held by any view" \
+    && ok "the last holder's removal DOES release the content keys (the ledger reaches zero and the row goes)" \
+    || bad "the last holder released nothing: $(echo "$ZB" | head -3)"
+$Y view --meta-store "$FDBURI" --meta-dir $S/zb/home scan > $S/scan3.txt 2>&1
+for v in zb1 zb2; do
+    grep -qE "^$v " $S/scan3.txt && bad "$v survived its removal" \
+        || ok "$v is gone from the cluster inventory"
+done
+
+
 if [ "$fail" = 0 ]; then echo "ALL FDB-BACKEND CHECKS PASSED"; exit 0; else echo "SOME FDB CHECKS FAILED"; exit 1; fi
