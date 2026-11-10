@@ -1189,6 +1189,38 @@ harness 现在在开头 `unset GROVEFS_META_STORE`（套件里每一处真要集
 `view rm --base` 自己的长帮助此前提的是“local SQLite store / PG 拒绝”，没提 fdb 分支，已按
 实现补齐。
 
+### v2.9（收尾一轮：全板回归、投放包重打，以及包内二进制补上此前五笔提交）
+
+上一轮（v2.8）只留了一条尾巴：改动全部落盘且 `fdb` 套件与规模用例都绿了，但**没提交、没跑全板、
+投放包还指着旧提交**。这一轮把三件事一起做完，并顺手清掉残留。
+
+**全板回归**（2026-11-10，交叉环境预先剥掉 `GROVEFS_META_STORE` 等残留变量）：
+`bash .build-bin/run_all.sh` 34 段 `RESULT: GREEN`，显式计数的那 30 段合计 899 条断言
+`fail=0`（`unit` 与 `bench` 不计入这个和：`unit` 跑的是 `cargo test`，`bench` 按设计只进 INFO）。
+日志 `.build-bin/logs/20261110-232942`。FDB 不进 CANON（R3），单独跑：
+`env -u GROVEFS_META_STORE … bash .build-bin/test_fdb.sh` → **216 OK / 0 FAIL**，
+`ALL FDB-BACKEND CHECKS PASSED`；`cargo test --release --features fdb --test fdb_tree` →
+**4 passed**（含 v2.8 那条分页差分，target-dir 取 `target/fdb`）。跑完 `view scan` 回到
+`no subspaces under the 'grovefs' root`，无遗留挂载与进程。
+
+**投放包重打**。查包时发现的问题不是“少一次重编”，而是**包内二进制落后五笔提交**：上一版打于
+`7601b22`，其后的 `view scan`、fdb 档 `view rm --base`、corpse 守卫/`refs rebuild`、集群整面消失
+探针、以及 readdir 分页修复都不在里面——也就是说那份包会让用户撞上 v2.8 那处跳名/重名。重打后：
+主二进制 6,716,144 B（`strip -s`，RUNPATH 保留 `$ORIGIN/lib:$ORIGIN/../lib` 与构建机路径第三项）、
+`BUILDINFO.txt` 的「源码坐标 / 重编记录 / 产物」三处改到 `ed87cbc` 并按新尺寸改写，打包件
+60,098,093 B / `sha256 = 789163c8812cf1757302a476ca91779cc3f6b3a9bfbc83fb70ab9d7d98fdce8b`。
+验收两条都跑了：`.bneck/pkg_final.sh`（全新位置解包、七件逐文件校验、`env -i` 下 `ldd` 落到包内
+`lib/libfdb_c.so`、构建机路径命中 0）与 `.bneck/pkg_verify.sh`（`env -i` 起 data-server +
+`meta-server --meta-store fdb://…`，建视图、挂载、写读、`mkdir`、用包内 `fdbcli` 直读 subspace、
+卸载后把探针视图清回 0 键），两条均 `PKG_*_DONE`。
+
+**doccheck 的一处真项**。参数对账报出一个 `--test`：它的出处是文档里 `cargo test --release --test
+meta_ledger` 这类命令行，属 cargo 的接口。没有把它塞进 `FOREIGN` 白名单——`test` 是通用词，
+豁免它等于放行今后任何同名臆造参数——而是沿用 v2.7 对运维配方立的那条规矩：**按行剥离**，
+含 `cargo test` 的行整行不看（已知代价同配方行：与 cargo 命令同行书写的 grovefs 臆造参数
+不再被这条规则抓到）。改完 `doccheck.sh` EXIT=0：真实 70 / 文档 88 / 差集 17 项全为外部工具、
+占位或负空间。
+
 ## 15. 决策门处置（G1–G4 与 R5，逐门留证）
 
 计划把生死判定放在阶段末的决策门上。每个门的处置只有三种合法写法：**判过并留下证据**、
