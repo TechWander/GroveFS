@@ -4,6 +4,28 @@
 # Preserved standalone release binary (copied out of target/ so it survives `cargo clean`)
 /bin/
 
+# Delivery packages (master worktree copies; ~200 MB of stripped binaries plus the
+# FDB artifacts). Released artifacts live on orphan `dist/vN` branches, never in the
+# main history, so a plain clone stays small — same rule as /bin/. Do NOT `git add -A`
+# this directory onto master.
+/dist/
+
+# Evidence bench `.bneck/`: the *recipes* (`.sh`/`.py`/`.c`) are tracked because docs
+# and the ledger cite them as reproduction steps; their captured output is machine-local
+# and regenerable by re-running the recipe, so it never belongs in a commit.
+/.bneck/central/
+/.bneck/raw/
+/.bneck/g3_evidence/
+/.bneck/__pycache__/
+/.bneck/*.jsonl
+/.bneck/*.log
+/.bneck/*.so
+
+# Local single-node FoundationDB cluster (cluster file, data dirs, server logs) used by
+# the `fdb` suite and the package verifiers. Recreated by `.build-bin/fdb_env.sh up`.
+/.fdbtest/
+/.fdbtest-build.log
+
 # Runtime / test scratch mounts and data dirs created by the suites
 /.bench/
 /.blk/
