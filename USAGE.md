@@ -2935,13 +2935,13 @@ PG 与 FDB 各一表；每行的“实测原文/行为”都在本机当前构�
 | `view --meta-store fdb://… create --view V` | **建树的唯一方式** | 开出一个 subspace（写根行与两个分配器键）；不带 `--meta-store` 只会造一个服务端读不到的本地 `meta/V.db` | 建完挂载写内容 |
 | `view create --manifest` | 拒绝 | `` `view create --manifest` seeds a SQLite db file; under `--meta-store fdb://…` mount the view and write the files instead `` | 挂载后直接写文件；批量入库走挂载点（§14.2） |
 | `view fork` | 拒绝 | ``… `fork` is not implemented on the FoundationDB backend (a fork copies a whole per-view tree, and a view here is one subspace of the cluster with no snapshot path to copy); serve 'NAME' as an alias or derived view instead… `` | 派生视图（§15.13）或别名（§3.4） |
-| `view export` / `view import`（单视图元数据搬运） | **可用**（跨后端与同后端的迁移通道，§3.4.2） | 导出把一个 subspace 写成与 SQLite 档逐行同形的宿主无关 JSONL（表头 + 每节点一行，无绝对路径/主机名/`blocks/` 路径）；导入在集群里**开出这个名字的 subspace**（`view create` 之外唯一的建树入口），保留 id/ino/硬链接/mode/uid/gid/时间/symlink 文本，同事务更新共享字节账本，并把两个分配器水位抬到导出最大值（对位 PG 的 `setval`）；目标已有树需 `--replace`，坏 dump 整体拒绝、不留半成品；`--as-fork` 在此档拒绝（理由同 `view fork` 行） | 字节另走对象存储：`rsync -a` 数据根，或让 data-server 服务同一批对象（§14.2） |
+| `view export` / `view import`（单视图元数据搬运） | **可用**（跨后端与同后端的迁移通道，§3.4.2） | 导出把一个 subspace 写成与 SQLite 档逐行同形的宿主无关 JSONL（表头 + 每节点一行，无绝对路径/主机名/`blocks/` 路径）；导入在集群里**开出这个名字的 subspace**（`view create` 之外唯一的建树入口），保留 id/ino/硬链接/mode/uid/gid/时间/symlink 文本，同事务更新共享字节账本，并把两个分配器水位抬到导出最大值（对位 PG 的 `setval`）；目标已有树需 `--replace`，坏 dump 整体拒绝、不留半成品；目标若是 **corpse**（有键、无根行）一律拒绝并给出 `view rm --name V --base`——`--replace` 也不放行，因为导入会继承旧树的 `'r'` 行、把 dump 从未描述的字节记在这个视图头上；导出对同一形状也拒绝（按根行区分 corpse 与从未建制，两者给不同出口）；`--as-fork` 在此档拒绝（理由同 `view fork` 行） | 字节另走对象存储：`rsync -a` 数据根，或让 data-server 服务同一批对象（§14.2） |
 | `view rm --base`（连字节删整个基视图） | **可用**（`view --meta-store fdb://… rm --name V --base --data-dir R`） | 删的是**子空间**而不是 db 文件：清空该视图的全部键 → 按幸存子树重算共享 `refs` 账本 → 对已无人持有的对象走 data-server 的 `remove`。回显把两件事分开陈述，不叠成一个数：`removed base view 'V' from fdb://…: 3505 key(s) gone, 701 node(s), 1 object(s) no longer held by any view` / `0 object(s) freed from …/blocks, 1 not found under that data root (wrong --data-dir? …), 0 could not be freed` / `note: new mounts of 'V' are now refused — \`view create\` starts over; the definitions this meta-dir holds were not touched`。删除**不碰** `--meta-dir` 里的视图定义、别名与 API key | 残留清扫与验收：删完用下方 `view scan` 确认子空间已消失；`--data-dir` 指向真正存 `blocks/` 的那台（meta/data 分家时点错只会如实报 not-found，不会假称已回收） |
 | `view scan`（集群侧清点） | **可用**（`view --meta-store fdb://… scan`） | 列的是**集群里的**子空间，不是本 `--meta-dir` 的定义：`SUBSPACE / KEYS / ENTRIES / KIND / PREFIX`，`KIND` 区分 `view`（有根行的活树）、`corpse`（有键但无根行，挂不上）、`ledger`（共享账本）；表尾给出汇总与 PREFIX 十六进制（即 `fdbcli clearrange` 的参数） | 清残留按这个表来：`KIND=corpse` 或没人认领的 `view` 都可以用上一行的 `rm --base` 收掉；`ledger` 随最后一次无人持有自动消失 |
 | `view create`（名字已被残留占用） | 拒绝，并点名出口 | `a subspace named 'V' already holds keys in fdb://… but has no root row (a corpse — nothing can mount it) — clear it first with \`grovefs view --meta-store fdb://… rm --name V --base\`` | 按提示先 `rm --base` 清残骸再建；健康子空间（含从备份恢复回来的）在这里只报「已存在」，不会被当成残骸 |
 | `import`（零拷贝） | 拒绝 | ``import operates on a local SQLite view db; under a FoundationDB deployment (--meta-store fdb://…, or GROVEFS_META_STORE) a base tree is a subspace of the cluster …`` | 挂载 + `rsync`/`cp` 走挂载点（§14.2）；已有目录批量入库走三步：本地 `import` 暂存 → `view export` → `view --meta-store fdb://… import`（§3.4.2） |
 | `gc --apply` | 拒绝 | `` `gc` audits LOCAL page files under <data-dir>/blocks; a FoundationDB deployment's trees are subspaces in the cluster and its bytes are owned by the data servers — reclaim there with the data-server tooling (and back the cluster up with `fdbbackup`), not this command `` | 字节回收由服务端事务与集群侧工具负责；不要在 fdb 部署上跑离线 `gc` |
-| `refs rebuild` | **别跑** | 与 PG 同口径：它写的是本地 `meta/refs.db`，而 FDB 的字节账本在集群的共享 `refs` subspace（`docs/fdb-keyspace.md` §3.6），这次输出对该部署无意义 | 账本由服务端事务维护 |
+| `refs rebuild` | **可用**（`refs --meta-store fdb://… rebuild`） | 重算的是**集群里的**共享账本（不是本地 `meta/refs.db`）：扫所有存活子空间，按 `data_ref → 还有几个视图命名它` 重写 `refs`，并删掉没有任何树认领的行；健康集群上是 no-op（`0 row(s) corrected, 0 row(s) deleted`），`1 row(s) deleted` 就是清掉了一条孤儿记账（fdb 档实测） | 只在**静止**时跑（读一遍与写一遍之间若有新记账会被旧值覆盖）；常态仍由服务端事务维护，不需要定期跑 |
 | `view list` / `view define` / `view alias` / `apikey` / `mcp` | 可用，且**不要求集群可达** | 控制面在本地文件：`<meta-dir>/meta/views/*.layout` 与 `<meta-dir>/meta/api_keys.db`；同一目录即同一份记录（`apikey` 套件的 fdb 档与 SQLite 档逐条一致） | 同 SQLite（§15.11/§15.13/§15.14）；代价是 `--meta-dir` 要随服务端一起备份 |
 | `du --meta-server` | 可用 | 走 `M_TREE_DUMP`，总额与挂载所见字节一致（`fdb` 套件实证） | 同 SQLite |
 | 挂载（`mount --meta-server`） | 可用 | 视图未 `view create` 时按名拒绝，不自建空树 | 先建后挂（§4） |
@@ -2949,15 +2949,17 @@ PG 与 FDB 各一表；每行的“实测原文/行为”都在本机当前构�
 | 视图名 > 25 字节 / 非法字符 | 拒绝 | `view name is N bytes; the backends all cap it at 25 so no view is openable on one engine and unrepresentable on another` / `view name 'X' is not usable as an FDB subspace key` | 名字控制在 25 字节内（中文约 8 字），与 PG 同一口径 |
 | 不带 `--features fdb` 的二进制收到 `fdb://…` | 启动即失败 | `… names the FoundationDB backend, but this binary was built without `--features fdb` … an fdb:// uri is never served by SQLite` | 用带 feature 的构建（§6.3），或去掉 `--meta-store` |
 
-#### FDB 档的三件运维实测（备份恢复 / 集群整面消失 / 超大目录）
+#### FDB 档的四件运维实测（备份恢复 / 集群整面消失 / 超大目录 / 元数据进程死掉）
 
-表格之外，三件只能靠集群和活挂载才能回答的事，都有可执行配方与实测读数（均在单节点 dev 集群、SATA 盘上测得；不构成可用性承诺，R3 实验档不变）：
+表格之外，四件只能靠集群和活挂载才能回答的事，都有可执行配方与实测读数（均在单节点 dev 集群、SATA 盘上测得；不构成可用性承诺，R3 实验档不变）：
 
 1. **备份与恢复是一个闭环，但恢复要求目标为空**。`fdbbackup start/status` 拍快照，`fdbrestore start -r <cluster>` 回灌；实测 12 步 48 条断言全绿（`.bneck/fdb_backup_mount.sh`）。三条硬约束：目标集群必须**没有同名子空间**（逐 range 检查，报 `restore_destination_not_empty`，`-k` 不解锁）；它只提交任务，需要目标集群里有 backup_agent 才会真正推进；**`fdbbackup` 只备集群里的键，不备 `--meta-dir` 里的定义，也不备 data-server 上的 `blocks/` 字节**——所以一份可恢复的部署要三样一起备：`fdbbackup` + `--meta-dir` + 数据根。恢复完直接挂载读回内容、`view scan` 能清点回同名子空间，那才叫闭环。
 
 2. **元数据集群整面消失时，挂载点不报错，它阻塞**。`kill -9` 掉唯一 fdbserver（单节点集群，没有 failover 可躲），8–90 秒窗口内：挂载点始终在 mount 表里（读 `/proc/self/mountinfo`，不是 `findmnt`——后者自己会 stat 目标而挂住）、FUSE 进程不死；挂载点上的 `cat`/`ls`/`create+write`/新 `dd` **全部 parked**，没有一个返回 EIO——客户端在等一个可用版本，外面套着内核的 FUSE 等待。集群回来后（实测 ~1.6s）parked 调用在 5–110ms 内被答复，**同一个挂载点直接可用，不需要重挂**；取决于事务是否已过期，恢复后**第一次** readdir/写可能报一次错（实测 rc=2），**重试一次即成功**。最要紧的一条：写入方被告知成功的文件，恢复后字节一个不少（已确认的 6/8 个 64 KiB 文件全部到位，sha256 不变）；数据半场独立，48 条断言见 `.bneck/fdb_fault_mount.sh`。
 
 3. **两万条的单目录，列举与删除后重读逐名对齐**。经挂载点逐个 create（每个一次事务）建 20,000 个文件：153.4s（7.7ms/条）；`ls -1` 3.8s、`ls -U` 3.7s（约 5.2k 名/秒）、`find` 3.7s、`du -s` 13.2s；两次列举的行数**和集合**都与预期全名单逐名相等（既不重名也不缺口，页边界 0/31/32/33/63/64/65/1023/1024/1025/中点/末尾逐个 stat 均可解析）；从中间删 500 个后重读为 19,500 条且集合精确等于幸存集，`view scan` 报 19,501 entries（根 + 19,500）。同一套判据在 6,000 条上复跑通过。入口 `.bneck/fdb_bigdir_paging.sh`（`N=…` 可调）。
+
+4. **元数据进程死掉是另一个故障面：写立刻报 EIO，不会 park**。`kill -9` 掉 **meta-server**（fdbserver 还活着）后，同一挂载点上的写**立即**返回 `Input/output error`（实测 1509ms 返回，客户端退避几次后放弃），文件不创建；把 meta-server 在原地址拉起来，同一挂载点直接恢复（`ls`/`cat`/新写全部成功，**重启前写入的文件字节完好**），**不需要重挂**。同段的 `--ro` 是**挂载策略**而不是视图属性：同一视图在另一个 rw 挂载上照常可写，ro 侧 `create`/`mkdir`/`unlink` 全部拒绝且理由是 `EROFS`。与第 2 条的区别在于**谁在等**：fdbserver 消失时客户端会 park 等一个可用版本（有恢复可能），meta-server 消失时请求在客户端一侧就失败了，没有可等的东西——所以两条不能写成一句话。`test_fdb.sh` 第 15 节 23 条断言把这三件事固化（`--ro` / `kill -9` 重启恢复 / 中断期 EIO）。
 
 ### 15.10 场景：已有目录零拷贝入库（SQLite 后端）
 

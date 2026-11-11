@@ -610,6 +610,18 @@ impl Keys {
         self.refs.pack(&(data_ref,))
     }
 
+    /// Whole shared ledger, for [`FdbStore::ledger_rows`]'s read-only inventory.
+    /// The `refs` subspace holds nothing but `(data_ref,)` rows, so its own range
+    /// IS the ledger — no family tag to add.
+    pub fn ledger_range(&self) -> RangeOption<'static> {
+        self.refs.range().into()
+    }
+
+    /// Decode one ledger key back to its `data_ref`.
+    pub fn decode_ledger(&self, key: &[u8]) -> Option<String> {
+        self.refs.unpack::<(String,)>(key).ok().map(|(dr,)| dr)
+    }
+
     // ---- decoders -----------------------------------------------------------
     //
     // Unpacking lives on `Keys` rather than at each call site so that "a query
@@ -1830,6 +1842,28 @@ impl FdbStore {
             .map_err(TxErr::hard_or_exhausted)
     }
 
+    /// Every row of the shared ledger as `(data_ref, holders)`, read-only.
+    ///
+    /// [`Self::ledger_holders`] cannot answer "is there a row at all": an absent
+    /// key reads as 0 by design (the SQL engines' "no row yet"), so a leaked
+    /// zero/negative row and a clean absence look identical through it. This is
+    /// the view that tells them apart, and it is what a `view scan`-style
+    /// diagnosis needs when the ledger is the only thing left in a cluster (a
+    /// bare `refs` subspace with no tree beside it is already a finding).
+    pub fn ledger_rows(&self) -> Result<Vec<(String, i64)>, MetaError> {
+        let tx = self.read_tx()?;
+        let mut out = Vec::new();
+        for (k, v) in tx
+            .scan(&self.keys.ledger_range())
+            .map_err(TxErr::hard_or_exhausted)?
+        {
+            if let Some(dr) = self.keys.decode_ledger(&k) {
+                out.push((dr, unpack_i64(&v).unwrap_or(0)));
+            }
+        }
+        Ok(out)
+    }
+
     pub fn view(&self) -> &str {
         &self.view
     }
@@ -2979,9 +3013,12 @@ impl FdbStore {
     /// and a view's bookings are one unit per content key it names, not one per
     /// name. Deleting the subspace without unbooking would leave every blob it
     /// referenced booked forever — the conservative direction (bytes kept too
-    /// long, never freed early), but permanent, and with no `refs rebuild` in
-    /// this backend to repair it afterwards. So the unwind is part of the same
-    /// operation, and its result is reported instead of assumed.
+    /// long, never freed early), but an over-count nothing lowers on its own: the
+    /// row outlives the only tree that would have read it, and `ledger_holders`
+    /// cannot even show it (absent and zero are the same number through that
+    /// door). `refs rebuild` can repair that shape, but only quiesced and only by
+    /// recounting every tree. So the unwind is part of the same operation, and its
+    /// result is reported instead of assumed.
     ///
     /// Order, and the reason for it — this is a destructive path:
     /// 1. inventory (read-only): entry count and the DISTINCT data refs the `'r`
@@ -3165,6 +3202,25 @@ impl FdbStore {
         };
         let tx = self.read_tx().map_err(std::io::Error::other)?;
         let rows = scan_all_entries(&tx, &self.keys);
+        // Two different refusals hide behind "no root row", and they have
+        // different remedies: a name nobody ever provisioned is fixed by
+        // `view create`, while a CORPSE (keys left, root row gone — the shape a
+        // partial `clearrange` of the `'n` family leaves) is fixed only by
+        // `view rm --base`, and telling the operator to create it would send them
+        // straight into `view create`'s own corpse refusal. The probe is the same
+        // one-key range `view scan` uses for its `KIND` column.
+        let has_root = rows
+            .iter()
+            .any(|(parent, name, _)| *parent == ROOT_PARENT && name.is_empty());
+        let leftovers = if has_root {
+            false
+        } else {
+            let mut probe = self.keys.all_range();
+            probe.limit = Some(1);
+            !tx.get_range(&probe)
+                .map_err(|e| std::io::Error::other(e.hard_or_exhausted().to_string()))?
+                .is_empty()
+        };
         drop(tx);
         // A name nobody provisioned must not export as an EMPTY tree. The SQLite
         // arm refuses this case outright, and a header claiming `nodes:0` would be
@@ -3172,10 +3228,14 @@ impl FdbStore {
         // fabricates a root row for a view that never existed, which is exactly
         // how a typo in a migration script turns into a provisioned-but-empty tree
         // that every later check reads as "it worked".
-        if !rows
-            .iter()
-            .any(|(parent, name, _)| *parent == ROOT_PARENT && name.is_empty())
-        {
+        if !has_root {
+            if leftovers {
+                return Err(std::io::Error::other(format!(
+                    "view '{view}' holds keys but no root row (a corpse — nothing can mount \
+                     it), so there is no tree to export — clear it with \
+                     `grovefs view --meta-store fdb://… rm --name {view} --base`"
+                )));
+            }
             return Err(std::io::Error::other(format!(
                 "view '{view}' is not a provisioned subspace of the cluster — create one with \
                  `view create --meta-store fdb://… --view {view}` first (a tree that does not \
@@ -3433,6 +3493,7 @@ impl FdbStore {
         }
 
         let keys = self.keys.clone();
+        let view_name = self.view.clone();
         let input_rows = rows.len() as i64;
         let claimed_nodes = header["nodes"].as_i64();
         let claimed_blobs = header["blobs"].as_i64();
@@ -3497,9 +3558,35 @@ impl FdbStore {
                     ))));
                 }
             }
+            // A subspace that holds keys and NO root row is a CORPSE (`view scan`
+            // names that kind): it counts 0 entries, so the "already holds a tree"
+            // test below would not fire and the import would seed a fresh root on
+            // the leftovers. Measured, not hypothesised: importing onto a corpse
+            // succeeded, the corpse's 9 keys stayed put, the import merely added
+            // its own rows (13 keys / 2 entries) and the shared ledger still
+            // carried BOTH the old and the new ref — so the imported tree claims
+            // bytes it does not own, and the inherited rows keep the old ref
+            // pinned to this view as a held claim no later pass can tell apart.
+            // `view create` refuses this same shape for the same
+            // reason (seeding a root over leftovers resurrects a corpse), so
+            // `import` refuses it too — `--replace` included, because replacing
+            // presupposes a tree whose ledger rows can be given back and a corpse
+            // has no root row for the dump to replace.
+            let mut probe = keys.all_range();
+            probe.limit = Some(1);
+            let has_keys = !tx.get_range(&probe)?.is_empty();
+            if has_keys && tx.get(&keys.name(ROOT_PARENT, ""))?.is_none() {
+                return Err(TxErr::Hard(MetaError::Db(format!(
+                    "target subspace '{view_name}' holds keys but no root row (a corpse — \
+                     nothing can mount it); importing would seed a new root on the old \
+                     tree's leftovers and inherit its booked byte references — clear it \
+                     first with `grovefs view --meta-store fdb://… rm --name {view_name} \
+                     --base`"
+                ))));
+            }
             // Refuse-not-downgrade on the target, same test the SQLite import
-            // makes with `dst.exists()`: here the subspace always holds the root
-            // row, so "a tree is already there" means "more than the root".
+            // makes with `dst.exists()`: here a healthy subspace always holds the
+            // root row, so "a tree is already there" means "more than the root".
             let existing = tx.count_range(&keys.all_names_range())?;
             let replaced = existing > 1;
             if replaced && !replace {
@@ -3520,7 +3607,20 @@ impl FdbStore {
                 for (k, _) in tx.scan(&keys.dataref_all_range())? {
                     if let Some(dr) = keys.decode_dataref(&k) {
                         if released.insert(dr.clone()) {
-                            tx.bump(&keys.ledger(&dr), -1)?;
+                            // Zero holders is not a count, it is the absence of a
+                            // booking — the same "delete the row at zero" the
+                            // unlink path and `remove_view` do. Leaving it was
+                            // reachable: a replace-import over a tree that was a
+                            // ref's last holder left the row at 0, and a second
+                            // replace over that same view bumped it to -1. The
+                            // row then outlived every tree in the cluster —
+                            // measured as one `refs` key whose value decoded to
+                            // -1 with no view beside it, i.e. a booking no tree
+                            // could ever release again.
+                            let left = tx.bump(&keys.ledger(&dr), -1)?;
+                            if left <= 0 {
+                                tx.clear(&keys.ledger(&dr));
+                            }
                         }
                     }
                 }

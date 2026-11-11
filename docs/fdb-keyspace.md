@@ -1222,6 +1222,83 @@ meta_ledger` 这类命令行，属 cargo 的接口。没有把它塞进 `FOREIGN
 不再被这条规则抓到）。改完 `doccheck.sh` EXIT=0：真实 70 / 文档 88 / 差集 17 项全为外部工具、
 占位或负空间。
 
+### v2.10（把「完备性」继续往下压：抓到三处真缺口——套件泄漏子空间、replace 导入留死账本行、import 接受 corpse）
+
+v2.9 收口后按“FDB 面再排查一轮”继续走：先把未覆盖路径逐个点掉（`MetaProvider` 面已全覆盖；
+`mcp` 的 fork/graft 是显式拒绝而非半可用；14 个 section 已覆盖扫描/删除/迁移/锁/lens/空闲驱逐），
+再把四套参数化臂与 SQLite 基线逐条对齐（差异全部可归因：locks §5 HA 只属于 SQLite，
+govcheck 用 3 条 fdb 专用断言替换 6 条 zero-copy import，layout/apikey 各多 1 条）。
+对齐过程中查出两处**缺陷**，随后用针对 corpse 的探针又抓到第三处，都不是断言问题：
+
+**缺口一：参数化 fdb 套件只卸载、不还树。** 跑完 layout/locks/govcheck/apikey 四个臂后
+`view scan` 报出 4 棵活子空间（`lt…/lk…/gc…/ak…`，keys 76/19/23/27）加一棵探针树——
+即**每跑一次板子就在集群里种一棵树**，而且对象继续被记账。修法是在
+`.build-bin/fdb_scaffold.sh` 新增 `fdb_drop_views <meta-dir> <data-dir> <view>...`，接进
+layout/govcheck/govtime/apikey/import/migrate 六个套件的 cleanup/trap；locks 不经过脚手架
+（它自己起 server 对），按其结构内联同一段清理。两处细节都是实测逼出来的：
+
+- **参数顺序**。第一次接线写成了 `fdb_drop_views <meta-dir> <view> <data-dir>`，CLI 把
+  `.ltest/home/data` 当视图名拒绝（`invalid view name`），钩子按“永不失败”吞掉，板子照旧全绿、
+  树照旧留下。签名与调用点已按 `<meta-dir> <data-dir> <view>...` 统一。
+- **定义挡路**。`view rm --base` 在仍有 lens/alias 定义指向该 base 时拒绝（与 SQLite 档同一条守卫）。
+  layout 的清理由此被拒，留下 76 个键。钩子现在从拒绝文本里取出定义名、先 `view rm --name <def>`
+  再重试删树（上限 8 次，仍无法解释的拒绝就停）——官方输出里被删的定义会单独打一行。
+
+**缺口二：`import --replace` 留下归零后仍未删除的账本行。** 清理完树后集群仍不是空的：
+`view scan` 剩一个只有 1 个键的 `refs`，`fdbcli getrange` 读到的值是 `\x15\x01`。先纠正上一版
+这里的一处误记：`\x15\x01` 是 **+1**，不是 -1——tuple 层 `0x15` 是正整数前缀、`0x14` 是 0、
+`0x13` 才是负数（`foundationdb-tuple` 自己的用例就是 `1i64 → [0x15,1]`、`-1i64 → [0x13,254]`）。
+所以它不是“第二次 replace 再减一次”的算术结果（那会编码成 `\x13\xfe`）；能确定的只有一件事：
+**0 棵树、1 个持有者**，即一条任何树都再也释放不掉的记账，`refs rebuild` 报 `1 row(s) deleted`
+后归零，这条行不属于设计。
+真正写得出来的是“行留在 0”的那个形状：`import_jsonl` 的 `replaced` 分支释放旧树时只做
+`bump(-1)`，0 行在 `get_i64` 与 `ledger_holders` 眼里与“键缺失”同形，所以不可见、也没有任何
+树会再来释放它。此后若有视图为同一个 ref 记上 +1、且该视图又不是走释放路径消失的（`clear_view`
+与探针里的 `clearrange` 正是这个形态），露出来的就是上面那种 +1 孤儿——这条组合序列是从两处
+已证缺陷推出来的，不能只凭值本身反推；能证的只有 0 行缺陷本身。修法是在同一事务里补上
+`if left <= 0 { clear }`，三条释放路径（unlink / remove / replace-import）自此同一条规则。
+
+**缺口三：`view import` 接受 corpse，把旧树的记账继承给新树。** `view create` 对“有键、无根行”
+的 corpse 是拒绝的（并点名 `rm --base`），导入却不是：探针 `.fdbtest/cp_probe.sh` 在视图里导入
+一份 dump、再用 `fdbcli clearrange` 只清 `'n'` 家族造出 corpse（`view scan`：9 keys / 0 entries /
+`corpse`）后，往同一处再导入另一份 dump——`import` 成功，视图变成 13 keys / 2 entries，`refs` 里
+`CPREF-A`（旧树）与 `CPREF-B`（新 dump）同时存在。结果很具体：导入写了新根行，却把旧树遗留的
+`'r'` 行留给新树，于是新树“认领”了 dump 从未描述过的字节；而 corpse 挂不上，任何卸载或拆除
+路径都不会再来看这些行。守卫用的是 `view scan` 同一个判定（有键且无根行），放在导入事务内；
+`--replace` 不放行（replace 的前提是有根行可替换）。修后同一探针：拒绝并给出
+`clear it first with grovefs view --meta-store fdb://… rm --name … --base`，corpse 保持 9 keys / 0 entries、账本仍是 1，
+随后 `view rm --base` 正常收回这 1 个对象。其它入口不会复活 corpse：`view create` 有同名守卫，
+M_OPEN 的存在性探针 `has_physical` 问的就是根行（`subspace_exists`），读不到的视图走不到
+`store_for` 里的 `ensure_root`；导入是唯一剩下那条能自己写根行的路，所以守卫补在这里。导出本来
+就会拒绝 corpse，但口径有问题：它把“没根行”一律说成“从未 provision 过”并建议 `view create`，
+而这条建议对 corpse 会立刻被 `view create` 自己的守卫驳回。现在导出先问同一探针，corpse 走
+`rm --base` 的出口，非 corpse 才建议 `create`（两种状态、两种补救）。
+
+**新增测试**。`tests/fdb_tree.rs` 加 `fdb_replace_import_deletes_the_ledger_row_it_emptied`：
+book → replace 导入一份只含根行的 dump → 再 book → 再 replace，每一步断言账本里该 ref 的**行不存在**
+（不是“读出 0”）。为了能断言这件事，`FdbStore` 加了一个只读的 `ledger_rows()`（`ledger_holders`
+按设计把“键缺失”与 0 读成同一个数，区分不了泄漏）。另一条 `fdb_import_refuses_a_corpse`：
+建树 → 只清根行造 corpse → 两种入口（带 `--replace` 与不带）都必须被拒，拒后键数与账本分毫
+未动，再断言拒绝文案指出的出口 `view rm --base` 仍能把那笔记账还回来。`test_fdb.sh` 的 §14c
+（本来就造 corpse）在同一处补了 9 条 CLI 断言：import 被拒（rc≠0）、文案点名 corpse、点名
+`--name … --base`、拒后键数不变、共享账本不增；export 同样被拒、口径是 corpse 而不是“未建制”、
+出口同样指向 `rm --base`、且不留半截 dump。`test_fdb.sh` 新增第 15 节 23 条断言，
+把此前只有手工探针的三件事故面钉住：
+
+1. `--ro` 是**挂载策略**而不是视图属性：同一个视图在 rw 挂载上仍可写，ro 挂载上
+   create/mkdir/unlink 全部拒绝且理由是 EROFS（三者的 rc 分别是 2/1/1——shell 重定向与 syscall
+   的退出码不同，所以断言的是“被拒绝”，EROFS 文本负责说明原因）；
+2. `kill -9` meta-server 后同址重启：活挂载上的 ls/cat/新写入全部恢复，**不需要重挂**，
+   重启前写入的文件完好，ro 挂载同样恢复；
+3. 服务中断期间发起的写**立即 EIO**（实测 1509ms 返回），不阻塞、不在事后补写——
+   这与“整个 FDB 集群消失时写会被 park”是**两个不同故障面**，文档不再把它们混为一句。
+
+**回归数据（2026-11-11）**。七个 fdb 臂逐个重跑，跑完一次 `view scan`、全部回到
+`no subspaces under the 'grovefs' root`：layout 82/0、locks 16/0（§5 HA 仍按设计 SKIP）、
+govcheck 29/0、govtime 10/0、apikey 34/0、import 47/0、migrate 71/0；
+`test_fdb.sh` 248 OK / 0 FAIL（原 216 + 第 15 节 23 + corpse 三个入口 9），`ALL FDB-BACKEND CHECKS PASSED`；
+`cargo test --release --features fdb --test fdb_tree` → **7 passed**。
+
 ## 15. 决策门处置（G1–G4 与 R5，逐门留证）
 
 计划把生死判定放在阶段末的决策门上。每个门的处置只有三种合法写法：**判过并留下证据**、
