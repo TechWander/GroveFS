@@ -330,7 +330,7 @@ $Y --home $BASE init --view alice --manifest ./seed.txt
 - **定义只是文本槽**:`view define/alias/fork` 写的是 `meta/views/<名字>.layout`,只有 fork 会额外新建一棵 `meta/<名字>.db`。
 - **定义可以先于基树存在**:`view define` 允许 base 还没建(会提示),但**挂载时**服务端与本地都会强制 base 必须已创建,否则派生名拒挂。建议顺序仍是“先 `view create` 基视图,再 define”。
 - **删定义不热作用**:`view rm --name` 后,新挂载立即看不到定义;已经挂着的派生/别名连接会保持旧解析,直到重挂(或服务端缓存被 HA/快照事件清掉)。
-- **删基视图有四道守卫**:名字本身不能还被定义治理;不能有别的派生/别名/fork 指向它;本机不能还挂着;PG 后端不支持 `view rm --base`。
+- **删基视图有四道守卫**:名字本身不能还被定义治理;不能有别的派生/别名/fork 指向它;本机不能还挂着;PG 里的树也必须**用同一条命令**删(`view --meta-store postgres://… rm --base`)——销账与 `DROP SCHEMA` 在同一事务里完成(§15.8),绕过 CLI 手工 `DROP SCHEMA` 只会留下永远多计的账本行。
 
 #### 4. 落盘结果:文件与表
 
@@ -383,7 +383,7 @@ fork team
 | `meta/refs.db` | 共享表 `grovefs_refs.holders` |
 | `meta/api_keys.db` | `grovefs_control.api_keys` + `mcp_calls` |
 
-PG 下 `view define/alias/rm --name` 照常可用(写 `view_defs`);`view --meta-store postgres://… create` 会显式建出该视图的 schema(`grovefs_v_<hex>`),`view fork`/`view rm --base`/`import` 仍基于本地文件树、会拒绝。
+PG 下 `view define/alias/rm --name` 照常可用(写 `view_defs`);`view --meta-store postgres://… create` 会显式建出该视图的 schema(`grovefs_v_<hex>`),`view --meta-store postgres://… rm --base` 在一个事务里销账(逐 key 减 `grovefs_refs.holders`)并 `DROP SCHEMA … CASCADE`,提交后按删除前读到的 `data_ref` 回收 `blocks/` 字节(§15.8);`view fork` 与零拷贝 `import` 仍基于本地文件树、会拒绝。
 
 > **PG 建库入口**:`grovefs view --meta-store postgres://… --meta-dir D create --view V` 会显式建出该视图的 `grovefs_v_<hex>` schema 和根行。挂载不会建 schema——schema 不存在时 `M_OPEN` 直接拒绝并提示这条命令;已有的 schema 也可以从 dump 恢复。
 
@@ -968,11 +968,11 @@ $ grovefs view --meta-dir .home rm --name alice --base
 removed base view 'alice': 2 node(s) gone, 2 blob reference(s) dropped, 2 object(s) freed from .home/blocks, 0 still held by other views
 ```
 
-**四重守卫**(任一命中即拒,树分毫不删):① 该名字被定义治理(是派生/别名/fork 的定义槽)——先跑不带 `--base` 的 `view rm` 删定义;② 仍有别名/透镜/fork **定义**经此基解析(否则删基会让那棵挂载悬空),报 `view 'lens1' is governed by a definition over base 'alice' — remove it first`;③ 本机 `/proc/mounts` 里有 `grovefs:<V>` 活挂载,报 `view 'alice' is mounted here at …  — unmount it first`(**其他机器**对同一 meta-server 的挂载本机看不到,须自行先停);④ `--meta-store postgres://…` 部署直接拒(基树是 PG schema,字节由 PG/data-server 自持,删除走 §15.8 的 `bash .bneck/pg_drop_views.sh --yes <视图名>`——它先销账再 `DROP SCHEMA … CASCADE`)。
+**四重守卫**(任一命中即拒,树分毫不删):① 该名字被定义治理(是派生/别名/fork 的定义槽)——先跑不带 `--base` 的 `view rm` 删定义;② 仍有别名/透镜/fork **定义**经此基解析(否则删基会让那棵挂载悬空),报 `view 'lens1' is governed by a definition over base 'alice' — remove it first`;③ 本机 `/proc/mounts` 里有 `grovefs:<V>` 活挂载,报 `view 'alice' is mounted here at …  — unmount it first`(**其他机器**对同一 meta-server 的挂载本机看不到,须自行先停);④ **PG 档走同一条命令**(`view --meta-store postgres://… rm --base`):基树是一个 schema,`remove_view` 在一个事务里逐 key 减 `grovefs_refs.holders`(归零即 DELETE)、再 `DROP SCHEMA … CASCADE`,提交之后才按返回的 `unbooked_refs` 逐个回收 `blocks/` 字节——没有 SQLite 档“先删 db 再重建账本”的中间窗口。**绕过 CLI 手工 `DROP SCHEMA` 不算删除**:账本是无 view 列的全局表,裸 drop 只删树不销账;更要紧的是该视图订过哪些对象**只有那个 schema 知道**,ref 清单随 schema 一起消失,字节从此没有记录可回收(§15.8 的 E 段实测)。
 
 **最后一个命名者死才释放**:fork 的 blob 引用来自基视图自己的 key、账本 hold>1,删基时那些仍被 fork 命名的字节**一个都不能动**;只有当基与所有依赖定义都消失、账本再无持有者时字节才真正回收。条带 key `s<N>:<stripe>:<uuid>` 活在 data-server 上,普通本地根无法回收——诚实计入 failed 并跳过,绝不半删。**MCP 边界**:`remove_view` 是控制面 only(等价不带 `--base` 的 `view rm`),删整基视图只经 CLI——接口从不碰数据字节。
 
-e2e 见 `viewrm` 套件(42 条断言:种树/挂载守卫/多重守卫/共享字节删失/最后命名者死后回收/分家根 `--data-dir`/删后重挂空树语义)。
+e2e 见 `viewrm` 套件(42 条断言:种树/挂载守卫/多重守卫/共享字节删失/最后命名者死后回收/分家根 `--data-dir`/删后重挂空树语义);PG 档的同一序列见 `.bneck/pg_view_teardown.sh`(44 条断言:真 FUSE 挂载写入 → schema/账本/字节三方对账 → 事务性删除 → 二次删除被拒 → out-of-band drop 后 `refs rebuild` 的两种方向 → 残留恰好等于不可回收的那部分)。
 
 ### 3.5 智能体定制数据列表:MCP 接口(`grovefs mcp`)
 
@@ -1200,7 +1200,7 @@ $Y mount --view alice \
 >
 > **正交的另一把锁是把 key 绑到视图**：`apikey create --view team` 的 key 去挂别的名字，在**绑定检查**处就被拒（比存在性检查更早），实测 `permission denied: this api key is bound to view 'team', not 'ghost3'`，同样不建树。分工：存在性检查管「这个名字在不在」，绑定 key 管「这个调用方能开哪一棵」。
 >
-> 清理误建的空树（先 `umount` 所有该名字的挂载）：裸基视图（无定义的物理树）用 `grovefs view --meta-dir D rm --name <base> --base` 一条命令删——它删 `meta/<base>.db`(+WAL/SHM)、`refs rebuild` 重算账本、并回收无其他视图持有的字节（§3.4.3）。手工等价路径：`rm -f meta/<name>.db meta/<name>.db-wal meta/<name>.db-shm` 后 `grovefs refs --meta-dir D rebuild`；PG 后端走 §15.8 第 3 步的 `bash .bneck/pg_drop_views.sh --yes <视图名>`——它**先销账再** `DROP SCHEMA … CASCADE`（单跑裸 `DROP SCHEMA` 会在无 view 列的全局账本里留下孤儿行；`--base` 在 PG 部署直接拒绝，字节由 data-server/PG 自持）。
+> 清理误建的空树（先 `umount` 所有该名字的挂载）：裸基视图（无定义的物理树）用 `grovefs view --meta-dir D rm --name <base> --base` 一条命令删——它删 `meta/<base>.db`(+WAL/SHM)、`refs rebuild` 重算账本、并回收无其他视图持有的字节（§3.4.3）。手工等价路径：`rm -f meta/<name>.db meta/<name>.db-wal meta/<name>.db-shm` 后 `grovefs refs --meta-dir D rebuild`；PG 后端是**同一条命令**加 `--meta-store`（`view --meta-store postgres://… rm --name <base> --base`）——销账（逐 key 减 `grovefs_refs.holders`）与 `DROP SCHEMA … CASCADE` 在同一事务里完成，提交后按删除前读到的 `data_ref` 回收字节（§15.8）。绕过 CLI 手工 `DROP SCHEMA` 不算删除：ref 清单随 schema 一起消失，账本里的行从此没人能回收（`refs --meta-store postgres://… rebuild` 只会把多计的行删掉，字节已经定位不到了）。
 
 ### 4.1 多机共享到底需要 PG 吗？——上手选型
 
@@ -1289,7 +1289,7 @@ $Y mount --view alice \
 ### 5.3 删除 / GC
 
 - `unlink`(删除文件)后,视图解除引用,后端据 key 尽力删全部分块;条带 remove 会展开删所有 chunk,**幂等**(残留块可被 GC 清)。
-- **跨视图共享对象的引用账本 `refs`**:一个 `data_ref` 命名唯一一个底层对象,却可能被多个物理视图同时挂着名字(`view fork` 与 `view export/import --as-fork` 复制同一批 `data_ref`、派生视图/别名共享基视图字节;而 `grovefs import` 把同一源文件导进两个视图时各得一个**独立 key**——两处 `blocks/` 都是源文件的硬链接,字节仍是同一 inode、零额外占用,但账本按 key 分别计数)。视图内的引用计数看不见别的视图,单看它会误删他视图仍在引用的对象。故记账落在 `<base>/meta/refs.db`(PG 后端落共享表 `grovefs_refs.holders`):每个视图 ATTACH 该账本,holder 计数与节点增删进**同一个 IMMEDIATE 事务**,跨文件原子提交。物理删除的准确规则是「**该视图内此 key 的最后一个名字被摘除、且全局账本再无其它视图持有**」——只有此时才 `backend.remove`。视图 db 被 out-of-band 删除(`rm meta/x.db`、新 `--home`)只会让账本**高估**、对象多留不误删;`grovefs refs --meta-dir D rebuild` 按现存视图树重算 holder 归位(SQLite 后端专用；PG 后端的等值配方是 `.bneck/pg_drop_views.sh --rebuild-ledger`，逐条对位 `src/meta/engine.rs` 里的 `rebuild_ledger`，见 §15.8)。账本里没有行的键即该视图私有(空账本不需要任何初始化步骤)。
+- **跨视图共享对象的引用账本 `refs`**:一个 `data_ref` 命名唯一一个底层对象,却可能被多个物理视图同时挂着名字(`view fork` 与 `view export/import --as-fork` 复制同一批 `data_ref`、派生视图/别名共享基视图字节;而 `grovefs import` 把同一源文件导进两个视图时各得一个**独立 key**——两处 `blocks/` 都是源文件的硬链接,字节仍是同一 inode、零额外占用,但账本按 key 分别计数)。视图内的引用计数看不见别的视图,单看它会误删他视图仍在引用的对象。故记账落在 `<base>/meta/refs.db`(PG 后端落共享表 `grovefs_refs.holders`):每个视图 ATTACH 该账本,holder 计数与节点增删进**同一个 IMMEDIATE 事务**,跨文件原子提交。物理删除的准确规则是「**该视图内此 key 的最后一个名字被摘除、且全局账本再无其它视图持有**」——只有此时才 `backend.remove`。视图 db 被 out-of-band 删除(`rm meta/x.db`、新 `--home`)只会让账本**高估**、对象多留不误删;三档都有这条命令,干的都是「读树重算、不读账本」:`grovefs refs --meta-dir D rebuild`(重写 `meta/refs.db`)、`refs --meta-store postgres://… rebuild`(重写 `grovefs_refs.holders`)、`refs --meta-store fdb://… rebuild`(重写集群里的账本子空间);方向始终是「多留字节」而不是少算,见 §15.8。账本里没有行的键即该视图私有(空账本不需要任何初始化步骤)。
 
 ### 5.4 备份与迁移
 
@@ -1413,6 +1413,7 @@ $Y meta-server --meta-dir /data/cluster --listen 0.0.0.0:50110 \
 
 **注意**：
 - **与自研 HA 不兼容**：`--meta-store postgres://…` + 任一 `--role standby` / `--peer` / `--witness` 会在启动时 fail-fast（`VACUUM INTO` 快照机制仅适用于 SQLite）。PG 高可用请交给 **PostgreSQL 自身的流复制 / logical replication / PITR**——本来就比文件快照更强。
+- **删视图是一条命令**：`view --meta-store postgres://… rm --name V --base --data-dir R` 在**一个事务**里逐 key 减 `grovefs_refs.holders`（归零即删除）再 `DROP SCHEMA … CASCADE`，提交后回收无人持有的 `blocks/` 对象；`refs --meta-store … rebuild` 在静止时按存活树重算整本账。PG 的 DDL 是事务性的，所以这一档不存在 SQLite 档“删 db → 重建账本”的中间态（§15.8）。
 - **空闲视图自动释放连接**：每个被挂载过的视图在 meta-server 里常驻一套引擎池（8 写 + 4 读连接）。`meta-server --engine-idle-secs N`（默认 300，`0` 关闭）在视图的最后一个挂载会话结束且静默 N 秒后回收引擎，连接随之关闭；下次访问自动重开，客户端无感（`evict` 套件实证：6 视图 76 连接 → 卸载回收后 4）。于是 PG 侧规划公式从「视图总数 × 12 ≤ max_connections」变为「**最近 N 分钟活跃视图数** × 12 + 突发溢出 ≤ max_connections」——视图总数不再被连接数封顶。挂载中的视图永不被回收（会话计数钉住引擎，哪怕无人读写）。
 - 为什么不提供 Redis：K/V+TTL 与视图树不同构（事务/行锁/多列索引都是自然需要,硬塞只会同实例重建一个更弱的 PG）。
 - 分场景的可执行命令（单机验证 / 生产 systemd / 巡检 / 备份恢复 / 删视图 / 能力边界）见 **§15.3–§15.9**。
@@ -1455,7 +1456,104 @@ $Y meta-server --meta-dir /data/cluster --listen 0.0.0.0:50110 \
 - **编码口径**：意图 = RecordLayer 式（分层键空间、记录整体入值、二级索引以独立键区间表达）；载体 = Rust `foundationdb` crate 的 tuple layer + subspace layer。官方 RecordLayer 是 Python/Java 侧的遗留绑定，本后端**不使用**它，也只如此表述——不得写成“用了 RecordLayer”。
 - **`--engine-idle-secs` 在此档只管内存**：FDB 没有“每视图 12 条连接”可回收（一个集群文件共享一个 handle，socket 状态在客户端自己的网络线程里），驱逐释放的是进程内引擎（号段、分页游标、last-touch 戳）。挂载中的视图仍永不被回收，客户端无感（§12.1）。这三条都在 `fdb` 套件第 13 节实测：把阈值压到 3s，挂载期间静默 8s ⇒ 服务端日志里 0 条驱逐；卸载会话后 ⇒ `meta-server: evicted 1 idle engine(s) (>3s idle, no sessions)`；同一个视图重挂 ⇒ 读回同一个对象（重开对客户端透明）。PG 的连接数规划公式在此档不适用，容量看集群的 proxy/GRV 与 log 副本写吞吐。
 - **高可用与备份归集群**：FoundationDB 自带三副本与协调层，快照用 `fdbbackup`。grovefs 自研主备（`--role standby` / `--peer` / `--witness`）与 `--meta-store fdb://…` 同时给会启动即 fail-fast，文案专指 FDB（§15.9）。
-- **功能面与容量面的取证范围不同**：**功能**判据在两处集群都有读数：本机单节点（副本因子 1）跑过当前全部 216 条断言与四套治理套件的 fdb 档；真四机跨故障域集群（`triple`、`fault_domains n1..n4`）跑过同一套断言并全绿（2026-11-10 实测 `pass=170 fail=0 SKIP=0`，那一轮之后套件又长出 scan / rm-base / 备份恢复等新段），四套治理套件目前仍只有单机读数。本节开头那一组**吞吐**数字只有一个来源——决策门 G3 的同场对照（同一台机器、同一份 feature 构建的二进制、照抄平台值出处的 op 序列、`configure new triple ssd` 三副本）。因此这组数字回答的是「FDB 臂相对 PG 臂差多少」，不是可外推的部署容量。**副本失效、恢复与跨故障域拓扑行为已在真集群上另测**（2026-11-10，四台机器各有独立内核与自己的数据盘，`fault_domains n1..n4`）：进程失效（`pkill -9`）与整机失效（`virsh destroy` 掉一台）的可用损失分别是 0s 与 0–1s，且三台幸存者无需死机回来就能重组日志集与三副本；`fdbbackup`/`fdbrestore` 做到时间点恢复——快照版本之后写的键只能靠日志重放回来，停止版本之后写的键被回滚。取证入口 `.bneck/fdb3vm_up.sh`、`fdb3vm_fault.sh`、`fdb3vm_backup.sh`，逐条账目见 `docs/fdb-keyspace.md` §14 v2.4。**仍未测的是吞吐**：G3 未过（本机无 SSD/NVMe 介质），所以本节的数字只是同场对照、不是部署容量。
+- **功能面与容量面的取证范围不同**：**功能**判据在两处集群都有读数：本机单节点（副本因子 1）跑过当前全部断言（含写者租约一节）与四套治理套件的 fdb 档；真四机跨故障域集群（`triple`、`fault_domains n1..n4`）跑过同一套断言并全绿（2026-11-10 实测 `pass=170 fail=0 SKIP=0`，那一轮之后套件又长出 scan / rm-base / 租约 / 备份恢复等新段），四套治理套件目前仍只有单机读数。本节开头那一组**吞吐**数字只有一个来源——决策门 G3 的同场对照（同一台机器、同一份 feature 构建的二进制、照抄平台值出处的 op 序列、`configure new triple ssd` 三副本）。因此这组数字回答的是「FDB 臂相对 PG 臂差多少」，不是可外推的部署容量。**副本失效、恢复与跨故障域拓扑行为已在真集群上另测**（2026-11-10，四台机器各有独立内核与自己的数据盘，`fault_domains n1..n4`）：进程失效（`pkill -9`）与整机失效（`virsh destroy` 掉一台）的可用损失分别是 0s 与 0–1s，且三台幸存者无需死机回来就能重组日志集与三副本；`fdbbackup`/`fdbrestore` 做到时间点恢复——快照版本之后写的键只能靠日志重放回来，停止版本之后写的键被回滚。取证入口 `.bneck/fdb3vm_up.sh`、`fdb3vm_fault.sh`、`fdb3vm_backup.sh`，逐条账目见 `docs/fdb-keyspace.md` §14 v2.4。**仍未测的是吞吐**：G3 未过（本机无 SSD/NVMe 介质），所以本节的数字只是同场对照、不是部署容量。
+
+#### 6.3.1 能力边界：三层各自负责什么
+
+这一档有三层「高可用」相关的东西，责任方和失效域都不同，不能混成一句「FDB 档高可用」：
+
+| 层 | 谁负责 | 这一版的实际行为 | 失效域 / 边界 |
+| --- | --- | --- | --- |
+| 元数据写者 | GroveFS meta-server + 一份 `--meta-dir` | **一个部署同时只有一个写者**：启动时在集群里取一行 writer 租约（键 `(root,"writer")/('lease', <canonical --meta-dir>)`，值 `(owner, expires_at_ms)`，owner = `host:pid:nonce`），续租周期 `max(TTL/3, 200ms)`；取不到就最多等 `GROVEFS_FDB_WRITER_WAIT_SECS`（默认 TTL+2s）再拒绝；运行中续租发现行已不属于自己就打印原因并 `exit 1`。TTL 默认 10s（`GROVEFS_FDB_WRITER_LEASE_SECS`） | 一个 `--meta-dir`。同一控制面被两个进程写是唯一不能正确的形态（各持自己的 view 定义、写同一批子树），这正是租约禁止的 |
+| FDB 集群 | FoundationDB 自己 | 节点数、副本因子、故障域全由集群的 `configure` 决定（`single`/`double`/`triple`/`three_data_hall`…），grovefs 既不参与也不改写拓扑；启动探针只读 `\xff\xff/status/json` 并报告当前拓扑 | 集群的协调层与日志副本。单节点集群能跑但没有冗余（唯一的 fdbserver 死掉时挂载点阻塞而不是报错，集群回来后同一个挂载点继续可用） |
+| GroveFS 原生 HA | 本项目的 standby/peer/witness | 与 `--meta-store fdb://…` 组合时**启动即拒绝**：它搬的是 SQLite 快照、用 epoch 做主备切换，FDB 档的副本与恢复归集群 | 不适用 |
+
+两个边界要单独说清，它们最容易被说错：
+
+- **副本与故障域是集群的能力，不是 grovefs 的**。grovefs 不复制任何东西；`configure new triple` + 四个故障域的集群上，进程 `kill -9` 与整机掉电的可用损失实测为 0s 与 0–1s，三台幸存者无需等死机回来就重组日志集（取证入口 `.bneck/fdb3vm_up.sh` / `fdb3vm_fault.sh` / `fdb3vm_backup.sh`，账目见 `docs/fdb-keyspace.md` §14 v2.4）。同一份数据在单节点集群上就没有这层保护。
+- **fencing 的粒度是「部署」，不是视图、也不是集群**：
+  - 对「同一 `--meta-dir` 的第二个写者」是强制的：它在 `bind` **之前**被拒（端口从未监听），拒绝文案点名 `lease --release --deployment …` 出口；
+  - 对「还活着的旧写者」是强制的：`view lease --release --deployment <dir> --force` 清掉活行后，旧持有者在下一次续租（≤ 一个续租周期，默认约 3.3s）打印 `meta-server: LOST the FDB writer lease …` 并以状态 1 退出，不会继续写；
+  - 对「两个不同 `--meta-dir` 同时服务同一视图」**不强制**：两个部署本来就是各自独立的控制面，租约按设计不跨部署，所以「一个视图只被一个部署服务」是运维约定（§6.3.3）；
+  - 对**客户端**不强制：挂载点不携带租约或 epoch 令牌，围栏只保证旧服务端停止写，不保证旧客户端不重连到新服务端。
+
+#### 6.3.2 部署与使用
+
+最小可用部署是「一个 FDB 集群 + 一个 meta-server」：
+
+```bash
+# 1) 集群先起来，并且自报 available（单机开发集群的最短路径）
+fdbcli -C /etc/foundationdb/fdb.cluster --exec 'configure new single ssd'
+fdbcli -C /etc/foundationdb/fdb.cluster --exec 'status minimal'   # 期望 The database is available.
+
+# 2) meta-server：启动探针在 bind 之前确认集群可用，再取写者租约
+$Y meta-server --meta-dir /data/cluster --listen 0.0.0.0:50110 \
+     --meta-store fdb:///etc/foundationdb/fdb.cluster --token $TOK
+
+# 3) 树是显式建的，客户端零变化
+$Y view --meta-store fdb:///etc/foundationdb/fdb.cluster create --view alice
+$Y --home $BASE mount --meta-server 127.0.0.1:50110 --view alice --mountpoint /mnt/alice
+```
+
+启动成功后 stderr 里有两行可核对（§17 的关键字表同列）：
+
+```text
+meta-server: fdb cluster up — redundancy single (ssd-2), tolerates 0 zone failure(s), 1 storage server(s), 1 coordinator(s)
+meta-server: writer lease HELD for deployment /data/cluster (holder <host>:<pid>:<nonce>, renewed every 3s, expires 10s after the last renewal); …
+```
+
+集群不可用时**拒绝启动**而不是挂在那里等：探针有界（`GROVEFS_FDB_OPEN_TIMEOUT_SECS`，默认 10s；不可达集群实测 2.07s 返回），文案带上集群自己的解释并点名排障命令：
+
+```text
+--meta-store fdb://…: the cluster reports its database as UNAVAILABLE (quorum_not_reachable: Unable to reach a quorum of coordinators.) — …
+```
+
+三个环境旋钮（进程级，meta-server 与 `view lease`/`scan` 读同一套）：
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `GROVEFS_FDB_WRITER_LEASE_SECS` | `10` | 写者租约 TTL。崩溃接管的上限就是一个 TTL；`0` 关闭租约（关掉的是防护本身，只用于测试或确定单实例的场合） |
+| `GROVEFS_FDB_WRITER_WAIT_SECS` | TTL + 2 | 启动时等一个仍在被续租的行的上限，超过即拒绝。设得比 TTL 小，会让「死进程的行还没过期」的重启被误拒 |
+| `GROVEFS_FDB_OPEN_TIMEOUT_SECS` | `10` | 启动探针（读 `\xff\xff/status/json`）的超时 |
+
+运维命令：
+
+```bash
+# 谁在写、还剩多久：STATE / DEPLOYMENT / HOLDER / EXPIRES
+grovefs view --meta-store fdb:///etc/foundationdb/fdb.cluster lease
+# 清掉一个再也不会回来的部署（机器已毁）；活行要 --force 才清
+grovefs view --meta-store fdb:///etc/foundationdb/fdb.cluster \
+        lease --release --deployment /data/cluster            # 过期行
+grovefs view --meta-store fdb:///etc/foundationdb/fdb.cluster \
+        lease --release --deployment /data/cluster --force    # 活行 = 主动围栏
+grovefs view --meta-store fdb:///etc/foundationdb/fdb.cluster scan   # 租约表是 KIND=lease 的一行，不是 corpse
+```
+
+多节点与多故障域：grovefs 侧**不需要任何额外配置**，拓扑全部在集群侧完成——每台机器一个 fdbserver、各自独立的数据目录，`fdbcli --exec 'configure new triple'` 之后用 `fault_domains` 把进程分配到不同故障域。meta-server 仍是一台（同一 `--meta-dir` 只能有一个写者）；多台 meta-server 只在「各自 `--meta-dir`、各自视图」的形态下成立，与集群的副本数无关。副本数、故障域与恢复策略改的是集群，不改 grovefs 的命令行。
+
+#### 6.3.3 已知限制（当前版本）
+
+- **meta-server 仍是单点**：租约保证不双写，不提供自动切换。进程死掉时，活挂载在服务中断期间的写立即 EIO（实测 1.5s），同址重启后同一个挂载点自动恢复；没有「第二个 meta-server 自动接管」的机制——租约只保证它不会在上一个还活着时启动。接管靠人（或编排工具）在同一 `--meta-dir` 上重启。
+- **崩溃接管最多等一个 TTL**：`kill -9` 的进程不能自己还租，重启会等行过期（默认 TTL 10s；套件把 TTL 压到 2s 时四次实测 1640–1696ms 接管）。要更快的接管就调小 TTL，代价是调度抖动更容易让续租迟到——丢租约的进程直接退出，而不是降级继续写。
+- **计划内重启同样要等一个 TTL**：`meta-server` 不捕 `SIGTERM`，`systemctl restart` 之后旧行仍要等到过期才会被新进程覆盖（最多一个 TTL；启动等 `GROVEFS_FDB_WRITER_WAIT_SECS`，默认 TTL+2，所以不会报错，只是慢）。要零等待就在旧进程已停后先 `lease --release --deployment <dir> --force` 再启动。
+- **租约用各主机墙钟比较过期时间**：行里存的是 epoch 毫秒，读它的进程按本机时钟判断。主机之间时钟漂移接近 TTL 会让行提前或延后过期，部署要开 NTP。
+- **控制面不随集群复制**：视图定义与 API key 在 `--meta-dir` 的本地文件里，多台 meta-server 各持一份即各自治（同一 `--meta-dir` 被租约挡住，不同 `--meta-dir` 是不同部署）。一份可恢复的部署要三样一起备：`fdbbackup` + `--meta-dir` + 数据根。
+- **「一个视图只被一个部署服务」靠约定**：租约不阻止两个不同 `--meta-dir` 打开同一视图并互相写（它们各自的 `view list` 也都是真的、互不知晓）。
+- **过期行不会自动回收**：进程被 `SIGTERM`/`SIGKILL` 收掉（meta-server 不捕信号，正常返回才走释放）或强制围栏留下的行一直列在 `view lease` 里（`STATE=expired`），直到同部署重启覆盖它、或被 `--release` 清掉；`view scan` 会把它计为一个 subspace，表尾标成 writer-lease subspace。
+- **启动探针只回答「可用/不可用」**：不校验 schema 版本、不预热引擎，所以第一个请求仍可能撞上 OCC 冲突重试（errno 映射见 §12）。
+- **`view lease` / `view scan` 需要集群可达**：不可达时命令失败并给出原因，不会打一张空表冒充「没有租约」。
+- **客户端没有 fencing 令牌**：被围栏的是服务端进程；旧客户端重连到新服务端后照常工作，这是有意的（挂载点不该因为服务端换人而失效），但也意味着租约不是端到端的一致性屏障。
+- **多机部署的真实形状（四机虚拟机实测）**：四台 guest 各跑一个 `fdbserver`（zone `n1..n4`），四个地址**同时都是 coordinator**（quorum 3）。好处是任意一台宕机集群仍可读写；代价是**每台既是协调者又是存储域**——“掉一台”同时掉一个协调者和一个故障域，`status` 里 `full_replicas` 从 4 降到 3 并保持 available，而不是掉一个副本（`.bneck/fdb3vm_lease.sh` 在持租约时 destroy 一台实测租约不误丢）。
+- **缺协调者时管理命令明显变慢**：协调者不齐时 `fdbcli … status json` 每次约 5s（超时重试）才返回，`meta-server` 的启动探针（`GROVEFS_FDB_OPEN_TIMEOUT_SECS`，默认 10s）与 `view scan` 都按这个代价计；自动化脚本要给单条命令留 ≥15s 超时，否则会把“慢”误判成“挂”。
+- **guest 上没有 fdbserver 的 systemd unit**：实验档的集群是手工 `setsid -f fdbserver -p <port> -C <cluster> -d <datadir> -L <logdir>` 拉起的，机器重启后不会自己回来（`systemctl list-units | grep fdb` 为空）。集群“在”但节点没回来时 `status` 只报副本不足而不报错，所以重启后必须逐台确认进程与 `status minimal`。
+- **容量面仍未判过（G3）**：原因与数字在 §6.3 开头，这一档仍是实验档，不进 CANON。
+
+#### 6.3.4 后续演进方向（未实现，按此顺序评估）
+
+1. **控制面入集群**：把视图定义与 API key 从 `--meta-dir` 的本地文件搬进集群（作为同一 root 下的子空间），多台 meta-server 才可能共享同一控制面；在那之前，租约的粒度只能是部署。这是把「多 meta-server」从「多部署」变成「同一部署多副本」的前提。
+2. **接管自动化**：控制面入集群之后，租约可以上移到视图或集群粒度并配一个跟随者——发现行过期即接管，而不是等人重启。需要同时给客户端一个 fencing 令牌（或用 FDB 的 read version 做读一致性），否则「旧客户端 + 新服务端」仍是弱环。
+3. **容量面转正**：G3 的判据与复跑配方在 `docs/fdb-keyspace.md` §14 v1.8/§15；必要条件是在 SSD/NVMe 介质上以 RF=3 重跑 `.bneck/bench_g3.sh` 达到 ≥4.6k（SATA）/ ≥9k（NVMe）ops/s，且同场 PG 控件不低于平台值。归因数据说明光换盘不够（`memory` 引擎 1642 ops/s），实现侧还有约 3× 的余量要处理。
+4. **运维闭环收紧**：把「`fdbbackup` 拍快照 → `fdbrestore` 恢复 → 挂载校验」固化成 CLI（当前是 `.bneck/fdb_backup_mount.sh` 的配方）；为租约行增加显式回收（当前靠同部署重启覆盖或手工 `--release`）。
 
 ---
 
@@ -1593,6 +1691,35 @@ bash .build-bin/run_all.sh fork mcp       # 只跑指定套件(build 自动前�
 ```
 
 端到端演示脚本(视图隔离 + 实时失效推送)见 `.build-bin/test_metasrv.sh`。
+
+### 10.1 三引擎完备性矩阵与跨机专项(不进默认全板)
+
+默认全板的 `pg`/`pg_parallel`/`control` 只能回答“这一档能不能挂载读写”，回答不了“同一件事在三个后端上是不是都有出口”。后者由下面五份脚本给出，全部可复跑、全部自己清场：
+
+| 脚本 | 量的是什么 | 最近一次实测 |
+| --- | --- | --- |
+| `bash .bneck/engine_matrix.sh` | 把**同一串治理序列**在 SQLite/PG/FDB 上各跑一遍，14 项能力并排成一张表：OK=能用、REFUSED=设计上不支持（引拒绝原文）、ERROR=缺口 | 14 行全部 OK/REFUSED，**无 ERROR**；末尾`post-teardown` 校验 `sqlite meta/*.db 0 / pg schema 0 / pg 账本 0 / fdb "no subspaces"` → `TEARDOWN CLEAN` |
+| `bash .bneck/pg_view_teardown.sh` | PG 基视图的事务性删除 + 账本双向修复，全程真 FUSE 挂载、真 data-server、真 PG | 44 pass / 0 fail（含 `schema dropped with 6 name(s), 4 object(s) no longer held by any view`、`3 row(s) deleted`、`2 row(s) corrected`、二次删除被拒） |
+| `bash .build-bin/test_pg.sh` / `test_pg_parallel.sh` | PG 档 e2e（并发、驱逐、控制面）；末尾用 `view rm --base` 自清场 | 24 / 41 断言全过；跑完库里 0 schema / 0 账本行（此前每跑一次漏一个 schema） |
+| `bash .bneck/fdb3vm_lease.sh` | 四机虚拟机集群上的跨机租约：同 `--meta-dir` 拒绝 / 不同目录并行 / 持租约时 destroy 一台 / 持有者与观察者时钟差 TTL/2 | 59 pass / 0 fail |
+| `bash .build-bin/test_fdb.sh`（在 guest 上跨机复跑） | FDB 档 272 断言（含 §16 租约、§12 双向迁移、§13 驱逐语义） | 272 OK / 0 fail |
+
+矩阵的结论（也是“完备性是否满足”的答案）：
+
+| 能力 | SQLite | PG | FDB |
+| --- | --- | --- | --- |
+| `view create` / `define` / `alias` / `list` / `rm --base` | OK | OK | OK |
+| `refs rebuild`（跨视图账本重算） | OK | OK | OK |
+| `view export` / `view import`（元数据搬运） | OK | REFUSED | OK |
+| `view fork`（独立物理树） | OK | REFUSED | REFUSED |
+| `grovefs import`（目录→视图，零拷贝） | OK | REFUSED | REFUSED |
+| `gc`（离线孤儿回收） | OK | REFUSED | REFUSED |
+| `view scan` / `view lease`（集群侧清点与租约） | REFUSED | REFUSED | OK |
+| 原生 HA（`--role standby`） | OK | REFUSED | REFUSED |
+
+两列 REFUSED 都是**设计边界**而非缺口，每条都能给出“为什么”和“替代做法”（§15.9 逐行写全）；三档共同拥有的是**控制面 + 树 + 账本 + 基视图拆除**这四件事，也就是一个元数据引擎至少要有的那一部分。
+
+> 矩阵要 `LD_LIBRARY_PATH` 能找到 `libfdb_c`（脚本会自己试 `.fdbbin/lib` 与 `target/fdb/release/lib`，都找不到时 fdb 一列会整列报库错误）。矩阵跑之前要确认本机没有残留的 grovefs 挂载/服务，否则 PG 列的 schema 计数会把并发运行的那个算进去。
 
 ---
 
@@ -1894,7 +2021,13 @@ journalctl -u grove-meta-server | grep -E 'metadata backend'
 | `meta-server: evicted N idle engine(s) (>Xs idle, no sessions)` | 空闲引擎回收(`--engine-idle-secs`,§6.2):N 个无挂载会话且静默超阈的视图释放了引擎(PG 连接/文件句柄) | 正常回收噪声无需处置;若希望视图热不回落,缩短阈值或确认会话已断;`0` 则关闭驱逐(常驻模型) |
 | `meta HA: promotion refused/deferred` | 提升被否(对端持更高 token 或前任租约尚活) | 正常:绝不双主;若两节点都拒升,查 witness 多数派 |
 | `invalidation listener stopped: token rejected` | 客户端失效推送通道被 token 拒(中心 token 换了) | 用新 token 重启对应 grove-mount@ 实例 |
-| `meta-server: metadata backend foundationdb — one subspace per view in FoundationDB (cluster file …); <base> holds no trees` | 树在集群 subspace 里,`--meta-dir` 只装定义与日志(§6.3) | 正常。排查"我的树跑哪去了"先看这一行:若它写的是 `one db file per view under <base>/meta/`,说明 `--meta-store` 没生效,这个服务端读的是本地 SQLite 树 |
+| `meta-server: metadata backend foundationdb — one subspace per view in FoundationDB (cluster file …); <base> holds no trees` | 树在集群 subspace 里,`--meta-dir` 只装定义与日志(§6.3) | 正常。排查"我的树跑哪去了"先看这一行:若它写的是 `one db file per view under <base>/meta/`,说明 `--meta-store` 没生效,这个服务端读的是 本地 SQLite 树 |
+| `meta-server: fdb cluster up — redundancy …, N storage server(s), M coordinator(s)` | 启动探针读到的集群拓扑(读 `\xff\xff/status/json`,bind 之前打印) | 正常。与预期不符(单机开发集群显示 `single`、`0 zone failure(s)`)说明集群未按多副本配置;排查前先看这一行,不必先登集群 |
+| `meta-server: writer lease HELD for deployment <dir> (holder …, renewed every Ns, expires Ns after the last renewal); …` | 该 `--meta-dir` 的写者租约已取到,续租周期与 TTL 同行列(§6.3.2) | 正常。同一 `--meta-dir` 再起一个实例会等一个 TTL 后拒绝(§15.9);`kill -9` 后重启会等旧行过期才接管 |
+| `meta-server: writer lease DISABLED (GROVEFS_FDB_WRITER_LEASE_SECS=0); …` | 租约被人为关闭,不再阻止同目录的第二个写者 | 只用于测试或确定单实例的场合;生产部署撤掉该变量 |
+| `meta-server: LOST the FDB writer lease for '…' (another server took it over); stopping instead of writing beside it` | 续租发现行已属于别人(被 `--force` 围栏,或本进程停顿超过 TTL 后被接管) | 进程以 1 退出是有意为之,不是崩溃;确认没有两个 server 共用同一目录后就地重启 |
+| `meta-server: writer lease released for '…'` | 正常关闭时先还租约再关网络 | 正常噪声,无需处置 |
+| `--meta-store fdb://…: the cluster reports its database as UNAVAILABLE (…)` | 启动探针有界失败,服务端拒绝启动而不是挂起 | 查集群:`fdbcli -C <集群文件> --exec 'status minimal'`;协调器不足看 `quorum_not_reachable` |
 | `names the FoundationDB backend, but this binary was built without \`--features fdb\`` | 服务端二进制不含该 feature(未链 `libfdb_c`),却给了 `fdb://…` | 预期拒绝而非降级:用 `--features fdb` 重建,或去掉 `--meta-store` 回到默认 SQLite(§6.3) |
 | `--meta-store fdb://… cannot be combined with --role standby / --peer / --witness` | 想用 grovefs 自研主备服务 FDB 部署 | 撤掉 HA 参数:副本与恢复由集群负责(`fdbbackup`),§6.3/§15.9 |
 | `fdb:// uri names no cluster file` | URI 里无路径且 `$GROVEFS_FDB_CLUSTER_FILE` 也未设 | 给 `fdb://<集群文件>` 或 `fdb://?cluster=<路径>`(§6.3) |
@@ -2625,7 +2758,7 @@ GC 语义(源码保证):对象只在**最后一个引用它的目录项**消失�
 前面各节按**机制**讲，本节按**你要干的事**给最短可执行序列。约定：
 
 - `G=grovefs`（换成你的二进制路径，如 `/usr/local/bin/grovefs`）；地址统一写 `10.0.0.10`，端口 `50100`（数据）/`50110`（元数据）/`5432`（PG）——换成你的即可；
-- PG 各节在本机 PostgreSQL 12 上**逐条实跑**过（建库、起服务、挂载、巡检 SQL、`pg_dump` + 新库恢复、`.bneck/pg_drop_views.sh` 的销账 + `DROP SCHEMA`、以及下文引用的每一句拒绝原文），跨挂载 `rsync -aH` 也在两个本地挂载之间验证过硬链接与增量；实测端口 5433，正文写标准 5432，差别只在端口；
+- PG 各节在本机 PostgreSQL 12 上**逐条实跑**过（建库、起服务、挂载、巡检 SQL、`pg_dump` + 新库恢复、`view rm --base` 的事务性销账 + `DROP SCHEMA` + 字节回收、`refs rebuild` 的两个方向（整条链由 `.bneck/pg_view_teardown.sh` 的 44 条断言在真 FUSE 挂载上跑通）、以及下文引用的每一句拒绝原文），跨挂载 `rsync -aH` 也在两个本地挂载之间验证过硬链接与增量；实测端口 5433，正文写标准 5432，差别只在端口；
 - 每条场景末尾都有一行**验收命令**，跑出预期结果再往下走，别攒到最后一起查；
 - 机制细节不在这里重复，表里给交叉引用。
 
@@ -2877,36 +3010,40 @@ $G umount -m /mnt/restore
 - **高可用不要叠 GroveFS 的 `--role`**：PG 下用 PG 自己的流复制或 PITR（§15.9 有 fail-fast 原文）；
 - 恢复后客户端的挂载点必须先全部卸掉再切库，重挂即可；不要把恢复库直接改成生产库名跑在线流量。
 
-### 15.8 场景：PG 下删视图、清残留 schema、清孤儿字节
+### 15.8 场景：PG 下删视图、清残留 schema、归位账本
+
+一条命令做完三件事：**销账**（`grovefs_refs.holders` 归零行删除）+ **删树**（`DROP SCHEMA … CASCADE`）+ **回收字节**（无人再持有的 `blocks/` 对象 `backend.remove`）。
 
 ```bash
 G=grovefs
-# 1) 先把挂载全部下线(在线的客户端遇到 schema 消失会 EIO)
+# 1) 先把挂载全部下线(在线客户端遇到 schema 消失会 EIO)
 $G umount -m /mnt/demo
 
-# 2) CLI 删不了 PG 里的树——它只认本地 meta/<view>.db(实测原文):
-$G view --meta-dir /data/cluster rm --name demo
-#   error: no view definition 'demo' under /data/cluster/meta/views
+# 2) 删整棵基视图:销账与 DROP 在同一事务里,不会出现“树没了账还在”
+$G view --meta-dir /data/cluster --meta-store postgres://grove:pw@10.0.0.9:5432/grovefs \
+   rm --name demo --base --data-dir /data/cluster
+#   removed base view 'demo' from postgres://…: schema dropped with 6 name(s), 4 object(s) no longer held by any view
+#   4 object(s) freed from /data/cluster/blocks, 0 not found under that data root (wrong --data-dir? …), 0 could not be freed
+#   note: new mounts of 'demo' are now refused — `view create` starts over; the definitions this meta-dir holds were not touched
 
-# 3) 删视图 = 先销账、再 DROP，两步必须成对
-#    账本 `grovefs_refs.holders` 是全局表且没有 view 列：单跑 `DROP SCHEMA … CASCADE`
-#    只删树不销账，该视图订过的每个对象留下一行（0 字节的文件也订对象），而树已
-#    经没有任何名字能再删它们。SQLite 档靠 `refs rebuild` 归位，PG 档没有这条 CLI
-#    路径，由 pg_drop_views.sh 这一配方承担（不传 `--yes` 一律干跑）：
-bash .bneck/pg_drop_views.sh --list                   # 列 schema 与解码出的视图名
-bash .bneck/pg_drop_views.sh --yes demo               # 指定视图：销账 + DROP SCHEMA CASCADE
-bash .bneck/pg_drop_views.sh --yes                    # 只清基准/套件留下的 pg<ts> 形态残留
-bash .bneck/pg_drop_views.sh --yes --rebuild-ledger   # 顺带按存活树重算整本账（见下）
-#   dropped demo  (ledger rows removed: 7)
-
-# 4) 字节:node 行没了,blocks/ 里的对象成为孤儿,不会自动回收
-find /data/cluster/blocks -type f | wc -l; du -sh /data/cluster/blocks
+# 3) 归位账本(只在静止时跑):按存活树重算,删掉没有任何树认领的行
+$G refs --meta-dir /data/cluster --meta-store postgres://… rebuild
+#   refs ledger rebuilt in postgres://…: 3 tree(s), 12 content key(s), 12 holder unit(s); 2 row(s) corrected, 1 row(s) deleted
 ```
 
-- 第 4 步的空间需要按 §12.6 的取舍手工处理:`grovefs gc` 只审计**本地 page 文件**(SQLite 后端),PG 下树是 schema、字节归 data-server,没有等价命令(`gc` 会明确拒绝)；
-- `pg_drop_views.sh --rebuild-ledger` 是 `refs rebuild` 的 PG 等值实现，逐条对位 `src/meta/engine.rs` 里的 `rebuild_ledger`：一个事务内清空 `grovefs_refs.holders`，再对每棵**存活** schema 取 `SELECT DISTINCT data_ref`，按留名的视图数计 holder。它不保留任何无树留名的行，而「无行即该视图私有」（§5.3），所以重算只会把越界删树攒下的**过计**归位、不会造成少计——方向永远是多留字节，不是误删。重写前把整表快照为 `grovefs_refs.holders_bak_<ts>`（回滚就是 `insert … select *` 回去）；快照确认无误后要手工 `drop table`，否则它自己就成了新的残留；
-- `grovefs_refs` **不要随手 DROP**：它是跨视图删除安全的账本，丢了只会让系统保守地多留字节（不会误删对象）；要把越界删树攒下的孤儿行归位，用上面第 3 步的 `pg_drop_views.sh --rebuild-ledger`（配方，不是 CLI；PG 侧仍没有 `refs rebuild` 命令，§15.9）；
-- 删完确认：§15.6 的第 1 条 SQL 里那个 schema 消失、客户端不再能挂载该视图名；账本对账看 `pg_drop_views.sh --rebuild-ledger` 的干跑预演，它报的「booked by no tree」应为 0。
+- **为什么能原子**：PG 的 DDL 是事务性的，所以“逐 key 减一格 holder（归零即 `DELETE`，并记下这个 ref）→ `DROP SCHEMA … CASCADE`”可以在**一个事务**里提交，崩溃也不会留下“树没了、账还在”的中间态；相较 SQLite 档的“先删 `<view>.db`，再 `refs rebuild` 重算整本账”，这里不需要事后重建；
+- **字节在这一步回收**：删完 `node` 行，`blocks/` 里的对象就是孤儿；CLI 拿删除前读到的 `DISTINCT data_ref` 逐个 `backend.remove`，**只有账本归零的**才删（仍被别名/fork/其它视图命名的计入 `still held by other views`）。`--data-dir` 指向真正存 `blocks/` 的那台，点错只会如实报 `not found`，不会假称已回收；条带 key（`s<N>:<stripe>:<uuid>`）在 data-server 上，普通本地根回收不了，计入 `could not be freed` 并跳过；
+- **删不掉的情况**：名字本身还被定义治理（先用不带 `--base` 的 `view rm` 删定义）、仍有定义经此基解析、本机还挂着——与 SQLite 同一套守卫，文案逐字相同（§3.4.3）；
+- **二次删除会失败**：报 `no schema grovefs_v_<hex> in the database — 'demo' has no base tree here (a governed name is removed with \`view rm\` WITHOUT --base; …)`，退出码非 0。把“什么都没做”报成成功，会让打字错误静默通过；
+- **绕过 CLI 手工 `DROP SCHEMA … CASCADE` 的代价**：账本是无 view 列的全局表，裸 drop 只删树不销账，该视图订过的每个对象留下一行；更要紧的是**它订过哪些对象只有那个 schema 知道**，ref 清单随 schema 一起消失——下面第 3 步能把账本归位（多计的行删掉），但**归不了字节**，那些对象从此没有记录可回收。`.bneck/pg_view_teardown.sh` 的 E/H 段就是为这件事写的：drop 前后各记一次，最后断言“剩下的正好是它订过的那些”并写明原因；
+- **`refs rebuild` 的方向**：枚举 `grovefs_v_*` schema → `view_from_schema_name` 过滤出本编码的视图名 → 逐树 `SELECT DISTINCT data_ref` → 按“还有几棵树命名它”重写 `grovefs_refs.holders`。**一棵树读失败就整体中止**（少算会走向误删，多算只多留字节）；健康库上是 no-op（`0 row(s) corrected, 0 row(s) deleted`）；读树不读账本，所以它既能删掉越界删树留下的过计，也能把丢失的记账（`holders` 行被误删）从树恢复回来——两个方向都在 `pg_view_teardown.sh` 的 E/F 段实测；
+- **`pg_drop_views.sh` 已降级为 out-of-band 巡检器**：CLI 能做的事它不再抢着做，只在“手上没有 grovefs 二进制”“要清 CLI 删不到的历史残留（旧版本套件留下的 schema）”“想在不启动服务的机器上核账本”时用（`--list` 列 schema 与解码出的视图名，不传 `--yes` 一律干跑）；
+- **`gc` 在 PG 档仍拒绝**：它只审计本地 page 文件，PG 下树是 schema、字节归 data-server，没有等价命令（§15.9）——字节回收只在上面第 2 步发生，所以“先删树再想回收”本来就是错的顺序。
+
+- **`grovefs_refs` 不要随手 DROP**：它是跨视图删除安全的账本，丢了只会让系统保守地多留字节（不会误删对象）；要从丢失状态恢复，用上面第 3 步的 `refs rebuild`。旧版本留下的、CLI 已经删不到的历史残留 schema，用 `bash .bneck/pg_drop_views.sh --list` 先看清楚，再 `--yes` 清（干跑默认）；
+- **删完确认**：§15.6 的第 1 条 SQL 里那个 schema 消失、客户端不再能挂载该视图名；账本里 `select count(*) from grovefs_refs.holders` 归零。
+
+> 套件：`.build-bin/test_pg.sh`（24 条）与 `.build-bin/test_pg_parallel.sh`（41 条）末尾都用 `view rm --base` 自清场，跑完库里 0 schema / 0 账本行（此前每跑一次就漏一个 schema）；`.bneck/pg_view_teardown.sh`（44 条）把上面整条链在真 FUSE 挂载上从头跑到尾。三条都是“跑完不留痕”，TEARDOWN 不再是人工步骤。
 
 ### 15.9 场景：非 SQLite 后端下的能力边界（哪些命令不能用、替代做法）
 
@@ -2920,8 +3057,9 @@ PG 与 FDB 各一表；每行的“实测原文/行为”都在本机当前构�
 | `view fork` | 拒绝 | `no physical base tree … a PostgreSQL-backed view cannot be forked` | 派生视图（§15.13）或别名 |
 | `view export` | 拒绝 | `no metadata tree … a PostgreSQL-backed view lives in Postgres` | `pg_dump -n grovefs_v_<hex>` |
 | `view list` | 可用(加 `--meta-store`) | `view --meta-store postgres://… list` 读 `grovefs_control.view_defs` + `grovefs_v_*` schema;不带 `--meta-store` 只看本地文件(输出 `no view definitions under …/meta/views`) | 同左,或 §15.6 巡检 SQL |
+| `view rm --base`（连字节删整个基视图） | **可用**（`view --meta-store postgres://… rm --name V --base --data-dir R`） | 在一个事务里逐 key 减 `grovefs_refs.holders`（归零即 `DELETE`）后 `DROP SCHEMA grovefs_v_<hex> CASCADE`，提交后拿删除前读到的 `DISTINCT data_ref` 逐个 `backend.remove`。回显分两行陈述：`schema dropped with 6 name(s), 4 object(s) no longer held by any view` / `4 object(s) freed from …/blocks, 0 not found …, 0 could not be freed`。二次删除报 `no schema grovefs_v_<hex> in the database — 'V' has no base tree here …` 并以非 0 退出 | 守卫与 SQLite 同一套（受治名/依赖定义/本机活挂载）；`--data-dir` 指向真正存 `blocks/` 的根；§15.8 |
 | `import`（零拷贝） | 不适用 | 会在本地造 `<view>.db`，元数据不进 PG | 挂载 + `rsync`（§15.5 路 B 同法） |
-| `refs rebuild` | **别跑** | 会静默建一个 0 行的本地 `meta/refs.db`（`rebuilt …: 0 holder entries`），PG 账本不受影响 | 日常由服务端事务维护；越界删树后归位走 §15.8 的 `pg_drop_views.sh --yes --rebuild-ledger`（配方，非 CLI） |
+| `refs rebuild` | **可用**（`refs --meta-store postgres://… rebuild`） | 重算的是**库里**的共享账本（不是本地 `meta/refs.db`）：枚举全部 `grovefs_v_*` schema → 逐树 `SELECT DISTINCT data_ref` → 按“还有几棵树命名它”重写 `grovefs_refs.holders`，删掉没有任何树认领的行。健康库是 no-op（`0 row(s) corrected, 0 row(s) deleted`）；越界删过 schema 时把过计的行删掉（实测 `0 tree(s) … 3 row(s) deleted`），`holders` 行被误删时从树恢复（实测 `2 row(s) corrected`）。**一棵树读失败就整体中止**（少算走向误删） | 只在**静止**时跑；常态由服务端事务维护，不需要定期跑。逐字配方见 §15.8 |
 | `apikey` | 可用(加 `--meta-store`) | key 与审计进 `grovefs_control.api_keys`/`mcp_calls`,本地不建 `api_keys.db`(`control` 套件实证) | 同 SQLite(§15.11) |
 | `mcp` | 可用(加 `--meta-store`) | 治理与只读探查十工具全走 `grovefs_control`(`list_view_tree` 也能走 PG 树);`fork_view`/`graft_view` 仍拒:`fork is not implemented on the PostgreSQL backend yet…` | 同左;巡检亦可 psql(§15.6) |
 | HA：`--role standby` / `--peer` / `--witness` | 启动即失败 | `--meta-store postgres://… cannot be combined with --role standby / --peer / --witness` | PG 流复制 / 逻辑复制 / PITR |
@@ -2937,7 +3075,10 @@ PG 与 FDB 各一表；每行的“实测原文/行为”都在本机当前构�
 | `view fork` | 拒绝 | ``… `fork` is not implemented on the FoundationDB backend (a fork copies a whole per-view tree, and a view here is one subspace of the cluster with no snapshot path to copy); serve 'NAME' as an alias or derived view instead… `` | 派生视图（§15.13）或别名（§3.4） |
 | `view export` / `view import`（单视图元数据搬运） | **可用**（跨后端与同后端的迁移通道，§3.4.2） | 导出把一个 subspace 写成与 SQLite 档逐行同形的宿主无关 JSONL（表头 + 每节点一行，无绝对路径/主机名/`blocks/` 路径）；导入在集群里**开出这个名字的 subspace**（`view create` 之外唯一的建树入口），保留 id/ino/硬链接/mode/uid/gid/时间/symlink 文本，同事务更新共享字节账本，并把两个分配器水位抬到导出最大值（对位 PG 的 `setval`）；目标已有树需 `--replace`，坏 dump 整体拒绝、不留半成品；目标若是 **corpse**（有键、无根行）一律拒绝并给出 `view rm --name V --base`——`--replace` 也不放行，因为导入会继承旧树的 `'r'` 行、把 dump 从未描述的字节记在这个视图头上；导出对同一形状也拒绝（按根行区分 corpse 与从未建制，两者给不同出口）；`--as-fork` 在此档拒绝（理由同 `view fork` 行） | 字节另走对象存储：`rsync -a` 数据根，或让 data-server 服务同一批对象（§14.2） |
 | `view rm --base`（连字节删整个基视图） | **可用**（`view --meta-store fdb://… rm --name V --base --data-dir R`） | 删的是**子空间**而不是 db 文件：清空该视图的全部键 → 按幸存子树重算共享 `refs` 账本 → 对已无人持有的对象走 data-server 的 `remove`。回显把两件事分开陈述，不叠成一个数：`removed base view 'V' from fdb://…: 3505 key(s) gone, 701 node(s), 1 object(s) no longer held by any view` / `0 object(s) freed from …/blocks, 1 not found under that data root (wrong --data-dir? …), 0 could not be freed` / `note: new mounts of 'V' are now refused — \`view create\` starts over; the definitions this meta-dir holds were not touched`。删除**不碰** `--meta-dir` 里的视图定义、别名与 API key | 残留清扫与验收：删完用下方 `view scan` 确认子空间已消失；`--data-dir` 指向真正存 `blocks/` 的那台（meta/data 分家时点错只会如实报 not-found，不会假称已回收） |
-| `view scan`（集群侧清点） | **可用**（`view --meta-store fdb://… scan`） | 列的是**集群里的**子空间，不是本 `--meta-dir` 的定义：`SUBSPACE / KEYS / ENTRIES / KIND / PREFIX`，`KIND` 区分 `view`（有根行的活树）、`corpse`（有键但无根行，挂不上）、`ledger`（共享账本）；表尾给出汇总与 PREFIX 十六进制（即 `fdbcli clearrange` 的参数） | 清残留按这个表来：`KIND=corpse` 或没人认领的 `view` 都可以用上一行的 `rm --base` 收掉；`ledger` 随最后一次无人持有自动消失 |
+| `view scan`（集群侧清点） | **可用**（`view --meta-store fdb://… scan`） | 列的是**集群里的**子空间，不是本 `--meta-dir` 的定义：`SUBSPACE / KEYS / ENTRIES / KIND / PREFIX`，`KIND` 区分 `view`（有根行的活树）、`corpse`（有键但无根行，挂不上）、`ledger`（共享账本）、`lease`（写者租约表，不属于任何视图）；表尾给出汇总与 PREFIX 十六进制（即 `fdbcli clearrange` 的参数） | 清残留按这个表来：`KIND=corpse` 或没人认领的 `view` 都可以用上一行的 `rm --base` 收掉；`ledger` 随最后一次无人持有自动消失；`lease` 行用 `view lease --release` 清，不要当 corpse 删 |
+| `view lease`（集群侧写者租约） | **可用**（`view --meta-store fdb://… lease`） | 列出 `STATE / DEPLOYMENT / HOLDER / EXPIRES`：`HELD` = 仍在续租的写者，`expired` = 行还在但持有者已不再续租；`EXPIRES` 给出 `in/ago Ns`。带 `--deployment <该 server 的 --meta-dir>` 锁定一个部署；不带 `--release` 只读。表尾说明「一个部署一个写者」与清理方法 | 清理僵死行：`lease --release --deployment <dir>`（过期行）；加 `--force` 清活行 = 主动围栏：旧持有者在下一次续租时打印 `LOST the FDB writer lease` 并以状态 1 退出，不会继续写 |
+| 启动时集群不可用 | 拒绝启动（bind 之前） | `--meta-store fdb://…: the cluster reports its database as UNAVAILABLE (<集群自己的解释>) — a meta-server cannot serve a mount from it; check fdbcli -C <cluster file> --exec 'status minimal'`；探针有界（`GROVEFS_FDB_OPEN_TIMEOUT_SECS`，默认 10s） | 先把集群拉起来并确认 `status minimal` 报 available；探针超时可调（§6.3.2） |
+| 同一 `--meta-dir` 的第二个 meta-server | 等 `GROVEFS_FDB_WRITER_WAIT_SECS`（默认 TTL+2s）后拒绝（bind 之前） | `deployment '<dir>' already has a live meta-server writer (holder '<host:pid:nonce>', lease expires in Ns): one meta-server per --meta-dir may write this cluster — stop that server, or wait for its lease to expire (10s, GROVEFS_FDB_WRITER_LEASE_SECS), or clear a stale row with … lease --release --deployment … --force` | 停旧实例；崩溃场景等 TTL（上限 10s）自行接管；确定旧实例不会回来就用 `--release --force` 围栏（`fdb` 套件第 16 节实测） |
 | `view create`（名字已被残留占用） | 拒绝，并点名出口 | `a subspace named 'V' already holds keys in fdb://… but has no root row (a corpse — nothing can mount it) — clear it first with \`grovefs view --meta-store fdb://… rm --name V --base\`` | 按提示先 `rm --base` 清残骸再建；健康子空间（含从备份恢复回来的）在这里只报「已存在」，不会被当成残骸 |
 | `import`（零拷贝） | 拒绝 | ``import operates on a local SQLite view db; under a FoundationDB deployment (--meta-store fdb://…, or GROVEFS_META_STORE) a base tree is a subspace of the cluster …`` | 挂载 + `rsync`/`cp` 走挂载点（§14.2）；已有目录批量入库走三步：本地 `import` 暂存 → `view export` → `view --meta-store fdb://… import`（§3.4.2） |
 | `gc --apply` | 拒绝 | `` `gc` audits LOCAL page files under <data-dir>/blocks; a FoundationDB deployment's trees are subspaces in the cluster and its bytes are owned by the data servers — reclaim there with the data-server tooling (and back the cluster up with `fdbbackup`), not this command `` | 字节回收由服务端事务与集群侧工具负责；不要在 fdb 部署上跑离线 `gc` |
@@ -3101,7 +3242,7 @@ $G meta-server --listen 0.0.0.0:50110
 | `error: view 'x' does not exist on this meta-server (sqlite/postgres): … views are created explicitly …` | 视图名还没有树/定义,服务端拒绝未创建的视图名(任何情况下都不会自建) | §4：先建后挂(SQLite `view create --view x` / `init` / `view import`；PG `view --meta-store postgres://… create --view x`) |
 | 挂载**成功**了，但目录是空的 | 视图确实存在,但树里还没有内容——例如刚 `view create` 的空树,或历史上手工遗留的空树 | `ls meta/` 确认；建错了就按 §15.8 清掉重来 |
 | `no physical base tree … cannot be forked` | 在 PG 后端下跑 `view fork` | §15.13 换派生视图/别名 |
-| `no view definition '<v>' under …/views` | 在 PG 下用 CLI 删视图 | §15.8 的 `bash .bneck/pg_drop_views.sh --yes <视图名>`（先销账再 `DROP SCHEMA`） |
+| `no view definition '<v>' under …/views` | 在 PG 部署下漏了 `--meta-store`——治理动作落到了本地文件,PG 里根本没有这条定义 | 原命令补上 `--meta-store postgres://…`;真要删视图是 §15.8 的 `view --meta-store … rm --base`(一个事务里销账 + `DROP SCHEMA`) |
 | `no metadata tree … lives in Postgres` | 在 PG 下跑 `view export` | 用 `pg_dump -n`（§15.7） |
 | `--meta-store postgres://… cannot be combined with --role standby / --peer / --witness` | PG 与 GroveFS 原生 HA 不能叠 | §15.9：高可用改走 PG 流复制 |
 | `--meta-store fdb://… cannot be combined with --role standby / --peer / --witness` | 同一条互斥，但 FDB 档的补救话术不同：复制与快照本来就在集群内（`fdbbackup`），原生 HA 在这里没有可交付的东西 | §6.3 / §15.9：去掉 HA 参数单实例起 meta-server |
@@ -3111,7 +3252,7 @@ $G meta-server --listen 0.0.0.0:50110
 | 命令**挂住不返回**：客户端只打到 `using remote metadata service at …` 就没了，退出只能靠外部超时；`meta-server` 那边横幅照打、端口照听、日志不再新增行 | **集群不可达在这一档不是报错，是无声等待**——`libfdb_c` 对协调器不可达按自己的策略持续重试，本后端没有给这类等待设上限（`docs/fdb-keyspace.md` §11 把 timeout/重试上限列为可后置项）。服务端启动**不探测集群**，所以"起来了"不等于"通" | 判据在集群侧：服务端机上 `fdbcli -C <集群文件> --exec "status minimal"`，`The database is unavailable` 就是这一类（几秒内给出，不像 grovefs 那样等）。恢复可达后卡住的那笔 op 自己走通，挂载不需重挂 |
 | `serialization retry exhausted after 12 attempts (view 'x')` | 一笔 op 连撞 12 次仍未提交（OCC 中止，退避 200µs→25ms 用尽）。**PG 与 FDB 同一条 driver 文案**（`src/pg_store.rs:550`、`src/fdb_store.rs:1523`），FDB 档没有锁等待这一说，出现这行就是重试预算真耗尽 | 查争用面而不是查集群：同一目录内高频 `rename`/同名 `create` 风暴；PG 侧该串由 `pg_parallel` 套件在日志里实测，FDB 侧走的是同一常量与同一分支 |
 | `view name is N bytes; the backends all cap it at 25 so no view is openable on one engine and unrepresentable on another` | 视图名超 25 字节。FDB 本身不需要这个上限，上限是从 PG 的 `schema_for` 跨过来的——为了让视图在三后端间可迁移（P8） | §15.9：换成 ≤25 字节的视图名 |
-| `refs … rebuilt: 0 holder entries`（PG 部署里） | 跑的是本地文件账本重建，与 PG 无关 | 不要依赖这次输出（§15.9）；账本内容看 `grovefs_refs.holders`（§15.6） |
+| `refs … rebuilt: 0 holder entries` | 跑的是**本地文件**账本重建（没带 `--meta-store`）：它按 `<meta-dir>/meta/*.db` 重算 `meta/refs.db`，在 PG/FDB 部署里那些文件并不存在，所以 0 行 | 后端部署要带 `--meta-store`：PG 报 `refs ledger rebuilt in postgres://…: N tree(s) …`，FDB 报同样形状的集群账本；账本内容看 `grovefs_refs.holders`（§15.6/§15.9） |
 | 写操作返回 `EPERM` | 只读 key（含 `flock` 类）或派生视图 | §15.11 / §15.13 |
 | 写 fork 内容返回 `EROFS` | fork 内容面只读 | 写基视图；结构整理继续在 fork 里做 |
 | 挂载后 2 秒内别的客户端看不到变化 | 不是 bug：TTL ≤2s；若一直不同步，查两地是否连的**同一个** meta | §4 的“两种一致性模式” |
@@ -3178,7 +3319,7 @@ $G meta-server --listen 0.0.0.0:50110
 | 导出/导入单视图元数据 | `grovefs view --meta-dir D export --view V --out F [--force]`(宿主无关 JSONL,不含字节) / `grovefs view --meta-dir D import --view V --in F [--replace] [--as-fork B]`(原子替换,字节另拷 `blocks/`,§3.4.2) |
 | 泄露后轮换公开名 | `grovefs view --meta-dir D alias --name A2 --real R --retire A`(先写后删零窗口:`A` 失效、`R` 全程不可直挂,§3.4) |
 | 列出/删除视图定义 | `grovefs view --meta-dir D list`(定义槽 + 裸基视图) / `grovefs view --meta-dir D rm --name V`(派生/别名只删定义不动数据;fork 连自己的 `meta/V.db` 一并删除并重建账本) |
-| 删整个基视图(连字节回收) | `grovefs view --meta-dir D rm --name V --base [--data-dir R]`(删 `meta/V.db`+WAL/SHM、`refs rebuild` 重建账本、回收无其他视图持有的字节;受治名/依赖定义/本机活挂载/PG 部署均拒绝,§3.4.3) |
+| 删整个基视图(连字节回收) | `grovefs view --meta-dir D rm --name V --base [--data-dir R]`(删 `meta/V.db`+WAL/SHM、`refs rebuild` 重建账本、回收无其他视图持有的字节;受治名/依赖定义/本机活挂载均拒绝;PG 档加 `--meta-store postgres://…`，销账 + `DROP SCHEMA` 在同一事务里，§3.4.3) |
 | 排查/回收孤儿对象(离线) | `grovefs gc --meta-dir D [--data-dir R] [--apply] [--older-than 24h] [--json]`(默认只扫描;`--apply` 要求本存储无活挂载、本机无 grovefs 进程,永不删账本仍持有的键,PG 部署拒绝,§12.6) |
 | 导入存量目录 | `grovefs import --view V --source DIR [--prefix P] [--data-dir R] [--dry-run]`(同盘硬链接零拷贝,重跑增量;在存储机执行,§3.3) |
 | 服务端用量统计 | `grovefs du --home H --view V [--data-servers A[,A2]\|--data-dir R] [--path P] [-d N] [-b] [--total]`(批量取对象字节汇总,不走逐文件 stat;字节来源 `--data-servers` > `--data-dir` > 元数据根,判不出来源直接拒绝,只有确认缺失才计入 warning,§12.6) |

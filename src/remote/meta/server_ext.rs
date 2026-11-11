@@ -598,11 +598,75 @@ impl MetaServer {
                 ),
             ));
         }
-        // SQLite trees live under `<base>/meta`; a PG or FDB store writes nothing
+        // SQLite trees live under `<base>/meta`; a PG store writes nothing
         // locally, so creating that directory would be a misleading footprint
         // (an empty `meta/` on a host that has no local metadata at all).
         if matches!(self.store, StoreKind::Sqlite) {
             std::fs::create_dir_all(self.base.join("meta"))?;
+        }
+        // ---- FoundationDB: cluster gate + writer lease ----------------------
+        //
+        // A `fdb://` server must establish two facts BEFORE it binds, because
+        // both used to be discovered the hard way:
+        //
+        // 1. The cluster is available. Starting against an unreachable or
+        //    unconfigured cluster printed the normal banners and then the first
+        //    mount blocked for ~150s with no output at all (measured); the probe
+        //    below reads the cluster's own status with a bounded timeout and
+        //    refuses instead, naming the timeout knob.
+        // 2. No other meta-server behind the same control plane is writing. The
+        //    view definitions/keys of an `fdb://` deployment are LOCAL files
+        //    (P5 has not moved governance into the cluster), so two servers
+        //    sharing a `--meta-dir` would each keep their own definitions while
+        //    writing the same trees — the one shape no amount of replication can
+        //    repair. The lease row in the cluster makes that shape refuse to start
+        //    instead of diverging silently.
+        #[cfg(feature = "fdb")]
+        if let StoreKind::Fdb(uri) = &self.store {
+            // The lease id is the canonical `--meta-dir`, and `canonicalize`
+            // needs the path to exist; creating it here is not a footprint — the
+            // local control plane of an FDB deployment lives in this directory
+            // (`meta/views/*.layout`, `api_keys.db`) and would be created by the
+            // first `view create` anyway.
+            std::fs::create_dir_all(&self.base)?;
+            let status = crate::fdb_store::cluster_status(
+                uri,
+                crate::fdb_store::cluster_open_timeout(),
+            )?;
+            if !status.available {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    format!(
+                        "--meta-store {uri}: the cluster reports its database as UNAVAILABLE ({}) — \
+                         a meta-server cannot serve a mount from it; check \
+                         `fdbcli -C <cluster file> --exec 'status minimal'`",
+                        if status.message.is_empty() {
+                            "no message from the cluster"
+                        } else {
+                            &status.message
+                        }
+                    ),
+                ));
+            }
+            // Printed even when the lease is disabled: this line is how an
+            // operator tells a single-node test cluster from a replicated one
+            // without reaching for `fdbcli`.
+            println!("meta-server: fdb cluster up — {}", status.topology());
+            let deployment = crate::fdb_store::deployment_id(&self.base);
+            match crate::fdb_store::hold_writer_lease(uri, &deployment)? {
+                Some(lease) => println!(
+                    "meta-server: writer lease HELD for deployment {} (holder {}, renewed every {}s, expires {}s after the last renewal); a second meta-server on this --meta-dir waits, then refuses — `grovefs view --meta-store {uri} lease` shows holders",
+                    lease.deployment,
+                    lease.owner,
+                    crate::fdb_store::writer_lease_ttl().map_or(0, |t| (t.as_secs() / 3).max(1)),
+                    crate::fdb_store::writer_lease_ttl().map_or(0, |t| t.as_secs()),
+                ),
+                None => println!(
+                    "meta-server: writer lease DISABLED ({}={}); nothing now stops a second meta-server on this --meta-dir from writing the same trees",
+                    crate::fdb_store::WRITER_LEASE_ENV,
+                    0
+                ),
+            }
         }
         let listener = TcpListener::bind(&self.listen)?;
         println!(

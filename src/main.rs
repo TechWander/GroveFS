@@ -934,6 +934,36 @@ enum ViewAction {
     /// an abandoned migration. This is the command that makes those visible, and
     /// the one to run before/after `view rm --base`.
     Scan,
+    /// Inspect or clear the CLUSTER's writer leases: the rows that say which
+    /// meta-server may write a given deployment (`--meta-dir`). `--meta-store
+    /// fdb://…` only.
+    ///
+    /// A `fdb://` meta-server takes one lease row per deployment at startup and
+    /// renews it while it serves, so two servers behind the SAME control plane
+    /// cannot both write the cluster; the second one waits up to one TTL for a
+    /// crashed holder's row to expire and then refuses. This command is the
+    /// operator's half of that contract: it shows who holds what and how long is
+    /// left, and it clears a row whose holder will never come back (a machine
+    /// that was destroyed, not merely stopped).
+    ///
+    /// Releasing a LIVE row is refused unless `--force` says so explicitly — a
+    /// live holder is still renewing, and dropping its row would let a second
+    /// server start while the first keeps writing. With `--force` the fence is
+    /// deliberate: the old holder notices on its next renewal and exits instead
+    /// of continuing beside the new one.
+    Lease {
+        /// The deployment to act on: the server's `--meta-dir`, canonicalized the
+        /// same way the server canonicalizes it. Default: list every row.
+        #[arg(long = "deployment", value_name = "DIR")]
+        deployment: Option<PathBuf>,
+        /// Clear the row for `--deployment` (an expired row clears without
+        /// `--force`; a live one needs it).
+        #[arg(long)]
+        release: bool,
+        /// Clear even a LIVE row — fences a holder that cannot be stopped.
+        #[arg(long)]
+        force: bool,
+    },
     /// Remove a view. WITHOUT `--base`: remove the view DEFINITION `--name`
     /// (derived, fork or alias — the file slot is shared). For derived/alias
     /// the underlying data is untouched; already-mounted clients keep their
@@ -954,16 +984,18 @@ enum ViewAction {
     /// the tree IS one subspace of the cluster, so the command clears the whole
     /// subspace, recomputes the shared `refs` ledger from the trees that
     /// survive, and then frees the objects nothing names any more — the same
-    /// one-range operation `docs/fdb-keyspace.md` §3.3 describes. The report
-    /// states both halves separately (keys gone / objects unbooked / objects
-    /// not found under this data root), so "the tree is gone" and "the bytes
-    /// were reclaimed" are never collapsed into one number.
+    /// one-range operation `docs/fdb-keyspace.md` §3.3 describes. With
+    /// `--meta-store postgres://…` the tree is a `grovefs_v_<hex>` schema, so
+    /// the command unbooks what the schema held and drops it in ONE
+    /// transaction (PostgreSQL's DDL is transactional), then frees the same
+    /// way. The report states both halves separately (names gone / objects
+    /// unbooked / objects not found under this data root), so "the tree is
+    /// gone" and "the bytes were reclaimed" are never collapsed into one
+    /// number.
     ///
-    /// Guards: a governed name needs the plain `view rm` first, an actively
-    /// mounted `grovefs:<name>` is refused, a `--meta-store postgres://…`
-    /// deployment is refused (its tree is a PG schema — drop the schema and let
-    /// PG/data servers own the bytes). Other machines' live mounts of the same
-    /// meta-server are not visible here — stop them first.
+    /// Guards: a governed name needs the plain `view rm` first, and an actively
+    /// mounted `grovefs:<name>` is refused. Other machines' live mounts of the
+    /// same meta-server are not visible here — stop them first.
     Rm {
         #[arg(long)]
         name: String,
@@ -2172,6 +2204,11 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         // keeps its content keys booked — counting it as a tree
                         // would hide the only ones that need a decision.
                         let corpses = subs.iter().filter(|s| s.kind() == "corpse").count();
+                        // The writer-lease table is a root sibling like `refs`: it
+                        // is counted (so "N subspace(s)" stays true) but never as a
+                        // tree — it has no root row and would otherwise read as a
+                        // corpse.
+                        let leases = subs.iter().filter(|s| s.lease).count();
                         if subs.is_empty() {
                             println!("no subspaces under the 'grovefs' root in {uri}");
                         } else {
@@ -2190,15 +2227,20 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                                 );
                             }
                             println!(
-                                "\n{} subspace(s) under the 'grovefs' root in {uri}: {} tree(s){} + {} ledger subspace(s)",
+                                "\n{} subspace(s) under the 'grovefs' root in {uri}: {} tree(s){} + {} ledger subspace(s){}",
                                 subs.len(),
-                                subs.len() - ledgers - corpses,
+                                subs.len() - ledgers - corpses - leases,
                                 if corpses > 0 {
                                     format!(" ({corpses} corpse(s): keys but no root row, unmountable)")
                                 } else {
                                     String::new()
                                 },
-                                ledgers
+                                ledgers,
+                                if leases > 0 {
+                                    format!(" + {leases} writer-lease subspace (see `view lease`)")
+                                } else {
+                                    String::new()
+                                }
                             );
                             println!(
                                 "a subspace is a TREE, not a definition — `view list` shows this meta-dir's definitions, this shows what the cluster holds; remove one with `view rm --name <name> --base` (that also works on a corpse, and is the only way to unbook its objects; the PREFIX column is what `fdbcli clearrange` takes for a name this build cannot open)"
@@ -2211,6 +2253,99 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         "{uri} names the FoundationDB backend, but this binary was built \
                          without `--features fdb` (it does not link libfdb_c); rebuild with the \
                          feature to read the cluster inventory"
+                    )
+                    .into());
+                }
+                ViewAction::Lease {
+                    deployment,
+                    release,
+                    force,
+                } => {
+                    // Without the feature there is no cluster to read, and the
+                    // refusal below says so — the fields are still parsed (the
+                    // help text and errors must stay identical) but never read.
+                    #[cfg(not(feature = "fdb"))]
+                    let _ = (deployment, release, force);
+                    let Some(uri) = store.as_deref() else {
+                        return Err("`view lease` reads the metadata CLUSTER; give `--meta-store fdb://<cluster-file>` (SQLite and PostgreSQL deployments have no cluster to lease)".into());
+                    };
+                    if !store_is_fdb {
+                        return Err(format!(
+                            "`{uri}` is not an fdb:// cluster — writer leases exist only for the FoundationDB backend"
+                        )
+                        .into());
+                    }
+                    #[cfg(feature = "fdb")]
+                    {
+                        use grovefs::fdb_store;
+                        let rows = fdb_store::list_writer_leases(uri)?;
+                        if release {
+                            let Some(dir) = deployment.as_deref() else {
+                                return Err("`view lease --release` needs `--deployment <the server's --meta-dir>` — the listing form takes no flag".into());
+                            };
+                            let dep = fdb_store::deployment_id(dir);
+                            let Some(row) = rows.iter().find(|r| r.deployment == dep) else {
+                                println!("no writer lease for deployment '{dep}' — nothing to release");
+                                return Ok(());
+                            };
+                            if row.is_live() && !force {
+                                return Err(format!(
+                                    "deployment '{dep}' is HELD by '{}' ({}s left): that server is still renewing, so removing its row would let a second writer start beside it — stop it first, or pass --force to fence it",
+                                    row.owner,
+                                    row.remaining_ms() / 1000
+                                )
+                                .into());
+                            }
+                            let cleared = fdb_store::release_writer_lease(uri, &dep, None)?;
+                            println!(
+                                "released the writer lease for '{dep}' (holder '{}', {})",
+                                row.owner,
+                                if row.is_live() {
+                                    "LIVE — fenced by --force"
+                                } else {
+                                    "already expired"
+                                }
+                            );
+                            if !cleared {
+                                println!("note: the row was taken over meanwhile and was left in place");
+                            }
+                            return Ok(());
+                        }
+                        if rows.is_empty() {
+                            println!(
+                                "no writer leases on {uri} — no `fdb://` meta-server has written here, or the lease is disabled with `GROVEFS_FDB_WRITER_LEASE_SECS=0`"
+                            );
+                        } else {
+                            println!(
+                                "{:<8} {:<44} {:<32} {}",
+                                "STATE", "DEPLOYMENT", "HOLDER", "EXPIRES"
+                            );
+                            for r in &rows {
+                                let live = r.is_live();
+                                let when = if live {
+                                    format!("in {}s", (r.remaining_ms() + 999) / 1000)
+                                } else {
+                                    format!("{}s ago", (-r.remaining_ms() + 999) / 1000)
+                                };
+                                println!(
+                                    "{:<8} {:<44} {:<32} {}",
+                                    if live { "HELD" } else { "expired" },
+                                    r.deployment,
+                                    r.owner,
+                                    when
+                                );
+                            }
+                            println!(
+                                "\none meta-server per deployment may write this cluster: a starting server waits up to one TTL for an expired row and refuses while a live one is renewed. Clear a row that will never be released with `lease --release --deployment <dir>` (a live one also needs `--force`)."
+                            );
+                        }
+                        return Ok(());
+                    }
+                    #[cfg(not(feature = "fdb"))]
+                    return Err(format!(
+                        "{uri} names the FoundationDB backend, but this binary was built \
+                         without `--features fdb` (it does not link libfdb_c); rebuild with the \
+                         feature to read the cluster's leases"
                     )
                     .into());
                 }
@@ -2382,9 +2517,81 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         )
                         .into());
                     }
-                    // SQLite arm; a PG deployment is refused HERE (its tree is a
-                    // schema, and its ledger is a global table a schema drop would
-                    // leave full of orphan rows).
+                    if store_is_pg {
+                        // A PG base view IS a `grovefs_v_<hex>` schema and the
+                        // cross-view ledger is `grovefs_refs.holders`, both in the
+                        // database — so teardown is "unbook, then drop" inside ONE
+                        // transaction (PostgreSQL's DDL is transactional). There is
+                        // no local file to unlink and no rebuild pass to run
+                        // afterwards: the schema drop and its holds cannot disagree,
+                        // even across a crash.
+                        let uri = store.as_deref().expect("store_is_pg implies a URI");
+                        let rep = grovefs::pg_store::PgEngine::remove_view(uri, &name)?;
+                        // Bytes: the ledger just took those refs to zero, so no view
+                        // names them any more. Freeing them needs a data root, which
+                        // the metadata URI cannot carry — same default and the same
+                        // honest accounting as the two arms above.
+                        let droot = data_root.clone().unwrap_or_else(|| vbase.clone());
+                        let (mut freed, mut missing, mut failed) = (0usize, 0usize, 0usize);
+                        let mut root_error = None;
+                        match backend::open_local(&droot) {
+                            Ok(be) => {
+                                for dr in &rep.unbooked_refs {
+                                    // Striped keys live as chunks on the data-servers;
+                                    // a plain local root cannot free them — report,
+                                    // never half-delete.
+                                    if dr.starts_with('s') && dr.matches(':').count() >= 2 {
+                                        failed += 1;
+                                        eprintln!("note: striped object {dr} not freed from a plain local root — reclaim it through a mount or the data-servers");
+                                        continue;
+                                    }
+                                    if be.len(dr).is_err() {
+                                        missing += 1;
+                                        continue;
+                                    }
+                                    match be.remove(dr) {
+                                        Ok(()) => freed += 1,
+                                        Err(e) => {
+                                            failed += 1;
+                                            eprintln!("warning: cannot free blob {dr}: {e}");
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => root_error = Some(e),
+                        }
+                        println!(
+                            "removed base view '{name}' from {uri}: schema dropped with {} name(s), {} object(s) no longer held by any view{}",
+                            rep.entries,
+                            rep.unbooked,
+                            if rep.still_held > 0 {
+                                format!(", {} still held by other views", rep.still_held)
+                            } else {
+                                String::new()
+                            }
+                        );
+                        match root_error {
+                            Some(e) => eprintln!(
+                                "note: cannot open data root {} to free {} object(s): {e} — the schema and its bookings are gone and those refs are unreferenced now; free them through the data-server or a mount",
+                                droot.display(),
+                                rep.unbooked
+                            ),
+                            None => println!(
+                                "{} object(s) freed from {}, {} not found under that data root (wrong --data-dir? they live on another store), {} could not be freed",
+                                freed,
+                                droot.join("blocks").display(),
+                                missing,
+                                failed
+                            ),
+                        }
+                        eprintln!(
+                            "note: new mounts of '{name}' are now refused — `view create` starts over; this meta-dir's definitions were not touched (the schema is gone, `view list` still shows them)"
+                        );
+                        return Ok(());
+                    }
+                    // SQLite arm. (The PG arm above owns a schema and the
+                    // `fdb://` one returned before it; by here the tree really is
+                    // the local file `meta/<name>.db`.)
                     require_sqlite("`view rm --base`")?;
                     let rm = meta::remove_base_view(&vbase, &name)?;
                     let droot = data_root.unwrap_or_else(|| vbase.clone());
@@ -2954,7 +3161,25 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         .as_deref()
                         .is_some_and(|u| u.starts_with("postgres://") || u.starts_with("postgresql://"))
                     {
-                        return Err("`refs rebuild` rewrites a local `meta/refs.db`; a PostgreSQL deployment's ledger is `grovefs_refs.holders` IN the database and there is no rebuild path in this CLI — the ledger belongs to the engine, so repair it where it lives rather than rebuilding a file nothing reads".into());
+                        // The ledger is `grovefs_refs.holders` IN the database, so
+                        // the recount has to happen there too: the same "read the
+                        // TREES, not the ledger" rule as the two arms above, and
+                        // the same repair of both directions (a lost booking AND
+                        // an over-count). Nothing here frees bytes — that is the
+                        // data servers' business, and `gc` refuses a store URI.
+                        let uri = store.as_deref().expect("just matched a pg uri");
+                        let rep = grovefs::pg_store::rebuild_ledger(uri)?;
+                        println!(
+                            "refs ledger rebuilt in {uri}: {} tree(s), {} content key(s), {} holder unit(s); {} row(s) corrected, {} row(s) deleted",
+                            rep.trees, rep.refs, rep.holders, rep.rows_fixed, rep.rows_deleted
+                        );
+                        println!(
+                            "  the recount reads the TREES (every grovefs_v_* schema), not the ledger — so a lost booking is restored (the unsafe direction) as well as an over-count dropped; nothing here frees object bytes (that is the data servers' business)"
+                        );
+                        println!(
+                            "  run it QUIESCED: a booking committed between the read pass and the write pass would be overwritten with the pre-booking count"
+                        );
+                        return Ok(());
                     }
                     let counted = grovefs::meta::rebuild_ledger(&rbase)?;
                     println!(

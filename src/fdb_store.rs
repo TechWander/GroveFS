@@ -260,6 +260,9 @@ fn guard_slot() -> &'static std::sync::Mutex<Option<NetworkAutoStop>> {
 /// treat continuing after a refused `fdb_stop_network()` as undefined behavior,
 /// and that is the right call for a process that has nowhere else to go.
 pub fn shutdown_network() {
+    // The lease is released BEFORE the network is closed: dropping the guard
+    // first would make this the one call that cannot reach the cluster.
+    release_held_writer_lease();
     let taken = guard_slot()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -282,6 +285,613 @@ fn database(cluster_file: &str) -> Result<DbHandle, std::io::Error> {
     );
     map.insert(cluster_file.to_string(), db.clone());
     Ok(db)
+}
+
+// ---- cluster gate and writer lease ------------------------------------------
+//
+// Two things a `fdb://` meta-server could not promise before this section:
+//
+// 1. It could start against an unreachable or UNCONFIGURED cluster and print its
+//    banners as if all was well; the first mount then blocked for ~150s with no
+//    output at all (measured). The gate below reads the cluster's own status at
+//    startup, refuses when the database is not available, and prints the
+//    topology it found — which is also how an operator can tell a single-node
+//    test cluster from a replicated one in the server's own log.
+// 2. "One meta-server per deployment" was a COMMENT (the control plane is local
+//    files, so two servers sharing a `--meta-dir` would each keep their own view
+//    definitions while writing the same subspaces — divergent governance over
+//    one tree). It is now a lease row in the cluster: the second server waits up
+//    to the TTL for the first one's row to expire and then refuses, a crashed
+//    holder's row expires so a restart proceeds after at most one TTL, and
+//    `grovefs view lease` shows and clears stale rows.
+//
+// The unit is the DEPLOYMENT (the canonical `--meta-dir`), not the cluster:
+// the suite this backend is tested with runs several meta-servers against one
+// cluster on purpose (one per `--home`, each serving its own views), so a
+// cluster-wide lock would forbid a shape the backend already supports. What the
+// lease forbids is the one shape that cannot be correct: two servers behind the
+// SAME control plane.
+
+/// Environment knob: writer-lease TTL in seconds (`0` disables the lease).
+pub const WRITER_LEASE_ENV: &str = "GROVEFS_FDB_WRITER_LEASE_SECS";
+/// Environment knob: how long a starting server waits for a held lease.
+pub const WRITER_WAIT_ENV: &str = "GROVEFS_FDB_WRITER_WAIT_SECS";
+/// Environment knob: timeout of the startup cluster-status probe, in seconds.
+pub const OPEN_TIMEOUT_ENV: &str = "GROVEFS_FDB_OPEN_TIMEOUT_SECS";
+
+const WRITER_LEASE_DEFAULT_SECS: u64 = 10;
+const OPEN_TIMEOUT_DEFAULT_SECS: u64 = 10;
+const LEASE_TX_TIMEOUT_MS: i32 = 5_000;
+
+fn env_secs(name: &str) -> Option<u64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+/// TTL of the writer lease, or `None` when it is disabled (`…=0`).
+pub fn writer_lease_ttl() -> Option<std::time::Duration> {
+    match env_secs(WRITER_LEASE_ENV) {
+        Some(0) => None,
+        Some(s) => Some(std::time::Duration::from_secs(s)),
+        None => Some(std::time::Duration::from_secs(WRITER_LEASE_DEFAULT_SECS)),
+    }
+}
+
+/// How long a starting server waits for a lease another (possibly dead) server
+/// still holds. Default: one TTL plus two seconds — long enough for a crashed
+/// holder's row to expire, short enough that a live holder is reported quickly.
+pub fn writer_lease_wait(ttl: std::time::Duration) -> std::time::Duration {
+    match env_secs(WRITER_WAIT_ENV) {
+        Some(s) => std::time::Duration::from_secs(s),
+        None => ttl + std::time::Duration::from_secs(2),
+    }
+}
+
+/// Timeout of the startup cluster-status probe.
+pub fn cluster_open_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(
+        env_secs(OPEN_TIMEOUT_ENV).unwrap_or(OPEN_TIMEOUT_DEFAULT_SECS),
+    )
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// One writer-lease row: who holds a deployment's write authority, and until when.
+///
+/// The value is `(owner, expires_at_ms)` and the owner string carries
+/// `host:pid:boot-nonce`, so an operator reading `view lease` can tell WHICH
+/// process to stop without asking the cluster for more.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WriterLease {
+    /// Canonical `--meta-dir` this row governs.
+    pub deployment: String,
+    /// `host:pid:nonce` of the holding process.
+    pub owner: String,
+    /// Wall-clock expiry (epoch ms). Renewed every TTL/3 while the holder lives.
+    pub expires_at_ms: i64,
+}
+
+impl WriterLease {
+    fn pack(&self) -> Vec<u8> {
+        (&self.owner, self.expires_at_ms).pack_to_vec()
+    }
+
+    fn unpack(deployment: &str, bytes: &[u8]) -> Option<Self> {
+        let items = Vec::<Element>::unpack_root(bytes).ok()?;
+        Some(Self {
+            deployment: deployment.to_string(),
+            owner: items.first()?.as_str()?.to_string(),
+            expires_at_ms: items.get(1)?.as_i64()?,
+        })
+    }
+
+    /// Milliseconds left before the row stops counting; negative once expired.
+    pub fn remaining_ms(&self) -> i64 {
+        self.expires_at_ms - now_ms()
+    }
+
+    pub fn is_live(&self) -> bool {
+        self.expires_at_ms > now_ms()
+    }
+}
+
+/// Identity of a DEPLOYMENT in a lease row: the canonical `--meta-dir`. The
+/// server and `view lease` must compute the same string or `--release` would
+/// address a row that does not exist, so both go through this function (a path
+/// that cannot be canonicalized — already deleted — is used verbatim).
+pub fn deployment_id(meta_dir: &Path) -> String {
+    std::fs::canonicalize(meta_dir)
+        .unwrap_or_else(|_| meta_dir.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Identity of THIS process inside a lease row: `host:pid:nonce`. The nonce
+/// separates two lifetimes of the same pid (a restart on the same port), which is
+/// what makes "is the row mine" answerable after a crash.
+pub fn writer_owner_id() -> String {
+    let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|s| s.trim().to_string())
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .unwrap_or_else(|| "unknown".to_string());
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{host}:{}:{nonce:x}", std::process::id())
+}
+
+fn lease_keys() -> Keys {
+    // The lease key space is a ROOT sibling, so any `Keys` value addresses it;
+    // this name is never written (same trick `rebuild_ledger` uses).
+    Keys::for_view(REBUILD_PROBE_VIEW)
+}
+
+/// Run one lease transaction with the same bounded retry policy the view writes
+/// use: a conflict re-runs the BODY (which re-reads the row), so a race is
+/// resolved by the read, never by a blind overwrite.
+fn with_lease_tx<T, F>(
+    db: &DbHandle,
+    mut body: F,
+) -> Result<T, std::io::Error>
+where
+    F: FnMut(&Transaction) -> Result<T, TxErr>,
+{
+    let mut delay = SERIALIZATION_BACKOFF_MIN;
+    for _ in 0..SERIALIZATION_MAX_ATTEMPTS {
+        let trx = db
+            .create_trx()
+            .map_err(|e| std::io::Error::other(TxErr::from(e).hard_or_exhausted().to_string()))?;
+        trx.set_option(foundationdb::options::TransactionOption::Timeout(
+            LEASE_TX_TIMEOUT_MS,
+        ))
+        .map_err(|e| std::io::Error::other(TxErr::from(e).hard_or_exhausted().to_string()))?;
+        let out: Result<T, TxErr> = (|| {
+            let v = body(&trx)?;
+            match futures::executor::block_on(trx.commit()) {
+                Ok(_) => Ok(v),
+                Err(e) => Err(TxErr::from(FdbError::from(e))),
+            }
+        })();
+        match out {
+            Ok(v) => return Ok(v),
+            Err(TxErr::Hard(me)) => return Err(std::io::Error::other(me.to_string())),
+            Err(TxErr::Retry(_)) => {
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(SERIALIZATION_BACKOFF_MAX);
+            }
+        }
+    }
+    Err(std::io::Error::other(
+        "writer lease: serialization retry exhausted",
+    ))
+}
+
+enum LeaseStep {
+    Acquired,
+    Held(WriterLease),
+}
+
+fn lease_attempt(
+    db: &DbHandle,
+    key: &[u8],
+    deployment: &str,
+    owner: &str,
+    ttl: std::time::Duration,
+) -> Result<LeaseStep, std::io::Error> {
+    let now = now_ms();
+    let expires = now + ttl.as_millis() as i64;
+    with_lease_tx(db, |trx| {
+        let cur = futures::executor::block_on(trx.get(key, false)).map_err(TxErr::from)?;
+        if let Some(row) = cur.as_deref().and_then(|b| WriterLease::unpack(deployment, b)) {
+            if row.expires_at_ms > now {
+                return Ok(LeaseStep::Held(row));
+            }
+        }
+        trx.set(
+            key,
+            &WriterLease {
+                deployment: deployment.to_string(),
+                owner: owner.to_string(),
+                expires_at_ms: expires,
+            }
+            .pack(),
+        );
+        Ok(LeaseStep::Acquired)
+    })
+}
+
+/// Take (or wait for) the deployment's writer lease.
+///
+/// `wait` bounds the wait, and it exists for the crash case: a SIGKILLed holder
+/// leaves its row behind until the TTL passes, and a restart should take over
+/// then rather than requiring an operator to clear a key by hand. When the holder
+/// is ALIVE, renewal keeps the row live and this returns the error below once
+/// `wait` elapses.
+pub fn acquire_writer_lease(
+    uri: &str,
+    deployment: &str,
+    owner: &str,
+    ttl: std::time::Duration,
+    wait: std::time::Duration,
+) -> Result<WriterLease, std::io::Error> {
+    let cluster_file = FdbConfig::parse_cluster(uri)?;
+    let db = database(&cluster_file)?;
+    let key = lease_keys().writer_lease(deployment);
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match lease_attempt(&db, &key, deployment, owner, ttl)? {
+            LeaseStep::Acquired => {
+                return Ok(WriterLease {
+                    deployment: deployment.to_string(),
+                    owner: owner.to_string(),
+                    expires_at_ms: now_ms() + ttl.as_millis() as i64,
+                })
+            }
+            LeaseStep::Held(row) => {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    return Err(std::io::Error::other(format!(
+                        "deployment '{deployment}' already has a live meta-server writer \
+                         (holder '{}', lease expires in {}s): one meta-server per --meta-dir \
+                         may write this cluster — stop that server, or wait for its lease to \
+                         expire ({}s, `{WRITER_LEASE_ENV}`), or clear a stale row with \
+                         `grovefs view --meta-store {uri} lease --release --deployment {deployment} --force`",
+                        row.owner,
+                        row.remaining_ms() / 1000,
+                        ttl.as_secs(),
+                    )));
+                }
+                std::thread::sleep(left.min(std::time::Duration::from_millis(200)));
+            }
+        }
+    }
+}
+
+/// Refresh a lease this process still owns. `Ok(false)` means the row is gone or
+/// belongs to someone else — the caller must STOP serving, not keep writing.
+pub fn renew_writer_lease(
+    uri: &str,
+    deployment: &str,
+    owner: &str,
+    ttl: std::time::Duration,
+) -> Result<bool, std::io::Error> {
+    let cluster_file = FdbConfig::parse_cluster(uri)?;
+    let db = database(&cluster_file)?;
+    let key = lease_keys().writer_lease(deployment);
+    let expires = now_ms() + ttl.as_millis() as i64;
+    with_lease_tx(&db, |trx| {
+        let cur = futures::executor::block_on(trx.get(&key, false)).map_err(TxErr::from)?;
+        match cur.as_deref().and_then(|b| WriterLease::unpack(deployment, b)) {
+            Some(row) if row.owner == owner => {
+                trx.set(
+                    &key,
+                    &WriterLease {
+                        owner: owner.to_string(),
+                        expires_at_ms: expires,
+                        ..row
+                    }
+                    .pack(),
+                );
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    })
+}
+
+/// Clear a lease row. `owner = Some(_)` releases only this process's own row;
+/// `None` is the operator override `--force` (an EXPIRED row is always safe to
+/// clear, a live one is a deliberate fence). `Ok(true)` = a row was removed.
+pub fn release_writer_lease(
+    uri: &str,
+    deployment: &str,
+    owner: Option<&str>,
+) -> Result<bool, std::io::Error> {
+    let cluster_file = FdbConfig::parse_cluster(uri)?;
+    let db = database(&cluster_file)?;
+    let key = lease_keys().writer_lease(deployment);
+    with_lease_tx(&db, |trx| {
+        let cur = futures::executor::block_on(trx.get(&key, false)).map_err(TxErr::from)?;
+        let Some(row) = cur.as_deref().and_then(|b| WriterLease::unpack(deployment, b)) else {
+            return Ok(false);
+        };
+        if owner.is_some_and(|o| o != row.owner) {
+            return Ok(false);
+        }
+        trx.clear(&key);
+        Ok(true)
+    })
+}
+
+/// Every lease row on the cluster, for `grovefs view lease`.
+pub fn list_writer_leases(uri: &str) -> Result<Vec<WriterLease>, std::io::Error> {
+    let cluster_file = FdbConfig::parse_cluster(uri)?;
+    let db = database(&cluster_file)?;
+    let keys = lease_keys();
+    let trx = db
+        .create_trx()
+        .map_err(|e| std::io::Error::other(TxErr::from(e).hard_or_exhausted().to_string()))?;
+    let _ = trx.set_option(foundationdb::options::TransactionOption::Timeout(
+        LEASE_TX_TIMEOUT_MS,
+    ));
+    // `iteration` starts at 1, not 0: `fdb_transaction_get_range` rejects 0 with
+    // error 2000 (`invalid_api_call`) — measured, not assumed, when this first
+    // ran as `get_range(.., 0, ..)` and `view lease` failed on an empty cluster.
+    let rows = futures::executor::block_on(trx.get_range(&keys.writer_leases(), 1, true))
+        .map_err(|e| std::io::Error::other(TxErr::from(e).hard_or_exhausted().to_string()))?;
+    let mut out = Vec::new();
+    for kv in rows.as_ref().iter() {
+        if let Ok((_, deployment)) = keys.writer.unpack::<(String, String)>(kv.key()) {
+            if let Some(row) = WriterLease::unpack(&deployment, kv.value()) {
+                out.push(row);
+            }
+        }
+    }
+    out.sort_by(|a, b| a.deployment.cmp(&b.deployment));
+    Ok(out)
+}
+
+/// What the cluster says about itself: availability, replication mode, fault
+/// tolerance and member counts — read from FDB's own `\xff\xff/status/json`
+/// special key, so this needs no `fdbcli` on the host.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClusterStatus {
+    pub available: bool,
+    /// The cluster's own explanation when it is not available (empty when up).
+    pub message: String,
+    pub redundancy: String,
+    pub storage_engine: String,
+    pub max_zone_failures: i64,
+    pub storage_servers: usize,
+    pub coordinators: usize,
+}
+
+impl ClusterStatus {
+    /// One line for the server banner, e.g.
+    /// `redundancy triple (ssd-2), tolerates 1 zone failure(s), 4 storage server(s), 3 coordinator(s)`.
+    pub fn topology(&self) -> String {
+        format!(
+            "redundancy {} ({}), tolerates {} zone failure(s), {} storage server(s), {} coordinator(s)",
+            if self.redundancy.is_empty() { "?" } else { &self.redundancy },
+            if self.storage_engine.is_empty() { "?" } else { &self.storage_engine },
+            self.max_zone_failures,
+            self.storage_servers,
+            self.coordinators
+        )
+    }
+}
+
+/// Probe the cluster at startup. A read TIMEOUT is an error (that is the 150s
+/// silent case this exists to replace); an available=false answer is returned so
+/// the caller can print the cluster's own explanation.
+pub fn cluster_status(
+    uri: &str,
+    timeout: std::time::Duration,
+) -> Result<ClusterStatus, std::io::Error> {
+    let cluster_file = FdbConfig::parse_cluster(uri)?;
+    let db = database(&cluster_file)?;
+    let trx = db.create_trx().map_err(|e| {
+        std::io::Error::other(format!(
+            "fdb://{cluster_file}: cannot create a transaction: {e}"
+        ))
+    })?;
+    let ms = timeout.as_millis().max(1).min(i32::MAX as u128) as i32;
+    trx.set_option(foundationdb::options::TransactionOption::Timeout(ms))
+        .map_err(|e| std::io::Error::other(format!("fdb://{cluster_file}: set timeout: {e}")))?;
+    // `\xff\xff/status/json` is FDB's own special key; reading it needs no
+    // system-key option (only WRITES to the special key space do).
+    let raw = futures::executor::block_on(trx.get(b"\xff\xff/status/json", true))
+        .map_err(|e| {
+            std::io::Error::other(format!(
+                "fdb://{cluster_file}: cluster status unreadable within {}s ({e}) — is the \
+                 cluster configured and running? (`fdbcli -C {cluster_file} --exec 'status minimal'`); \
+                 the startup probe timeout is `{OPEN_TIMEOUT_ENV}`",
+                timeout.as_secs(),
+            ))
+        })?;
+    let bytes = raw
+        .map(|b| b.to_vec())
+        .unwrap_or_else(|| b"".to_vec());
+    let doc: Value = serde_json::from_slice(&bytes).map_err(|e| {
+        std::io::Error::other(format!(
+            "fdb://{cluster_file}: cluster status is not the documented JSON ({e}); \
+             this build speaks the 7.1 status shape"
+        ))
+    })?;
+    let field = |ptr: &str| doc.pointer(ptr).and_then(|v| v.as_str()).unwrap_or_default();
+    let count = |ptr: &str| {
+        doc.pointer(ptr)
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0)
+    };
+    // FDB 7.1's status JSON does not spell these the way a reader would guess,
+    // which is why the first version of this probe printed
+    // "0 storage server(s), 0 coordinator(s)" for a healthy cluster:
+    //   * there is no `cluster.storage_servers` — storage is a ROLE inside
+    //     `cluster.processes`, and `processes` is an OBJECT keyed by process id;
+    //   * the coordinator list lives on the CLIENT side (`client.coordinators`),
+    //     with `cluster.configuration.coordinators_count` as the fallback;
+    //   * an unavailable client explains itself in `client.messages[].description`
+    //     (`cluster.messages` once the cluster itself is up but unhappy), not in
+    //     `database_status.message`, which is usually absent.
+    // Verified against 7.1.67 with `fdbcli … --exec 'get \xff\xff/status/json'`.
+    let role_count = |role: &str| -> usize {
+        doc.pointer("/cluster/processes")
+            .and_then(|v| v.as_object())
+            .map(|procs| {
+                procs
+                    .values()
+                    .filter_map(|p| p.get("roles").and_then(|r| r.as_array()))
+                    .flatten()
+                    .filter(|r| r.get("role").and_then(|v| v.as_str()) == Some(role))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    let first_message = |ptr: &str| -> String {
+        doc.pointer(ptr)
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .map(|m| {
+                let name = m.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let desc = m.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                if name.is_empty() {
+                    desc.to_string()
+                } else {
+                    format!("{name}: {desc}")
+                }
+            })
+            .unwrap_or_default()
+    };
+    let db_message = field("/client/database_status/message");
+    let message = if !db_message.is_empty() {
+        db_message.to_string()
+    } else {
+        let client = first_message("/client/messages");
+        if !client.is_empty() {
+            client
+        } else {
+            first_message("/cluster/messages")
+        }
+    };
+    let coordinators = {
+        let listed = count("/client/coordinators/coordinators");
+        if listed > 0 {
+            listed
+        } else {
+            doc.pointer("/cluster/configuration/coordinators_count")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+                .max(0) as usize
+        }
+    };
+    Ok(ClusterStatus {
+        available: doc
+            .pointer("/client/database_status/available")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        message,
+        redundancy: field("/cluster/configuration/redundancy_mode").to_string(),
+        storage_engine: field("/cluster/configuration/storage_engine").to_string(),
+        max_zone_failures: doc
+            .pointer("/cluster/fault_tolerance/max_zone_failures_without_losing_availability")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0),
+        storage_servers: role_count("storage"),
+        coordinators,
+    })
+}
+
+// ---- lease keeper (the daemon side) ----------------------------------------
+//
+// `serve()` calls [`hold_writer_lease`] once; the row is renewed from a dedicated
+// thread and released from [`shutdown_network`], which is the only point this
+// process knows a command is over. A daemon killed by a signal never reaches that
+// point, so the row simply expires after one TTL — that is the designed
+// behaviour, not a leak: it is what lets a restart take over without an operator
+// deleting a key, and `view lease` shows the row while it waits.
+
+struct LeaseKeeper {
+    uri: String,
+    deployment: String,
+    owner: String,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+fn keeper_slot() -> &'static std::sync::Mutex<Option<LeaseKeeper>> {
+    static SLOT: OnceLock<std::sync::Mutex<Option<LeaseKeeper>>> = OnceLock::new();
+    SLOT.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Acquire the lease for `deployment` and keep it alive until shutdown.
+///
+/// `Ok(None)` means the lease is disabled by `{WRITER_LEASE_ENV}=0`. The renewal
+/// thread is the safety half of the contract: if the row is taken over (this
+/// process stalled past its TTL, or an operator forced a release), continuing to
+/// write would be exactly the divergence the lease exists to prevent, so the
+/// process prints why and exits rather than racing the new holder.
+pub fn hold_writer_lease(
+    uri: &str,
+    deployment: &str,
+) -> Result<Option<WriterLease>, std::io::Error> {
+    let Some(ttl) = writer_lease_ttl() else {
+        return Ok(None);
+    };
+    let owner = writer_owner_id();
+    let wait = writer_lease_wait(ttl);
+    let lease = acquire_writer_lease(uri, deployment, &owner, ttl, wait)?;
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (u, d, o) = (uri.to_string(), deployment.to_string(), owner.clone());
+    let flag = stop.clone();
+    let join = std::thread::Builder::new()
+        .name("fdb-writer-lease".into())
+        .spawn(move || {
+            let period = (ttl / 3).max(std::time::Duration::from_millis(200));
+            while !flag.load(Ordering::SeqCst) {
+                std::thread::sleep(period);
+                if flag.load(Ordering::SeqCst) {
+                    break;
+                }
+                match renew_writer_lease(&u, &d, &o, ttl) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        eprintln!(
+                            "meta-server: LOST the FDB writer lease for '{d}' (another server \
+                             took it over); stopping instead of writing beside it"
+                        );
+                        std::process::exit(1);
+                    }
+                    Err(e) => eprintln!(
+                        "meta-server: writer lease renewal failed ({e}); the row stays valid \
+                         until its TTL and will be retried"
+                    ),
+                }
+            }
+        })
+        .map_err(std::io::Error::other)?;
+    *keeper_slot()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(LeaseKeeper {
+        uri: uri.to_string(),
+        deployment: deployment.to_string(),
+        owner,
+        stop,
+        join: Some(join),
+    });
+    Ok(Some(lease))
+}
+
+fn release_held_writer_lease() {
+    let taken = keeper_slot()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take();
+    let Some(mut k) = taken else { return };
+    k.stop.store(true, Ordering::SeqCst);
+    if let Some(j) = k.join.take() {
+        let _ = j.join();
+    }
+    match release_writer_lease(&k.uri, &k.deployment, Some(&k.owner)) {
+        Ok(true) => println!(
+            "meta-server: writer lease released for '{}'",
+            k.deployment
+        ),
+        Ok(false) => {}
+        Err(e) => eprintln!(
+            "meta-server: could not release the writer lease (it expires on its own): {e}"
+        ),
+    }
 }
 
 // ---- key space (design doc §1–§4, frozen by decision D1/D2) -----------------
@@ -312,10 +922,17 @@ const TAG_LOCK_EXPIRE: &str = "lx";
 const TAG_CTRL: &str = "c";
 const TAG_ALLOC: &str = "m";
 const TAG_REFS: &str = "refs";
+/// `root + tuple("writer")` — the cluster-level writer-lease family, a SIBLING of
+/// the view prefixes for the same reason `refs` is (it belongs to no view). One
+/// row per DEPLOYMENT, where a deployment is the `--meta-dir` whose local
+/// control plane governs those trees; see [`FdbStore::open`] for why that, and
+/// not the cluster, is the unit that must have one writer.
+const TAG_WRITER: &str = "writer";
 
 const CTRL_EPOCH: &str = "epoch";
 const ALLOC_ID: &str = "id";
 const ALLOC_INO: &str = "ino";
+const WRITER_LEASE: &str = "lease";
 
 /// §2: the root's name key is `('n', 0, "")` — `parent_id = 0` stands for the SQL
 /// `parent_id IS NULL` of the root row, and root takes part in no lookup or
@@ -337,6 +954,10 @@ pub struct Keys {
     /// OUTSIDE any view prefix: every view books and unbooks the same counts
     /// (decision D5, mirroring the `grovefs_refs` schema in the PG backend).
     refs: Subspace,
+    /// `root + tuple("writer")` — the cluster-level writer-lease table, a sibling
+    /// of the view prefixes (no view owns it, so it must live outside any view
+    /// prefix or `view rm --base` of one tree could delete the lease of another).
+    writer: Subspace,
 }
 
 impl Keys {
@@ -350,6 +971,7 @@ impl Keys {
         Self {
             view: root.subspace(&view),
             refs: root.subspace(&TAG_REFS),
+            writer: root.subspace(&TAG_WRITER),
         }
     }
 
@@ -596,7 +1218,7 @@ impl Keys {
     /// discipline into a failure that fires at the call site that broke it rather
     /// than surfacing much later as another view's data in a listing.
     pub fn permits(&self, key: &[u8]) -> bool {
-        self.view.is_start_of(key) || self.refs.is_start_of(key)
+        self.view.is_start_of(key) || self.refs.is_start_of(key) || self.writer.is_start_of(key)
     }
 
     /// Prefix of the whole `'n'` family — every entry of the view, which is what
@@ -615,6 +1237,19 @@ impl Keys {
     /// IS the ledger — no family tag to add.
     pub fn ledger_range(&self) -> RangeOption<'static> {
         self.refs.range().into()
+    }
+
+    /// `(root,'writer','lease',deployment)` — one writer-lease row per deployment.
+    /// The deployment string is the canonical `--meta-dir`, so two servers that
+    /// share a control plane queue behind each other while two independent
+    /// deployments on one cluster keep separate rows.
+    pub fn writer_lease(&self, deployment: &str) -> Vec<u8> {
+        self.writer.pack(&(WRITER_LEASE, deployment))
+    }
+
+    /// Every writer-lease row on this cluster, for `grovefs view lease`.
+    pub fn writer_leases(&self) -> RangeOption<'static> {
+        self.writer.subspace(&WRITER_LEASE).range().into()
     }
 
     /// Decode one ledger key back to its `data_ref`.
@@ -698,6 +1333,16 @@ impl FdbConfig {
             return Err(std::io::Error::other(
                 "view name 'refs' is reserved: it is the shared cross-view byte \
                  ledger, not a tree — choose another name",
+            ));
+        }
+        // `writer` is the other sibling, and the same argument applies: a tree
+        // named 'writer' would put its root row inside the lease table, so
+        // `view lease` would report a tree as a holder and `view rm --base writer`
+        // would be the only way to clear a lease.
+        if view == TAG_WRITER {
+            return Err(std::io::Error::other(
+                "view name 'writer' is reserved: it is the cluster's writer-lease \
+                 table (one row per deployment), not a tree — choose another name",
             ));
         }
         // §1 also carries PG's 25-byte cap over, even though FDB needs no such
@@ -1352,6 +1997,11 @@ pub struct SubspaceInfo {
     pub entries: u64,
     /// True for the shared cross-view ledger, which is not a mountable tree.
     pub ledger: bool,
+    /// True for the cluster's writer-lease table, which is a sibling of the views
+    /// (one row per deployment) and not a tree either. Without this flag a lease
+    /// row has no root row and would be reported as a `corpse` — an invitation to
+    /// run `view rm --base` on the lease table.
+    pub lease: bool,
     /// Did the subspace still hold its root row, `('n', ROOT_PARENT, '')`?
     ///
     /// A mount OPENS the root row, so a subspace that has keys but has lost it can
@@ -1373,6 +2023,8 @@ impl SubspaceInfo {
     pub fn kind(&self) -> &'static str {
         if self.ledger {
             "ledger"
+        } else if self.lease {
+            "lease"
         } else if !crate::layout::valid_view_name(&self.name) {
             "?"
         } else if !self.root_row {
@@ -1541,6 +2193,7 @@ pub fn list_subspaces(uri: &str) -> Result<Vec<SubspaceInfo>, MetaError> {
         let rest = &key[cut..];
         let e = found.entry(name.clone()).or_insert_with(|| SubspaceInfo {
             ledger: name == TAG_REFS,
+            lease: name == TAG_WRITER,
             name,
             keys: 0,
             entries: 0,

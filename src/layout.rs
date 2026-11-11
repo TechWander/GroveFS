@@ -86,21 +86,21 @@ const PAGE_CACHE_ROWS: usize = 400_000;
 /// governs memory, and stalest-first eviction only kicks in under memory
 /// pressure. O(len) work happens only when already over `cap`, amortizing to a
 /// `len()` check in the common case.
-fn bound_map<K, V>(map: &mut HashMap<K, (Instant, V)>, cap: usize)
+fn bound_map<K, V>(map: &mut HashMap<K, V>, cap: usize, stamp: impl Fn(&V) -> Instant)
 where
     K: Eq + std::hash::Hash,
 {
     if map.len() <= cap {
         return;
     }
-    map.retain(|_, (at, _)| at.elapsed() < CACHE_TTL);
+    map.retain(|_, v| stamp(v).elapsed() < CACHE_TTL);
     if map.len() <= cap {
         return;
     }
-    let mut times: Vec<Instant> = map.values().map(|(at, _)| *at).collect();
+    let mut times: Vec<Instant> = map.values().map(&stamp).collect();
     times.sort();
     let cutoff = times[times.len() - cap];
-    map.retain(|_, (at, _)| *at >= cutoff);
+    map.retain(|_, v| stamp(v) >= cutoff);
 }
 
 /// One relocation rule: source path displayed at a destination path.
@@ -467,8 +467,16 @@ impl LayoutRules {
 /// multi-threaded, and all inner-provider calls happen OUTSIDE the guard
 /// (parking_lot locks are not reentrant).
 struct State {
-    /// source display path -> resolved inode (positive and negative).
-    resolve: HashMap<String, (Instant, Option<i64>)>,
+    /// Bumped by every push-invalidation (see [`LayoutMeta::flush_listing`]).
+    /// Entries of an older generation are treated as absent, so invalidating
+    /// is O(1) instead of a sweep over up to [`RESOLVE_CAP`] paths — the push
+    /// path runs once per event, and a mounted lens over a bulk import would
+    /// otherwise pay a full-map clear per created entry.
+    resolve_gen: u64,
+    /// source display path -> (cached at, generation, resolved inode).
+    /// Misses are cached too, which is why the generation is needed: a path
+    /// that resolved to nothing a moment ago can hold a real inode now.
+    resolve: HashMap<String, (Instant, u64, Option<i64>)>,
     /// real inode -> its SOURCE path (walk of the raw tree).
     src_path: HashMap<i64, (Instant, String)>,
     /// real inode -> display path, only for inodes the lens relocated (so a
@@ -543,6 +551,7 @@ impl LayoutMeta {
             trie,
             vdirs,
             st: Mutex::new(State {
+                resolve_gen: 0,
                 resolve: HashMap::new(),
                 src_path: HashMap::new(),
                 disp_of: HashMap::new(),
@@ -636,9 +645,12 @@ impl LayoutMeta {
         if path == "/" {
             return Some(ROOT_INO);
         }
-        if let Some((at, v)) = self.st.lock().resolve.get(path).cloned() {
-            if at.elapsed() < CACHE_TTL {
-                return v;
+        {
+            let st = self.st.lock();
+            if let Some((at, g, v)) = st.resolve.get(path) {
+                if at.elapsed() < CACHE_TTL && *g == st.resolve_gen {
+                    return *v;
+                }
             }
         }
         let mut cur = ROOT_INO;
@@ -654,21 +666,24 @@ impl LayoutMeta {
                 }
                 None => {
                     let mut st = self.st.lock();
-                    st.resolve.insert(path.to_string(), (Instant::now(), None));
-                    bound_map(&mut st.resolve, RESOLVE_CAP);
+                    let g = st.resolve_gen;
+                    st.resolve
+                        .insert(path.to_string(), (Instant::now(), g, None));
+                    bound_map(&mut st.resolve, RESOLVE_CAP, |e| e.0);
                     return None;
                 }
             }
         }
         {
             let mut st = self.st.lock();
+            let g = st.resolve_gen;
             st.resolve
-                .insert(path.to_string(), (Instant::now(), Some(cur)));
+                .insert(path.to_string(), (Instant::now(), g, Some(cur)));
             for (ino, p) in chain {
                 st.src_path.insert(ino, (Instant::now(), p));
             }
-            bound_map(&mut st.resolve, RESOLVE_CAP);
-            bound_map(&mut st.src_path, SRC_PATH_CAP);
+            bound_map(&mut st.resolve, RESOLVE_CAP, |e| e.0);
+            bound_map(&mut st.src_path, SRC_PATH_CAP, |e| e.0);
         }
         Some(cur)
     }
@@ -703,7 +718,7 @@ impl LayoutMeta {
         {
             let mut st = self.st.lock();
             st.src_path.insert(ino, (Instant::now(), p.clone()));
-            bound_map(&mut st.src_path, SRC_PATH_CAP);
+            bound_map(&mut st.src_path, SRC_PATH_CAP, |e| e.0);
         }
         Some(p)
     }
@@ -1031,9 +1046,29 @@ impl MetaProvider for LayoutMeta {
     /// cached rows until the TTL. The event handler flushes the coordinates it
     /// invalidates in the kernel, which is exactly the pair this closes.
     fn flush_listing(&self, parent: i64) {
-        let mut c = self.pages.lock();
-        if let Some(v) = c.dirs.remove(&parent) {
-            c.rows = c.rows.saturating_sub(v.rows.len());
+        {
+            let mut c = self.pages.lock();
+            if let Some(v) = c.dirs.remove(&parent) {
+                c.rows = c.rows.saturating_sub(v.rows.len());
+            }
+        }
+        // The page is only half the staleness. Every row of a synthesized
+        // parent is materialised by `leaf_node`, which resolves its source
+        // path through `resolve_src` — and that cache stores MISSES for
+        // [`CACHE_TTL`] as well. A row that was listed-away a moment ago left
+        // a negative entry behind, so dropping the page alone would serve a
+        // freshly recreated source entry as still absent (measured: one in
+        // three re-runs of the display-freshness e2e; it only looked green
+        // while SQLite happened to hand the recreated node its old rowid, so
+        // the stale positive resolved to a live inode). A push-invalidation
+        // means the source tree moved under this lens, so every cached path
+        // answer goes with the page. Bumping the generation does that in O(1):
+        // this runs once per event, and a sweep over up to [`RESOLVE_CAP`]
+        // paths would make a bulk import quadratic. `src_path` stays: it is
+        // keyed by inode and cannot change while that inode lives.
+        {
+            let mut st = self.st.lock();
+            st.resolve_gen = st.resolve_gen.wrapping_add(1);
         }
     }
 
@@ -1448,7 +1483,7 @@ mod tests {
         // (1) Under cap is a pure no-op even with an expired entry present.
         let mut m: HashMap<String, (Instant, i64)> = HashMap::new();
         m.insert("keep".into(), (expired(), 1));
-        bound_map(&mut m, 8);
+        bound_map(&mut m, 8, |(at, _)| *at);
         assert_eq!(m.len(), 1, "under cap must not evict");
 
         // (2) Over cap: expired entries are reclaimed first; the surviving
@@ -1459,7 +1494,7 @@ mod tests {
         }
         m.insert("f1".into(), (aged(500), 10));
         m.insert("f2".into(), (aged(100), 11));
-        bound_map(&mut m, 3);
+        bound_map(&mut m, 3, |(at, _)| *at);
         assert_eq!(m.len(), 2, "expired dropped, still under cap after");
         assert!(m.contains_key("f1") && m.contains_key("f2"));
 
@@ -1470,7 +1505,7 @@ mod tests {
         m.insert("middle".into(), (aged(500), 2));
         m.insert("newer".into(), (aged(300), 3));
         m.insert("newest".into(), (base, 4));
-        bound_map(&mut m, 2);
+        bound_map(&mut m, 2, |(at, _)| *at);
         assert_eq!(m.len(), 2);
         assert!(m.contains_key("newest") && m.contains_key("newer"));
         assert!(!m.contains_key("oldest") && !m.contains_key("middle"));

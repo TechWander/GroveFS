@@ -27,6 +27,7 @@ RecordLayer 是 Python/Java 侧的遗留绑定层，无 Rust 实现；把它引�
 每视图子空间:              \x01 + tuple(view_name)         ← subspace(view)
 视图内键族:                view_subspace + tuple(kind_tag, ...kind_key)
 跨视图共享账本:            \x01 + tuple("refs") + tuple(data_ref)   ← 不在任何视图子空间内
+写者租约表:                \x01 + tuple("writer") + tuple("lease", deployment)   ← 同上，不属于任何视图
 ```
 
 **实测字节形态（v1.1 补，取代上面示意式的写法；由 `src/fdb_store.rs` 的
@@ -41,6 +42,7 @@ RecordLayer 是 Python/Java 侧的遗留绑定层，无 Rust 实现；把它引�
 名字键        + \x15 \x07 \x02 a \x00      (7, "a")：\x15=正整数 7，\x07=长度 1 的串
 完整形态      \x01grovefs\x00 \x02v1\x00 \x02n\x00 \x15\x07\x02a\x00
 账本键        \x01grovefs\x00 \x02refs\x00 \x02abc\x00
+租约键        \x01grovefs\x00 \x02writer\x00 \x02lease\x00 \x02<deployment>\x00
 ```
 
 - 视图名 → 子空间键的映射函数必须做**长度与字符校验**，对位 PG 的 `schema_for`
@@ -360,7 +362,8 @@ RecordLayer 是 Python/Java 侧的遗留绑定层，无 Rust 实现；把它引�
 
 允许新增键前缀（安全，不动既有数据）；**禁止**删除或调换既有键的字段顺序（= 全量搬迁）。
 已冻结前缀：`'n'` 主键族、`'i'`(ino→名)、`'d'`(id→位置)、`'r'`(data_ref→名字)、`'k'`(仅目录)、
-`'h'`(ino→名字集)、`'l'`/`'lo'`/`'ls'`/`'lx'`(锁)、`'c'`(ctrl)、`'m'`(分配器)、`'refs'` 共享账本。
+`'h'`(ino→名字集)、`'l'`/`'lo'`/`'ls'`/`'lx'`(锁)、`'c'`(ctrl)、`'m'`(分配器)、`'refs'` 共享账本、
+`'writer'` 写者租约表（根下兄弟，不在任何视图子空间内；见 §14 v2.11）。
 锁侧四条键的**字段集**在 v1.2 定稿（C5）：二级键携带主键全字段，以便无歧义反解；
 此前缀集合在 P4 之前无数据写入（锁面 P4 才落地），故该修订不需要搬迁，v1.2 之后即为不可逆。
 
@@ -369,11 +372,12 @@ RecordLayer 是 Python/Java 侧的遗留绑定层，无 Rust 实现；把它引�
 号段步长（初值 1024）、退避常数、重试次数、账本是否分桶、锁是否分桶、集群拓扑与副本因子、
 `ssd`/`memory` 存储引擎选择、NVMe/SATA 档位——全部为压测后再定项，不影响键空间契约。
 
-其中**"协调器不可达的等待上限"这一项未设，后果已实测并写进用户文档**：`libfdb_c` 对
-`coordinator_not_available` 按自身策略持续重试，本后端不强加超时，于是数据面 op 在集群不可达时
-**静默阻塞而非报错**（150s 无任何输出实测；`meta-server` 启动不探测集群，横幅照打）。它属运维可见
-行为而非键空间契约，故 USAGE §15.16 / docs.html §5.9 按"不可达 = 无声等待"记账，判据指向
-`fdbcli status minimal`；将来若引入该上限，改的是这一项的表述，不是任何编码或事务语义。
+其中**"协调器不可达的等待上限"只加在启动探针上，数据面仍未设**：`libfdb_c` 对
+`coordinator_not_available` 按自身策略持续重试，本后端不给数据面 op 强加超时，于是集群不可达时
+**挂载上的 op 静默阻塞而非报错**（8–90s 窗口实测，§14 v2.4；USAGE §15.9 的运维条目）。`meta-server`
+启动这一步不再如此：探针读 `\xff\xff/status/json` 并设 `TransactionOption::Timeout`，不可用即
+**拒绝启动**并点名 `fdbcli status minimal`（§14 v2.11）。将来若把上限也加到数据面，改的是这一项的表述，
+不是任何编码或事务语义。
 
 ## 12. 已知的可归因差异（诚实负空间，P6 差分对拍须按此核对）
 
@@ -1298,6 +1302,149 @@ book → replace 导入一份只含根行的 dump → 再 book → 再 replace�
 govcheck 29/0、govtime 10/0、apikey 34/0、import 47/0、migrate 71/0；
 `test_fdb.sh` 248 OK / 0 FAIL（原 216 + 第 15 节 23 + corpse 三个入口 9），`ALL FDB-BACKEND CHECKS PASSED`；
 `cargo test --release --features fdb --test fdb_tree` → **7 passed**。
+
+### v2.11（把「单 meta-server 契约」从注释变成可执行机制：启动门禁 + 部署级写者租约）
+
+v2.10 之后剩下的一处结构性缺口不在数据面，而在**谁能写**：`fdb://` 部署的控制面是本地文件
+（`meta/views/*.layout`、`meta/api_keys.db`），而树是集群里的子空间。于是两个 server 共用一份
+`--meta-dir` 时会各持一套定义、写同一批子树——这是任何副本数都修不好的形态，而它此前只是
+`FdbStore::open` 上的一行注释。本轮把它做成两个启动期事实：
+
+**1）集群门禁。** `serve()` 在 `bind` 之前读 FDB 自己的 `\xff\xff/status/json`（读 special key 不需
+system-key 选项），`TransactionOption::Timeout` 由 `GROVEFS_FDB_OPEN_TIMEOUT_SECS` 定（默认 10s）。
+`available=false` 一律拒绝启动，文案带集群自己的解释并点名 `fdbcli … 'status minimal'`；探针本身
+超时也是错误（那正是它要取代的无声等待）。可用时先打一行拓扑横幅再取租约。
+
+**2）部署级写者租约。** 键在根下、与 `refs` 平级（§1），一行一个**部署**：
+
+```
+键: \x01grovefs\x00 \x02writer\x00 \x02lease\x00 \x02<canonical --meta-dir>\x00
+值: (owner, expires_at_ms)      owner = host:pid:<monotonic nonce>
+```
+
+粒度选部署而不是集群，是被既有用例逼出来的：套件本身就并发跑多个 meta-server（每个 `--home`
+服务自己的视图），集群级锁会禁掉一个已经成立、也完全正确的形态；而同一控制面被两个进程写
+才是唯一不能正确的那个。启动流程 = acquire（轮询片 200ms，等待上限 `GROVEFS_FDB_WRITER_WAIT_SECS`，
+默认 TTL+2）→ 续租线程（周期 `max(TTL/3, 200ms)`）→ 续租发现行已不属于自己就 `eprintln` + `exit(1)`；
+正常关闭先 release 再关网络。TTL 由 `GROVEFS_FDB_WRITER_LEASE_SECS` 定（默认 10s，`0` 关闭）。
+
+**3）运维面。** `grovefs view --meta-store fdb://… lease` 列出 `STATE/DEPLOYMENT/HOLDER/EXPIRES`；
+`--release --deployment <dir>` 清过期行，活行需要 `--force`（= 主动围栏，旧持有者在下一轮续租
+时退出）；`view scan` 把这张表归为 `KIND=lease`，既不迁就成 tree 也不误判成 corpse（corpse 正是
+`rm --base` 会吃掉的东西）。
+
+**实测踩到的两个错（都是实现错，不是设计错）**：
+
+- `list_writer_leases` 第一版把 `get_range(range, iteration=0)` 传成 0，空集群上直接报
+  `fdb error 2000: Invalid API call`；`iteration` 从 1 开始（与既有代码一致），已注释钉住。
+- 拓扑横幅第一版对健康集群打印 `0 storage server(s), 0 coordinator(s)`：FDB 7.1 的 status JSON 没有
+  `cluster.storage_servers`（storage 是 `cluster.processes` **对象**里的 role），协调器在
+  `client.coordinators`（回退 `cluster.configuration.coordinators_count`），不可用原因在
+  `client.messages[].description` 而不是 `database_status.message`。用
+  `fdbcli … --exec 'get \xff\xff/status/json'` dump 出真实字段后重写解析，复测
+  `1 storage server(s), 1 coordinator(s)`。
+
+**本轮读数（本机单节点 `single` 集群，2026-11-11）**：
+
+| 场景 | 结果 |
+| --- | --- |
+| 启动门禁：健康集群 | `redundancy single (ssd-2), tolerates 0 zone failure(s), 1 storage server(s), 1 coordinator(s)` |
+| 启动门禁：不可达集群 | 2.07s 拒绝，文案含 `quorum_not_reachable: Unable to reach a quorum of coordinators.` |
+| 同 `--meta-dir` 第二个实例 | 等一个 TTL 后 rc=1；端口从未监听；文案点名 `lease --release --deployment …` |
+| 不同 `--meta-dir` | 两个服务端同时写同一集群，`view lease` 各一行 `HELD` |
+| `kill -9` 后重启 | 旧行仍在（崩溃留证），重启等过期后接管，TTL=2s 时实测 1640–1696ms |
+| `--release --force` | 旧持有者打印 `LOST the FDB writer lease …`，exit 1 |
+| `view scan` | `writer … lease` 一行；表尾单独计为 writer-lease subspace |
+| 套件收尾 | `test_fdb.sh` 272 OK / 0 FAIL；跑完 `view scan` 回到 `no subspaces under the 'grovefs' root`（cleanup 增了一条「本机已死 pid 的租约行」清扫，覆盖 13/15 节自己起的服务端） |
+| 单测 | `cargo test --features fdb --test fdb_tree` → 8 passed（新用例覆盖空闲→获取→拒绝→续租→清单→过期接管→释放→deployment_id 规范化→cluster_status 字段） |
+
+**待验证项（需当前不具备的硬件条件，实现已完成）**：
+
+1. **多故障域下的租约。** 四机 `fault_domains n1..n4` 集群上重跑
+   `GROVEFS_FDB_CLUSTER_FILE=<四机集群文件> bash .build-bin/test_fdb.sh`（第 16 节需 3 个空闲本地端口），
+   另外单独做两个场景：持有租约时 `virsh destroy` 一台**非协调**节点 / 一台**协调**节点。判据：
+   日志集重配期间写者不退出（续租允许因集群短暂不可用而重试，不当作丢租约）；集群恢复后
+   `view lease` 仍只有该部署一行；重启接管仍以 TTL 为上限。
+2. **跨主机部署隔离。** 两台机器的 meta-server 各自 `--meta-dir`、同一集群，验证租约不误伤
+   （本机只用两个目录等价验证了粒度，未用真两台主机）。
+3. **时钟漂移。** 把一台机器的时钟拨快/拨慢 TTL/2 后观察接管与误判（需要可改时钟的两台机器或 VM）。
+4. **容量**：G3（SSD/NVMe 介质、RF=3）——与租约无关，仍按 §15 的转正条件。
+
+**本版未做**（已写入 USAGE §6.3.4 的演进方向）：控制面入集群、跟随者自动接管、客户端 fencing 令牌。
+在这三件之前，「一个视图只被一个部署服务」是运维约定，不是保证。
+
+### v2.12（v2.11 的三个待验证项在四机 VM 上判过；PG 档「删不掉」这条真缺口补齐）
+
+v2.11 结尾留了两件未了的事：三条「只有多机才能判」的待验证项，以及 PG 档「视图删不掉」这
+处结构性缺口。本轮都做了。验证侧用 libvirt 上那套四机 `triple/ssd` 集群（zone `n1..n4`，四台
+全是 coordinator）；实现侧给 PG 补上 `PgEngine::remove_view` 与 `rebuild_ledger`，并用一条 14 项
+的三引擎矩阵把「哪个后端的哪件事有出口」从散文变成可跑的断言。
+
+**1）跨主机租约：`.bneck/fdb3vm_lease.sh`（59 断言 / 0 失败）**
+
+| 段 | 判的是什么 | 读数 |
+| --- | --- | --- |
+| A | 两台机器用**同一个 `--meta-dir` 字符串** = 一个部署 | 第二台在 `bind` 之前被拒（等满一个 TTL，端口从未监听），文案点名 `lease --release --deployment …` |
+| B | 两台机器用**不同目录** = 两个部署 | 同时各持一行 `HELD`、同时写各自的视图；A 看不到 B 的字节，也读不到 B 的定义（两份控制面互不可见） |
+| C | 持租约时 `virsh destroy` 一台（协调者 + 存储域同时失效） | 全程 `available=True`；10 次探针没有一次读到 `full_replication=False`；9.2s 后集群自述 `coordinators 3/4`、`zones=n1,n2,n3`；租约行未中断 |
+| D | 观察者时钟快 8s | 同一行：正确时钟读出「还剩 9s」，+8s 那台读出「-1s」；持有者被杀后 +8s 那台 **2202ms** 接管（正确时钟要等 ~8000ms） |
+
+段 C 顺手量出一条运维代价：**缺协调者时 `fdbcli status json` 每次 ~5.1s**（10 次共 51.0s）。
+启动探针（`GROVEFS_FDB_OPEN_TIMEOUT_SECS` 默认 10s）与任何脚本超时都不能按健康态写，
+否则会把「慢」误判成「挂」。另外四台全是 coordinator 这件事得写清楚：这套拓扑里没有
+「非协调者」机器可杀，所以「杀掉一台非协调节点」这个场景**不存在**——掉一台就是同时掉一个
+协调者和一个存储域。
+
+**2）PG 档：删视图与重算账本（不再是配方，是 CLI）**
+
+- `PgEngine::remove_view`：一个事务里 `COUNT(*) FROM <schema>.node` → `SELECT DISTINCT data_ref`
+  → 逐 ref `UPDATE grovefs_refs.holders SET holders=holders-1 RETURNING holders`（>0 计入
+  `still_held`，=0 则 `DELETE` 并收进 `unbooked_refs`）→ `DROP SCHEMA <schema> CASCADE` → commit。
+  提交之后 CLI 才拿 `unbooked_refs` 去 `backend.remove`（条带 key 与打不开的数据根如实计入
+  `could not be freed` / `not found`）。
+- **为什么 PG 能一条命令到底**：PostgreSQL 的 DDL 是事务性的，销账与删树可以原子提交；SQLite
+  做不到，所以那边才是「删 db → `refs rebuild` 重算」两步。这是本轮唯一一处「PG 比 SQLite 强」
+  的语义差异，写进了 USAGE §6.2/§15.8。
+- `rebuild_ledger`：枚举 `grovefs_v_*` → `view_from_schema_name` 过滤 → 逐树
+  `SELECT DISTINCT data_ref`（**读失败即整体 abort**：少算会走向误删，多算只多留字节）→
+  单事务 UPDATE/DELETE/INSERT。两个方向都实测：out-of-band 删 schema 后 `3 row(s) deleted`，
+  手工删掉 `holders` 行后 `2 row(s) corrected`。
+- **历史债一次清完**：库里当时攒了 13 个 CLI 删不掉的 schema 与 288 行卡死的
+  `grovefs_refs.holders`，一条 `view rm --base` 一条、逐条归零，最后 `schemas=0 / ledger=0`。
+- **套件开始自己清场**：`test_pg.sh` 24 断言、`test_pg_parallel.sh` 41 断言末尾都加 teardown
+  段（此前每跑一次漏 1–2 个 schema，库只增不减）；`.bneck/pg_view_teardown.sh` 44 断言把
+  整条链在真 FUSE 挂载上从头跑到尾。`.bneck/pg_drop_views.sh` 降级为 out-of-band 巡检器。
+- **诚实边界**：绕过 CLI 的 `DROP SCHEMA … CASCADE` 之后，账本可以靠 `refs rebuild` 归位，
+  **字节不行**——该视图订过哪些对象只有那个 schema 知道，ref 清单随 schema 一起消失。
+  teardown 套件的 H 段就是断言「剩下的正好是 V2 订过的 3 个、与 stranded 行数一致」而不是
+  假装干净。
+
+**3）三引擎矩阵：`.bneck/engine_matrix.sh`（14 项 × 3 档）**
+
+| 能力 | SQLite | PG | FDB |
+| --- | --- | --- | --- |
+| create / define / alias / list / `rm --base` | OK | OK | OK |
+| `refs rebuild` | OK | OK | OK |
+| `view export` / `view import` | OK | REFUSED | OK |
+| `view fork` | OK | REFUSED | REFUSED |
+| `grovefs import`（目录→视图） | OK | REFUSED | REFUSED |
+| `gc` | OK | REFUSED | REFUSED |
+| `view scan` / `view lease` | REFUSED | REFUSED | OK |
+| 原生 HA | OK | REFUSED | REFUSED |
+
+14 行全 OK/REFUSED、**无 ERROR**；跑完的 post-teardown 校验 `sqlite meta/*.db 0 / pg schema 0 /
+pg 账本 0 / fdb "no subspaces"` → `TEARDOWN CLEAN`。三处测量学问题写进了脚本注释：`rmbase` 必须是
+表里的一行（否则「删不掉」永远藏在 cleanup 里）、每次 `reset_engine` 先清场（否则上一轮的
+`mxbase already exists` 会读成 ERROR）、`gc` 的后端守卫读的是 `GROVEFS_META_STORE` 环境变量
+（不设就落到误导性的 "no metadata directory"）。
+
+**4）文档同步。** 以前文档里那些「PG 下 `view rm --base` 拒绝 / `refs rebuild` 别跑 / 清理走
+`pg_drop_views.sh`」的句子不是「过时」，而是**与本版事实相反**，所以逐句重写成现在的行为
+（USAGE §3.4/§3.4.3/§6.2/§10.1/§15.8/§15.9/§17 共 9 处；`docs.html` 11 处，脚本
+`.bneck/p9_doc_pg_teardown.py` 留证）。同时把四机拓扑的三条运维事实写进 USAGE §6.3.3。
+
+**仍开放**：G3 容量（SATA 介质，判据见 §15）；PG 的 `fork`/`export`/`import` 是设计边界而非缺口；
+FDB 控制面仍未入集群（USAGE §6.3.4）。
 
 ## 15. 决策门处置（G1–G4 与 R5，逐门留证）
 
