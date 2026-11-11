@@ -70,7 +70,7 @@ ok "servers up on $DATA / $META"
 
 cleanup(){
     for d in .pgpar/mnt_a .pgpar/mnt_b .pgpar/mnt_c; do fusermount -u "$d" 2>/dev/null; done
-    kill $RA $RB $RC $DP $MP 2>/dev/null
+    for p in "${RA:-0}" "${RB:-0}" "${RC:-0}" "${DP:-0}" "${MP:-0}"; do [ "$p" != 0 ] && kill "$p" 2>/dev/null; done
     wait 2>/dev/null
 }
 RA=0; RB=0; RC=0
@@ -245,5 +245,16 @@ done
 
 # ---- summary ----
 echo
+# Teardown: this suite used to leave its `grovefs_v_<hex>` schema (and every
+# holder row it booked) in the database on every run, because a PG tree had no
+# removal path in the CLI. `view rm --base` owns that now, so the suite removes
+# what it created instead of adding to the residue a DBA has to clean up.
+for d in .pgpar/mnt_a .pgpar/mnt_b .pgpar/mnt_c; do fusermount -u "$d" 2>/dev/null; done
+for p in $RA $RB $RC $MP $DP; do [ "$p" != 0 ] && kill "$p" 2>/dev/null; done
+RA=0; RB=0; RC=0; MP=0; DP=0
+sleep 0.5
+$Y view --meta-dir .pgpar/home --meta-store "$PGURI" rm --name "$VIEW" --base --data-dir .pgpar/central/data > .pgpar/rm.log 2>&1
+[ $? = 0 ] && ok "teardown: view rm --base removed the PG tree" \
+    || bad "teardown: view rm --base failed: $(cat .pgpar/rm.log)"
 echo "==================== SUMMARY: pass=$pass fail=$fail ===================="
 if [ "$fail" = 0 ]; then echo "ALL PG-PARALLEL-WRITE CHECKS PASSED"; exit 0; else echo "SOME PG-PARALLEL CHECKS FAILED"; exit 1; fi

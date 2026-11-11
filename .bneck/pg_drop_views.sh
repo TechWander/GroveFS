@@ -1,13 +1,21 @@
 #!/usr/bin/env bash
-# Operator teardown for PostgreSQL-mode base views, which GroveFS deliberately
-# will not delete for you.
+# Operator teardown for PostgreSQL-mode base views.
 #
-# `grovefs view rm --base` refuses a `--meta-store postgres://…` deployment on
-# purpose — its own help says the tree "is a PG schema — drop the schema and let
-# PG/data servers own the bytes".  Nothing in the CLI does that drop, so any
-# benchmark that creates one view per cell (bench_g3.sh, the `pg` suites) leaves
-# residue with no supported removal path.  This script IS that path, done in
-# full:
+# STATUS: the CLI now does this natively -- `grovefs view rm --base
+# --meta-store postgres://…` unbooks the tree's holds and drops its
+# `grovefs_v_<hex>` schema in ONE transaction, and `grovefs refs rebuild
+# --meta-store postgres://…` recomputes `grovefs_refs.holders` from the
+# surviving trees. `.bneck/pg_view_teardown.sh` is the end-to-end suite for
+# both. This script remains as the OUT-OF-BAND inspector, for the cases the CLI
+# deliberately will not touch:
+#
+#   * bulk cleanup after a benchmark run (`--pattern '^pg[0-9]+$'`);
+#   * a ledger recount with a printed PREVIEW and a snapshot table
+#     (`--rebuild-ledger` writes `grovefs_refs.holders_bak_<ts>` first);
+#   * answering "which schemas exist, what do they decode to, and how many
+#     ledger rows does each book" without opening a view.
+#
+# What the CLI and this script agree on:
 #
 #   * a view's tree is its schema `grovefs_v_<hex of the view name>` (verified by
 #     decoding the schemas already present in this database, not guessed);

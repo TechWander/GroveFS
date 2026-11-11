@@ -162,6 +162,36 @@ pub struct PgEngine {
     cursors: parking_lot::Mutex<HashMap<(i64, usize), String>>,
 }
 
+/// What a whole-base-view teardown found and did (see [`PgEngine::remove_view`]).
+#[derive(Debug)]
+pub struct PgPurgeReport {
+    /// Node rows the tree held, the root included.
+    pub entries: u64,
+    /// Data refs whose holder count reached zero: no surviving view names those
+    /// bytes, so the caller may free them through its data root.
+    pub unbooked: usize,
+    /// The same refs by name, so a caller that owns a data root can act on
+    /// them instead of only reporting a number.
+    pub unbooked_refs: Vec<String>,
+    /// Data refs another view still names — decremented by one, kept.
+    pub still_held: usize,
+}
+
+/// What a ledger recount found and corrected (see [`rebuild_ledger`]).
+#[derive(Debug)]
+pub struct PgLedgerReport {
+    /// How many `grovefs_v_*` trees were actually read.
+    pub trees: usize,
+    /// Distinct content keys those trees name.
+    pub refs: usize,
+    /// Holder units the recount booked (one per tree per key).
+    pub holders: i64,
+    /// Ledger rows whose count was wrong and has been rewritten.
+    pub rows_fixed: usize,
+    /// Ledger rows no surviving tree names (booked for bytes nobody owns).
+    pub rows_deleted: usize,
+}
+
 /// Ceiling on those cursors (one checkpoint per [`READDIR_CURSOR_STRIDE`] rows
 /// per open directory).
 const READDIR_CURSOR_CAP: usize = 65_536;
@@ -1233,6 +1263,104 @@ impl PgEngine {
         ))
     }
 
+    // ---- base-view teardown and ledger repair (governance plane) -----------
+    //
+    // The SQLite arm unlinks `meta/<view>.db` and then rebuilds a file ledger;
+    // the FDB arm clears a subspace and unwinds the cluster ledger. On PG the
+    // tree is a `grovefs_v_<hex>` schema and the ledger is
+    // `grovefs_refs.holders`, so a teardown is "unbook what the tree held, then
+    // drop the schema" — and because PostgreSQL's DDL is TRANSACTIONAL both
+    // halves fit in ONE transaction. That is strictly stronger than the file
+    // arm, which needs a rebuild pass afterwards: there is no instant where the
+    // tree is gone but its holds are still booked.
+
+    /// Remove a whole BASE tree: unbook every content key `view` held, then
+    /// drop its schema, atomically. Reclaiming the bytes of the refs that
+    /// reached zero is the CALLER's job (it owns a data root); this reports
+    /// which refs those are.
+    ///
+    /// A missing schema is an error, never a cheerful zero: a typo must not
+    /// read as a successful removal (the same rule the file arm applies to a
+    /// missing `meta/<view>.db`).
+    pub fn remove_view(conn_uri: &str, view: &str) -> Result<PgPurgeReport, String> {
+        let schema = schema_for(view).ok_or_else(|| {
+            format!(
+                "view name '{view}' incompatible with PG schema naming (empty, or longer than 25 bytes)"
+            )
+        })?;
+        let mut c = Client::connect(conn_uri, NoTls).map_err(|e| format!("postgres connect {e}"))?;
+        let mut tx = c.transaction().map_err(|e| format!("postgres begin {e}"))?;
+        let there = tx
+            .query(
+                "SELECT 1 FROM information_schema.schemata WHERE schema_name = $1",
+                &[&schema],
+            )
+            .map_err(|e| format!("postgres {e}"))?;
+        if there.is_empty() {
+            return Err(format!(
+                "no schema {schema} in the database — '{view}' has no base tree here (a governed name is removed with `view rm` WITHOUT --base; a name this store never had cannot be removed twice)"
+            ));
+        }
+        // Read the refs BEFORE the drop: once the schema is gone the database
+        // has no record of what it held (the same reason the file arm reads the
+        // tree while the db still exists).
+        let entries: i64 = tx
+            .query(&format!("SELECT COUNT(*) FROM {schema}.node"), &[])
+            .map_err(|e| format!("postgres {e}"))?
+            .first()
+            .map(|r| r.get::<_, i64>(0))
+            .unwrap_or(0);
+        let refs: Vec<String> = tx
+            .query(
+                &format!("SELECT DISTINCT data_ref FROM {schema}.node WHERE data_ref IS NOT NULL"),
+                &[],
+            )
+            .map_err(|e| format!("postgres {e}"))?
+            .iter()
+            .map(|r| r.get::<_, String>(0))
+            .collect();
+        let (mut unbooked_refs, mut still_held) = (Vec::new(), 0usize);
+        for dr in &refs {
+            // One ledger row per content key per VIEW, so a whole-tree teardown
+            // decrements once — not once per name. A missing row reads as "no
+            // other holder" (it was never booked), matching `ledger_remove_tx`.
+            let left: Option<i64> = tx
+                .query(
+                    &format!(
+                        "UPDATE {PG_REFS_TABLE} SET holders = holders - 1 WHERE data_ref=$1 RETURNING holders"
+                    ),
+                    &[dr],
+                )
+                .map_err(|e| format!("postgres {e}"))?
+                .into_iter()
+                .next()
+                .map(|r| r.get::<_, i64>(0));
+            match left {
+                Some(h) if h > 0 => still_held += 1,
+                _ => {
+                    tx.execute(
+                        &format!("DELETE FROM {PG_REFS_TABLE} WHERE data_ref=$1"),
+                        &[dr],
+                    )
+                    .map_err(|e| format!("postgres {e}"))?;
+                    unbooked_refs.push(dr.clone());
+                }
+            }
+        }
+        // CASCADE is required, not incidental: the schema's three tables ARE
+        // the tree, so dropping the schema without them is not a teardown.
+        tx.batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .map_err(|e| format!("postgres drop schema {schema}: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("postgres commit (schema and ledger rolled back): {e}"))?;
+        Ok(PgPurgeReport {
+            entries: entries.max(0) as u64,
+            unbooked: unbooked_refs.len(),
+            unbooked_refs,
+            still_held,
+        })
+    }
+
     // ---- POSIX advisory locks ---------------------------------------------
 
     #[allow(clippy::too_many_arguments)]
@@ -1500,6 +1628,141 @@ fn ledger_remove_tx(
         // pre-ledger engine did for every private object.
         None => Ok(Some(dr.to_string())),
     }
+}
+
+/// Recompute `grovefs_refs.holders` from the `grovefs_v_*` TREES.
+///
+/// This is the PG counterpart of `grovefs::meta::rebuild_ledger` (file store)
+/// and `grovefs::fdb_store::rebuild_ledger` (cluster). The ledger is DERIVED
+/// state: the only authoritative record of what a tree holds is the tree. A
+/// schema removed out of band (a manual `DROP SCHEMA`, a restore, a database
+/// cloned from an older backup) never unbooked its holds, so the counts drift
+/// upward and bytes stay alive for nobody.
+///
+/// The recount reads every tree and then rewrites the ledger in one
+/// transaction, so a tree that cannot be read ABORTS the whole run: a skipped
+/// tree would make content it still names look unreferenced (the unsafe
+/// direction, the same rule the offline `gc` scan applies). Run it QUIESCED —
+/// a booking committed between the read pass and the write pass would be
+/// overwritten with the pre-booking count. Nothing here frees object bytes;
+/// that belongs to the data servers.
+pub fn rebuild_ledger(conn_uri: &str) -> Result<PgLedgerReport, String> {
+    let mut c = Client::connect(conn_uri, NoTls).map_err(|e| format!("postgres connect {e}"))?;
+    let schemas: Vec<String> = c
+        .query(
+            "SELECT schema_name FROM information_schema.schemata \
+             WHERE schema_name LIKE 'grovefs_v_%' ORDER BY schema_name",
+            &[],
+        )
+        .map_err(|e| format!("postgres {e}"))?
+        .iter()
+        .map(|r| r.get::<_, String>(0))
+        .collect();
+    let mut truth: std::collections::BTreeMap<String, i64> = Default::default();
+    let mut trees = 0usize;
+    for s in &schemas {
+        // Only our own deterministic encoding: a foreign schema that merely
+        // begins with the prefix is never read as a tree.
+        if crate::control::view_from_schema_name(s).is_none() {
+            continue;
+        }
+        let rows = c
+            .query(
+                &format!("SELECT DISTINCT data_ref FROM {s}.node WHERE data_ref IS NOT NULL"),
+                &[],
+            )
+            .map_err(|e| {
+                format!(
+                    "cannot read tree {s}: {e} — refusing to recount from a partial view of the store (a skipped tree would make every blob it names look unreferenced)"
+                )
+            })?;
+        trees += 1;
+        for r in rows {
+            *truth.entry(r.get::<_, String>(0)).or_insert(0) += 1;
+        }
+    }
+    // A database that never opened a view has no ledger table yet; create it
+    // (idempotent) instead of failing a recount that has nothing to correct.
+    let mut current: Vec<(String, i64)> = match c.query(
+        &format!("SELECT data_ref, holders FROM {PG_REFS_TABLE}"),
+        &[],
+    ) {
+        Ok(rows) => rows
+            .iter()
+            .map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1)))
+            .collect(),
+        Err(e) if is_undefined_table(&e) => {
+            c.batch_execute(&format!(
+                "CREATE SCHEMA IF NOT EXISTS {PG_REFS_SCHEMA};
+                 CREATE TABLE IF NOT EXISTS {PG_REFS_TABLE} (
+                     data_ref TEXT PRIMARY KEY,
+                     holders  BIGINT NOT NULL
+                 );"
+            ))
+            .map_err(|e| format!("postgres create {PG_REFS_TABLE}: {e}"))?;
+            Vec::new()
+        }
+        Err(e) => return Err(format!("postgres read {PG_REFS_TABLE}: {e}")),
+    };
+    current.sort();
+    let booked: std::collections::HashSet<String> =
+        current.iter().map(|(d, _)| d.clone()).collect();
+    let (mut rows_fixed, mut rows_deleted) = (0usize, 0usize);
+    let mut tx = c.transaction().map_err(|e| format!("postgres begin {e}"))?;
+    for (dr, held) in &current {
+        match truth.get(dr) {
+            Some(&t) if t == *held => {}
+            Some(&t) => {
+                tx.execute(
+                    &format!("UPDATE {PG_REFS_TABLE} SET holders = $2 WHERE data_ref = $1"),
+                    &[dr as &(dyn ToSql + Sync), &t],
+                )
+                .map_err(|e| format!("postgres {e}"))?;
+                rows_fixed += 1;
+            }
+            None => {
+                tx.execute(
+                    &format!("DELETE FROM {PG_REFS_TABLE} WHERE data_ref = $1"),
+                    &[dr as &(dyn ToSql + Sync)],
+                )
+                .map_err(|e| format!("postgres {e}"))?;
+                rows_deleted += 1;
+            }
+        }
+    }
+    for (dr, &t) in &truth {
+        if booked.contains(dr) {
+            continue;
+        }
+        // The unsafe direction the recount exists to repair: a surviving tree
+        // still names this key but nothing is booked against it.
+        tx.execute(
+            &format!(
+                "INSERT INTO {PG_REFS_TABLE} (data_ref, holders) VALUES ($1, $2)
+                 ON CONFLICT (data_ref) DO UPDATE SET holders = EXCLUDED.holders"
+            ),
+            &[dr as &(dyn ToSql + Sync), &t],
+        )
+        .map_err(|e| format!("postgres {e}"))?;
+        rows_fixed += 1;
+    }
+    tx.commit()
+        .map_err(|e| format!("postgres commit (ledger unchanged): {e}"))?;
+    Ok(PgLedgerReport {
+        trees,
+        refs: truth.len(),
+        holders: truth.values().sum(),
+        rows_fixed,
+        rows_deleted,
+    })
+}
+
+/// SQLSTATE 42P01 (`undefined_table`) — the one "no ledger yet" case a recount
+/// may create its way out of.
+fn is_undefined_table(e: &postgres::Error) -> bool {
+    e.as_db_error()
+        .map(|d| d.code().code() == "42P01")
+        .unwrap_or(false)
 }
 
 /// Internal marker returned by [`PgEngine::with_serial_retry`] bodies so the

@@ -16,6 +16,7 @@
 /.bneck/central/
 /.bneck/raw/
 /.bneck/g3_evidence/
+/.bneck/.pgtd/
 /.bneck/__pycache__/
 /.bneck/*.jsonl
 /.bneck/*.log

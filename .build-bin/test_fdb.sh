@@ -107,6 +107,18 @@ export LD_LIBRARY_PATH="$FDB_HOME/lib:${LD_LIBRARY_PATH:-}"
 # ambient variable is never the intended source.
 unset GROVEFS_META_STORE
 
+# Writer-lease TTL. "One meta-server per --meta-dir" is enforced by a lease row in
+# the cluster, and a server killed by a signal never releases it — the row simply
+# expires one TTL later, which is what lets the restart take over without an
+# operator. The DEFAULT TTL is 10s and the default takeover wait is TTL+2s, while
+# this suite's `wait_port` gives up after 5s, so section 15's own kill-and-restart
+# would read as "never bound" rather than "took over". Section 16 pins the
+# behaviour; these two exports are what keep the DEFAULT setting from governing
+# the speed of every restart in the file. Override from the environment to test
+# the shipped numbers instead.
+export GROVEFS_FDB_WRITER_LEASE_SECS=${GROVEFS_FDB_WRITER_LEASE_SECS:-2}
+export GROVEFS_FDB_WRITER_WAIT_SECS=${GROVEFS_FDB_WRITER_WAIT_SECS:-6}
+
 META=127.0.0.1:15186
 META_REFUSE=127.0.0.1:15188
 DATA=127.0.0.1:15187
@@ -156,6 +168,40 @@ cleanup(){
         kill "$p" 2>/dev/null || true
     done
     wait 2>/dev/null
+    # Writer-lease rows belong to a DEPLOYMENT, not to a view, so the subspace
+    # sweep below cannot remove them. Section 16 records the deployment ids it
+    # used; forcing is safe here because every server this suite started is dead
+    # by the time cleanup runs. Without this, a section that FAILed midway would
+    # leave a `writer` subspace in the inventory (and, with the default TTL, keep
+    # a restart of the next run waiting).
+    if [ -x "$Y" ] && [ -f "$S/lease_deployments.txt" ]; then
+        while read -r dep; do
+            [ -n "$dep" ] || continue
+            "$Y" view --meta-store "$FDBURI" --meta-dir "$S" lease \
+                --release --deployment "$dep" --force >/dev/null 2>&1 || true
+        done < "$S/lease_deployments.txt"
+    fi
+    # The recorded list cannot be complete: every section that starts its own
+    # meta-server (13, 15, …) takes a row too, and a FAILed run never reaches the
+    # code that would have recorded one. Release exactly the rows whose holder is
+    # a DEAD process on THIS host — the field is `host:pid:nonce`, so a pid that
+    # no longer exists proves the row is garbage, while a live pid (another
+    # deployment on this host) or any other host's row is left alone. Measured:
+    # without this pass the inventory ends with a `writer` subspace holding four
+    # expired rows, i.e. the suite no longer returns the cluster as it found it.
+    if [ -x "$Y" ]; then
+        leasehost=$(cat /proc/sys/kernel/hostname 2>/dev/null || hostname)
+        "$Y" view --meta-store "$FDBURI" --meta-dir "$S" lease 2>/dev/null \
+            | awk -v h="$leasehost" '$1=="HELD"||$1=="expired" {
+                  n=split($3, p, ":");
+                  if (n >= 3 && substr($3, 1, length(h)+1) == h ":") print $2 "\t" p[n-1] }' \
+            | while IFS="$(printf '\t')" read -r dep pid; do
+                  [ -n "$dep" ] || continue
+                  kill -0 "$pid" 2>/dev/null && continue
+                  "$Y" view --meta-store "$FDBURI" --meta-dir "$S" lease \
+                      --release --deployment "$dep" --force >/dev/null 2>&1 || true
+              done
+    fi
     # Teardown, now that the command exists: `view rm --base` deletes a subspace
     # AND unwinds the shared ledger in that order, so a run leaves the cluster as
     # it found it instead of +N subspaces per run forever (the state that made an
@@ -1393,5 +1439,146 @@ kill $RMS $RDS 2>/dev/null; wait $RMS 2>/dev/null; wait $RDS 2>/dev/null; RMS=0;
 $RCLI rm --name "$V15" --base --data-dir $R/data > $R/rm.log 2>&1 \
     && ok "the section's subspace is removed, so the run leaves no tree behind" \
     || bad "could not remove $V15: $(head -2 $R/rm.log)"
+
+# 16) "One meta-server per deployment" used to be a COMMENT. It is now a lease
+# row in the cluster, and this section is the daemon-side proof:
+#   * a second meta-server behind the SAME --meta-dir is refused BEFORE it binds,
+#     and the refusal names the way out (`lease --release --deployment …`);
+#   * a DIFFERENT --meta-dir on the same cluster is allowed — the deployment, not
+#     the cluster, is the unit that must have one writer (earlier sections rely
+#     on exactly that shape);
+#   * a `kill -9`ed server's row survives the process and expires, so its restart
+#     takes over without anyone clearing a key;
+#   * `view lease` shows both states, `view scan` classifies the table as a lease
+#     (NOT a corpse a `view rm --base` would eat);
+#   * `--release` on a LIVE row demands `--force`, and a forced release FENCES the
+#     running server: it prints that it lost the lease and exits instead of
+#     writing beside the new holder. That exit is the whole point — a lease nobody
+#     checks is a comment with a key.
+echo "===== 16) writer lease: one writer per deployment, crash takeover, fencing ====="
+L=$S/lease; mkdir -p $L/home $L/home2 $L/data
+LCLI="$Y view --meta-store $FDBURI --meta-dir $L/home"
+LMETA=127.0.0.1:15360; LMETA2=127.0.0.1:15361
+L1=$(cd $L/home && pwd); L2=$(cd $L/home2 && pwd)
+printf '%s\n%s\n' "$L1" "$L2" > $S/lease_deployments.txt
+# One synchronous connect attempt: the point is that the port was NEVER bound, and
+# `wait_port` would spend its full 5s budget proving a negative.
+port_open(){ (echo >/dev/tcp/${1%%:*}/${1##*:}) 2>/dev/null; }
+
+$Y meta-server --listen $LMETA --home $L/home --meta-store "$FDBURI" > $L/meta1.log 2>&1 & LMS=$!
+wait_port $LMETA && ok "the first meta-server on $L1 binds" \
+    || bad "the first meta-server never bound (see $L/meta1.log)"
+grep -q "writer lease HELD for deployment $L1" $L/meta1.log \
+    && ok "its banner names the deployment whose lease it holds" \
+    || bad "no lease banner in $L/meta1.log: $(grep -i lease $L/meta1.log | head -1)"
+grep -q "fdb cluster up" $L/meta1.log \
+    && ok "and the startup gate printed the topology it verified before binding" \
+    || bad "no cluster-topology line in $L/meta1.log: $(head -3 $L/meta1.log)"
+
+$LCLI lease > $L/lease1.txt 2>&1
+awk -v d="$L1" '$1=="HELD" && $2==d' $L/lease1.txt | grep -q . \
+    && ok "view lease lists the row as HELD against that deployment" \
+    || bad "no HELD row for $L1: $(head -3 $L/lease1.txt)"
+
+# The shape the lease exists to forbid, and the one no amount of cluster
+# replication can repair: two servers behind ONE local control plane. The refusal
+# must come BEFORE the bind, or a client would connect and be served by a second
+# writer for the fraction of a second it takes to die.
+$Y meta-server --listen $LMETA2 --home $L/home --meta-store "$FDBURI" > $L/meta2.log 2>&1
+chk "$?" "1" "a second meta-server on the same --meta-dir is refused"
+port_open $LMETA2 && bad "the refused server bound its port anyway" \
+    || ok "and it never bound the port (the refusal is before the listener)"
+grep -q "already has a live meta-server writer" $L/meta2.log \
+    && ok "the refusal says a live writer holds the deployment" \
+    || bad "unexpected refusal: $(head -3 $L/meta2.log)"
+grep -q "lease --release --deployment $L1" $L/meta2.log \
+    && ok "and it names the exact command that clears a stale row" \
+    || bad "the refusal is not actionable: $(head -3 $L/meta2.log)"
+
+# Deployment granularity, asserted rather than assumed: this is the shape the
+# earlier sections run (several meta-servers, one cluster, one --home each).
+$Y meta-server --listen $LMETA2 --home $L/home2 --meta-store "$FDBURI" > $L/meta3.log 2>&1 & LMS2=$!
+wait_port $LMETA2 && ok "a DIFFERENT --meta-dir on the same cluster is allowed" \
+    || bad "a second deployment was refused too — the lease is cluster-wide, not per deployment: $(head -3 $L/meta3.log)"
+$LCLI lease > $L/lease2.txt 2>&1
+awk -v d="$L2" '$1=="HELD" && $2==d' $L/lease2.txt | grep -q . \
+    && ok "both deployments are listed with their own holders" \
+    || bad "$L2 is not listed as a holder: $(head -4 $L/lease2.txt)"
+
+# Crash takeover. SIGKILL is the case: the row cannot be released by the dying
+# process, so the restart has to wait for the TTL. That wait is the price of the
+# guarantee, and it must be bounded by the TTL rather than by a human.
+kill -9 $LMS 2>/dev/null; wait $LMS 2>/dev/null; LMS=0
+kill -0 $LMS2 2>/dev/null && ok "the other deployment's server is unaffected by this crash" \
+    || bad "killing one deployment's server took the other one down"
+$LCLI lease > $L/lease3.txt 2>&1
+grep -q "$L1" $L/lease3.txt \
+    && ok "the killed server's row is still listed (a crash leaves evidence, not nothing)" \
+    || bad "the crashed server's row vanished from the listing"
+L0=$(date +%s%N)
+$Y meta-server --listen $LMETA --home $L/home --meta-store "$FDBURI" > $L/meta4.log 2>&1 & LMS=$!
+wait_port $LMETA && ok "its restart takes the lease over without an operator" \
+    || bad "the restart never bound: $(tail -2 $L/meta4.log)"
+L1MS=$(( ($(date +%s%N) - L0) / 1000000 ))
+[ "$L1MS" -ge 1000 ] && ok "and it waited ${L1MS}ms for the expired row (the takeover is bounded by the TTL, not by a person)" \
+    || bad "the restart took ${L1MS}ms — it did not wait out the previous row, so nothing enforced it"
+grep -q "writer lease HELD for deployment $L1" $L/meta4.log \
+    && ok "the restarted server holds the lease itself" \
+    || bad "the restarted server did not report a lease: $(head -3 $L/meta4.log)"
+
+# `view scan` must not mistake the lease table for a corpse: a corpse is exactly
+# what `view rm --base` is documented to eat.
+$LCLI scan > $L/scan.txt 2>&1
+awk '$1=="writer" && $4=="lease"' $L/scan.txt | grep -q . \
+    && ok "view scan classifies the lease table as kind=lease" \
+    || bad "the lease table is missing or mis-typed: $(grep -i writer $L/scan.txt | head -2)"
+grep -q "writer-lease subspace" $L/scan.txt \
+    && ok "and the summary counts it apart from trees and ledgers" \
+    || bad "the scan summary does not mention the lease subspace: $(tail -2 $L/scan.txt)"
+
+# Forced release = fencing, and the running server must NOTICE. A release that
+# only deleted a row would leave the old server writing into the same trees, i.e.
+# exactly the divergence this section claims to prevent.
+$LCLI lease --release --deployment "$L1" > $L/rel1.txt 2>&1; LRC=$?
+chk "$LRC" "1" "releasing a LIVE row without --force is refused"
+$LCLI lease --release --deployment "$L1" > $L/rel1.txt 2>&1
+grep -q "still renewing" $L/rel1.txt \
+    && ok "and the refusal explains that the holder is still renewing it" \
+    || bad "unexpected release refusal: $(head -2 $L/rel1.txt)"
+$LCLI lease --release --deployment "$L1" --force > $L/rel2.txt 2>&1 \
+    && ok "--force clears the live row" || bad "--force did not clear it: $(head -2 $L/rel2.txt)"
+F=0
+# "Stopped" means the process is gone OR a zombie: bash reaps its own children in
+# the background non-interactively, so `ps -p` can come back EMPTY for an exited
+# child (measured: the first version of this loop only accepted STAT=Z and missed
+# the exit while the next two assertions — the log line and the wait status —
+# already showed it).
+for _ in $(seq 1 60); do
+    kill -0 $LMS 2>/dev/null || { LF=1; break; }
+    LSTAT=$(ps -o stat= -p $LMS 2>/dev/null | tr -d ' ')
+    { [ "$LSTAT" = "Z" ] || [ -z "$LSTAT" ]; } && { LF=1; break; }
+    sleep 0.1
+done
+wait $LMS 2>/dev/null; LSRC=$?; LMS=0
+chk "$LF" "1" "the fenced server stopped instead of writing beside the new holder"
+grep -q "LOST the FDB writer lease" $L/meta4.log \
+    && ok "and it said why (a lost lease, not a crash)" \
+    || bad "the fenced server printed no reason: $(tail -2 $L/meta4.log)"
+chk "$LSRC" "1" "it exits 1, so a supervisor sees a failed server rather than a healthy one"
+
+# This section's rows are gone at the end of it. The assertion is NOT "the
+# cluster has no lease rows": the suite's own long-lived meta-server (and the
+# sections' servers this one may run beside) legitimately hold theirs, and an
+# expired row of a dead deployment is visible until something overwrites or
+# releases it — the `cleanup` trap does the suite-wide release once every server
+# is dead.
+kill $LMS2 2>/dev/null; wait $LMS2 2>/dev/null; LMS2=0
+$LCLI lease --release --deployment "$L2" --force > $L/last.txt 2>&1 || true
+$LCLI lease > $L/final.txt 2>&1
+if grep -qF "$L1" $L/final.txt || grep -qF "$L2" $L/final.txt; then
+    bad "this section's lease rows survive it: $(head -4 $L/final.txt)"
+else
+    ok "both of the section's lease rows are cleared (other deployments keep theirs until the suite stops them)"
+fi
 
 if [ "$fail" = 0 ]; then echo "ALL FDB-BACKEND CHECKS PASSED"; exit 0; else echo "SOME FDB CHECKS FAILED"; exit 1; fi

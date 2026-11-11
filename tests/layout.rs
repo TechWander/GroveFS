@@ -361,3 +361,41 @@ fn flush_listing_drops_the_materialized_shape() {
         vec!["private".to_string(), "public".to_string()]
     );
 }
+
+/// The flush must drop the lens's path→inode answers as well as its rows: a
+/// synthesized parent materialises every row through `leaf_node`, which caches
+/// MISSES for the same TTL. Dropping only the page then rebuilds it from a
+/// cached miss, so a source entry recreated a moment after it was removed stays
+/// invisible for up to `CACHE_TTL` — the exact window the push path exists to
+/// close (measured end-to-end as an intermittent display-freshness failure; it
+/// only looked green while the recreated node happened to inherit its old
+/// rowid, so the stale entry still resolved).
+#[test]
+fn flush_listing_clears_cached_misses_for_a_recreated_entry() {
+    let eng = seed_tree("flush2");
+    let data = eng.lookup(ROOT_INO, "data").unwrap().id;
+    let raw = eng.lookup(data, "raw").unwrap().id;
+    // A peer empties and removes the source subtree BEFORE the lens is built,
+    // so the first shaped listing below caches a miss rather than a hit.
+    eng.unlink(raw, "big.bin").unwrap();
+    eng.unlink(data, "raw").unwrap();
+
+    let l = lens_over(eng.clone(), "map /data/raw /team/raw\n");
+    let team = l.lookup(ROOT_INO, "team").expect("synthesized /team").id;
+    assert_eq!(names(&l.readdir(team)), Vec::<String>::new());
+
+    // The peer recreates it at a fresh inode; the push event flushes the
+    // display parent.
+    let new_raw = eng
+        .create_node(data, "raw", true, None, 0o0755, 1000, 1000)
+        .unwrap();
+    eng.create_node(new_raw, "small.bin", false, Some("ks"), 0o0644, 1000, 1000)
+        .unwrap();
+    l.flush_listing(team);
+
+    assert_eq!(
+        names(&l.readdir(team)),
+        vec!["raw".to_string()],
+        "a flushed page must not be rebuilt from a cached miss"
+    );
+}

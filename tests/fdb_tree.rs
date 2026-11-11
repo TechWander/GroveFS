@@ -1269,3 +1269,160 @@ fn fdb_import_refuses_a_corpse() {
         "fdb_import_corpse: refused with and without --replace, wrote nothing, `view rm --base` still unbooked it"
     );
 }
+
+// ---- writer lease and the startup gate -------------------------------------
+//
+// The lease is the executable half of "one meta-server per deployment": the doc
+// used to state it as a rule nothing enforced. What the test pins down is the
+// state machine, not the wiring: exactly one of two servers wins, a renewal only
+// succeeds for the OWNER (so a fenced server can tell), an expired row is taken
+// over without an operator, and a release never clears someone else's row.
+//
+// It drives `acquire/renew/release` directly instead of `hold_writer_lease`, and
+// that is deliberate: the keeper installs a PROCESS-GLOBAL slot, spawns a renewal
+// thread and `exit(1)`s when fenced — right for a daemon, fatal for a test binary
+// running several suites in parallel. The daemon path is covered end to end by
+// `.build-bin/test_fdb.sh` §16, which starts real `meta-server` processes.
+
+#[test]
+fn fdb_writer_lease_admits_one_server_per_deployment() {
+    use grovefs::fdb_store as fdb;
+
+    let Some(file) = cluster_file() else {
+        eprintln!("SKIP fdb_lease: no FDB cluster file (set GROVEFS_FDB_CLUSTER_FILE)");
+        return;
+    };
+    if !cluster_reachable(&file) {
+        eprintln!("SKIP fdb_lease: cluster {} unreachable", file.display());
+        return;
+    }
+    let uri = format!("fdb://{}", file.display());
+    let nanos = std::time::UNIX_EPOCH.elapsed().map(|d| d.as_nanos()).unwrap_or(0);
+    // A lease id is a deployment NAME, not a directory that must exist; keeping
+    // it synthetic means the test cannot collide with a real server's row.
+    let deployment = format!("/tmp/grovefs-lease-test-{:x}", nanos);
+    let ttl = Duration::from_millis(600);
+    let (owner_a, owner_b) = ("testhost:1:a", "testhost:1:b");
+
+    // However this test ends, it must not leave a row behind: a leaked lease
+    // would be a 10s land mine for the next `test_fdb.sh` run, which starts real
+    // servers against this same cluster.
+    struct Guard<'a> {
+        uri: &'a str,
+        deployment: &'a str,
+    }
+    impl Drop for Guard<'_> {
+        fn drop(&mut self) {
+            let _ = grovefs::fdb_store::release_writer_lease(self.uri, self.deployment, None);
+        }
+    }
+    let _guard = Guard {
+        uri: &uri,
+        deployment: &deployment,
+    };
+
+    // 1. It starts unheld — otherwise everything below would "pass" for the
+    //    wrong reason (a row this test never wrote).
+    assert!(
+        !fdb::list_writer_leases(&uri)
+            .expect("list leases")
+            .iter()
+            .any(|r| r.deployment == deployment),
+        "the fabricated deployment already holds a row"
+    );
+    let first = fdb::acquire_writer_lease(&uri, &deployment, owner_a, ttl, Duration::ZERO)
+        .expect("first acquire must succeed on a free deployment");
+    assert_eq!(first.owner, owner_a);
+    assert!(first.is_live(), "a fresh lease must be live: {first:?}");
+
+    // 2. The second server on the SAME deployment is refused, and the refusal
+    //    has to be actionable: the error an operator sees is the whole feature.
+    let err = fdb::acquire_writer_lease(&uri, &deployment, owner_b, ttl, Duration::from_millis(150))
+        .expect_err("a live holder must refuse a second writer");
+    let msg = err.to_string();
+    assert!(msg.contains("already has a live meta-server writer"), "{msg}");
+    assert!(msg.contains("--meta-dir"), "{msg}");
+    assert!(msg.contains("lease --release"), "{msg}");
+
+    // 3. Renewal is owner-fenced. `Ok(false)` is the signal a running server
+    //    stops on, so it must be distinguishable from an error (retry).
+    assert_eq!(
+        fdb::renew_writer_lease(&uri, &deployment, owner_b, ttl).expect("renew as b"),
+        false,
+        "a non-owner must not be able to renew someone else's lease"
+    );
+    assert_eq!(
+        fdb::renew_writer_lease(&uri, &deployment, owner_a, ttl).expect("renew as a"),
+        true,
+        "the owner must be able to renew"
+    );
+
+    // 4. The inventory classifies the table as a lease subspace, not a tree and
+    //    not a corpse (a corpse invites `view rm --base` on the lease table).
+    let subs = fdb::list_subspaces(&uri).expect("inventory");
+    let writer = subs
+        .iter()
+        .find(|s| s.name == "writer")
+        .unwrap_or_else(|| panic!("the lease table must appear in the inventory: {subs:?}"));
+    assert!(writer.lease && !writer.ledger && !writer.root_row);
+    assert_eq!(writer.kind(), "lease");
+    assert_eq!(writer.entries, 0, "a lease row is not an 'n' row");
+
+    // 5. Expiry is takeover: a crashed holder's row must stop blocking a restart
+    //    after one TTL, without anyone clearing a key.
+    std::thread::sleep(ttl + Duration::from_millis(250));
+    let expired = fdb::list_writer_leases(&uri)
+        .expect("list leases")
+        .into_iter()
+        .find(|r| r.deployment == deployment)
+        .expect("the row must still be there until it is taken over");
+    assert!(!expired.is_live(), "the row should have expired: {expired:?}");
+    let second = fdb::acquire_writer_lease(&uri, &deployment, owner_b, ttl, Duration::from_secs(2))
+        .expect("an expired row must be taken over, not refuse the restart");
+    assert_eq!(second.owner, owner_b);
+
+    // 6. Release is owner-fenced; `None` is the operator override.
+    assert!(
+        !fdb::release_writer_lease(&uri, &deployment, Some(owner_a)).expect("release as a"),
+        "a non-owner must not clear the row"
+    );
+    assert!(
+        fdb::release_writer_lease(&uri, &deployment, Some(owner_b)).expect("release as b"),
+        "the owner must be able to release"
+    );
+    assert!(
+        !fdb::list_writer_leases(&uri)
+            .expect("list leases")
+            .iter()
+            .any(|r| r.deployment == deployment),
+        "the released row is still listed"
+    );
+
+    // 7. `deployment_id` is the CANONICAL `--meta-dir`: two spellings of one
+    //    directory must be one deployment, or `--release --deployment` would
+    //    address a row no server wrote.
+    let dir = tempfile::tempdir().expect("tmpdir");
+    assert_eq!(
+        fdb::deployment_id(dir.path()),
+        fdb::deployment_id(&dir.path().join(".")),
+        "`/x` and `/x/.` are the same deployment"
+    );
+    assert!(std::path::Path::new(&fdb::deployment_id(dir.path())).is_absolute());
+
+    // 8. The startup gate's reading of FDB's own status JSON, pinned against a
+    //    live cluster: the first version of it counted zero storage servers and
+    //    zero coordinators on a healthy cluster (wrong field names in 7.1).
+    let st = fdb::cluster_status(&uri, Duration::from_secs(10)).expect("cluster status");
+    assert!(st.available, "the test cluster must report itself available: {st:?}");
+    assert_eq!(st.message, "", "an available cluster has no message: {st:?}");
+    assert!(st.storage_servers >= 1, "{st:?}");
+    assert!(st.coordinators >= 1, "{st:?}");
+    assert!(!st.redundancy.is_empty(), "{st:?}");
+    assert!(!st.storage_engine.is_empty(), "{st:?}");
+
+    println!(
+        "fdb_writer_lease: second writer refused, renewal owner-fenced, expired row taken over, classification `{}`, status `{}`",
+        writer.kind(),
+        st.topology()
+    );
+}

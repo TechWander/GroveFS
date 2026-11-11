@@ -93,7 +93,7 @@ MP=$!
 wait_port $DATA || { echo "data-server failed"; cat .pgtest/data.log; }
 wait_port $META || { echo "meta-server failed"; cat .pgtest/meta.log; }
 
-cleanup(){ for d in .pgtest/mnt_a .pgtest/mnt_b; do fusermount -u "$d" 2>/dev/null; done; kill $RAP $RBP $DP $MP 2>/dev/null; }
+cleanup(){ for d in .pgtest/mnt_a .pgtest/mnt_b; do fusermount -u "$d" 2>/dev/null; done; for p in "${RAP:-0}" "${RBP:-0}" "${DP:-0}" "${MP:-0}"; do [ "$p" != 0 ] && kill "$p" 2>/dev/null; done; true; }
 RAP=0; RBP=0
 trap cleanup EXIT
 
@@ -143,6 +143,44 @@ echo "===== 6) unlink -> PG row deleted, entry gone from both mounts ====="
 T rm "$A/hardlink" && ok "A removes hardlink" || bad "A unlink failed"
 sleep 1.5
 [ ! -e "$B/hardlink" ] && ok "hardlink gone on B (shared delete)" || bad "hardlink still visible on B"
+
+echo "===== 7) teardown: view rm --base drops the schema AND unwinds the ledger ====="
+# This suite used to leak by construction: every run left its `grovefs_v_<hex>`
+# schema behind (13 schemas / 288 stuck `grovefs_refs.holders` rows when it was
+# measured), because a PG tree had no removal path in the CLI at all. It ends by
+# removing what it created, and asserts BOTH halves — the schema is gone and the
+# view's ledger rows are gone — since doing only the drop is exactly the leak
+# `.bneck/pg_drop_views.sh` used to exist to clean up by hand.
+for d in .pgtest/mnt_a .pgtest/mnt_b; do fusermount -u "$d" 2>/dev/null; done
+kill $RAP $RBP 2>/dev/null; RAP=0; RBP=0
+kill $MP $DP 2>/dev/null; MP=0; DP=0
+sleep 0.5
+export PGPASSWORD=grovepw
+PGQ(){ psql "postgres://grove:grovepw@${PGHOST}:${PGPORT}/grovefs" -qtA -c "$1" 2>/dev/null; }
+SCH=$(printf '%s' "$VIEW" | od -An -tx1 | tr -d ' \n')
+if ! command -v psql >/dev/null; then
+    echo "  INFO: host psql unavailable — teardown row assertions skipped (the rm still ran)"
+fi
+BEFORE_SCH=""
+[ -n "$(command -v psql)" ] && BEFORE_SCH=$(PGQ "select count(*) from information_schema.schemata where schema_name='grovefs_v_${SCH}'")
+if [ -n "$(command -v psql)" ]; then
+    chk "$BEFORE_SCH" "1" "schema grovefs_v_${SCH} exists before teardown"
+    BEFORE_LED=$(PGQ "select count(*) from grovefs_refs.holders where data_ref in (select data_ref from grovefs_v_${SCH}.node where data_ref is not null)")
+    [ "${BEFORE_LED:-0}" -gt 0 ] && ok "the view booked ${BEFORE_LED} ledger row(s)" \
+        || bad "ledger booked nothing for a view that holds files (got '$BEFORE_LED')"
+fi
+$Y view --meta-dir .pgtest/home --meta-store "$PGURI" rm --name "$VIEW" --base --data-dir .pgtest/central/data > .pgtest/rm.log 2>&1
+RRC=$?
+[ "$RRC" = 0 ] && ok "view rm --base on postgres://… succeeds" || bad "view rm --base failed: $(cat .pgtest/rm.log)"
+if [ -n "$(command -v psql)" ]; then
+    chk "$(PGQ "select count(*) from information_schema.schemata where schema_name='grovefs_v_${SCH}'")" "0" \
+        "schema grovefs_v_${SCH} is gone"
+    chk "$(PGQ "select count(*) from grovefs_refs.holders")" "0" \
+        "every ledger row the view booked is unwound (no residue for the next run)"
+fi
+$Y view --meta-dir .pgtest/home --meta-store "$PGURI" rm --name "$VIEW" --base > .pgtest/rm2.log 2>&1
+[ $? != 0 ] && ok "a second removal is refused (a typo never reads as success)" \
+    || bad "a second removal of the same view returned 0"
 
 # ---- summary ----
 echo
