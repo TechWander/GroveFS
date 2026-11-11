@@ -11,7 +11,10 @@
 #     . .build-bin/fdb_scaffold.sh
 #     fdb_gate                          # skip cleanly / fail under FDB_TEST=1
 #     fdb_binary                        # $Y := a binary that links libfdb_c
-#     fdb_up <workdir> <meta> <data>    # subspace + meta-server + data-server
+#     fdb_up <workdir> <view> <meta-listen> <data-listen>
+#                                       # subspace + meta-server + data-server
+#     fdb_drop_views <meta-dir> <data-dir> <view>...
+#                                       # hand the subspaces back at exit
 # and then uses $MSARG / $REMOTE / $BIN where it used the bare `grovefs view`
 # and a local mount, plus kp()/wk()/mnt_gate()/seed_through_mount().
 #
@@ -105,6 +108,62 @@ fdb_up(){ # fdb_up <workdir> <view> <meta-listen> <data-listen>
         || { echo "FAIL: the meta-server did not banner the foundationdb backend"; head -5 "$wd/meta.log"; exit 1; }
 }
 fdb_reap(){ kp $FDB_MP $FDB_DP; wk $FDB_MP $FDB_DP; }
+
+# fdb_drop_views: hand the cluster back every subspace this run made.
+#
+# A subspace OUTLIVES the run that created it — that is why every suite here uses a
+# per-run name — but "outlives the run" is a property of the storage, not a licence
+# to leak one tree per execution. Measured on 2026-11-11: running the four
+# parameterized arms once each (layout/locks/govcheck/apikey) left four live
+# subspaces (`lt…`, `lk…`, `gc…`, `ak…`, keys 76/19/23/27) plus the shared `refs`
+# ledger, i.e. the board was planting exactly the residue `view scan` exists to
+# find. Only unmounting is not cleanup: it leaks keys, keeps objects booked, and
+# makes the next scan report trees nobody can attribute.
+#
+# `--data-dir` is the suite's scratch root, so the objects this view alone named are
+# freed there; pointing it at a now-deleted root can only report "not found", never
+# pretend bytes were reclaimed. A missing name is not an error (a suite that aborted
+# before provisioning still runs its trap), and the helper never fails the suite.
+#
+# A lens/alias DEFINITION over the base refuses the `--base` removal, and the
+# definition is a file in the same scratch meta-dir the run owns — so the first
+# cleanup of a suite that defines one (layout's `trimphotos`, govcheck's lenses)
+# would be refused and, because this helper never fails a suite, would leave the
+# whole tree behind while the board stayed green. Measured on 2026-11-11: layout's
+# first cleanup printed "had no tree to drop (error: view 'trimphotos' is governed
+# …)" and left 76 keys in the cluster. The loop below drops such a definition by
+# name and retries, bounded so a refusal this helper cannot interpret still ends.
+fdb_drop_views(){ # fdb_drop_views <meta-dir> <data-dir> <view>...
+    [ "${BACKEND:-}" = fdb ] || return 0
+    local md="${1:-}" dd="${2:-}" v out rc def attempt
+    [ -n "$md" ] || return 0
+    shift 2 || true
+    for v in "$@"; do
+        [ -n "$v" ] || continue
+        mkdir -p "$md"
+        attempt=0
+        while :; do
+            if [ -n "$dd" ] && [ -d "$dd" ]; then
+                out=$($Y view $MSARG --meta-dir "$md" rm --name "$v" --base --data-dir "$dd" 2>&1); rc=$?
+            else
+                out=$($Y view $MSARG --meta-dir "$md" rm --name "$v" --base 2>&1); rc=$?
+            fi
+            [ $rc -eq 0 ] && break
+            def=$(printf '%s' "$out" | sed -n "s/^error: view '\([^']*\)' is governed by a definition.*/\1/p")
+            [ -n "$def" ] && [ $attempt -lt 8 ] || break
+            attempt=$((attempt + 1))
+            $Y view $MSARG --meta-dir "$md" rm --name "$def" >/dev/null 2>&1 || break
+            echo "  cluster: removed definition '$def' over '$v' before dropping the tree"
+        done
+        if [ $rc -eq 0 ]; then
+            echo "  cluster: dropped subspace '$v'"
+            printf '%s\n' "$out" | grep -E "key\(s\) gone|object\(s\)" | sed 's/^/    /'
+        else
+            echo "  cluster: '$v' had no tree to drop ($(printf '%s' "$out" | head -1))"
+        fi
+    done
+    return 0
+}
 
 # --- small shared helpers ---------------------------------------------------
 # A mount that never came up must abort, not let the following writes land in a

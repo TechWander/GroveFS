@@ -87,7 +87,18 @@ _reap(){ local p; for p in $(pgrep -f 'grovefs.*[. ]\.locks' 2>/dev/null || true
         case " $$ $PPID " in *" $p "*) continue ;; esac
         kill "$p" 2>/dev/null || true
     done; }
-cleanup(){ fusermount -u $M1 2>/dev/null; fusermount -u $M2 2>/dev/null; fusermount -u .locks/ha/mnt 2>/dev/null; kill_pids "${P1:-}" "${P2:-}" "${DP:-}" "${MP:-}"; _reap; }
+cleanup(){ fusermount -u $M1 2>/dev/null; fusermount -u $M2 2>/dev/null; fusermount -u .locks/ha/mnt 2>/dev/null; kill_pids "${P1:-}" "${P2:-}" "${DP:-}" "${MP:-}"; _reap
+    # This suite stands its own server pair rather than going through fdb_up, so
+    # it also drops its own tree: a subspace OUTLIVES the run, and unmounting
+    # alone leaves it (plus every object it booked) in the cluster for
+    # `view scan` to find. Measured 2026-11-11: the four parameterised arms left
+    # one tree each; this is the same leak in the arm that does not use the
+    # scaffold's hook.
+    if [ "$BACKEND" = fdb ] && [ -n "${VIEW:-}" ]; then
+        $Y view --meta-store "$FDBURI" --meta-dir .locks/srv/home rm --name "$VIEW" --base \
+            --data-dir .locks/srv/data >/dev/null 2>&1 || true
+    fi
+    return 0; }
 # Armed before the first mount: a fail-fast gate below exits non-zero, and
 # without the trap that would leave FUSE mounts and servers behind for the
 # next run of the suite.

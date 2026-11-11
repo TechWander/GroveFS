@@ -186,7 +186,7 @@ $Y mount --view "$VIEW" --mountpoint .govcheck/mnt_lens --no-cache --layout .gov
 LENP=$!
 PIDS=$(jobs -p)
 MAPP=""   # B3's map mount exists only later; the trap must never signal a name that was never set
-cleanup(){ for d in .govcheck/mnt_*; do fusermount -u "$d" 2>/dev/null; done; kp $PIDS $BASEP $LENP $MAPP $FDB_MP $FDB_DP; }
+cleanup(){ for d in .govcheck/mnt_*; do fusermount -u "$d" 2>/dev/null; done; kp $PIDS $BASEP $LENP $MAPP $FDB_MP $FDB_DP; fdb_drop_views "${HOME_DIR:-}" "${HOME_DIR:-}/data" "${VIEW:-}"; }
 trap cleanup EXIT
 sleep 1.5
 

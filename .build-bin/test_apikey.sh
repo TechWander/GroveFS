@@ -59,7 +59,7 @@ else
     # fdb_up chained an EXIT trap that reaps its server pair; extend it (do not
     # replace it) so an abort between here and line 66 also drops the seeding
     # mount, which would otherwise shadow `rm -rf .apitest` on the next run.
-    trap 'fusermount -u .apitest/mnt_seed 2>/dev/null; fdb_reap' EXIT
+    trap 'fusermount -u .apitest/mnt_seed 2>/dev/null; fdb_reap; fdb_drop_views .apitest/home .apitest/home/data "${TEAM:-}"' EXIT
     $Y mount --view "$TEAM" -m .apitest/mnt_seed $REMOTE --foreground > .apitest/seed.log 2>&1 &
     SEEDP=$!
     mnt_gate .apitest/mnt_seed && ok "the subspace mounted for seeding" \

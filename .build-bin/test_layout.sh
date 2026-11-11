@@ -21,9 +21,12 @@ TEAM=team
 fdb_gate
 fdb_binary
 if [ "$BACKEND" = fdb ]; then
-    # A subspace outlives a run (`view rm` of a cluster tree is P8's work), so the
-    # view name is per-run: a second run of this suite must not inherit the first
-    # one's tree and read a stale listing as a pass.
+    # A subspace outlives a run until something removes it, so the view name is
+    # per-run: a second run of this suite must not inherit the first one's tree
+    # and read a stale listing as a pass. The cleanup trap drops it again with
+    # `fdb_drop_views`, so a successful run hands the cluster back exactly what
+    # it took; the per-run name is what keeps a CRASHED run from poisoning the
+    # next one.
     TEAM="lt$(date +%s)"
 fi
 rm -rf .ltest; mkdir -p .ltest/home .ltest/mnt_base .ltest/mnt_a .ltest/mnt_b .ltest/mnt_c .ltest/mnt_d
@@ -93,7 +96,7 @@ $Y mount --view $TEAM --mountpoint .ltest/mnt_d   --no-cache --layout .ltest/d.l
 PIDS=$(jobs -p)
 sleep 1.5
 
-cleanup(){ for d in .ltest/mnt_*; do fusermount -u "$d" 2>/dev/null; done; kp $PIDS $MSP $DSP $MSP2 $DSP2 $MSP3 $DSP3 $FDB_MP $FDB_DP; }
+cleanup(){ for d in .ltest/mnt_*; do fusermount -u "$d" 2>/dev/null; done; kp $PIDS $MSP $DSP $MSP2 $DSP2 $MSP3 $DSP3 $FDB_MP $FDB_DP; fdb_drop_views .ltest/home .ltest/home/data "${TEAM:-}"; }
 trap cleanup EXIT
 
 BASE=.ltest/mnt_base; A=.ltest/mnt_a; B=.ltest/mnt_b; C=.ltest/mnt_c; D=.ltest/mnt_d

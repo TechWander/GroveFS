@@ -42,6 +42,12 @@
 #      refuses, a corrupt dump leaves the installed tree untouched, the same dump
 #      drops back into a fresh SQLite store, and the source store never changed.
 #
+#  11. the three shapes that exist only because a SERVER sits between the mount
+#      and the tree: a `--ro` mount of a view another mount is writing (EROFS,
+#      while the sibling stays writable), a `kill -9` of the meta-server under a
+#      live mount (transparent recovery, no remount), and a write during that
+#      outage (EIO at once — 1.5s measured — never a parked request).
+#
 # Infrastructure: `.build-bin/fdb_env.sh` (user-space fdbserver, no root, no
 # system package). The suite SKIPS cleanly (exit 0, no FAILs) when the cluster
 # is unreachable, so the board stays GREEN on hosts without FDB; set
@@ -1169,6 +1175,42 @@ $VCLI create --view "$ZC" > $S/zc_create.log 2>&1 \
     || ok "view create refuses to resurrect a corpse instead of writing a root over its keys"
 grep -q "no root row" $S/zc_create.log \
     && ok "the refusal says what is wrong and what to run" || bad "unexpected create text: $(head -2 $S/zc_create.log)"
+# `import` is the OTHER entry that can seed a root, and it used to accept a corpse:
+# measured here, re-importing a dump onto it returned 0, the view went from 1 entry
+# to 2 and both content keys stayed booked — i.e. the imported tree claimed the
+# old tree's `'r` rows and the bytes they name, which nothing can release later
+# because a corpse never mounts again. The guard asks `view scan`'s question, so
+# the refusal must arrive BEFORE the `--replace`-less "already holds a tree" text.
+$VCLI import --view "$ZC" --in $S/m_src.jsonl > $S/zc_imp2.log 2>&1
+IRC=$?
+[ "$IRC" != 0 ] && ok "import onto the corpse is refused too (rc=$IRC)" \
+    || bad "import seeded a root on the corpse's leftovers (rc=0)"
+grep -q "corpse" $S/zc_imp2.log \
+    && ok "the refusal names the shape it found, not a generic import failure" \
+    || bad "unexpected import text: $(head -2 $S/zc_imp2.log)"
+grep -q -- "--name $ZC --base" $S/zc_imp2.log \
+    && ok "and points at the exit that clears it" \
+    || bad "the refusal does not name rm --base: $(head -2 $S/zc_imp2.log)"
+$VCLI scan > $S/scan5b.txt 2>&1
+chk "$(awk -v v="$ZC" '$1==v {print $2}' $S/scan5b.txt)" "$ZK" \
+    "a refused import wrote no keys into the corpse"
+chk "$(awk '$4=="ledger"{print $2}' $S/scan5b.txt)" "$LKB" \
+    "and booked nothing new in the shared ledger"
+# `view export` is the third door that asks the cluster about a tree. It already
+# refused a corpse, but blamed provisioning ("create one with `view create`")
+# — advice that a corpse refuses in turn. Two states, two remedies, two sentences.
+$VCLI export --view "$ZC" --out $S/zc_exp.jsonl > $S/zc_exp.log 2>&1
+ERC=$?
+[ "$ERC" != 0 ] && ok "export of the corpse is refused (rc=$ERC)" \
+    || bad "export wrote a dump for a corpse (no import could ever accept it)"
+grep -q "corpse" $S/zc_exp.log \
+    && ok "and it names the shape instead of calling it unprovisioned" \
+    || bad "export blamed provisioning: $(head -2 $S/zc_exp.log)"
+grep -q -- "--name $ZC --base" $S/zc_exp.log \
+    && ok "with the exit that actually clears it" \
+    || bad "export did not point at rm --base: $(head -2 $S/zc_exp.log)"
+[ ! -s $S/zc_exp.jsonl ] && ok "and left no half-written dump behind" \
+    || bad "a dump file was written anyway"
 ZR=$($VCLI rm --name "$ZC" --base --data-dir $S/zc/data 2>&1)
 echo "$ZR" | grep -q "removed base view '$ZC'" \
     && ok "rm --base removes a corpse (the refusal that started this section is gone)" \
@@ -1255,5 +1297,101 @@ else
     bad "could not read a ledger row to damage (refs at '$S/scan7.txt' says '$LK0' keys)"
 fi
 
+
+# 15) Three shapes a client meets only in a REMOTE deployment, i.e. the ones the
+# SQLite arm cannot have: a read-only mount of a view another mount is writing, a
+# meta-server killed and restarted under a live mount (there is a process between
+# the mount and the tree here, and it is allowed to die), and a write issued
+# while that process is gone. All three were probed by hand first (2026-11-11) and
+# are pinned here so a later change to the reconnect policy has to face them.
+# The interesting part of the outage case is that it must FAIL FAST: a dead
+# metadata server is EIO immediately, not a write parked until the server returns
+# (which is what a whole-cluster outage does — the two fault surfaces differ).
+echo "===== 15) --ro mount, meta-server restart, and the outage window ====="
+R=$S/rr; mkdir -p $R/home $R/data $R/h1 $R/h2 $R/mnt $R/mnt_ro
+V15="rr$$"
+RMETA=127.0.0.1:15340; RDATA=127.0.0.1:15341
+RCLI="$Y view --meta-store $FDBURI --meta-dir $R/home"
+$RCLI create --view "$V15" > $R/create.log 2>&1 \
+    && ok "provisioned $V15 for the restart section" \
+    || bad "view create $V15 failed: $(head -2 $R/create.log)"
+$Y data-server --listen $RDATA --data-dir $R/data > $R/data.log 2>&1 & RDS=$!
+$Y meta-server --listen $RMETA --home $R/home --meta-store "$FDBURI" > $R/meta.log 2>&1 & RMS=$!
+wait_port $RDATA && wait_port $RMETA \
+    && ok "a second server pair stands on the same cluster" \
+    || bad "the second pair never bound (see $R/data.log, $R/meta.log)"
+$Y --home $R/h1 mount --view "$V15" --mountpoint $R/mnt --meta-server $RMETA \
+    --data-servers $RDATA --foreground > $R/mnt.log 2>&1 & RMP=$!
+mnt_gate $R/mnt || { bad "the rw mount never came up"; cat $R/mnt.log; }
+T sh -c "printf 'alpha' > $R/mnt/a.txt" && ok "rw mount writes" || bad "rw mount write failed"
+
+# --ro is a MOUNT policy, not a view property: the same view stays writable
+# through the other mount, which is the assertion that separates "this mount is
+# read-only" from "this tree became read-only".
+$Y --home $R/h2 mount --view "$V15" --mountpoint $R/mnt_ro --meta-server $RMETA \
+    --data-servers $RDATA --ro --foreground > $R/ro.log 2>&1 & ROP=$!
+mnt_gate $R/mnt_ro || { bad "the --ro mount never came up"; cat $R/ro.log; }
+chk "$(ls_wait $R/mnt_ro | tr '\n' ' ')" "a.txt " "the read-only mount lists what the rw mount wrote"
+chk "$(T cat $R/mnt_ro/a.txt)" "alpha" "and reads its content"
+T sh -c "printf 'x' > $R/mnt_ro/b.txt" 2> $R/ro_err.txt; RRC=$?
+[ "$RRC" != 0 ] && ok "a create through --ro is refused (rc=$RRC)" || bad "a create through --ro succeeded"
+grep -qi "read-only file system" $R/ro_err.txt \
+    && ok "the refusal is EROFS, not an unexplained failure" \
+    || bad "unexpected --ro error: $(head -2 $R/ro_err.txt)"
+# The exact code differs by syscall (1 from mkdir/rm, 2 from a shell redirection),
+# so the assertion is "refused", and EROFS above is what names the reason.
+T mkdir $R/mnt_ro/dir 2>> $R/ro_err.txt; RRC=$?
+[ "$RRC" != 0 ] && ok "mkdir through --ro is refused too (rc=$RRC)" || bad "mkdir through --ro succeeded"
+T rm -f $R/mnt_ro/a.txt 2>> $R/ro_err.txt; RRC=$?
+[ "$RRC" != 0 ] && ok "unlink through --ro is refused (rc=$RRC)" || bad "unlink through --ro succeeded"
+chk "$(T cat $R/mnt_ro/a.txt)" "alpha" "and the file is still there afterwards"
+T sh -c "printf 'beta' > $R/mnt/b.txt" && ok "the rw mount is still writable while the ro one is refused" \
+    || bad "the rw mount became read-only along with its sibling"
+
+# kill -9, not SIGTERM: the point is that the client survives a server that never
+# got to clean up (a crash, an OOM kill, a machine that went away).
+kill -9 $RMS 2>/dev/null; wait $RMS 2>/dev/null; RMS=0; sleep 0.3
+$Y meta-server --listen $RMETA --home $R/home --meta-store "$FDBURI" > $R/meta2.log 2>&1 & RMS=$!
+wait_port $RMETA || bad "the restarted meta-server never bound"
+ls_wait $R/mnt > /dev/null && ok "the live mount serves again after a kill -9 of the meta-server" \
+    || bad "the mount did not recover from the server restart"
+chk "$(T cat $R/mnt/a.txt)" "alpha" "the file written before the restart still reads"
+T sh -c "printf 'gamma' > $R/mnt/c.txt" && ok "a NEW write goes through the restarted server without a remount" \
+    || bad "the mount would not take a write after the restart"
+chk "$(T cat $R/mnt/c.txt)" "gamma" "and reads back"
+ls_wait $R/mnt_ro > /dev/null && ok "the --ro mount recovered the same way" \
+    || bad "the --ro mount did not recover"
+
+# The outage window: server gone, stub still mounted. A write must return EIO
+# promptly — a parked write would turn a dead server into a hung caller, and the
+# 5s ceiling is what distinguishes that from a slow retry.
+kill -9 $RMS 2>/dev/null; wait $RMS 2>/dev/null; RMS=0; sleep 0.3
+O0=$(date +%s%N)
+T sh -c "printf 'gone' > $R/mnt/d.txt" 2> $R/outage_err.txt; ORC=$?
+O1=$(date +%s%N); OMS=$(( (O1 - O0) / 1000000 ))
+[ "$ORC" != 0 ] && ok "a write during the outage fails instead of reporting success" \
+    || bad "a write during the outage succeeded — nothing is checking the server"
+grep -qi "input/output error" $R/outage_err.txt \
+    && ok "the caller sees EIO (a dead metadata server, not a permission or a name problem)" \
+    || bad "unexpected outage error: $(head -2 $R/outage_err.txt)"
+[ "$OMS" -lt 5000 ] && ok "and it returned in ${OMS}ms rather than blocking on the dead peer" \
+    || bad "the write during the outage blocked for ${OMS}ms"
+[ ! -e $R/mnt/d.txt ] && ok "the file was not created behind the failure" \
+    || bad "d.txt exists even though its create failed"
+$Y meta-server --listen $RMETA --home $R/home --meta-store "$FDBURI" > $R/meta3.log 2>&1 & RMS=$!
+wait_port $RMETA || bad "the third meta-server never bound"
+T sh -c "printf 'delta' > $R/mnt/d.txt" && ok "and the same write succeeds once the server is back" \
+    || bad "the mount stayed broken after the server returned"
+chk "$(T cat $R/mnt/d.txt)" "delta" "with the content it was given"
+
+# Teardown. Unmount first, then the processes, then the subspace: `rm --base`
+# refuses while a definition resolves through the base, and nothing here defines
+# one, so the removal is the plain path this section's baseline depends on.
+fusermount -u $R/mnt_ro 2>/dev/null; kill $ROP 2>/dev/null; wait $ROP 2>/dev/null; ROP=0
+fusermount -u $R/mnt 2>/dev/null; kill $RMP 2>/dev/null; wait $RMP 2>/dev/null; RMP=0
+kill $RMS $RDS 2>/dev/null; wait $RMS 2>/dev/null; wait $RDS 2>/dev/null; RMS=0; RDS=0
+$RCLI rm --name "$V15" --base --data-dir $R/data > $R/rm.log 2>&1 \
+    && ok "the section's subspace is removed, so the run leaves no tree behind" \
+    || bad "could not remove $V15: $(head -2 $R/rm.log)"
 
 if [ "$fail" = 0 ]; then echo "ALL FDB-BACKEND CHECKS PASSED"; exit 0; else echo "SOME FDB CHECKS FAILED"; exit 1; fi

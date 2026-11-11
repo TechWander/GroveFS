@@ -66,7 +66,7 @@ if [ "$BACKEND" = fdb ]; then
     fdb_ports_free "$META" "$DATA"
     # Every mount this suite makes lives under .migtest/mnt_*, so an early abort
     # cannot leave one attached; fdb_up chains its own server reaper onto this.
-    trap 'for d in .migtest/mnt_*; do [ -d "$d" ] && fusermount -u "$d" 2>/dev/null; done' EXIT
+    trap 'for d in .migtest/mnt_*; do [ -d "$d" ] && fusermount -u "$d" 2>/dev/null; done; fdb_drop_views .migtest/src .migtest/src/data "${VIEW1:-}" "${VIEW2:-}" "${VIEWA:-}" "${VIEWB:-}"' EXIT
     fdb_up .migtest/src "$VIEW1" "$META" "$DATA"
 else
     VIEW1=team; VIEW2=team; VIEWA=alpha; VIEWB=beta

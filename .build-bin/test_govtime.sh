@@ -97,7 +97,7 @@ else
     $Y data-server --listen $DATA --data-dir "$GROVEFS_HOME" > .govtime/data.log 2>&1 &
     DSP=$!
 fi
-cleanup(){ for d in .govtime/mnt_*; do fusermount -u "$d" 2>/dev/null; done; kp $MSP $DSP $FDB_MP $FDB_DP $(jobs -p); }
+cleanup(){ for d in .govtime/mnt_*; do fusermount -u "$d" 2>/dev/null; done; kp $MSP $DSP $FDB_MP $FDB_DP $(jobs -p); fdb_drop_views .govtime/home .govtime/home/data "${TEAM:-}"; }
 trap cleanup EXIT
 wait_port $META && wait_port $DATA && ok "meta/data servers up" || { bad "servers failed to start"; exit 1; }
 

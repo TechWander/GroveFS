@@ -629,6 +629,107 @@ fn fdb_readdir_pages_stitch_into_the_sqlite_listing() {
     println!("fdb_readdir_pages_stitch_into_the_sqlite_listing: 700 names, 7 chunk sizes + 20 resumes");
 }
 
+// ---- the checkpoint is a CACHE, not state ---------------------------------
+//
+// `readdir_page` keeps its `(parent, row)` -> name hints in the SERVER's memory.
+// A meta-server restart (or an idle-engine eviction) throws that map away while a
+// client is mid-enumeration, and the next page therefore arrives at a store that
+// has never seen the earlier ones. The contract that makes this safe is that a
+// hint only ever SHORTENS the scan: with no hint the page is produced by scanning
+// from row 0 and skipping `offset`, which is slower and exactly as correct. That
+// is a property no amount of same-process paging tests can pin — they all reuse
+// the store that laid the checkpoints.
+//
+// So this test walks the directory through a FRESH store per page: every page
+// after the first sees a cold cache, which is the restart case without the
+// flakiness of actually killing a process mid-`getdents`.
+#[test]
+fn fdb_readdir_pages_survive_a_cold_checkpoint_cache() {
+    let Some(file) = cluster_file() else {
+        eprintln!("SKIP fdb_cold_cache: no FDB cluster file (set GROVEFS_FDB_CLUSTER_FILE)");
+        return;
+    };
+    if !cluster_reachable(&file) {
+        eprintln!("SKIP fdb_cold_cache: cluster {} unreachable", file.display());
+        return;
+    }
+    let uri = format!("fdb://{}", file.display());
+    let nanos = std::time::UNIX_EPOCH.elapsed().map(|d| d.as_nanos()).unwrap_or(0);
+    let view: String = format!("cc{:x}.{:x}", std::process::id(), nanos)
+        .chars()
+        .take(20)
+        .collect();
+    let dr = format!("CC{:x}", nanos);
+
+    let dir = tempfile::tempdir().expect("sqlite base");
+    let sqlite = MetaStore::open_sqlite(dir.path(), &view, false).expect("open sqlite store");
+    let fdb = MetaStore::open_fdb(&uri, &view, false)
+        .unwrap_or_else(|e| panic!("open fdb view {view} against {}: {e}", file.display()));
+
+    // 311 names: not a multiple of the 32-row stride, so the last full page ends
+    // mid-stride and the resume that follows has to skip a partial stride.
+    for i in 0..311 {
+        let nm = format!("c{i:04}");
+        for s in [&sqlite, &fdb] {
+            s.create_node(ROOT_INO, &nm, false, Some(&dr), 0o644, 1000, 1000)
+                .unwrap_or_else(|e| panic!("create {nm}: {e}"));
+        }
+    }
+    let full: Vec<String> = sqlite.readdir(ROOT_INO).into_iter().map(|n| n.name).collect();
+    assert_eq!(full.len(), 311);
+
+    // (a) every page through a NEW store: 7 does not divide 32, so page starts
+    // land inside the stride window on most iterations.
+    let mut walked: Vec<String> = Vec::new();
+    let mut off = 0usize;
+    let mut opens = 0usize;
+    loop {
+        let fresh = MetaStore::open_fdb(&uri, &view, false)
+            .unwrap_or_else(|e| panic!("re-open view {view} at offset {off}: {e}"));
+        opens += 1;
+        let page: Vec<String> = fresh
+            .readdir_page(ROOT_INO, off, 7)
+            .into_iter()
+            .map(|n| n.name)
+            .collect();
+        if page.is_empty() {
+            break;
+        }
+        off += page.len();
+        walked.extend(page);
+        assert!(off <= 311, "cold-cache walk ran past the end at offset {off}");
+    }
+    assert_eq!(walked, full, "a cold cache must reassemble the listing");
+    assert!(opens >= 44, "one open per page, but only {opens} happened");
+
+    // (b) hints laid by one store, read by another: the resume must not trust a
+    // hint it did not lay, and whether it finds one or not the window is the same.
+    assert_eq!(fdb.readdir_page(ROOT_INO, 0, 300).len(), 300);
+    let other = MetaStore::open_fdb(&uri, &view, false).expect("second store");
+    for off in [3usize, 32, 33, 96, 160, 299, 310] {
+        let want = &full[off..(off + 5).min(full.len())];
+        let got: Vec<String> = other
+            .readdir_page(ROOT_INO, off, 5)
+            .into_iter()
+            .map(|n| n.name)
+            .collect();
+        assert_eq!(got, want, "resume at {off} through a second store");
+    }
+
+    if let MetaStore::Fdb(f) = &fdb {
+        release_ledger(&fdb);
+        let rep = f
+            .remove_view()
+            .unwrap_or_else(|e| panic!("remove scratch view {view}: {e}"));
+        assert_eq!((rep.unbooked, rep.still_held), (0, 0), "cold-cache test leaked bookings: {rep:?}");
+        assert!(
+            !grovefs::fdb_store::FdbStore::subspace_exists(&uri, &view).unwrap_or(true),
+            "cold-cache test left the subspace in {view}"
+        );
+    }
+    println!("fdb_readdir_pages_survive_a_cold_checkpoint_cache: 311 names, {opens} fresh stores");
+}
+
 // ---- the third arm --------------------------------------------------------
 //
 // `docs/fdb-keyspace.md` §14 registers the harness P6 asks for as a THREE-way
@@ -908,5 +1009,263 @@ fn fdb_remove_view_unwinds_the_shared_ledger_exactly_once() {
 
     println!(
         "fdb_remove_view: 3 views sharing one content key — unwind counted 1 holder at a time, deleted the row at zero, re-run was a no-op"
+    );
+}
+
+// ---- a replace-import must not leave dead rows in the SHARED ledger --------
+//
+// `refs` is the only subspace every view writes to, so a row left there outlives
+// the tree that booked it: no view can release it any more, and
+// `ledger_holders` cannot even report it — an absent key reads as 0 by design,
+// so a leaked 0 and a clean absence are the same number through that door. What
+// an operator sees instead is a `refs` subspace with keys and no tree beside it,
+// which is exactly what `view scan` showed after a run of the parameterised
+// suites. The path that produced it was `import --replace`: it released the old
+// tree's units with a bare decrement, while `unlink` and `remove_view` delete the
+// row at zero. This pins the reproduction end to end — book, replace-import over
+// the only holder, book again, replace again — and asserts the ledger is EMPTY,
+// not merely that it reads 0.
+#[test]
+fn fdb_replace_import_deletes_the_ledger_row_it_emptied() {
+    let Some(file) = cluster_file() else {
+        eprintln!("SKIP fdb_import_ledger: no FDB cluster file (set GROVEFS_FDB_CLUSTER_FILE)");
+        return;
+    };
+    if !cluster_reachable(&file) {
+        eprintln!("SKIP fdb_import_ledger: cluster {} unreachable", file.display());
+        return;
+    }
+    let uri = format!("fdb://{}", file.display());
+    let nanos = std::time::UNIX_EPOCH.elapsed().map(|d| d.as_nanos()).unwrap_or(0);
+    let view: String = format!("ri{:x}.{:x}", std::process::id(), nanos)
+        .chars()
+        .take(20)
+        .collect();
+    // Unique refs: the ledger is cluster-wide and shared with the tests running
+    // in parallel, so the assertions below can only name refs this test booked.
+    let (dr_a, dr_b) = (format!("RPA{:x}", nanos), format!("RPB{:x}", nanos));
+
+    let fdb = MetaStore::open_fdb(&uri, &view, false)
+        .unwrap_or_else(|e| panic!("open fdb view {view} against {}: {e}", file.display()));
+
+    // A dump carrying nothing but the root row: "the same tree, without the
+    // file that held the bytes". 0755 = 493.
+    let dir = tempfile::tempdir().expect("dump dir");
+    let dump = dir.path().join("root.jsonl");
+    std::fs::write(
+        &dump,
+        format!(
+            "{{\"format\":\"{}\",\"version\":{},\"view\":\"{}\",\"kind\":\"physical\"}}\n\
+             {{\"id\":1,\"ino\":1,\"parent_id\":null,\"name\":\"/\",\"is_dir\":1,\"mode\":493}}\n",
+            grovefs::meta::VIEW_EXPORT_FORMAT,
+            grovefs::meta::VIEW_EXPORT_VERSION,
+            view
+        ),
+    )
+    .expect("write dump");
+
+    let f = match &fdb {
+        MetaStore::Fdb(f) => f,
+        _ => unreachable!("open_fdb returns the Fdb arm"),
+    };
+    let row_of = |dr: &str| -> Option<i64> {
+        f.ledger_rows()
+            .unwrap_or_else(|e| panic!("ledger inventory: {e}"))
+            .into_iter()
+            .find(|(d, _)| d == dr)
+            .map(|(_, n)| n)
+    };
+
+    // (1) Book one unit: a file naming a content key.
+    fdb.create_node(ROOT_INO, "a", false, Some(&dr_a), 0o644, 1000, 1000)
+        .expect("create a");
+    assert_eq!(row_of(&dr_a), Some(1), "create must book exactly one unit");
+
+    // (2) Replace the tree with one that no longer names it. The old tree was
+    // the ONLY holder, so the row must disappear rather than sit at 0.
+    let st = f.import_jsonl(&dump, true).expect("replace-import over a");
+    assert!(st.replaced && st.nodes == 1, "{st:?}");
+    assert_eq!(
+        row_of(&dr_a),
+        None,
+        "replace-import left the emptied ledger row behind — a row no tree can release"
+    );
+
+    // (3) A second book + replace, the shape that turned the leak into -1: with
+    // the row already at 0 a further decrement could not be observed at all.
+    fdb.create_node(ROOT_INO, "b", false, Some(&dr_b), 0o644, 1000, 1000)
+        .expect("create b");
+    assert_eq!(row_of(&dr_b), Some(1), "second create must book one unit");
+    f.import_jsonl(&dump, true).expect("second replace-import");
+    assert_eq!(row_of(&dr_b), None, "second replace leaked its ref");
+    assert_eq!(row_of(&dr_a), None, "the first ref came back");
+
+    // Teardown: the view holds only the root, so nothing is booked and the
+    // subspace goes away whole.
+    let rep = f
+        .remove_view()
+        .unwrap_or_else(|e| panic!("remove scratch view {view}: {e}"));
+    assert_eq!(
+        (rep.unbooked, rep.still_held),
+        (0, 0),
+        "the emptied view should have had nothing left to release: {rep:?}"
+    );
+    assert_eq!(row_of(&dr_a), None, "ref A back after the view went");
+    assert_eq!(row_of(&dr_b), None, "ref B back after the view went");
+    assert!(
+        !grovefs::fdb_store::FdbStore::subspace_exists(&uri, &view).unwrap_or(true),
+        "import test left the subspace in {view}"
+    );
+    println!(
+        "fdb_replace_import: book -> replace -> book -> replace, ledger rows deleted at zero"
+    );
+}
+
+// ---- an import must refuse a CORPSE (keys, but no root row) ----------------
+//
+// `view create` refuses that shape by name, because seeding a root on the
+// leftovers resurrects a corpse as a mountable tree whose inode table predates
+// the caller. `import` used to accept it: measured on the dev cluster, importing
+// a one-node dump onto a 9-key corpse returned rc 0, the view went from 9 keys /
+// 1 entry to 13 keys / 2 entries, and BOTH refs stayed in the shared ledger —
+// i.e. the tree the dump described inherited the old tree's `'r` rows and their
+// bookings. Nothing can mount a corpse, so no later teardown would ever look for
+// those rows again: the old bytes stay booked to this view forever.
+//
+// The guard asks the cluster the SAME question `view scan` asks (`KIND=corpse`:
+// keys AND no root row), inside the transaction that would do the import, and
+// `--replace` does not bypass it — replacing presupposes a root row for the dump
+// to replace. This pins both doors, the no-write property, and the exit the
+// refusal names: `view rm --base` on a corpse still hands the old booking back.
+#[test]
+fn fdb_import_refuses_a_corpse() {
+    let Some(file) = cluster_file() else {
+        eprintln!("SKIP fdb_import_corpse: no FDB cluster file (set GROVEFS_FDB_CLUSTER_FILE)");
+        return;
+    };
+    if !cluster_reachable(&file) {
+        eprintln!("SKIP fdb_import_corpse: cluster {} unreachable", file.display());
+        return;
+    }
+    let uri = format!("fdb://{}", file.display());
+    let nanos = std::time::UNIX_EPOCH.elapsed().map(|d| d.as_nanos()).unwrap_or(0);
+    let view: String = format!("cp{:x}.{:x}", std::process::id(), nanos)
+        .chars()
+        .take(20)
+        .collect();
+    // Unique refs: the ledger is shared with every other test on this cluster, so
+    // the assertions can only name refs this test booked.
+    let (dr_a, dr_b) = (format!("CPA{:x}", nanos), format!("CPB{:x}", nanos));
+
+    let fdb = MetaStore::open_fdb(&uri, &view, false)
+        .unwrap_or_else(|e| panic!("open fdb view {view} against {}: {e}", file.display()));
+    fdb.create_node(ROOT_INO, "a", false, Some(&dr_a), 0o644, 1000, 1000)
+        .expect("create a");
+
+    // The dump names a different content key, so "the refused import wrote
+    // nothing" is visible in the ledger too, not only in the key count.
+    let dir = tempfile::tempdir().expect("dump dir");
+    let dump = dir.path().join("b.jsonl");
+    std::fs::write(
+        &dump,
+        format!(
+            "{{\"format\":\"{}\",\"version\":{},\"view\":\"{}\",\"kind\":\"physical\"}}\n\
+             {{\"id\":1,\"ino\":1,\"parent_id\":null,\"name\":\"/\",\"is_dir\":1,\"mode\":493}}\n\
+             {{\"id\":2,\"ino\":2,\"parent_id\":1,\"name\":\"g\",\"is_dir\":0,\"data_ref\":\"{}\",\"mode\":420}}\n",
+            grovefs::meta::VIEW_EXPORT_FORMAT,
+            grovefs::meta::VIEW_EXPORT_VERSION,
+            view,
+            dr_b
+        ),
+    )
+    .expect("write dump");
+
+    let f = match &fdb {
+        MetaStore::Fdb(f) => f,
+        _ => unreachable!("open_fdb returns the Fdb arm"),
+    };
+    let row_of = |dr: &str| -> Option<i64> {
+        f.ledger_rows()
+            .unwrap_or_else(|e| panic!("ledger inventory: {e}"))
+            .into_iter()
+            .find(|(d, _)| d == dr)
+            .map(|(_, n)| n)
+    };
+    let keys_of = |name: &str| -> u64 {
+        grovefs::fdb_store::list_subspaces(&uri)
+            .unwrap_or_else(|e| panic!("inventory: {e}"))
+            .into_iter()
+            .find(|s| s.name == name)
+            .map(|s| s.keys)
+            .unwrap_or(0)
+    };
+
+    assert_eq!(row_of(&dr_a), Some(1), "create must book exactly one unit");
+    let keys_before = keys_of(&view);
+    assert!(keys_before >= 4, "a one-file tree should hold more than a handful of keys: {keys_before}");
+
+    // The corpse, built exactly the way a partial `clearrange` of the `'n` family
+    // builds one: the root row is gone, every other family is untouched.
+    {
+        let trx = f.db().create_trx().expect("create trx");
+        trx.clear(&f.keys().name(grovefs::fdb_store::ROOT_PARENT, ""));
+        // The crate's transaction wrapper blocks on `commit()` the same way.
+        futures::executor::block_on(trx.commit()).expect("commit the root-row clear");
+    }
+    assert!(
+        !grovefs::fdb_store::FdbStore::subspace_exists(&uri, &view).unwrap_or(true),
+        "clearing the root row must make the subspace unmountable"
+    );
+    assert_eq!(
+        keys_of(&view),
+        keys_before - 1,
+        "the damage must drop the root row and nothing else"
+    );
+    assert!(
+        grovefs::fdb_store::FdbStore::subspace_has_keys(&uri, &view).unwrap_or(false),
+        "the corpse should still hold keys"
+    );
+
+    // Both doors: plain import and `--replace`.
+    for replace in [false, true] {
+        let msg = match f.import_jsonl(&dump, replace) {
+            Ok(st) => panic!("import (replace={replace}) onto a corpse was ACCEPTED: {st:?}"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("corpse"),
+            "the refusal must name the shape it found: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("--name {view} --base")),
+            "the refusal must point at the exit that clears it: {msg}"
+        );
+    }
+    assert_eq!(
+        keys_of(&view),
+        keys_before - 1,
+        "a refused import wrote keys into the corpse"
+    );
+    assert_eq!(row_of(&dr_a), Some(1), "a refused import moved the old booking");
+    assert_eq!(row_of(&dr_b), None, "a refused import booked the dump's ref");
+
+    // The exit the refusal names, exercised rather than assumed: `view rm --base`
+    // still works on a corpse (its teardown predicate is the `'r` family, not the
+    // root row), and it is the only path that hands the old booking back.
+    let rep = f
+        .remove_view()
+        .unwrap_or_else(|e| panic!("remove corpse view {view}: {e}"));
+    assert_eq!(
+        (rep.unbooked, rep.still_held),
+        (1, 0),
+        "removing the corpse should have released its one booking: {rep:?}"
+    );
+    assert_eq!(row_of(&dr_a), None, "the corpse's booking survived its removal");
+    assert!(
+        !grovefs::fdb_store::FdbStore::subspace_exists(&uri, &view).unwrap_or(true),
+        "the corpse's subspace survived its removal"
+    );
+    println!(
+        "fdb_import_corpse: refused with and without --replace, wrote nothing, `view rm --base` still unbooked it"
     );
 }

@@ -123,7 +123,12 @@ sleep 1.5
 # every listener the suite made, and hands the next suite a stranger's deployment.
 cleanup(){ fusermount -u .itest/mnt .itest/mnt_r .itest/mnt_v 2>/dev/null
            kp ${MP:-} ${MSP:-} ${DSP:-} ${RP:-} ${VP:-} ${FDB_MP:-} ${FDB_DP:-}
-           wk ${MP:-} ${MSP:-} ${DSP:-} ${RP:-} ${VP:-} ${FDB_MP:-} ${FDB_DP:-}; }
+           wk ${MP:-} ${MSP:-} ${DSP:-} ${RP:-} ${VP:-} ${FDB_MP:-} ${FDB_DP:-}
+           # Both names this suite can leave in the cluster: the bootstrap subspace
+           # `fdb_up` provisioned and the one the move created (import is the only
+           # other way to make a tree here).
+           fdb_drop_views .itest/fdbhome .itest/fdbhome/data "${BOOT:-}"
+           fdb_drop_views .itest/fdbhome .itest/fdbhome/data "${VIEW:-}"; }
 trap cleanup EXIT
 M=.itest/mnt
 if [ "$BACKEND" = fdb ]; then
