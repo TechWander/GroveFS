@@ -42,11 +42,11 @@ pub const STATS_INO: u64 = u64::MAX - 1;
 /// and never reach it. A resume at this exact offset means "listing done" -> EOF.
 const STATS_COOKIE: u64 = i64::MAX as u64;
 
-/// How long a queued `CREATE` waits for the group commit before answering EIO
-/// itself. Generous (a batch is one local commit) but bounded: a panicking
-/// leader or a mount torn down under a queued request must not wedge a FUSE
-/// worker forever.
-const CREATE_GROUP_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a queued name operation (`CREATE`, `UNLINK`) waits for the group
+/// commit before answering EIO itself. Generous (a batch is one local commit)
+/// but bounded: a panicking leader or a mount torn down under a queued request
+/// must not wedge a FUSE worker forever.
+const GROUP_COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A `CREATE` waiting for the group commit to carry it.
 struct PendingCreate {
@@ -77,7 +77,7 @@ impl CreateSlot {
     }
 
     fn wait(&self) {
-        let deadline = std::time::Instant::now() + CREATE_GROUP_TIMEOUT;
+        let deadline = std::time::Instant::now() + GROUP_COMMIT_TIMEOUT;
         let mut done = self.done.lock();
         while !*done {
             let now = std::time::Instant::now();
@@ -89,6 +89,50 @@ impl CreateSlot {
             }
             self.cv.wait_for(&mut done, deadline - now);
         }
+    }
+}
+
+/// An `UNLINK`/`RMDIR` waiting for the group commit to carry it.
+struct PendingUnlink {
+    parent: i64,
+    name: String,
+    slot: Arc<UnlinkSlot>,
+}
+
+/// Hand-off between a queued delete and the worker that commits it.
+///
+/// The OUTCOME travels back instead of the reply: the worker that received the
+/// request still calls `backend.remove` and answers, so only the metadata
+/// commit is shared and object removal keeps running in parallel across
+/// workers.
+struct UnlinkSlot {
+    reply: Mutex<Option<ReplyEmpty>>,
+    done: Mutex<Option<Result<Option<String>, Errno>>>,
+    cv: Condvar,
+}
+
+impl UnlinkSlot {
+    fn deliver(&self, out: Result<Option<String>, Errno>) {
+        *self.done.lock() = Some(out);
+        self.cv.notify_all();
+    }
+
+    /// The batch's answer, or `None` if the group commit missed the deadline
+    /// (the waiter already answered EIO for itself).
+    fn wait(&self) -> Option<Result<Option<String>, Errno>> {
+        let deadline = std::time::Instant::now() + GROUP_COMMIT_TIMEOUT;
+        let mut done = self.done.lock();
+        while done.is_none() {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                if let Some(reply) = self.reply.lock().take() {
+                    reply.error(Errno::EIO);
+                }
+                return None;
+            }
+            self.cv.wait_for(&mut done, deadline - now);
+        }
+        done.take()
     }
 }
 
@@ -122,6 +166,17 @@ pub struct GroveFS {
     /// per-op store (PG / FDB / remote) keeps the plain one-commit-per-create
     /// path: grouping there would serialize what is already parallel.
     batch_creates: bool,
+    /// Group-commit queue for `UNLINK`/`RMDIR` (see `drain_unlinks`), the delete
+    /// twin of `create_q`. Same reason: with the local single-writer engine every
+    /// delete otherwise pays its own commit, so a parallel `rm` only queues
+    /// behind the same serialized write and the rate stays flat as workers are
+    /// added (measured: 8 workers at 5.3k files/s, and the wall time was exactly
+    /// the serialized `meta.unlink` time).
+    unlink_q: Mutex<Vec<PendingUnlink>>,
+    /// True while one worker is draining `unlink_q`; late arrivals just queue.
+    unlink_leader: std::sync::atomic::AtomicBool,
+    /// Whether the store can commit a burst of deletes as one transaction.
+    batch_unlinks: bool,
     /// When set, every mutating operation is refused with EROFS. This is a
     /// filesystem-side safety net that mirrors the kernel `MS_RDONLY` mount flag
     /// (both are applied for `--ro`), so the view stays read-only even if the
@@ -228,6 +283,7 @@ impl GroveFS {
         bw_write_bps: u64,
     ) -> Self {
         let batch_creates = meta.supports_create_batch();
+        let batch_unlinks = meta.supports_unlink_batch();
         Self {
             meta,
             backend,
@@ -236,6 +292,9 @@ impl GroveFS {
             create_q: Mutex::new(Vec::new()),
             create_leader: std::sync::atomic::AtomicBool::new(false),
             batch_creates,
+            unlink_q: Mutex::new(Vec::new()),
+            unlink_leader: std::sync::atomic::AtomicBool::new(false),
+            batch_unlinks,
             readonly,
             content_ro,
             strict,
@@ -588,6 +647,84 @@ impl GroveFS {
                 }
             }
             p.slot.finish();
+        }
+    }
+
+    /// Hand an `UNLINK`/`RMDIR` to the group commit: enqueue it, then either
+    /// drain the queue (this worker happened to win the leader flag) or wait for
+    /// the leader already draining to carry it.
+    ///
+    /// A lone delete is its own leader and its batch has exactly one item, so a
+    /// single-threaded `rm` pays no extra latency: grouping only happens when
+    /// deleters are actually concurrent — which is exactly where the serialized
+    /// commit hurts (see `unlink_q`).
+    fn submit_unlink(&self, parent: i64, name: String, reply: ReplyEmpty) {
+        let slot = Arc::new(UnlinkSlot {
+            reply: Mutex::new(Some(reply)),
+            done: Mutex::new(None),
+            cv: Condvar::new(),
+        });
+        self.unlink_q.lock().push(PendingUnlink {
+            parent,
+            name,
+            slot: slot.clone(),
+        });
+        if !self
+            .unlink_leader
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.drain_unlinks();
+        }
+        let Some(out) = slot.wait() else {
+            // Timed out: `wait` already answered EIO for this request.
+            return;
+        };
+        let Some(reply) = slot.reply.lock().take() else {
+            return;
+        };
+        match out {
+            Ok(Some(k)) => {
+                // Last name for the key: drop its bytes HERE, on the worker that
+                // received the request, so object removal stays parallel.
+                stats::count(stats::Counter::GcFreed, 1);
+                let _ = self.backend.remove(&k);
+                reply.ok();
+            }
+            Ok(None) => reply.ok(),
+            Err(e) => reply.error(e),
+        }
+    }
+
+    /// Commit queued deletes, one metadata transaction per round trip through the
+    /// queue, until it is empty (late arrivals join the next round).
+    fn drain_unlinks(&self) {
+        loop {
+            let batch = {
+                let mut q = self.unlink_q.lock();
+                if q.is_empty() {
+                    // Clear the flag while still holding the queue lock: a pusher
+                    // serialized after this point observes `false` and takes over,
+                    // so no item can sit in a queue that has no leader.
+                    self.unlink_leader
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    return;
+                }
+                std::mem::take(&mut *q)
+            };
+            self.commit_unlinks(batch);
+        }
+    }
+
+    /// One transaction for the whole batch; every request keeps its own outcome
+    /// (a missing name or a non-empty directory costs only that request).
+    fn commit_unlinks(&self, batch: Vec<PendingUnlink>) {
+        let items: Vec<(i64, &str)> = batch
+            .iter()
+            .map(|p| (p.parent, p.name.as_str()))
+            .collect();
+        let results = self.meta.unlink_nodes_batch(&items);
+        for (p, res) in batch.iter().zip(results) {
+            p.slot.deliver(res.map_err(Self::err_to_errno));
         }
     }
 
@@ -1585,6 +1722,10 @@ impl fuser::Filesystem for GroveFS {
             return;
         }
         let name_str = name.to_string_lossy().to_string();
+        if self.batch_unlinks {
+            self.submit_unlink(parent.0 as i64, name_str, reply);
+            return;
+        }
         match self.meta.unlink(parent.0 as i64, &name_str) {
             Ok(gced_key) => {
                 if let Some(k) = gced_key {

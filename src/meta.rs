@@ -374,6 +374,26 @@ pub trait MetaProvider: Send + Sync {
     }
     fn link_node(&self, src_ino: i64, new_parent: i64, new_name: &str) -> Result<i64, MetaError>;
     fn unlink(&self, parent: i64, name: &str) -> Result<Option<String>, MetaError>;
+    /// Whether [`Self::unlink_nodes_batch`] really amortizes the commit. Same
+    /// reasoning as [`Self::supports_create_batch`]: for a store whose writes are
+    /// already parallel, grouping would turn N parallel deletes into N
+    /// *sequential* ones.
+    fn supports_unlink_batch(&self) -> bool {
+        false
+    }
+    /// Remove several names, returning one result per item in input order.
+    ///
+    /// The delete-side counterpart of [`Self::create_nodes_batch`]. The local
+    /// engine serializes every `unlink` behind one write lock and one commit, so
+    /// without grouping a burst of `rm` costs a full commit per name and the
+    /// rate stays flat however many FUSE workers join. A failing item stays in
+    /// its own slot (`ENOENT`, `ENOTEMPTY`) and never fails its siblings.
+    fn unlink_nodes_batch(
+        &self,
+        items: &[(i64, &str)],
+    ) -> Vec<Result<Option<String>, MetaError>> {
+        items.iter().map(|(p, n)| self.unlink(*p, n)).collect()
+    }
     fn rename(
         &self,
         parent: i64,
