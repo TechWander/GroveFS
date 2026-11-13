@@ -3,7 +3,7 @@ name = "grovefs"
 version = "0.1.0"
 edition = "2021"
 description = "A user-view FUSE filesystem with pluggable storage backend, no NFS"
-license = "MIT"
+license = "Apache-2.0"
 
 # The `[[bin]]` is the Linux FUSE mount + cluster server. The native clients
 # (see the sibling `grovefs-client` repo: `win/` WinFsp, `mac/` macOS skeleton)

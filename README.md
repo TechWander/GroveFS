@@ -870,7 +870,7 @@ SKIP_BENCH=1 bash .build-bin/run_all.sh   # 跳过吞吐基准（纯功能回归
 
 ## 许可
 
-MIT。
+Apache License 2.0（见仓库根目录 `LICENSE`）。
 
 ---
 
@@ -1571,4 +1571,4 @@ Where numbers are not measured, no benefit is claimed; wherever there is a limit
 
 ## License
 
-MIT.
+Apache License 2.0 (see the `LICENSE` file at the repository root).
