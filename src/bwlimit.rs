@@ -103,6 +103,33 @@ pub fn parse_rate(s: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("rate '{s}' overflows u64 bytes/second"))
 }
 
+/// Parse a plain SIZE in bytes (not a rate): a byte count with an optional
+/// `K`/`M`/`G` suffix (1024-based, case-insensitive), e.g. `16777216`, `16M`,
+/// `1G`. Unlike [`parse_rate`] `0` is REFUSED — a zero stripe is meaningless
+/// where a zero rate means "unlimited". Anything else malformed (decimals,
+/// unknown suffixes, overflow) is a hard error, because a silently ignored
+/// operator-supplied size is worse than a refusal.
+pub fn parse_size_bytes(s: &str) -> Result<u64, String> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Err("empty size (expected bytes, or a K/M/G suffix — e.g. 16M)".to_string());
+    }
+    let (digits, mult) = match t.as_bytes()[t.len() - 1] {
+        b'k' | b'K' => (&t[..t.len() - 1], 1u64 << 10),
+        b'm' | b'M' => (&t[..t.len() - 1], 1u64 << 20),
+        b'g' | b'G' => (&t[..t.len() - 1], 1u64 << 30),
+        _ => (t, 1u64),
+    };
+    let n: u64 = digits.trim().parse().map_err(|_| {
+        format!("invalid size '{s}' (expected bytes, or a K/M/G suffix — e.g. 16M)")
+    })?;
+    if n == 0 {
+        return Err(format!("size '{s}' is zero (must be at least 1 byte)"));
+    }
+    n.checked_mul(mult)
+        .ok_or_else(|| format!("size '{s}' overflows u64 bytes"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,6 +148,24 @@ mod tests {
     fn parse_rate_refuses_garbage_and_overflow() {
         for bad in ["", "abc", "12Z", "1.5M", "-4", "M", "99999999999999999999G"] {
             assert!(parse_rate(bad).is_err(), "{bad:?} should be refused");
+        }
+    }
+
+    #[test]
+    fn parse_size_bytes_accepts_plain_and_suffixed_forms() {
+        assert_eq!(parse_size_bytes("16777216"), Ok(16 << 20));
+        assert_eq!(parse_size_bytes("512k"), Ok(512 << 10));
+        assert_eq!(parse_size_bytes("16M"), Ok(16 << 20));
+        assert_eq!(parse_size_bytes("2g"), Ok(2 << 30));
+        assert_eq!(parse_size_bytes(" 4M "), Ok(4 << 20));
+        assert_eq!(parse_size_bytes("1"), Ok(1));
+    }
+
+    #[test]
+    fn parse_size_bytes_refuses_zero_garbage_and_overflow() {
+        // `0` is refused here but valid for parse_rate (where it means "off").
+        for bad in ["", "0", "0M", "abc", "12Z", "1.5M", "-4", "M", "99999999999999999999G"] {
+            assert!(parse_size_bytes(bad).is_err(), "{bad:?} should be refused");
         }
     }
 

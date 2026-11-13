@@ -156,6 +156,22 @@ pub trait StorageBackend: Send + Sync {
         uuid.to_string()
     }
 
+    /// A stable identity for this member, used by [`ShardedBackend`] to pin
+    /// logical chunk placement to WHO a member is rather than to its position
+    /// in the `--data-servers` list. A remote data-server reports the
+    /// `--member-id` it was started with (carried in the `OP_OPEN` ack), so
+    /// re-ordering the address list can no longer misroute chunks, and replacing
+    /// a disk behind the same `--member-id` keeps its data addressable.
+    ///
+    /// `None` means "no identity advertised" — the member is placed purely by
+    /// list position (the historical behavior). A stripe is only identity-pinned
+    /// when EVERY member reports a distinct key; a mix, or duplicates, falls
+    /// back to positional placement. The default is `None`, so single-object and
+    /// local backends keep behaving exactly as before.
+    fn placement_key(&self) -> Option<u64> {
+        None
+    }
+
     /// Ensure an object exists (empty). Idempotent.
     fn create(&self, key: &str) -> io::Result<()>;
 
@@ -245,4 +261,4 @@ pub fn open_local_roots(roots: &[std::path::PathBuf]) -> io::Result<Box<dyn Stor
 }
 
 #[cfg(feature = "native")]
-pub use sharded::ShardedBackend;
+pub use sharded::{ShardedBackend, STRIPE_BYTES};

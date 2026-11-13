@@ -624,6 +624,11 @@ fn resolve_remote(
         .map(|b| b as Arc<dyn crate::backend::StorageBackend>)
         .collect();
     let single = concrete.len() == 1;
+    // The default stripe is fine here and needs no `--stripe-bytes` knob:
+    // `du` only measures, so every size comes from `len_strict`, which decodes
+    // each object's own stripe from its `s<N>:<stripe>:<uuid>` key. `self.stripe`
+    // on this backend is used only by `new_key` (a WRITE path `du` never takes),
+    // so the constructor value is inert regardless of how the tree was written.
     let sharded: Arc<crate::backend::ShardedBackend> =
         Arc::new(crate::backend::ShardedBackend::with_default_stripe(members));
 

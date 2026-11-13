@@ -80,6 +80,12 @@ pub struct RemoteBackend {
     /// `fence_epoch`) and return it; invoked once when the data-server fences a
     /// write. Defaults to a no-op returning the current value.
     fence_refresh: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// The member id this data-server reported in its `OP_OPEN` ack, captured on
+    /// the first successful handshake (the id is stable, so later reconnects are
+    /// ignored). `u64::MAX` means the server was started without `--member-id`
+    /// and therefore advertises no identity — [`Self::placement_key`] then
+    /// returns `None` and a stripe places this member by list position.
+    member_id: std::sync::OnceLock<u64>,
 }
 
 impl RemoteBackend {
@@ -118,6 +124,7 @@ impl RemoteBackend {
             reconnect_backoff: Duration::from_millis(150),
             fence_epoch: Arc::new(AtomicU64::new(0)),
             fence_refresh: Arc::new(|| 0),
+            member_id: std::sync::OnceLock::new(),
         };
         // Probe once: TCP connect + OP_OPEN handshake, so mount fails fast on a
         // dead or unauthorized server.
@@ -207,7 +214,15 @@ impl RemoteBackend {
                     proto::put_key(&mut body, &self.api_key);
                     let mut s = s;
                     match Self::call(&mut s, proto::OP_OPEN, &body) {
-                        Ok((0, _, _)) => return Ok((s, false)),
+                        Ok((0, val, _)) => {
+                            // Latch the server's stable member id from the ack.
+                            // First handshake wins; the value never changes, so
+                            // reconnects harmlessly fail the `set` and are
+                            // dropped. `u64::MAX` = server started with no
+                            // `--member-id` (positional placement).
+                            let _ = self.member_id.set(val);
+                            return Ok((s, false));
+                        }
                         Ok((EACCES, _, reason)) => {
                             let why =
                                 refusal_text(&reason, "data-server rejected the access token");
@@ -566,6 +581,18 @@ impl RemoteBackend {
 }
 
 impl StorageBackend for RemoteBackend {
+    /// Report the member id this data-server carried in its `OP_OPEN` ack, so a
+    /// [`crate::backend::ShardedBackend`] can pin chunk placement to this
+    /// server's identity instead of its position in `--data-servers`. `None`
+    /// when the server runs without `--member-id` (`u64::MAX` sentinel), which
+    /// keeps the historical positional placement.
+    fn placement_key(&self) -> Option<u64> {
+        self.member_id
+            .get()
+            .copied()
+            .filter(|v| *v != proto::NO_MEMBER_ID)
+    }
+
     fn create(&self, key: &str) -> io::Result<()> {
         let mut body = Vec::new();
         proto::put_key(&mut body, key);

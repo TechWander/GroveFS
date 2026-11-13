@@ -71,6 +71,13 @@ pub const OP_FENCE: u8 = 10;
 /// contributes `0u64` (non-existent == zero size) rather than aborting the batch.
 pub const OP_BATCH_LEN: u8 = 11;
 
+/// Sentinel member id carried in the `OP_OPEN` ack's `VAL` field when the
+/// data-server was started WITHOUT `--member-id`. A client reading it reports
+/// `placement_key() == None`, so a stripe falls back to positional placement
+/// (the historical behavior). Any real `--member-id` (including `0`) is a valid
+/// identity; only this reserved value means "unconfigured".
+pub const NO_MEMBER_ID: u64 = u64::MAX;
+
 /// REMOTE CONTROL PLANE (governance), served by `meta-server --control-listen`.
 /// One request = one frame = one governance call; the connection carries no
 /// session state, so an operator on any machine needs nothing but the address
