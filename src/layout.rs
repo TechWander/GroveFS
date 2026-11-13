@@ -1159,6 +1159,12 @@ impl MetaProvider for LayoutMeta {
         true
     }
 
+    /// The lens adds no state of its own to a read; size the inner store's pool
+    /// so a `--layout` mount gets the same read concurrency as a plain one.
+    fn set_read_pool(&self, n: usize) {
+        self.inner.set_read_pool(n)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn create_node(
         &self,

@@ -29,7 +29,7 @@ cleanup() {
 trap cleanup EXIT
 
 rm -rf "$ROOT"; mkdir -p "$ROOT/home" "$ROOT/mnt"
-"$BIN" view --meta-dir "$ROOT/home" create --view v1 >/dev/null || { echo VIEW_FAILED; exit 1; }
+"$BIN" view --home "$ROOT/home" create --view v1 >/dev/null || { echo VIEW_FAILED; exit 1; }
 
 # arm <name> <python-body>
 arm() {

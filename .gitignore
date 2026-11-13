@@ -85,6 +85,10 @@
 /.fdb3bench/
 /.fdb3bench_*.out
 
+# Small-file A/B scaffolding: throwaway mounts, view homes, built binaries and
+# their captured reports. Rebuilt by re-running the recipes inside it.
+/.sfa/
+
 # Regenerable docs.html backups left behind by in-place rewrites.
 /docs-original.html
 /docs.html.bak.*

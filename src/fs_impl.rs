@@ -13,7 +13,7 @@
 //!   all per-inode state lives behind the locks below.
 
 use crate::backend::StorageBackend;
-use crate::meta::{LockType, MetaError, MetaProvider, NodeInfo, NodeKind};
+use crate::meta::{LockType, MetaError, MetaProvider, NewNode, NodeInfo, NodeKind};
 use fuser::{
     AccessFlags, BsdFileFlags, Errno, FileAttr, FileHandle, FileType, FopenFlags, Generation,
     INodeNo, InitFlags, IoctlFlags, KernelConfig, LockOwner, OpenAccMode, OpenFlags, RenameFlags,
@@ -21,7 +21,7 @@ use fuser::{
     ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyIoctl,
     ReplyLock, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
-use parking_lot::RwLock;
+use parking_lot::{Condvar, Mutex, RwLock};
 use std::ffi::OsStr;
 use std::io;
 use std::path::Path;
@@ -42,22 +42,86 @@ pub const STATS_INO: u64 = u64::MAX - 1;
 /// and never reach it. A resume at this exact offset means "listing done" -> EOF.
 const STATS_COOKIE: u64 = i64::MAX as u64;
 
-/// Handle table: maps an inode number to its object key so read/write don't
-/// re-query metadata each call.
+/// How long a queued `CREATE` waits for the group commit before answering EIO
+/// itself. Generous (a batch is one local commit) but bounded: a panicking
+/// leader or a mount torn down under a queued request must not wedge a FUSE
+/// worker forever.
+const CREATE_GROUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A `CREATE` waiting for the group commit to carry it.
+struct PendingCreate {
+    parent: i64,
+    name: String,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    key: Arc<str>,
+    slot: Arc<CreateSlot>,
+}
+
+/// Hand-off between a queued `CREATE` and the worker that commits it.
 ///
-/// We key by INODE, not by the open handle `fh`, because with `FUSE_WRITEBACK_CACHE`
-/// the kernel flushes dirty pages asynchronously — often *after* the writing
-/// process has closed the file (i.e. after our `release`). A per-handle table
-/// would already be torn down by then and reject the writeback with ENOENT.
-/// The inode->object binding is immutable for the inode's lifetime, so this map
-/// is populated on lookup/create/open and pruned in `forget` (the kernel's
-/// "inode is dead" signal).
+/// The reply lives here so exactly one side sends it — normally the leader, or
+/// the waiter itself if the leader vanished — and `done` wakes the waiter once
+/// the answer is out.
+struct CreateSlot {
+    reply: Mutex<Option<ReplyCreate>>,
+    done: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl CreateSlot {
+    fn finish(&self) {
+        *self.done.lock() = true;
+        self.cv.notify_all();
+    }
+
+    fn wait(&self) {
+        let deadline = std::time::Instant::now() + CREATE_GROUP_TIMEOUT;
+        let mut done = self.done.lock();
+        while !*done {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                if let Some(reply) = self.reply.lock().take() {
+                    reply.error(Errno::EIO);
+                }
+                return;
+            }
+            self.cv.wait_for(&mut done, deadline - now);
+        }
+    }
+}
+
 pub struct GroveFS {
     meta: Arc<dyn MetaProvider>,
     backend: Arc<dyn StorageBackend>,
+    /// Handle table: maps an inode number to its object key so read/write don't
+    /// re-query metadata each call.
+    ///
+    /// We key by INODE, not by the open handle `fh`, because with `FUSE_WRITEBACK_CACHE`
+    /// the kernel flushes dirty pages asynchronously — often *after* the writing
+    /// process has closed the file (i.e. after our `release`). A per-handle table
+    /// would already be torn down by then and reject the writeback with ENOENT.
+    /// The inode->object binding is immutable for the inode's lifetime, so this map
+    /// is populated on lookup/create/open and pruned in `forget` (the kernel's
+    /// "inode is dead" signal).
     ino_to_key: RwLock<std::collections::HashMap<u64, Arc<str>>>,
-    /// Last write-path mtime touch per inode, for the `write()` debounce below.
-    last_write_touch: RwLock<std::collections::HashMap<u64, SystemTime>>,
+    /// Last second the write path stamped per inode, for the `write()` gate below
+    /// (epoch seconds, the resolution the metadata stores keep).
+    last_write_touch: RwLock<std::collections::HashMap<u64, u64>>,
+    /// Group-commit queue for `CREATE` (see `drain_creates`): with the local
+    /// single-writer engine every create otherwise pays its own commit, so
+    /// concurrent creates would only queue behind the same serialized write and
+    /// the mount's create rate would stay flat as writers are added. Only used
+    /// when the store reports `supports_create_batch()`.
+    create_q: Mutex<Vec<PendingCreate>>,
+    /// True while one worker is draining `create_q`; late arrivals just queue
+    /// (and are carried by that drain, so they add no latency of their own).
+    create_leader: std::sync::atomic::AtomicBool,
+    /// Whether the store can commit a burst of creates as one transaction. A
+    /// per-op store (PG / FDB / remote) keeps the plain one-commit-per-create
+    /// path: grouping there would serialize what is already parallel.
+    batch_creates: bool,
     /// When set, every mutating operation is refused with EROFS. This is a
     /// filesystem-side safety net that mirrors the kernel `MS_RDONLY` mount flag
     /// (both are applied for `--ro`), so the view stays read-only even if the
@@ -163,11 +227,15 @@ impl GroveFS {
         bw_read_bps: u64,
         bw_write_bps: u64,
     ) -> Self {
+        let batch_creates = meta.supports_create_batch();
         Self {
             meta,
             backend,
             ino_to_key: RwLock::new(std::collections::HashMap::new()),
             last_write_touch: RwLock::new(std::collections::HashMap::new()),
+            create_q: Mutex::new(Vec::new()),
+            create_leader: std::sync::atomic::AtomicBool::new(false),
+            batch_creates,
             readonly,
             content_ro,
             strict,
@@ -325,12 +393,26 @@ impl GroveFS {
         Some(Arc::from(k.as_str()))
     }
 
-    /// Debounce gate for the write-path mtime touch: takes the timestamp lock
+    /// Same-second gate for the write-path mtime stamp: takes the stamp lock
     /// only to decide/record, and NEVER calls into `meta` while holding it —
     /// with --meta-server that would serialize every concurrent writer behind one
     /// synchronous RPC inside our own lock.
     fn should_touch_write(&self, ino: u64) -> bool {
-        should_touch_write(&mut self.last_write_touch.write(), ino, SystemTime::now())
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        should_touch_write(&mut self.last_write_touch.write(), ino, now_secs)
+    }
+
+    /// Record the mtime a just-created node already carries, so the first write
+    /// of a small file does not spend a second metadata transaction stamping the
+    /// very second the create stamped. `mtime` is epoch seconds — the resolution
+    /// the stores keep — so the write path can compare against it exactly.
+    fn note_created_mtime(&self, ino: u64, mtime: i64) {
+        self.last_write_touch
+            .write()
+            .insert(ino, mtime.max(0) as u64);
     }
 
     fn build_attr(&self, node: &NodeInfo) -> FileAttr {
@@ -400,6 +482,113 @@ impl GroveFS {
         }
         let end = off.saturating_add(size).min(b.len());
         b[off..end].to_vec()
+    }
+
+    /// Hand a `CREATE` to the group commit: enqueue it, then either drain the
+    /// queue (this worker happened to win the leader flag) or wait for the
+    /// leader already draining to carry it.
+    ///
+    /// A lone create is its own leader and its batch has exactly one item, so a
+    /// single-threaded `cp -r` pays no extra latency: grouping only happens when
+    /// writers are actually concurrent — which is exactly where the serialized
+    /// commit hurts (the create rate is otherwise flat from 1 to 16 writers).
+    fn submit_create(
+        &self,
+        parent: i64,
+        name: String,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        key: String,
+        reply: ReplyCreate,
+    ) {
+        let slot = Arc::new(CreateSlot {
+            reply: Mutex::new(Some(reply)),
+            done: Mutex::new(false),
+            cv: Condvar::new(),
+        });
+        self.create_q.lock().push(PendingCreate {
+            parent,
+            name,
+            mode,
+            uid,
+            gid,
+            key: Arc::from(key.as_str()),
+            slot: slot.clone(),
+        });
+        if !self
+            .create_leader
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.drain_creates();
+        }
+        slot.wait();
+    }
+
+    /// Commit queued creates, one metadata transaction per round trip through the
+    /// queue, until it is empty (late arrivals join the next round).
+    fn drain_creates(&self) {
+        loop {
+            let batch = {
+                let mut q = self.create_q.lock();
+                if q.is_empty() {
+                    // Clear the flag while still holding the queue lock: a pusher
+                    // serialized after this point observes `false` and takes over,
+                    // so no item can sit in a queue that has no leader.
+                    self.create_leader
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    return;
+                }
+                std::mem::take(&mut *q)
+            };
+            self.commit_creates(batch);
+        }
+    }
+
+    /// One transaction for the whole batch; every item gets its own reply (a
+    /// duplicate name costs only that request).
+    fn commit_creates(&self, batch: Vec<PendingCreate>) {
+        let specs: Vec<NewNode<'_>> = batch
+            .iter()
+            .map(|p| NewNode {
+                parent: p.parent,
+                name: &p.name,
+                is_dir: false,
+                data_ref: Some(p.key.as_ref()),
+                mode: p.mode,
+                uid: p.uid,
+                gid: p.gid,
+            })
+            .collect();
+        let results = self.meta.create_nodes_batch(&specs);
+        for (p, res) in batch.into_iter().zip(results) {
+            let Some(reply) = p.slot.reply.lock().take() else {
+                // The waiter gave up (see `CreateSlot::wait`) and already answered
+                // itself; never reply twice to one request.
+                continue;
+            };
+            match res {
+                Ok(node) => {
+                    self.cache_key(node.id as u64, &p.key);
+                    self.note_created_mtime(node.id as u64, node.mtime);
+                    let attr = self.build_attr(&node);
+                    // Echo the inode as the handle: IO resolves by inode, so fh is
+                    // opaque here. Returning it keeps the reply shape valid.
+                    reply.created(
+                        &self.short_ttl(),
+                        &attr,
+                        Generation(0),
+                        FileHandle(node.id as u64),
+                        FopenFlags::empty(),
+                    );
+                }
+                Err(e) => {
+                    let _ = self.backend.remove(&p.key);
+                    reply.error(Self::err_to_errno(e));
+                }
+            }
+            p.slot.finish();
+        }
     }
 
     fn err_to_errno(e: MetaError) -> Errno {
@@ -591,6 +780,16 @@ impl fuser::Filesystem for GroveFS {
             return;
         }
         let _t = stats::start(stats::Stage::MetaSetattr);
+        // Any of these mutates the stored row, so a row read *before* it cannot
+        // answer the reply. The close-time SETATTR the kernel sends under
+        // WRITEBACK_CACHE carries none of them (only `size`, echoing what the
+        // write already committed), which is exactly the case we want to serve
+        // from a single read.
+        let attrs_touched = mode.is_some() || uid.is_some() || gid.is_some();
+        // A node read by the `size` branch, reusable for the reply when nothing
+        // after it changed the row: without this the common small-file close
+        // pays two `meta.getattr` (one for the size decision, one for the reply).
+        let mut reusable: Option<crate::meta::NodeInfo> = None;
         if let Some(m) = mode {
             self.meta.set_mode(ino.0 as i64, m);
         }
@@ -624,12 +823,28 @@ impl fuser::Filesystem for GroveFS {
                     return;
                 }
                 Some(n) => {
+                    let mut changed = false;
                     if let Some(k) = &n.data_ref {
-                        if let Err(e) = self.backend.truncate(k, new_size) {
-                            reply.error(errno_of(&e));
-                            return;
+                        // With WRITEBACK_CACHE the kernel echoes the size it just
+                        // committed back through SETATTR at close. When that equals
+                        // the object's current length, both the ftruncate and the
+                        // mtime transaction would store what is already there —
+                        // pure amplification, and the dominant extra cost of a
+                        // create/write/close of one small file.
+                        let cur = self.backend.len(k).unwrap_or(new_size);
+                        if cur != new_size {
+                            if let Err(e) = self.backend.truncate(k, new_size) {
+                                reply.error(errno_of(&e));
+                                return;
+                            }
+                            if self.should_touch_write(ino.0) {
+                                self.meta.touch_mtime(ino.0 as i64);
+                            }
+                            changed = true;
                         }
-                        self.meta.touch_mtime(ino.0 as i64);
+                    }
+                    if !changed && !attrs_touched {
+                        reusable = Some(n);
                     }
                 }
                 None => {
@@ -639,12 +854,37 @@ impl fuser::Filesystem for GroveFS {
             }
         }
         // Honor explicit atime/mtime updates (utimes / touch / SET_ATIME etc.).
-        let a = time_to_epoch(atime);
-        let m = time_to_epoch(mtime);
+        // WRITEBACK_CACHE also makes the kernel echo the inode's mtime when it
+        // flushes a written file, so this branch runs for every small-file close.
+        // The stored value has epoch-**second** granularity, so an echo landing in
+        // the second already recorded would store the identical value: read the
+        // row (which the reply needs anyway) and skip the transaction when there
+        // is nothing left to write.
+        let mut a = time_to_epoch(atime);
+        let mut m = time_to_epoch(mtime);
         if a.is_some() || m.is_some() {
-            self.meta.set_times(ino.0 as i64, a, m);
+            if reusable.is_none() {
+                reusable = self.meta.getattr(ino.0 as i64);
+                if reusable.is_none() {
+                    reply.error(Errno::ENOENT);
+                    return;
+                }
+            }
+            if let Some(n) = &reusable {
+                let (na, nm) = times_to_write(a, m, n.atime, n.mtime);
+                a = na;
+                m = nm;
+            }
+            if a.is_some() || m.is_some() {
+                self.meta.set_times(ino.0 as i64, a, m);
+                reusable = None;
+            }
         }
-        match self.meta.getattr(ino.0 as i64) {
+        let node = match reusable {
+            Some(n) => Some(n),
+            None => self.meta.getattr(ino.0 as i64),
+        };
+        match node {
             Some(node) => reply.attr(&self.short_ttl(), &self.build_attr(&node)),
             None => reply.error(Errno::ENOENT),
         }
@@ -764,6 +1004,7 @@ impl fuser::Filesystem for GroveFS {
                 match self.meta.getattr(id) {
                     Some(node) => {
                         self.cache_key(id as u64, &key);
+                        self.note_created_mtime(id as u64, node.mtime);
                         reply.entry(&self.short_ttl(), &self.build_attr(&node), Generation(0));
                     }
                     // Raced with a concurrent unlink of the just-created name:
@@ -831,6 +1072,18 @@ impl fuser::Filesystem for GroveFS {
             return;
         }
         let perm = mode & !umask;
+        if self.batch_creates {
+            self.submit_create(
+                parent.0 as i64,
+                name_str,
+                perm,
+                req.uid(),
+                req.gid(),
+                key,
+                reply,
+            );
+            return;
+        }
         match self.meta.create_node_with_attr(
             parent.0 as i64,
             &name_str,
@@ -842,6 +1095,7 @@ impl fuser::Filesystem for GroveFS {
         ) {
             Ok(node) => {
                 self.cache_key(node.id as u64, &key);
+                self.note_created_mtime(node.id as u64, node.mtime);
                 let attr = self.build_attr(&node);
                 // Echo the inode as the handle: IO resolves by inode, so fh is
                 // opaque here. Returning it keeps the reply shape valid.
@@ -890,11 +1144,19 @@ impl fuser::Filesystem for GroveFS {
                         return;
                     }
                     if let Some(k) = &node.data_ref {
-                        if let Err(e) = self.backend.truncate(k, 0) {
-                            reply.error(errno_of(&e));
-                            return;
+                        // Only a real length change is a real truncate: an
+                        // O_TRUNC open of an already-empty object must not buy an
+                        // ftruncate syscall plus a metadata transaction.
+                        let cur = self.backend.len(k).unwrap_or(0);
+                        if cur != 0 {
+                            if let Err(e) = self.backend.truncate(k, 0) {
+                                reply.error(errno_of(&e));
+                                return;
+                            }
+                            if self.should_touch_write(ino.0) {
+                                self.meta.touch_mtime(ino.0 as i64);
+                            }
                         }
-                        self.meta.touch_mtime(ino.0 as i64);
                     }
                 }
                 // Handle is the inode; read/write resolve the object from it.
@@ -1012,15 +1274,17 @@ impl fuser::Filesystem for GroveFS {
         // the FUSE reply (and therefore the app's write/flush) is delayed by
         // any deficit, which backpressures the writer instead of dropping data.
         self.bw_write.acquire(n as u64);
-        // Debounced mtime touch: a streaming writer fires one write
-        // callback per 1MiB chunk, and each unhedged touch is a full
-        // metadata write (a local tx, or — with --meta-server — a synchronous
-        // RPC round-trip and one row in the HA replication stream).
-        // One touch per WRITE_TOUCH_DEBOUNCE window per inode bounds
-        // that amplification. Honest cost: mtime granularity degrades
-        // to ~the window (200ms); the setattr path (truncate, explicit
-        // utimes/touch) is NOT debounced because those semantics require
-        // immediacy.
+        // Same-second mtime suppression: the metadata stores keep mtime at
+        // whole-second resolution, so a touch that would rewrite the value the
+        // node already carries is pure amplification — and the create / write /
+        // close of one small file normally lands inside a single second (create
+        // seeds that second, see `note_created_mtime`). It also caps a streaming
+        // writer at one metadata write per second per inode where it fires one
+        // callback per 1MiB chunk and each unhedged touch is a full metadata
+        // write (a local tx, or — with --meta-server — a synchronous RPC
+        // round-trip and one row in the HA replication stream). The setattr path
+        // (truncate, explicit utimes/touch) is NOT gated because those semantics
+        // require immediacy.
         {
             let _t = stats::start(stats::Stage::WriteTouchMtime);
             if self.should_touch_write(ino.0) {
@@ -1294,6 +1558,7 @@ impl fuser::Filesystem for GroveFS {
 
     fn forget(&self, _req: &Request, ino: INodeNo, _nlookup: u64) {
         self.ino_to_key.write().remove(&ino.0);
+        self.last_write_touch.write().remove(&ino.0);
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
@@ -1602,8 +1867,10 @@ impl fuser::Filesystem for GroveFS {
     }
 }
 
-/// Debounce window for the write-path mtime touch (see `GroveFS::write`).
-const WRITE_TOUCH_DEBOUNCE: Duration = Duration::from_millis(200);
+/// Resolution of the write-path mtime gate (see `GroveFS::write`): the stores
+/// keep mtime in whole epoch seconds, so a touch is only worth a transaction
+/// when the second differs from the one the node already carries.
+const WRITE_TOUCH_RESOLUTION_SECS: u64 = 1;
 
 /// First (smallest) page of children fetched per metadata query while
 /// streaming a READDIR/READDIRPLUS reply, and the cap it grows to. fuser does
@@ -1615,23 +1882,43 @@ const WRITE_TOUCH_DEBOUNCE: Duration = Duration::from_millis(200);
 const READDIR_FETCH_MIN: usize = 32;
 const READDIR_FETCH_MAX: usize = 1024;
 
-/// True if `ino`'s write-path mtime should be touched now: either never
-/// touched since the last prune, or the debounce window has elapsed. Updates
-/// the timestamp map when firing. Split out of `write()` so it is unit-testable
-/// with an injected clock.
+/// True if `ino`'s write-path mtime should be stamped now: either never stamped
+/// since the last prune, or the whole second differs from the last stamp (a
+/// same-second re-stamp would store the identical value). Updates the stamp map
+/// when firing. Split out of `write()` so it is unit-testable with an injected
+/// clock.
 fn should_touch_write(
-    map: &mut std::collections::HashMap<u64, SystemTime>,
+    map: &mut std::collections::HashMap<u64, u64>,
     ino: u64,
-    now: SystemTime,
+    now_secs: u64,
 ) -> bool {
     let fire = match map.get(&ino) {
-        Some(&last) => now.duration_since(last).unwrap_or(Duration::ZERO) >= WRITE_TOUCH_DEBOUNCE,
+        Some(&last) => now_secs >= last.saturating_add(WRITE_TOUCH_RESOLUTION_SECS),
         None => true,
     };
     if fire {
-        map.insert(ino, now);
+        map.insert(ino, now_secs);
     }
     fire
+}
+
+/// Drop the requested atime/mtime that equal what the row already holds: the
+/// store keeps epoch **seconds**, so such a write would land the identical value
+/// (and only bump `ctime` inside the same second, which is invisible). Under
+/// `WRITEBACK_CACHE` the kernel echoes the inode's mtime on every close, so this
+/// is what keeps a create/write/close of one small file down to zero
+/// time-writes instead of one per file. Split out of `setattr()` so it is
+/// unit-testable.
+fn times_to_write(
+    atime: Option<i64>,
+    mtime: Option<i64>,
+    stored_atime: i64,
+    stored_mtime: i64,
+) -> (Option<i64>, Option<i64>) {
+    (
+        atime.filter(|v| *v != stored_atime),
+        mtime.filter(|v| *v != stored_mtime),
+    )
 }
 
 fn errno_of(e: &io::Error) -> Errno {
@@ -1660,50 +1947,74 @@ fn time_to_epoch(t: Option<TimeOrNow>) -> Option<i64> {
 mod tests {
     use super::*;
 
-    /// The write-path touch debounce: first write to an inode fires, repeats
-    /// inside the window are suppressed, the next one after the window fires
-    /// again — and different inodes keep independent windows.
+    /// The write-path mtime gate: the first write stamps, repeats inside the
+    /// same whole second are suppressed (the stored value would not change), the
+    /// next second stamps again — and different inodes are independent.
     #[test]
-    fn write_touch_debounces_per_inode() {
+    fn write_touch_gates_on_the_second() {
         let mut map = std::collections::HashMap::new();
-        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
         assert!(
-            should_touch_write(&mut map, 7, t0),
-            "first write always touches"
+            should_touch_write(&mut map, 7, 1000),
+            "first write always stamps"
         );
         assert!(
-            !should_touch_write(&mut map, 7, t0 + Duration::from_millis(50)),
-            "50ms later is inside the window"
+            !should_touch_write(&mut map, 7, 1000),
+            "same second: re-stamping stores the identical value"
         );
         assert!(
-            !should_touch_write(&mut map, 7, t0 + Duration::from_millis(199)),
-            "199ms is still inside"
+            should_touch_write(&mut map, 7, 1001),
+            "next second stamps (and re-stamps the map)"
         );
-        // A suppressed read of the window must not move the deadline:
-        assert!(
-            should_touch_write(&mut map, 7, t0 + Duration::from_millis(200)),
-            "exactly the window elapsed fires (and re-stamps)"
-        );
-        // Separate inode has its own window (new file while streaming another).
-        assert!(should_touch_write(
-            &mut map,
-            8,
-            t0 + Duration::from_millis(201)
-        ));
+        assert!(!should_touch_write(&mut map, 7, 1001));
+        // Separate inode carries its own stamp (new file while streaming another).
+        assert!(should_touch_write(&mut map, 8, 1001));
+    }
+
+    /// A node created in second S must not spend a transaction re-stamping S:
+    /// seeding the map with the create's own second suppresses the first write,
+    /// which is the whole point of `note_created_mtime`.
+    #[test]
+    fn first_write_of_a_fresh_file_is_free() {
+        let mut map = std::collections::HashMap::new();
+        map.insert(9u64, 1234u64); // what `note_created_mtime` records
+        assert!(!should_touch_write(&mut map, 9, 1234));
+        assert!(should_touch_write(&mut map, 9, 1235));
     }
 
     /// Regression guard for the amplification math the P2 claim rests on:
-    /// 1000 write callbacks spread over 10s must collapse to ~the window count,
-    /// not 1000 metadata writes.
+    /// 1000 write callbacks spread over 10s must collapse to one metadata write
+    /// per second, not 1000.
     #[test]
     fn write_touch_collapses_streaming_writes() {
         let mut map = std::collections::HashMap::new();
-        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
         let fires = (0..1000)
-            .filter(|i| should_touch_write(&mut map, 1, t0 + Duration::from_millis(10 * i)))
+            .filter(|i| should_touch_write(&mut map, 1, 1000 + i / 100))
             .count();
-        // 1000 callbacks at 10ms spacing span 0..9990ms; each fire re-stamps at
-        // its own instant, so touches land at 0,200,...,9800 -> exactly 50.
-        assert_eq!(fires, 50, "1000 x 10ms writes fired {fires} touches");
+        // 1000 callbacks at 10ms spacing span 0..9990ms; the gate fires once per
+        // second boundary -> 0 s, 1 s, ..., 9 s = exactly 10.
+        assert_eq!(fires, 10, "1000 x 10ms writes fired {fires} stamps");
+    }
+
+    /// The close-time echo of `mtime` must not cost a transaction: only a
+    /// requested time whose second differs from the stored one is written.
+    #[test]
+    fn identical_second_times_are_not_written() {
+        // Create-then-close inside one second: nothing to store.
+        assert_eq!(times_to_write(None, Some(1000), 0, 1000), (None, None));
+        // A real write into the next second stores the new mtime only.
+        assert_eq!(
+            times_to_write(None, Some(1001), 0, 1000),
+            (None, Some(1001))
+        );
+        // Each field is filtered on its own (utimes with one side unchanged).
+        assert_eq!(
+            times_to_write(Some(500), Some(1001), 500, 1000),
+            (None, Some(1001))
+        );
+        // Both differ: both are written.
+        assert_eq!(
+            times_to_write(Some(501), Some(1001), 500, 1000),
+            (Some(501), Some(1001))
+        );
     }
 }
