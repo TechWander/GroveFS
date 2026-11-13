@@ -96,13 +96,14 @@ pub fn other_view_holds(tx: &rusqlite::Transaction<'_>, dr: &str) -> bool {
 /// Book this view as holding a name for `dr` (call when the view's name count
 /// for `dr` goes 0 -> 1, inside the same tx as the node INSERT).
 pub fn ledger_add(tx: &rusqlite::Transaction<'_>, dr: &str) -> rusqlite::Result<()> {
-    tx.execute(
-        &format!(
-            "INSERT INTO {REFS_SCHEMA}.holders (data_ref, holders) VALUES (?1, 1)
+    // Every namespace write books here, so this statement is prepared once per
+    // connection instead of once per row (the text is constant, only the schema
+    // alias is interpolated).
+    tx.prepare_cached(&format!(
+        "INSERT INTO {REFS_SCHEMA}.holders (data_ref, holders) VALUES (?1, 1)
              ON CONFLICT(data_ref) DO UPDATE SET holders = holders + 1"
-        ),
-        params![dr],
-    )?;
+    ))?
+    .execute(params![dr])?;
     Ok(())
 }
 
@@ -113,24 +114,24 @@ pub fn ledger_add(tx: &rusqlite::Transaction<'_>, dr: &str) -> rusqlite::Result<
 /// treated as "no other holder": nothing was ever booked for this key.
 pub fn ledger_remove(tx: &rusqlite::Transaction<'_>, dr: &str) -> Option<String> {
     let n = tx
-        .execute(
-            &format!("UPDATE {REFS_SCHEMA}.holders SET holders = holders - 1 WHERE data_ref=?1"),
-            params![dr],
-        )
+        .prepare_cached(&format!(
+            "UPDATE {REFS_SCHEMA}.holders SET holders = holders - 1 WHERE data_ref=?1"
+        ))
+        .and_then(|mut s| s.execute(params![dr]))
         .unwrap_or(0);
     if n > 0 {
         let left: i64 = tx
-            .query_row(
-                &format!("SELECT holders FROM {REFS_SCHEMA}.holders WHERE data_ref=?1"),
-                params![dr],
-                |r| r.get(0),
-            )
+            .prepare_cached(&format!(
+                "SELECT holders FROM {REFS_SCHEMA}.holders WHERE data_ref=?1"
+            ))
+            .and_then(|mut s| s.query_row(params![dr], |r| r.get(0)))
             .unwrap_or(0);
         if left <= 0 {
-            let _ = tx.execute(
-                &format!("DELETE FROM {REFS_SCHEMA}.holders WHERE data_ref=?1"),
-                params![dr],
-            );
+            let _ = tx
+                .prepare_cached(&format!(
+                    "DELETE FROM {REFS_SCHEMA}.holders WHERE data_ref=?1"
+                ))
+                .and_then(|mut s| s.execute(params![dr]));
             return Some(dr.to_string());
         }
         None
@@ -1419,23 +1420,35 @@ fn insert_row(
     t: i64,
 ) -> Result<i64, MetaError> {
     // Is this the view's FIRST name for the key (count before the INSERT)?
-    // Only then does the cross-view ledger take a new hold.
+    // Only then does the cross-view ledger take a new hold. The three statements
+    // below are cached on the connection: `insert_row` runs once per created row
+    // (or several times inside one batched create), and re-parsing the same two
+    // INSERT/UPDATE texts for each of them was a measurable share of a create.
     let first_name = data_ref
         .map(|dr| {
-            tx.query_row(
-                "SELECT COUNT(*) FROM node WHERE data_ref=?1",
-                params![dr],
-                |r| r.get::<_, i64>(0),
-            )
-            .unwrap_or(0)
+            tx.prepare_cached("SELECT COUNT(*) FROM node WHERE data_ref=?1")
+                .and_then(|mut s| s.query_row(params![dr], |r| r.get::<_, i64>(0)))
+                .unwrap_or(0)
                 == 0
         })
         .unwrap_or(false);
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO node (parent_id,name,is_dir,data_ref,link_target,mode,uid,gid,mtime,atime,ctime)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?9)",
-        params![parent, name, is_dir as i64, data_ref, link_target, mode, uid, gid, t],
     )
+    .and_then(|mut s| {
+        s.execute(params![
+            parent,
+            name,
+            is_dir as i64,
+            data_ref,
+            link_target,
+            mode,
+            uid,
+            gid,
+            t
+        ])
+    })
     .map_err(|e| match e {
         rusqlite::Error::SqliteFailure(f, _)
             if f.code == rusqlite::ErrorCode::ConstraintViolation =>
@@ -1446,7 +1459,8 @@ fn insert_row(
     })?;
     let rowid = tx.last_insert_rowid();
     // A brand-new name owns a fresh inode: ino == its own row id.
-    tx.execute("UPDATE node SET ino=?1 WHERE id=?1", params![rowid])?;
+    tx.prepare_cached("UPDATE node SET ino=?1 WHERE id=?1")
+        .and_then(|mut s| s.execute(params![rowid]))?;
     if first_name {
         if let Some(dr) = data_ref {
             ledger_add(tx, dr)?;
@@ -2399,31 +2413,28 @@ impl MetaEngine {
             let mut conn = self.conn.lock();
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let (id, is_dir, data_ref) = tx
-                .query_row(
-                    "SELECT id,is_dir,data_ref FROM node WHERE parent_id=?1 AND name=?2",
-                    params![parent, name],
-                    |r| {
+                .prepare_cached("SELECT id,is_dir,data_ref FROM node WHERE parent_id=?1 AND name=?2")
+                .and_then(|mut s| {
+                    s.query_row(params![parent, name], |r| {
                         Ok((
                             r.get::<_, i64>(0)?,
                             r.get::<_, i64>(1)?,
                             r.get::<_, Option<String>>(2)?,
                         ))
-                    },
-                )
+                    })
+                })
                 .map_err(|_| MetaError::NotFound)?;
             if is_dir == 1 {
                 let kids: i64 = tx
-                    .query_row(
-                        "SELECT COUNT(*) FROM node WHERE parent_id=?1",
-                        params![id],
-                        |r| r.get(0),
-                    )
+                    .prepare_cached("SELECT COUNT(*) FROM node WHERE parent_id=?1")
+                    .and_then(|mut s| s.query_row(params![id], |r| r.get(0)))
                     .unwrap_or(0);
                 if kids > 0 {
                     return Err(MetaError::NotEmpty);
                 }
             }
-            tx.execute("DELETE FROM node WHERE id=?1", params![id])?;
+            tx.prepare_cached("DELETE FROM node WHERE id=?1")
+                .and_then(|mut s| s.execute(params![id]))?;
             // The blob is freeable only once this view holds no other name for the
             // key AND the cross-view ledger confirms no other view holds it (the
             // last remove deletes the holder row and returns the key). See
@@ -2431,11 +2442,8 @@ impl MetaEngine {
             let gc = match &data_ref {
                 Some(dr) => {
                     let refs: i64 = tx
-                        .query_row(
-                            "SELECT COUNT(*) FROM node WHERE data_ref=?1",
-                            params![dr],
-                            |r| r.get(0),
-                        )
+                        .prepare_cached("SELECT COUNT(*) FROM node WHERE data_ref=?1")
+                        .and_then(|mut s| s.query_row(params![dr], |r| r.get(0)))
                         .unwrap_or(0);
                     if refs == 0 {
                         ledger_remove(&tx, dr)
