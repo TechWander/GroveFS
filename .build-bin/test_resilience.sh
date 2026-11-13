@@ -5,8 +5,10 @@
 # while the client mount stays up the whole time:
 #
 #   A) seed a file (warms a pooled connection)
-#   B) server DOWN  -> creating a file fails fast/gracefully (bounded, no hang,
-#      client process alive); the local metadata view still lists files.
+#   B) server DOWN -> a create still lands (it is a metadata-plane op: the object
+#      is materialized by the first write), while the first write that forces a
+#      data-plane round trip (an explicit fsync) fails fast/gracefully (bounded,
+#      no hang, client process alive); the local view still lists files.
 #   C) server RESTARTED (same addr+root) -> the same mount recovers: a create
 #      succeeds via a fresh connect, prior data persisted on the shared root.
 #   D) live pool + immediate restart -> next op silently retries over a dead
@@ -56,15 +58,38 @@ timeout 10 sh -c "printf 'persistent payload\n' > $A/seed.txt" && sync
 chk "$(timeout 5 cat $A/seed.txt)" "persistent payload" "seed written+read on live server"
 seed_md5=$(timeout 5 md5sum $A/seed.txt | awk '{print $1}')
 
-echo "===== B) server DOWN: graceful failure, client alive, metadata still local ====="
+echo "===== B) server DOWN: name ops stay on the metadata plane, byte ops fail loud ====="
 stop_server
+# A create reserves the name and nothing else (the object is materialized by the
+# first write), so with the data plane unreachable the name still lands and the
+# file is a real, listable, 0-byte entry.
 timeout 8 sh -c "touch $A/during_down.txt"; rc=$?
-if [ "$rc" -ne 0 ]; then ok "create while server down fails (rc=$rc), bounded by timeout"; else bad "create wrongly 'succeeded' while server down"; fi
+if [ "$rc" -eq 0 ]; then ok "create while server down succeeds (a name needs no bytes)"; else bad "create failed (rc=$rc) while server down"; fi
+# ... and the op that must fail is the one that actually crosses to the data
+# plane. A plain write() cannot be the probe: under WRITEBACK_CACHE the kernel
+# takes the bytes into the page cache and returns to the app before we see them,
+# so only an explicit fsync (which forces the flush through us) can report the
+# outage at all.
+frc=$(timeout 8 python3 -c '
+import os, sys
+try:
+    fd = os.open(sys.argv[1], os.O_CREAT | os.O_WRONLY)
+    os.write(fd, b"x")
+    os.fsync(fd)
+    print("ok")
+except OSError as e:
+    print("errno=%d" % e.errno)
+' "$A/during_down.txt")
+if [ "$frc" != "ok" ]; then ok "fsync while server down fails loud ($frc)"; else bad "fsync wrongly 'succeeded' while server down"; fi
 if kill -0 $MA 2>/dev/null; then ok "client mount process survived the outage"; else bad "client mount process died"; fi
 if timeout 5 ls $A | grep -qx seed.txt; then ok "local view still lists files during outage"; else bad "listing failed during outage"; fi
 
 echo "===== C) server RESTARTED (same addr+root): recovery + persistence ====="
 start_server 2
+# A name created during the outage matures into a real object once the data plane
+# is back, with no remount and no explicit retry by the app.
+timeout 10 sh -c "printf 'later\n' > $A/during_down.txt"
+chk "$(timeout 5 cat $A/during_down.txt)" "later" "a name created during the outage takes bytes after recovery"
 timeout 10 sh -c "printf 'recovered\n' > $A/recovered.txt"; rc=$?
 chk "$rc" "0" "create succeeds after server restart (reconnect)"
 chk "$(timeout 5 cat $A/recovered.txt)" "recovered" "post-reconnect write is readable"

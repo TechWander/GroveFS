@@ -831,8 +831,19 @@ impl fuser::Filesystem for GroveFS {
                         // mtime transaction would store what is already there —
                         // pure amplification, and the dominant extra cost of a
                         // create/write/close of one small file.
-                        let cur = self.backend.len(k).unwrap_or(new_size);
-                        if cur != new_size {
+                        // An absent object means "never written" (create defers
+                        // materialization), and that is exactly 0 bytes — so it
+                        // must not be mistaken for "already the requested size",
+                        // which would skip the truncate that materializes it.
+                        let cur = match self.backend.len(k) {
+                            Ok(n) => Some(n),
+                            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                            Err(e) => {
+                                reply.error(errno_of(&e));
+                                return;
+                            }
+                        };
+                        if cur != Some(new_size) {
                             if let Err(e) = self.backend.truncate(k, new_size) {
                                 reply.error(errno_of(&e));
                                 return;
@@ -983,13 +994,10 @@ impl fuser::Filesystem for GroveFS {
         let name_str = name.to_string_lossy().to_string();
         // The durable data_ref is backend-decided: single-object backends return
         // the bare uuid (unchanged behavior), a sharded backend encodes its
-        // stripe layout so reads are self-describing.
+        // stripe layout so reads are self-describing. Like `create`, mknod does
+        // not materialize the object — the first write/truncate does.
         let base = uuid::Uuid::new_v4().to_string();
         let key = self.backend.new_key(&base);
-        if let Err(e) = self.backend.create(&key) {
-            reply.error(errno_of(&e));
-            return;
-        }
         let perm = mode & !umask & 0o7777;
         match self.meta.create_node(
             parent.0 as i64,
@@ -1066,11 +1074,13 @@ impl fuser::Filesystem for GroveFS {
         let name_str = name.to_string_lossy().to_string();
         let base = uuid::Uuid::new_v4().to_string();
         let key = self.backend.new_key(&base);
-        // Materialize the object first so a failed create doesn't leave a dangling node.
-        if let Err(e) = self.backend.create(&key) {
-            reply.error(errno_of(&e));
-            return;
-        }
+        // The object is deliberately NOT materialized here. A create only has to
+        // make a durable name; the backend object is made by the first `write` or
+        // `truncate`, both of which open with O_CREAT internally. So a
+        // `touch`-style create — and every empty file a tree copy drags along —
+        // pays neither a data-plane round trip nor a cached fd, and an unwritten
+        // file still reads back as 0 bytes because an absent object IS an empty
+        // one (see `read`).
         let perm = mode & !umask;
         if self.batch_creates {
             self.submit_create(
@@ -1208,6 +1218,11 @@ impl fuser::Filesystem for GroveFS {
                     stats::count(stats::Counter::BytesRead, d.len() as u64);
                     d
                 }
+                // A file that was created but never written has no object yet
+                // (create/mknod defer materialization to the first write), so an
+                // ABSENT object is an EMPTY one — the same answer `getattr` already
+                // gives by reporting 0 bytes from the same failed lookup.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
                 Err(e) => {
                     reply.error(errno_of(&e));
                     return;
@@ -1303,8 +1318,11 @@ impl fuser::Filesystem for GroveFS {
         reply: ReplyEmpty,
     ) {
         match self.key_for_ino(ino.0) {
+            // An unwritten object has no bytes to flush: the deferred create never
+            // touched the data plane, so "absent" is already durable.
             Some(k) => match self.backend.fsync(&k) {
                 Ok(()) => reply.ok(),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => reply.ok(),
                 Err(e) => reply.error(errno_of(&e)),
             },
             None => reply.error(Errno::ENOENT),
