@@ -482,6 +482,51 @@ mod tests {
         p
     }
 
+    /// The FUSE layer defers object materialization to the first write
+    /// (`create`/`mknod` only reserve a key), so this is the backend contract it
+    /// stands on: a key nobody wrote is ABSENT — not a zero-length file — and the
+    /// first write or truncate MATERIALIZES it. `remove` must survive the other
+    /// order (a name that is dropped before its bytes ever existed).
+    #[test]
+    fn absent_object_materializes_on_first_write_or_truncate() {
+        let root = tmp_root("deferred");
+        let be = LocalBackend::new(&root).unwrap();
+        let blocks = root.join("blocks");
+        let files = || {
+            fs::read_dir(&blocks)
+                .unwrap()
+                .filter_map(|d| fs::read_dir(d.ok()?.path()).ok())
+                .flatten()
+                .count()
+        };
+
+        let k = be.new_key("d3f7a2c0-0000-4000-8000-00000000d0d0");
+        assert_eq!(be.len(&k).unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert_eq!(
+            be.read(&k, 0, 16).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(be.fsync(&k).unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert_eq!(files(), 0, "a reserved key must leave no file behind");
+
+        be.write(&k, 0, b"abc").unwrap();
+        assert_eq!(be.len(&k).unwrap(), 3);
+        assert_eq!(be.read(&k, 0, 16).unwrap(), b"abc");
+        assert_eq!(files(), 1, "the first write materializes exactly one file");
+
+        // Truncate is the other materializer: extending a never-written key must
+        // produce real zero bytes, not silently stay absent.
+        let k2 = be.new_key("d3f7a2c0-0000-4000-8000-00000000d0d1");
+        be.truncate(&k2, 4096).unwrap();
+        assert_eq!(be.len(&k2).unwrap(), 4096);
+        assert!(be.read(&k2, 0, 8).unwrap().iter().all(|b| *b == 0));
+
+        // Unlink of a name whose bytes never existed is a successful no-op.
+        let k3 = be.new_key("d3f7a2c0-0000-4000-8000-00000000d0d2");
+        be.remove(&k3).unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// The bucket table is precreated at startup with exactly the names
     /// `bucket_hex` produces — a key's hash and its on-disk dir can never
     /// disagree.
