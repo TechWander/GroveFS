@@ -629,6 +629,183 @@ fn fdb_readdir_pages_stitch_into_the_sqlite_listing() {
     println!("fdb_readdir_pages_stitch_into_the_sqlite_listing: 700 names, 7 chunk sizes + 20 resumes");
 }
 
+/// The readdir page's per-entry `nlink` now comes from ONE concurrent
+/// `count_multi` wave instead of a serial range count per entry (a 100k-name
+/// directory paid ~22.9 s for the serial shape). That is only a shortcut if the
+/// numbers are identical to the serial path `lookup`/`getattr` still uses, so pin
+/// the equality on the three kinds that count differently: a plain file (1
+/// holder), a hard-linked pair (2), and a directory (2 + its subdirectories).
+#[test]
+fn fdb_readdir_nlink_matches_lookup_after_batch_counting() {
+    let Some(file) = cluster_file() else {
+        eprintln!("SKIP fdb_nlink: no FDB cluster file (set GROVEFS_FDB_CLUSTER_FILE)");
+        return;
+    };
+    if !cluster_reachable(&file) {
+        eprintln!("SKIP fdb_nlink: cluster {} unreachable", file.display());
+        return;
+    }
+    let uri = format!("fdb://{}", file.display());
+    let nanos = std::time::UNIX_EPOCH.elapsed().map(|d| d.as_nanos()).unwrap_or(0);
+    let view: String = format!("nl{:x}.{:x}", std::process::id(), nanos)
+        .chars()
+        .take(20)
+        .collect();
+    let dr = format!("NL{:x}", nanos);
+    let store = MetaStore::open_fdb(&uri, &view, false)
+        .unwrap_or_else(|e| panic!("open fdb view {view} against {}: {e}", file.display()));
+
+    for nm in ["a_plain", "b_linked"] {
+        store
+            .create_node(ROOT_INO, nm, false, Some(&dr), 0o644, 1000, 1000)
+            .unwrap_or_else(|e| panic!("create {nm}: {e}"));
+    }
+    // A second name for b: one inode, two holders.
+    let b = seen(&store, ROOT_INO, "b_linked").expect("b_linked").id;
+    store.link_node(b, ROOT_INO, "b_alias").expect("link b_alias");
+    // d holds one subdirectory: d's nlink is 2 + 1.
+    store
+        .create_node(ROOT_INO, "d", true, None, 0o755, 1000, 1000)
+        .expect("mkdir d");
+    let d = seen(&store, ROOT_INO, "d").expect("d").id;
+    store
+        .create_node(d, "inner", true, None, 0o755, 1000, 1000)
+        .expect("mkdir d/inner");
+    store
+        .create_node(d, "leaf", false, Some(&dr), 0o644, 1000, 1000)
+        .expect("create d/leaf");
+
+    let cases: Vec<(i64, Vec<(&str, u64)>)> = vec![
+        (
+            ROOT_INO,
+            vec![("a_plain", 1), ("b_linked", 2), ("b_alias", 2), ("d", 3)],
+        ),
+        (d, vec![("inner", 2), ("leaf", 1)]),
+    ];
+    for (parent, want) in &cases {
+        let full = store.readdir(*parent);
+        // 3-name pages: the path `count_multi` feeds, including a short tail.
+        let mut paged = Vec::new();
+        let mut off = 0usize;
+        loop {
+            let page = store.readdir_page(*parent, off, 3);
+            if page.is_empty() {
+                break;
+            }
+            off += page.len();
+            paged.extend(page);
+        }
+        for (name, nlink) in want {
+            let from_lookup = seen(&store, *parent, name)
+                .unwrap_or_else(|| panic!("lookup {parent}/{name}"))
+                .nlink;
+            assert_eq!(from_lookup, *nlink, "lookup nlink of {name}");
+            for (how, listing) in [("readdir", &full), ("readdir_page", &paged)] {
+                let e = listing
+                    .iter()
+                    .find(|e| e.name == *name)
+                    .unwrap_or_else(|| panic!("{how} {parent} misses {name}"));
+                assert_eq!(e.nlink, *nlink, "{how} nlink of {name}");
+            }
+        }
+    }
+
+    if let MetaStore::Fdb(f) = &store {
+        release_ledger(&store);
+        let rep = f
+            .remove_view()
+            .unwrap_or_else(|e| panic!("remove scratch view {view}: {e}"));
+        assert_eq!(
+            (rep.unbooked, rep.still_held),
+            (0, 0),
+            "nlink test left bookings behind: {rep:?}"
+        );
+        assert!(
+            !grovefs::fdb_store::FdbStore::subspace_exists(&uri, &view).unwrap_or(true),
+            "nlink test left the subspace in {view}"
+        );
+    }
+    println!("fdb_readdir_nlink_matches_lookup_after_batch_counting: 2 dirs, 3 kinds");
+}
+
+/// The same contract on a page whose inode ids are NOT contiguous: the one-read
+/// inode span (`count_holder_span`) only applies to a compact run, so a page that
+/// mixes an old name with a freshly created one must still report the exact
+/// nlink through the per-prefix fallback. Names are created in an order that
+/// leaves ~40 ids of gap between the two files of `a`.
+#[test]
+fn fdb_readdir_nlink_survives_a_scattered_inode_page() {
+    let Some(file) = cluster_file() else {
+        eprintln!("SKIP fdb_nlink_scatter: no FDB cluster file (set GROVEFS_FDB_CLUSTER_FILE)");
+        return;
+    };
+    if !cluster_reachable(&file) {
+        eprintln!("SKIP fdb_nlink_scatter: cluster {} unreachable", file.display());
+        return;
+    }
+    let uri = format!("fdb://{}", file.display());
+    let nanos = std::time::UNIX_EPOCH.elapsed().map(|d| d.as_nanos()).unwrap_or(0);
+    let view: String = format!("sc{:x}.{:x}", std::process::id(), nanos)
+        .chars()
+        .take(20)
+        .collect();
+    let dr = format!("SC{:x}", nanos);
+    let store = MetaStore::open_fdb(&uri, &view, false)
+        .unwrap_or_else(|e| panic!("open fdb view {view} against {}: {e}", file.display()));
+
+    let a = store
+        .create_node(ROOT_INO, "a", true, None, 0o755, 1000, 1000)
+        .expect("mkdir a");
+    let far = store
+        .create_node(ROOT_INO, "far", true, None, 0o755, 1000, 1000)
+        .expect("mkdir far");
+    store
+        .create_node(a, "x", false, Some(&dr), 0o644, 1000, 1000)
+        .expect("create a/x");
+    let x = seen(&store, a, "x").expect("a/x").id;
+    store.link_node(x, a, "x_alias").expect("link a/x_alias");
+    for i in 0..40 {
+        let nm = format!("filler{i:02}");
+        store
+            .create_node(far, &nm, false, Some(&dr), 0o644, 1000, 1000)
+            .unwrap_or_else(|e| panic!("create far/{nm}: {e}"));
+    }
+    store
+        .create_node(a, "y", false, Some(&dr), 0o644, 1000, 1000)
+        .expect("create a/y");
+
+    let page = store.readdir_page(a, 0, 8);
+    assert_eq!(page.len(), 3, "a holds x, x_alias, y: {page:?}");
+    for (name, nlink) in [("x", 2), ("x_alias", 2), ("y", 1)] {
+        let from_lookup = seen(&store, a, name)
+            .unwrap_or_else(|| panic!("lookup a/{name}"))
+            .nlink;
+        assert_eq!(from_lookup, nlink, "lookup nlink of a/{name}");
+        let e = page
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("readdir_page a misses {name}"));
+        assert_eq!(e.nlink, nlink, "readdir_page nlink of a/{name}");
+    }
+
+    if let MetaStore::Fdb(f) = &store {
+        release_ledger(&store);
+        let rep = f
+            .remove_view()
+            .unwrap_or_else(|e| panic!("remove scratch view {view}: {e}"));
+        assert_eq!(
+            (rep.unbooked, rep.still_held),
+            (0, 0),
+            "scattered-page test left bookings behind: {rep:?}"
+        );
+        assert!(
+            !grovefs::fdb_store::FdbStore::subspace_exists(&uri, &view).unwrap_or(true),
+            "scattered-page test left the subspace in {view}"
+        );
+    }
+    println!("fdb_readdir_nlink_survives_a_scattered_inode_page: 2 ids apart, 1 alias");
+}
+
 // ---- the checkpoint is a CACHE, not state ---------------------------------
 //
 // `readdir_page` keeps its `(parent, row)` -> name hints in the SERVER's memory.
@@ -1226,21 +1403,22 @@ fn fdb_import_refuses_a_corpse() {
         "the corpse should still hold keys"
     );
 
-    // Both doors: plain import and `--replace`.
-    for replace in [false, true] {
-        let msg = match f.import_jsonl(&dump, replace) {
-            Ok(st) => panic!("import (replace={replace}) onto a corpse was ACCEPTED: {st:?}"),
-            Err(e) => e.to_string(),
-        };
-        assert!(
-            msg.contains("corpse"),
-            "the refusal must name the shape it found: {msg}"
-        );
-        assert!(
-            msg.contains(&format!("--name {view} --base")),
-            "the refusal must point at the exit that clears it: {msg}"
-        );
-    }
+    // Two doors, two different contracts: a plain `import` refuses a corpse, and
+    // `--replace` ADOPTS it — that is the documented continuation entry for a
+    // split import that was interrupted mid-way (USAGE §4.1.1), so only the plain
+    // door may be refused here.
+    let msg = match f.import_jsonl(&dump, false) {
+        Ok(st) => panic!("plain import onto a corpse was ACCEPTED: {st:?}"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        msg.contains("corpse"),
+        "the refusal must name the shape it found: {msg}"
+    );
+    assert!(
+        msg.contains(&format!("--name {view} --base")),
+        "the refusal must point at the exit that clears it: {msg}"
+    );
     assert_eq!(
         keys_of(&view),
         keys_before - 1,
@@ -1248,6 +1426,19 @@ fn fdb_import_refuses_a_corpse() {
     );
     assert_eq!(row_of(&dr_a), Some(1), "a refused import moved the old booking");
     assert_eq!(row_of(&dr_b), None, "a refused import booked the dump's ref");
+
+    // …and `--replace` is the other exit the refusal names: it clears the leftover
+    // keys (returning their booking) before seeding the dump's root LAST.
+    let st = f
+        .import_jsonl(&dump, true)
+        .unwrap_or_else(|e| panic!("--replace must adopt a corpse: {e}"));
+    assert!(st.replaced, "--replace on a corpse reports replaced: {st:?}");
+    assert_eq!(
+        row_of(&dr_a),
+        None,
+        "--replace must hand back the corpse's old booking"
+    );
+    assert_eq!(row_of(&dr_b), Some(1), "--replace must book the dump's ref");
 
     // The exit the refusal names, exercised rather than assumed: `view rm --base`
     // still works on a corpse (its teardown predicate is the `'r` family, not the
@@ -1266,7 +1457,7 @@ fn fdb_import_refuses_a_corpse() {
         "the corpse's subspace survived its removal"
     );
     println!(
-        "fdb_import_corpse: refused with and without --replace, wrote nothing, `view rm --base` still unbooked it"
+        "fdb_import_corpse: plain import refused and wrote nothing, --replace adopted it, `view rm --base` still unbooked the rest"
     );
 }
 
