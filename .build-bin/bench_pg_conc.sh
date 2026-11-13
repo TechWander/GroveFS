@@ -79,12 +79,17 @@ echo "===== 1) matrix: time-boxed distinct-parent writes (steady state) ====="
 for N in $N_LIST; do
   $Y view --meta-dir $P/sql_home create --view "s${N}t${T}" > /dev/null 2>&1
   run_one sql "s${N}t${T}" $SQL_META $N
+  # PG trees outlive the run (schemas in the cluster), and the driver uses fixed
+  # names per mount: a leftover tree makes every mkdir EEXIST and the row reads
+  # `ops=0` instead of a number. Drop the tree so a rerun measures again.
+  $Y view --meta-store "$PGURI" rm --base --name "p${N}t${T}" > /dev/null 2>&1
   $Y view --meta-store "$PGURI" create --view "p${N}t${T}" > /dev/null 2>&1
   run_one pg "p${N}t${T}" $PG_META $N
 done
 
 echo "===== 2) contention: N mounts x T threads slamming identical names ====="
 N=${N_COND:-4}
+$Y view --meta-store "$PGURI" rm --base --name "pc${N}" > /dev/null 2>&1
 $Y view --meta-store "$PGURI" create --view "pc${N}" > /dev/null 2>&1
 run_one pgc "pc${N}" $PG_META $N 1 $CD $CF
 echo "  (expect ops == CD*(1+CF) == $((CD*(1+CF))) exactly-one-winner-per-name across all mounts)"

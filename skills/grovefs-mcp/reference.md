@@ -172,10 +172,13 @@ SQLite backend (default) — effects on disk:
 
 Under `--meta-store postgres://…` nothing control-plane lands on disk: the
 `.layout` writes above become rows in `grovefs_control.view_defs`
-(verify with `SELECT name, definition FROM grovefs_control.view_defs`), and
-`fork_view` and `graft_view` are refused (`fork is not implemented on the
-PostgreSQL backend yet …` / `graft is not implemented on the PostgreSQL
-backend yet …`).
+(verify with `SELECT name, definition FROM grovefs_control.view_defs`), and the
+tree a fork or graft creates is a NEW `grovefs_v_<hex>` schema — copied with
+`INSERT … SELECT` (fork) or written row by row (graft) in ONE transaction, with
+content bytes shared through `grovefs_refs.holders` rather than duplicated. On
+`fdb://` the same two tools copy/write a SUBSPACE, so the only pre-flight
+question in both cases is whether the base exists in the store's own terms:
+`no physical base tree for 'X' in <store> — fork copies a physical view tree …`.
 
 A read-only probe never mints anything on PG either: `list_view_tree` on a
 view whose `grovefs_v_<hex>` schema does not exist is refused with the same
@@ -244,7 +247,7 @@ the CLI cannot, and bypass no guard**.
 | Auth fails: `invalid api key id` / `invalid api key secret` / `has been revoked` | plaintext transcribed wrong, revoked, or id:secret pasted incorrectly | match the id via `grovefs apikey list`; re-mint if needed |
 | Auth fails though the key is valid | scope does not include the MCP plane | re-mint with `--for mcp` (or `--for any`); a `--for mount` key cannot open the governance interface |
 | `no metadata tree for view 'X' … list_view_tree walks this store's own backend; a remote tree not reachable from here is not` | the view has no tree in the backend the MCP server is bound to (no local `meta/X.db`, and no `--meta-store` was given for the PG schema) | run the server against the right backend (`--meta-dir` on the store machine, or `--meta-store postgres://…`), or keep a local metadata copy (`view import`) |
-| `no physical base tree … PostgreSQL-backed view cannot be forked` | fork needs a local SQLite bare base | first `grovefs --home H init/view create --view B`, or use a derived view instead |
+| `no physical base tree … — `fork` copies a physical view tree; create the base first` | fork needs a physical base (a `.db` file, a PG schema, an FDB subspace — one sentence on every backend) | `grovefs --home H init/view create --view B` (or `view --meta-store … create --view B`) first; a derived view is not a tree |
 | Wrote the `.layout` but the mount still shows the old shape | a bare local mount resolves its definition once at mount time | remount; mounts through `meta-server` reshape themselves within ≤2s |
 | `list_view_tree` answers `truncated:true` | hit the `depth`(6)/`max`(800) bounds | drill down with `path` in segments, or raise `depth`/`max` |
 | Hangs waiting for a reply after sending a notification | id-less frames are never answered by design | send notifications without waiting; only await replies for requests with an id |

@@ -293,8 +293,9 @@ SROUT2=$($Y apikey --meta-dir "$BASE" set-ro --id "$ID_TOG" --rw 2>&1)
 echo "$SROUT2" | grep -q "is now rw (read-write)" && ok "set-ro --rw flips ro->rw in place" || bad "set-ro --rw output: $SROUT2"
 sleep 1.3
 T mkdir .mktest/mnt_tog/post_rw && ok "writes admitted again on the live mount — no reconnect, no remount" || bad "rw not restored hot: $(cat .mktest/tog.log)"
-# The rw COLUMN (field 6 of the list row) flipped, not just some "rw" text.
-ROWCOL=$($Y apikey --meta-dir "$BASE" list 2>&1 | grep -F "$ID_TOG" | awk '{print $6}')
+# The rw COLUMN (field 7 of the list row: # id owner label scope view rw …)
+# flipped, not just some "rw" text.
+ROWCOL=$($Y apikey --meta-dir "$BASE" list 2>&1 | grep -F "$ID_TOG" | awk '{print $7}')
 chk "$ROWCOL" "rw" "list reflects the flipped rw column"
 # The guard cases: unknown id, and a revoked row that set-ro must not resurrect.
 if $Y apikey --meta-dir "$BASE" set-ro --id nosuchkeyid --rw >/dev/null 2>&1; then

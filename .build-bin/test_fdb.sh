@@ -30,8 +30,9 @@
 #      shape the SQLite backend does — proven against a live SQLite twin of the
 #      same deployment (same binary, same rule files, same seeding function) by
 #      comparing listings byte-for-byte, with literal expectations asserted on top
-#      so "identical" cannot mean "identically wrong"; and `fork`/`graft` answer
-#      with an explicit verdict instead of a half-working local tree.
+#      so "identical" cannot mean "identically wrong"; and `fork`/`graft` copy a
+#      whole SUBSPACE (section 10d) with the same contract the other two backends
+#      are held to: a real tree, no local file, stated byte sharing.
 
 #  10. the P8 migration round trip goes BOTH ways with the existing commands: a
 #      SQLite view's dump imports into a subspace nobody provisioned, the mounted
@@ -212,16 +213,28 @@ cleanup(){
     # know about would otherwise leak its subtree forever, and a section that
     # FAILs halfway never reaches its own teardown at all. Silent on purpose — a
     # FAIL printed by a trap would contradict the SUMMARY just printed. The control
-    # plane is LOCAL files under fdb:// (C6), and every definition in it belongs to
-    # this run, so dropping it is what satisfies the "others resolve through this
-    # base" guard rather than working around it.
+    # plane is the CLUSTER's ctl subspace under fdb://, and every definition this
+    # run published belongs to it — so a base they resolve through refuses `rm
+    # --base` until the definition is dropped by name (the unwind below), rather
+    # than the old `rm -rf` of a local file silently satisfying the guard.
     if [ -x "$Y" ] && fdb_available 2>/dev/null && [ -f "$S/inv_before.txt" ]; then
         rm -rf "$S/home" "$S/ev/home"
+        mkdir -p "$S/home"
         inv_list > "$S/inv_after.txt" 2>/dev/null
         comm -13 "$S/inv_before.txt" "$S/inv_after.txt" | while read -r v; do
             [ -n "$v" ] || continue
-            "$Y" view --meta-store "$FDBURI" --meta-dir "$S/home" rm --name "$v" --base \
-                --data-dir "$S/central/data" >/dev/null 2>&1 || true
+            # Drop the governing definition(s) and retry, bounded — the same
+            # unwind fdb_scaffold's fdb_drop_views does for the parameterized arms.
+            attempt=0
+            while :; do
+                out=$("$Y" view --meta-store "$FDBURI" --meta-dir "$S/home" rm --name "$v" --base \
+                    --data-dir "$S/central/data" 2>&1); rc=$?
+                [ $rc -eq 0 ] && break
+                def=$(printf '%s' "$out" | sed -n "s/^error: view '\([^']*\)' is governed by a definition.*/\1/p")
+                [ -n "$def" ] && [ $attempt -lt 8 ] || break
+                attempt=$((attempt + 1))
+                "$Y" view --meta-store "$FDBURI" --meta-dir "$S/home" rm --name "$def" >/dev/null 2>&1 || break
+            done
         done
     fi
 }
@@ -805,35 +818,49 @@ grep -q "view '${VIEW}_map' -> base '$V2'" $S/vlist.log \
     && ok "view list answers the derived lens too (one listing, both kinds)" \
     || bad "derived missing from the fdb listing: $(cat $S/vlist.log)"
 
-echo "===== 10d) fork on fdb://: an explicit verdict, never a half-working tree ====="
+echo "===== 10d) fork/graft on fdb://: the tree-copy verbs copy SUBSPACES ====="
+# This section used to assert an explicit REFUSAL ("nothing here copies a
+# subspace"). The backend now copies one: a whole-subspace read plus one write
+# transaction, with the definition recorded in the control plane and the bytes
+# left where they are. What the assertions below pin is the same contract the
+# other two backends are held to by `forksrv` — a real tree, no local file, a
+# stated byte-sharing, and a graft that lands a curated subset.
 $Y view --meta-store "$FDBURI" --meta-dir $S/home fork --name "${V2}_fk" --base "$V2" \
     > $S/fork.log 2>&1
 FRC=$?
-[ "$FRC" != 0 ] && ok "view fork refuses on an fdb:// store (rc=$FRC)" \
-    || bad "view fork was ACCEPTED on fdb:// — nothing here copies a subspace"
-grep -qi "not implemented" $S/fork.log && grep -qi "FoundationDB" $S/fork.log \
-    && ok "the refusal says what is missing and on which backend" \
-    || bad "refusal unclear: $(head -3 $S/fork.log)"
-grep -qiE "alias|derived view" $S/fork.log \
-    && ok "the refusal names the alternative that does work here" \
-    || bad "refusal offers no way forward: $(head -3 $S/fork.log)"
+[ "$FRC" = 0 ] && ok "view fork copies a whole subspace (rc=$FRC)" \
+    || bad "view fork still fails on fdb://: $(head -3 $S/fork.log)"
+grep -q "forked view '${V2}_fk' from base '${V2}'" $S/fork.log \
+    && ok "the fork reports what it copied, in the same words as the other backends" \
+    || bad "fork wording differs: $(head -2 $S/fork.log)"
+grep -qi "shared object" $S/fork.log \
+    && ok "the fork states the bytes are shared, not copied" \
+    || bad "no byte-sharing note: $(head -2 $S/fork.log)"
 grep -qiE "No such file|os error 2" $S/fork.log \
-    && bad "the refusal leaked a raw io error instead of a verdict" \
+    && bad "the fork leaked a raw io error instead of a verdict" \
     || ok "no raw io error leaked from the wrong layer"
-[ ! -e "$S/home/meta/${V2}_fk.db" ] && ok "the refusal minted no local fork tree" \
+[ ! -e "$S/home/meta/${V2}_fk.db" ] && ok "the fork minted no LOCAL SQLite tree" \
     || bad "a LOCAL SQLite fork db appeared for an fdb:// view (the silent half-usable shape)"
-$Y view --meta-store "$FDBURI" --meta-dir $S/home list 2>/dev/null | grep -q "${V2}_fk" \
-    && bad "a refused fork still left a definition behind" || ok "no definition left behind"
-# Grafting needs a destination that OWNS a tree, so this grafts FROM the run's
-# first subspace INTO the shape subspace — past every guard, straight into the
-# store-level verdict (a refusal that never reached `graft_tree` would be the
-# wrong-layer answer this criterion is about).
-printf '/docs\tgrafted_docs\n' | $Y view --meta-store "$FDBURI" --meta-dir $S/home graft \
-    --name "$V2" --src "$VIEW" --map - > $S/graft.log 2>&1
+$Y view --meta-store "$FDBURI" --meta-dir $S/home list 2>/dev/null \
+    | grep -q "fork '${V2}_fk' of base '${V2}'" \
+    && ok "the fork definition landed in the control plane" \
+    || bad "fork missing from the fdb listing: $(head -5 $S/vlist.log)"
+# Graft into the FORK — the destination must OWN a tree, and the plan exercises
+# both forms (a rename and a --dest-style path rewrite) from the shape subspace.
+printf 'docs\tgrafted_docs\ndata/raw\tmeta/raw\n' > $S/fk.plan
+$Y view --meta-store "$FDBURI" --meta-dir $S/home graft --name "${V2}_fk" --src "$V2" \
+    --map $S/fk.plan > $S/graft.log 2>&1
 GRC=$?
-[ "$GRC" != 0 ] && grep -qi "not implemented" $S/graft.log && grep -qi "FoundationDB" $S/graft.log \
-    && ok "graft answers with the same explicit verdict" \
-    || bad "graft on fdb:// did not refuse clearly (rc=$GRC): $(head -3 $S/graft.log)"
+[ "$GRC" = 0 ] && ok "view graft places a curated subset inside the fork (rc=$GRC)" \
+    || bad "graft failed on fdb://: $(head -3 $S/graft.log)"
+grep -qi "grafted" $S/graft.log \
+    && ok "graft reports the entries it placed" \
+    || bad "graft said nothing about what it placed: $(head -2 $S/graft.log)"
+$Y view --meta-store "$FDBURI" --meta-dir $S/home rm --name "${V2}_fk" > $S/fkrm.log 2>&1 \
+    && ok "view rm drops the fork's own subspace" \
+    || bad "view rm of the fork failed: $(head -3 $S/fkrm.log)"
+[ ! -e "$S/home/meta/${V2}_fk.db" ] && ok "no local tree was left behind by the round trip" \
+    || bad "a local fork db survived the removal"
 
 echo "===== 11) unmount + remount: content identical (durability without an engine) ====="
 SNAP_A=$(cd "$A" 2>/dev/null && find . -type f | sort | while read -r f; do printf '%s %s\n' "$f" "$(cat "$f")"; done)
@@ -889,20 +916,20 @@ $Y view --meta-store "$FDBURI" --meta-dir $S/home import --view "$V3" --in $S/m_
 grep -q "$NODES node(s)" $S/m_imp1.log && ok "import reports the source's node count ($NODES)" \
     || bad "import output unexpected: $(cat $S/m_imp1.log)"
 # What `view list --meta-store fdb://…` answers, stated rather than assumed:
-# definitions come from the local files (C6), while a BASE tree is a subspace — and
-# the two questions are answered by two different commands on purpose. `view list`
-# keeps answering the DEFINITIONS (that is what a definition slot is for: the
-# derived/alias/fork names, which have no subspace of their own); `view scan`
-# (section 14) walks the cluster and answers what TREES exist. Collapsing them
-# would make a base view and a definition look alike in one listing, and it would
-# hide the case both commands exist for: a subspace nothing here defines (an
-# abandoned run, an import nobody mounted).
+# definitions are cluster rows in the ctl subspace, and a BASE tree is a subspace
+# too — but the two questions are answered by two different commands on purpose.
+# `view list` is the GOVERNANCE catalog (the derived/alias/fork definitions and the
+# base names they resolve to, never a bare subspace-name line); `view scan`
+# (section 14) walks the cluster and answers what TREES exist, with counts and
+# prefix hex. Collapsing them would make a base view and a definition look alike
+# in one listing, and it would hide the case both commands exist for: a subspace
+# nothing here defines (an abandoned run, an import nobody mounted).
 #
 # Existence is still decided by the cluster — by name, through
 # `has_physical`/`subspace_exists` — which is what the mount below proves.
 $Y view --meta-store "$FDBURI" --meta-dir $S/home list 2>/dev/null | grep -q "^$V3\$" \
     && bad "view list NOW enumerates base subspaces — this assertion, and docs.html's 未提供操作 row, both need updating" \
-    || ok "the documented boundary holds: \`view list\` answers the definitions (local files, C6) and \`view scan\` answers the subspaces"
+    || ok "the documented boundary holds: \`view list\` answers the governance catalog (cluster ctl rows) and \`view scan\` answers the subspaces"
 $Y --home $S/h1 mount --view "$V3" --mountpoint $S/mnt_m2 --meta-server $META \
     --data-servers $DATA --foreground > $S/m_mnt2.log 2>&1 &
 MP2=$!; BG="$BG $MP2"
@@ -1072,9 +1099,10 @@ fusermount -u $S/mnt_ev 2>/dev/null; kill $MNE2 2>/dev/null; wait $MNE2 2>/dev/n
 kill $MPE $DPE 2>/dev/null; wait $MPE 2>/dev/null; wait $DPE 2>/dev/null
 
 echo "===== 14) view scan / view rm --base: the cluster inventory and the real teardown ====="
-# C6's split, made operational: definitions are LOCAL files under `--meta-store
-# fdb://…`, trees are SUBSPACES in the cluster. `view list` answers the first and
-# `view scan` the second; neither can answer the other. This section pins both the
+# The governance/physical split, made operational: under `--meta-store fdb://…`
+# definitions are ctl-subspace rows and trees are per-view SUBSPACES, both in the
+# cluster. `view list` answers the governance catalog and `view scan` the physical
+# inventory; neither can answer the other. This section pins both the
 # listing (including that the prefix column addresses the keys it counted) and the
 # removal — tree first is WRONG, so what is asserted here is the order: unwind the
 # shared ledger, then drop the subspace, and a second run is a no-op.

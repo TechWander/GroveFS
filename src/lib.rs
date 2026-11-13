@@ -25,6 +25,11 @@ pub mod backend;
 pub mod bwlimit;
 #[cfg(feature = "native")]
 pub mod control;
+/// The REMOTE control plane: governance (`ControlStore`) over the framed
+/// transport, so an operator machine needs an account key instead of a database
+/// connection. Pairs with `meta-server --control-listen`.
+#[cfg(feature = "native")]
+pub mod control_remote;
 #[cfg(feature = "native")]
 pub mod du;
 // Optional FoundationDB metadata backend. Gated on `fdb` (not just `native`)

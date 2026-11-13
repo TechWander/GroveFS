@@ -15,7 +15,8 @@ backend: on embedded SQLite it writes `<meta-dir>/meta/views/*.layout` (a fork
 additionally writes `meta/<name>.db` and rebuilds the `refs.db` ledger); when
 the server runs with `--meta-store postgres://…` definitions write to the PG table
 `grovefs_control.view_defs` instead and nothing control-plane lands on local
-disk (fork is not implemented on PG — it refuses). It **never mounts and never
+disk — a fork there copies the `grovefs_v_<hex>` schema itself (one transaction,
+bytes shared through `grovefs_refs.holders`); on `fdb://` it copies a subspace. It **never mounts and never
 reads object bytes**. Mounting and data I/O belong to the CLI/ops plane, not
 here.
 
@@ -133,7 +134,7 @@ bash scripts/smoke.sh
 | `define_derived_view` | ★`name` ★`base` ★`rules` | Publish/replace a **read-only** derived lens |
 | `alias_view` | ★`name` ★`real` \| `retire` | Publish a writable public alias; `retire` rotates names gaplessly (write new, then remove old) |
 | `fork_view` | ★`name` ★`base` \| `seed` | Seed an **independent metadata tree** (structure writable, content `EROFS`, bytes shared). `seed:false` creates the tree EMPTY (root only) to be filled by `graft_view` |
-| `graft_view` | ★`name` ★`map` \| `src`/`dest`/`skip_existing` | Copy a **curated subset** of one view's names into `name` — `name` may be a **fork OR a bare base view** (any tree that owns its `node` table; a derived lens or an alias is refused by role). `map` is plan text, one entry per line (blank lines and whole-line `#` comments ignored): `<src>` alone keeps that entry's **full relative path** in the destination (NOT its basename — the parent dirs are recreated), `<src>TAB<dst>` lands exactly at `dst` (that TAB is the only way to rename), and `dest` prefixes **every** line, TAB lines included. A trailing `#` is part of the name, not a comment. A directory source brings its whole subtree; missing destination dirs are created (0755); the reply's `entries` count includes auto-created parents; the whole plan lands in ONE transaction (any conflict refuses all of it unless `skip_existing`); bytes are shared (ledger hold per blob). `src` defaults to the fork's recorded base and is **required** when `name` is a base view |
+| `graft_view` | ★`name` ★`map` \| `src`/`dest`/`skip_existing` | Copy a **curated subset** of one view's names into `name` — `name` may be a **fork OR a bare base view** (any tree that owns its `node` table; a derived lens or an alias is refused by role). `map` is plan text, one entry per line (blank lines and whole-line `#` comments ignored): `<src>` alone keeps that entry's **full relative path** in the destination (NOT its basename — the parent dirs are recreated), `<src>TAB<dst>` lands exactly at `dst` (that TAB is the only way to rename), and `dest` prefixes **every** line, TAB lines included. A trailing `#` is part of the name, not a comment. A directory source brings its whole subtree; missing destination dirs are created (0755); the reply's `entries` count includes auto-created parents; the whole plan lands in ONE transaction (any conflict refuses all of it unless `skip_existing`; under `fdb://` a plan larger than the 10 MB transaction limit is split into several — an oversized directory included — and the batches already committed stay if one fails); bytes are shared (ledger hold per blob). `src` defaults to the fork's recorded base and is **required** when `name` is a base view |
 | `remove_view` | ★`name` | Delete a definition slot (derived/alias/shared); deleting a fork drops its own tree too |
 | `preview_rules` | ★`rules` | Validates verb syntax only; errors carry line numbers |
 | `validate_definition` | ★`name` ★`base` ★`rules` | Runs a publish through the **entire governance guard set** before anything is written, returning the exact refusal text |
@@ -284,8 +285,8 @@ lines interpolates your own names/paths.
 | `retire` naming something that is not an alias here | `--retire '<old>' is not a pure alias here (a derived view is separate — \`grovefs view list\` shows what '<old>' actually is)` |
 | `retire` removing an alias of a different view | `--retire '<old>' currently aliases a different real view ('<r>'), not '<real>' — rotation must retire the previous name of the same view` |
 | `retire` equal to the new name | `--retire must name a DIFFERENT (previous) alias, not the one being created` |
-| Forking a base with no local tree | `no physical base tree for '<base>' in <store> — \`fork\` copies a LOCAL SQLite tree; … A PostgreSQL-backed view cannot be forked (…)` |
-| Forking through a `--meta-store postgres://…` server even when the base schema exists | `fork is not implemented on the PostgreSQL backend yet (the tree copy needs a per-view snapshot path; PG-backed views are served through a meta-server or a mount)` |
+| Forking a base with no tree in the store | `no physical base tree for '<base>' in <store> — `fork` copies a physical view tree; create the base first (…)` (one sentence for every backend: `has_physical` answers in the store's own terms) |
+| Forking through a `--meta-store postgres://…` server | works — the copy is one `INSERT … SELECT` between the source and target `grovefs_v_<hex>` schemas, in one transaction (`forksrv` suite, PG arm) |
 | Forking a base that is itself governed | `base '<base>' is governed by a definition (alias/derived/fork) — fork the physical base tree instead` |
 | Fork name == base name | `fork name must differ from its base` |
 | Forking a name that already has a definition | `view '<name>' already has a definition — remove it first (\`grovefs view rm --name <name>\`) before forking` |

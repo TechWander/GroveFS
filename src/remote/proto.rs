@@ -71,6 +71,32 @@ pub const OP_FENCE: u8 = 10;
 /// contributes `0u64` (non-existent == zero size) rather than aborting the batch.
 pub const OP_BATCH_LEN: u8 = 11;
 
+/// REMOTE CONTROL PLANE (governance), served by `meta-server --control-listen`.
+/// One request = one frame = one governance call; the connection carries no
+/// session state, so an operator on any machine needs nothing but the address
+/// and an admin-scope `api key`. Body is JSON:
+/// `{"k":"<id>:<secret>","op":"def.list","a":{…}}`.
+/// Response STATUS 0 carries a JSON envelope `{"ok":true,"r":<result>}` or
+/// `{"ok":false,"e":"<refusal>"}` — a wrong/revoked/under-scoped key is a
+/// normal refusal in that envelope, so the caller can print the real reason.
+/// A non-zero STATUS is a transport/protocol error with the text as payload.
+/// Deliberately its own op code (not `M_*`): governance is not a filesystem
+/// op and must never be reachable through a mount session.
+pub const OP_CONTROL: u8 = 12;
+/// Enumerate stored objects in pages — the data plane's half of the offline
+/// `gc` audit. Request body is `[u32 limit][key cursor]` (an EMPTY cursor asks
+/// for the first page); response DATA is `[u32 count]`, then `count` x
+/// `[key][u64 size][u64 mtime_secs]`, then one final `[key next]` (empty = the
+/// walk is complete).
+///
+/// The cursor is OPAQUE and is echoed back verbatim: the data-server owns the
+/// layout (bucket fan-out, disks, shards), so only it can say what "continue"
+/// means. `mtime_secs` travels with each row because `gc`'s grace window must
+/// be judged by the machine HOLDING the bytes, not by the auditor's clock.
+/// This is a read: it carries no fence epoch and is deliberately not in
+/// [`is_data_write`], so an enumeration can never be mistaken for a mutation.
+pub const OP_LIST: u8 = 13;
+
 /// Data-plane ops that MUTATE stored object bytes/state. Since fencing, each
 /// carries a leading `[u64 epoch]` prefix on the request body — the fence token
 /// the client last learned from its (primary) meta-server. The data-server that

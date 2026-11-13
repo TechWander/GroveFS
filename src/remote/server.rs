@@ -596,6 +596,44 @@ fn dispatch(backend: &dyn StorageBackend, op: u8, body: &[u8]) -> (i32, u64, Vec
         return (0, total, data);
     }
 
+    // Enumeration is the third op with no single-key operand: the request
+    // carries its own cursor, and the response carries a whole page.
+    if op == proto::OP_LIST {
+        let mut li = 0usize;
+        let limit = match proto::read_u32(body, &mut li) {
+            Ok(n) => (n as usize).min(crate::backend::LIST_LIMIT_MAX),
+            Err(_) => return (EIO, 0, Vec::new()),
+        };
+        let cursor = match proto::get_key(body, &mut li) {
+            Ok(c) => c,
+            Err(_) => return (EIO, 0, Vec::new()),
+        };
+        let cur = if cursor.is_empty() {
+            None
+        } else {
+            Some(cursor.as_str())
+        };
+        return match backend.list_objects(cur, limit) {
+            Ok(page) => {
+                let mut d = Vec::with_capacity(4 + page.rows.len() * 72);
+                proto::put_u32(&mut d, page.rows.len() as u32);
+                for r in &page.rows {
+                    proto::put_key(&mut d, &r.key);
+                    proto::put_u64(&mut d, r.size);
+                    proto::put_u64(&mut d, r.mtime_secs as u64);
+                }
+                proto::put_key(&mut d, page.next.as_deref().unwrap_or(""));
+                (0, page.rows.len() as u64, d)
+            }
+            // A backend that cannot enumerate says so with a distinct errno
+            // rather than a generic EIO: "this node's storage cannot be walked"
+            // is a different fact from "the walk failed", and an auditor must
+            // refuse to draw a verdict in either case.
+            Err(e) if e.kind() == io::ErrorKind::Unsupported => (ENOSYS, 0, Vec::new()),
+            Err(e) => (errno(&e), 0, Vec::new()),
+        };
+    }
+
     let mut i = 0usize;
     let key = match proto::get_key(body, &mut i) {
         Ok(k) => k,

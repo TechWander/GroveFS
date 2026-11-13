@@ -54,6 +54,23 @@ fn attach_refs_ledger(conn: &Connection, path: &Path) -> rusqlite::Result<()> {
     // Best effort: switching needs a brief exclusive lock, so a busy ledger
     // (another process converting at the same moment) must not fail the open.
     let _ = conn.execute_batch(&format!("PRAGMA {REFS_SCHEMA}.journal_mode=WAL;"));
+    // `journal_mode` switches re-seed the ledger's *own* `synchronous` back to
+    // FULL: `synchronous` is tracked per attached database, not per connection,
+    // and the switch resets it. The ledger is touched by almost every namespace
+    // write (holders bookkeeping), so a FULL ledger meant one fsync per op on
+    // `refs.db-wal` and dwarfed everything else the engine did — strace put 301
+    // of 328 fsyncs on that file for 300 sequential e2e creates, i.e. the whole
+    // "~19ms/create, 45-58 ops/s" FUSE ceiling was this one line.
+    //
+    // Mirror whatever the view db runs with instead of hardcoding NORMAL, so a
+    // deployment that deliberately raises main to FULL keeps the same crash
+    // guarantee here: node rows and holder rows are committed in one txn, and
+    // they must not disagree about durability. (WAL multi-db commits are not
+    // power-loss atomic regardless — that trade-off predates this line.)
+    let main_sync: i64 = conn
+        .query_row("PRAGMA main.synchronous", [], |r| r.get(0))
+        .unwrap_or(1);
+    let _ = conn.execute_batch(&format!("PRAGMA {REFS_SCHEMA}.synchronous={main_sync};"));
     conn.execute_batch(&format!(
         "CREATE TABLE IF NOT EXISTS {REFS_SCHEMA}.holders (
              data_ref TEXT PRIMARY KEY,
@@ -316,7 +333,12 @@ pub struct GraftStats {
 /// Normalize one plan path: strip leading/trailing slashes and `.`
 /// components, refuse `..` outright. A plan is DATA handed over by another
 /// program, never a shell word, so it must not be able to walk out of the view.
-fn normalize_plan_path(p: &str) -> Result<String, String> {
+///
+/// Public because the graft CONTRACT is shared: the PG arm
+/// ([`crate::pg_store::graft_tree`]) normalizes its `dest` prefix with THIS
+/// function, so a `..` is refused identically on every backend instead of being
+/// re-derived (and possibly mis-derived) per store.
+pub fn normalize_plan_path(p: &str) -> Result<String, String> {
     if p.contains('\0') {
         return Err("path contains a NUL byte".to_string());
     }
@@ -699,6 +721,24 @@ pub fn graft_view(
             .query_row("SELECT IFNULL(MAX(ino),0) FROM node", [], |r| r.get(0))
             .map_err(|e| format!("cannot size the destination tree: {e}"))?;
         ctx.next = max_id.max(max_ino) + 1;
+        // What the destination ALREADY names, read before a single grafted row
+        // lands: the ledger counts holders per view, so these blobs must not be
+        // booked again (see the booking loop below).
+        let held_before: HashSet<String> = {
+            let mut st = tx
+                .prepare("SELECT DISTINCT data_ref FROM node WHERE data_ref IS NOT NULL")
+                .map_err(|e| format!("cannot size the destination tree: {e}"))?;
+            let mut v: Vec<String> = Vec::new();
+            {
+                let it = st
+                    .query_map([], |r| r.get::<_, String>(0))
+                    .map_err(|e| format!("cannot size the destination tree: {e}"))?;
+                for x in it.flatten() {
+                    v.push(x);
+                }
+            }
+            v.into_iter().collect()
+        };
         {
             let mut ins = tx
                 .prepare(GRAFT_INSERT)
@@ -714,10 +754,14 @@ pub fn graft_view(
                 )?;
             }
         }
-        // Book the destination's hold on every blob it now names; if the SOURCE
-        // view was never booked (a store predating the ledger and never
-        // rebuilt), book it first — otherwise its last-name delete would free a
-        // blob this graft still names.
+        // Book the destination's hold on every blob it now names. The ledger
+        // counts HOLDERS PER VIEW, not names, so a blob the destination already
+        // named before this graft (a second graft into the same fork, or a
+        // curated copy beside an earlier one) must NOT be booked again — that
+        // would leave a holder nobody ever unbooks and the object would never be
+        // freed. If the SOURCE view was never booked (a store predating the
+        // ledger and never rebuilt), book it first — otherwise its last-name
+        // delete would free a blob this graft still names.
         for dr in &ctx.blobs {
             let booked = tx
                 .query_row(
@@ -729,8 +773,12 @@ pub fn graft_view(
             if !booked {
                 ledger_add(&tx, dr)
                     .map_err(|e| format!("cannot book '{dr}' in the ledger: {e}"))?;
+                ledger_add(&tx, dr)
+                    .map_err(|e| format!("cannot book '{dr}' in the ledger: {e}"))?;
+            } else if !held_before.contains(dr) {
+                ledger_add(&tx, dr)
+                    .map_err(|e| format!("cannot book '{dr}' in the ledger: {e}"))?;
             }
-            ledger_add(&tx, dr).map_err(|e| format!("cannot book '{dr}' in the ledger: {e}"))?;
         }
         tx.commit()
             .map_err(|e| format!("cannot commit the graft into {}: {e}", dst_path.display()))?;
@@ -1406,9 +1454,50 @@ impl CheckpointCtl {
 /// fires on the hot path — the stall moves off the user's metadata write.
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Number of pooled read connections opened per view engine for concurrent
-/// metadata reads.
-pub const READ_POOL_SIZE: usize = 4;
+/// Default number of pooled read connections opened per view engine for
+/// concurrent metadata reads. Kept small on purpose: every open connection
+/// costs ~3 fds (db + `-wal` + `-shm`) on top of the writer's, so this is the
+/// dominant term in the "how many views fit in `LimitNOFILE`" budget quoted
+/// by the selection guide (~15 fds/view at the old default of 4). Draining the
+/// pool lazily opens a replacement, so 1 keeps one warm reader while a cold
+/// burst pays one open per concurrent read instead of pinning four forever.
+pub const READ_POOL_SIZE: usize = 1;
+
+/// Runtime knob for [`READ_POOL_SIZE`]: `GROVEFS_SQLITE_READ_POOL` (`0..=16`).
+/// `0` means fully lazy — every read opens, returns, and closes — which is the
+/// fd-cheapest shape for thousands of idle-but-mounted views; `8` restores the
+/// old warm-reader width. Internal tuning knob (like `GROVEFS_LOCK_LEASE_SECS`),
+/// cached on first read; the CLI surface is unchanged.
+fn read_pool_size() -> usize {
+    static SLOT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+    let cur = SLOT.load(std::sync::atomic::Ordering::Relaxed);
+    if cur != usize::MAX {
+        return cur;
+    }
+    let v = std::env::var("GROVEFS_SQLITE_READ_POOL")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|n| n.min(16))
+        .unwrap_or(READ_POOL_SIZE);
+    SLOT.store(v, std::sync::atomic::Ordering::Relaxed);
+    v
+}
+
+/// Connection-level pragmas applied to every READ handle (pooled, lazily
+/// opened, or standby). The default 2 MiB page cache is small for the hot
+/// reads GroveFS issues (lookup by `(parent,name)`, getattr by `ino`, and the
+/// directory nlink COUNT over `(parent,is_dir)`), so the ceiling is raised and
+/// a read-only mmap is allowed; `temp_store=MEMORY` keeps paging sorts off
+/// disk. The cache ceiling is per connection and grows only as pages are
+/// touched, so it is not an immediate per-view RSS cost.
+fn apply_read_pragmas(conn: &Connection) {
+    let _ = conn.execute_batch(
+        "PRAGMA busy_timeout=5000;
+         PRAGMA cache_size=-8192;
+         PRAGMA mmap_size=67108864;
+         PRAGMA temp_store=MEMORY;",
+    );
+}
 /// Ceiling on the keyset cursors kept for READDIR paging. One checkpoint per
 /// [`READDIR_CURSOR_STRIDE`] rows per open directory; a walk of ten million
 /// entries needs ~300k, so this only trips under pathological seekdir churn,
@@ -1439,7 +1528,7 @@ impl Drop for ReadGuard<'_> {
     fn drop(&mut self) {
         if let Some(c) = self.conn.take() {
             let mut pool = self.eng.read_pool.lock();
-            if pool.len() < READ_POOL_SIZE {
+            if pool.len() < read_pool_size() {
                 pool.push(c);
             }
         }
@@ -1520,7 +1609,7 @@ impl MetaEngine {
             Connection::open(path)
         }?;
         if readonly {
-            let _ = conn.execute_batch("PRAGMA busy_timeout=5000;");
+            apply_read_pragmas(&conn);
             // Best-effort ledger attach (no DDL — the file must already exist):
             // a standby never writes, and its cross-view hold checks simply read
             // "no other view" when the sibling refs.db is absent.
@@ -1545,6 +1634,8 @@ impl MetaEngine {
              PRAGMA foreign_keys=ON;
              PRAGMA busy_timeout=5000;
              PRAGMA wal_autocheckpoint=1000;
+             PRAGMA cache_size=-8192;
+             PRAGMA temp_store=MEMORY;
              CREATE TABLE IF NOT EXISTS node (
                  id           INTEGER PRIMARY KEY,
                  parent_id    INTEGER,
@@ -1612,9 +1703,9 @@ impl MetaEngine {
             )?;
         }
         let mut pool = Vec::new();
-        for _ in 0..READ_POOL_SIZE {
+        for _ in 0..read_pool_size() {
             if let Ok(rc) = Connection::open(path) {
-                let _ = rc.execute_batch("PRAGMA busy_timeout=5000;");
+                apply_read_pragmas(&rc);
                 pool.push(rc);
             }
         }
@@ -1724,7 +1815,7 @@ impl MetaEngine {
         let c = self.read_pool.lock().pop().unwrap_or_else(|| {
             stats::count(stats::Counter::PoolLazyOpen, 1);
             let rc = Connection::open(&self.path).expect("open read connection");
-            let _ = rc.execute_batch("PRAGMA busy_timeout=5000;");
+            apply_read_pragmas(&rc);
             rc
         });
         ReadGuard {
@@ -3136,6 +3227,30 @@ mod tests {
             .lookup(ROOT_INO, "f")
             .expect("entry must survive rename(a,a)");
         assert_eq!(n.id, id, "no-op must keep the same inode");
+    }
+
+    /// The cross-view ledger is ATTACHed after `synchronous=NORMAL` is set, but
+    /// switching its `journal_mode` to WAL re-seeds that database's *own*
+    /// `synchronous` back to FULL — which put one fsync per namespace write on
+    /// `refs.db-wal` and capped e2e create at ~50 ops/s (strace: 301 fsyncs on
+    /// the ledger for 300 creates). The fix mirrors main's setting onto the
+    /// ledger; this pins the two together so they cannot drift apart again.
+    #[test]
+    fn refs_ledger_mirrors_the_view_synchronous_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = MetaEngine::open(&dir.path().join("view.db")).unwrap();
+        let conn = e.conn.lock();
+        let main_sync: i64 = conn
+            .query_row("PRAGMA main.synchronous", [], |r| r.get(0))
+            .unwrap();
+        let refs_sync: i64 = conn
+            .query_row(&format!("PRAGMA {REFS_SCHEMA}.synchronous"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(main_sync, 1, "view db runs NORMAL in WAL mode");
+        assert_eq!(
+            refs_sync, main_sync,
+            "ledger must carry the same durability setting as the view db"
+        );
     }
 
     /// Renaming a directory over an EXISTING NON-EMPTY directory must fail

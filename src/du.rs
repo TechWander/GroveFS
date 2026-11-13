@@ -189,9 +189,13 @@ fn gather_nodes(opts: &DuOpts) -> io::Result<Vec<FlatNode>> {
 /// The FDB counterpart of `gather_pg`: one read-only subspace scan, no meta-server
 /// round trip. Opening read-only matters — `du` must not seed a root row for a
 /// view name that does not exist (the same "a probe must not create" rule
-/// `crate::mcp` applies to its PG probe).
+/// `crate::mcp` applies to its PG probe), and the same existence probe decides
+/// whether this is a tree at all or a misspelt name.
 #[cfg(feature = "fdb")]
 fn gather_fdb(uri: &str, view: &str) -> io::Result<Vec<FlatNode>> {
+    if !crate::fdb_store::FdbStore::subspace_exists(uri, view).map_err(io::Error::other)? {
+        return Err(no_tree(view, uri));
+    }
     let store = crate::fdb_store::FdbStore::open(uri, view, true)?;
     Ok(store
         .dump_tree()
@@ -212,8 +216,29 @@ fn resolve_store(explicit: &Option<String>) -> Option<String> {
         .or_else(|| std::env::var("GROVEFS_META_STORE").ok())
 }
 
+/// One sentence for "this name has no tree here", raised by all three gatherers.
+///
+/// Without it a misspelt `--view` was answered three different ways: SQLite said
+/// `sqlite open ...: No such file or directory`, PG said `pg query: db error`
+/// (SQLSTATE 42P01 in disguise) and FDB said nothing at all — 0 B, byte-identical
+/// to a genuinely empty view. A measuring tool must not be able to report "empty"
+/// for a name that does not exist.
+fn no_tree(view: &str, store: &str) -> io::Error {
+    io::Error::other(format!(
+        "no tree for view '{view}' in {store} — `grovefs view create --view {view}` makes one, \
+         and `grovefs view list` shows the names that exist"
+    ))
+}
+
 fn gather_pg(uri: &str, view: &str) -> io::Result<Vec<FlatNode>> {
     let schema = grovefs_pg_schema(view);
+    // Ask the catalog BEFORE selecting from it: the schema is the tree, so a
+    // missing one is "no such view", not a query failure to be quoted raw.
+    match crate::pg_store::PgEngine::tree_exists(uri, view) {
+        Ok(true) => {}
+        Ok(false) => return Err(no_tree(view, uri)),
+        Err(e) => return Err(io::Error::other(e)),
+    }
     let conn = postgres::Client::connect(uri, postgres::tls::NoTls)
         .map_err(|e| io::Error::other(format!("pg connect: {e}")))?;
     let sql =
@@ -236,6 +261,9 @@ fn gather_pg(uri: &str, view: &str) -> io::Result<Vec<FlatNode>> {
 
 fn gather_sqlite(db_path: &std::path::Path, view: &str) -> io::Result<Vec<FlatNode>> {
     let db_file = db_path.join("meta").join(format!("{view}.db"));
+    if !db_file.exists() {
+        return Err(no_tree(view, &db_file.display().to_string()));
+    }
     let conn = rusqlite::Connection::open(&db_file)
         .map_err(|e| io::Error::other(format!("sqlite open {}: {e}", db_file.display())))?;
     let mut stmt = conn

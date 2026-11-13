@@ -75,6 +75,15 @@
 /.s7test/
 /.rgap/
 /.f63/
+/.ctltest/
+/.forkpgtest/
+/.forktest2/
+/.gcremtest/
+/.pgbench/
+/.xfertest/
+/.probe_sync/
+/.fdb3bench/
+/.fdb3bench_*.out
 
 # Regenerable docs.html backups left behind by in-place rewrites.
 /docs-original.html

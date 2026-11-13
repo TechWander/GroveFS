@@ -165,7 +165,8 @@ BEFORE_SCH=""
 [ -n "$(command -v psql)" ] && BEFORE_SCH=$(PGQ "select count(*) from information_schema.schemata where schema_name='grovefs_v_${SCH}'")
 if [ -n "$(command -v psql)" ]; then
     chk "$BEFORE_SCH" "1" "schema grovefs_v_${SCH} exists before teardown"
-    BEFORE_LED=$(PGQ "select count(*) from grovefs_refs.holders where data_ref in (select data_ref from grovefs_v_${SCH}.node where data_ref is not null)")
+    LED_REFS=$(PGQ "select data_ref from grovefs_v_${SCH}.node where data_ref is not null order by 1")
+    BEFORE_LED=$(printf '%s\n' "$LED_REFS" | grep -c .)
     [ "${BEFORE_LED:-0}" -gt 0 ] && ok "the view booked ${BEFORE_LED} ledger row(s)" \
         || bad "ledger booked nothing for a view that holds files (got '$BEFORE_LED')"
 fi
@@ -175,8 +176,23 @@ RRC=$?
 if [ -n "$(command -v psql)" ]; then
     chk "$(PGQ "select count(*) from information_schema.schemata where schema_name='grovefs_v_${SCH}'")" "0" \
         "schema grovefs_v_${SCH} is gone"
-    chk "$(PGQ "select count(*) from grovefs_refs.holders")" "0" \
-        "every ledger row the view booked is unwound (no residue for the next run)"
+    # The PG cluster is SHARED with the other suites (and with whatever an
+    # earlier killed run left behind), so a global `holders = 0` answers the
+    # wrong question: it fails on THEIR residue, not on a leak of ours. Ask the
+    # precise one instead — for every content key THIS view held, the ledger row
+    # must be gone unless a surviving schema still names that key (a legitimate
+    # shared hold, which is exactly what `holders` is for).
+    RESID=0
+    for r in $LED_REFS; do
+        [ "$(PGQ "select count(*) from grovefs_refs.holders where data_ref='$r'")" = "0" ] && continue
+        STILL=0
+        for s in $(PGQ "select schema_name from information_schema.schemata where schema_name like 'grovefs_v_%'"); do
+            STILL=$((STILL + $(PGQ "select count(*) from ${s}.node where data_ref='$r'")))
+        done
+        [ "$STILL" = 0 ] && RESID=$((RESID + 1))
+    done
+    chk "$RESID" "0" \
+        "every ledger row this view booked is unwound (holds surviving schemas still need are kept)"
 fi
 $Y view --meta-dir .pgtest/home --meta-store "$PGURI" rm --name "$VIEW" --base > .pgtest/rm2.log 2>&1
 [ $? != 0 ] && ok "a second removal is refused (a typo never reads as success)" \

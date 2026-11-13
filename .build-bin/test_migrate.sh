@@ -173,24 +173,32 @@ $Y view $MSRC rm --name lens > /dev/null 2>&1
 
 echo "===== 4) a fork exports as kind=fork, with a warning ====="
 if [ "$BACKEND" = fdb ]; then
-    # Fork is the one thing in this suite that has no FoundationDB shape: a fork
-    # is a copied snapshot of a base tree, and a view here IS one subspace of the
-    # cluster, with nothing to copy from. The answer is the explicit verdict the
-    # backend already gives (P5), asserted exactly as section 10d of test_fdb.sh
-    # asserts it — this tier exists to re-run the suite's claims, not to invent a
-    # quieter second truth.
+    # Fork now HAS a FoundationDB shape: a whole-subspace read plus one write
+    # transaction, the definition recorded in the (file) control plane and the
+    # bytes left where they are. This re-runs the same contract test_fdb.sh §10d
+    # pins and the SQLite branch below asserts — a real fork, no local SQLite
+    # tree, a stated byte-sharing, and an export marked kind=fork. (The old
+    # refusal verdict was retired when the backend learned to copy a subspace.)
     $Y view $MSRC fork --name lab --base $VIEW1 > .migtest/fork.log 2>&1
     FRC=$?
-    [ "$FRC" != 0 ] && ok "view fork refuses on an fdb:// store (rc=$FRC)" \
-        || bad "view fork was ACCEPTED on fdb:// — nothing here copies a subspace"
-    grep -qi "not implemented" .migtest/fork.log && grep -qi "FoundationDB" .migtest/fork.log \
-        && ok "the refusal says what is missing and on which backend" \
-        || bad "refusal unclear: $(head -3 .migtest/fork.log)"
-    grep -qiE "alias|derived view" .migtest/fork.log \
-        && ok "the refusal names the alternative that does work here" \
-        || bad "refusal offers no way forward: $(head -3 .migtest/fork.log)"
-    [ ! -e .migtest/src/meta/lab.db ] && ok "the refusal minted no local fork tree" \
-        || bad "fork left a tree behind"
+    [ "$FRC" = 0 ] && ok "view fork copies a whole subspace on fdb:// (rc=$FRC)" \
+        || bad "view fork failed on fdb://: $(head -3 .migtest/fork.log)"
+    grep -q "forked view 'lab' from base '$VIEW1'" .migtest/fork.log \
+        && ok "the fork reports what it copied, in the same words as the other backends" \
+        || bad "fork wording differs: $(head -2 .migtest/fork.log)"
+    grep -qi "shared object" .migtest/fork.log \
+        && ok "the fork states the bytes are shared, not copied" \
+        || bad "no byte-sharing note: $(head -2 .migtest/fork.log)"
+    [ ! -e .migtest/src/meta/lab.db ] && ok "the fork minted no LOCAL SQLite tree" \
+        || bad "a local SQLite fork db appeared for an fdb:// view"
+    $Y view $MSRC export --view lab --out .migtest/lab.jsonl > .migtest/exp_lab.log 2>&1 \
+        && ok "fork tree exported" || bad "fork export failed: $(cat .migtest/exp_lab.log)"
+    head -1 .migtest/lab.jsonl | grep -q '"kind":"fork"' \
+        && ok "header marks the tree as a fork" || bad "fork kind missing"
+    grep -q "this is a fork tree" .migtest/exp_lab.log \
+        && ok "export warns that import creates a writable base unless --as-fork" || bad "fork warning missing"
+    $Y view $MSRC rm --name lab > /dev/null 2>&1 \
+        && ok "the fork's own subspace is dropped (no cluster leak)" || bad "fork rm failed"
 else
     $Y view $MSRC fork --name lab --base $VIEW1 > .migtest/fork.log 2>&1 \
       && ok "forked 'lab' from '$VIEW1'" || bad "fork failed: $(cat .migtest/fork.log)"
@@ -225,8 +233,11 @@ $Y view $MDST import --view $VIEW2 --in .migtest/team.jsonl > .migtest/imp.log 2
   && ok "view import into the new store" || bad "import failed: $(cat .migtest/imp.log)"
 grep -q "8 node(s), 3 blob reference(s)" .migtest/imp.log \
   && ok "import reports the same node/blob counts" || bad "import counts: $(cat .migtest/imp.log)"
-grep -q "cross-view ledger rebuilt" .migtest/imp.log \
-  && ok "cross-view ledger rebuilt after import" || bad "ledger note missing"
+# The wording follows the mechanism: import no longer rebuilds the ledger from
+# scratch, it adjusts it from the OLD refs to the new ones (a rebuild would
+# re-count every other view's holds and could double-book a shared object).
+grep -q "cross-view ledger adjusted" .migtest/imp.log \
+  && ok "cross-view ledger adjusted after import" || bad "ledger note missing"
 if [ "$BACKEND" = fdb ]; then
     # "tree + ledger exist" has no file to look at here, so the question is asked
     # of the authority: the imported subspace dumps back with the same rows, which
@@ -358,28 +369,47 @@ fusermount -u .migtest/mnt_dst 2>/dev/null; kill $KP2 2>/dev/null; wait $KP2 2>/
 
 echo "===== 8) --as-fork restores fork semantics plus ledger sharing ====="
 if [ "$BACKEND" = fdb ]; then
-    # `--as-fork` is the import-side half of section 4's fork, and it meets the
-    # same verdict for the same reason: a fork is a copied snapshot of a base
-    # tree, and there is no snapshot of a subspace to copy. So the claim this
-    # section makes on SQLite — fork semantics, a shared ledger, an EROFS content
-    # write — has no fdb counterpart to re-run, and what runs instead is the
-    # refusal the backend actually gives, asserted with the same four checks
-    # section 4 uses: it refuses, it says on which backend and why, it names the
-    # way forward, and it provisions neither a subspace nor a definition.
+    # `--as-fork` is the import-side half of section 4's fork and now HAS a
+    # FoundationDB shape: it records a fork definition and shares the base's
+    # bytes through the cross-view ledger. Re-run the same contract the SQLite
+    # branch pins — fork semantics, a shared ledger, an EROFS content write —
+    # through a remote mount of the fork, then the same two import guards.
     $Y view $MDST import --view labx --in .migtest/team.jsonl --as-fork $VIEW1 > .migtest/f1.log 2>&1
-    [ $? -ne 0 ] && ok "import --as-fork refuses on an fdb:// store" \
-        || bad "--as-fork was ACCEPTED on fdb://: $(cat .migtest/f1.log)"
-    grep -q "as-fork" .migtest/f1.log && grep -qi "not implemented" .migtest/f1.log \
-        && ok "the refusal names the flag it refused and what is missing" \
-        || bad "refusal unclear: $(cat .migtest/f1.log)"
-    grep -qiE "alias|derived view" .migtest/f1.log \
-        && ok "the refusal names the alternative that works on every backend" \
-        || bad "refusal offers no way forward: $(cat .migtest/f1.log)"
-    $Y view $MDST export --view labx --out .migtest/labx.jsonl > .migtest/f1b.log 2>&1
-    [ $? -ne 0 ] && grep -qF "$GHOST" .migtest/f1b.log \
-        && ok "the refusal provisioned no subspace" || bad "labx answers after the refusal"
-    [ ! -e .migtest/src/meta/views/labx.layout ] && ok "the refusal wrote no definition slot" \
-        || bad "labx.layout left behind"
+    [ $? = 0 ] && ok "import --as-fork installs a fork on fdb://" \
+        || bad "--as-fork failed on fdb://: $(cat .migtest/f1.log)"
+    grep -q "recorded \`fork $VIEW1\`" .migtest/f1.log \
+        && ok "fork definition recorded" || bad "fork definition note missing: $(cat .migtest/f1.log)"
+    grep -qi "cross-view ledger" .migtest/f1.log \
+        && ok "the import states the ledger was adjusted (bytes shared)" || bad "no ledger note: $(cat .migtest/f1.log)"
+    [ ! -e .migtest/src/meta/labx.db ] && ok "the fork minted no LOCAL SQLite tree" \
+        || bad "a local SQLite fork db appeared for an fdb:// view"
+    $Y --home .migtest/dst mount --view labx -m .migtest/mnt_lab --no-cache $REMOTE --foreground > .migtest/lab.log 2>&1 &
+    LP=$!
+    mnt_gate .migtest/mnt_lab || bad "the imported fork never mounted"
+    L=.migtest/mnt_lab
+    # On the remote path the contract is announced at IMPORT time (the local
+    # mount banner is a local-only nicety); the EROFS check below pins behavior.
+    grep -q "content read-only (EROFS)" .migtest/f1.log \
+        && ok "imported fork announces its content-RO contract" || bad "fork contract note missing: $(cat .migtest/f1.log)"
+    T sh -c "printf 'new-body' > $L/docs/a.md" 2>.migtest/fw.err \
+        && bad "imported fork accepted a content write" \
+        || { rofs .migtest/fw.err && ok "content write refused with EROFS" || bad "wrong errno: $(cat .migtest/fw.err)"; }
+    T mkdir $L/org && ok "imported fork accepts structure writes" || bad "fork mkdir failed"
+    fusermount -u .migtest/mnt_lab 2>/dev/null; kill $LP 2>/dev/null; wait $LP 2>/dev/null
+    # base content still intact after the fork session (ledger sharing)
+    $Y --home .migtest/dst mount --view $VIEW1 -m .migtest/mnt_dst --no-cache $REMOTE --foreground > .migtest/dst2.log 2>&1 &
+    DP2=$!
+    mnt_gate .migtest/mnt_dst || bad "base never remounted"
+    chk "$(T cat .migtest/mnt_dst/docs/a.md)" "report-body" "base content intact after the fork session (ledger)"
+    fusermount -u .migtest/mnt_dst 2>/dev/null; kill $DP2 2>/dev/null; wait $DP2 2>/dev/null
+    # guards: a missing base subspace, and a view that is its own base
+    $Y view $MDST import --view laby --in .migtest/team.jsonl --as-fork ghost > .migtest/f2.log 2>&1
+    [ $? -ne 0 ] && ok "--as-fork requires a provisioned base subspace" || bad "missing-base guard: $(cat .migtest/f2.log)"
+    $Y view $MDST import --view labz --in .migtest/team.jsonl --as-fork labz > .migtest/f3.log 2>&1
+    [ $? -ne 0 ] && grep -q "must differ from its base" .migtest/f3.log \
+        && ok "a view cannot be its own fork base" || bad "self-base guard: $(cat .migtest/f3.log)"
+    $Y view $MDST rm --name labx > /dev/null 2>&1 \
+        && ok "the fork's own subspace is dropped (no cluster leak)" || bad "labx rm failed"
 else
     $Y view --meta-dir .migtest/dst import --view labx --in .migtest/lab.jsonl --as-fork team > .migtest/f1.log 2>&1 \
       && ok "import --as-fork team" || bad "as-fork import failed: $(cat .migtest/f1.log)"

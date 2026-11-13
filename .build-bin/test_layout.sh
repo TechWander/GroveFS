@@ -35,8 +35,8 @@ if [ "$BACKEND" = fdb ]; then
     # One meta-server + one data-server for the whole run: sections 9 and 11 below
     # would start their own pair on SQLite, where the mounts of sections 1-8 need
     # no server at all. Under `fdb://` every mount has to reach the cluster through
-    # a server, and the DEFINITIONS stay files in this one root, so a second root
-    # would split the control plane from the trees.
+    # a server, and the DEFINITIONS are cluster-wide too (the ctl subspace), so one
+    # server pair serving one scratch root carries the whole run.
     fdb_up .ltest/home "$TEAM" 127.0.0.1:15400 127.0.0.1:15401
 fi
 # Server pids start EMPTY: sections 9/11 spawn their own pair on SQLite and reuse
@@ -417,20 +417,20 @@ chk "$(T ls .ltest/mnt_rr | tr '\n' ' ')" "data docs photos shared " "real name 
 fusermount -u .ltest/mnt_rr 2>/dev/null
 kp $RRP2 $MSP3 $DSP3; wk $RRP2 $MSP3 $DSP3
 # The offline ingest path guards the NAME (an alias is not a storage identity) and
-# the BACKEND (a non-SQLite deployment has no local tree to write). Both refusals
-# are explicit errors, and neither can fall through to a file operation — the
-# scheme (no cluster, no PG server is ever contacted) and because an fdb://
-# deployment deliberately keeps GOVERNANCE in the local `meta/views/*.layout`
-# files (docs/fdb-keyspace.md: moving trees into the cluster while governance
-# stayed per-node is the split-brain the design refuses, so `fdb://` is
-# single-meta-server by contract and `resolve_store` routes defs to local files).
-mkdir -p .ltest/src_dir && touch .ltest/src_dir/f1
-$Y view $MSARG --meta-dir .ltest/home alias --name pub2 --real $TEAM > /dev/null 2>&1
-$Y import --meta-dir .ltest/home --view pub2 --source .ltest/src_dir > .ltest/al_imp.log 2>&1
+# the BACKEND (a non-SQLite deployment has no local tree to write). `import` is the
+# SQLite-only ingest verb: it refuses fdb:// and postgres:// outright (the BACKEND
+# guard, below), and its NAME guard reads the LOCAL `meta/views/<name>.layout` slot
+# directly — it never consults the cluster. So the alias-name guard is exercised
+# against an isolated local SQLite home of its own, on EVERY backend: under fdb://
+# the run's definitions live in the cluster's ctl subspace, where a local-file
+# command like `import` never looks, so the guard needs a real local base to alias.
+mkdir -p .ltest/src_dir .ltest/imp_home && touch .ltest/src_dir/f1
+$Y --home .ltest/imp_home init --view impbase > /dev/null 2>&1
+$Y view --meta-dir .ltest/imp_home alias --name pub2 --real impbase > /dev/null 2>&1
+$Y import --meta-dir .ltest/imp_home --view pub2 --source .ltest/src_dir > .ltest/al_imp.log 2>&1
 rc=$?
 [ $rc -ne 0 ] && grep -q "pure alias" .ltest/al_imp.log \
   && ok "import refuses an alias target (names the real view)" || bad "import guard wrong: $(cat .ltest/al_imp.log)"
-$Y view $MSARG --meta-dir .ltest/home rm --name pub2 > /dev/null 2>&1
 # Baseline for the next gate: the NAMES of the physical trees in this root (not
 # their -wal/-shm side files, which a healthy checkpoint comes and goes with).
 dbs_before=$(cd .ltest/home/meta && ls *.db 2>/dev/null | sort)

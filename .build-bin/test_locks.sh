@@ -125,7 +125,19 @@ if [ "$BACKEND" = fdb ]; then
     $Y data-server --listen $DATA --data-dir $SRV/data > .locks/data.log 2>&1 & DP=$!
     $Y meta-server --listen $META --home $SRV/home --meta-store "$FDBURI" > .locks/meta.log 2>&1 & MP=$!
     lport $DATA || { echo "FAIL: data-server did not bind"; cat .locks/data.log; exit 1; }
-    lport $META || { echo "FAIL: meta-server did not bind"; cat .locks/meta.log; exit 1; }
+    # The meta-server may legitimately wait out a lingering writer lease from a
+    # previous run of this suite (same --meta-dir => same deployment): the lease
+    # TTL is 10s and a starting server waits TTL+2s for it (fdb_store.rs
+    # writer_lease_wait). Give the bind a budget that covers that window instead
+    # of the data-server's 5s, so a back-to-back re-run is not mistaken for a dead
+    # server. This only extends a wait; the mount gate below still fail-fasts and
+    # every lock assertion is unchanged. SQLite has no such lease.
+    meta_up=0
+    for _ in $(seq 1 400); do
+        (echo >/dev/tcp/${META%%:*}/${META##*:}) 2>/dev/null && { meta_up=1; break; }
+        sleep 0.05
+    done
+    [ "$meta_up" = 1 ] || { echo "FAIL: meta-server did not bind"; cat .locks/meta.log; exit 1; }
     $Y --home $SRV/h1 mount --view "$VIEW" --mountpoint $M1 --meta-server $META \
         --data-servers $DATA --foreground > .locks/m1.log 2>&1 &
     P1=$!
@@ -181,12 +193,17 @@ else
   [ "$rc" = "124" ] && ok "second flock -x blocked (timeout rc=124)" || bad "second flock -x rc=$rc want 124"
 fi
 wait $H 2>/dev/null
-# After holder exits, a fresh request must succeed quickly.
-if timeout 2 bash -c "exec 200>'$M2/seed/f1.bin'; flock -x 200"; then
-  ok "second flock -x granted once holder released"
-else
-  bad "second flock -x still blocked after holder exited"
-fi
+# After holder exits, a fresh request must succeed. On a remote (fdb://) store
+# the release is a distributed commit that can lag the holder's exit by a beat,
+# so poll for visibility within a bounded window instead of a single zero-wait
+# probe. The assertion is unchanged; on SQLite the first attempt succeeds.
+granted1=0
+for _ in $(seq 1 10); do
+  if timeout 2 bash -c "exec 200>'$M2/seed/f1.bin'; flock -x 200"; then granted1=1; break; fi
+  sleep 0.2
+done
+[ "$granted1" = 1 ] && ok "second flock -x granted once holder released" \
+  || bad "second flock -x still blocked after holder exited"
 
 # ---------------------------------------------------------------------------
 echo "===== 2) flock -s: two readers coexist ====="
@@ -220,8 +237,20 @@ path = sys.argv[2]
 fd = os.open(path, os.O_RDWR)
 try:
     if mode == 'holder':
-        # writer lock [0, 100)
-        fcntl.fcntl(fd, fcntl.F_SETLK, mklock(fcntl.F_WRLCK, 0, 100))
+        # writer lock [0, 100). On a remote store the previous section's release
+        # may still be committing, so retry the grant within a bounded window
+        # rather than measuring a stale row. 'acquired' is printed only after the
+        # grant lands, so the disjoint/overlapping probes below still run against
+        # a genuinely held range. On SQLite the first attempt succeeds.
+        deadline = time.time() + 10
+        while True:
+            try:
+                fcntl.fcntl(fd, fcntl.F_SETLK, mklock(fcntl.F_WRLCK, 0, 100))
+                break
+            except OSError as ex:
+                if ex.errno in (errno.EACCES, errno.EWOULDBLOCK) and time.time() < deadline:
+                    time.sleep(0.1); continue
+                raise
         print('holder:acquired', flush=True)
         # Hold until the script lifts the marker, so the disjoint/overlapping
         # requests below provably run against a LOCKED range. This used to be
@@ -341,7 +370,14 @@ else
   ok "live lock still held at 5s (> lease): renewal keeps live holders alive"
 fi
 kill -9 $HP2 2>/dev/null; wait $HP2 2>/dev/null
-if python3 .locks/ask.py "$M2/seed/f2.bin" >/dev/null 2>&1; then ok "lock released once live holder killed"; else bad "lock still held after holder killed"; fi
+# release-driven reap is a distributed commit on fdb://; poll for visibility
+# exactly as section 4 does, instead of a single zero-wait probe.
+reaped2=0
+for _ in $(seq 1 25); do
+  if python3 .locks/ask.py "$M2/seed/f2.bin" >/dev/null 2>&1; then reaped2=1; break; fi
+  sleep 0.2
+done
+if [ "$reaped2" = 1 ]; then ok "lock released once live holder killed"; else bad "lock still held after holder killed"; fi
 
 # ---------------------------------------------------------------------------
 echo "===== 4c) POSIX fcntl close/exit releases the lock (no sid-renewal leak) ====="
@@ -388,7 +424,14 @@ PY
 # (a) holder acquires on M1, then closes+exits; a fresh process must get the lock.
 python3 .locks/posix_hold.py "$M1/seed/f1.bin" 0 > .locks/ph.out 2>&1
 grep -q acquired .locks/ph.out && ok "posix holder acquired whole-file W" || bad "posix holder failed to acquire"
-ra=$(python3 .locks/posix_ask.py "$M2/seed/f1.bin" 2>&1 | tail -1)
+# post-close reap visibility (distributed commit on fdb://): bounded poll, same
+# rationale as sections 1/4/4b. The leak assertion itself is unchanged.
+ra=""
+for _ in $(seq 1 25); do
+  ra=$(python3 .locks/posix_ask.py "$M2/seed/f1.bin" 2>&1 | tail -1)
+  case "$ra" in posix:granted) break ;; esac
+  sleep 0.2
+done
 case "$ra" in
   posix:granted) ok "fresh F_SETLK granted after holder close (leak fixed)" ;;
   *) bad "POSIX lock leaked on close (ask got: $ra)" ;;

@@ -27,8 +27,8 @@
 #   $EARLY   1 when fdb_up already started a meta-server + data-server for the
 #            whole run: sections that would otherwise start their own pair skip
 #            it, because under `fdb://` the trees are the cluster's and one
-#            server pair serving one scratch root is enough (and two roots would
-#            split the DEFINITIONS, which stay files — see docs/fdb-keyspace.md).
+#            server pair serving one scratch root is enough (the DEFINITIONS are
+#            cluster-wide too — the ctl subspace — so a second root adds nothing).
 set -u
 
 : "${BACKEND:=sqlite}"
@@ -126,13 +126,14 @@ fdb_reap(){ kp $FDB_MP $FDB_DP; wk $FDB_MP $FDB_DP; }
 # before provisioning still runs its trap), and the helper never fails the suite.
 #
 # A lens/alias DEFINITION over the base refuses the `--base` removal, and the
-# definition is a file in the same scratch meta-dir the run owns — so the first
-# cleanup of a suite that defines one (layout's `trimphotos`, govcheck's lenses)
-# would be refused and, because this helper never fails a suite, would leave the
-# whole tree behind while the board stayed green. Measured on 2026-11-11: layout's
-# first cleanup printed "had no tree to drop (error: view 'trimphotos' is governed
-# …)" and left 76 keys in the cluster. The loop below drops such a definition by
-# name and retries, bounded so a refusal this helper cannot interpret still ends.
+# definition is a row in the cluster's ctl subspace (it outlives the run, like the
+# tree) — so the first cleanup of a suite that defines one (layout's `trimphotos`,
+# govcheck's lenses) would be refused and, because this helper never fails a suite,
+# would leave the whole tree behind while the board stayed green. Measured on
+# 2026-11-11: layout's first cleanup printed "had no tree to drop (error: view
+# 'trimphotos' is governed …)" and left 76 keys in the cluster. The loop below drops
+# such a definition by name and retries, bounded so a refusal this helper cannot
+# interpret still ends.
 fdb_drop_views(){ # fdb_drop_views <meta-dir> <data-dir> <view>...
     [ "${BACKEND:-}" = fdb ] || return 0
     local md="${1:-}" dd="${2:-}" v out rc def attempt

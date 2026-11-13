@@ -283,6 +283,43 @@ pub trait MetaProvider: Send + Sync {
         uid: u32,
         gid: u32,
     ) -> Result<i64, MetaError>;
+    /// `create_node` plus the attributes a `CREATE`/`MKDIR` reply needs.
+    ///
+    /// A local engine answers this with one extra store read, which costs no
+    /// round trip. A remote client overrides it so the server ships the row it
+    /// just wrote inside the same reply — otherwise every creation pays a
+    /// second full `GETATTR` RTT purely to fill the FUSE reply (measured: 3
+    /// metadata RTTs per create, see USAGE §4.1.1). Keeping the pair as a
+    /// separate method leaves every other provider's signature untouched.
+    #[allow(clippy::too_many_arguments)]
+    fn create_node_with_attr(
+        &self,
+        parent: i64,
+        name: &str,
+        is_dir: bool,
+        data_ref: Option<&str>,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<NodeInfo, MetaError> {
+        let id = self.create_node(parent, name, is_dir, data_ref, mode, uid, gid)?;
+        // A concurrent unlink between the create and this read is a real
+        // outcome (the caller reports ENOENT), not a provider failure.
+        self.getattr(id).ok_or(MetaError::NotFound)
+    }
+    /// Same idea for symlinks: the reply needs the entry attributes and the
+    /// remote provider can fetch them without a second trip.
+    fn create_symlink_with_attr(
+        &self,
+        parent: i64,
+        name: &str,
+        target: &str,
+        uid: u32,
+        gid: u32,
+    ) -> Result<NodeInfo, MetaError> {
+        let id = self.create_symlink(parent, name, target, uid, gid)?;
+        self.getattr(id).ok_or(MetaError::NotFound)
+    }
     fn link_node(&self, src_ino: i64, new_parent: i64, new_name: &str) -> Result<i64, MetaError>;
     fn unlink(&self, parent: i64, name: &str) -> Result<Option<String>, MetaError>;
     fn rename(
