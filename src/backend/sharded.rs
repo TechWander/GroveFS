@@ -1,12 +1,17 @@
 //! Deterministic cross-server striping backend (data plane, no meta change).
 //!
 //! A file's bytes are spread round-robin over `N` member backends in fixed
-//! `STRIPE_BYTES` chunks: logical chunk `i` lives on server `i % N` under the
-//! object key `{base}#{i}`. The layout is encoded into the durable `data_ref`
-//! key (`s<N>:<stripe>:<uuid>`) at create time so reads are self-describing and
-//! an unprefixed key (a single-object write, striping off) still resolves to
-//! server 0 — the metadata schema, `MetaProvider` and the wire protocol are
-//! all untouched.
+//! `STRIPE_BYTES` chunks: logical chunk `i` lives on member slot `i % N` under
+//! the object key `{base}#{i}`. When every member advertises a stable identity
+//! (a remote data-server started with `--member-id`), the slots are assigned by
+//! SORTING those ids, so the order of the caller's `--data-servers` list no
+//! longer decides placement — reordering it cannot misroute a chunk. The layout
+//! is encoded into the durable `data_ref` key at create time — `s<N>:<stripe>:<fp>:<uuid>`
+//! for an identity-pinned stripe (where `<fp>` fingerprints the exact member-id
+//! set) and the historical `s<N>:<stripe>:<uuid>` for a positional one — so
+//! reads are self-describing and an unprefixed key (a single-object write,
+//! striping off) still resolves to slot 0. The metadata schema, `MetaProvider`
+//! and the wire protocol are all untouched.
 //!
 //! Concurrency: a large read/write that spans several chunks fans its chunk
 //! operations out with `std::thread::scope`, so aggregate bandwidth scales with
@@ -18,9 +23,12 @@ use std::io;
 use std::sync::Arc;
 use std::thread;
 
-/// Bytes per stripe chunk. A file smaller than this lives entirely on server 0
-/// (chunk 0), so small files pay no cross-server cost; larger files distribute
-/// across every server. 16 MiB matches the plan's size threshold.
+/// Default bytes per stripe chunk, used when a mount names no `--stripe-bytes`
+/// / `GROVEFS_STRIPE_BYTES`. A file smaller than the stripe lives entirely on
+/// slot 0 (chunk 0), so small files pay no cross-server cost; larger files
+/// distribute across every server. 16 MiB matches the plan's size threshold.
+/// The mount path mints a `ShardedBackend` with the operator's configured
+/// stripe (see `ShardedBackend::new`); this constant is only the fallback.
 pub const STRIPE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Stable leading token on the error message [`ShardedBackend::len_with`]
@@ -36,10 +44,19 @@ const DAMAGE_TAG: &str = "grovefs:striped-damaged:";
 pub struct ShardedBackend {
     servers: Vec<Arc<dyn StorageBackend>>,
     stripe: u64,
+    /// Fingerprint of the member-id set when placement is identity-pinned (every
+    /// member advertised a distinct `--member-id`, and `servers` is sorted by
+    /// it). `None` means positional placement: `servers` is in the caller's
+    /// `--data-servers` order and keys carry no fingerprint. Stamped into every
+    /// `new_key` so [`Self::check_layout`] can refuse a DIFFERENT member set
+    /// (even one of the same size) rather than silently misroute chunks.
+    membership: Option<u64>,
     /// Set once some object's chunk 0 has been found where this list puts it:
     /// the order of this address list is then known to agree with the writer's,
     /// so [`ShardedBackend::chunk0_elsewhere`] no longer has to re-check every
-    /// chunk-0 miss. A reversed list never sets it and keeps reporting.
+    /// chunk-0 miss. A reversed list never sets it and keeps reporting. Only
+    /// meaningful for positional stripes — an identity-pinned stripe is correct
+    /// by construction regardless of input order.
     order_verified: std::sync::atomic::AtomicBool,
 }
 
@@ -47,7 +64,26 @@ pub struct ShardedBackend {
 struct Layout {
     n: usize,
     stripe: u64,
+    /// Member-id fingerprint for a 4-field `s<N>:<stripe>:<fp>:<base>` key;
+    /// `None` for the historical 3-field `s<N>:<stripe>:<base>` (positional).
+    fp: Option<u64>,
     base: String,
+}
+
+/// FNV-1a over the member ids in canonical (sorted) order — a compact,
+/// allocation-free fingerprint of the exact membership set. A reorder leaves it
+/// unchanged (sorted set is the same); adding, removing, or swapping a member
+/// changes it, which is precisely what [`ShardedBackend::check_layout`] must
+/// detect.
+fn membership_fingerprint(ids: &[u64]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &id in ids {
+        for b in id.to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h
 }
 
 /// How many data-servers a `data_ref` was laid out across: `Some(N)` for the
@@ -59,13 +95,25 @@ pub(crate) fn layout_server_count(key: &str) -> Option<usize> {
     parse_layout(key).map(|l| l.n)
 }
 
-/// Parse `s<N>:<stripe>:<base>`; `None` for any other (unstriped) key. A v4 uuid
-/// never begins with `s` followed by digits+`:`, so the two forms cannot collide.
+/// Parse `s<N>:<stripe>[:<fp>]:<base>`; `None` for any other (unstriped) key.
+/// A 4-field key carries a member-id fingerprint `<fp>` (16 hex digits, written
+/// by an identity-pinned stripe); a 3-field key is a positional stripe. A v4
+/// uuid never begins with `s` followed by digits+`:`, and a uuid/base never
+/// contains a `:`, so the segment count disambiguates the two forms cleanly and
+/// neither can be mistaken for an unstriped key.
 fn parse_layout(key: &str) -> Option<Layout> {
     let rest = key.strip_prefix('s')?;
     let (n_str, tail) = rest.split_once(':')?;
-    let (stripe_str, base) = tail.split_once(':')?;
     let n: usize = n_str.parse().ok()?;
+    // Split the remainder into its `:`-separated components.
+    let segs: Vec<&str> = tail.split(':').collect();
+    let (stripe_str, fp, base) = match segs.len() {
+        // s<N>:<stripe>:<base> — positional, no fingerprint.
+        2 => (segs[0], None, segs[1]),
+        // s<N>:<stripe>:<fp>:<base> — identity-pinned.
+        3 => (segs[0], Some(u64::from_str_radix(segs[1], 16).ok()?), segs[2]),
+        _ => return None,
+    };
     let stripe: u64 = stripe_str.parse().ok()?;
     if n == 0 || stripe == 0 || base.is_empty() {
         return None;
@@ -73,19 +121,55 @@ fn parse_layout(key: &str) -> Option<Layout> {
     Some(Layout {
         n,
         stripe,
+        fp,
         base: base.to_string(),
     })
 }
 
 impl ShardedBackend {
+    /// Build a stripe over `servers`. Placement is IDENTITY-pinned when every
+    /// member reports a distinct [`StorageBackend::placement_key`] (a remote
+    /// data-server started with `--member-id`): the members are then SORTED by
+    /// that id, so the caller's `--data-servers` order no longer decides which
+    /// slot a chunk lands in, and a fingerprint of the sorted id set is stamped
+    /// into new keys so [`Self::check_layout`] refuses a different member set.
+    /// Otherwise (any member un-identified, or a duplicate id, or a single
+    /// member) placement stays POSITIONAL — exactly the list order — matching
+    /// the historical behavior.
     pub fn new(servers: Vec<Arc<dyn StorageBackend>>, stripe: u64) -> Self {
         assert!(
             !servers.is_empty(),
             "ShardedBackend needs at least one server"
         );
+        let keys: Vec<Option<u64>> = servers.iter().map(|s| s.placement_key()).collect();
+        // Identity-pinned only when there is more than one member AND every one
+        // advertises a UNIQUE id; a single member never stripes, so its keys
+        // stay fingerprint-free for interoperability with positional mounts.
+        let identified = servers.len() > 1
+            && keys.iter().all(|k| k.is_some())
+            && {
+                let mut v: Vec<u64> = keys.iter().filter_map(|k| *k).collect();
+                v.sort_unstable();
+                v.dedup();
+                v.len() == servers.len()
+            };
+        let (servers, membership) = if identified {
+            let mut pairs: Vec<(u64, Arc<dyn StorageBackend>)> = servers
+                .into_iter()
+                .zip(keys.into_iter().flatten())
+                .map(|(s, k)| (k, s))
+                .collect();
+            pairs.sort_by_key(|(k, _)| *k);
+            let ids: Vec<u64> = pairs.iter().map(|(k, _)| *k).collect();
+            let fp = membership_fingerprint(&ids);
+            (pairs.into_iter().map(|(_, s)| s).collect(), Some(fp))
+        } else {
+            (servers, None)
+        };
         Self {
             servers,
             stripe: stripe.max(1),
+            membership,
             order_verified: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -104,12 +188,27 @@ impl ShardedBackend {
         (idx, format!("{}#{}", l.base, i))
     }
 
-    /// A striped key encodes the server count it was created with (`l.n`). If
-    /// this mount was brought up with a DIFFERENT number of data servers, the
-    /// `i % n` mapping in [`Self::chunk`] would silently route logical chunks to
-    /// the wrong member — reading or overwriting a different object. Fail loudly
-    /// at every dispatch entry instead of corrupting data on a misconfigured
-    /// shrink/grow of the `--data-servers` list.
+    /// A striped key encodes the server count it was created with (`l.n`) and,
+    /// for an identity-pinned stripe, a fingerprint of the exact member-id set
+    /// (`l.fp`). If this mount was brought up with a DIFFERENT number of data
+    /// servers, the `i % n` mapping in [`Self::chunk`] would silently route
+    /// logical chunks to the wrong member — reading or overwriting a different
+    /// object. And with the SAME count but a different SET of `--member-id`s,
+    /// sorting now maps slots to different physical servers, so the chunks still
+    /// land wrong. Fail loudly at every dispatch entry instead of corrupting
+    /// data on a misconfigured shrink/grow/swap of the `--data-servers` list.
+    ///
+    /// Reordering the SAME member set is deliberately NOT an error: placement is
+    /// keyed by sorted id, so a reorder yields identical slots and an identical
+    /// fingerprint — the exact hazard this removes.
+    ///
+    /// The stripe size is deliberately NOT checked here. Each `data_ref` carries
+    /// its own stripe (`s<N>:<stripe>[:<fp>]:<uuid>`) and [`Self::chunks_for`]
+    /// splits on `l.stripe`, never on `self.stripe` — so a mount reconfigured
+    /// with a new `--stripe-bytes` still reads objects written under the old
+    /// value, and only newly created objects use the current one. Enforcing
+    /// stripe equality here would break that backward compatibility for no
+    /// safety gain.
     fn check_layout(&self, l: &Layout) -> io::Result<()> {
         if l.n != self.servers.len() {
             return Err(io::Error::other(format!(
@@ -119,6 +218,38 @@ impl ShardedBackend {
                 l.n,
                 self.servers.len()
             )));
+        }
+        // Same count but a different member SET would sort slots onto different
+        // physical servers, so also pin the identity fingerprint when either side
+        // has one. The four cases keep positional<->identity mounts from
+        // silently remapping each other's chunks.
+        match (l.fp, self.membership) {
+            (None, None) => {} // both positional: count check above is sufficient
+            (Some(key_fp), Some(mount_fp)) if key_fp == mount_fp => {} // same set
+            (Some(_), Some(_)) => {
+                return Err(io::Error::other(format!(
+                    "striped object {} was laid out across {} servers with a different \
+                     --member-id set than this mount; the same-count swap would map slots to \
+                     the wrong data-servers, so refusing to read/write it",
+                    l.base, l.n
+                )));
+            }
+            (Some(_), None) => {
+                return Err(io::Error::other(format!(
+                    "striped object {} was written by an identity-pinned stripe (members carry \
+                     --member-id) but this mount lists those data-servers without matching \
+                     identities; start each data-server with the same --member-id set",
+                    l.base
+                )));
+            }
+            (None, Some(_)) => {
+                return Err(io::Error::other(format!(
+                    "striped object {} was written by a positional stripe (no --member-id) but \
+                     this mount is identity-pinned; its chunk slots cannot be re-derived \
+                     safely — read legacy objects through a positional mount or rewrite them",
+                    l.base
+                )));
+            }
         }
         Ok(())
     }
@@ -376,7 +507,13 @@ enum Probe {
 
 impl StorageBackend for ShardedBackend {
     fn new_key(&self, uuid: &str) -> String {
-        format!("s{}:{}:{}", self.servers.len(), self.stripe, uuid)
+        // An identity-pinned stripe stamps the member-set fingerprint so a later
+        // mount with a DIFFERENT set is refused by `check_layout`; a positional
+        // stripe keeps the compact 3-field form for interoperability.
+        match self.membership {
+            Some(fp) => format!("s{}:{}:{:016x}:{}", self.servers.len(), self.stripe, fp, uuid),
+            None => format!("s{}:{}:{}", self.servers.len(), self.stripe, uuid),
+        }
     }
 
     fn create(&self, key: &str) -> io::Result<()> {
@@ -774,6 +911,150 @@ mod tests {
             .collect()
     }
 
+    /// A member that advertises a stable `--member-id` (like a remote
+    /// data-server), wrapping a real `LocalBackend` so its bytes persist on disk
+    /// and travel WITH the id rather than the list position — the property
+    /// identity-pinned placement relies on.
+    struct IdMember {
+        id: u64,
+        inner: Arc<dyn StorageBackend>,
+    }
+    impl StorageBackend for IdMember {
+        fn placement_key(&self) -> Option<u64> {
+            Some(self.id)
+        }
+        fn create(&self, k: &str) -> io::Result<()> {
+            self.inner.create(k)
+        }
+        fn read(&self, k: &str, o: u64, l: usize) -> io::Result<Vec<u8>> {
+            self.inner.read(k, o, l)
+        }
+        fn write(&self, k: &str, o: u64, d: &[u8]) -> io::Result<usize> {
+            self.inner.write(k, o, d)
+        }
+        fn len(&self, k: &str) -> io::Result<u64> {
+            self.inner.len(k)
+        }
+        fn fsync(&self, k: &str) -> io::Result<()> {
+            self.inner.fsync(k)
+        }
+        fn truncate(&self, k: &str, n: u64) -> io::Result<()> {
+            self.inner.truncate(k, n)
+        }
+        fn remove(&self, k: &str) -> io::Result<()> {
+            self.inner.remove(k)
+        }
+        fn statvfs(&self) -> io::Result<FsStat> {
+            self.inner.statvfs()
+        }
+    }
+
+    /// Build `roots.len()` identity-pinned members with ids `0..n`, paired to
+    /// each root.
+    fn id_members(roots: &[std::path::PathBuf]) -> Vec<Arc<dyn StorageBackend>> {
+        roots
+            .iter()
+            .enumerate()
+            .map(|(k, r)| {
+                Arc::new(IdMember {
+                    id: k as u64,
+                    inner: Arc::new(LocalBackend::new(r).unwrap()),
+                }) as Arc<dyn StorageBackend>
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_reordered_identity_stripe_reads_back_correctly() {
+        // The hazard identity pinning removes: a positional stripe whose list
+        // order changes mis-reads the data (see
+        // `a_reversed_server_list_is_reported_not_read_as_empty`). With ids
+        // advertised, reordering the SAME member set must be harmless — and a
+        // swap that leaves slot 0 in place (indices 1<->2) is precisely the case
+        // a positional stripe silently corrupts but chunk-0 detection misses.
+        let roots = tmp_root("idorder", 3);
+        let stripe = 4096u64;
+        let base = id_members(&roots);
+        let sb = ShardedBackend::new(base.clone(), stripe);
+        let key = sb.new_key("obj");
+        // identity-pinned keys carry the member fingerprint: 4 `:`-separated
+        // fields (s<N>, stripe, fp, base).
+        assert_eq!(key.split(':').count(), 4, "{key}");
+        sb.create(&key).unwrap();
+        let data: Vec<u8> = (0..20000u32).map(|i| (i % 251) as u8).collect();
+        sb.write(&key, 0, &data).unwrap();
+        assert_eq!(sb.len(&key).unwrap(), data.len() as u64);
+
+        // Same members, slots 1 and 2 swapped in the input list.
+        let mut scrambled = base.clone();
+        scrambled.swap(1, 2);
+        let sb2 = ShardedBackend::new(scrambled, stripe);
+        assert_eq!(sb2.len(&key).unwrap(), data.len() as u64);
+        assert_eq!(sb2.read(&key, 0, data.len()).unwrap(), data);
+        assert_eq!(sb2.read(&key, 1000, 500).unwrap(), data[1000..1500]);
+        // Sorting by id makes the fingerprint — and so every new key — order
+        // independent.
+        assert_eq!(sb2.new_key("x"), sb.new_key("x"));
+        for r in roots {
+            let _ = std::fs::remove_dir_all(r);
+        }
+    }
+
+    #[test]
+    fn a_different_member_set_of_the_same_count_is_refused() {
+        // Same stripe width (N = 2) but a genuinely different member SET: id 1 is
+        // replaced by id 2. Sorting slots onto different physical servers would
+        // silently misroute chunk #1, so the fingerprint check must refuse.
+        let roots = tmp_root("setswap", 3);
+        let stripe = 4096u64;
+        let mk = |pairs: &[(u64, &std::path::PathBuf)]| -> Vec<Arc<dyn StorageBackend>> {
+            pairs
+                .iter()
+                .map(|(id, r)| {
+                    Arc::new(IdMember {
+                        id: *id,
+                        inner: Arc::new(LocalBackend::new(r).unwrap()),
+                    }) as Arc<dyn StorageBackend>
+                })
+                .collect()
+        };
+        let a = mk(&[(0, &roots[0]), (1, &roots[1])]);
+        let sb = ShardedBackend::new(a, stripe);
+        let key = sb.new_key("obj");
+        sb.create(&key).unwrap();
+        let data: Vec<u8> = (0..10000u32).map(|i| (i % 251) as u8).collect();
+        sb.write(&key, 0, &data).unwrap();
+
+        let b = mk(&[(0, &roots[0]), (2, &roots[2])]);
+        let sb2 = ShardedBackend::new(b, stripe);
+        let err = sb2
+            .len(&key)
+            .expect_err("a same-count different member set must not remap");
+        assert!(err.to_string().contains("--member-id set"), "{err}");
+        // Reordering the SAME set (ids 1,0) is fine, by contrast.
+        let c = mk(&[(1, &roots[1]), (0, &roots[0])]);
+        let sb3 = ShardedBackend::new(c, stripe);
+        assert_eq!(sb3.len(&key).unwrap(), data.len() as u64);
+        for r in roots {
+            let _ = std::fs::remove_dir_all(r);
+        }
+    }
+
+    #[test]
+    fn positional_keys_keep_the_three_field_form() {
+        // A stripe over un-identified members (no placement_key) must stay on
+        // the historical 3-field layout, so existing positional data and the
+        // compact `data_ref` are unaffected by the identity feature.
+        let roots = tmp_root("posform", 2);
+        let sb = ShardedBackend::new(members(&roots), 1024);
+        let k = sb.new_key("abcd-uuid");
+        assert_eq!(k, "s2:1024:abcd-uuid");
+        assert_eq!(parse_layout(&k).unwrap().fp, None);
+        for r in roots {
+            let _ = std::fs::remove_dir_all(r);
+        }
+    }
+
     #[test]
     fn new_key_encodes_layout_and_parses_back() {
         let roots = tmp_root("key", 2);
@@ -808,6 +1089,39 @@ mod tests {
         assert_eq!(slice, &data[4000..4500]);
         sb.remove(&key).unwrap();
         assert_eq!(sb.len(&key).unwrap(), 0);
+        for r in roots {
+            let _ = std::fs::remove_dir_all(r);
+        }
+    }
+
+    /// A `data_ref` carries its own stripe (`s<N>:<stripe>:<uuid>`), so a mount
+    /// reconfigured with a different `--stripe-bytes`/`GROVEFS_STRIPE_BYTES`
+    /// must still read objects written under the old value — only newly created
+    /// objects follow the new stripe. `check_layout` deliberately ignores the
+    /// stripe for exactly this, so this is the compatibility the CLI wiring
+    /// relies on and the regression a future stripe check would break.
+    #[test]
+    fn an_old_stripe_key_reads_under_a_new_mount_stripe() {
+        let roots = tmp_root("migstripe", 2);
+        // Write across 2 servers with the OLD 1 KiB stripe.
+        let old = ShardedBackend::new(members(&roots), 1024);
+        let key = old.new_key("mig-uuid"); // s2:1024:mig-uuid
+        old.create(&key).unwrap();
+        let data: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
+        old.write(&key, 0, &data).unwrap();
+        assert_eq!(key, "s2:1024:mig-uuid");
+
+        // Reopen the SAME two servers under a NEW, larger stripe: reads and len
+        // still split on the key's 1024 (from `l.stripe`), never the mount's
+        // 4096 (`self.stripe`), so the object survives the reconfiguration.
+        let new = ShardedBackend::new(members(&roots), 4096);
+        assert_eq!(new.len(&key).unwrap(), data.len() as u64);
+        assert_eq!(new.read(&key, 0, data.len()).unwrap(), data);
+        assert_eq!(new.read(&key, 1500, 500).unwrap(), &data[1500..2000]);
+
+        // A NEW object minted through the reconfigured mount carries the new
+        // stripe, proving the override reaches `new_key` too.
+        assert_eq!(new.new_key("fresh-uuid"), "s2:4096:fresh-uuid");
         for r in roots {
             let _ = std::fs::remove_dir_all(r);
         }

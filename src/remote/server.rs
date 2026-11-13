@@ -257,6 +257,12 @@ pub struct DataServer {
     /// — a frame whose epoch lags the held token is refused with `EROFS` before
     /// its bytes reach the backend (see [`handle_conn`]).
     fence: Arc<Fence>,
+    /// This node's stable member id, echoed in every `OP_OPEN` ack's `VAL` so a
+    /// [`crate::backend::ShardedBackend`] client can pin a logical chunk to WHO
+    /// this server is rather than its position in the caller's `--data-servers`
+    /// list. Defaults to [`proto::NO_MEMBER_ID`] (started without `--member-id`),
+    /// which tells the client to keep placing by list position.
+    member_id: u64,
 }
 
 impl DataServer {
@@ -270,6 +276,7 @@ impl DataServer {
             token: String::new(),
             keys: None,
             fence: Arc::new(Fence::new_in_memory()),
+            member_id: proto::NO_MEMBER_ID,
         }
     }
 
@@ -285,6 +292,7 @@ impl DataServer {
             token: token.to_string(),
             keys: None,
             fence: Arc::new(Fence::new_in_memory()),
+            member_id: proto::NO_MEMBER_ID,
         }
     }
 
@@ -312,6 +320,16 @@ impl DataServer {
         self
     }
 
+    /// Set this node's stable `--member-id`, echoed in the `OP_OPEN` ack so a
+    /// striping client places chunks by member identity instead of list order.
+    /// Members of one striped cluster must use DISTINCT ids; a stripe with any
+    /// duplicate (or an id left at the `NO_MEMBER_ID` default) is treated by the
+    /// client as positional placement.
+    pub fn with_member_id(mut self, id: u64) -> Self {
+        self.member_id = id;
+        self
+    }
+
     /// Blocks forever serving connections.
     pub fn serve(&self) -> io::Result<()> {
         let listener = TcpListener::bind(&self.listen)?;
@@ -335,6 +353,7 @@ impl DataServer {
             &self.token,
             self.fence.clone(),
             self.keys.clone(),
+            self.member_id,
         );
         Ok(())
     }
@@ -349,6 +368,7 @@ pub fn serve_on(listener: TcpListener, backend: Arc<dyn StorageBackend>) {
         "",
         Arc::new(Fence::new_in_memory()),
         None,
+        proto::NO_MEMBER_ID,
     )
 }
 
@@ -360,17 +380,43 @@ pub fn serve_on_auth(
     token: &str,
     fence: Arc<Fence>,
 ) {
-    serve_auth_keys(listener, backend, token, fence, None)
+    serve_auth_keys(
+        listener,
+        backend,
+        token,
+        fence,
+        None,
+        proto::NO_MEMBER_ID,
+    )
+}
+
+/// Accept loop that advertises a stable `member_id` in every `OP_OPEN` ack, so
+/// a striping client places chunks by identity. Mirrors [`serve_on`] (no auth,
+/// in-memory fence) with the id plumbed through — the test/embedded counterpart
+/// of `data-server --member-id`.
+pub fn serve_on_member(listener: TcpListener, backend: Arc<dyn StorageBackend>, member_id: u64) {
+    serve_auth_keys(
+        listener,
+        backend,
+        "",
+        Arc::new(Fence::new_in_memory()),
+        None,
+        member_id,
+    )
 }
 
 /// Accept loop with the full auth surface: an optional static token and an
-/// optional per-caller API-key store.
+/// optional per-caller API-key store. `member_id` is echoed in every `OP_OPEN`
+/// ack so a striping client can place chunks by identity (see
+/// [`DataServer::with_member_id`]); pass [`proto::NO_MEMBER_ID`] for positional
+/// placement.
 fn serve_auth_keys(
     listener: TcpListener,
     backend: Arc<dyn StorageBackend>,
     token: &str,
     fence: Arc<Fence>,
     keys: Option<Arc<crate::apikeys::ApiKeyStore>>,
+    member_id: u64,
 ) {
     let token = token.to_string();
     for stream in listener.incoming() {
@@ -381,7 +427,7 @@ fn serve_auth_keys(
                 let fence = fence.clone();
                 let keys = keys.clone();
                 thread::spawn(move || {
-                    if let Err(e) = handle_conn(s, backend, &token, fence, keys) {
+                    if let Err(e) = handle_conn(s, backend, &token, fence, keys, member_id) {
                         // A client hanging up is normal; log only real protocol errors.
                         if e.kind() != io::ErrorKind::UnexpectedEof {
                             eprintln!("conn error: {e}");
@@ -400,6 +446,7 @@ fn handle_conn(
     token: &str,
     fence: Arc<Fence>,
     keys: Option<Arc<crate::apikeys::ApiKeyStore>>,
+    member_id: u64,
 ) -> io::Result<()> {
     stream.set_nodelay(true)?;
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -444,7 +491,10 @@ fn handle_conn(
             }
         }
     }
-    proto::send_response(&mut writer, 0, 0, &[])?; // handshake ack
+    // Handshake ack. `VAL` carries this node's stable member id (`NO_MEMBER_ID`
+    // when unconfigured) so a striping client can pin chunk placement to identity
+    // instead of the caller's list order.
+    proto::send_response(&mut writer, 0, member_id, &[])?; // handshake ack
 
     // Live-credential re-check: one store lookup per connection per
     // `KEY_RECHECK` window (a control-plane query, off the per-byte hot path),

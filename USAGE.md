@@ -113,6 +113,8 @@ cargo build --release                                       # 产物:target/rele
 | `GROVEFS_HOME` | `--home` | 本地存储根 |
 | `GROVEFS_META_SERVER` | `mount --meta-server` | 元数据服务地址(含故障转移列表) |
 | `GROVEFS_DATA_SERVERS` | `mount --data-servers` | 数据服务地址(含条带列表) |
+| `GROVEFS_STRIPE_BYTES` | `mount --stripe-bytes` | 跨 server 条带的分块尺寸(默认 16MiB;只在与多地址 `--data-servers` 列表同时给出时生效,非法值拒绝启动) |
+| `GROVEFS_MEMBER_ID` | `data-server --member-id` | 本 data-server 在条带集群中的稳定身份 id(每个成员唯一的 64 位整数;非法值拒绝启动;不给则该节点按历史位置模式参与条带) |
 | `GROVEFS_TOKEN` | `mount --token`、`meta-server/data-server --token` | 集群准入口令 |
 | `GROVEFS_META_DIR` | `meta-server --meta-dir` | 服务端元数据根(优先级:`--meta-dir` 参数 > 本 env > `--home` > `~/.grovefs`) |
 | `GROVEFS_META_STORE` | `--meta-store`(`view`/`apikey`/`mcp`/`meta-server`/`data-server`/`du`/`import`) | 非 SQLite 后端寻址;未给 flag 时由本 env 回退(源码 `resolve_store()`)。`import` 只写本地 SQLite 树,故这里给的是 `postgres://…`/`fdb://…` 时**如实拒绝** |
@@ -948,7 +950,7 @@ e2e:`fdb` 套件第 12 节(SQLite→subspace→SQLite 全链,含逐行 `diff`、
 **迁移的拓扑约束(数据分布,不是硬件绑定)**:
 
 - 多盘 `--data-dir`:对象按 `FNV1a(key) % root 数量` 选盘,目标机 root **数量与顺序要一致**;也可合并成单 root(把各盘 `blocks/` 合并)。
-- 跨 server 条带(`s<N>:...`)：第 i 块在 `servers[i % N]`，目标必须保留 **N 个 data-server 及顺序**；台数不符直接被拒（报 `laid out across N servers but this mount has M; refusing to remap`），**顺序不符会被 stat 检出**：非空条带对象的 `{uuid}#0` 必在成员 0，落在别的成员上就报“服务器对、顺序不对”而不是出一个 0（否则整棵树会被读成一堆空文件）；`read` 路径本身仍只按分块定位，不做这层回溯（不会读到别人的数据，对象名带全局 `#i`）。**换机器 / 换 IP 本身不是约束**：成员按下标寻址，在 `-o data=` 里**原位替换**那一项就能自动识别，元数据不改、已写对象不需 `rebal`（轮转放置 `i % N` 只决定新写入对象落哪台）。
+- 跨 server 条带(`s<N>:`)：第 i 块在 `servers[i % N]`。配了 `--member-id` 时按**成员身份**寻址：`--data-servers` 顺序无关（任意顺序列出同一批机器都正确读写），但必须保持 **N 个成员且集合不变**——换掉任意一台（即使保持台数）会被成员集合指纹检出并拒挂，而不是静默错读别人的块。未配 `--member-id` 的位置模式按客户端列表**下标**寻址，此时**顺序本身就是布局的一部分**，列表调序会静默错路由既有对象（读写一个既有对象前没有任何握手能发现调序）——这是位置模式的固有隐患，要根治就给每台 data-server 配唯一 `--member-id`。**换机器 / 换 IP 本身不是约束**：身份模式下在 `-o data=` 里原位替换那一项（保持 id 不变）就能自动识别，元数据不改、已写对象不需 `rebal`（轮转放置 `i % N` 只决定新写入对象落哪台）。台数不符直接被拒（报 `laid out across N servers but this mount has M; refusing to remap`）。
 - HA `epoch`(每个视图的 `ctrl` 表):整目录拷贝会带过去,迁移后旧主必须停;`view export/import` 与 `view fork` 有意不复制 `ctrl` 与 `locks`。
 - PG 后端不能用文件拷贝,整库级备份用 `pg_dump`/逻辑复制;但 `view export/import` 三档通用——PG 的树在 schema 里,导出走 REPEATABLE READ 只读快照、导入单事务重建(§15.9,`xfer` 套件 PG 档实证)。
 - `uid/gid` 是数值元数据(advisory),按数字保留;symlink 目标文本是用户数据,原样保留。
@@ -977,7 +979,7 @@ removed base view 'alice': 2 node(s) gone, 2 blob reference(s) dropped, 2 object
 
 **四重守卫**(任一命中即拒,树分毫不删):① 该名字被定义治理(是派生/别名/fork 的定义槽)——先跑不带 `--base` 的 `view rm` 删定义;② 仍有别名/透镜/fork **定义**经此基解析(否则删基会让那棵挂载悬空),报 `view 'lens1' is governed by a definition over base 'alice' — remove it first`;③ 本机 `/proc/mounts` 里有 `grovefs:<V>` 活挂载,报 `view 'alice' is mounted here at …  — unmount it first`(**其他机器**对同一 meta-server 的挂载本机看不到,须自行先停);④ **PG 档走同一条命令**(`view --meta-store postgres://… rm --base`):基树是一个 schema,`remove_view` 在一个事务里逐 key 减 `grovefs_refs.holders`(归零即 DELETE)、再 `DROP SCHEMA … CASCADE`,提交之后才按返回的 `unbooked_refs` 逐个回收 `blocks/` 字节——没有 SQLite 档“先删 db 再重建账本”的中间窗口。**绕过 CLI 手工 `DROP SCHEMA` 不算删除**:账本是无 view 列的全局表,裸 drop 只删树不销账;更要紧的是该视图订过哪些对象**只有那个 schema 知道**,ref 清单随 schema 一起消失,字节从此没有记录可回收(§15.8 的 E 段实测)。
 
-**最后一个命名者死才释放**:fork 的 blob 引用来自基视图自己的 key、账本 hold>1,删基时那些仍被 fork 命名的字节**一个都不能动**;只有当基与所有依赖定义都消失、账本再无持有者时字节才真正回收。条带 key `s<N>:<stripe>:<uuid>` 活在 data-server 上,普通本地根无法回收——诚实计入 failed 并跳过,绝不半删。**MCP 边界**:`remove_view` 是控制面 only(等价不带 `--base` 的 `view rm`),删整基视图只经 CLI——接口从不碰数据字节。
+**最后一个命名者死才释放**:fork 的 blob 引用来自基视图自己的 key、账本 hold>1,删基时那些仍被 fork 命名的字节**一个都不能动**;只有当基与所有依赖定义都消失、账本再无持有者时字节才真正回收。条带 key `s<N>:<stripe>[:<fp>]:<uuid>` 活在 data-server 上,普通本地根无法回收——诚实计入 failed 并跳过,绝不半删。**MCP 边界**:`remove_view` 是控制面 only(等价不带 `--base` 的 `view rm`),删整基视图只经 CLI——接口从不碰数据字节。
 
 e2e 见 `viewrm` 套件(42 条断言:种树/挂载守卫/多重守卫/共享字节删失/最后命名者死后回收/分家根 `--data-dir`/删后重挂空树语义);PG 档的同一序列见 `.bneck/pg_view_teardown.sh`(44 条断言:真 FUSE 挂载写入 → schema/账本/字节三方对账 → 事务性删除 → 二次删除被拒 → out-of-band drop 后 `refs rebuild` 的两种方向 → 残留恰好等于不可回收的那部分)。
 
@@ -1441,8 +1443,8 @@ $Y mount --view alice \
 
 - **单对象**:`blocks/<2hex>/<key>`,一个文件 = 一个对象文件。对象按 key 哈希自动扇出进 256 个桶子目录(桶名是 key 哈希的前两位 hex),单层即止、不建深层树——单目录条目数不随总量增长,千万级对象下每个桶仅数万条,`ls`/`rsync`/备份工具不退化。桶名是 key 的纯函数,启动时预建 256 个,热路径不做 mkdir。
 - **key 命名**:视图写入时生成 UUID 作为对象 key,存进视图 `data_ref` 字段。
-- **条带化(大文件跨多 data-server)**:`data_ref` 编码为 `s<N>:<stripe_bytes>:<uuid>`,
-  第 i 块 key = `{uuid}#{i}`,落在 `servers[i % N]`——**是列表下标,不是地址**。**无 `s` 前缀的 key = 单对象**(未启用条带的存储形态)。
+- **条带化(大文件跨多 data-server)**:`data_ref` 编码为 `s<N>:<stripe>[:<fp>]:<uuid>`(`<fp>` 是成员 id 集合的指纹,只在身份模式下出现;位置模式保持三字段),
+  第 i 块 key = `{uuid}#{i}`,落在 `servers[i % N]`——启用了 `--member-id` 时槽位按成员 id 排序后的**身份**确定(列表顺序无关),未启用时是**列表下标**,不是地址。**无 `s` 前缀的 key = 单对象**(未启用条带的存储形态)。
 
 ### 5.2 多 data-server 条带(聚合容量/带宽)
 
@@ -1452,9 +1454,10 @@ $Y mount --view alice \
      --data-servers 10.0.0.5:50100,10.0.0.6:50100 --meta-server 10.0.0.5:50110 -m /mnt/alice
 ```
 
-- 文件 ≥ 16MiB 才分块;小文件自然只落 chunk0(单节点)。
+- 文件 ≥ 分块尺寸才拆块;分块尺寸由 `--stripe-bytes`(env `GROVEFS_STRIPE_BYTES`)配置,默认 16MiB——它逐对象记进 `data_ref`,改配置只影响此后新建的对象,旧对象按各自记录的尺寸继续可读,同一集群可以混用不同的值。小文件自然只落 chunk0(单节点)。
 - **价值**:把一个大文件摊到多节点的**聚合容量**上。注意:单条已饱和的链路(loopback/单网卡)上不会有吞吐增益,须用真正独立的链路才能测出收益。
-- 单地址 `--data-servers host:port` 就是未启用条带:整对象落那一台,key 不带 `s` 前缀。
+- 单地址 `--data-servers host:port` 就是未启用条带:整对象落那一台,key 不带 `s` 前缀(此时给 `--stripe-bytes` 会如实提示无效)。
+- **成员身份 `--member-id`(消除顺序隐患)**:每台 data-server 以唯一的 `--member-id N`(或 `GROVEFS_MEMBER_ID`)启动后,客户端的条带放置按**成员身份排序**而非 `--data-servers` 列表顺序——列表以任意顺序列出同一批机器都正确读写,换机器/换 IP 原位替换即可。台数不变但**集合变了**(换掉一台机器并给了新 id)会被 `data_ref` 里的成员集合指纹检出并拒绝挂载,而不是静默读到错块。要么全部成员都配 id、要么全不配:同一 key 空间里混用两种模式会被拒挂。不配 id 时保持按列表下标的历史位置模式,此时调序 `--data-servers` 会静默错路由既有对象(见 §3.4.2 迁移约束)。
 
 ### 5.3 删除 / GC
 
@@ -1467,7 +1470,7 @@ $Y mount --view alice \
 - **要迁的清单**:`blocks/`(字节)、`meta/<view>.db`(每视图树)、`meta/refs.db`(跨视图账本,可用 `grovefs refs rebuild` 重算)、`meta/views/*.layout`(派生/别名/fork 定义)、`meta/api_keys.db`(用过 key 才需要)。以上是 SQLite 后端清单;PG 后端下树、账本、定义、key、审计全在库内,随 `pg_dump`/`pg_restore` 迁移,本地只需搬 `blocks/` + env。
 - **整目录冷拷**:停掉所有挂载与 `meta-server` 后 `rsync -a -H` 整个存储根;**勿裸拷运行中的 SQLite**(WAL),不能停机就 `sqlite3 <db> ".backup"` / `VACUUM INTO`。
 - **单视图导出/导入**:`grovefs view --meta-dir D export --view V --out F` → 目标机拷 `blocks/` 后 `grovefs view --meta-dir D2 import --view V --in F`;保留 id/inode/硬链接/权限/属主/符号链接,原子替换(失败不伤旧树),`--as-fork B` 可恢复 fork 语义。详见 §3.4.2。
-- **拓扑边界**:多盘 `--data-dir` 的数量与顺序要一致(等盘克隆原位顶替不影响定位,增删/调序才重映射;或合并成单 root);跨 server 条带 `s<N>:` 要保留 N 个 data-server 及顺序;整目录拷会把 HA `epoch` 带过去,旧主必须先停;PG 后端用 `pg_dump`/逻辑复制。
+- **拓扑边界**:多盘 `--data-dir` 的数量与顺序要一致(等盘克隆原位顶替不影响定位,增删/调序才重映射;或合并成单 root);跨 server 条带 `s<N>:` 要保留 N 个成员;配了 `--member-id` 时顺序无关但集合不可变,未配时顺序也是布局的一部分(§5.2);整目录拷会把 HA `epoch` 带过去,旧主必须先停;PG 后端用 `pg_dump`/逻辑复制。
 - **多基视图**:任意多个基视图各自一棵 `meta/<name>.db`,可只迁其中一棵,key 也可按视图分别绑定。
 - **HA** 模式下另可由 meta-server 用备份 API 复制(见 5.5)。
 
@@ -1849,7 +1852,7 @@ grovefs FUSE caps granted: ASYNC_READ=true BIG_WRITES=true PARALLEL_DIROPS=true 
 | --- | --- | --- |
 | 应用层(挂载进程自身) | `--threads N`(默认 4,每 worker 独立 `/dev/fuse` fd)、`--stats`/`--stats-interval`(纯观测零开销)、`--log-file` | 改 GroveFS 自己的并发与观测 |
 | FUSE 协商层(受内核钳制) | `max_write`/`readahead`、`--cache-ttl`、`--no-cache` | 上限由内核 `FUSE_MAX_MAX_PAGES` 决定:老内核(如 5.4)申请 4MiB 也自然退化,不是 bug |
-| 后端能力层(服务端配置) | `--data-servers A1,A2[,A3…]` 分节点、≥16MiB 自动条带、`--meta-store postgres://…` | 改容量与并行度(§5.2、§6.2) |
+| 后端能力层(服务端配置) | `--data-servers A1,A2[,A3…]` 分节点、≥`--stripe-bytes`(默认 16MiB)自动条带、`--meta-store postgres://…` | 改容量与并行度(§5.2、§6.2) |
 | 结构性(改代码) | `MetaProvider`/`StorageBackend` 换实现(§16.1) | 前层都不够用时才到这里 |
 
 **最小回路**:① 定位现象——挂 `--stats` 跑一段真实负载读报告:`[io]` 看 backend_total/pool_wait 占比,`[meta]` 看每操作 p50/p99 与 ops/s,`[counters]` 看并行切片与 readdir 预取计数;② 判瓶颈——backend_total/pool_wait 占大头=网络 RTT 或后端;`meta.create` p50 高且 ops/s 上不去=SQLite 单写者串行;`dup>0` 占比高=内核缓存没吃到(考虑 `--cache-ttl`);③ 只拧一个旋钮,重启挂载生效(远程挂载 systemd `daemon-reload`+重启;本地挂载改 env/配置即可);④ 对比两窗,收益声称以同机同负载实测为准——手册里给的都是地板线,不是收益数字。
@@ -2927,7 +2930,7 @@ sudo systemctl daemon-reload && sudo systemctl restart grove-data-server
 rsync -a /data/blocks/ /mnt/bigdisk/blocks/
 ```
 
-> **例外——条带文件的搬迁**:条带布局自描述在 `data_ref`(`s<N>:<stripe>:<uuid>`)里,但 chunk i 落在哪台是由客户端 `--data-servers` 列表的**顺序**(`servers[i%N]`)决定的——多地址列表迁移时,列表顺序与台数一变,已写条带文件就找不回分块。单地址 `--data-dir` 搬迁无此问题。
+> **例外——条带文件的搬迁**:条带布局自描述在 `data_ref`(`s<N>:<stripe>[:<fp>]:<uuid>`)里——配了 `--member-id` 时 chunk i 落在哪台由成员**身份**决定,列表顺序随便排,已写条带文件照常找回;未配时由客户端 `--data-servers` 列表的**顺序**(`servers[i%N]`)决定,多地址列表迁移时顺序一变,已写条带文件就找不回分块。两种模式下**台数**都必须保持一致。单地址 `--data-dir` 搬迁无此问题。
 
 **多块盘/容量扩展**：两条正路① 一条 data-server 挂多盘：`--data-dir /data,/mnt/d2,...` 逗号分隔多存储根,整对象按 key 哈希自动放置到其中一条盘,`df`(statfs)自动聚合全盘容量——但根列表对同一存储须**固定**(放置是哈希 mod 根数,增删盘会重映射所有 key、使旧对象按新布局不可达),故宜一次性配齐多根;② 起多台 data-server + 客户端 `--data-servers a,b,c` 条带(≥16MiB 才分块,小文件只落一台;链路未饱和才有带宽收益,见 §5.2 诚实标注)。也可在 OS 层用 LVM/mdadm 把多盘合成一个文件系统再挂给单路径 `--data-dir`。没有 per-directory 配额与存储分层(未实现)。
 
@@ -3281,7 +3284,7 @@ $G refs --meta-dir /data/cluster --meta-store postgres://… rebuild
 ```
 
 - **为什么能原子**：PG 的 DDL 是事务性的，所以“逐 key 减一格 holder（归零即 `DELETE`，并记下这个 ref）→ `DROP SCHEMA … CASCADE`”可以在**一个事务**里提交，崩溃也不会留下“树没了、账还在”的中间态；相较 SQLite 档的“先删 `<view>.db`，再 `refs rebuild` 重算整本账”，这里不需要事后重建；
-- **字节在这一步回收**：删完 `node` 行，`blocks/` 里的对象就是孤儿；CLI 拿删除前读到的 `DISTINCT data_ref` 逐个 `backend.remove`，**只有账本归零的**才删（仍被别名/fork/其它视图命名的计入 `still held by other views`）。`--data-dir` 指向真正存 `blocks/` 的那台，点错只会如实报 `not found`，不会假称已回收；条带 key（`s<N>:<stripe>:<uuid>`）在 data-server 上，普通本地根回收不了，计入 `could not be freed` 并跳过；
+- **字节在这一步回收**：删完 `node` 行，`blocks/` 里的对象就是孤儿；CLI 拿删除前读到的 `DISTINCT data_ref` 逐个 `backend.remove`，**只有账本归零的**才删（仍被别名/fork/其它视图命名的计入 `still held by other views`）。`--data-dir` 指向真正存 `blocks/` 的那台，点错只会如实报 `not found`，不会假称已回收；条带 key（`s<N>:<stripe>[:<fp>]:<uuid>`）在 data-server 上，普通本地根回收不了，计入 `could not be freed` 并跳过；
 - **删不掉的情况**：名字本身还被定义治理（先用不带 `--base` 的 `view rm` 删定义）、仍有定义经此基解析、本机还挂着——与 SQLite 同一套守卫，文案逐字相同（§3.4.3）；
 - **二次删除会失败**：报 `no schema grovefs_v_<hex> in the database — 'demo' has no base tree here (a governed name is removed with \`view rm\` WITHOUT --base; …)`，退出码非 0。把“什么都没做”报成成功，会让打字错误静默通过；
 - **绕过 CLI 手工 `DROP SCHEMA … CASCADE` 的代价**：账本是无 view 列的全局表，裸 drop 只删树不销账，该视图订过的每个对象留下一行；更要紧的是**它订过哪些对象只有那个 schema 知道**，ref 清单随 schema 一起消失——下面第 3 步能把账本归位（多计的行删掉），但**归不了字节**，那些对象从此没有记录可回收。`.bneck/pg_view_teardown.sh` 的 E/H 段就是为这件事写的：drop 前后各记一次，最后断言“剩下的正好是它订过的那些”并写明原因；

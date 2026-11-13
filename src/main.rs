@@ -89,7 +89,7 @@ Run `grovefs <command> --help` for a command's full options.
   Long commands shrink: a KEY=VALUE file is auto-loaded into the environment
   ($GROVEFS_CONFIG, else $HOME/.config/grovefs/grovefs.conf),
   and the repeat-heavy flags fall back to env — GROVEFS_META_SERVER / GROVEFS_DATA_SERVERS /
-  GROVEFS_TOKEN for `mount` and the servers, GROVEFS_HOME, GROVEFS_META_DIR,
+  GROVEFS_TOKEN / GROVEFS_STRIPE_BYTES for `mount` and the servers, GROVEFS_HOME, GROVEFS_META_DIR,
   GROVEFS_STATS, GROVEFS_API_KEY, GROVEFS_MCP_API_KEY, GROVEFS_BW_READ /
   GROVEFS_BW_WRITE. Precedence is always flag > live env > config file;
   keep the file 600 if it holds secrets.
@@ -174,6 +174,19 @@ enum Cmd {
         /// cross-server striping; a single address behaves exactly as before.
         #[arg(long = "data-servers", value_name = "ADDR[,ADDR]")]
         data: Option<String>,
+        /// Stripe chunk size for cross-server striping: a byte count or a
+        /// K/M/G suffix (1024-based, e.g. `16M`, `4194304`). Default 16 MiB.
+        /// Only meaningful with a multi-address `--data-servers` list. The
+        /// value is baked into each NEW object's `data_ref`
+        /// (`s<N>:<stripe>:<uuid>`); existing objects keep the stripe they
+        /// were written with, so changing this never requires re-ingesting
+        /// data. Falls back to env `GROVEFS_STRIPE_BYTES`.
+        #[arg(
+            long = "stripe-bytes",
+            value_name = "SIZE",
+            value_parser = grovefs::bwlimit::parse_size_bytes
+        )]
+        stripe_bytes: Option<u64>,
         /// Remote metadata service address (host:port). If set, the view tree is
         /// served by a central `meta-server` instead of a local `<home>/meta` DB,
         /// so multiple clients mounting the same view share ONE authoritative view
@@ -355,6 +368,20 @@ enum Cmd {
         /// file to colocate (and `--meta-dir` is then unused).
         #[arg(long = "meta-store", value_name = "URI")]
         store: Option<String>,
+        /// This node's stable identity within a striped cluster. When clients
+        /// mount with a comma `--data-servers h1:port,h2:port,...` list, chunk
+        /// placement is normally decided by list position, so reordering the
+        /// addresses would silently misroute reads/writes of existing objects.
+        /// Each data-server started with a DISTINCT `--member-id` (0, 1, 2, …)
+        /// lets those clients place chunks by member IDENTITY instead: the
+        /// `--data-servers` order then no longer matters, and a disk replaced
+        /// behind the same id keeps its bytes addressable. Members of one
+        /// stripe must use unique ids; the id must stay FIXED for a given
+        /// store — changing it re-maps every chunk family. Falls back to
+        /// `GROVEFS_MEMBER_ID`. Unset (or single-address use) keeps the
+        /// historical positional placement.
+        #[arg(long = "member-id", value_name = "N")]
+        member_id: Option<u64>,
     },
     /// Run the central metadata service many `mount --meta-server` clients share.
     ///
@@ -1274,7 +1301,8 @@ enum RefsAction {
 /// the first existing file wins. Only
 /// `GROVEFS_`-prefixed keys are honored (the rest are ignored with a warning);
 /// recognized: GROVEFS_HOME, GROVEFS_META_SERVER / GROVEFS_DATA_SERVERS / GROVEFS_TOKEN
-/// (mount defaults), GROVEFS_STATS, GROVEFS_API_KEY, GROVEFS_MCP_API_KEY, …
+/// (mount defaults), GROVEFS_STRIPE_BYTES (mount stripe size), GROVEFS_STATS,
+/// GROVEFS_API_KEY, GROVEFS_MCP_API_KEY, …
 /// The file is read once before clap parses, so the existing per-knob env
 /// fallbacks consume the values without any extra plumbing; the mount
 /// re-exec keeps them (the child inherits the environment). Secrets do belong
@@ -1359,6 +1387,26 @@ fn resolve_bw(flag: Option<u64>, env_key: &str) -> Result<u64, Box<dyn std::erro
             grovefs::bwlimit::parse_rate(&s).map_err(|e| format!("{env_key}: {e}").into())
         }
         _ => Ok(0),
+    }
+}
+
+/// `--stripe-bytes` env fallback, same shape as [`resolve_bw`]: an explicit
+/// flag wins; an unparsable env value is a hard error (silently ignoring a
+/// stripe the operator believes is set would bake the wrong layout into every
+/// new `data_ref`). When neither is given, the built-in default
+/// (`backend::STRIPE_BYTES`, 16 MiB) is returned. A `0` value is refused by
+/// the parser (a zero stripe is meaningless).
+fn resolve_stripe(
+    flag: Option<u64>,
+    env_key: &str,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    if let Some(v) = flag {
+        return Ok(v);
+    }
+    match std::env::var(env_key) {
+        Ok(s) if !s.trim().is_empty() => grovefs::bwlimit::parse_size_bytes(&s)
+            .map_err(|e| format!("{env_key}: {e}").into()),
+        _ => Ok(grovefs::backend::STRIPE_BYTES),
     }
 }
 
@@ -1766,6 +1814,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             view,
             mountpoint,
             data,
+            stripe_bytes,
             meta,
             ro,
             strict,
@@ -1797,6 +1846,9 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             // an unparsable env value refuses the mount (see `resolve_bw`).
             let bw_read = resolve_bw(bw_read, "GROVEFS_BW_READ")?;
             let bw_write = resolve_bw(bw_write, "GROVEFS_BW_WRITE")?;
+            // Stripe size for cross-server striping: same precedence, the
+            // built-in default when neither knob is set (see `resolve_stripe`).
+            let stripe = resolve_stripe(stripe_bytes, "GROVEFS_STRIPE_BYTES")?;
             // Default `mount` detaches: re-exec this exact command with
             // `--foreground` in a new session (stdio → log file when attached
             // to a terminal, inherited otherwise so redirecting scripts keep
@@ -2042,8 +2094,9 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         .collect();
                     if addrs.len() > 1 {
                         println!(
-                            "using sharded remote data service across {} servers: {}",
+                            "using sharded remote data service across {} servers (stripe {} bytes): {}",
                             addrs.len(),
+                            stripe,
                             addrs.join(",")
                         );
                         let mut members: Vec<Arc<dyn backend::StorageBackend>> =
@@ -2058,8 +2111,20 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                                 .with_fence(fence_epoch.clone(), fence_refresh.clone()),
                             ));
                         }
-                        Arc::new(backend::ShardedBackend::with_default_stripe(members))
+                        Arc::new(backend::ShardedBackend::new(members, stripe))
                     } else {
+                        // A single data-server never stripes, so the knob is
+                        // inert here — say so rather than let a config-file
+                        // default silently vanish on a deployment that shrinks
+                        // the server list. Not a hard error: the same conf is
+                        // meant to survive across multi- and single-server tops.
+                        if stripe_bytes.is_some()
+                            || std::env::var_os("GROVEFS_STRIPE_BYTES").is_some()
+                        {
+                            eprintln!(
+                                "note: --stripe-bytes / GROVEFS_STRIPE_BYTES has no effect with a single --data-servers address (striping needs a comma list)"
+                            );
+                        }
                         let one = addrs.first().copied().unwrap_or(addr.as_str());
                         println!("using remote data service at {one}");
                         Arc::new(
@@ -2215,6 +2280,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             require_api_key,
             keys_from,
             store,
+            member_id,
         } => {
             // Comma-separated roots = several disks behind one data-server;
             // placement across them is automatic (see PlacementBackend).
@@ -2260,6 +2326,31 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             // Startup banner echoes the root list + host (display only): root
             // paths repeat across nodes, so the listen line alone is ambiguous.
             let srv = srv.with_roots(&roots);
+            // Stable member id for identity-based striping: flag > env >
+            // unconfigured. A malformed `GROVEFS_MEMBER_ID` is a HARD error, not
+            // a silent drop to positional placement — quietly losing the id an
+            // operator believes is set would reintroduce the reorder hazard this
+            // feature exists to remove.
+            let member_id = match member_id {
+                Some(v) => Some(v),
+                None => match std::env::var("GROVEFS_MEMBER_ID") {
+                    Ok(s) if !s.trim().is_empty() => Some(s.trim().parse::<u64>().map_err(|_| {
+                        format!("GROVEFS_MEMBER_ID: invalid integer '{}'", s.trim())
+                    })?),
+                    _ => None,
+                },
+            };
+            let srv = match member_id {
+                Some(id) => {
+                    println!(
+                        "data-server: member-id {id} — clients that stripe across a comma \
+                         --data-servers list place chunks by this identity, so their order \
+                         is irrelevant (must be unique across the cluster's members)"
+                    );
+                    srv.with_member_id(id)
+                }
+                None => srv,
+            };
             srv.serve()?;
         }
         Cmd::MetaServer {
