@@ -143,6 +143,60 @@ pub fn ledger_remove(tx: &rusqlite::Transaction<'_>, dr: &str) -> Option<String>
     }
 }
 
+/// One name's removal inside an already-open IMMEDIATE transaction: look the row
+/// up, refuse a non-empty directory, drop it, and book the ledger so only the
+/// LAST name for a key comes back for GC.
+///
+/// Split out of [`MetaEngine::unlink`] so the batched delete runs this exact
+/// sequence per row inside one commit — the delete-side twin of `insert_row`.
+fn unlink_row(
+    tx: &rusqlite::Transaction<'_>,
+    parent: i64,
+    name: &str,
+) -> Result<Option<String>, MetaError> {
+    let (id, is_dir, data_ref) = tx
+        .prepare_cached("SELECT id,is_dir,data_ref FROM node WHERE parent_id=?1 AND name=?2")
+        .and_then(|mut s| {
+            s.query_row(params![parent, name], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })
+        })
+        .map_err(|_| MetaError::NotFound)?;
+    if is_dir == 1 {
+        let kids: i64 = tx
+            .prepare_cached("SELECT COUNT(*) FROM node WHERE parent_id=?1")
+            .and_then(|mut s| s.query_row(params![id], |r| r.get(0)))
+            .unwrap_or(0);
+        if kids > 0 {
+            return Err(MetaError::NotEmpty);
+        }
+    }
+    tx.prepare_cached("DELETE FROM node WHERE id=?1")
+        .and_then(|mut s| s.execute(params![id]))?;
+    // The blob is freeable only once this view holds no other name for the key
+    // AND the cross-view ledger confirms no other view holds it (the last remove
+    // deletes the holder row and returns the key). See [`ledger_remove`].
+    let gc = match &data_ref {
+        Some(dr) => {
+            let refs: i64 = tx
+                .prepare_cached("SELECT COUNT(*) FROM node WHERE data_ref=?1")
+                .and_then(|mut s| s.query_row(params![dr], |r| r.get(0)))
+                .unwrap_or(0);
+            if refs == 0 {
+                ledger_remove(tx, dr)
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
+    Ok(gc)
+}
+
 /// Outcome of [`fork_view`]: directory entries copied and DISTINCT blobs the
 /// new tree now co-holds with its source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2412,50 +2466,46 @@ impl MetaEngine {
         with_ledger_serial(|| {
             let mut conn = self.conn.lock();
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let (id, is_dir, data_ref) = tx
-                .prepare_cached("SELECT id,is_dir,data_ref FROM node WHERE parent_id=?1 AND name=?2")
-                .and_then(|mut s| {
-                    s.query_row(params![parent, name], |r| {
-                        Ok((
-                            r.get::<_, i64>(0)?,
-                            r.get::<_, i64>(1)?,
-                            r.get::<_, Option<String>>(2)?,
-                        ))
-                    })
-                })
-                .map_err(|_| MetaError::NotFound)?;
-            if is_dir == 1 {
-                let kids: i64 = tx
-                    .prepare_cached("SELECT COUNT(*) FROM node WHERE parent_id=?1")
-                    .and_then(|mut s| s.query_row(params![id], |r| r.get(0)))
-                    .unwrap_or(0);
-                if kids > 0 {
-                    return Err(MetaError::NotEmpty);
-                }
-            }
-            tx.prepare_cached("DELETE FROM node WHERE id=?1")
-                .and_then(|mut s| s.execute(params![id]))?;
-            // The blob is freeable only once this view holds no other name for the
-            // key AND the cross-view ledger confirms no other view holds it (the
-            // last remove deletes the holder row and returns the key). See
-            // [`ledger_remove`].
-            let gc = match &data_ref {
-                Some(dr) => {
-                    let refs: i64 = tx
-                        .prepare_cached("SELECT COUNT(*) FROM node WHERE data_ref=?1")
-                        .and_then(|mut s| s.query_row(params![dr], |r| r.get(0)))
-                        .unwrap_or(0);
-                    if refs == 0 {
-                        ledger_remove(&tx, dr)
-                    } else {
-                        None
-                    }
-                }
-                None => None,
-            };
+            let out = unlink_row(&tx, parent, name);
             tx.commit()?;
-            Ok(gc)
+            out
         })
+    }
+
+    /// Remove a burst of names in ONE IMMEDIATE transaction: one ledger-lock
+    /// acquisition and one commit for the whole group instead of one each.
+    ///
+    /// Same reasoning as [`MetaEngine::create_nodes_batch`], on the delete side:
+    /// both the connection and the process-wide ledger lock are single-writer, so
+    /// a concurrent `rm` otherwise only queues behind the same commit (measured:
+    /// 8 deleting workers ran at 5.3k files/s, and the wall time was just the
+    /// serialized `meta.unlink` time). A missing name or a non-empty directory
+    /// keeps its own error and does not fail its siblings.
+    pub fn unlink_nodes_batch(
+        &self,
+        items: &[(i64, &str)],
+    ) -> Vec<Result<Option<String>, MetaError>> {
+        let _t = stats::start(stats::Stage::MetaUnlink);
+        self.drop_cursors();
+        let out = with_ledger_serial(|| -> Result<Vec<_>, MetaError> {
+            let mut conn = self.conn.lock();
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let mut out = Vec::with_capacity(items.len());
+            for (parent, name) in items {
+                out.push(unlink_row(&tx, *parent, name));
+            }
+            tx.commit()?;
+            Ok(out)
+        });
+        match out {
+            Ok(rows) => rows,
+            Err(e) => {
+                let msg = e.to_string();
+                (0..items.len())
+                    .map(|_| Err(MetaError::Db(msg.clone())))
+                    .collect()
+            }
+        }
     }
 
     /// Update a file's mtime/ctime (after a write or truncate). Applies to every
@@ -2903,6 +2953,15 @@ impl MetaProvider for MetaEngine {
     fn unlink(&self, parent: i64, name: &str) -> Result<Option<String>, MetaError> {
         MetaEngine::unlink(self, parent, name)
     }
+    fn supports_unlink_batch(&self) -> bool {
+        true
+    }
+    fn unlink_nodes_batch(
+        &self,
+        items: &[(i64, &str)],
+    ) -> Vec<Result<Option<String>, MetaError>> {
+        MetaEngine::unlink_nodes_batch(self, items)
+    }
     fn rename(
         &self,
         parent: i64,
@@ -3197,6 +3256,25 @@ impl MetaProvider for MetaStore {
             MetaStore::Pg(p) => p.unlink(parent, name),
             #[cfg(feature = "fdb")]
             MetaStore::Fdb(f) => f.unlink(parent, name),
+        }
+    }
+    fn supports_unlink_batch(&self) -> bool {
+        match self {
+            MetaStore::Sqlite(m) => MetaProvider::supports_unlink_batch(m),
+            MetaStore::Pg(p) => MetaProvider::supports_unlink_batch(&**p),
+            #[cfg(feature = "fdb")]
+            MetaStore::Fdb(f) => MetaProvider::supports_unlink_batch(&**f),
+        }
+    }
+    fn unlink_nodes_batch(
+        &self,
+        items: &[(i64, &str)],
+    ) -> Vec<Result<Option<String>, MetaError>> {
+        match self {
+            MetaStore::Sqlite(m) => MetaProvider::unlink_nodes_batch(m, items),
+            MetaStore::Pg(p) => MetaProvider::unlink_nodes_batch(&**p, items),
+            #[cfg(feature = "fdb")]
+            MetaStore::Fdb(f) => MetaProvider::unlink_nodes_batch(&**f, items),
         }
     }
     fn rename(
@@ -4511,5 +4589,75 @@ mod tests {
             Some("k"),
             "ledger rebuilt -> GC works"
         );
+    }
+
+    /// A batched delete commits once for the whole group, but every name keeps
+    /// its OWN outcome: a missing name is `NotFound`, a non-empty directory is
+    /// `NotEmpty`, and neither fails its siblings. It must also book the ledger
+    /// row by row — the FIRST name of a shared key frees nothing, the LAST one
+    /// returns the key for GC — exactly as the per-name path does.
+    #[test]
+    fn unlink_batch_isolates_failures_and_books_the_ledger_per_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = MetaEngine::open(&dir.path().join("view.db")).unwrap();
+        // `a`/`b` are two names of ONE key, `c` has its own, `gone` is deleted
+        // before the batch, `d` is a non-empty directory.
+        let a = e
+            .create_node(ROOT_INO, "a", false, Some("k1"), 0o644, 1000, 1000)
+            .unwrap();
+        e.link_node(a, ROOT_INO, "b").unwrap();
+        e.create_node(ROOT_INO, "c", false, Some("k2"), 0o644, 1000, 1000)
+            .unwrap();
+        e.create_node(ROOT_INO, "gone", false, Some("k3"), 0o644, 1000, 1000)
+            .unwrap();
+        e.unlink(ROOT_INO, "gone").unwrap();
+        let d = e
+            .create_node(ROOT_INO, "d", true, None, 0o755, 1000, 1000)
+            .unwrap();
+        e.create_node(d, "inside", false, Some("k4"), 0o644, 1000, 1000)
+            .unwrap();
+
+        let out = e.unlink_nodes_batch(&[
+            (ROOT_INO, "a"),
+            (ROOT_INO, "gone"),
+            (ROOT_INO, "d"),
+            (ROOT_INO, "b"),
+            (ROOT_INO, "c"),
+            (ROOT_INO, "nope"),
+        ]);
+        assert_eq!(out.len(), 6, "one result per request, in input order");
+        assert!(matches!(out[0], Ok(None)), "k1 still has name b: no GC yet");
+        assert!(matches!(out[1], Err(MetaError::NotFound)));
+        assert!(
+            matches!(out[2], Err(MetaError::NotEmpty)),
+            "a non-empty directory keeps ENOTEMPTY and survives"
+        );
+        assert_eq!(
+            out[3].as_ref().unwrap().as_deref(),
+            Some("k1"),
+            "the LAST name of a key is the one that frees it"
+        );
+        assert_eq!(out[4].as_ref().unwrap().as_deref(), Some("k2"));
+        assert!(matches!(out[5], Err(MetaError::NotFound)));
+
+        // Survivors and casualties: a failed rmdir must not take its subtree with
+        // it, and both names of the freed key must be gone.
+        assert!(e.lookup(ROOT_INO, "d").is_some());
+        assert!(e.lookup(d, "inside").is_some());
+        assert!(e.lookup(ROOT_INO, "a").is_none());
+        assert!(e.lookup(ROOT_INO, "b").is_none());
+        assert!(e.lookup(ROOT_INO, "c").is_none());
+        // Both freed keys left the cross-view ledger, so no blob leaks.
+        let conn = e.conn.lock();
+        for k in ["k1", "k2"] {
+            let n: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {REFS_SCHEMA}.holders WHERE data_ref=?1"),
+                    params![k],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 0, "{k} must be unbooked once its last name leaves");
+        }
     }
 }
