@@ -137,6 +137,15 @@ RecordLayer 是 Python/Java 侧的遗留绑定层，无 Rust 实现；把它引�
   **v1.1 更正（C4）**：原写"用一次前缀扫完成"不对——FDB 无 `ANY($1)` 式的多前缀单扫描，M 个父目录就是
   M 次前缀 probe（可同事务并发），与 PG 的 `= ANY($1) GROUP BY`（`src/pg_store.rs:662-673`）同构而非等价，
   属 P6 差分对拍的可归因代价。
+- **实现形状（`FdbStore::readdir_page`）**：那 M 次 probe 不是逐条发，而是 `Tx::count_multi` 按
+  `COUNT_MULTI_FANOUT = 256` 并发成波，每轮用一次 `join_all` 把整波请求都在途；单条 range 超过一个
+  reply 页时由 `next_range` 续读，所以不会像老的逐条循环那样被截断。
+- 普通文件的 nlink 不走前缀波：一页文件的 id 通常连号，`Tx::count_holder_span` 用一次
+  `(v,'h',lo,·) .. (v,'h',hi,·)` 区间读就拿到整页计数；`SPAN_SLACK`（id 跨度 / 条数 > 8）与
+  `ROW_SLACK`（区间行数 > 条数 × 4 + 64）任一越界即返回 `None`，退到逐前缀 `count_multi`——两条路
+  都错时仍回落逐条 `info`，结果与逐条计数逐项相等（`tests/fdb_tree.rs` 的两个 `nlink` 用例分别钉
+  连号页与散号页）。实测（本机单节点集群、2,000 条目录、每页 128）：逐条计数 95.7µs/条，本节形状
+  8.1µs/条（11.8×，同一进程同一份数据往返三轮取最优）。
 - 普通文件的 nlink = 同 `ino` 的名字数：新增 `(v,'h',ino, parent_id, name)` 存在性键（"该 ino 在本视图的名字集"），
   **v1.1 修订（C2）**：原设计为 `(v,'h',ino, name)`，实现加入 `parent_id`。存在性键的性质不变（空值、nlink 由
   前缀计数），多出的分量使 §3.2 的指针修复（unlink 后若该 ino 还有名字，需选一个权威名字写回 `'i'` 键）
@@ -478,7 +487,7 @@ OCC → errno 映射、三后端对照与可归因差异清单。未动一行代
 | **C1** | `ino = id`，`'m','ino'` 降为迁移高水位 | `src/pg_store.rs:851-877`（PG 本身就是 `ino=id`）；`src/fdb_store.rs::create_node` | 改变 §4 的计数器语义；使 P8 迁移必须单独处理外部 ino |
 | **C2** | `'h` 键加 `parent_id`：`(ino, parent, name)` | `src/fdb_store.rs::Keys::holder`；`tests::key_encoding_is_byte_frozen` | 仅影响簇内尚无数据时（现仍在 P3 实验分支）；属性不变 |
 | **C3** | getattr 两次读串行、同事务，不是一 RTT | `foundationdb-tuple`/`Transaction::get` 的键依赖；`src/fdb_store.rs::getattr` | §3.2 的延迟承诺降级；热路径比原设计多一个 RTT |
-| **C4** | 批量 finalize = M 次前缀 probe（同事务） | FDB 无多前缀单扫描原语；实现处是逐条解析 nlink 的 `src/fdb_store.rs::FdbStore::info`（由 `readdir`/`readdir_page` 在同一只读事务内逐项调用），对位 PG 的 `pg_store::finalize`/`finalize_batch` | READDIRPLUS 代价随批内父目录数线性增长；P6 对拍需按此对齐 |
+| **C4** | 批量 finalize = M 次前缀 probe（同事务） | FDB 无多前缀单扫描原语；v1.1 时实现是逐条解析 nlink 的 `src/fdb_store.rs::FdbStore::info`（由 `readdir`/`readdir_page` 在同一只读事务内逐项调用），对位 PG 的 `pg_store::finalize`/`finalize_batch`。**现行实现**已把这一页改成一次区间读（`count_holder_span`）+ 一波并发前缀计数（`count_multi`，见 §3.4），逐条 `info` 只剩兜底 | READDIRPLUS 代价随批内父目录数线性增长（并发波把 M 次串行 probe 压成 M/256 轮）；P6 对拍需按此对齐 |
 
 另有一处**字节层面的事实更正**（不编 C 号，因为它不是设计决策而是原示意式含糊）：§1 的
 `\x01 + tuple(...)` 展开为实测字节表后，变长元素的终止符是 `0x00` 而非 `0xff`（后者只作 NUL 转义引导）。

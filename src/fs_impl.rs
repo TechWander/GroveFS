@@ -426,9 +426,15 @@ impl GroveFS {
     /// remote server that did not advertise the cap) would re-materialise the
     /// entire listing for every page, so they are asked for one full listing per
     /// kernel buffer: one round trip per buffer, no paging assumption.
-    fn fetch_policy(&self) -> (usize, usize) {
+    ///
+    /// `first` is the first page of the calling callback, sized to what a 4 KiB
+    /// kernel reply buffer actually holds: a plain READDIR record is ~40 B, so
+    /// ~102 names fit and asking for 32/64/128 in turn spends three fetches —
+    /// three scans, and on FoundationDB three nlink count waves — to deliver one
+    /// buffer (32 + 64 + 128 rows fetched for ~102 delivered).
+    fn fetch_policy(&self, first: usize) -> (usize, usize) {
         if self.meta.supports_paged_readdir() {
-            (READDIR_FETCH_MIN, READDIR_FETCH_MAX)
+            (first, READDIR_FETCH_MAX)
         } else {
             (usize::MAX, usize::MAX)
         }
@@ -1851,7 +1857,7 @@ impl fuser::Filesystem for GroveFS {
         // two slots taken by "." and "..") is exactly the offset the previous
         // full-scan implementation reported for the same entry.
         let mut child_i = skip.saturating_sub(2);
-        let (mut want, want_max) = self.fetch_policy();
+        let (mut want, want_max) = self.fetch_policy(READDIR_FETCH_MIN);
         loop {
             let page = self.meta.readdir_page(ino.0 as i64, child_i, want);
             let got = page.len();
@@ -1951,7 +1957,7 @@ impl fuser::Filesystem for GroveFS {
             }
         }
         let mut child_i = skip.saturating_sub(2);
-        let (mut want, want_max) = self.fetch_policy();
+        let (mut want, want_max) = self.fetch_policy(READDIR_FETCH_MIN_PLAIN);
         loop {
             let page = self.meta.readdir_page(ino.0 as i64, child_i, want);
             let got = page.len();
@@ -2034,11 +2040,16 @@ const WRITE_TOUCH_RESOLUTION_SECS: u64 = 1;
 /// First (smallest) page of children fetched per metadata query while
 /// streaming a READDIR/READDIRPLUS reply, and the cap it grows to. fuser does
 /// not expose how much room is left in the reply buffer, so the fetch size
-/// doubles on each refill: the kernel asks for 4 KiB READDIRPLUS buffers (~23
-/// fat records), where a fixed large chunk would waste most of every query,
-/// while a geometric run costs at most about one extra chunk per buffer — and
-/// still adapts when the kernel does ask for a big one.
+/// doubles on each refill when a page did not fill the buffer, and still adapts
+/// when the kernel does ask for a big one.
+///
+/// The two callbacks start at different sizes because their records are: a
+/// READDIRPLUS entry carries a full attribute set and only ~22 fit in the 4 KiB
+/// kernel buffer, while a plain READDIR entry is the bare directory record and
+/// ~102 fit. Starting the plain listing at 32 makes every buffer cost three
+/// fetches (32 + 64 + 128 rows for 102 delivered).
 const READDIR_FETCH_MIN: usize = 32;
+const READDIR_FETCH_MIN_PLAIN: usize = 128;
 const READDIR_FETCH_MAX: usize = 1024;
 
 /// True if `ino`'s write-path mtime should be stamped now: either never stamped
