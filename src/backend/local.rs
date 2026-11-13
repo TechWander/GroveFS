@@ -108,8 +108,6 @@ pub struct LocalBackend {
     /// key -> open handle, bounded by `fd_limit` entries and trimmed coldest
     /// first when it overflows.
     fds: RwLock<HashMap<String, Arc<CachedFd>>>,
-    /// Guards object creation so two threads don't race to open a brand-new file.
-    creating: RwLock<()>,
     /// Monotonic recency clock for the fd cache (one relaxed fetch_add per op).
     tick: AtomicU64,
     /// Upper bound on cached handles before a trim is triggered.
@@ -139,7 +137,6 @@ impl LocalBackend {
         Ok(Self {
             root: root.to_path_buf(),
             fds: RwLock::new(HashMap::new()),
-            creating: RwLock::new(()),
             tick: AtomicU64::new(0),
             fd_limit: fd_limit.max(FD_LIMIT_MIN),
             dirty_marker: AtomicBool::new(false),
@@ -177,42 +174,45 @@ impl LocalBackend {
             entry.last.store(self.next_tick(), Ordering::Relaxed);
             return Ok(entry.clone());
         }
-        // Slow path: serialize creation, then open.
-        let _g = self.creating.write();
-        // Re-check under the creation lock (double-checked locking).
-        if let Some(entry) = self.fds.read().get(key) {
-            entry.last.store(self.next_tick(), Ordering::Relaxed);
-            return Ok(entry.clone());
-        }
+        // Miss: open without holding any of our own locks. Creation is a single
+        // `O_CREAT` open rather than a probe-then-create pair, and it is NOT
+        // serialized: two threads racing on the same brand-new key just get two
+        // handles to one inode, and `or_insert` below keeps only the first while
+        // the loser's handle closes as its `Arc` drops. Nothing in the write
+        // path depends on a file position, so either handle is usable.
         let bucket = self.bucket_path(key);
         let mut opts = OpenOptions::new();
         opts.read(true).write(true);
+        if create {
+            opts.create(true);
+        }
         let file = match opts.open(&bucket) {
             Ok(f) => f,
-            Err(e) if e.kind() == io::ErrorKind::NotFound && create => {
-                // Brand-new object: materialize it under its bucket (the parent
-                // is precreated at startup, so the mkdir is a no-op in practice).
+            // The bucket table is precreated at startup, so this is the
+            // "someone pruned a bucket" case rather than the hot path.
+            Err(e) if create && e.kind() == io::ErrorKind::NotFound => {
                 if let Some(d) = bucket.parent() {
                     fs::create_dir_all(d)?;
                 }
-                opts.create(true).open(&bucket)?
+                opts.open(&bucket)?
             }
             // Missing and not creating: return the real OS error, which carries
             // `raw_os_error() == ENOENT` (a synthesized NotFound would degrade to
             // EIO over the remote wire and break the striped size probe).
             Err(e) => return Err(e),
         };
-        let entry = Arc::new(CachedFd {
+        let fresh = Arc::new(CachedFd {
             file,
             last: AtomicU64::new(self.next_tick()),
         });
-        {
+        let entry = {
             let mut map = self.fds.write();
-            map.insert(key.to_string(), entry.clone());
+            let entry = map.entry(key.to_string()).or_insert(fresh).clone();
             if map.len() > self.fd_limit {
                 trim_coldest(&mut map, self.fd_limit);
             }
-        }
+            entry
+        };
         Ok(entry)
     }
 
@@ -524,6 +524,31 @@ mod tests {
         // Unlink of a name whose bytes never existed is a successful no-op.
         let k3 = be.new_key("d3f7a2c0-0000-4000-8000-00000000d0d2");
         be.remove(&k3).unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Two threads racing to create the SAME brand-new object must both get a
+    /// usable handle and leave ONE cached entry: `fd()` opens with `O_CREAT` and
+    /// keeps whichever handle reached the map first, so the loser's duplicate
+    /// close never leaks. Guards the lock-free creation path.
+    #[test]
+    fn concurrent_first_writes_share_one_cached_handle() {
+        let root = tmp_root("race");
+        let be = std::sync::Arc::new(LocalBackend::new(&root).unwrap());
+        let k = be.new_key("d3f7a2c0-0000-4000-8000-00000000beef");
+        let mut hs = Vec::new();
+        for i in 0..8u64 {
+            let be = be.clone();
+            let k = k.clone();
+            hs.push(std::thread::spawn(move || {
+                be.write(&k, i * 4, b"word").unwrap();
+            }));
+        }
+        for h in hs {
+            h.join().unwrap();
+        }
+        assert_eq!(be.len(&k).unwrap(), 32, "every racing write must land");
+        assert_eq!(be.cached_fds(), 1, "one object, one cached handle");
         let _ = fs::remove_dir_all(&root);
     }
 
