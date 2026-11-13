@@ -12,7 +12,7 @@
 //! operations out with `std::thread::scope`, so aggregate bandwidth scales with
 //! the number of servers rather than being capped by one node's socket.
 
-use super::{FsStat, StorageBackend};
+use super::{FsStat, ObjectPage, StorageBackend};
 use crate::stats;
 use std::io;
 use std::sync::Arc;
@@ -693,6 +693,19 @@ impl StorageBackend for ShardedBackend {
             }
         }
         Ok(())
+    }
+
+    fn list_objects(&self, cursor: Option<&str>, limit: usize) -> io::Result<ObjectPage> {
+        // Striping puts each chunk on ONE member, so walking the members covers
+        // every stored key exactly once — chunks included, which is exactly what
+        // the auditor needs (`s<N>:<stripe>:<base>` is named by the trees, the
+        // `#<i>` chunks are the bytes on disk).
+        super::list_across_members(
+            self.servers.len(),
+            |i| self.servers[i].clone(),
+            cursor,
+            limit,
+        )
     }
 
     fn statvfs(&self) -> io::Result<FsStat> {

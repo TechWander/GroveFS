@@ -25,6 +25,13 @@
 //! reported as `held` and NEVER deleted, even when no tree names it — that is
 //! the documented over-count from an out-of-band tree removal. Run
 //! `grovefs refs rebuild` first and the same object becomes reclaimable.
+//!
+//! The same verdict serves deployments whose trees are NOT local files: the
+//! control plane reads a PG/`fdb://` store where it lives ([`Picture`]) and
+//! lists the objects through the data servers, so an operator on another machine
+//! audits the deployment's real bytes instead of a `<data-dir>` that does not
+//! exist on their host. Only the listing changes; [`audit`] is the one rule that
+//! decides what may be deleted.
 
 use rusqlite::{Connection, OpenFlags};
 use std::collections::HashSet;
@@ -233,10 +240,34 @@ pub fn physical_views(meta_root: &Path) -> Result<Vec<String>, String> {
     Ok(views)
 }
 
-struct Refs {
-    views: Vec<String>,
-    keys: HashSet<String>,
-    striped: HashSet<String>,
+/// The tree side of a [`Picture`]: every surviving view and the content keys
+/// (plus striped layout bases) they name.
+pub struct Refs {
+    pub views: Vec<String>,
+    pub keys: HashSet<String>,
+    pub striped: HashSet<String>,
+}
+
+impl Refs {
+    /// Build the tree side from an already-read key set. The PG and `fdb://`
+    /// arms hand over decoded content keys, so the striped-base rule has to be
+    /// applied here — identically to [`collect_refs`], which is the whole point
+    /// of every backend sharing one [`Picture`].
+    pub fn from_keys(views: Vec<String>, keys: impl IntoIterator<Item = String>) -> Self {
+        let mut striped = HashSet::new();
+        let mut set = HashSet::new();
+        for k in keys {
+            if let Some(base) = layout_base(&k) {
+                striped.insert(base.to_string());
+            }
+            set.insert(k);
+        }
+        Self {
+            views,
+            keys: set,
+            striped,
+        }
+    }
 }
 
 /// Union of every surviving tree's DISTINCT `data_ref` values. A tree that
@@ -291,9 +322,28 @@ fn collect_refs(meta_root: &Path) -> Result<Refs, String> {
     })
 }
 
-struct Ledger {
-    keys: HashSet<String>,
-    striped: HashSet<String>,
+/// The ledger side of a [`Picture`]: keys the cross-view ledger still books.
+pub struct Ledger {
+    pub keys: HashSet<String>,
+    pub striped: HashSet<String>,
+}
+
+impl Ledger {
+    /// Build the ledger side from an already-read holder set (`holders > 0`).
+    pub fn from_keys(keys: impl IntoIterator<Item = String>) -> Self {
+        let mut striped = HashSet::new();
+        let mut set = HashSet::new();
+        for k in keys {
+            if let Some(base) = layout_base(&k) {
+                striped.insert(base.to_string());
+            }
+            set.insert(k);
+        }
+        Self {
+            keys: set,
+            striped,
+        }
+    }
 }
 
 /// Keys the cross-view ledger still books (`holders > 0`). A missing or
@@ -332,6 +382,118 @@ fn collect_ledger(meta_root: &Path) -> Result<Ledger, String> {
         keys.insert(dr);
     }
     Ok(Ledger { keys, striped })
+}
+
+/// What the surviving trees name and what the shared ledger books — the two
+/// halves every deletion verdict needs, with no assumption about WHERE the trees
+/// live.
+///
+/// The SQLite arm fills this from `meta/*.db` ([`picture_sqlite`]); the control
+/// plane fills it from a PG schema set or an `fdb://` root walk. Keeping the
+/// three sets identical is what lets one deployment audit be the same decision
+/// in a file store, a database and a cluster.
+pub struct Picture {
+    pub refs: Refs,
+    pub ledger: Ledger,
+}
+
+/// Read the [`Picture`] of a local store: every surviving `<meta>/*.db` tree and
+/// `meta/refs.db`. A tree that cannot be read aborts (the same refusal [`scan`]
+/// makes).
+pub fn picture_sqlite(meta_root: &Path) -> Result<Picture, String> {
+    Ok(Picture {
+        refs: collect_refs(meta_root)?,
+        ledger: collect_ledger(meta_root)?,
+    })
+}
+
+/// One judged object as a report needs it: no path, because the bytes may live
+/// on a data server that no path on this host can name.
+#[derive(Debug, Clone)]
+pub struct Judged {
+    pub key: String,
+    pub size: u64,
+    pub mtime: SystemTime,
+    pub kind: ObjectKind,
+    pub within_grace: bool,
+}
+
+impl Judged {
+    pub fn kind_str(&self) -> &'static str {
+        self.kind.as_str()
+    }
+}
+
+/// Outcome of [`audit`]: the totals a report states plus the two object lists.
+#[derive(Debug, Default)]
+pub struct Audit {
+    pub objects: usize,
+    pub objects_bytes: u64,
+    pub matched: usize,
+    pub orphans: Vec<Judged>,
+    /// Unreferenced but still booked: never deleted by any caller.
+    pub held: Vec<Judged>,
+}
+
+impl Audit {
+    pub fn orphan_bytes(&self) -> u64 {
+        self.orphans.iter().map(|c| c.size).sum()
+    }
+
+    pub fn reclaimable(&self) -> usize {
+        self.orphans.iter().filter(|c| !c.within_grace).count()
+    }
+
+    pub fn reclaimable_bytes(&self) -> u64 {
+        self.orphans
+            .iter()
+            .filter(|c| !c.within_grace)
+            .map(|c| c.size)
+            .sum()
+    }
+
+    pub fn within_grace(&self) -> usize {
+        self.orphans.len() - self.reclaimable()
+    }
+
+    pub fn held_bytes(&self) -> u64 {
+        self.held.iter().map(|c| c.size).sum()
+    }
+}
+
+/// Judge a listed object set against a [`Picture`].
+///
+/// This is the ONE rule both listings share: the local [`scan`] walks
+/// `<data-dir>/blocks` and the control plane walks a data server's object pages,
+/// and both hand the same `(key, size, mtime)` triples here. A new listing path
+/// therefore cannot invent a laxer rule than the one an offline scan applies.
+pub fn audit(
+    objects: impl IntoIterator<Item = (String, u64, SystemTime)>,
+    pic: &Picture,
+    grace: Duration,
+) -> Audit {
+    let mut out = Audit::default();
+    for (key, size, mtime) in objects {
+        out.objects += 1;
+        out.objects_bytes = out.objects_bytes.saturating_add(size);
+        let judged = |kind| Judged {
+            key: key.clone(),
+            size,
+            mtime,
+            kind,
+            within_grace: !older_than(mtime, grace),
+        };
+        match verdict(&key, &pic.refs, &pic.ledger) {
+            Verdict::Referenced => out.matched += 1,
+            Verdict::Held(kind) => out.held.push(judged(kind)),
+            Verdict::Orphan(kind) => out.orphans.push(judged(kind)),
+        }
+    }
+    out.orphans
+        .sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.key.cmp(&b.key)));
+    out.held
+        .sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.key.cmp(&b.key)));
+    out
 }
 
 enum Verdict {
@@ -453,8 +615,9 @@ fn scan_root(
 
 /// Scan `data_roots` against the trees under `meta_root` (read-only).
 pub fn scan(meta_root: &Path, data_roots: &[PathBuf], grace: Duration) -> Result<Report, String> {
-    let refs = collect_refs(meta_root)?;
-    let ledger = collect_ledger(meta_root)?;
+    let pic = picture_sqlite(meta_root)?;
+    let refs = &pic.refs;
+    let ledger = &pic.ledger;
     let mut rep = Report {
         meta_root: meta_root.to_path_buf(),
         data_roots: Vec::new(),
@@ -476,7 +639,7 @@ pub fn scan(meta_root: &Path, data_roots: &[PathBuf], grace: Duration) -> Result
             continue;
         }
         rep.data_roots.push(root.clone());
-        scan_root(&canon.join("blocks"), root, &refs, &ledger, grace, &mut rep)?;
+        scan_root(&canon.join("blocks"), root, refs, ledger, grace, &mut rep)?;
     }
     rep.orphans
         .sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.key.cmp(&b.key)));
@@ -609,6 +772,24 @@ mod tests {
         assert_eq!(rep.held.len(), 1);
         assert_eq!(rep.held[0].key, "k-held");
         assert_eq!(rep.held[0].kind, ObjectKind::Plain);
+
+        // The control plane judges a data server's listing through `audit`
+        // instead of walking a local tree: the SAME keys must land in the same
+        // buckets, or a remote `gc --apply` would delete by a different rule
+        // than the offline scan the operator validated with.
+        let pic = picture_sqlite(&base).unwrap();
+        let listed = ["k-live", "k-orphan", "base-live#0", "base-orphan#0", "k-held"]
+            .iter()
+            .map(|k| (k.to_string(), 1u64, SystemTime::UNIX_EPOCH));
+        let aud = audit(listed, &pic, Duration::ZERO);
+        assert_eq!(aud.objects, 5);
+        assert_eq!(aud.matched, 2);
+        let mut k: Vec<&str> = aud.orphans.iter().map(|c| c.key.as_str()).collect();
+        k.sort();
+        assert_eq!(k, vec!["base-orphan#0", "k-orphan"]);
+        assert_eq!(aud.held.len(), 1);
+        assert_eq!(aud.held[0].kind, ObjectKind::Plain);
+        assert_eq!(aud.orphan_bytes(), 2);
     }
 
     #[test]

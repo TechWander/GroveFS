@@ -135,7 +135,7 @@ code "rotation refuses a non-alias retire" 3 \
     python3 "$CALL" --bin "$BIN" --quiet --meta-dir "$STORE" call alias_view \
     '{"name":"team-public3","real":"team","retire":"release"}'
 
-note "[6] fork (independent tree, shared bytes) — local SQLite base only"
+note "[6] fork (independent tree, shared bytes) — any backend, here the local SQLite one"
 FK="$(mcp call fork_view '{"name":"lab","base":"team"}')"
 ok "fork seeded from the base"      "$FK" "forked view 'lab' from base 'team'"
 NOF="$(mcp call fork_view '{"name":"lab2","base":"release"}')"

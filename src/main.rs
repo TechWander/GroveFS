@@ -369,10 +369,10 @@ enum Cmd {
         /// by `view create` / `init` / `view import`, never by a mount) and
         /// the API-key/audit store lives at `<meta-dir>/meta/api_keys.db`;
         /// under PostgreSQL (`--meta-store postgres://…`) or FoundationDB
-        /// (`--meta-store fdb://…`) the view trees live in
-        /// that engine, making `<meta-dir>` a config-only directory (derived-view
-        /// definitions, logs). Takes precedence over the global `--home` when
-        /// both are given.
+        /// (`--meta-store fdb://…`) the view trees AND the control plane
+        /// (definitions, keys, audit) live in that engine, making `<meta-dir>` a
+        /// config-only directory (logs, scratch — no authoritative record). Takes
+        /// precedence over the global `--home` when both are given.
         #[arg(long = "meta-dir", value_name = "DIR")]
         db_path: Option<PathBuf>,
         /// Shared secret clients must present (`mount --token`). When set, the
@@ -488,6 +488,22 @@ enum Cmd {
         /// memory only: a memory bound rather than a scalability gate.
         #[arg(long = "engine-idle-secs", value_name = "SECS", default_value_t = 300)]
         engine_idle_secs: u64,
+        /// Expose the REMOTE CONTROL PLANE on a second listener
+        /// (`--control-listen HOST:PORT`): `grovefs view` / `grovefs apikey` /
+        /// `grovefs refs` calls arrive as framed requests and are executed HERE,
+        /// by the process that already owns the metadata store. That is what
+        /// replaces handing every operator machine a database password: a
+        /// remote admin presents an ACCOUNT KEY (`apikey create --for admin
+        /// --owner <account>`) and never sees a store URI — and it works for the
+        /// SQLite backend too, whose trees were previously local-only.
+        ///
+        /// The port ALWAYS authenticates as `Scope::Admin`; there is no open
+        /// mode (mint the first admin key on this host). Bound before `--listen`
+        /// accepts, so a bad address fails the start. Every call is audited as
+        /// `method=control` in the same `mcp_calls` table `apikey calls` reads.
+        /// Unset (default) keeps this process exactly as it was.
+        #[arg(long = "control-listen", value_name = "HOST:PORT")]
+        control_listen: Option<String>,
     },
     /// Unmount a mountpoint
     Umount {
@@ -503,8 +519,9 @@ enum Cmd {
     /// ALIAS maps a public name to a real name (writable, real name not
     /// mountable); a FORK is an independent metadata tree seeded from a base —
     /// structure writable, content read-only (EROFS), deletes touch only the
-    /// fork. Definitions live in the meta root
-    /// (`<meta-dir>/meta/views/<name>.layout`), clients simply mount
+    /// fork. Definitions live in the control-plane store (SQLite
+    /// `<meta-dir>/meta/views/<name>.layout`, PG `grovefs_control.view_defs`,
+    /// `fdb://` the cluster's `ctl` subspace), clients simply mount
     /// `--view <name>` and need no local rules file. A `meta-server` resolves
     /// them at `M_OPEN`; a local mount resolves them from `--home`. Rules are
     /// display customization, NOT a security boundary — hard isolation stays
@@ -517,19 +534,37 @@ enum Cmd {
     /// read-write for the tree and refuses only content writes (write/truncate)
     /// with EROFS — organize names freely, upload bytes to the base view.
     View {
-        /// The metadata root holding `meta/views/*.layout` — same option name
-        /// and directory as `meta-server --meta-dir` / `grovefs apikey --meta-dir`;
-        /// falls back to the global `--home` when omitted.
+        /// The metadata root — same option name and directory as `meta-server
+        /// --meta-dir` / `grovefs apikey --meta-dir`; falls back to the global
+        /// `--home` when omitted. Under SQLite it holds `meta/views/*.layout`;
+        /// under `fdb://` the definitions are cluster rows and this root is only
+        /// a scratch/config directory (no authoritative record).
         #[arg(long = "meta-dir", value_name = "DIR")]
         db_path: Option<PathBuf>,
         /// Control-plane backend. Unset / `"sqlite"` governs the local
         /// `<meta-dir>/meta/views/*.layout` files; a `postgres://…`
-        /// (`postgresql://…` too) URI — or the `GROVEFS_META_STORE` env — governs the
-        /// shared `grovefs_control.view_defs` table instead, so definitions and
-        /// the meta-server's own resolver read/write ONE system of record. Must
+        /// (`postgresql://…` too) URI governs the shared `grovefs_control.view_defs`
+        /// table; an `fdb://…` URI governs the cluster's `ctl` subspace. Either
+        /// URI — or the `GROVEFS_META_STORE` env — makes definitions and the
+        /// meta-server's own resolver read/write ONE system of record. Must
         /// match the `meta-server --meta-store` this root is served by.
         #[arg(long = "meta-store", value_name = "URI")]
         store: Option<String>,
+        /// Govern the REMOTE deployment served by `meta-server --control-listen
+        /// HOST:PORT` instead of a store on this machine: the server performs
+        /// the work and this host needs only an admin ACCOUNT KEY (no database
+        /// URI, no access to `<meta-dir>`). Works for BOTH backends, including
+        /// SQLite. Cannot be combined with `--meta-dir`/`--meta-store`: a
+        /// remote control plane is bound to its server, so a local path here
+        /// would describe a store this deployment never sees (the pair is
+        /// refused, not silently merged).
+        #[arg(long = "control-server", value_name = "HOST:PORT")]
+        control_server: Option<String>,
+        /// The `admin`-scope account key (`<id>:<secret>`, printed once by
+        /// `apikey create --for admin --owner <account>`) for --control-server.
+        /// Falls back to `GROVEFS_CONTROL_KEY`, then `GROVEFS_API_KEY`.
+        #[arg(long = "api-key", value_name = "ID:SECRET")]
+        control_key: Option<String>,
         #[command(subcommand)]
         action: ViewAction,
     },
@@ -542,8 +577,8 @@ enum Cmd {
     /// data listing's shape without touching files. Implements the initialize /
     /// ping / tools/list / tools/call core of the 2025-06-18 protocol revision
     /// with newline-delimited JSON-RPC 2.0 framing. Control plane only: it
-    /// writes `<meta-dir>/meta/views/*.layout` definitions (live meta-server
-    /// mounts hot-reload them) but never mounts or touches data. `--meta-dir`
+    /// writes the store's view definitions (live meta-server mounts hot-reload
+    /// them) but never mounts or touches data. `--meta-dir`
     /// sets the default metadata root (falls back to `--home`); a per-call
     /// `db_path` argument overrides it.
     #[command(
@@ -634,6 +669,16 @@ NOTES
         /// URI with no per-node file to colocate.
         #[arg(long = "meta-store", value_name = "URI")]
         store: Option<String>,
+        /// Manage the keys of the REMOTE deployment behind `meta-server
+        /// --control-listen HOST:PORT` with an admin account key. The first
+        /// admin key must be minted on the server host (a control port that
+        /// would mint its own administrator would defeat the gate).
+        #[arg(long = "control-server", value_name = "HOST:PORT")]
+        control_server: Option<String>,
+        /// The `admin`-scope account key for --control-server
+        /// (`GROVEFS_CONTROL_KEY` / `GROVEFS_API_KEY` fill a missing value).
+        #[arg(long = "api-key", value_name = "ID:SECRET")]
+        control_key: Option<String>,
         #[command(subcommand)]
         action: ApikeyAction,
     },
@@ -660,24 +705,39 @@ NOTES
         /// `$GROVEFS_META_STORE`, exactly like `gc`'s backend guards.
         #[arg(long = "meta-store", value_name = "URI")]
         store: Option<String>,
+        /// Rebuild the ledger on the REMOTE deployment behind `meta-server
+        /// --control-listen HOST:PORT` (either backend) with an admin account
+        /// key instead of touching the store here.
+        #[arg(long = "control-server", value_name = "HOST:PORT")]
+        control_server: Option<String>,
+        /// The `admin`-scope account key for --control-server
+        /// (`GROVEFS_CONTROL_KEY` / `GROVEFS_API_KEY` fill a missing value).
+        #[arg(long = "api-key", value_name = "ID:SECRET")]
+        control_key: Option<String>,
         #[command(subcommand)]
         action: RefsAction,
     },
-    /// Audit and reclaim ORPHAN objects in a LOCAL store (offline GC).
+    /// Audit and reclaim ORPHAN objects (offline GC).
     ///
-    /// An orphan is a page under `<data-dir>/blocks/` that NO surviving view
-    /// tree names and the cross-view ledger does not book — the residue of an
-    /// out-of-band `rm meta/<view>.db` (no unlink ever ran) or a crash between
-    /// object creation and the node insert. SCAN IS THE DEFAULT: it prints the
-    /// counts, the biggest orphans and any ledger-held keys that must first be
-    /// released with `grovefs refs rebuild`.
+    /// An orphan is an object that NO surviving view tree names and the
+    /// cross-view ledger does not book — the residue of an out-of-band
+    /// `rm meta/<view>.db` (no unlink ever ran) or a crash between object
+    /// creation and the node insert. SCAN IS THE DEFAULT: it prints the counts,
+    /// the biggest orphans and any ledger-held keys that must first be released
+    /// with `grovefs refs rebuild`.
+    ///
+    /// Two ways to reach the store. `<data-dir>/blocks/` is audited in place,
+    /// which is the local deployment. With `--control-server` the TREES are read
+    /// by the server that owns them — SQLite, PostgreSQL or FoundationDB — and
+    /// the objects are listed from `--data-servers`, so any machine holding an
+    /// admin key runs the same audit for any backend.
     ///
     /// `--apply` deletes only objects older than `--older-than` (a hard-linked
     /// import inherits the SOURCE file's mtime, so young-object filtering alone
     /// is not enough), never a key the ledger still holds, and refuses to run
-    /// while this store is mounted or served by a local grovefs process. A
-    /// view tree that cannot be read aborts the whole scan rather than guessing
-    /// — a skipped tree would make every blob it names look orphaned.
+    /// while a view is mounted or a grovefs process is using the store. A view
+    /// tree that cannot be read aborts the whole scan rather than guessing — a
+    /// skipped tree would make every blob it names look orphaned.
     Gc {
         /// Metadata root holding `meta/*.db` — same option name and directory
         /// as `meta-server --meta-dir`; falls back to the global `--home`.
@@ -702,6 +762,28 @@ NOTES
         /// only for a store whose every surviving reference lives elsewhere.
         #[arg(long)]
         force: bool,
+        /// Audit the deployment behind `meta-server --control-listen HOST:PORT`
+        /// with an admin account key: the server reads its own trees (any
+        /// backend) and the objects are listed from `--data-servers`.
+        #[arg(long = "control-server", value_name = "HOST:PORT")]
+        control_server: Option<String>,
+        /// The `admin`-scope account key for --control-server
+        /// (`GROVEFS_CONTROL_KEY` / `GROVEFS_API_KEY` fill a missing value).
+        #[arg(long = "api-key", value_name = "ID:SECRET")]
+        control_key: Option<String>,
+        /// Data server(s) holding the bytes — comma-separated `HOST:PORT`, the
+        /// same addresses a mount uses (`GROVEFS_DATA_SERVERS` fills a missing
+        /// value). Required with --control-server.
+        #[arg(long = "data-servers", value_name = "HOST:PORT[,HOST:PORT]")]
+        data_servers: Option<String>,
+        /// Static token the data server was started with (`--require-token`);
+        /// `GROVEFS_TOKEN` fills a missing value.
+        #[arg(long = "data-token", value_name = "TOKEN")]
+        data_token: Option<String>,
+        /// Account key the data server was started with (`--require-api-key`);
+        /// `GROVEFS_API_KEY` fills a missing value.
+        #[arg(long = "data-api-key", value_name = "ID:SECRET")]
+        data_api_key: Option<String>,
     },
     /// Import an existing local directory tree into a view, zero-copy where possible.
     ///
@@ -843,9 +925,9 @@ enum ViewAction {
         manifest: Option<PathBuf>,
     },
     /// Create a FORK `--name` of the physical base view `--base`: an
-    /// INDEPENDENT metadata tree (`<meta-dir>/meta/<name>.db`) seeded with a
-    /// point-in-time copy of the base's names. Content bytes are SHARED (booked
-    /// in the cross-view ledger, no copies), so a fork costs metadata only.
+    /// INDEPENDENT metadata tree seeded with a point-in-time copy of the base's
+    /// names. Content bytes are SHARED (booked in the cross-view ledger, no
+    /// copies), so a fork costs metadata only.
     ///
     /// A fork is the writable middle ground between a base view and a lens:
     /// structure (mkdir/rename/unlink/symlink/link) is allowed, but CONTENT
@@ -853,14 +935,15 @@ enum ViewAction {
     /// to a base view. Deleting a name removes only the fork's own metadata;
     /// the base's tree is untouched and a shared object is freed only when no
     /// view holds a name for it anymore. Removing the fork (`view rm`) deletes
-    /// its tree and rebuilds the ledger; content bytes the base still names stay.
+    /// its tree and releases its ledger holds; content bytes the base still
+    /// names stay.
     ///
-    /// The base must be a physical view (a name with its own `meta/<base>.db`
-    /// and no definition) backed by local SQLite. A PostgreSQL-backed view
-    /// cannot be forked yet; a FoundationDB-backed one never can be — a fork
-    /// copies a whole per-view tree, and an `fdb://` view is one subspace of the
-    /// cluster with no snapshot path to copy, so serve the subset as an alias or
-    /// a derived view instead (both work on every backend).
+    /// The base must be a PHYSICAL view (a name with a tree of its own and no
+    /// definition). Every metadata backend can fork: SQLite copies a `.db`
+    /// file's rows, PostgreSQL copies one `grovefs_v_<hex>` schema into another,
+    /// FoundationDB copies one subspace into another — each in one transaction,
+    /// or in several when the tree exceeds one (the FDB arm splits it at 70% of
+    /// its 10 MB limit, root row LAST).
     Fork {
         #[arg(long)]
         name: String,
@@ -877,9 +960,13 @@ enum ViewAction {
     /// `<src>` (keep its basename, placed in `--dest`) or `<src>TAB<dst>`
     /// (rename and/or another directory). `--map -` reads the plan from
     /// stdin, so an external program can generate it on the fly. A directory
-    /// source brings its whole subtree; the placement is ONE transaction (all
-    /// or nothing) and copies no bytes — rows enter the fork, objects stay
-    /// shared through the cross-view ledger. An existing name refuses the
+    /// source brings its whole subtree; the placement is all-or-nothing while it
+    /// fits one transaction and copies no bytes — rows enter the fork, objects
+    /// stay shared through the cross-view ledger. A plan too large for one
+    /// transaction (FDB's 10 MB limit) is placed in several, an oversized
+    /// directory included; the batches already committed stay if a later one
+    /// fails, and re-running the same plan with `--skip-existing` continues
+    /// where it stopped. An existing name refuses the
     /// plan unless `--skip-existing` leaves it alone. Only a view that OWNS
     /// its tree (a fork) can receive.
     Graft {
@@ -904,7 +991,8 @@ enum ViewAction {
     /// Create/replace derived view `--name` on physical `--base`, rules read
     /// from `--rules FILE` (same verbs as `mount --layout`: hide/only/map/link).
     /// Against a `meta-server`, live mounts of that name pick the new shape up
-    /// automatically (the server re-checks the definition's mtime per op; the
+    /// automatically (the server re-checks the definition's change ticket per op
+    /// — mtime under SQLite, the cluster write version under `fdb://`; the
     /// client converges within its attr/dentry TTL, ≤2s — no remount). A local
     /// (`--home`) mount resolves the definition once at mount time. Mounts of
     /// the derived name are READ-ONLY (writes belong to the base view).
@@ -927,12 +1015,14 @@ enum ViewAction {
     /// `grovefs` root, with key count, entry count and prefix hex. `--meta-store
     /// fdb://…` only.
     ///
-    /// The two answers differ because view DEFINITIONS are local under `fdb://`
-    /// (they are control-plane files beside `api_keys.db`), while the TREES are
-    /// subspaces in the cluster: `view list` can therefore be complete about
-    /// definitions and silent about a subspace nobody here defines — a test run,
-    /// an abandoned migration. This is the command that makes those visible, and
-    /// the one to run before/after `view rm --base`.
+    /// The two answers differ in KIND: under `fdb://` both the definitions and
+    /// the trees are cluster rows, but `view list` is the GOVERNANCE catalog (the
+    /// derived/alias/fork definitions and the base names they resolve to), while
+    /// this walks every physical subspace under the root with its key and entry
+    /// counts and prefix hex — so it surfaces a subspace no definition references
+    /// (a test run, an abandoned migration, an import nobody mounted) and the
+    /// non-view subspaces (ledger, writer lease, credentials). This is the command
+    /// that makes those visible, and the one to run before/after `view rm --base`.
     Scan,
     /// Inspect or clear the CLUSTER's writer leases: the rows that say which
     /// meta-server may write a given deployment (`--meta-dir`). `--meta-store
@@ -1064,8 +1154,11 @@ enum ViewAction {
     /// fork semantics: structure writable, content EROFS). With
     /// `--meta-store fdb://…` the import instead OPENS that view's subspace in
     /// the cluster — the only tree-building entry besides `view create` — and
-    /// `--as-fork` is refused there, because an `fdb://` view is one subspace
-    /// with no snapshot path to copy.
+    /// `--as-fork` records the definition there too (the tree is the subspace
+    /// the dump just filled; if writing `fork <base>` fails, the subspace is
+    /// cleared again). A dump larger than one transaction is written in several
+    /// under `fdb://`, root row LAST, so an interrupted import leaves an
+    /// unmountable partial tree a later `--replace` continues from.
     Import {
         #[arg(long)]
         view: String,
@@ -1092,10 +1185,13 @@ enum ApikeyAction {
         #[arg(long)]
         label: String,
         /// Which entrance the key may open: `mount` (a `--require-api-key`
-        /// meta/data-server), `mcp` (`grovefs mcp --require-api-key`) or `any`
-        /// (both — the default, and what every key minted before scopes existed
-        /// carries). Narrow it so a mount credential cannot be replayed against
-        /// the governance API, and an agent key cannot mount data.
+        /// meta/data-server), `mcp` (`grovefs mcp --require-api-key`), `admin`
+        /// (the governance port, `meta-server --control-listen` — this is the
+        /// DATABASE-REPLACEMENT credential, and it also admits mount+mcp) or
+        /// `any` (mount+mcp, the default, and what every key minted before
+        /// scopes existed carries — `any` deliberately does NOT imply `admin`).
+        /// Narrow it so a mount credential cannot be replayed against the
+        /// governance API, and an agent key cannot mount data.
         #[arg(long, default_value = "any")]
         r#for: String,
         /// Bind the key to ONE physical view: it can only open `--view NAME`
@@ -1111,6 +1207,14 @@ enum ApikeyAction {
         /// read-write key on the BASE view does real GC — see `view create`).
         #[arg(long)]
         ro: bool,
+        /// The ACCOUNT this key belongs to (a person or a service). One account
+        /// holds SEVERAL keys, which is what makes rotation and per-device
+        /// revocation real: `revoke --id` kills one key while the account keeps
+        /// working — the opposite of a shared database password, where every
+        /// holder must be re-taught a new secret. Also what the control-plane
+        /// audit attributes a call to. Required for `--for admin`.
+        #[arg(long)]
+        owner: Option<String>,
     },
     /// List every key (id, label, scope, view binding, ro/rw,
     /// created/last-used/revoked) — never any secret material. Add `--view NAME`
@@ -1293,23 +1397,277 @@ fn open_existing_view(base: &Path, view: &str) -> Result<MetaEngine, Box<dyn std
 
 /// Resolve the metadata backend URI for a CONTROL-plane command. The explicit
 /// `--meta-store` flag wins; otherwise the `GROVEFS_META_STORE` env fills the default
-/// (same flag > env chain as `--token`/`--home`). `None` / a non-`postgres[ql]://`
-/// value means the local SQLite/file control plane; a `postgres[ql]://` URI
-/// routes api_keys and view definitions to the shared `grovefs_control` schema.
-/// This is what makes the control plane FOLLOW the metadata backend — one
-/// system of record, never a local file a PG deployment would silently ignore.
+/// (same flag > env chain as `--token`/`--home`). `None` / a value that is neither
+/// `postgres[ql]://` nor `fdb://` means the local SQLite/file control plane; a
+/// `postgres[ql]://` URI routes api_keys and view definitions to the shared
+/// `grovefs_control` schema, and an `fdb://` URI routes them to the cluster's
+/// `ctl` subspace. This is what makes the control plane FOLLOW the metadata
+/// backend — one system of record, never a local file a PG or FDB deployment
+/// would silently ignore.
 ///
-/// An `fdb://` URI is NOT a control-plane backend: view definitions, aliases and
-/// API keys have exactly two implementations (local files, `grovefs_control` in
-/// PG), so for now an FDB deployment governs its control plane from the local
-/// files. That is a deliberate staging decision, not an oversight — moving the
-/// governance surface into the cluster (the I1–I4 invariants over FDB keys) is
-/// the design doc's P5, and a half-migrated control plane (trees authoritative
-/// in the cluster, governance per-node) is the split-brain that stage refuses to
-/// create. Until then an `fdb://` deployment is single-meta-server by contract,
-/// which is why `MetaServer::serve()` refuses to pair it with `--peer`.
+/// All three backends govern from one place: SQLite from `<meta-dir>` files, PG
+/// from `grovefs_control`, FDB from the cluster `ctl` subspace — definitions in
+/// `CtlDefTable`, keys/audit in `CtlKeyTable`, the I1–I4 invariants over FDB keys
+/// — so every meta-server/MCP/CLI on the cluster shares one authoritative record
+/// exactly as PG. `MetaServer::serve()` still refuses to pair `fdb://` with
+/// `--peer`/`--role standby`: GroveFS-native HA snapshot shipping is SQLite-only,
+/// and the cluster already replicates and snapshots itself (`fdbbackup`).
 fn resolve_store(explicit: Option<String>) -> Option<String> {
     explicit.or_else(|| std::env::var("GROVEFS_META_STORE").ok())
+}
+
+/// Resolve the admin credential for a `--control-server` call: the flag wins,
+/// then `GROVEFS_CONTROL_KEY`, then `GROVEFS_API_KEY` (the same variable a mount
+/// already uses, so one admin key can be exported once for a whole session).
+fn resolve_control_key(explicit: Option<String>) -> Option<String> {
+    explicit
+        .or_else(|| std::env::var("GROVEFS_CONTROL_KEY").ok())
+        .or_else(|| std::env::var("GROVEFS_API_KEY").ok())
+        .filter(|k| !k.trim().is_empty())
+}
+
+/// Attach to a REMOTE governance entrance, or say exactly what is missing.
+fn remote_control(
+    addr: &str,
+    key: Option<String>,
+) -> Result<grovefs::control_remote::RemoteControlStore, Box<dyn std::error::Error>> {
+    let key = key.ok_or_else(|| {
+        format!(
+            "--control-server {addr} needs an admin account key: pass --api-key '<id>:<secret>' \
+             (or export GROVEFS_CONTROL_KEY). The first one is minted ON THE SERVER HOST with \
+             `grovefs apikey --meta-dir <server-meta-dir> create --for admin --owner <account>`."
+        )
+    })?;
+    Ok(grovefs::control_remote::RemoteControlStore::connect(addr, &key)?)
+}
+
+/// The control plane a governance command should talk to: the remote one when
+/// `--control-server` is given, else the local/`--meta-store` implementation.
+/// A remote store is bound to the store ITS server owns — a local
+/// `--meta-dir`/`--meta-store` beside `--control-server` describes a different
+/// one and is refused by [`refuse_local_with_remote`], not merged.
+fn control_store_for_target(
+    vbase: &Path,
+    store: Option<&str>,
+    control_server: Option<&str>,
+    control_key: Option<String>,
+) -> Result<Arc<dyn grovefs::mcp::ControlStore>, Box<dyn std::error::Error>> {
+    match control_server {
+        Some(addr) => Ok(Arc::new(remote_control(addr, control_key)?)),
+        None => {
+            Ok(grovefs::mcp::control_store_for(vbase, store)?)
+        }
+    }
+}
+
+/// A governance command reaches ONE store. Asking for the remote control plane
+/// and a local store at the same time would leave it ambiguous which one is
+/// authoritative, so the combination is refused by name instead of silently
+/// preferring one (the admin key alone decides what a remote call governs).
+fn refuse_local_with_remote(
+    addr: &str,
+    db_path: &Option<PathBuf>,
+    store: &Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if db_path.is_some() || store.is_some() {
+        return Err(format!(
+            "--control-server {addr} cannot be combined with --meta-dir/--meta-store: a remote \
+             control plane governs the store ITS server owns, so a local path here would describe \
+             a different store. Drop the local flags — the account key alone decides what is governed."
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// The `view` verb a refusal message should name. Kept separate from the
+/// dispatch so the "this one needs the bytes' host" error reads like the
+/// subcommand the operator typed.
+fn view_action_name(a: &ViewAction) -> &'static str {
+    match a {
+        ViewAction::Create { .. } => "create",
+        ViewAction::Fork { .. } => "fork",
+        ViewAction::Graft { .. } => "graft",
+        ViewAction::Define { .. } => "define",
+        ViewAction::List => "list",
+        ViewAction::Scan => "scan",
+        ViewAction::Lease { .. } => "lease",
+        ViewAction::Rm { .. } => "rm",
+        ViewAction::Alias { .. } => "alias",
+        ViewAction::Export { .. } => "export",
+        ViewAction::Import { .. } => "import",
+    }
+}
+
+/// Undo a just-imported tree whose `fork <base>` definition could not be
+/// recorded. The tree exists on whichever backend the store names, so the undo
+/// has to be backend-aware: a `<view>.db` file, a PG schema, an FDB subspace.
+/// Bytes are never touched — they are still named by the source tree, and the
+/// ledger follows the trees that exist.
+fn rollback_imported_tree(vbase: &Path, store: Option<&str>, view: &str) -> String {
+    let uri = store.unwrap_or("");
+    if uri.starts_with("fdb://") {
+        #[cfg(feature = "fdb")]
+        {
+            return match grovefs::fdb_store::FdbStore::drop_tree(uri, view) {
+                Ok(()) => "the imported tree was removed again".to_string(),
+                Err(e) => format!(
+                    "the imported tree could NOT be removed ({e}) — clear its subspace by hand"
+                ),
+            };
+        }
+        #[cfg(not(feature = "fdb"))]
+        return "the imported tree could not be removed by this build (no --features fdb)".to_string();
+    }
+    if uri.starts_with("postgres://") || uri.starts_with("postgresql://") {
+        return match grovefs::pg_store::PgEngine::remove_view(uri, view) {
+            Ok(_) => "the imported tree was removed again".to_string(),
+            Err(e) => format!(
+                "the imported tree could NOT be removed ({e}) — drop its schema by hand"
+            ),
+        };
+    }
+    for ext in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(vbase.join("meta").join(format!("{view}.db{ext}")));
+    }
+    let _ = meta::rebuild_ledger(vbase);
+    "the imported tree was removed again".to_string()
+}
+
+/// Whichever key registry an `apikey` command acts on: the store THIS machine
+/// opens (`--meta-dir`/`--meta-store`), or the registry inside a remote
+/// meta-server reached through its governance port. An account's keys are
+/// guarded by the surface that installs them, so the server that owns the
+/// store also owns the mint/revoke — the operator's machine holds only the
+/// admin credential, never the store.
+///
+/// Every verb is one of these five, so the ID resolution and the printing above
+/// stay single-sourced instead of being duplicated per transport.
+enum KeyAdmin {
+    Local(grovefs::apikeys::ApiKeyStore),
+    Remote(grovefs::control_remote::ControlClient),
+}
+
+impl KeyAdmin {
+    fn list(&self) -> Result<Vec<grovefs::apikeys::KeyInfo>, String> {
+        match self {
+            Self::Local(k) => k.list(),
+            Self::Remote(c) => {
+                let rows = c.call("apikey.list", serde_json::json!({}))?;
+                let arr = rows
+                    .as_array()
+                    .ok_or_else(|| "malformed control reply: apikey.list is not an array".to_string())?;
+                let s = |v: &serde_json::Value, f: &str| -> Result<String, String> {
+                    v.get(f)
+                        .and_then(|x| x.as_str())
+                        .map(str::to_string)
+                        .ok_or_else(|| format!("malformed control reply: key row without '{f}'"))
+                };
+                let opt = |v: &serde_json::Value, f: &str| -> Option<String> {
+                    v.get(f).and_then(|x| x.as_str()).map(str::to_string)
+                };
+                arr.iter()
+                    .map(|r| {
+                        Ok(grovefs::apikeys::KeyInfo {
+                            id: s(r, "id")?,
+                            owner: opt(r, "owner"),
+                            label: s(r, "label")?,
+                            scope: s(r, "scope")?,
+                            view: opt(r, "view"),
+                            ro: r.get("ro").and_then(|x| x.as_bool()).unwrap_or(false),
+                            created_at: s(r, "created_at")?,
+                            last_used_at: opt(r, "last_used_at"),
+                            revoked_at: opt(r, "revoked_at"),
+                        })
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    fn create(
+        &self,
+        label: &str,
+        scope: grovefs::apikeys::Scope,
+        view: Option<&str>,
+        ro: bool,
+        owner: Option<&str>,
+    ) -> Result<(String, String), String> {
+        match self {
+            Self::Local(k) => k.create_bound(label, scope, view, ro, owner),
+            // Closes the credential loop: a key for the ADMINISTRATOR of one
+            // deployment is itself minted over that deployment's control plane,
+            // so a second operator never needs the server's store either.
+            Self::Remote(c) => {
+                let r = c.call(
+                    "apikey.create",
+                    serde_json::json!({
+                        "label": label,
+                        "scope": scope.as_str(),
+                        "view": view,
+                        "ro": ro,
+                        "owner": owner,
+                    }),
+                )?;
+                let id = r
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "malformed control reply: apikey.create without an id".to_string())?;
+                let key = r
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "malformed control reply: apikey.create without a key".to_string())?;
+                Ok((id.to_string(), key.to_string()))
+            }
+        }
+    }
+
+    fn revoke(&self, id: &str) -> Result<bool, String> {
+        match self {
+            Self::Local(k) => k.revoke(id),
+            Self::Remote(c) => Ok(c
+                .call("apikey.revoke", serde_json::json!({ "id": id }))?
+                .as_bool()
+                .unwrap_or(false)),
+        }
+    }
+
+    fn set_ro(&self, id: &str, ro: bool) -> Result<bool, String> {
+        match self {
+            Self::Local(k) => k.set_ro(id, ro),
+            Self::Remote(c) => Ok(c
+                .call("apikey.set_ro", serde_json::json!({ "id": id, "ro": ro }))?
+                .as_bool()
+                .unwrap_or(false)),
+        }
+    }
+
+    fn recent_calls(&self, limit: usize) -> Result<Vec<grovefs::apikeys::CallLog>, String> {
+        match self {
+            Self::Local(k) => k.recent_calls(limit),
+            Self::Remote(c) => {
+                let rows = c.call("apikey.calls", serde_json::json!({ "limit": limit }))?;
+                let arr = rows
+                    .as_array()
+                    .ok_or_else(|| "malformed control reply: apikey.calls is not an array".to_string())?;
+                let opt = |v: &serde_json::Value, f: &str| -> Option<String> {
+                    v.get(f).and_then(|x| x.as_str()).map(str::to_string)
+                };
+                Ok(arr
+                    .iter()
+                    .map(|r| grovefs::apikeys::CallLog {
+                        ts: opt(r, "ts").unwrap_or_default(),
+                        key_id: opt(r, "key_id"),
+                        key_label: opt(r, "key_label"),
+                        method: opt(r, "method").unwrap_or_default(),
+                        tool: opt(r, "tool").unwrap_or_default(),
+                        ok: r.get("ok").and_then(|x| x.as_bool()).unwrap_or(false),
+                        detail: opt(r, "detail").unwrap_or_default(),
+                    })
+                    .collect())
+            }
+        }
+    }
 }
 
 /// Scan `<base>/meta/views/*.layout` once for PURE ALIAS definitions
@@ -1905,6 +2263,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             witness,
             store,
             engine_idle_secs,
+            control_listen,
         } => {
             let role = if role.eq_ignore_ascii_case("standby") {
                 grovefs::remote::meta::Role::Standby
@@ -1946,6 +2305,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             srv = srv.with_witness(witness);
             srv = srv.with_store(store);
             srv = srv.with_engine_idle_secs(engine_idle_secs);
+            srv = srv.with_control_listen(control_listen);
             srv.serve()?;
         }
         Cmd::Umount { mountpoint } => {
@@ -1955,6 +2315,8 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::View {
             db_path,
             store,
+            control_server,
+            control_key,
             action,
         } => {
             // View definitions are CONTROL-PLACE state and FOLLOW the metadata
@@ -1965,6 +2327,9 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             // and the MCP server can never drift per backend. Base-view
             // creation and export are PHYSICAL-tree operations (a local db file)
             // and stay file-based.
+            if let Some(addr) = control_server.as_deref() {
+                refuse_local_with_remote(addr, &db_path, &store)?;
+            }
             let vbase = db_path.unwrap_or_else(|| base.clone());
             let store = resolve_store(store);
             let store_is_pg = store
@@ -1977,7 +2342,42 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             let store_is_fdb = store
                 .as_deref()
                 .is_some_and(|u| u.starts_with("fdb://"));
-            let ctrl = grovefs::mcp::control_store_for(&vbase, store.as_deref())?;
+            // The same `ControlStore` the MCP server drives — except that with
+            // `--control-server` it is a thin client of the meta-server's
+            // governance port, so the definitions/aliases of a PG *or SQLite*
+            // deployment are governed from any machine with an admin key.
+            let ctrl = control_store_for_target(
+                &vbase,
+                store.as_deref(),
+                control_server.as_deref(),
+                resolve_control_key(control_key.clone()),
+            )?;
+            // The ops that are NOT governance (they walk a local byte root or a
+            // local cluster handle) cannot be served remotely; name them instead
+            // of silently operating on this machine's empty `--home`. Notably
+            // `export`/`import` are NOT on this list any more: the dump travels
+            // in chunks and only the operator's path is local (see the arms).
+            let remote_ctl = control_server.as_deref().map(|a| {
+                let key = resolve_control_key(control_key).unwrap_or_default();
+                grovefs::control_remote::ControlClient::new(a, &key)
+            });
+            if let Some(rc) = &remote_ctl {
+                match &action {
+                    ViewAction::Scan | ViewAction::Lease { .. } => {
+                        return Err(format!(
+                            "`view {}` is not a governance op: it moves or inspects TREE BYTES or \
+                             cluster state on this machine, so it cannot run through --control-server {}. \
+                             Governance over the wire covers view create/define/alias/list/rm \
+                             (including --base), fork/graft, export/import, apikey and refs; run this one \
+                             on the server host with --meta-dir/--meta-store.",
+                            view_action_name(&action),
+                            rc.addr(),
+                        )
+                        .into());
+                    }
+                    _ => {}
+                }
+            }
             // A PG deployment has no local per-view db file: a base tree is a
             // `grovefs_v_<hex(view)>` schema that `view create` provisions
             // explicitly, and its bytes move through a mount — so the file-level
@@ -2021,7 +2421,22 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         )
                         .into());
                     }
-                    if store_is_fdb {
+                    if let Some(rc) = &remote_ctl {
+                        // The manifest is a FILE here but only TEXT to the
+                        // server: the tree it seeds lives on the server's store,
+                        // so the lines travel and the seeding happens there.
+                        let mut args = serde_json::json!({ "view": view });
+                        if let Some(mf) = manifest.as_ref() {
+                            let text = std::fs::read_to_string(mf).map_err(|e| {
+                                format!("cannot read manifest {}: {e}", mf.display())
+                            })?;
+                            args["manifest"] = serde_json::json!(text);
+                        }
+                        let r = rc
+                            .call("view.create", args)
+                            .map_err(Box::<dyn std::error::Error>::from)?;
+                        println!("{} (via {})", r.as_str().unwrap_or("created"), rc.addr());
+                    } else if store_is_fdb {
                         if manifest.is_some() {
                             return Err("`view create --manifest` seeds a SQLite db file; under `--meta-store fdb://…` mount the view and write the files instead".into());
                         }
@@ -2166,26 +2581,34 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     // Inventory hint: keys are per-view and unlimited, so the
                     // "who can open what" question is one filtered listing away.
-                    println!(
-                        "view keys: `grovefs apikey --meta-dir {} list [--view NAME]` (add --view to see only that view's keys)",
-                        vbase.display()
-                    );
+                    // Named against the SAME entrance this listing came from: a
+                    // remote store's keys are behind the control port, not in a
+                    // local `--meta-dir` directory.
+                    match &remote_ctl {
+                        Some(rc) => println!(
+                            "view keys: `grovefs apikey --control-server {} --api-key <admin-key> list [--view NAME]` (add --view to see only that view's keys)",
+                            rc.addr()
+                        ),
+                        None => println!(
+                            "view keys: `grovefs apikey --meta-dir {} list [--view NAME]` (add --view to see only that view's keys)",
+                            vbase.display()
+                        ),
+                    }
                     if store_is_fdb {
-                        // Definitions are LOCAL under fdb://; the trees are not.
-                        // Saying so here is the difference between "no views" and
-                        // "no definitions in this meta-dir".
+                        // Definitions and trees are both cluster rows now; this
+                        // listing is the governance catalog, `view scan` the raw
+                        // physical inventory (counts + prefix hex per subspace).
                         println!(
-                            "note: this list is the DEFINITIONS in {}, and under `--meta-store fdb://…` a base view has none — the trees in the cluster are `grovefs view --meta-store {} scan`",
-                            vbase.display(),
+                            "note: this list is the cluster's governance catalog (definitions + base view names); for the raw physical inventory — every subspace with key/entry counts and prefix hex — run `grovefs view --meta-store {} scan`",
                             store.as_deref().unwrap_or("fdb://…")
                         );
                     }
                 }
                 ViewAction::Scan => {
                     // Cluster inventory: deliberately NOT the same question as
-                    // `view list`. Definitions are local files, trees are
-                    // subspaces, and only this command can see a subspace that
-                    // nothing here defines (a test run, an abandoned migration).
+                    // `view list`. That is the governance catalog (definitions +
+                    // base names); this walks every physical subspace, so it sees
+                    // one nothing defines (a test run, an abandoned migration).
                     let Some(uri) = store.as_deref() else {
                         return Err("`view scan` reads the metadata CLUSTER; give `--meta-store fdb://<cluster-file>` (for a local SQLite store, `view list` already lists meta/*.db)".into());
                     };
@@ -2209,6 +2632,10 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         // tree — it has no root row and would otherwise read as a
                         // corpse.
                         let leases = subs.iter().filter(|s| s.lease).count();
+                        // The credential/audit tables are the third root sibling:
+                        // counted for the same reason, never as a tree, and never
+                        // offered for removal.
+                        let ctls = subs.iter().filter(|s| s.ctl).count();
                         if subs.is_empty() {
                             println!("no subspaces under the 'grovefs' root in {uri}");
                         } else {
@@ -2227,9 +2654,9 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                                 );
                             }
                             println!(
-                                "\n{} subspace(s) under the 'grovefs' root in {uri}: {} tree(s){} + {} ledger subspace(s){}",
+                                "\n{} subspace(s) under the 'grovefs' root in {uri}: {} tree(s){} + {} ledger subspace(s){}{}",
                                 subs.len(),
-                                subs.len() - ledgers - corpses - leases,
+                                subs.len() - ledgers - corpses - leases - ctls,
                                 if corpses > 0 {
                                     format!(" ({corpses} corpse(s): keys but no root row, unmountable)")
                                 } else {
@@ -2240,10 +2667,15 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                                     format!(" + {leases} writer-lease subspace (see `view lease`)")
                                 } else {
                                     String::new()
+                                },
+                                if ctls > 0 {
+                                    format!(" + {ctls} credential/audit subspace (see `apikey list`)")
+                                } else {
+                                    String::new()
                                 }
                             );
                             println!(
-                                "a subspace is a TREE, not a definition — `view list` shows this meta-dir's definitions, this shows what the cluster holds; remove one with `view rm --name <name> --base` (that also works on a corpse, and is the only way to unbook its objects; the PREFIX column is what `fdbcli clearrange` takes for a name this build cannot open)"
+                                "a subspace is a TREE, not a definition — `view list` shows the cluster's governance catalog (definitions + base view names), this shows the physical subspaces the cluster holds; remove one with `view rm --name <name> --base` (that also works on a corpse, and is the only way to unbook its objects; the PREFIX column is what `fdbcli clearrange` takes for a name this build cannot open)"
                             );
                         }
                         return Ok(());
@@ -2415,6 +2847,22 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                     if !grovefs::layout::valid_view_name(&name) {
                         return Err(format!("invalid view name '{name}'").into());
                     }
+                    if let Some(rc) = &remote_ctl {
+                        // The SERVER runs the same guards (definition dependent,
+                        // its own mount table) and owns the store whose tree and
+                        // ledger this teardown rewrites — so the whole operation
+                        // is one call, not a local half that would leave the
+                        // remote ledger over-counting.
+                        let mut args = serde_json::json!({ "view": name });
+                        if let Some(dr) = &data_root {
+                            args["data_root"] = serde_json::json!(dr.display().to_string());
+                        }
+                        let r = rc
+                            .call("view.rm_base", args)
+                            .map_err(Box::<dyn std::error::Error>::from)?;
+                        println!("{}", r.as_str().unwrap_or("removed"));
+                        return Ok(());
+                    }
                     if store_is_fdb {
                         // Under `fdb://` the tree IS a subspace and the cross-view
                         // ledger lives in the cluster, so this is the ONE backend
@@ -2505,7 +2953,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                                 ),
                             }
                             eprintln!(
-                                "note: new mounts of '{name}' are now refused — `view create` starts over; the definitions this meta-dir holds were not touched (`view scan` confirms the subspace is gone)"
+                                "note: new mounts of '{name}' are now refused — `view create` starts over; the cluster's view definitions were not touched (`view scan` confirms the subspace is gone)"
                             );
                             return Ok(());
                         }
@@ -2673,58 +3121,60 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                     if !grovefs::layout::valid_view_name(&view) {
                         return Err(format!("invalid view name '{view}'").into());
                     }
-                    if !store_is_fdb {
-                        require_sqlite("`view export`")?;
-                    }
-                    // A virtual name has no tree: exporting its definition file
-                    // would silently produce an empty/nonexistent export, so
-                    // point at the physical base instead.
-                    let slot = vbase
-                        .join("meta")
-                        .join("views")
-                        .join(format!("{view}.layout"));
-                    if slot.is_file() {
-                        match grovefs::layout::LayoutRules::parse_def_file(&slot)
-                            .map_err(|e| format!("bad view definition '{view}': {e}"))?
-                        {
-                            grovefs::layout::ViewDef::Alias(real) => {
-                                return Err(format!(
-                                    "'{view}' is a pure alias of real view '{real}' — export '{real}' instead (an alias has no metadata tree of its own)"
-                                )
-                                .into())
-                            }
-                            grovefs::layout::ViewDef::Derived(base, _) => {
-                                return Err(format!(
-                                    "'{view}' is a derived (virtual) view over '{base}' — export '{base}' instead (a derived view has no metadata tree of its own)"
-                                )
-                                .into())
-                            }
-                            grovefs::layout::ViewDef::Fork(_) => {}
-                        }
-                    }
-                    let st = if store_is_fdb {
-                        // P8: a subspace dumps into the SAME portable format a
-                        // SQLite db does, so `view export` stays one tool with
-                        // three backends rather than a fourth command nobody
-                        // maintains. The open is READ-ONLY, which here means a
-                        // probe: exporting a name that was never provisioned
-                        // must report that, not seed a subspace as a side
-                        // effect of being asked about it.
-                        #[cfg(feature = "fdb")]
-                        {
-                            let uri = store.as_deref().expect("fdb:// is a store uri");
-                            let definition = std::fs::read_to_string(&slot).ok();
-                            grovefs::fdb_store::FdbStore::open(uri, &view, true)?
-                                .export_jsonl(&view, &out, force, definition)?
-                        }
-                        #[cfg(not(feature = "fdb"))]
-                        return Err(format!(
-                            "{store:?} names the FoundationDB backend, but this binary was built \
-                             without `--features fdb` (it does not link libfdb_c)"
-                        )
-                        .into());
+                    // Where does this view's tree live? Under `--control-server`
+                    // the SERVER owns it and the dump is pulled over the wire in
+                    // chunks (only `--out` is local). Otherwise every backend
+                    // dumps here, through its own reader: a SQLite file, a PG
+                    // schema, an FDB subspace — one portable format, one tool.
+                    let st = if let Some(rc) = &remote_ctl {
+                        rc.export_view(&view, &out, force)?
                     } else {
-                        meta::export_view(&vbase, &view, &out, force)?
+                        // The definition lives in the control store, not
+                        // necessarily in `meta/views/*.layout`: asking it is what
+                        // makes the alias/derived refusal right on all three
+                        // backends instead of only on the file one.
+                        let definition = ctrl.get_def_raw(&view)?;
+                        if let Some(text) = definition.as_deref() {
+                            match grovefs::layout::LayoutRules::parse_def(text)
+                                .map_err(|e| format!("bad view definition '{view}': {e}"))?
+                            {
+                                grovefs::layout::ViewDef::Alias(real) => {
+                                    return Err(format!(
+                                        "'{view}' is a pure alias of real view '{real}' — export '{real}' instead (an alias has no metadata tree of its own)"
+                                    )
+                                    .into())
+                                }
+                                grovefs::layout::ViewDef::Derived(base, _) => {
+                                    return Err(format!(
+                                        "'{view}' is a derived (virtual) view over '{base}' — export '{base}' instead (a derived view has no metadata tree of its own)"
+                                    )
+                                    .into())
+                                }
+                                grovefs::layout::ViewDef::Fork(_) => {}
+                            }
+                        }
+                        if store_is_fdb {
+                            #[cfg(feature = "fdb")]
+                            {
+                                let uri = store.as_deref().expect("fdb:// is a store uri");
+                                // READ-ONLY open: exporting a name that was
+                                // never provisioned must report that, not seed a
+                                // subspace as a side effect of being asked.
+                                grovefs::fdb_store::FdbStore::open(uri, &view, true)?
+                                    .export_jsonl(&view, &out, force, definition)?
+                            }
+                            #[cfg(not(feature = "fdb"))]
+                            return Err(format!(
+                                "{store:?} names the FoundationDB backend, but this binary was built \
+                                 without `--features fdb` (it does not link libfdb_c)"
+                            )
+                            .into());
+                        } else if store_is_pg {
+                            let uri = store.as_deref().expect("postgres:// is a store uri");
+                            grovefs::pg_store::export_view(uri, &view, &out, force, definition)?
+                        } else {
+                            grovefs::meta::export_view(&vbase, &view, &out, force)?
+                        }
                     };
                     println!(
                         "exported view '{view}' metadata: {} node(s), {} blob reference(s) -> {}",
@@ -2732,6 +3182,13 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         st.blobs,
                         out.display()
                     );
+                    if let Some(rc) = &remote_ctl {
+                        println!(
+                            "note: the dump was rendered by the control plane at {} and pulled in \
+                             chunks; only this file was written here",
+                            rc.addr()
+                        );
+                    }
                     if st.kind == "fork" {
                         println!("note: this is a fork tree; `view import` creates a normal writable base tree unless you pass --as-fork <base>");
                     }
@@ -2746,60 +3203,49 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                     if !grovefs::layout::valid_view_name(&view) {
                         return Err(format!("invalid view name '{view}'").into());
                     }
-                    if !store_is_fdb {
-                        require_sqlite("`view import`")?;
-                    }
-                    let meta_dir = vbase.join("meta");
-                    let dir = meta_dir.join("views");
-                    if dir.join(format!("{view}.layout")).is_file() {
+                    // The control store is the system of record for definitions
+                    // on EVERY backend (files, `grovefs_control`, the FDB control
+                    // subspace), so the guards below are asked of it rather than
+                    // of a `meta/views/*.layout` file a PG/FDB deployment may not
+                    // even keep.
+                    if ctrl.get_def_raw(&view)?.is_some() {
                         return Err(format!(
                             "view '{view}' already has a definition — remove it first (`grovefs view rm --name {view}`) before importing"
                         )
                         .into());
                     }
                     if let Some(base) = &as_fork {
-                        if store_is_fdb {
-                            // The message says why, in the same terms the layout
-                            // `fork` rule uses (mcp.rs): an FDB view is one
-                            // subspace, and there is no snapshot of a subspace to
-                            // copy — so a fork target has nothing to fork FROM.
-                            return Err(format!(
-                                "`--as-fork` needs a SQLite base tree at {}/meta/{base}.db; under `--meta-store fdb://…` a view is one subspace of the cluster with no snapshot path to copy, so fork is not implemented there — serve the name as an alias or derived view instead, which works on every backend",
-                                vbase.display()
-                            )
-                            .into());
-                        }
                         if !grovefs::layout::valid_view_name(base) {
                             return Err(format!("invalid base view name '{base}'").into());
                         }
                         if base == &view {
                             return Err("fork name must differ from its base".into());
                         }
-                        if dir.join(format!("{base}.layout")).is_file() {
+                        if ctrl.get_def_raw(base)?.is_some() {
                             return Err(format!(
                                 "base '{base}' is governed by a definition (alias/derived/fork) — fork the physical base tree instead"
                             )
                             .into());
                         }
-                        if !meta_dir.join(format!("{base}.db")).is_file() {
+                        if !ctrl.has_physical(base)? {
                             return Err(format!(
-                                "no physical base tree {}/meta/{base}.db — import the base first, or omit --as-fork",
-                                vbase.display()
+                                "no physical base tree '{base}' in this store — import the base first, or omit --as-fork"
                             )
                             .into());
                         }
                     }
-                    let st = if store_is_fdb {
+                    // The server records `--as-fork` itself (same verdict, same
+                    // rollback); locally this end writes the definition below.
+                    let def_written = remote_ctl.is_some();
+                    let st = if let Some(rc) = &remote_ctl {
+                        rc.import_view(&view, &input, replace, as_fork.as_deref())?
+                    } else if store_is_fdb {
                         #[cfg(feature = "fdb")]
                         {
                             let uri = store.as_deref().expect("fdb:// is a store uri");
                             // `true` here means "do not provision" rather than
                             // "cannot write": the dump brings its own root row and
-                            // both allocator water marks, so seeding one before the
-                            // dump has been validated would leave a provisioned-but
-                            // empty subspace behind every time an import is
-                            // refused — the shape SQLite avoids by building beside
-                            // the destination and renaming only at the end.
+                            // both allocator water marks.
                             grovefs::fdb_store::FdbStore::open(uri, &view, true)?
                                 .import_jsonl(&input, replace)?
                         }
@@ -2809,12 +3255,15 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                              without `--features fdb` (it does not link libfdb_c)"
                         )
                         .into());
+                    } else if store_is_pg {
+                        let uri = store.as_deref().expect("postgres:// is a store uri");
+                        grovefs::pg_store::import_view(uri, &view, &input, replace)?
                     } else {
-                        meta::import_view(&vbase, &view, &input, replace)?
+                        grovefs::meta::import_view(&vbase, &view, &input, replace)?
                     };
                     let kind_word = if as_fork.is_some() { "view" } else { "BASE view" };
                     println!(
-                        "imported {kind_word} '{view}' from {}: {} node(s), {} blob reference(s){}; cross-view ledger rebuilt",
+                        "imported {kind_word} '{view}' from {}: {} node(s), {} blob reference(s){}; cross-view ledger adjusted",
                         input.display(),
                         st.nodes,
                         st.blobs,
@@ -2824,26 +3273,28 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                             ""
                         }
                     );
-                    if let Some(base) = as_fork {
-                        std::fs::create_dir_all(&dir)?;
-                        if let Err(e) = std::fs::write(
-                            dir.join(format!("{view}.layout")),
-                            format!("fork {base}\n"),
-                        ) {
-                            for ext in ["", "-wal", "-shm"] {
-                                let _ =
-                                    std::fs::remove_file(meta_dir.join(format!("{view}.db{ext}")));
+                    if let Some(rc) = &remote_ctl {
+                        println!(
+                            "note: the dump was pushed in chunks to the control plane at {}; the \
+                             tree now lives on that store",
+                            rc.addr()
+                        );
+                    }
+                    if let Some(base) = &as_fork {
+                        if !def_written {
+                            if let Err(e) = ctrl.put_def(&view, &format!("fork {base}\n")) {
+                                let rollback = rollback_imported_tree(&vbase, store.as_deref(), &view);
+                                return Err(format!(
+                                    "cannot record fork definition for '{view}': {e}; {rollback}"
+                                )
+                                .into());
                             }
-                            let _ = meta::rebuild_ledger(&vbase);
-                            return Err(
-                                format!("cannot record fork definition for '{view}': {e}").into()
-                            );
                         }
                         println!("note: recorded `fork {base}` — mounts of '{view}' are structure-writable, content read-only (EROFS)");
                     } else if st.kind == "fork" {
                         println!("note: the source was a fork tree; imported as a normal writable base view (use --as-fork <base> when you need fork semantics)");
                     }
-                    println!("note: content bytes are not in the export — make sure `blocks/` from the source store is present under the target data root before mounting");
+                    println!("note: content bytes are not in the export — make sure `blocks/` from the source store is present under the target data root before mounting; a cross-machine import copies METADATA only and the CLI never silently copies bytes");
                 }
             }
         }
@@ -2869,6 +3320,8 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Apikey {
             db_path,
             store,
+            control_server,
+            control_key,
             action,
         } => {
             // Keys + audit log are CONTROL-PLACE state and FOLLOW the metadata
@@ -2876,23 +3329,63 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             // `grovefs_control.api_keys`/`mcp_calls` tables under a
             // `--meta-store postgres://…` — so one mint is authoritative for every
             // server pointing at the URI, with no per-node file to colocate.
+            //
+            // With `--control-server` the registry is the one INSTALLED IN the
+            // remote meta-server's store: an operator rotates keys of a PG *or
+            // SQLite* deployment from any machine, holding only an admin key
+            // and never the store credential.
+            let remote = match control_server.as_deref() {
+                Some(addr) => {
+                    refuse_local_with_remote(addr, &db_path, &store)?;
+                    Some(remote_control(addr, resolve_control_key(control_key))?)
+                }
+                None => None,
+            };
             let ak_base = db_path.unwrap_or_else(|| base.clone());
             let store = resolve_store(store);
-            let keys = grovefs::apikeys::ApiKeyStore::open_for(&ak_base, store.as_deref())?;
+            // Where this command's keys/audit actually live, for the messages
+            // that point an operator at the next command.
+            let where_keys = match &remote {
+                Some(rc) => format!("the control plane at {}", rc.client().addr()),
+                None => ak_base.display().to_string(),
+            };
+            let keys = match &remote {
+                Some(rc) => KeyAdmin::Remote(rc.client().clone()),
+                None => KeyAdmin::Local(grovefs::apikeys::ApiKeyStore::open_for(
+                    &ak_base,
+                    store.as_deref(),
+                )?),
+            };
             match action {
                 ApikeyAction::Create {
                     label,
                     r#for,
                     view,
                     ro,
+                    owner,
                 } => {
                     let scope = grovefs::apikeys::Scope::parse(&r#for)
                         .map_err(Box::<dyn std::error::Error>::from)?;
-                    let (id, full) = keys.create_bound(&label, scope, view.as_deref(), ro)?;
+                    // An admin key with no account is an unattributable
+                    // administrator — the one thing the account model exists to
+                    // prevent, so it is refused instead of silently defaulted.
+                    if scope == grovefs::apikeys::Scope::Admin && owner.is_none() {
+                        return Err(format!(
+                            "`--for admin` needs `--owner <account>`: an administrator key is \
+                             attributed by account in the control-plane audit, and one account \
+                             (with several keys) is what makes rotation possible. Retry with e.g.\n  \
+                             grovefs apikey create --label {label} --for admin --owner alice"
+                        )
+                        .into());
+                    }
+                    let (id, full) = keys
+                        .create(&label, scope, view.as_deref(), ro, owner.as_deref())
+                        .map_err(Box::<dyn std::error::Error>::from)?;
                     println!(
                         "apikey created — shown ONCE (only its SHA-256 is stored; save it now):"
                     );
                     println!("  id:    {id}");
+                    println!("  owner: {}", owner.as_deref().unwrap_or("<none>"));
                     println!("  label: {label}");
                     println!("  scope: {}", scope.as_str());
                     println!("  view:  {}", view.as_deref().unwrap_or("<any>"));
@@ -2907,6 +3400,9 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("  key:   {full}");
                     println!();
                     match scope {
+                        // `admin` admits mount/mcp too (`admits` is a table), but
+                        // the block below is the one that describes how to USE it;
+                        // printing the mount recipe first would bury that.
                         grovefs::apikeys::Scope::Mount | grovefs::apikeys::Scope::Any => {
                             println!("Present it to a `--require-api-key` server as");
                             println!("  grovefs mount --meta-server ... --data-servers ... --api-key '{full}' -m /mnt/x");
@@ -2915,20 +3411,29 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         grovefs::apikeys::Scope::Mcp => {
                             println!("Present it as the `apiKey` param in the MCP `initialize` handshake, or");
                             println!("export GROVEFS_MCP_API_KEY='{full}' when launching");
-                            println!(
-                                "`grovefs mcp --meta-dir {} --require-api-key`.",
-                                ak_base.display()
-                            );
+                            println!("`grovefs mcp --require-api-key`.");
                         }
+                        grovefs::apikeys::Scope::Admin => {}
+                    }
+                    if scope == grovefs::apikeys::Scope::Admin {
+                        println!("Admin scope also governs a `meta-server --control-listen` from any machine, with");
+                        println!("  grovefs view --control-server HOST:PORT --api-key '{full}' list");
+                        println!("  grovefs apikey --control-server HOST:PORT --api-key '{full}' create --label k2 --for mount");
+                        println!("(or export GROVEFS_CONTROL_KEY='{full}'). The operator never needs the store URI —");
+                        println!("the server performs the work and audits every call under account '{}'.", owner.as_deref().unwrap_or("-"));
                     }
                     if scope == grovefs::apikeys::Scope::Any {
                         println!("Scope it to one entrance with `--for mount` / `--for mcp` to keep a mount");
-                        println!("credential out of the governance API (and vice versa).");
+                        println!("credential out of the governance API (and vice versa); `--for admin` is the");
+                        println!("governance credential and is never implied by `any`.");
                     }
-                    println!(
-                        "Revoke later with: grovefs apikey --meta-dir {} revoke --id {id}",
-                        ak_base.display()
-                    );
+                    println!("Revoke later with: grovefs apikey {}", match &remote {
+                        Some(rc) => format!(
+                            "--control-server {} revoke --id {id}",
+                            rc.client().addr()
+                        ),
+                        None => format!("--meta-dir {} revoke --id {id}", ak_base.display()),
+                    });
                 }
                 ApikeyAction::List { view } => {
                     let all = keys.list()?;
@@ -2939,8 +3444,13 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                     let real = match view.as_deref() {
                         None => None,
                         Some(v) => {
-                            let cs = grovefs::mcp::control_store_for(&ak_base, store.as_deref())
-                                .map_err(Box::<dyn std::error::Error>::from)?;
+                            // The SAME control plane the keys come from: a remote
+                            // registry's aliases live behind the remote server, not
+                            // in this machine's `--home`.
+                            let cs: Arc<dyn grovefs::mcp::ControlStore> = match &remote {
+                                Some(rc) => Arc::new(rc.clone()),
+                                None => grovefs::mcp::control_store_for(&ak_base, store.as_deref())?,
+                            };
                             cs.load_alias_map()
                                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?
                                 .get(v)
@@ -2961,20 +3471,20 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         .collect();
                     if all.is_empty() && view.is_none() {
                         println!(
-                            "no api keys yet (under {}); mint one with `grovefs apikey create --label L`",
-                            ak_base.display()
+                            "no api keys yet (in {where_keys}); mint one with `grovefs apikey create --label L`"
                         );
                         return Ok(());
                     }
                     println!(
-                        "{:<3} {:<34} {:<16} {:<7} {:<12} {:<4} {:<25} {:<25} revoked",
-                        "#", "id", "label", "scope", "view", "rw", "created", "last_used"
+                        "{:<3} {:<34} {:<16} {:<16} {:<7} {:<12} {:<4} {:<25} {:<25} revoked",
+                        "#", "id", "owner", "label", "scope", "view", "rw", "created", "last_used"
                     );
                     for (i, r) in rows.iter().enumerate() {
                         println!(
-                            "{:<3} {:<34} {:<16} {:<7} {:<12} {:<4} {:<25} {:<25} {}",
+                            "{:<3} {:<34} {:<16} {:<16} {:<7} {:<12} {:<4} {:<25} {:<25} {}",
                             i + 1,
                             r.id,
+                            r.owner.as_deref().unwrap_or("-"),
                             r.label,
                             r.scope,
                             r.view.as_deref().unwrap_or("<any>"),
@@ -3096,7 +3606,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                 ApikeyAction::Calls { limit } => {
                     let rows = keys.recent_calls(limit)?;
                     if rows.is_empty() {
-                        println!("no logged calls yet (a `grovefs mcp` run appends one row per tools/call, and a `--require-api-key` meta/data-server one per mount connect, here)");
+                        println!("no logged calls yet (in {where_keys}; a `grovefs mcp` run appends one row per tools/call, a `--require-api-key` meta/data-server one per mount connect, and a `--control-listen` server one per governance call)");
                     } else {
                         println!("last {} call(s), newest first:", rows.len());
                         println!(
@@ -3125,8 +3635,30 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Refs {
             db_path,
             store,
+            control_server,
+            control_key,
             action,
         } => {
+            if let Some(addr) = control_server.as_deref() {
+                refuse_local_with_remote(addr, &db_path, &store)?;
+                let rc = remote_control(addr, resolve_control_key(control_key))?;
+                match action {
+                    RefsAction::Rebuild => {
+                        // The recount reads the TREES, so it must run where they
+                        // live; the server applies it to whatever backend it
+                        // serves and answers in its own wording.
+                        let r = rc
+                            .client()
+                            .call("refs.rebuild", serde_json::json!({}))
+                            .map_err(Box::<dyn std::error::Error>::from)?;
+                        println!("{}", r.as_str().unwrap_or("refs ledger rebuilt"));
+                        println!(
+                            "  run it QUIESCED: a booking committed between the server's read pass and write pass would be overwritten with the pre-booking count"
+                        );
+                        return Ok(());
+                    }
+                }
+            }
             let rbase = db_path.unwrap_or_else(|| base.clone());
             let store = resolve_store(store);
             match action {
@@ -3197,7 +3729,73 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             apply,
             json,
             force,
+            control_server,
+            control_key,
+            data_servers,
+            data_token,
+            data_api_key,
         } => {
+            // The REMOTE audit: the server reads the trees where they live and
+            // we only name the bytes. This is the one form that works under PG
+            // and `fdb://`, where no `<data-dir>` on this machine holds them.
+            if let Some(addr) = control_server.as_deref() {
+                refuse_local_with_remote(addr, &db_path, &None)?;
+                if data_root.is_some() {
+                    return Err(format!(
+                        "--control-server {addr} audits bytes on the DATA SERVERS, so --data-dir cannot be combined with it — name the roots with --data-servers HOST:PORT instead"
+                    )
+                    .into());
+                }
+                let rc = remote_control(addr, resolve_control_key(control_key))?;
+                let servers: Vec<String> = data_servers
+                    .or_else(|| {
+                        std::env::var("GROVEFS_DATA_SERVERS")
+                            .ok()
+                            .filter(|s| !s.is_empty())
+                    })
+                    .map(|s| {
+                        s.split(',')
+                            .map(str::trim)
+                            .filter(|a| !a.is_empty())
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if servers.is_empty() {
+                    return Err(format!(
+                        "gc --control-server {addr} needs --data-servers HOST:PORT[,HOST:PORT] \
+                         (or GROVEFS_DATA_SERVERS): the server owns the trees, the data servers own \
+                         the bytes"
+                    )
+                    .into());
+                }
+                let token = data_token
+                    .or_else(|| std::env::var("GROVEFS_TOKEN").ok())
+                    .unwrap_or_default();
+                let dkey = data_api_key
+                    .or_else(|| std::env::var("GROVEFS_API_KEY").ok())
+                    .unwrap_or_default();
+                let op = if apply { "gc.apply" } else { "gc.scan" };
+                let rep = rc
+                    .client()
+                    .call(
+                        op,
+                        serde_json::json!({
+                            "data_servers": servers,
+                            "data_token": token,
+                            "data_api_key": dkey,
+                            "older_than": older_than,
+                            "force": force,
+                        }),
+                    )
+                    .map_err(Box::<dyn std::error::Error>::from)?;
+                if json {
+                    println!("{rep}");
+                } else {
+                    print_gc_remote(&rep);
+                }
+                return Ok(());
+            }
             // The trees this command audits are local `<view>.db` files. Under
             // PG they are schemas and the bytes belong to the data servers —
             // there is no offline page tree to walk here. The same argument is
@@ -4391,6 +4989,121 @@ fn gc_json(rep: &grovefs::gc::Report, rec: Option<&grovefs::gc::Reclaimed>) -> s
         "deleted_bytes": rec.map(|r| r.bytes).unwrap_or(0),
         "delete_failed": rec.map(|r| r.failed.clone()).unwrap_or_default(),
     })
+}
+
+/// Render the control plane's `gc` report. The server answers in the shape
+/// [`gc_json`] uses (plus where it ran and what it could see), so this prints
+/// the lines the local report prints without re-deriving a single verdict here:
+/// the deletion decision stays on the server that owns the trees.
+fn print_gc_remote(rep: &serde_json::Value) {
+    let num = |k: &str| rep.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+    let txt = |k: &str| rep.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    let arr = |k: &str| -> Vec<serde_json::Value> { rep.get(k).and_then(|v| v.as_array()).cloned().unwrap_or_default() };
+    let servers: Vec<&str> = rep
+        .get("data_roots")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    println!("gc: meta {} (backend {})", txt("meta_root"), txt("backend"));
+    println!("  data server(s): {}", servers.join(", "));
+    println!(
+        "  views: {} tree(s), {} referenced key(s), {} striped layout(s)",
+        arr("views").len(),
+        num("referenced_keys"),
+        num("striped_layouts")
+    );
+    println!(
+        "  objects: {} ({})",
+        num("objects"),
+        fmt_bytes(num("object_bytes"))
+    );
+    println!(
+        "  orphans: {} ({}; {} reclaimable, {} within grace <{})",
+        num("orphans"),
+        fmt_bytes(num("orphan_bytes")),
+        num("reclaimable"),
+        num("within_grace"),
+        fmt_age(num("grace_secs"))
+    );
+    let orphans = arr("orphans");
+    for c in orphans.iter().take(20) {
+        println!(
+            "    {:>10}  {:>8}  {:<5}  {}",
+            fmt_bytes(c["size"].as_u64().unwrap_or(0)),
+            fmt_age(c["age_secs"].as_u64().unwrap_or(0)),
+            c["kind"].as_str().unwrap_or("?"),
+            c["key"].as_str().unwrap_or("")
+        );
+    }
+    if orphans.len() > 20 {
+        println!(
+            "    ... {} more (use --json for the full list)",
+            orphans.len() - 20
+        );
+    }
+    let held = arr("ledger_held");
+    if !held.is_empty() {
+        println!(
+            "  ledger-held: {} ({}) — NOT deleted; run `grovefs refs rebuild --control-server …` first if these are stale",
+            held.len(),
+            fmt_bytes(num("ledger_held_bytes"))
+        );
+        for c in held.iter().take(5) {
+            println!(
+                "    {:>10}  {}",
+                fmt_bytes(c["size"].as_u64().unwrap_or(0)),
+                c["key"].as_str().unwrap_or("")
+            );
+        }
+        if held.len() > 5 {
+            println!("    ... {} more", held.len() - 5);
+        }
+    }
+    let mounts = arr("server_mounts");
+    let sessions = arr("live_sessions");
+    if !mounts.is_empty() || !sessions.is_empty() {
+        println!(
+            "  in use: {} mount(s) on the server host, {} view(s) with live sessions there",
+            mounts.len(),
+            sessions.len()
+        );
+        for m in mounts.iter().take(5) {
+            println!("    mounted on the server: {}", m.as_str().unwrap_or(""));
+        }
+        println!(
+            "  a mount on another machine is not visible from the server host; stop it too before --apply"
+        );
+    }
+    if rep.get("applied").and_then(|v| v.as_bool()).unwrap_or(false) {
+        let failed = arr("delete_failed");
+        println!(
+            "reclaimed: {} object(s), {} freed; {} within grace kept; {} failed",
+            num("deleted"),
+            fmt_bytes(num("deleted_bytes")),
+            num("within_grace"),
+            failed.len()
+        );
+        for f in failed.iter().take(10) {
+            println!("    failed: {}", f.as_str().unwrap_or(""));
+        }
+    } else {
+        let tail = if num("reclaimable") > 0 {
+            format!(
+                " Re-run with --apply to reclaim {} object(s), {}.",
+                num("reclaimable"),
+                fmt_bytes(num("reclaimable_bytes"))
+            )
+        } else if orphans.is_empty() {
+            " No unreferenced objects were found.".to_string()
+        } else {
+            format!(
+                " {} orphan(s) are all within the {} grace; re-run after it elapses.",
+                orphans.len(),
+                fmt_age(num("grace_secs"))
+            )
+        };
+        println!("dry run: nothing deleted.{tail}");
+    }
 }
 
 fn run_fusermount(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {

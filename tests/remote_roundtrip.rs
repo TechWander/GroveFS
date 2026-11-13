@@ -407,3 +407,41 @@ fn fenced_write_refreshes_epoch_and_retries_once() {
     assert_eq!(c.write("obj", 0, b"recovered").unwrap(), 9);
     assert_eq!(c.read("obj", 0, 16).unwrap(), b"recovered");
 }
+
+/// OP_LIST: the data-server enumerates what it HOLDS, in pages, so an auditor
+/// on another machine never has to be pointed at the disks it is judging. The
+/// cursor is the server's own, and a full walk must cover every object exactly
+/// once with its authoritative size — the two facts `gc` deletes bytes on.
+#[test]
+fn remote_list_walks_every_object_in_pages() {
+    let (addr, _dir) = spawn_server();
+    let c = make_client(&addr);
+    let mut want = std::collections::BTreeMap::new();
+    for i in 0..40u32 {
+        let key = format!("obj-{i:04}");
+        let body = vec![b'x'; (i as usize % 5) + 1];
+        c.create(&key).unwrap();
+        c.write(&key, 0, &body).unwrap();
+        want.insert(key, body.len() as u64);
+    }
+    // Page sizes that cut inside a bucket, exactly at the end, and past it.
+    for page_size in [1usize, 3, 39, 40, 41, 1000] {
+        let mut seen = std::collections::BTreeMap::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = c.list_objects(cursor.as_deref(), page_size).unwrap();
+            for r in page.rows {
+                assert!(
+                    seen.insert(r.key.clone(), r.size).is_none(),
+                    "{} listed twice (page size {page_size})",
+                    r.key
+                );
+            }
+            match page.next {
+                Some(n) => cursor = Some(n),
+                None => break,
+            }
+        }
+        assert_eq!(seen, want, "page size {page_size} did not cover the server");
+    }
+}

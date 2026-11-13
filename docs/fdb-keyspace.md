@@ -28,6 +28,7 @@ RecordLayer 是 Python/Java 侧的遗留绑定层，无 Rust 实现；把它引�
 视图内键族:                view_subspace + tuple(kind_tag, ...kind_key)
 跨视图共享账本:            \x01 + tuple("refs") + tuple(data_ref)   ← 不在任何视图子空间内
 写者租约表:                \x01 + tuple("writer") + tuple("lease", deployment)   ← 同上，不属于任何视图
+控制面子空间:              \x01 + tuple("ctl") + tuple(kind, ...)   ← 同上，部署级共享（定义/key/审计）
 ```
 
 **实测字节形态（v1.1 补，取代上面示意式的写法；由 `src/fdb_store.rs` 的
@@ -55,6 +56,12 @@ RecordLayer 是 Python/Java 侧的遗留绑定层，无 Rust 实现；把它引�
   so every view books/unbooks the same counts"）。
 - **禁止**再挂一个 SQLite `refs.db` 作账本：那会在 FDB 权威之外引入第二个持久化权威，
   HA 切换与备份恢复下必然裂（决策 D5 的否决项）。
+- **控制面子空间 `(root,'ctl')`：部署级共享的权威记录**（对位 PG `grovefs_control` schema，v2.13）。
+  与视图子空间、`refs`、`writer` 同为 root 兄弟，任何视图 teardown 触不到、任何视图名不能遮蔽
+  （`'ctl'` 是保留视图名，`src/fdb_store.rs:1917`）。两张表落在这里：
+  - `CtlKeyTable`（凭据/审计）：`(root,'ctl','keys',id)`→凭据行 JSON；`(root,'ctl','order',seq)`→第 seq 把 key 的 id（`apikey list` newest-first 由键序承载，无需排序）；`(root,'ctl','calls',seq)`→审计行 JSON；`(root,'ctl','seq',kind)`→`keys`/`calls`/`view_defs` 各自插入计数器（分开计数：撤销 key 不在审计序列留洞、定义重发布不耗审计 seq）。
+  - `CtlDefTable`（视图定义，v2.13 新增）：`(root,'ctl','view_defs',name)`→定义原文（对位 `grovefs_control.view_defs` 一行 / 文件档 `meta/views/<name>.layout`）；`(root,'ctl','view_def_ver',name)`→写版本 i64，即热重载票（对位文件档 mtime / PG `xmin`；每次 publish 从全局 `view_defs` 计数器领新号，单调不复用，byte-identical 重发布也换号 ⇒ 缓存透镜必被驱逐）；`(root,'ctl','defs_migrated')`→存量本地定义一次性上传 marker（同事务写、每部署一次、并发安全、不覆盖集群已有定义）。
+  - 定义与 key 同落 `ctl` ⇒ 一个 FDB 集群是控制面**唯一权威**：瞄准它的每台 meta-server/MCP/CLI 共享同一份记录，治理命令需带 `--meta-store fdb://…` 且需集群可达，本地不落 `*.layout`/`api_keys.db`（`src/fdb_store.rs:976-1110`/`1760-1821`；§8 对照表、§14 v2.13）。
 
 ## 2. 记录编码（决策 D2，不可逆）
 
@@ -265,10 +272,13 @@ RecordLayer 是 Python/Java 侧的遗留绑定层，无 Rust 实现；把它引�
 3. **`'refs'` 是 per-view 隔离的唯一例外**，且这个例外正是 I2 要求的（对位 PG 注释"every view
    books/unbooks the same counts"）。任何"顺手把账本挪进视图 subspace"的改动会静默造出两份计数。
 4. **`fork` 与 TOS `lem:derived`（派生投影不 fork）在 FDB 档从性质升为实现约束**：一个视图就是一个
-   subspace，没有 snapshot/clone 路径可复制整棵树，所以 `fork` 要么真能用、要么点名拒绝，二者只取其一。
-   实测取后者，且拒绝文案与 PG 文案**同等明确**——五要素（`not implemented` / 点名后端 / 点名操作 /
-   给出理由 / 指向真正可用的替代）由单测 `src/mcp.rs:3212` `fork_and_graft_refuse_explicitly_on_an_fdb_store`
-   与 e2e `.build-bin/test_fdb.sh` §10d 双重钉住，并断言拒绝后**不留**本地 `meta/<fork>.db`、不留 fork 定义。
+   subspace，`fork` 要么真能用、要么点名拒绝，二者只取其一。**早期裁决取“点名拒绝”**（无 snapshot/clone
+   路径时的保守选择，曾由单测 `fork_and_graft_refuse_explicitly_on_an_fdb_store` 与 `test_fdb.sh` §10d 的拒绝
+   断言钉住）；**本版已反转为“真能用”**——`FdbStore::fork_tree`（`src/fdb_store.rs:4549`）一次快照读基树、
+   一笔写事务把 `'n` 族复制进目标 subspace 并订共享账本，与 PG `INSERT … SELECT` 跨 schema 同契约。旧拒绝
+   单测已删、§10d 改写为「the tree-copy verbs copy SUBSPACES」，由 `.bneck/engine_matrix.sh` 三引擎矩阵
+   （`view fork`/`graft`/`import --as-fork` 三档全 OK）与 `forksrv`/`xfer` 套件实证。I4「派生不 fork、fork 是树
+   身份」不变量不受影响——反转的只是 FDB 档 fork 的可用性裁决。
 
 与 §12 的交叉核对：§12 的四条可归因差异（`getattr` 的 name 选择、时间精度、`ino IS NULL`、id 空洞）
 **都不落在 I1–I4 的判据上**——前两条是展示与精度，后两条是 FDB 严格强于原实现。因此 P6 差分对拍若出现
@@ -308,6 +318,46 @@ RecordLayer 是 Python/Java 侧的遗留绑定层，无 Rust 实现；把它引�
   退避 `200µs` 翻倍至 `25ms`（`src/pg_store.rs:181-190` 的注释理由：8 写者抢热点 rename 也能 ~1 秒收敛）。
   FDB 侧初值照抄，压测后再调（§11）。
 
+### 5.1 整树写（`view import` / `fork` / `graft`）的事务粒度
+
+这三条不是「一个 POSIX 操作」，而是「一棵树」。它们先按实测定标的状态模型
+`rows×625 B + 新账本对象×660 B + 事务内读到的行×240 B` 给整份计划定价：
+
+- **装得下就仍是一个事务**（这仍是 all-or-nothing）；这由
+  `chunk_lengths(rows, blobs, read_rows).len() <= 1` 判，`graft` 用
+  `graft_chunk_lengths(units, dest_rows)` —— 单事务那条要在事务内扫目标命名空间续
+  id/ino 分配器，所以**读集也计入**。`fork` 另加一个前提：目标子空间不能有残留账本行
+  （`has_bookings()` 探一个键），有残留就必须走分批退订，否则清前缀会把多记的 ref
+  留下。
+- **装不下就按 `TX_CHUNK_BUDGET = 7_000_000`（硬限的 70%）分批**，每批一次提交。
+  余量是给模型的：成本系数是实测标定的（FDB 不公开逐键计费），不是文档值。
+- **根行最后写**（`import` / `fork`）：根行是「树可挂载」的唯一判据，于是一次中断的
+  分批写留下的是**没有挂载点能到达的键**（`view scan` 的 `corpse`），而不是半棵树。
+  `graft` 落进已存在的树，没有这个判据可用，所以它的语义是「已提交的批次保留 +
+  `--skip-existing` 续跑」。
+- **`import` 断点可以接上**：`--replace` 收养 corpse——先把残留的 `'r'` 引用按 256 个一
+  个事务退订、再 `clear_prefix`，然后照常分批写入。corpse 的残留可能是好几个事务的量，
+  所以这条路径总是分批（即使新 dump 本身装得下一个事务），`import_jsonl` 为此加了
+  `force_split`。实测：一个被 `kill -9` 在 2/4 事务处的 `import` 留下 54,472 键 / 10,894 条目
+  的 corpse，`--replace` 重跑 4 个事务写回 20,000 行，导出与源 dump 逐行相同，
+  `refs rebuild` 报 `0 row(s) corrected, 0 row(s) deleted`。
+- **`graft` 的单元划分**：一个计划项整体装得下就是一个 `subtree` 单元；装不下就递归
+  拆成「**只写它自己那一行**（保住 dir 的 mode/uid/gid/mtime，否则 `graft_ensure_dir`
+  会用 0755 与当前 euid 重建）+ 每个子项一个单元」。打包是贪心，首批不再扣读预算
+  （分批路径从快照续分配器，不扫目标树）。
+- **重试安全**：`graft` 的 `next`（分配器）与 `inos`（源 ino → 目标 ino）作为 **输入**
+  传进事务、成功后作为 **输出** 返回，所以 `with_serial_retry` 重试从同一条基线重跑，
+  不会从「半推进的分配器」重跑；跨批硬链接因此仍然指向同一个 inode。
+- **账本**：`put_row_tx` 只在「本视图首次命名这个 `data_ref`」时 `bump(+1)`（同事务内对 `'r'` 前缀做 `count_range` 得 0），所以分批与跨批硬链接天然正确；`--replace` 与重跑前的
+  退订走 `unbook_refs`（256 个引用一个事务）再 `clear_prefix`，不是一个事务碰百万账本键。
+
+实测（`single ssd` 单节点，2026-11-13）：带引用时每批 **5,447 行**（7,000,000/1,285）；
+20,000 行带引用的 `import` **4 个事务 7.8s**（7,900 行即 `2101`）；20,000 行的
+`fork` 4 个事务 7.2s；8,001 个条目的 `graft` 进 20,000 行的树 2 个事务；6,002 个条目
+的 `graft` 进 28,001 行的树 2 个事务（6,000 行进 10,000 行树即 `2101`）；
+`import --replace` 20,000 行 4 个事务 9.6s；五轮之后 `refs rebuild` 报
+`0 row(s) corrected, 0 row(s) deleted`。
+
 ## 6. OCC 冲突 → POSIX errno 映射（决策 D6，不可逆）
 
 | 现有 PG 分类（`src/pg_store.rs:473-479`、`1556`） | 语义 | FDB 对位 |
@@ -342,7 +392,7 @@ RecordLayer 是 Python/Java 侧的遗留绑定层，无 Rust 实现；把它引�
 | 索引 | B-tree 索引 4 + UNIQUE | 同形态镜像 4 + UNIQUE | 全部改为**显式二级键**（§3.2–§3.7） |
 | 分页 readdir | 游标 + LIMIT/OFFSET | 游标 + LIMIT/OFFSET | range + start_after + 同款步长检查点 |
 | fencing/epoch | `ctrl` 表 | `ctrl` 表 | `(v,'c','epoch')` 键 |
-| 控制面（view 定义/别名/API key） | `<meta-dir>/meta/views/*.layout` + `meta/api_keys.db` 本地文件 | 共享 `grovefs_control` schema（`view_defs`/`api_keys`） | **仍是本地文件**：`fdb://` 不是控制面后端，只是数据面换了 subspace（§14 v1.3 C6） |
+| 控制面（view 定义/别名/API key） | `<meta-dir>/meta/views/*.layout` + `meta/api_keys.db` 本地文件 | 共享 `grovefs_control` schema（`view_defs`/`api_keys`） | 集群 `ctl` 子空间（`CtlDefTable` 定义/版本 + `CtlKeyTable` key/审计），对位 PG `grovefs_control`；集群是唯一权威，治理需带 `--meta-store fdb://…` 且需集群可达（§1、§14 v2.13） |
 | HA | grovefs 自研快照主备（`VACUUM INTO`） | PG 流复制/`pg_basebackup`/PITR | 集群自带三副本，grovefs 侧**不叠加** |
 
 ## 9. 键长核算表（FDB 软限：键 ~10KB，值 ~100KB，事务写集软限 10MB）
@@ -357,6 +407,10 @@ RecordLayer 是 Python/Java 侧的遗留绑定层，无 Rust 实现；把它引�
 | 值（节点记录） | 11 列 tuple | **< 600B**（路径不入库，最长 name 255B 已在键侧） |
 
 结论：本项目记录粒度（约 230 B/节点量级）与 FDB 限制余量四个数量级以上，**不存在需要分块值的形态**。
+
+同一个 10 MB 对**整树写**是另一回事：`view import` / `fork` / `graft` 的事务状态是整棵树的
+行数×625 B 加上读集，一棵大树必然超——它们按 §5.1 自动分批（装得下仍单事务，根行最后写）。
+单事务能写多少行的实测边界与复跑配方在 USAGE §6.3.4。
 
 ## 10. 二级索引"只增不改"清单（决策 D10）
 
@@ -1370,7 +1424,7 @@ system-key 选项），`TransactionOption::Timeout` 由 `GROVEFS_FDB_OPEN_TIMEOU
 3. **时钟漂移。** 把一台机器的时钟拨快/拨慢 TTL/2 后观察接管与误判（需要可改时钟的两台机器或 VM）。
 4. **容量**：G3（SSD/NVMe 介质、RF=3）——与租约无关，仍按 §15 的转正条件。
 
-**本版未做**（已写入 USAGE §6.3.4 的演进方向）：控制面入集群、跟随者自动接管、客户端 fencing 令牌。
+**本版未做**（已写入 USAGE §6.3.5 的演进方向）：控制面入集群、跟随者自动接管、客户端 fencing 令牌。
 在这三件之前，「一个视图只被一个部署服务」是运维约定，不是保证。
 
 ### v2.12（v2.11 的三个待验证项在四机 VM 上判过；PG 档「删不掉」这条真缺口补齐）
@@ -1419,24 +1473,44 @@ v2.11 结尾留了两件未了的事：三条「只有多机才能判」的待�
   teardown 套件的 H 段就是断言「剩下的正好是 V2 订过的 3 个、与 stranded 行数一致」而不是
   假装干净。
 
-**3）三引擎矩阵：`.bneck/engine_matrix.sh`（14 项 × 3 档）**
+**3）三引擎矩阵：`.bneck/engine_matrix.sh`（22 项 × 3 档）**
+
+跑的是**无 FUSE** 的纯治理序列：`graft` 的源是一份手写 seed dump（`data_ref` 为空，只量树搬运），字节与账本那条路归 `forksrv`/`xfer`。
 
 | 能力 | SQLite | PG | FDB |
 | --- | --- | --- | --- |
-| create / define / alias / list / `rm --base` | OK | OK | OK |
-| `refs rebuild` | OK | OK | OK |
-| `view export` / `view import` | OK | REFUSED | OK |
-| `view fork` | OK | REFUSED | REFUSED |
+| `view create` | OK | OK | OK |
+| `view define` | OK | OK | OK |
+| `view alias` | OK | OK | OK |
+| `view fork` | OK | OK | OK |
+| `view list` | OK | OK | OK |
+| `view export` | OK | OK | OK |
+| `view import` | OK | OK | OK |
+| `view import --as-fork` | OK | OK | OK |
+| `view import`（手写 seed） | OK | OK | OK |
 | `grovefs import`（目录→视图） | OK | REFUSED | REFUSED |
-| `gc` | OK | REFUSED | REFUSED |
-| `view scan` / `view lease` | REFUSED | REFUSED | OK |
+| `view graft` | OK | OK | OK |
+| `refs rebuild` | OK | OK | OK |
+| `gc --data-dir` | OK | REFUSED | REFUSED |
+| `gc --data-servers` | OK | OK | OK |
+| `du` | OK | OK | OK |
+| `du --view <不存在>` | REFUSED | REFUSED | REFUSED |
+| `apikey list` | OK | OK | OK |
+| `apikey calls` | OK | OK | OK |
+| `view scan` | REFUSED | REFUSED | OK |
+| `view lease` | REFUSED | REFUSED | OK |
 | 原生 HA | OK | REFUSED | REFUSED |
+| `view rm --base` | OK | OK | OK |
 
-14 行全 OK/REFUSED、**无 ERROR**；跑完的 post-teardown 校验 `sqlite meta/*.db 0 / pg schema 0 /
-pg 账本 0 / fdb "no subspaces"` → `TEARDOWN CLEAN`。三处测量学问题写进了脚本注释：`rmbase` 必须是
-表里的一行（否则「删不掉」永远藏在 cleanup 里）、每次 `reset_engine` 先清场（否则上一轮的
-`mxbase already exists` 会读成 ERROR）、`gc` 的后端守卫读的是 `GROVEFS_META_STORE` 环境变量
-（不设就落到误导性的 "no metadata directory"）。
+22 行全 OK/REFUSED、**无 ERROR**；跑完的 post-teardown 校验 `sqlite meta/*.db 0 / pg schema 与账本回到基线 /
+fdb 树子空间 0` → `TEARDOWN CLEAN`。`du` 对不存在的名字回同一句 `no tree for view 'V' in <store>`
+（此前 SQLite 报文件不存在、PG 报 `pg query: db error`、FDB 回 `0B`，三档不一致）。
+
+几处测量学问题写进了脚本注释：`rmbase` 必须是表里的一行（否则「删不掉」永远藏在 cleanup 里）、
+每次 `reset_engine` 先清场且**先删定义再删树**（否则 `mxbase already exists` 读成 ERROR、或基树因
+fork 定义挡着删不掉）、脚本顶部 `unset GROVEFS_META_STORE`（继承来的 store 会让 SQLite 臂以为自己在服务
+FDB，三列变成同一个引擎）、`gc` 的后端守卫读的是 `GROVEFS_META_STORE`（不设就落到误导性的
+"no metadata directory"）。
 
 **4）文档同步。** 以前文档里那些「PG 下 `view rm --base` 拒绝 / `refs rebuild` 别跑 / 清理走
 `pg_drop_views.sh`」的句子不是「过时」，而是**与本版事实相反**，所以逐句重写成现在的行为
@@ -1444,7 +1518,105 @@ pg 账本 0 / fdb "no subspaces"` → `TEARDOWN CLEAN`。三处测量学问题�
 `.bneck/p9_doc_pg_teardown.py` 留证）。同时把四机拓扑的三条运维事实写进 USAGE §6.3.3。
 
 **仍开放**：G3 容量（SATA 介质，判据见 §15）；PG 的 `fork`/`export`/`import` 是设计边界而非缺口；
-FDB 控制面仍未入集群（USAGE §6.3.4）。
+FDB 控制面仍未入集群（USAGE §6.3.5）。
+
+### v2.13（把 v1.3 C6「控制面仍是本地文件」反转：FDB 视图定义入集群 ctl，与 PG 对齐）
+
+v2.11/v2.12 都把「FDB 控制面入集群」列为未做（USAGE §6.3.5 的演进方向）。本轮做了：FDB 档的
+视图定义/别名从 `<meta-dir>/meta/views/*.layout` 本地文件搬进集群 `ctl` 子空间，与 key/审计
+（`CtlKeyTable`，早已在集群）同落一处，对位 PG 把控制面搬进 `grovefs_control` schema。至此三档
+各落自己的控制面存储、同一条纪律，**v1.3 C6「`fdb://` 不是控制面后端」就此被取代**（C6 作为
+历史裁决保留在 v1.3，不改写）。
+
+**1）键空间（§1 已补 ctl 子空间规格）**
+
+新增 `CtlDefTable`（`src/fdb_store.rs:976-1110`），镜像 `CtlKeyTable` 的形态：
+- `(root,'ctl','view_defs',name)` → 定义原文文本（对位 `grovefs_control.view_defs` 一行）；
+- `(root,'ctl','view_def_ver',name)` → 写版本 i64，热重载票（对位文件档 mtime / PG `xmin`）；
+- `(root,'ctl','defs_migrated')` → 存量本地定义一次性上传 marker。
+
+`put` 在同一事务里写定义 + 从全局 `view_defs` 计数器领一个新版本号（单调不复用，byte-identical
+重发布也换号，故缓存透镜必被驱逐——与 PG UPDATE 语义一致）；`remove` 连版本键一起清，重发布领新号。
+
+**2）热重载：mtime → 集群写版本戳**
+
+`FileControlStore::new_fdb` 的 `stamp()`/`defs_changed()` 改读 `CtlDefTable` 的写版本，不再 stat
+本地 `.layout` 的 mtime。对位关系：SQLite=mtime、PG=`xmin::text`、FDB=集群写版本。I3 失效完整性
+不变量不受影响（§3.10）——换的只是「定义有没有变」的判据来源，派生挂载 ≤2s 热换形的契约不变。
+
+**3）存量迁移与路由**
+
+`control_store_for`（`src/mcp.rs`）的 fdb 分支：`FileControlStore::new_fdb` + 当本地定义槽非空时
+`CtlDefTable::open(uri).migrate_local(&local)` 尽力上传——非覆盖（集群已治理的名字不动）、marker
+同事务守卫（每部署一次、并发安全）。治理命令需带 `--meta-store fdb://…`（或 `GROVEFS_META_STORE`）
+且需集群可达；不带 URI 仍落本地文件（服务端永不在看），与 PG 同款纪律。`--meta-dir` 在此档只是
+部署身份（写者租约按它 fencing）兼 scratch/config，不再是控制面记录。
+
+**4）写者租约的语义随之收紧**
+
+v2.11 的租约禁的是「两个写权威写同一批子空间」；控制面入集群后，两个部署读的是**同一份**定义
+（`view list` 一致），租约禁的不再是「各持一份互不知晓的定义」而是「两个写权威写同一棵树」。
+租约仍按部署（`--meta-dir`）fencing、按设计不跨部署（USAGE §6.3.1/§6.3.3）。
+
+**5）实证（当前工作树重跑，非引用历史值）**
+
+- `test_apikey.sh` fdb 档 36/0、`test_layout.sh` fdb 档 82/0、`test_fdb.sh` 275/0
+  （`ALL FDB-BACKEND CHECKS PASSED`）；SQLite 回归 apikey 33/0、layout 81/0 不退。
+- 清场回归：定义入集群后 `rm -rf <home>` 不再删定义、`rm --base` 被治理守卫拒，套件清场改用
+  有界 unwind（先删定义再删树，`fdb_scaffold.sh::fdb_drop_views`）。复跑后 `view scan` 仅余
+  `ctl`，**0 树 / 0 账本 / 0 租约 / 0 定义**（跑前手工清掉存量泄漏的 fd1794469683 定义+base 与
+  6 条 dead-holder 过期租约）。
+- native + fdb 双 build exit 0（`FDB_CLIENT_LIB_PATH` 带绝对目录，RUNPATH 三段，§14 v2.9 口径）。
+
+**6）文档与注释同步**
+
+`docs.html` 10 处、`USAGE.md` 21 处（含 §6.3.5 删去「控制面入集群」这条已实现项并重编号、§15.9
+备份声明改「树+控制面同一次 fdbbackup 快照，两样一起备：fdbbackup + 数据根」）、本文件 §1/§8/本注记；
+源码过时注释 `main.rs`（resolve_store doc、meta-server --meta-dir help）、`fdb_store.rs`（writer-lease、
+list_subspaces、export_jsonl 三处 C6 声明）、`mcp.rs` 8 处。历史 changelog（v1.3 C6、v2.11/v2.12
+「仍未入集群」）一律保留为史实，不改写。
+
+**仍开放**：G3 容量（SATA 介质，判据见 §15，本轮未动）；跟随者自动接管、客户端 fencing 令牌
+（USAGE §6.3.5 演进方向，控制面入集群后这两项的前提已就绪）。
+
+### v2.14（10 MB 墙从「拒绝」变「分批」：三条整树写按预算自动拆，corpse 能被 `--replace` 接上）
+
+用户诉求的原话是「超过 10M 希望你具备自己拆成合适的大小，自动分批提交」——此前的裁决是
+「装不下就点名拒绝」（§5 的 2101 边界），它把迁移挡在 7,700 行。本轮改为**默认自动分批**：
+- 预算器：`chunk_lengths` / `graft_chunk_lengths` 按实测模型 `行×625 B + 新账本对象×660 B +
+  事务内读到的行×240 B` 定价，`TX_CHUNK_BUDGET = 7_000_000`（硬限 70%，余量给模型误差）；
+  **装得下仍是单事务**（`chunks.len() <= 1`，all-or-nothing 不变）。
+- 三条不变量：根行最后写（中断留下 `view scan` 可辨认的 corpse）、账本不泄漏（`--replace`/重跑
+  走 `unbook_refs` 每 256 个引用一个事务）、硬链接跨批（源 ino → 目标 ino 作为批间输出）。
+  `graft` 的单条目超预算递归拆成「它自己那一行 + 每个子项一个单元」（保住 dir 的 mode/uid/
+  gid/mtime）；分批路径从快照续分配器、不扫目标树，所以首批不再扣读预算（首块从 1,712 变
+  5,447 行，3 个事务降到 2 个）。
+- 收尾时真机暴露一处体验断点：分批中断的报错说「re-run with `--replace`」，而 corpse 守卫对
+  `--replace` 也拒绝——两个出口互相指。已修：`prep_import_target` 在 `replace && !teardown` 时
+  答 `Ok(true)`（交给分批退订），`import_jsonl` 加 `force_split`（corpse + `--replace` 强制走
+  分批，即使新 dump 装得下一个事务）；`replaced` 收回 `existing > 1`（有根行的空视图不再被
+  误判为「已有一棵树」）。
+
+实测（`single ssd` 单节点，2026-11-13）：`import` 20,000 行 4 个事务 7.8s；`fork` 20,000 行 4 个
+事务 7.2s；8,001 条目 `graft` 进 20,000 行树 2 个事务；6,002 条目 `graft` 进 28,001 行树 2 个
+事务（硬链接对分居两批、`ino` 相同）；`import --replace` 20,000 行 4 个事务 9.6s。中断链：
+`kill -9` 在 2/4 事务处 → `view scan` 报 `cc1 54472 keys / 10894 entries / corpse` → 不加
+`--replace` 时拒绝并点名两个出口 → 加 `--replace` 后 4 个事务写回 20,000 行（8.6s），导出与源
+ dump 逐行相同，`refs rebuild` 报 `0 row(s) corrected, 0 row(s) deleted`（连跑五轮均 `0/0`）。
+单测 `chunk_lengths_cover_every_row_within_budget`、`graft_units_split_an_oversized_directory`
+新增，`cargo test --release --lib --features fdb` **167 passed / 0 failed**。口径同步：USAGE
+§2/§4.1.1/§4.1.2/§5/§6.3.3/§6.3.4、docs.html、README、`skills/grovefs-mcp/SKILL.md`、`main.rs`
+三处 clap 文档、`mcp.rs` 的 `graft_view` 说明。
+
+### v2.15（`fork` 的残留账本守卫：目标有账本行就必须分批退订）
+
+`fork` 盖一个已有子空间时，旧树的 `'r'` 行要先退订、再清前缀。单事务那条把两者放进同一个
+事务，于是残留账本行超过一个事务的容量时，清前缀会掉一部分 `'r'` 行，账本从此多记这份视图
+再也不会释放的引用。现在 `fork_tree` 先问一句 `has_bookings()`（对 `dataref_all_range()` 探
+一个键）：目标有残留账本就走分批路径（只有 `!residue && chunks.len() <= 1` 才是单事务），
+退订按 256 个引用一个事务逐批做完。同一轮把 `graft` 的计划定价收成只数节点
+（`graft_plan_nodes`），分批路径不再需要目标树的大小；整树写只有一条路径——装得下就一个
+事务，装不下就分批，没有别的选择。`cargo test --release --lib --features fdb` 167 passed。
 
 ## 15. 决策门处置（G1–G4 与 R5，逐门留证）
 
@@ -1456,6 +1628,6 @@ G3 在 v1.8 前是第三种写法，现在是第二种。逐门如下：
 |---|---|---|---|
 | **G1** 环境门 | P0 末 | **通过** | 三条判据原文见 §14 v1.1 末（`The database is available.`、`cargo build --release --features fdb --example fdb_spike` 链接 `libfdb_c` 成功、spike `P0_SPIKE_VERDICT=PASS`）。环境路径按 Spec 要求"选定一条即写死命令"：发行版 apt 源与 docker 守护进程在本机都不通（前者无源、后者不可达），故走官方 release 资产 + sha256 校验 + 用户态运行——`bash .build-bin/fdb_env.sh fetch && bash .build-bin/fdb_env.sh up`，`eval "$(bash .build-bin/fdb_env.sh vars)"` 导出 `FDB_CLIENT_LIB_PATH` 与 `GROVEFS_FDB_CLUSTER_FILE`；不装系统包、不用 root，头注释里写明了降级次序 |
 | **G2** 设计门 | P1 末 | **未触发** | 三条最难的形态都有表达且已落地：分页 readdir = `'n'` 前缀 range + `start_after` + 步长检查点（§3.3，`FdbStore::supports_paged_readdir()` 返回 `true`，`src/fdb_store.rs:1721`）、目录 nlink = `('k',parent,name)` 仅目录子空间计数（§3.4）、锁区间重叠 = `('l',ino)` 前缀扫 + 事务内过滤（§3.7，C5 另加"二级键须能无歧义重建主键"的硬判据）。P3/P4 的实现与差分对拍是这些映射真正成立的最终证据，不需要退回分片路线 |
-| **G3** 性能门 | P4 末 | **未通过（已实测，2026-11-09）** | 判据是"不劣于 PG 平台值 ~4.6k ops/s"（SATA SSD 三副本档；NVMe 档 ≥9k）。本机两块盘都在 MR9361-8i 后面 `queue/rotational=1`，没有 SSD 介质，gfs1/gfs2/gfs-client 三台 VM 当时跑着本项目的 grovefs 测试集群、且每台各有自己两条 30G 数据盘（原文「他人的集群」「共享同两块盘」两处均失实，更正见 §14 v2.4）——所以按 Spec 的原义改做**同场对照**：同机、同 op 序列（照抄平台值出处 `bench_pg_conc.sh`）、同一 feature 二进制起两臂，RF=3 三副本。结果：FDB 臂 24 个单元最好 1601 ops/s（ssd 引擎；更早三轮顶到 1200），同一场 PG 臂 4100–4900 复现平台值——差 3–6 倍，判为未通过。归因（集群侧 `status json` 80 份快照）：conflicted ≈0（非 OCC）、tx_limit 7 万+ 未饱和（非配额）、tx/op ≈1（非键空间粒度）、durability lag 5.0–18.7s 且 commit 探针 3–600ms 而 read 探针 0.1–0.5ms（提交耐久是直接压力）；但 `memory` 引擎去盘后仍只 1642，说明约 3× 差距不在盘上，实现侧余量未能归因。R3 的处置已执行：`run_all.sh` 的 CANON 去掉 `fdb`（改 `EXPERIMENTAL`，按名可跑，取证 169/0）、USAGE §6.3/§11.10 与 docs.html §5.9/§16 撤下第三后端承诺并写入实测数字、`--meta-store` help 标 EXPERIMENTAL、段数口径 35→34/34→33/32→31。**不执行**"分派处返回实验未就绪"一条——feature 本就默认关闭且 `fdb://` 已被按名拒绝（P2 实证），再返回假错误会让 P3–P8 的证据不可复跑，理由与全部数据见 §14 v1.8。转正条件：SSD/NVMe 介质上 RF=3 重跑 `.bneck/bench_g3.sh` 达 ≥4.6k（SATA）/ ≥9k（NVMe），过线才回 CANON 与承诺面；门线判定本身已可执行（`G3_GATE` 传档、`.bneck/g3_verdict.py` 出结论、退出码 0/1/2，并带同场 PG 控件下限），配方与一次自证复跑见 §14 v2.5
+| **G3** 性能门 | P4 末 | **未通过（已实测，2026-11-09）** | 判据是"不劣于 PG 平台值 ~4.6k ops/s"（SATA SSD 三副本档；NVMe 档 ≥9k）。本机两块盘都在 MR9361-8i 后面 `queue/rotational=1`，没有 SSD 介质，gfs1/gfs2/gfs-client 三台 VM 当时跑着本项目的 grovefs 测试集群、且每台各有自己两条 30G 数据盘（原文「他人的集群」「共享同两块盘」两处均失实，更正见 §14 v2.4）——所以按 Spec 的原义改做**同场对照**：同机、同 op 序列（照抄平台值出处 `bench_pg_conc.sh`）、同一 feature 二进制起两臂，RF=3 三副本。结果：FDB 臂 24 个单元最好 1601 ops/s（ssd 引擎；更早三轮顶到 1200），同一场 PG 臂 4100–4900 复现平台值——差 3–6 倍，判为未通过。归因（集群侧 `status json` 80 份快照）：conflicted ≈0（非 OCC）、tx_limit 7 万+ 未饱和（非配额）、tx/op ≈1（非键空间粒度）、durability lag 5.0–18.7s 且 commit 探针 3–600ms 而 read 探针 0.1–0.5ms（提交耐久是直接压力）；但 `memory` 引擎去盘后仍只 1642，说明约 3× 差距不在盘上，实现侧余量未能归因。R3 的处置已执行：`run_all.sh` 的 CANON 去掉 `fdb`（改 `EXPERIMENTAL`，按名可跑，取证 169/0）、USAGE §6.3/§11.10 与 docs.html §5.9/§16 撤下第三后端承诺并写入实测数字、`--meta-store` help 标 EXPERIMENTAL、段数口径 35→34/34→33/32→31。**不执行**"分派处返回实验未就绪"一条——feature 本就默认关闭且 `fdb://` 已被按名拒绝（P2 实证），再返回假错误会让 P3–P8 的证据不可复跑，理由与全部数据见 §14 v1.8。转正条件：SSD/NVMe 介质上 RF=3 重跑 `.bneck/bench_g3.sh` 达 ≥4.6k（SATA）/ ≥9k（NVMe），过线才回 CANON 与承诺面；门线判定本身已可执行（`G3_GATE` 传档、`.bneck/g3_verdict.py` 出结论、退出码 0/1/2，并带同场 PG 控件下限），配方与一次自证复跑见 §14 v2.5。**2026-11-12 真四机复跑**（`.bneck/fdb3vm_up.sh` 拉起的 4 zone `triple/ssd-2`、`Replication health` 正常；`CLUSTER3=… bash .bneck/bench_g3.sh` 两臂交错两轮，N∈{1,4,8}、T=8、6s）：PG 1,886–4,798 vs FDB 171–498，`G3_RED`（fdb/pg=0.10、fdb/gate=0.11）——旧数字来自单机三进程伪造故障域，换到真三副本**没有改变量级**；单点跳动 2–3×（`bench_fdb3.sh` 三轮同点得 425/96/223 等），所以只取多轮中位数并同时报散布
 | **G4** 语义等价门 | P5 / P6 | **未触发** | 三后端 `dump_tree()` 差分对拍 identical（P3 建立、P6 复跑）；四套治理套件在 fdb 档逐条通过（§14 v1.3 双档表）；§3 的九类映射与 §10 的冻结前缀集合未因任何一条断言放宽。暴露出的差异全部落进 §12 的可归因清单（硬链接多名下 `name` 取值、秒级时间、`ino IS NULL` 在 FDB 结构上不可能），没有一条需要"改不变量"才通过 |
 | **R5** 台架拖累 | P6 内 | **已封堵** | 集群是外部状态，缺失即 SKIP 而非 FAIL：`GROVEFS_FDB_CLUSTER_FILE=<不存在的文件> bash .build-bin/test_fdb.sh` 打 `SUMMARY: pass=0 fail=0 SKIP=1` 且 rc=0；同一条件加 `FDB_TEST=1` 打 `SUMMARY: pass=0 fail=1 SKIP=0` 且 rc=1（两条均为本轮在同一台机器上实测）。`run_all.sh::run_fdb` 把 `SKIP=1` 登记为 `RESULT[fdb]=SKIP`，不进 FAIL 计数，所以没装 FDB 的机器上全板仍 `RESULT: GREEN` |

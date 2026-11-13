@@ -754,6 +754,66 @@ impl RemoteMeta {
             Err(_) => Err(MetaError::Db("remote meta transport".to_string())),
         }
     }
+
+    /// Like [`Self::call_id`], but keeps the node the reply carries.
+    ///
+    /// `M_CREATE`/`M_SYMLINK` replies append the created row, so the client can
+    /// fill the FUSE reply without a second `M_GETATTR` round trip. A server
+    /// built before that ships an empty payload; the caller then falls back to
+    /// the old `getattr`, which keeps new-client/old-server working.
+    fn call_id_node(&self, op: u8, body: &[u8]) -> Result<(i64, Option<NodeInfo>), MetaError> {
+        match self.round_trip(op, body) {
+            Ok((0, val, data)) => {
+                let node = if data.is_empty() {
+                    None
+                } else {
+                    node_from(&data, &mut 0).ok()
+                };
+                Ok((val as i64, node))
+            }
+            Ok((c, _, _)) => Err(err_from_code(c)),
+            Err(_) => Err(MetaError::Db("remote meta transport".to_string())),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_node_rpc(
+        &self,
+        parent: i64,
+        name: &str,
+        is_dir: bool,
+        data_ref: Option<&str>,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<(i64, Option<NodeInfo>), MetaError> {
+        let mut b = Vec::new();
+        put_i64(&mut b, parent);
+        put_u8(&mut b, is_dir as u8);
+        put_opt(&mut b, data_ref);
+        proto::put_u32(&mut b, mode);
+        proto::put_u32(&mut b, uid);
+        proto::put_u32(&mut b, gid);
+        proto::put_key(&mut b, name);
+        self.call_id_node(M_CREATE, &b)
+    }
+
+    fn create_symlink_rpc(
+        &self,
+        parent: i64,
+        name: &str,
+        target: &str,
+        uid: u32,
+        gid: u32,
+    ) -> Result<(i64, Option<NodeInfo>), MetaError> {
+        let mut b = Vec::new();
+        put_i64(&mut b, parent);
+        proto::put_key(&mut b, target);
+        proto::put_u32(&mut b, uid);
+        proto::put_u32(&mut b, gid);
+        proto::put_key(&mut b, name);
+        self.call_id_node(M_SYMLINK, &b)
+    }
 }
 
 impl MetaProvider for RemoteMeta {
@@ -824,15 +884,27 @@ impl MetaProvider for RemoteMeta {
         uid: u32,
         gid: u32,
     ) -> Result<i64, MetaError> {
-        let mut b = Vec::new();
-        put_i64(&mut b, parent);
-        put_u8(&mut b, is_dir as u8);
-        put_opt(&mut b, data_ref);
-        proto::put_u32(&mut b, mode);
-        proto::put_u32(&mut b, uid);
-        proto::put_u32(&mut b, gid);
-        proto::put_key(&mut b, name);
-        self.call_id(M_CREATE, &b)
+        self.create_node_rpc(parent, name, is_dir, data_ref, mode, uid, gid)
+            .map(|(id, _)| id)
+    }
+
+    fn create_node_with_attr(
+        &self,
+        parent: i64,
+        name: &str,
+        is_dir: bool,
+        data_ref: Option<&str>,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<NodeInfo, MetaError> {
+        match self.create_node_rpc(parent, name, is_dir, data_ref, mode, uid, gid)? {
+            (_, Some(node)) => Ok(node),
+            // Old server: its reply carries only the id, so read the row back.
+            (id, None) => self
+                .getattr(id)
+                .ok_or(MetaError::NotFound),
+        }
     }
 
     fn create_symlink(
@@ -843,13 +915,22 @@ impl MetaProvider for RemoteMeta {
         uid: u32,
         gid: u32,
     ) -> Result<i64, MetaError> {
-        let mut b = Vec::new();
-        put_i64(&mut b, parent);
-        proto::put_key(&mut b, target);
-        proto::put_u32(&mut b, uid);
-        proto::put_u32(&mut b, gid);
-        proto::put_key(&mut b, name);
-        self.call_id(M_SYMLINK, &b)
+        self.create_symlink_rpc(parent, name, target, uid, gid)
+            .map(|(id, _)| id)
+    }
+
+    fn create_symlink_with_attr(
+        &self,
+        parent: i64,
+        name: &str,
+        target: &str,
+        uid: u32,
+        gid: u32,
+    ) -> Result<NodeInfo, MetaError> {
+        match self.create_symlink_rpc(parent, name, target, uid, gid)? {
+            (_, Some(node)) => Ok(node),
+            (id, None) => self.getattr(id).ok_or(MetaError::NotFound),
+        }
     }
 
     fn link_node(&self, src_ino: i64, new_parent: i64, new_name: &str) -> Result<i64, MetaError> {

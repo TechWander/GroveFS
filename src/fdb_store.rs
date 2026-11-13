@@ -84,7 +84,13 @@
 //!   backends does not also compare tuning histories. We do NOT use
 //!   `Transaction::on_error`, which applies the C client's own unbounded retry and
 //!   backoff policy: that would silently replace the frozen budget with a
-//!   different one and make the two backends incomparable.
+//!   different one and make the two backends incomparable. For the same reason
+//!   `RetryLimit`/`MaxRetryDelay` are never set — without `on_error` they do
+//!   nothing. What every data-path transaction DOES carry is
+//!   `TransactionOption::Timeout` (see [`DATA_TX_TIMEOUT_MS`], applied by
+//!   [`data_trx`]): that is a liveness ceil, not a retry policy — `block_on` has
+//!   no deadline of its own, so an unreachable cluster would otherwise park a
+//!   fuser worker forever instead of surfacing an error.
 //! * **No connection pools.** There is no checkout/requeue/wait stage here on
 //!   purpose — porting [`crate::pg_store`]`'s pool logic would invent a resource
 //!   the backend does not have. One `Database` handle per cluster file is shared
@@ -297,13 +303,14 @@ fn database(cluster_file: &str) -> Result<DbHandle, std::io::Error> {
 //    startup, refuses when the database is not available, and prints the
 //    topology it found — which is also how an operator can tell a single-node
 //    test cluster from a replicated one in the server's own log.
-// 2. "One meta-server per deployment" was a COMMENT (the control plane is local
-//    files, so two servers sharing a `--meta-dir` would each keep their own view
-//    definitions while writing the same subspaces — divergent governance over
-//    one tree). It is now a lease row in the cluster: the second server waits up
-//    to the TTL for the first one's row to expire and then refuses, a crashed
-//    holder's row expires so a restart proceeds after at most one TTL, and
-//    `grovefs view lease` shows and clears stale rows.
+// 2. "One meta-server per deployment" was a COMMENT, not an enforced rule: two
+//    servers sharing a `--meta-dir` would both write the same subspaces with no
+//    fencing between them (governance is cluster-wide too now, so the risk is
+//    two write authorities over one tree, not divergent definitions). It is now
+//    a lease row in the cluster: the second server waits up to the TTL for the
+//    first one's row to expire and then refuses, a crashed holder's row expires
+//    so a restart proceeds after at most one TTL, and `grovefs view lease` shows
+//    and clears stale rows.
 //
 // The unit is the DEPLOYMENT (the canonical `--meta-dir`), not the cluster:
 // the suite this backend is tested with runs several meta-servers against one
@@ -322,6 +329,29 @@ pub const OPEN_TIMEOUT_ENV: &str = "GROVEFS_FDB_OPEN_TIMEOUT_SECS";
 const WRITER_LEASE_DEFAULT_SECS: u64 = 10;
 const OPEN_TIMEOUT_DEFAULT_SECS: u64 = 10;
 const LEASE_TX_TIMEOUT_MS: i32 = 5_000;
+
+/// Timeout on every data-path transaction (namespace ops, governance probes,
+/// scans). Without it a transaction whose commit cannot complete waits forever:
+/// `block_on` parks a fuser worker thread and nothing above it has a deadline,
+/// so an unreachable cluster turns into a hung mount instead of an error.
+///
+/// Deliberately generous: this is a liveness ceil, not a latency budget. An
+/// `import` may commit close to the 10 MB transaction limit, and a loaded
+/// three-replica cluster can take seconds to acknowledge that — 30s clears the
+/// slow case while still bounding a wedged one. Retry accounting stays ours
+/// (see the module docs on why `on_error`/`RetryLimit` are not used).
+const DATA_TX_TIMEOUT_MS: i32 = 30_000;
+
+/// One data-path transaction with the standard options applied. A failure to
+/// carry the timeout is tolerated (the op still runs, just unbounded), because
+/// turning a tuning knob into an outage would be worse than the missing ceil.
+fn data_trx(db: &Database) -> Result<Transaction, FdbError> {
+    let trx = db.create_trx()?;
+    let _ = trx.set_option(foundationdb::options::TransactionOption::Timeout(
+        DATA_TX_TIMEOUT_MS,
+    ));
+    Ok(trx)
+}
 
 fn env_secs(name: &str) -> Option<u64> {
     std::env::var(name)
@@ -432,13 +462,16 @@ pub fn writer_owner_id() -> String {
 fn lease_keys() -> Keys {
     // The lease key space is a ROOT sibling, so any `Keys` value addresses it;
     // this name is never written (same trick `rebuild_ledger` uses).
-    Keys::for_view(REBUILD_PROBE_VIEW)
+    root_keys()
 }
 
-/// Run one lease transaction with the same bounded retry policy the view writes
-/// use: a conflict re-runs the BODY (which re-reads the row), so a race is
-/// resolved by the read, never by a blind overwrite.
-fn with_lease_tx<T, F>(
+/// Run one small control-plane transaction with the same bounded retry policy the
+/// view writes use: a conflict re-runs the BODY (which re-reads the row), so a
+/// race is resolved by the read, never by a blind overwrite. Used by the
+/// writer-lease rows and by the credential/audit tables ([`CtlKeyTable`]) — all
+/// of them are single-row (or single-scan) control-plane operations, not tree
+/// mutations.
+fn with_kv_tx<T, F>(
     db: &DbHandle,
     mut body: F,
 ) -> Result<T, std::io::Error>
@@ -489,7 +522,7 @@ fn lease_attempt(
 ) -> Result<LeaseStep, std::io::Error> {
     let now = now_ms();
     let expires = now + ttl.as_millis() as i64;
-    with_lease_tx(db, |trx| {
+    with_kv_tx(db, |trx| {
         let cur = futures::executor::block_on(trx.get(key, false)).map_err(TxErr::from)?;
         if let Some(row) = cur.as_deref().and_then(|b| WriterLease::unpack(deployment, b)) {
             if row.expires_at_ms > now {
@@ -568,7 +601,7 @@ pub fn renew_writer_lease(
     let db = database(&cluster_file)?;
     let key = lease_keys().writer_lease(deployment);
     let expires = now_ms() + ttl.as_millis() as i64;
-    with_lease_tx(&db, |trx| {
+    with_kv_tx(&db, |trx| {
         let cur = futures::executor::block_on(trx.get(&key, false)).map_err(TxErr::from)?;
         match cur.as_deref().and_then(|b| WriterLease::unpack(deployment, b)) {
             Some(row) if row.owner == owner => {
@@ -599,7 +632,7 @@ pub fn release_writer_lease(
     let cluster_file = FdbConfig::parse_cluster(uri)?;
     let db = database(&cluster_file)?;
     let key = lease_keys().writer_lease(deployment);
-    with_lease_tx(&db, |trx| {
+    with_kv_tx(&db, |trx| {
         let cur = futures::executor::block_on(trx.get(&key, false)).map_err(TxErr::from)?;
         let Some(row) = cur.as_deref().and_then(|b| WriterLease::unpack(deployment, b)) else {
             return Ok(false);
@@ -638,6 +671,482 @@ pub fn list_writer_leases(uri: &str) -> Result<Vec<WriterLease>, std::io::Error>
     }
     out.sort_by(|a, b| a.deployment.cmp(&b.deployment));
     Ok(out)
+}
+
+// ---- control plane: credentials and the call audit ---------------------------
+//
+// The same two tables [`crate::apikeys`] keeps in one SQLite file or in the
+// `grovefs_control` schema, here under `(root,'ctl',…)` — a root sibling for the
+// reason `refs` and `writer` are siblings: a credential governs EVERY tree, so
+// there is no view prefix it could belong to, and `view rm --base` of any tree
+// must be unable to reach it.
+//
+// Two shape decisions are what keep this table comparable to the SQL ones rather
+// than merely working:
+//   * the row's KEY is the `id` (the primary key both SQL backends use), so
+//     authentication is one point read and never a scan;
+//   * insertion ORDER is a key, not a column — `(ctl,'order',seq)` → id and
+//     `(ctl,'calls',seq)` → row — mirroring SQLite's implicit `rowid` and PG's
+//     `seq IDENTITY`. `apikey list` then reports newest-first from a range read,
+//     and `apikey calls` takes its `--limit` off the END of the range, which is
+//     the cost `ORDER BY … DESC LIMIT $1` has on the SQL backends.
+//
+// Values are JSON rather than a packed tuple: nothing indexes a value component
+// here, so tuple packing would buy an ordering nobody reads, while JSON keeps a
+// row legible to an operator looking at a cluster in trouble with `fdbcli
+// getrange` — which is the one moment this table has to be readable by a human
+// who is not running grovefs.
+
+/// One credential row: exactly the `api_keys` columns, so `apikey list` prints
+/// the same table on all three backends.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CtlKeyRow {
+    pub id: String,
+    pub label: String,
+    /// SHA-256 of the secret half. The plaintext is never stored (see
+    /// [`crate::apikeys`]), so a dump of this subspace hands out nothing usable.
+    pub secret_hash: String,
+    pub created_at: String,
+    pub last_used_at: Option<String>,
+    pub revoked_at: Option<String>,
+    pub scope: String,
+    pub view: Option<String>,
+    pub ro: bool,
+    pub owner: Option<String>,
+}
+
+impl CtlKeyRow {
+    fn encode(&self) -> Vec<u8> {
+        json!({
+            "id": &self.id,
+            "label": &self.label,
+            "secret_hash": &self.secret_hash,
+            "created_at": &self.created_at,
+            "last_used_at": &self.last_used_at,
+            "revoked_at": &self.revoked_at,
+            "scope": &self.scope,
+            "view": &self.view,
+            "ro": self.ro,
+            "owner": &self.owner,
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        let v: Value = serde_json::from_slice(bytes).ok()?;
+        let s = |f: &str| v.get(f).and_then(Value::as_str).map(str::to_string);
+        Some(Self {
+            id: s("id")?,
+            label: s("label")?,
+            secret_hash: s("secret_hash")?,
+            created_at: s("created_at")?,
+            last_used_at: s("last_used_at"),
+            revoked_at: s("revoked_at"),
+            scope: s("scope")?,
+            view: s("view"),
+            ro: v.get("ro").and_then(Value::as_bool).unwrap_or(false),
+            owner: s("owner"),
+        })
+    }
+}
+
+/// One call-audit row (`mcp_calls`), by the same column names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CtlCallRow {
+    pub ts: String,
+    pub key_id: Option<String>,
+    pub key_label: Option<String>,
+    pub method: String,
+    pub tool: String,
+    pub ok: bool,
+    pub detail: String,
+}
+
+impl CtlCallRow {
+    fn encode(&self) -> Vec<u8> {
+        json!({
+            "ts": &self.ts,
+            "key_id": &self.key_id,
+            "key_label": &self.key_label,
+            "method": &self.method,
+            "tool": &self.tool,
+            "ok": self.ok,
+            "detail": &self.detail,
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        let v: Value = serde_json::from_slice(bytes).ok()?;
+        let s = |f: &str| v.get(f).and_then(Value::as_str).map(str::to_string);
+        Some(Self {
+            ts: s("ts")?,
+            key_id: s("key_id"),
+            key_label: s("key_label"),
+            method: s("method")?,
+            tool: s("tool")?,
+            ok: v.get("ok").and_then(Value::as_bool).unwrap_or(false),
+            detail: s("detail").unwrap_or_default(),
+        })
+    }
+}
+
+/// Any `Keys` value addresses the ROOT siblings (`refs`, `writer`, `ctl`): the
+/// view name packed into it is never written, which is the trick
+/// [`rebuild_ledger`] uses for the ledger.
+fn root_keys() -> Keys {
+    Keys::for_view(REBUILD_PROBE_VIEW)
+}
+
+/// Claim the next value of one insertion counter INSIDE the caller's transaction,
+/// so a row and its ordering entry commit together — a torn write would otherwise
+/// leave the `order`/`calls` index pointing at a row that never landed.
+fn ctl_next_seq(trx: &Transaction, key: &[u8]) -> Result<i64, TxErr> {
+    let cur = futures::executor::block_on(trx.get(key, false))
+        .map_err(TxErr::from)?
+        .as_deref()
+        .and_then(unpack_i64)
+        .unwrap_or(0);
+    let next = cur + 1;
+    trx.set(key, &next.pack_to_vec());
+    Ok(next)
+}
+
+/// Every key in `opt`, pages followed until the range is exhausted — the same
+/// continuation [`Tx::scan`] runs, without that method's view-boundary assertion
+/// (these keys live under the `ctl` sibling, outside every view by design).
+fn ctl_scan_all(
+    trx: &Transaction,
+    opt: RangeOption<'static>,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TxErr> {
+    let mut out = Vec::new();
+    let mut next = Some(opt);
+    while let Some(mut page) = next {
+        page.target_bytes = PAGE_BYTES;
+        let kvs = futures::executor::block_on(trx.get_range(&page, 1, true)).map_err(TxErr::from)?;
+        for kv in kvs.as_ref().iter() {
+            out.push((kv.key().to_vec(), kv.value().to_vec()));
+        }
+        next = page.next_range(&kvs);
+    }
+    Ok(out)
+}
+
+/// The cluster-side credential/audit tables of one `fdb://` deployment.
+///
+/// Cheap to build and safe to share (`&self` everywhere): the `Database` handle
+/// behind it is the per-cluster one every view already shares, so a meta-server
+/// that opens a key store adds no connection.
+pub struct CtlKeyTable {
+    keys: Keys,
+    db: DbHandle,
+}
+
+impl CtlKeyTable {
+    /// Open the tables on the cluster named by `uri` (`fdb://<cluster-file>`).
+    /// Nothing is created here: both tables are key spaces, and an empty range is
+    /// a valid empty table — unlike PG, which needs its DDL run first.
+    pub fn open(uri: &str) -> Result<Self, String> {
+        let cluster_file = FdbConfig::parse_cluster(uri).map_err(|e| e.to_string())?;
+        let db = database(&cluster_file).map_err(|e| e.to_string())?;
+        Ok(Self {
+            keys: root_keys(),
+            db,
+        })
+    }
+
+    /// One control-plane transaction, with the same bounded retry budget the view
+    /// writes use (see [`with_kv_tx`]).
+    fn run<T, F>(&self, body: F) -> Result<T, String>
+    where
+        F: FnMut(&Transaction) -> Result<T, TxErr>,
+    {
+        with_kv_tx(&self.db, body).map_err(|e| e.to_string())
+    }
+
+    /// Insert one credential row, claiming its position in the listing order in
+    /// the same transaction.
+    pub fn insert_key(&self, row: &CtlKeyRow) -> Result<(), String> {
+        let val = row.encode();
+        let row_key = self.keys.ctl_key(&row.id);
+        let order_id = row.id.clone().into_bytes();
+        self.run(move |trx| {
+            let seq = ctl_next_seq(trx, &self.keys.ctl_seq(CTL_KEY_ROW))?;
+            trx.set(&row_key, &val);
+            trx.set(&self.keys.ctl_order(seq), &order_id);
+            Ok(())
+        })
+    }
+
+    /// One credential row by id — the whole authentication lookup.
+    pub fn lookup(&self, id: &str) -> Result<Option<CtlKeyRow>, String> {
+        let key = self.keys.ctl_key(id);
+        self.run(|trx| {
+            // A snapshot read: this transaction writes nothing, and an
+            // authentication must not enter a conflict set a concurrent mint/revoke
+            // would then have to settle.
+            let cur = futures::executor::block_on(trx.get(&key, true)).map_err(TxErr::from)?;
+            Ok(cur.as_deref().and_then(CtlKeyRow::decode))
+        })
+    }
+
+    /// Read-modify-write one row. `f` returns false for "there is nothing this
+    /// operation may change" (a revoked key, an unknown id), which is reported as
+    /// `Ok(false)` rather than written back unchanged — the same verdict the SQL
+    /// backends derive from `rows_affected == 0`.
+    fn mutate<F>(&self, id: &str, mut f: F) -> Result<bool, String>
+    where
+        F: FnMut(&mut CtlKeyRow) -> bool,
+    {
+        let key = self.keys.ctl_key(id);
+        self.run(move |trx| {
+            let cur = futures::executor::block_on(trx.get(&key, false)).map_err(TxErr::from)?;
+            let Some(mut row) = cur.as_deref().and_then(CtlKeyRow::decode) else {
+                return Ok(false);
+            };
+            if !f(&mut row) {
+                return Ok(false);
+            }
+            trx.set(&key, &row.encode());
+            Ok(true)
+        })
+    }
+
+    /// Stamp `last_used_at` after a successful authentication.
+    pub fn stamp_used(&self, id: &str, ts: &str) -> Result<(), String> {
+        let ts = ts.to_string();
+        self.mutate(id, move |r| {
+            r.last_used_at = Some(ts.clone());
+            true
+        })
+        .map(|_| ())
+    }
+
+    /// Flip the read-only flag of an ACTIVE key (`apikey set-ro`), reporting
+    /// whether an active row was there to flip.
+    pub fn set_ro(&self, id: &str, ro: bool) -> Result<bool, String> {
+        self.mutate(id, move |r| {
+            if r.revoked_at.is_some() {
+                return false;
+            }
+            r.ro = ro;
+            true
+        })
+    }
+
+    /// Revoke an ACTIVE key, reporting whether this call did it (a second revoke
+    /// is `Ok(false)` and leaves the first timestamp alone).
+    pub fn revoke(&self, id: &str, ts: &str) -> Result<bool, String> {
+        let ts = ts.to_string();
+        self.mutate(id, move |r| {
+            if r.revoked_at.is_some() {
+                return false;
+            }
+            r.revoked_at = Some(ts.clone());
+            true
+        })
+    }
+
+    /// Every key, in the order `apikey list` prints them: `created_at` descending
+    /// with insertion order as the tiebreak — the ORDER BY both SQL backends
+    /// spell out, kept identical rather than "close enough".
+    pub fn list(&self) -> Result<Vec<CtlKeyRow>, String> {
+        self.run(|trx| {
+            let mut rows: Vec<(i64, CtlKeyRow)> = Vec::new();
+            for (okey, oval) in ctl_scan_all(trx, self.keys.ctl_orders())? {
+                let Ok((_, seq)) = self.keys.ctl.unpack::<(String, i64)>(&okey) else {
+                    continue;
+                };
+                let id = String::from_utf8_lossy(&oval).into_owned();
+                let cur = futures::executor::block_on(trx.get(&self.keys.ctl_key(&id), true))
+                    .map_err(TxErr::from)?;
+                if let Some(row) = cur.as_deref().and_then(CtlKeyRow::decode) {
+                    rows.push((seq, row));
+                }
+            }
+            rows.sort_by(|a, b| b.1.created_at.cmp(&a.1.created_at).then(b.0.cmp(&a.0)));
+            Ok(rows.into_iter().map(|(_, r)| r).collect())
+        })
+    }
+
+    /// Append one audit row.
+    pub fn append_call(&self, row: &CtlCallRow) -> Result<(), String> {
+        let val = row.encode();
+        self.run(move |trx| {
+            let seq = ctl_next_seq(trx, &self.keys.ctl_seq(CTL_CALL_ROW))?;
+            trx.set(&self.keys.ctl_call(seq), &val);
+            Ok(())
+        })
+    }
+
+    /// The most recent `limit` audit rows, newest first: a REVERSE range read off
+    /// the tail of the `calls` subrange, which is `ORDER BY seq DESC LIMIT n`
+    /// without the sort.
+    pub fn recent_calls(&self, limit: usize) -> Result<Vec<CtlCallRow>, String> {
+        let mut opt = self.keys.ctl_calls();
+        opt.reverse = true;
+        opt.limit = Some(limit);
+        self.run(move |trx| {
+            let kvs = futures::executor::block_on(trx.get_range(&opt, 1, true))
+                .map_err(TxErr::from)?;
+            Ok(kvs
+                .as_ref()
+                .iter()
+                .filter_map(|kv| CtlCallRow::decode(kv.value()))
+                .take(limit)
+                .collect())
+        })
+    }
+}
+
+/// The cluster-side view-definition table of one `fdb://` deployment — the
+/// FoundationDB analogue of PG's `grovefs_control.view_defs` and of the file
+/// store's `meta/views/<name>.layout` slots. It lives under the SAME `ctl` root
+/// sibling as the credential/audit tables ([`CtlKeyTable`]), so a definition
+/// belongs to the deployment: no view's teardown can reach it and no view can
+/// shadow it. This is what makes an `fdb://` control plane a single system of
+/// record shared by every meta-server / MCP / CLI on the cluster, exactly as PG
+/// is — nothing to sync, nothing to co-locate.
+///
+/// Cheap to build and safe to share (`&self` everywhere): the `Database` handle
+/// behind it is the per-cluster one every view already shares, so opening a
+/// definition table adds no connection (same contract as [`CtlKeyTable`]).
+pub struct CtlDefTable {
+    keys: Keys,
+    db: DbHandle,
+}
+
+impl CtlDefTable {
+    /// Open the table on the cluster named by `uri` (`fdb://<cluster-file>`).
+    /// Nothing is created here: the definitions are a key space, and an empty
+    /// range is a valid empty table — unlike PG, which needs its DDL run first.
+    pub fn open(uri: &str) -> Result<Self, String> {
+        let cluster_file = FdbConfig::parse_cluster(uri).map_err(|e| e.to_string())?;
+        let db = database(&cluster_file).map_err(|e| e.to_string())?;
+        Ok(Self {
+            keys: root_keys(),
+            db,
+        })
+    }
+
+    /// One control-plane transaction, with the same bounded retry budget the
+    /// credential table and the view writes use (see [`with_kv_tx`]).
+    fn run<T, F>(&self, body: F) -> Result<T, String>
+    where
+        F: FnMut(&Transaction) -> Result<T, TxErr>,
+    {
+        with_kv_tx(&self.db, body).map_err(|e| e.to_string())
+    }
+
+    /// Publish (or replace) one definition, claiming a fresh write version in
+    /// the same transaction. The version is the hot-reload ticket the file store
+    /// gets from mtime and PG from `xmin`: it changes on EVERY publish, even a
+    /// byte-identical one (exactly PG's UPDATE semantics), so a cached lens is
+    /// always evicted when a definition is re-written.
+    pub fn put(&self, name: &str, text: &str) -> Result<(), String> {
+        let def_key = self.keys.ctl_def(name);
+        let ver_key = self.keys.ctl_def_ver(name);
+        let val = text.as_bytes().to_vec();
+        self.run(move |trx| {
+            let ver = ctl_next_seq(trx, &self.keys.ctl_seq(CTL_DEF_ROW))?;
+            trx.set(&def_key, &val);
+            trx.set(&ver_key, &ver.pack_to_vec());
+            Ok(())
+        })
+    }
+
+    /// One definition's verbatim text, or `None` when the name is not governed.
+    pub fn get(&self, name: &str) -> Result<Option<String>, String> {
+        let key = self.keys.ctl_def(name);
+        self.run(|trx| {
+            // Snapshot read: this transaction writes nothing, and a definition
+            // probe must not enter a conflict set a concurrent publish would
+            // then have to settle (same reason [`CtlKeyTable::lookup`] does).
+            let cur = futures::executor::block_on(trx.get(&key, true)).map_err(TxErr::from)?;
+            Ok(cur.as_deref().map(|b| String::from_utf8_lossy(b).into_owned()))
+        })
+    }
+
+    /// Every governed definition as (name, verbatim text), in name order — the
+    /// `ORDER BY name` the PG store spells out, carried here by the tuple-layer
+    /// ordering of the packed names.
+    pub fn list(&self) -> Result<Vec<(String, String)>, String> {
+        self.run(|trx| {
+            let mut out = Vec::new();
+            for (key, val) in ctl_scan_all(trx, self.keys.ctl_defs())? {
+                let Ok((_, name)) = self.keys.ctl.unpack::<(String, String)>(&key) else {
+                    continue;
+                };
+                out.push((name, String::from_utf8_lossy(&val).into_owned()));
+            }
+            Ok(out)
+        })
+    }
+
+    /// Remove one definition and its version ticket, reporting whether a row was
+    /// there to remove — the `rows_affected > 0` verdict the SQL backends derive
+    /// from DELETE. The version key is cleared too, so a later re-publish claims
+    /// a fresh ticket rather than resurrecting the old one.
+    pub fn remove(&self, name: &str) -> Result<bool, String> {
+        let def_key = self.keys.ctl_def(name);
+        let ver_key = self.keys.ctl_def_ver(name);
+        self.run(move |trx| {
+            let cur = futures::executor::block_on(trx.get(&def_key, false)).map_err(TxErr::from)?;
+            if cur.is_none() {
+                return Ok(false);
+            }
+            trx.clear(&def_key);
+            trx.clear(&ver_key);
+            Ok(true)
+        })
+    }
+
+    /// The hot-reload ticket for `name`: its write version, or `None` when the
+    /// name is not governed right now. The version is claimed from the GLOBAL
+    /// `view_defs` counter, so it is monotonic and never reused — a remove-then-
+    /// re-publish cannot collide with a cached stamp the way a per-name counter
+    /// reset to zero would.
+    pub fn stamp(&self, name: &str) -> Result<Option<String>, String> {
+        let key = self.keys.ctl_def_ver(name);
+        self.run(|trx| {
+            let cur = futures::executor::block_on(trx.get(&key, true)).map_err(TxErr::from)?;
+            Ok(cur.as_deref().and_then(unpack_i64).map(|v| v.to_string()))
+        })
+    }
+
+    /// One-time upload of a deployment's pre-existing local definition slots
+    /// (an older build kept `fdb://` definitions as `meta/views/*.layout` files)
+    /// into the cluster. Non-clobbering: a name already governed in the cluster
+    /// is left untouched, so a stale local slot can never overwrite a newer
+    /// cluster definition. Guarded by a marker written in the SAME transaction,
+    /// so it runs once per deployment and is safe to call concurrently. Returns
+    /// how many definitions were uploaded (0 once the marker is set).
+    pub fn migrate_local(&self, defs: &[(String, String)]) -> Result<usize, String> {
+        let marker = self.keys.ctl_defs_migrated();
+        self.run(move |trx| {
+            let done = futures::executor::block_on(trx.get(&marker, true)).map_err(TxErr::from)?;
+            if done.is_some() {
+                return Ok(0);
+            }
+            let mut n = 0;
+            for (name, text) in defs {
+                let def_key = self.keys.ctl_def(name);
+                let cur =
+                    futures::executor::block_on(trx.get(&def_key, false)).map_err(TxErr::from)?;
+                if cur.is_some() {
+                    continue;
+                }
+                let ver = ctl_next_seq(trx, &self.keys.ctl_seq(CTL_DEF_ROW))?;
+                trx.set(&def_key, text.as_bytes());
+                trx.set(&self.keys.ctl_def_ver(name), &ver.pack_to_vec());
+                n += 1;
+            }
+            trx.set(&marker, b"1");
+            Ok(n)
+        })
+    }
 }
 
 /// What the cluster says about itself: availability, replication mode, fault
@@ -928,6 +1437,26 @@ const TAG_REFS: &str = "refs";
 /// control plane governs those trees; see [`FdbStore::open`] for why that, and
 /// not the cluster, is the unit that must have one writer.
 const TAG_WRITER: &str = "writer";
+/// `root + tuple("ctl")` — the deployment's API-key and call-audit tables, a
+/// THIRD root sibling beside the view prefixes for the same reason the other two
+/// are: a credential belongs to the deployment (for this backend, the cluster),
+/// so no view's teardown may reach it, and no view may shadow it.
+const TAG_CTL: &str = "ctl";
+const CTL_KEY_ROW: &str = "keys";
+const CTL_KEY_ORDER: &str = "order";
+const CTL_CALL_ROW: &str = "calls";
+const CTL_SEQ: &str = "seq";
+/// `view_defs` / `view_def_ver` — the cluster-side definition table and its
+/// per-name write-version tickets: the FDB analogue of PG's
+/// `grovefs_control.view_defs` (and of the file store's `meta/views/*.layout`
+/// slots). They share the `ctl` root sibling with the credential/audit tables
+/// because a definition belongs to the DEPLOYMENT, so no view's teardown may
+/// reach it and no view may shadow it.
+const CTL_DEF_ROW: &str = "view_defs";
+const CTL_DEF_VER: &str = "view_def_ver";
+/// One-time marker: this deployment's pre-existing local definition slots have
+/// been uploaded into the cluster (see [`CtlDefTable::migrate_local`]).
+const CTL_DEFS_MIGRATED: &str = "defs_migrated";
 
 const CTRL_EPOCH: &str = "epoch";
 const ALLOC_ID: &str = "id";
@@ -958,6 +1487,10 @@ pub struct Keys {
     /// of the view prefixes (no view owns it, so it must live outside any view
     /// prefix or `view rm --base` of one tree could delete the lease of another).
     writer: Subspace,
+    /// `root + tuple("ctl")` — the API-key and call-audit tables the governance
+    /// port authenticates against. A sibling for the writer table's reason: they
+    /// describe who may open ANY tree, so they cannot live inside one.
+    ctl: Subspace,
 }
 
 impl Keys {
@@ -972,6 +1505,7 @@ impl Keys {
             view: root.subspace(&view),
             refs: root.subspace(&TAG_REFS),
             writer: root.subspace(&TAG_WRITER),
+            ctl: root.subspace(&TAG_CTL),
         }
     }
 
@@ -1252,6 +1786,69 @@ impl Keys {
         self.writer.subspace(&WRITER_LEASE).range().into()
     }
 
+    /// `(root,'ctl','keys',id)` → one credential row (JSON, see [`CtlKeyRow`]).
+    /// `id` is the whole key: the table has exactly one lookup pattern, and an
+    /// insert is therefore one `set` with no index to maintain.
+    pub fn ctl_key(&self, id: &str) -> Vec<u8> {
+        self.ctl.pack(&(CTL_KEY_ROW, id))
+    }
+
+    /// `(root,'ctl','order',seq)` → the id of the `seq`-th key minted. This is
+    /// the ordering `apikey list` reports newest-first, carried by the KEY so the
+    /// listing needs no sort of a table it cannot index.
+    pub fn ctl_order(&self, seq: i64) -> Vec<u8> {
+        self.ctl.pack(&(CTL_KEY_ORDER, seq))
+    }
+
+    /// Whole insertion-order index.
+    pub fn ctl_orders(&self) -> RangeOption<'static> {
+        self.ctl.subspace(&CTL_KEY_ORDER).range().into()
+    }
+
+    /// `(root,'ctl','calls',seq)` → one audit row (JSON, see [`CtlCallRow`]).
+    pub fn ctl_call(&self, seq: i64) -> Vec<u8> {
+        self.ctl.pack(&(CTL_CALL_ROW, seq))
+    }
+
+    /// Every audit row in insertion order; [`CtlKeyTable::recent_calls`] reads it
+    /// backwards with a limit, so "newest first" is a range direction, not a
+    /// sort.
+    pub fn ctl_calls(&self) -> RangeOption<'static> {
+        self.ctl.subspace(&CTL_CALL_ROW).range().into()
+    }
+
+    /// `(root,'ctl','seq',kind)` — the insertion counter for `"keys"`, `"calls"`
+    /// or `"view_defs"`. Separate counters rather than one so revoking a key
+    /// cannot leave a hole in the audit sequence (a gap is how an operator spots
+    /// a rewritten log), and a definition re-publish never consumes an audit seq.
+    pub fn ctl_seq(&self, kind: &str) -> Vec<u8> {
+        self.ctl.pack(&(CTL_SEQ, kind))
+    }
+
+    /// `(root,'ctl','view_defs',name)` → one definition's verbatim text. `name`
+    /// is the whole key (one lookup pattern), so a publish is one `set` plus its
+    /// version ticket — the FDB analogue of a `grovefs_control.view_defs` row.
+    pub fn ctl_def(&self, name: &str) -> Vec<u8> {
+        self.ctl.pack(&(CTL_DEF_ROW, name))
+    }
+
+    /// `(root,'ctl','view_def_ver',name)` → the definition's write version (i64),
+    /// the hot-reload ticket the file store reads from mtime and PG from `xmin`.
+    pub fn ctl_def_ver(&self, name: &str) -> Vec<u8> {
+        self.ctl.pack(&(CTL_DEF_VER, name))
+    }
+
+    /// Whole definition table; the tuple layer orders the packed names, so the
+    /// scan is already in `ORDER BY name` order (no sort of an unindexable table).
+    pub fn ctl_defs(&self) -> RangeOption<'static> {
+        self.ctl.subspace(&CTL_DEF_ROW).range().into()
+    }
+
+    /// `(root,'ctl','defs_migrated')` → the one-time local-slot migration marker.
+    pub fn ctl_defs_migrated(&self) -> Vec<u8> {
+        self.ctl.pack(&(CTL_DEFS_MIGRATED,))
+    }
+
     /// Decode one ledger key back to its `data_ref`.
     pub fn decode_ledger(&self, key: &[u8]) -> Option<String> {
         self.refs.unpack::<(String,)>(key).ok().map(|(dr,)| dr)
@@ -1343,6 +1940,16 @@ impl FdbConfig {
             return Err(std::io::Error::other(
                 "view name 'writer' is reserved: it is the cluster's writer-lease \
                  table (one row per deployment), not a tree — choose another name",
+            ));
+        }
+        // `ctl` is the third sibling: the API-key/audit tables the governance
+        // port authenticates against. A tree named 'ctl' would put its root row
+        // inside them, and `view rm --base ctl` would then delete the only
+        // credentials that can govern the cluster.
+        if view == TAG_CTL {
+            return Err(std::io::Error::other(
+                "view name 'ctl' is reserved: it holds the cluster's API-key and \
+                 call-audit tables, not a tree — choose another name",
             ));
         }
         // §1 also carries PG's 25-byte cap over, even though FDB needs no such
@@ -1681,6 +2288,377 @@ fn first_holder(tx: &Tx, keys: &Keys, ino: i64) -> Result<Option<(i64, String)>,
         .map(|(_, parent, name)| (parent, name)))
 }
 
+/// The portable spelling of an entry's name, mapped to the name its KEY lives at.
+///
+/// The root row is exported the way BOTH SQL dumps export it: name "/" with a
+/// NULL parent. "/" is precisely the one spelling that is not a legal directory
+/// entry — it names the frozen root KEY `(ROOT_PARENT, "")` (§1) and nothing else
+/// can reach that key — so every place a row is turned into a stored name goes
+/// through this one rule rather than re-deciding it.
+fn root_entry_name<'a>(parent: i64, name: &'a str) -> &'a str {
+    if parent == ROOT_PARENT && name == "/" {
+        ""
+    } else {
+        name
+    }
+}
+
+// ---- writing a tree's rows ---------------------------------------------------
+//
+// Three callers write whole trees into a view subspace: `import_jsonl` (a
+// migration dump), `fork_tree` (a copy of another view) and `graft_tree` (a
+// subtree placed into an existing one). They must agree on every key family a
+// row owns, on when the shared ledger is booked, on which name the `('i',ino)`
+// pointer names and on how the allocator water marks move — so all four
+// decisions live here once, and the callers differ only in which rows they hand
+// over.
+
+/// Mutable state one transaction's worth of rows leaves behind for the finish
+/// pass: the inodes whose `('i',ino)` pointer must be (re)written, the
+/// authoritative name of every directory written, and the id/ino high-water
+/// marks §4's allocator continues from.
+struct RowWriter {
+    inos: std::collections::BTreeSet<i64>,
+    /// ino -> the `(parent, stored_name)` its name key lives at, for directories:
+    /// they have no holder rows, so their own name is their authoritative one.
+    dir_entry_of: std::collections::HashMap<i64, (i64, String)>,
+    max_id: i64,
+    max_ino: i64,
+}
+
+impl RowWriter {
+    fn new() -> Self {
+        Self {
+            inos: Default::default(),
+            dir_entry_of: Default::default(),
+            max_id: crate::meta::ROOT_INO,
+            max_ino: crate::meta::ROOT_INO,
+        }
+    }
+}
+
+/// Write ONE entry — every key family the entry owns — inside the caller's
+/// transaction.
+///
+/// The ledger rule is stated once here because it is the one that is easy to get
+/// wrong: the shared counter carries one unit per content key per VIEW (§3.6),
+/// never per name, so a view books a blob at the moment it gains its FIRST name
+/// for it. Read in the same transaction, that test is `count_range` over this
+/// view's own `'r` family: a second name in the same batch, a re-graft of the
+/// same subtree and a hard link all see the key the first name wrote and book
+/// nothing. The alternative (collect the batch's blobs and book them after the
+/// rows land) cannot tell "already named before this call" from "named by this
+/// call" and leaves a holder nobody ever unbooks.
+fn put_row_tx(
+    tx: &Tx,
+    keys: &Keys,
+    w: &mut RowWriter,
+    parent: i64,
+    name: &str,
+    rec: &Rec,
+) -> Result<(), TxErr> {
+    let stored_name = root_entry_name(parent, name);
+    tx.set(&keys.name(parent, stored_name), &rec.pack());
+    tx.set(&keys.by_id(rec.id), &(parent, stored_name).pack_to_vec());
+    if rec.is_dir {
+        tx.set(&keys.dir_entry(parent, stored_name), b"");
+        w.dir_entry_of.insert(rec.ino, (parent, stored_name.to_string()));
+    } else {
+        tx.set(&keys.holder(rec.ino, parent, stored_name), b"");
+    }
+    if let Some(dr) = &rec.data_ref {
+        let first_name = tx.count_range(&keys.dataref_prefix_of(dr))? == 0;
+        tx.set(&keys.dataref(dr, parent, stored_name), b"");
+        if first_name {
+            tx.bump(&keys.ledger(dr), 1)?;
+        }
+    }
+    w.inos.insert(rec.ino);
+    w.max_id = w.max_id.max(rec.id);
+    w.max_ino = w.max_ino.max(rec.ino);
+    Ok(())
+}
+
+/// The pass that must run AFTER the last [`put_row_tx`] of a transaction: the
+/// `('i',ino)` pointers and §4's allocator continuation.
+///
+/// Directories are their own one-row inode, so their authoritative pointer comes
+/// straight out of the rows in hand — through the SAME `(parent, stored_name)`
+/// pair the name key was written with, because the root's portable name "/" is
+/// not the key it lives at: pointing `('i',1)` at `(ROOT_PARENT, "/")` would make
+/// `getattr` of the root read a key that does not exist, and the mount would
+/// answer ENOENT for the whole tree while every other key is in place. Files take
+/// `first_holder`, the smallest-`(parent,name)` rule `link_node` and `unlink`
+/// apply.
+fn finish_rows_tx(tx: &Tx, keys: &Keys, w: &RowWriter) -> Result<(), TxErr> {
+    for ino in &w.inos {
+        if let Some((p, nm)) = first_holder(tx, keys, *ino)? {
+            tx.set(&keys.ino(*ino), &(p, nm.as_str()).pack_to_vec());
+        } else if let Some((p, nm)) = w.dir_entry_of.get(ino) {
+            tx.set(&keys.ino(*ino), &(*p, nm.as_str()).pack_to_vec());
+        } else {
+            return Err(TxErr::Hard(MetaError::Db(format!(
+                "tree write rejected: inode {ino} has no directory entry to point at"
+            ))));
+        }
+    }
+    // §4's continuation: the water marks must not go backwards, and a create
+    // after this write must not re-issue a written id. This is the
+    // `setval(pg_get_serial_sequence(...), MAX(id))` of `pg_store.rs`.
+    tx.raise_to_max(&keys.alloc(AllocKind::Id), w.max_id)?;
+    tx.raise_to_max(&keys.alloc(AllocKind::Ino), w.max_ino)?;
+    Ok(())
+}
+
+/// Write a whole tree's rows into an view subspace that is (or was just made)
+/// empty. Rows are `(parent_id, name, record)` with the root's parent as `None`
+/// and its portable name spelled "/".
+fn write_rows_tx(
+    tx: &Tx,
+    keys: &Keys,
+    rows: &[(Option<i64>, String, Rec)],
+) -> Result<(), TxErr> {
+    let mut w = RowWriter::new();
+    for (parent, name, rec) in rows {
+        put_row_tx(tx, keys, &mut w, parent.unwrap_or(ROOT_PARENT), name, rec)?;
+    }
+    finish_rows_tx(tx, keys, &w)
+}
+
+/// FDB bounds ONE transaction at 10 MB of *transaction state*, and its own
+/// accounting is far heavier than the bytes a row occupies at rest — and it
+/// charges what a transaction only READS as well as what it writes. Measured on
+/// this encoding (FDB 7.1 at the default limit), each cell the last one to commit
+/// / the first refused:
+///
+/// | one transaction                                   | commits     | `2101` from |
+/// |---------------------------------------------------|-------------|-------------|
+/// | `import`, one blob ref per row                     | 7,700 rows  | 7,900 rows  |
+/// | `import`, no blob refs                             | 15,000 rows | 17,000 rows |
+/// | `graft` 6,000 rows into a 9,500-row tree            | fits        | 10,000 rows |
+///
+/// One model fits all three: ≈625 B per row written, ≈660 B per blob booked and
+/// ≈240 B per row the transaction merely scans. That is two to three times the
+/// 194 B (no blob) / 292 B (one blob) the same rows occupy on disk once written,
+/// which is why a row-count ceiling was the wrong shape — at 292 B/row it would
+/// have promised 34,000 rows and aborted at 7,800.
+const TX_LIMIT_BYTES: usize = 10_000_000;
+const TX_ROW_BYTES: usize = 625;
+const TX_BLOB_BYTES: usize = 660;
+const TX_READ_ROW_BYTES: usize = 240;
+
+/// Budget ONE written transaction may use when a whole-tree write is split
+/// across several: 70% of the hard limit, not 100%, because the cost model above
+/// is measured rather than documented (FDB does not publish its per-key
+/// accounting) — a chunk that lands 20% above its estimate must still commit.
+const TX_CHUNK_BUDGET: usize = TX_LIMIT_BYTES * 7 / 10;
+
+/// Lengths of the transactions one whole-tree write becomes: the first may be
+/// smaller because its transaction also READS the destination (`read_rows`),
+/// every later one only writes. `blobs` is the number of ledger units the plan
+/// books in total, so the tail answers "how many rows at this density".
+///
+/// Never returns a zero length, and always sums to `rows` — the callers slice by
+/// it, so an off-by-one would either drop a row or panic.
+fn chunk_lengths(rows: usize, blobs: usize, read_rows: usize) -> Vec<usize> {
+    if rows == 0 {
+        return Vec::new();
+    }
+    let blob_per_row = blobs.saturating_mul(TX_BLOB_BYTES).div_ceil(rows);
+    let per_row = TX_ROW_BYTES.saturating_add(blob_per_row).max(1);
+    let cap_rest = (TX_CHUNK_BUDGET / per_row).max(1);
+    let cap_first = (TX_CHUNK_BUDGET
+        .saturating_sub(read_rows.saturating_mul(TX_READ_ROW_BYTES))
+        / per_row)
+        .max(1);
+    let mut out = Vec::new();
+    let mut left = rows;
+    let mut first = true;
+    while left > 0 {
+        let n = left.min(if first { cap_first } else { cap_rest });
+        out.push(n);
+        left -= n;
+        first = false;
+    }
+    out
+}
+
+/// Split a write list into "everything but the root" plus the root row, so the
+/// caller can put the root LAST. The root entry is `(None, "/", _)` in the
+/// portable spelling and `(None, "", _)` when it came from a scan; both are
+/// recognised by the null parent, which is the only row that has one.
+fn root_last(
+    rows: Vec<(Option<i64>, String, Rec)>,
+) -> (Vec<(Option<i64>, String, Rec)>, Vec<(Option<i64>, String, Rec)>) {
+    let mut data = Vec::with_capacity(rows.len());
+    let mut root = Vec::new();
+    for r in rows {
+        if r.0.is_none() {
+            root.push(r);
+        } else {
+            data.push(r);
+        }
+    }
+    (data, root)
+}
+
+/// Structural validation of an import dump, on the rows alone: exactly one root
+/// row, a root that is `ROOT_INO` and a directory, no dangling parent, and — when
+/// the header claims counts — the counts it claims. Pure on purpose: a malformed
+/// dump must write nothing whether the write is one transaction or several, so
+/// every check that needs no cluster read happens before the first transaction.
+fn validate_import_rows(
+    rows: &[(Option<i64>, String, Rec)],
+    claimed_nodes: Option<i64>,
+) -> Result<(), String> {
+    let roots: Vec<&(Option<i64>, String, Rec)> =
+        rows.iter().filter(|(p, _, _)| p.is_none()).collect();
+    if roots.len() != 1 {
+        return Err(format!(
+            "import rejected: expected exactly one root row (parent_id null), found {}",
+            roots.len()
+        ));
+    }
+    if roots[0].2.id != crate::meta::ROOT_INO || !roots[0].2.is_dir {
+        return Err(format!(
+            "import rejected: root row must be id {} and a directory (got id {}, is_dir {})",
+            crate::meta::ROOT_INO,
+            roots[0].2.id,
+            roots[0].2.is_dir
+        ));
+    }
+    let mut dirs: std::collections::HashMap<i64, bool> = Default::default();
+    for (_, _, r) in rows {
+        dirs.entry(r.id).and_modify(|d| *d |= r.is_dir).or_insert(r.is_dir);
+    }
+    let mut dangling = 0usize;
+    for (p, _, _) in rows {
+        let Some(p) = p else { continue };
+        if dirs.get(p).copied() != Some(true) {
+            dangling += 1;
+        }
+    }
+    if dangling != 0 {
+        return Err(format!(
+            "import rejected: {dangling} node(s) point at a missing or non-directory parent"
+        ));
+    }
+    if let Some(c) = claimed_nodes {
+        if c != rows.len() as i64 {
+            return Err(format!(
+                "import rejected: header declares {c} node(s), file carries {}",
+                rows.len()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The cluster-side import gate: corpse refusal, "already holds a tree" refusal,
+/// and — when `teardown` — the old tree's ledger unwind plus the range clear.
+///
+/// `teardown` is false for a SPLIT import, which unwinds through
+/// [`FdbStore::unbook_refs`] in 256-ref transactions instead: one transaction
+/// touching a million ledger keys is the same 10 MB wall this split exists to
+/// avoid, so a replace that does not fit one transaction cannot use the inline
+/// unwind that the single-transaction path gets for free.
+///
+/// The one shape `--replace` adopts but `teardown` cannot serve is a CORPSE: its
+/// leftovers can be many transactions' worth of rows, so the gate answers `true`
+/// and lets the caller's chunked unwind do the work — see the branch below. The
+/// caller forces the split branch for this shape, so a corpse never reaches the
+/// refusal below when `replace` is set.
+fn prep_import_target(
+    tx: &Tx,
+    keys: &Keys,
+    view_name: &str,
+    replace: bool,
+    teardown: bool,
+) -> Result<bool, TxErr> {
+    // A subspace that holds keys and NO root row is a CORPSE (`view scan`
+    // names that kind): it counts 0 entries, so the "already holds a tree"
+    // test below would not fire and the import would seed a fresh root on
+    // the leftovers. Measured, not hypothesised: importing onto a corpse
+    // succeeded, the corpse's 9 keys stayed put, the import merely added
+    // its own rows (13 keys / 2 entries) and the shared ledger still
+    // carried BOTH the old and the new ref — so the imported tree claims
+    // bytes it does not own, and the inherited rows keep the old ref
+    // pinned to this view as a held claim no later pass can tell apart.
+    // `view create` refuses this same shape for the same
+    // reason (seeding a root over leftovers resurrects a corpse). `import`
+    // refuses it too, unless `--replace` can adopt it through the CHUNKED
+    // unwind: replacing presupposes rows whose ledger bookings can be given
+    // back, and a corpse's can — it just takes 256 refs per transaction.
+    let mut probe = keys.all_range();
+    probe.limit = Some(1);
+    let has_keys = !tx.get_range(&probe)?.is_empty();
+    let has_root = tx.get(&keys.name(ROOT_PARENT, ""))?.is_some();
+    if has_keys && !has_root {
+        if replace && !teardown {
+            // `--replace` DOES adopt a corpse — that is how a split import
+            // interrupted before its last transaction gets continued — but only
+            // through the chunked unwind (`teardown == false`), which is why the
+            // caller forces the split branch for this shape. Answering `true` is
+            // what tells that caller to run `booked_refs` + `unbook_refs` +
+            // `clear_view_prefix` before the first row.
+            return Ok(true);
+        }
+        // Reaching here means the caller did not ask to replace, so the leftovers
+        // have to go first — and they may be several transactions' worth.
+        return Err(TxErr::Hard(MetaError::Db(format!(
+            "target subspace '{view_name}' holds keys but no root row (a corpse — \
+             nothing can mount it); importing would seed a new root on the old \
+             tree's leftovers and inherit its booked byte references. clear it \
+             first with `grovefs view --meta-store fdb://… rm --name … --base`, or \
+             pass --replace to have the import clear it"
+        ))));
+    }
+    // Refuse-not-downgrade on the target, same test the SQLite import
+    // makes with `dst.exists()`: here a healthy subspace always holds the
+    // root row, so "a tree is already there" means "more than the root" —
+    // NOT "holds keys", which is also true of the root row alone.
+    let existing = tx.count_range(&keys.all_names_range())?;
+    let replaced = existing > 1;
+    if replaced && !replace {
+        return Err(TxErr::Hard(MetaError::Db(
+            "target view already holds a tree — pass --replace to overwrite it \
+             (stop every mount/meta-server using this backend first)"
+                .to_string(),
+        )));
+    }
+    if replaced && teardown {
+        // Release the old tree's ledger units first, in the SAME
+        // transaction that tears it down: one unit per content key per
+        // view (§3.6), so the distinct refs of the `'r` family are what
+        // this view has booked. The re-add for the imported rows happens
+        // below, and a retry of the whole body sees the same old tree
+        // again because none of this commits until it succeeds.
+        let mut released: std::collections::HashSet<String> = Default::default();
+        for (k, _) in tx.scan(&keys.dataref_all_range())? {
+            if let Some(dr) = keys.decode_dataref(&k) {
+                if released.insert(dr.clone()) {
+                    // Zero holders is not a count, it is the absence of a
+                    // booking — the same "delete the row at zero" the
+                    // unlink path and `remove_view` do. Leaving it was
+                    // reachable: a replace-import over a tree that was a
+                    // ref's last holder left the row at 0, and a second
+                    // replace over that same view bumped it to -1. The
+                    // row then outlived every tree in the cluster —
+                    // measured as one `refs` key whose value decoded to
+                    // -1 with no view beside it, i.e. a booking no tree
+                    // could ever release again.
+                    let left = tx.bump(&keys.ledger(&dr), -1)?;
+                    if left <= 0 {
+                        tx.clear(&keys.ledger(&dr));
+                    }
+                }
+            }
+        }
+        tx.clear_prefix(keys.view_prefix().bytes())?;
+    }
+    Ok(replaced)
+}
+
 /// §3.7's lock value tuple `(ltype, pid, sid, expires_at)`.
 ///
 /// `expires_at` is a VALUE and deliberately never part of the primary key: that
@@ -2002,6 +2980,11 @@ pub struct SubspaceInfo {
     /// row has no root row and would be reported as a `corpse` — an invitation to
     /// run `view rm --base` on the lease table.
     pub lease: bool,
+    /// True for the API-key/call-audit tables, the third root sibling. Same
+    /// argument as `lease`: they hold no root row, so without their own flag they
+    /// would read as corpses and invite a `view rm --base` that would delete the
+    /// only credentials able to govern the cluster.
+    pub ctl: bool,
     /// Did the subspace still hold its root row, `('n', ROOT_PARENT, '')`?
     ///
     /// A mount OPENS the root row, so a subspace that has keys but has lost it can
@@ -2017,14 +3000,17 @@ pub struct SubspaceInfo {
 }
 
 impl SubspaceInfo {
-    /// `ledger` for the shared `refs` subspace, `corpse` for a tree that can no
-    /// longer be mounted, `view` for a live tree, `?` for a name this build
-    /// cannot reproduce (reported by hex alone rather than hidden).
+    /// `ledger` for the shared `refs` subspace, `lease`/`control` for the two
+    /// other root siblings, `corpse` for a tree that can no longer be mounted,
+    /// `view` for a live tree, `?` for a name this build cannot reproduce
+    /// (reported by hex alone rather than hidden).
     pub fn kind(&self) -> &'static str {
         if self.ledger {
             "ledger"
         } else if self.lease {
             "lease"
+        } else if self.ctl {
+            "control"
         } else if !crate::layout::valid_view_name(&self.name) {
             "?"
         } else if !self.root_row {
@@ -2148,9 +3134,7 @@ where
     );
     while let Some(mut opt) = next {
         opt.target_bytes = PAGE_BYTES;
-        let txn = db
-            .create_trx()
-            .map_err(|e| MetaError::Db(format!("fdb scan: {e}")))?;
+        let txn = data_trx(&db).map_err(|e| MetaError::Db(format!("fdb scan: {e}")))?;
         let kvs = futures::executor::block_on(txn.get_range(&opt, 1, true))
             .map_err(|e| MetaError::Db(format!("fdb scan: {e}")))?;
         for kv in kvs.as_ref().iter() {
@@ -2164,11 +3148,12 @@ where
 
 /// Every subspace under the `grovefs` root in this cluster, by name.
 ///
-/// This is the answer to "what is actually in there", which no other command
-/// could give: the control plane is LOCAL files under `fdb://` (C6), so
-/// `view list` describes the definitions this `--meta-dir` knows about and says
-/// nothing about the cluster. Reading the cluster instead of a directory is what
-/// makes an orphan (a subspace with no definition anywhere) visible at all.
+/// This is the answer to "what is actually in there", which `view list` does not
+/// give: `view list` is the governance catalog (the definitions in the cluster's
+/// `ctl` subspace and the base names they resolve to), while this walks the
+/// cluster's physical subspaces with key/entry counts. The two are different
+/// questions on purpose — reading the physical inventory is what makes an orphan
+/// (a subspace no definition names) visible at all.
 ///
 /// Entries are counted from the `'n'` family, so they mean the same thing the
 /// export header means by `nodes`, and `refs` is reported as a ledger rather than
@@ -2194,6 +3179,7 @@ pub fn list_subspaces(uri: &str) -> Result<Vec<SubspaceInfo>, MetaError> {
         let e = found.entry(name.clone()).or_insert_with(|| SubspaceInfo {
             ledger: name == TAG_REFS,
             lease: name == TAG_WRITER,
+            ctl: name == TAG_CTL,
             name,
             keys: 0,
             entries: 0,
@@ -2222,6 +3208,75 @@ pub fn list_subspaces(uri: &str) -> Result<Vec<SubspaceInfo>, MetaError> {
     Ok(found.into_values().collect())
 }
 
+/// The NAME of every tree under the `grovefs` root that can still be mounted,
+/// without counting anybody's keys.
+///
+/// [`list_subspaces`] answers "what is in this cluster, and how big is each part",
+/// and pays for it by visiting every key. The question `view list` asks is much
+/// narrower — "which trees exist" — so this walk takes ONE key per subspace: read
+/// a single-key page, decode the component after the root, then JUMP the range
+/// past that whole subtree. Each candidate is then probed for its root row, which
+/// is exactly the test [`FdbStore::subspace_exists`] applies, so a name reported
+/// here is a name that mounts.
+///
+/// The root's three non-tree siblings (`refs`, `writer`, `ctl`) need no exclusion
+/// list: they hold no root row, so the probe drops them by the same rule that
+/// keeps a `corpse` out of the answer.
+pub fn list_tree_names(uri: &str) -> Result<Vec<String>, MetaError> {
+    let cluster_file = FdbConfig::parse_cluster(uri)
+        .map_err(|e| MetaError::Db(format!("fdb:// inventory: {e}")))?;
+    let db = database(&cluster_file)
+        .map_err(|e| MetaError::Db(format!("fdb:// inventory: {e}")))?;
+    let root = Keys::root();
+    let (mut begin, end) = root_bounds();
+    let mut names: Vec<String> = Vec::new();
+    while begin < end {
+        let opt = RangeOption {
+            begin: KeySelector::first_greater_or_equal(begin.clone()),
+            end: KeySelector::first_greater_or_equal(end.clone()),
+            limit: Some(1),
+            ..RangeOption::default()
+        };
+        let txn = data_trx(&db).map_err(|e| MetaError::Db(format!("fdb scan: {e}")))?;
+        let kvs = futures::executor::block_on(txn.get_range(&opt, 1, true))
+            .map_err(|e| MetaError::Db(format!("fdb scan: {e}")))?;
+        let Some(kv) = kvs.as_ref().iter().next() else {
+            break;
+        };
+        let key = kv.key().to_vec();
+        match child_name(&root, &key) {
+            Some((name, used)) => {
+                names.push(name);
+                // Jump past this child's whole subtree. Without the jump this
+                // would be a one-key-per-key walk spelled as a loop.
+                begin = prefix_upper_bound(&key[..root.bytes().len() + used])
+                    .unwrap_or_else(|| key.clone());
+            }
+            // A subspace this build cannot name cannot be a mountable view
+            // either; advance by one key so the walk still terminates.
+            None => begin = key,
+        }
+    }
+    // One batched root-row probe: `has_physical` asks each name the same
+    // question, so `list` and `has` cannot disagree about what a tree is.
+    let probes: Vec<Vec<u8>> = names
+        .iter()
+        .map(|n| Keys::for_view(n).name(ROOT_PARENT, ""))
+        .collect();
+    let txn = data_trx(&db).map_err(|e| MetaError::Db(format!("fdb scan: {e}")))?;
+    let futs = probes.iter().map(|k| txn.get(k, true)).collect::<Vec<_>>();
+    let found = futures::executor::block_on(futures::future::join_all(futs));
+    let mut out = Vec::new();
+    for (name, row) in names.into_iter().zip(found) {
+        let row = row.map_err(|e| MetaError::Db(format!("fdb scan: {e}")))?;
+        if row.is_some() && crate::layout::valid_view_name(&name) {
+            out.push(name);
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
 /// What [`rebuild_ledger`] changed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LedgerRebuild {
@@ -2244,6 +3299,115 @@ const REBUILD_PROBE_VIEW: &str = "refs-rebuild";
 /// transaction may touch, and each chunk is independently committed, so an
 /// interrupted rebuild is re-runnable: the next run recounts from the trees.
 const REBUILD_CHUNK: usize = 256;
+
+/// The two READ halves of a ledger recount, with nothing written: what the
+/// SURVIVING TREES still name (one holder unit per view, the same rule both
+/// SQL rebuilds apply) and what the shared ledger currently books.
+///
+/// Split out because two callers need exactly this view of the cluster —
+/// `refs rebuild`, which then rewrites the difference, and the control-plane
+/// `gc` audit, which must never rewrite anything. Both inherit the same
+/// refusal semantics: an undecodable key or an unwalkable tree ABORTS instead
+/// of being skipped, because skipping lowers a count and lowering is the unsafe
+/// direction (the next unlink would free bytes a live name still reads).
+#[derive(Clone, Debug, Default)]
+pub struct LedgerPicture {
+    /// Subspaces that still exist (the shared ledger excluded).
+    pub trees: std::collections::BTreeSet<String>,
+    /// Content key → number of views naming it.
+    pub refs: std::collections::BTreeMap<String, i64>,
+    /// Content key → holder count currently booked (zeros included).
+    pub booked: std::collections::BTreeMap<String, i64>,
+}
+
+/// Read a [`LedgerPicture`] from the cluster.
+///
+/// A pure READ: no write transaction, no writer lease, so an audit can run
+/// beside a live deployment without changing a byte. `refs rebuild` calls this
+/// and then writes the difference; the quiesced-store requirement belongs to
+/// that write pass, not to this read.
+pub fn ledger_picture(uri: &str) -> Result<LedgerPicture, MetaError> {
+    let cluster_file = FdbConfig::parse_cluster(uri)
+        .map_err(|e| MetaError::Db(format!("fdb:// ledger recount: {e}")))?;
+    let db = database(&cluster_file)
+        .map_err(|e| MetaError::Db(format!("fdb:// ledger recount: {e}")))?;
+    let root = Keys::root();
+    let ledger_root = root.subspace(&TAG_REFS);
+    let (begin, end) = root_bounds();
+
+    // ---- pass 1: what the SURVIVING TREES say, one walk over the root --------
+    let mut computed: std::collections::BTreeMap<String, i64> = Default::default();
+    let mut trees: std::collections::BTreeSet<String> = Default::default();
+    let mut ledger_rows: Vec<String> = Vec::new();
+    {
+        // Keys are ordered by subspace, so a view's `'r'` rows are contiguous:
+        // one distinct-set per subspace is enough to turn "rows" into "views".
+        let mut cur = String::new();
+        let mut seen: std::collections::HashSet<String> = Default::default();
+        let mut visit = |key: &[u8]| -> Result<(), MetaError> {
+            let base = root.bytes().len();
+            let (name, used) = child_name(&root, key).ok_or_else(|| {
+                MetaError::Db(format!(
+                    "fdb:// ledger recount: a key under the 'grovefs' root names a subspace this build cannot decode ({}); refusing to recount from a tree that cannot be walked",
+                    hex_bytes(&key[..key.len().min(48)])
+                ))
+            })?;
+            let rest = &key[base + used..];
+            if name == TAG_REFS {
+                let (dr, _) = child_name(&ledger_root, key).ok_or_else(|| {
+                    MetaError::Db(format!(
+                        "fdb:// ledger recount: a ledger row's content key does not decode ({})",
+                        hex_bytes(&key[..key.len().min(48)])
+                    ))
+                })?;
+                ledger_rows.push(dr);
+                return Ok(());
+            }
+            if cur != name {
+                for dr in seen.drain() {
+                    *computed.entry(dr).or_insert(0) += 1;
+                }
+                trees.insert(name.clone());
+                cur = name.clone();
+            }
+            if rest.starts_with(b"\x02r\x00") {
+                let dr = Keys::for_view(&name).decode_dataref(key).ok_or_else(|| {
+                    MetaError::Db(format!(
+                        "fdb:// ledger recount: view '{}' holds a 'r' row with no decodable content key ({}); refusing to recount",
+                        name,
+                        hex_bytes(&key[..key.len().min(48)])
+                    ))
+                })?;
+                seen.insert(dr);
+            }
+            Ok(())
+        };
+        for_each_key(&db, begin, end, &mut visit)?;
+        for dr in seen.drain() {
+            *computed.entry(dr).or_insert(0) += 1;
+        }
+    }
+
+    // ---- pass 2: what the ledger currently claims ---------------------------
+    let probe = FdbStore::open(uri, REBUILD_PROBE_VIEW, true)
+        .map_err(|e| MetaError::Db(format!("fdb:// ledger recount: {e}")))?;
+    let mut current: std::collections::BTreeMap<String, i64> = Default::default();
+    if !ledger_rows.is_empty() {
+        let tx = probe.read_tx()?;
+        let keys: Vec<Vec<u8>> = ledger_rows.iter().map(|dr| probe.keys.ledger(dr)).collect();
+        let vals = tx
+            .get_multi(&keys)
+            .map_err(TxErr::hard_or_exhausted)?;
+        for (dr, v) in ledger_rows.iter().zip(vals) {
+            current.insert(dr.clone(), v.as_deref().and_then(unpack_i64).unwrap_or(0));
+        }
+    }
+    Ok(LedgerPicture {
+        trees,
+        refs: computed,
+        booked: current,
+    })
+}
 
 /// Recompute the SHARED ledger from the surviving trees — the fdb:// answer to
 /// `refs rebuild`, which used to be SQLite-only and therefore left a drifted
@@ -2272,84 +3436,18 @@ const REBUILD_CHUNK: usize = 256;
 /// recompute every ref it names to a lower number, and lowering is the unsafe
 /// direction. Refusing is the only honest answer.
 pub fn rebuild_ledger(uri: &str) -> Result<LedgerRebuild, MetaError> {
-    let cluster_file = FdbConfig::parse_cluster(uri)
-        .map_err(|e| MetaError::Db(format!("fdb:// rebuild: {e}")))?;
-    let db = database(&cluster_file).map_err(|e| MetaError::Db(format!("fdb:// rebuild: {e}")))?;
-    let root = Keys::root();
-    let ledger_root = root.subspace(&TAG_REFS);
-    let (begin, end) = root_bounds();
-
-    // ---- pass 1: what the SURVIVING TREES say, one walk over the root --------
-    let mut computed: std::collections::BTreeMap<String, i64> = Default::default();
-    let mut trees: std::collections::BTreeSet<String> = Default::default();
-    let mut ledger_rows: Vec<String> = Vec::new();
-    {
-        // Keys are ordered by subspace, so a view's `'r'` rows are contiguous:
-        // one distinct-set per subspace is enough to turn "rows" into "views".
-        let mut cur = String::new();
-        let mut seen: std::collections::HashSet<String> = Default::default();
-        let mut visit = |key: &[u8]| -> Result<(), MetaError> {
-            let base = root.bytes().len();
-            let (name, used) = child_name(&root, key).ok_or_else(|| {
-                MetaError::Db(format!(
-                    "fdb:// rebuild: a key under the 'grovefs' root names a subspace this build cannot decode ({}); refusing to recount from a tree that cannot be walked",
-                    hex_bytes(&key[..key.len().min(48)])
-                ))
-            })?;
-            let rest = &key[base + used..];
-            if name == TAG_REFS {
-                let (dr, _) = child_name(&ledger_root, key).ok_or_else(|| {
-                    MetaError::Db(format!(
-                        "fdb:// rebuild: a ledger row's content key does not decode ({})",
-                        hex_bytes(&key[..key.len().min(48)])
-                    ))
-                })?;
-                ledger_rows.push(dr);
-                return Ok(());
-            }
-            if cur != name {
-                for dr in seen.drain() {
-                    *computed.entry(dr).or_insert(0) += 1;
-                }
-                trees.insert(name.clone());
-                cur = name.clone();
-            }
-            if rest.starts_with(b"\x02r\x00") {
-                let dr = Keys::for_view(&name).decode_dataref(key).ok_or_else(|| {
-                    MetaError::Db(format!(
-                        "fdb:// rebuild: view '{}' holds a 'r' row with no decodable content key ({}); refusing to recount",
-                        name,
-                        hex_bytes(&key[..key.len().min(48)])
-                    ))
-                })?;
-                seen.insert(dr);
-            }
-            Ok(())
-        };
-        for_each_key(&db, begin, end, &mut visit)?;
-        for dr in seen.drain() {
-            *computed.entry(dr).or_insert(0) += 1;
-        }
-    }
-
-    // ---- pass 2: what the ledger currently claims ---------------------------
+    let pic = ledger_picture(uri)?;
+    // The write half needs a store handle for its transactions; the picture
+    // above deliberately did not keep one, so a read-only caller (the `gc`
+    // audit) never holds a writer-capable object at all.
     let probe = FdbStore::open(uri, REBUILD_PROBE_VIEW, true)
         .map_err(|e| MetaError::Db(format!("fdb:// rebuild: {e}")))?;
-    let mut current: std::collections::BTreeMap<String, i64> = Default::default();
-    if !ledger_rows.is_empty() {
-        let tx = probe.read_tx()?;
-        let keys: Vec<Vec<u8>> = ledger_rows.iter().map(|dr| probe.keys.ledger(dr)).collect();
-        let vals = tx
-            .get_multi(&keys)
-            .map_err(TxErr::hard_or_exhausted)?;
-        for (dr, v) in ledger_rows.iter().zip(vals) {
-            current.insert(dr.clone(), v.as_deref().and_then(unpack_i64).unwrap_or(0));
-        }
-    }
+    let computed = &pic.refs;
+    let current = &pic.booked;
 
     // ---- pass 3: rewrite the difference ------------------------------------
     let mut set_rows: Vec<(String, i64)> = Vec::new();
-    for (dr, want) in &computed {
+    for (dr, want) in computed {
         if current.get(dr) != Some(want) {
             set_rows.push((dr.clone(), *want));
         }
@@ -2381,7 +3479,7 @@ pub fn rebuild_ledger(uri: &str) -> Result<LedgerRebuild, MetaError> {
         })?;
     }
     Ok(LedgerRebuild {
-        trees: trees.len(),
+        trees: pic.trees.len(),
         refs: computed.len(),
         rows_fixed: set_rows.len(),
         rows_deleted: del_rows.len(),
@@ -2437,9 +3535,7 @@ impl FdbStore {
     /// [`crate::mcp::ControlStore`], whose whole error surface is a `String`.
     pub fn subspace_exists(uri: &str, view: &str) -> Result<bool, String> {
         let this = Self::open(uri, view, true).map_err(|e| e.to_string())?;
-        let tx = this
-            .db
-            .create_trx()
+        let tx = data_trx(&this.db)
             .map_err(|e| TxErr::from(e).hard_or_exhausted().to_string())?;
         let key = this.keys.name(ROOT_PARENT, "");
         let root = futures::executor::block_on(tx.get(&key, true))
@@ -2463,9 +3559,7 @@ impl FdbStore {
     /// committed: it neither creates the subspace nor leaves a read conflict.
     pub fn subspace_has_keys(uri: &str, view: &str) -> Result<bool, String> {
         let this = Self::open(uri, view, true).map_err(|e| e.to_string())?;
-        let tx = this
-            .db
-            .create_trx()
+        let tx = data_trx(&this.db)
             .map_err(|e| TxErr::from(e).hard_or_exhausted().to_string())?;
         let prefix = this.keys.view_prefix().bytes().to_vec();
         let end = prefix_upper_bound(&prefix)
@@ -2594,7 +3688,7 @@ impl FdbStore {
     /// The one piece of governance state that is already live: the epoch, read as
     /// a single point get on a fresh transaction with no write set.
     pub fn get_epoch(&self) -> i64 {
-        let Ok(tx) = self.db.create_trx() else {
+        let Ok(tx) = data_trx(&self.db) else {
             return 0;
         };
         let Ok(Some(v)) = futures::executor::block_on(tx.get(&self.keys.epoch(), false)) else {
@@ -2660,7 +3754,7 @@ impl FdbStore {
     {
         let mut delay = SERIALIZATION_BACKOFF_MIN;
         for attempt in 0..SERIALIZATION_MAX_ATTEMPTS {
-            let raw = match self.db.create_trx() {
+            let raw = match data_trx(&self.db) {
                 Ok(t) => t,
                 Err(e) => {
                     return Err(TxErr::from(e).hard_or_exhausted());
@@ -3659,6 +4753,102 @@ impl FdbStore {
         self.with_serial_retry(move |tx| tx.clear_prefix(keys.view_prefix().bytes()))
     }
 
+    /// Unbook `refs` from this view, 256 at a time: for each, delete this view's
+    /// `'r` rows for that content key AND decrement the shared ledger (deleting
+    /// the row at zero), both halves in the same transaction so the `'r` rows are
+    /// the re-run marker (§`remove_view`). Returns `(unbooked, still_held,
+    /// unbooked_refs)` — the refs that reached zero are the caller's byte reclaim
+    /// list.
+    ///
+    /// Shared by `view rm --base` and by the multi-transaction whole-tree writes,
+    /// which have to give a previous tree's bookings back before they rewrite it
+    /// in chunks (a single-transaction write does that inline, in the one
+    /// transaction that also writes the new rows).
+    fn unbook_refs(&self, refs: Vec<String>) -> Result<(usize, usize, Vec<String>), MetaError> {
+        const UNBOOK_CHUNK: usize = 256;
+        let keys = self.keys.clone();
+        let mut unbooked = 0usize;
+        let mut still_held = 0usize;
+        let mut unbooked_refs: Vec<String> = Vec::new();
+        for chunk in refs.chunks(UNBOOK_CHUNK) {
+            let k = keys.clone();
+            let chunk: Vec<String> = chunk.to_vec();
+            let (u, h) = self.with_serial_retry(move |tx| {
+                let (mut u, mut h) = (Vec::new(), 0usize);
+                for dr in &chunk {
+                    let rows = k.dataref_prefix_of(dr);
+                    tx.clear_prefix(rows.begin.key().to_vec().as_slice())?;
+                    let left = tx.bump(&k.ledger(dr), -1)?;
+                    if left <= 0 {
+                        tx.clear(&k.ledger(dr));
+                        u.push(dr.clone());
+                    } else {
+                        h += 1;
+                    }
+                }
+                Ok((u, h))
+            })?;
+            unbooked += u.len();
+            unbooked_refs.extend(u);
+            still_held += h;
+        }
+        Ok((unbooked, still_held, unbooked_refs))
+    }
+
+    /// The DISTINCT content keys this view books, read from its own `'r` family.
+    /// One range scan, so the caller can hand the result to [`Self::unbook_refs`]
+    /// without re-deriving what a booking means.
+    fn booked_refs(&self) -> Result<Vec<String>, MetaError> {
+        let mut out = std::collections::BTreeSet::new();
+        for (k, _) in self.with_serial_retry(|tx| tx.scan(&self.keys.dataref_all_range()))? {
+            if let Some(dr) = self.keys.decode_dataref(&k) {
+                out.insert(dr);
+            }
+        }
+        Ok(out.into_iter().collect())
+    }
+
+    /// Does this view book ANY content key? A one-key probe, for callers that are
+    /// about to clear the prefix and have to know whether the chunked unwind
+    /// ([`Self::unbook_refs`]) is needed — knowing the COUNT would mean scanning
+    /// the family, and the answer is only ever "none" or "some".
+    fn has_bookings(&self) -> Result<bool, MetaError> {
+        self.with_serial_retry(|tx| {
+            let mut probe = self.keys.dataref_all_range();
+            probe.limit = Some(1);
+            Ok(!tx.get_range(&probe)?.is_empty())
+        })
+    }
+
+    /// Keys but no root row: the shape a SPLIT import/fork leaves behind when it
+    /// is interrupted before its last transaction (the root row is written last
+    /// on purpose). `view scan` calls it a CORPSE.
+    ///
+    /// Read before the write branch, because `import --replace` adopts such a
+    /// subspace through the CHUNKED unwind only: the leftovers can be several
+    /// transactions' worth of rows, so the inline unwind the single-transaction
+    /// path uses for a real tree would itself hit the 10 MB wall.
+    fn residue_without_root(&self) -> Result<bool, MetaError> {
+        self.with_serial_retry(|tx| {
+            let mut probe = self.keys.all_range();
+            probe.limit = Some(1);
+            let has_keys = !tx.get_range(&probe)?.is_empty();
+            if !has_keys || tx.get(&self.keys.name(ROOT_PARENT, ""))?.is_some() {
+                return Ok(false);
+            }
+            Ok(true)
+        })
+    }
+
+    /// Throw away every key this view owns, in ONE range mutation (its width is a
+    /// round trip, not the width of the tree). Bookings are NOT released here —
+    /// [`Self::unbook_refs`] must have run first, or the ledger keeps counting
+    /// names that no longer exist.
+    fn clear_view_prefix(&self) -> Result<(), MetaError> {
+        let keys = self.keys.clone();
+        self.with_serial_retry(move |tx| tx.clear_prefix(keys.view_prefix().bytes()))
+    }
+
     /// Tear this view's whole subspace down AND unwind the shared byte ledger —
     /// what `view rm --base` means under `fdb://`.
     ///
@@ -3731,43 +4921,11 @@ impl FdbStore {
         };
 
         // One ledger row per content key per view, so the DISTINCT refs above are
-        // exactly what this view booked. Chunked because each chunk is its own
-        // transaction: a view holding a million blobs would otherwise need one
-        // transaction to touch a million ledger keys.
-        const UNBOOK_CHUNK: usize = 256;
+        // exactly what this view booked. Unwound through the shared helper, whose
+        // per-256-ref transactions are what let a view holding a million blobs be
+        // torn down without one transaction touching a million ledger keys.
         let refs: Vec<String> = blobs.into_iter().collect();
-        let (mut unbooked, mut still_held) = (0usize, 0usize);
-        // Refs that reached zero, collected for the caller's byte reclaim.
-        let mut unbooked_refs: Vec<String> = Vec::new();
-        for chunk in refs.chunks(UNBOOK_CHUNK) {
-            let k = keys.clone();
-            let chunk: Vec<String> = chunk.to_vec();
-            let (u, h) = self.with_serial_retry(move |tx| {
-                let (mut u, mut h) = (Vec::new(), 0usize);
-                for dr in &chunk {
-                    // First half of the pair: this view's `'r` rows for `dr` go
-                    // away in the SAME transaction as the ledger decrement below,
-                    // so they are the progress marker a re-run reads.
-                    let rows = k.dataref_prefix_of(dr);
-                    tx.clear_prefix(rows.begin.key().to_vec().as_slice())?;
-                    let left = tx.bump(&k.ledger(dr), -1)?;
-                    if left <= 0 {
-                        // Zero holders is not a count, it is the absence of a
-                        // booking — the same "delete the row at zero" the SQL
-                        // backends do, so the ledger cannot accumulate dead keys.
-                        tx.clear(&k.ledger(dr));
-                        u.push(dr.clone());
-                    } else {
-                        h += 1;
-                    }
-                }
-                Ok((u, h))
-            })?;
-            unbooked += u.len();
-            unbooked_refs.extend(u);
-            still_held += h;
-        }
-
+        let (unbooked, still_held, unbooked_refs) = self.unbook_refs(refs)?;
         let k = keys.clone();
         self.with_serial_retry(move |tx| tx.clear_prefix(k.view_prefix().bytes()))?;
         Ok(PurgeReport {
@@ -3777,6 +4935,422 @@ impl FdbStore {
             unbooked,
             unbooked_refs,
             still_held,
+        })
+    }
+
+    // ---- fork / graft (P4) ---------------------------------------------------
+    //
+    // A fork here is a COPY OF ONE SUBSPACE into another, and a graft is a subtree
+    // placed into an existing one. Both are ONE transaction while the plan fits
+    // one, the FDB counterpart of the file arm's `IMMEDIATE` transaction and of
+    // PG's `INSERT ... SELECT` over schemas: a crash leaves either the whole copy
+    // or nothing, never a half tree that a later `refs rebuild` would have to
+    // interpret. A plan that does NOT fit one transaction is split (see
+    // `TX_CHUNK_BUDGET`), root row LAST, so a crash leaves an unmountable partial
+    // tree — visible as a corpse `view scan` names, never as half a view.
+
+    /// Remove `view`'s tree — subspace AND its bookings — by opening it read-only
+    /// and running the same unwind `view rm --base` uses.
+    ///
+    /// The read-only open is load-bearing: [`FdbStore::open`]'s writable form
+    /// seeds the root row, so a drop of a name that was never seeded would create
+    /// the very thing it is meant to delete.
+    pub fn drop_tree(uri: &str, view: &str) -> Result<(), String> {
+        let st = Self::open(uri, view, true).map_err(|e| e.to_string())?;
+        if !Self::subspace_has_keys(uri, view)? {
+            return Ok(());
+        }
+        st.remove_view().map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    /// Seed `name` as a point-in-time copy of `base`'s tree, with content bytes
+    /// SHARED rather than copied: every distinct `data_ref` is booked once against
+    /// the new view, so a delete in either tree frees a blob only when its last
+    /// name in the last holding view disappears — the same contract the file arm
+    /// (`fork_view_with`) and the PG arm (`PgEngine::fork_tree`) implement.
+    ///
+    /// Not copied on purpose: `('c',epoch)` (the HA fencing epoch — a fork is a new
+    /// view, not a standby replica) and the `'l'`/`'lo'`/`'ls'`/`'lx'` lock rows
+    /// (transient leases of the source mount). Both live in the view prefix, so
+    /// the copy simply does not carry them: rows come from the `'n'` family only.
+    ///
+    /// Inode numbers ARE copied, so hard links inside the base stay hard links in
+    /// the fork.
+    ///
+    /// `seed == false` creates the fork's OWN tree (root only), so a curated
+    /// subset can be placed later with [`Self::graft_tree`].
+    pub fn fork_tree(
+        uri: &str,
+        base: &str,
+        name: &str,
+        seed: bool,
+    ) -> Result<crate::meta::ForkStats, String> {
+        // ONE snapshot read of the base, inodes included: names that shared an
+        // inode stay hard links in the fork, the same guarantee the file arm gets
+        // from its read-only connection and PG from `ORDER BY id`.
+        let src = Self::open(uri, base, true).map_err(|e| e.to_string())?;
+        let rows = {
+            let tx = src.read_tx().map_err(|e| e.to_string())?;
+            scan_all_entries(&tx, &src.keys)
+        };
+        let root_rec = rows
+            .iter()
+            .find(|(p, n, _)| *p == ROOT_PARENT && n.is_empty())
+            .map(|(_, _, r)| r.clone())
+            .ok_or_else(|| {
+                format!(
+                    "no physical base tree '{base}' in {uri} — `fork` copies a whole view \
+                     tree, so the base must exist first (`view create --name {base}`)"
+                )
+            })?;
+        let nodes_all = rows.len() as i64;
+        let blobs_all = rows
+            .iter()
+            .filter_map(|(_, _, r)| r.data_ref.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .len() as i64;
+        let (out_rows, nodes, blobs) = if seed {
+            let out: Vec<(Option<i64>, String, Rec)> = rows
+                .into_iter()
+                .map(|(p, n, r)| {
+                    if p == ROOT_PARENT && n.is_empty() {
+                        (None, "/".to_string(), r)
+                    } else {
+                        (Some(p), n, r)
+                    }
+                })
+                .collect();
+            (out, nodes_all, blobs_all)
+        } else {
+            // Root only. The root row is COPIED rather than re-seeded, so the
+            // fork's root metadata matches its base instead of becoming a fresh
+            // 0755-by-this-process root the way a brand-new view would.
+            (vec![(None, "/".to_string(), root_rec)], 1, 0)
+        };
+
+        let dst = Self::open(uri, name, true).map_err(|e| e.to_string())?;
+        let keys = dst.keys.clone();
+        let out_blobs = out_rows
+            .iter()
+            .filter_map(|(_, _, r)| r.data_ref.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        // The root row goes LAST, the same rule the import follows: the root row
+        // is what makes a tree mountable, so a split fork stays invisible until
+        // its final transaction instead of exposing a half-copied tree.
+        let (mut write_order, root_row) = root_last(out_rows);
+        write_order.extend(root_row);
+        let total = write_order.len();
+        let chunks = chunk_lengths(total, out_blobs, 0);
+
+        // A destination that still BOOKS something is residue from an interrupted
+        // attempt (its root row is written last, so `view scan` calls it a corpse)
+        // or from an out-of-band clear. The write below replaces the destination's
+        // rows wholesale, and only the chunked unwind further down can give those
+        // bookings back: a bare `clear_prefix` would drop the `'r` rows while the
+        // ledger kept counting them, and no later pass could tell they were stale.
+        // So any residue takes the split branch even when the copy fits one
+        // transaction.
+        let residue = dst.has_bookings().map_err(|e| e.to_string())?;
+        if !residue && chunks.len() <= 1 {
+            dst.with_serial_retry(move |tx| {
+                // The destination REPLACES its contents instead of merging into them —
+                // PG's `DELETE FROM <dst>.node` before the `INSERT ... SELECT`, said
+                // once here. The control plane has already refused a name holding a
+                // live tree, so what this clears is residue (keys a crashed teardown
+                // or an out-of-band `clearrange` left), which a pure append would
+                // otherwise inherit.
+                tx.clear_prefix(keys.view_prefix().bytes())?;
+                write_rows_tx(tx, &keys, &write_order)
+            })
+            .map_err(|e| e.to_string())?;
+            return Ok(crate::meta::ForkStats { nodes, blobs });
+        }
+
+        // A split fork: give back whatever an earlier interrupted attempt booked
+        // before clearing the prefix. Without this the re-run would inherit
+        // bookings for names it is about to replace, i.e. ledger units nothing
+        // would ever release.
+        let refs = dst.booked_refs().map_err(|e| e.to_string())?;
+        dst.unbook_refs(refs).map_err(|e| e.to_string())?;
+        dst.clear_view_prefix().map_err(|e| e.to_string())?;
+        let tx_count = chunks.len();
+        let mut offset = 0usize;
+        for (i, &len) in chunks.iter().enumerate() {
+            let slice: Vec<(Option<i64>, String, Rec)> = write_order[offset..offset + len].to_vec();
+            let keys = keys.clone();
+            let done = offset;
+            dst.with_serial_retry(move |tx| write_rows_tx(tx, &keys, &slice))
+                .map_err(|e| {
+                    format!(
+                        "fork of '{base}' into '{name}' aborted after {done} of {total} node(s) \
+                         (transaction {} of {tx_count}): {e} — the root row is written last, so \
+                         nothing can mount the partial fork; drop it with `grovefs view \
+                         --meta-store fdb://… rm --name {name} --base` and re-run",
+                        i + 1
+                    )
+                })?;
+            offset += len;
+            tracing::info!(
+                nodes = offset,
+                total,
+                transaction = i + 1,
+                of = tx_count,
+                "fdb fork: transaction committed"
+            );
+        }
+        Ok(crate::meta::ForkStats { nodes, blobs })
+    }
+
+    /// Graft a curated subset of `src`'s tree into `dst`'s tree: for every
+    /// [`crate::meta::GraftItem`], copy that entry (a directory brings its whole
+    /// subtree) to `dest/<dst>`, renaming it to the destination basename. Bytes
+    /// are shared: every distinct `data_ref` is booked against the destination
+    /// exactly like a fork's, and one the destination already named is not booked
+    /// again (the ledger counts holders per VIEW, not per name).
+    ///
+    /// All-or-nothing while the plan fits one transaction: the source is ONE
+    /// snapshot read, every plan path is resolved before the first write, and the
+    /// whole plan lands in one transaction, so a bad line writes nothing. A plan
+    /// that does not fit is placed in several transactions instead (see
+    /// [`TX_CHUNK_BUDGET`]): an item too large for one transaction is split into
+    /// its own entry plus one unit per child, and the ones already committed stay
+    /// if a later one fails — the error says so and names `--skip-existing` as the
+    /// continuation. Missing parent directories under `dest` are created (0755).
+    /// `skip_existing` turns a conflict into "leave what is there and keep going",
+    /// merging into an existing directory and skipping colliding files.
+    pub fn graft_tree(
+        uri: &str,
+        dst: &str,
+        src: &str,
+        items: &[crate::meta::GraftItem],
+        dest: &str,
+        skip_existing: bool,
+    ) -> Result<crate::meta::GraftStats, String> {
+        if items.is_empty() {
+            return Err("empty graft plan — nothing to copy".to_string());
+        }
+        let dest_prefix = if dest.trim().is_empty() {
+            String::new()
+        } else {
+            crate::meta::normalize_plan_path(dest)?
+        };
+        let src_store = Self::open(uri, src, true).map_err(|e| e.to_string())?;
+        let rows = {
+            let tx = src_store.read_tx().map_err(|e| e.to_string())?;
+            scan_all_entries(&tx, &src_store.keys)
+        };
+        let root = rows
+            .iter()
+            .find(|(p, n, _)| *p == ROOT_PARENT && n.is_empty())
+            .map(|(_, _, r)| r.id)
+            .ok_or_else(|| {
+                format!(
+                    "source view '{src}' has no tree in {uri} — refusing to graft from \
+                     an empty store"
+                )
+            })?;
+        let children = graft_children(&rows);
+        // Resolve every source path BEFORE writing anything, so a typo on line 900
+        // of a 100k-line plan cannot leave a half-grafted tree behind.
+        let mut plan: Vec<(usize, String)> = Vec::with_capacity(items.len());
+        for it in items {
+            let idx = graft_resolve(&rows, &children, root, &it.src)
+                .ok_or_else(|| format!("'{}' does not exist in view '{src}'", it.src))?;
+            let full = if dest_prefix.is_empty() {
+                it.dst.clone()
+            } else {
+                format!("{dest_prefix}/{}", it.dst)
+            };
+            plan.push((idx, full));
+        }
+
+        // ONE transaction for the whole plan (all-or-nothing) whenever it fits one,
+        // so its size is decided BEFORE the destination is opened for writing
+        // (`open` provisions the subspace) — after the plan resolves, which is
+        // when the subtree sizes are known. That transaction also READS the
+        // destination's whole namespace (`scan_all_entries` is what continues its
+        // id/ino allocator) and FDB charges reads against the same budget: that is
+        // why the identical plan fits an empty tree and not a large one.
+        let plan_rows = graft_plan_nodes(&rows, &children, &plan);
+        let dest_rows = {
+            let probe = Self::open(uri, dst, true).map_err(|e| e.to_string())?;
+            let tx = probe.read_tx().map_err(|e| e.to_string())?;
+            scan_all_entries(&tx, &probe.keys)
+        };
+
+        // The plan is placed in ONE transaction when it fits, and in several when
+        // it does not: `graft_units` expands any item too large for a transaction
+        // into its own entry plus one unit per child, so "too big" stops meaning
+        // "refused" and starts meaning "more transactions".
+        let units = graft_units(&rows, &children, &plan, TX_CHUNK_BUDGET);
+        // "Does it fit one transaction" is answered WITH the destination scan
+        // charged, because that path scans inside the transaction itself.
+        let fits_one = graft_chunk_lengths(&units, dest_rows.len()).len() <= 1;
+        if fits_one {
+            let dst_store = Self::open(uri, dst, true).map_err(|e| e.to_string())?;
+            let keys = dst_store.keys.clone();
+            return dst_store
+                .with_serial_retry(move |tx| {
+                    // A graft lands in a BASE view or a fork — a tree with a root row.
+                    // Asking the cluster (rather than trusting a definition) is what
+                    // keeps a lens/alias name from receiving rows nothing can mount.
+                    if tx.get(&keys.name(ROOT_PARENT, ""))?.is_none() {
+                        return Err(TxErr::Hard(MetaError::Db(format!(
+                            "no destination tree '{dst}' in {uri} — a graft lands in a BASE \
+                             view or a fork (create it first)"
+                        ))));
+                    }
+                    // Fresh ids/ino numbers start ABOVE both the existing id space and
+                    // the existing inode numbers, so a graft never collides with rows
+                    // copied by an earlier fork (whose inos came from another tree).
+                    let existing = scan_all_entries(tx, &keys);
+                    let max_id = existing.iter().map(|(_, _, r)| r.id).max().unwrap_or(0);
+                    let max_ino = existing.iter().map(|(_, _, r)| r.ino).max().unwrap_or(0);
+                    let mut ctx = GraftFdbCtx {
+                        next: max_id.max(max_ino).max(crate::meta::ROOT_INO) + 1,
+                        skip_existing,
+                        stats: crate::meta::GraftStats::default(),
+                        blobs: Default::default(),
+                        inos: Default::default(),
+                    };
+                    let mut w = RowWriter::new();
+                    for (idx, full) in &plan {
+                        let (parent_path, name) = match full.rfind('/') {
+                            Some(k) => (&full[..k], &full[k + 1..]),
+                            None => ("", full.as_str()),
+                        };
+                        let parent = graft_ensure_dir(tx, &keys, &mut w, parent_path, &mut ctx)?;
+                        graft_copy(
+                            tx, &keys, &mut w, &rows, &children, *idx, parent, name, &mut ctx,
+                        )?;
+                    }
+                    // ONE finish pass for everything this graft wrote: the `('i',ino)`
+                    // pointers and the allocator continuation, by the same rules an
+                    // import applies. Bookings were made per row by `put_row_tx`, so
+                    // there is no batch-level booking loop here — that loop is what
+                    // left a holder nobody could ever unbook on the file backend.
+                    finish_rows_tx(tx, &keys, &w)?;
+                    ctx.stats.blobs = ctx.blobs.len() as i64;
+                    Ok(ctx.stats)
+                })
+                .map_err(|e| e.to_string());
+        }
+
+        // A split graft. The destination scan above already answered what the
+        // first transaction would have asked, so the allocator continues from
+        // there and no transaction rescans the tree (an O(n) read per chunk is how
+        // a chunked writer would make itself quadratic) — which is also why these
+        // chunks are packed at the FULL budget: the read that made the single
+        // transaction too big is not in them.
+        let chunks = graft_chunk_lengths(&units, 0);
+        let dst_store = Self::open(uri, dst, true).map_err(|e| e.to_string())?;
+        let tx_count = chunks.len();
+        let mut inos: std::collections::HashMap<i64, i64> = Default::default();
+        let mut next = dest_rows
+            .iter()
+            .map(|(_, _, r)| r.id.max(r.ino))
+            .max()
+            .unwrap_or(0)
+            .max(crate::meta::ROOT_INO)
+            + 1;
+        let mut stats = crate::meta::GraftStats::default();
+        let mut blobs: std::collections::HashSet<String> = Default::default();
+        let mut placed = 0usize;
+        let mut offset = 0usize;
+        for (i, &len) in chunks.iter().enumerate() {
+            let out = dst_store
+                .graft_chunk(
+                    &rows,
+                    &children,
+                    &units[offset..offset + len],
+                    dst,
+                    next,
+                    &inos,
+                    skip_existing,
+                )
+                .map_err(|e| {
+                    format!(
+                        "graft into '{dst}' aborted after {placed} of {plan_rows} node(s) \
+                         (transaction {} of {tx_count}): {e} — the transactions already \
+                         committed stay; re-run with --skip-existing to continue where it \
+                         stopped",
+                        i + 1
+                    )
+                })?;
+            stats.nodes += out.stats.nodes;
+            stats.dirs += out.stats.dirs;
+            stats.skipped += out.stats.skipped;
+            placed += out.stats.nodes as usize;
+            next = out.next;
+            inos = out.inos;
+            blobs.extend(out.blobs);
+            offset += len;
+            tracing::info!(
+                nodes = placed,
+                total = plan_rows,
+                transaction = i + 1,
+                of = tx_count,
+                "fdb graft: transaction committed"
+            );
+        }
+        stats.blobs = blobs.len() as i64;
+        Ok(stats)
+    }
+
+    /// One transaction of a SPLIT graft: place `units` under `dst`, continuing the
+    /// id/ino allocator from `base_next` and the hard-link map from `inos`.
+    ///
+    /// Both are inputs and the grown values are outputs, so a serialization retry
+    /// re-runs from the same base instead of from a half-advanced allocator (the
+    /// single-transaction path gets the same guarantee by building its context
+    /// inside the body).
+    #[allow(clippy::too_many_arguments)]
+    fn graft_chunk(
+        &self,
+        rows: &[(i64, String, Rec)],
+        children: &std::collections::HashMap<i64, Vec<usize>>,
+        units: &[GraftUnit],
+        dst: &str,
+        base_next: i64,
+        inos: &std::collections::HashMap<i64, i64>,
+        skip_existing: bool,
+    ) -> Result<GraftChunk, MetaError> {
+        let keys = self.keys.clone();
+        self.with_serial_retry(move |tx| {
+            if tx.get(&keys.name(ROOT_PARENT, ""))?.is_none() {
+                return Err(TxErr::Hard(MetaError::Db(format!(
+                    "no destination tree '{dst}' in this store — a graft lands in a BASE \
+                     view or a fork (create it first)"
+                ))));
+            }
+            let mut ctx = GraftFdbCtx {
+                next: base_next,
+                skip_existing,
+                stats: crate::meta::GraftStats::default(),
+                blobs: Default::default(),
+                inos: inos.clone(),
+            };
+            let mut w = RowWriter::new();
+            for u in units {
+                let (parent_path, name) = match u.full.rfind('/') {
+                    Some(k) => (&u.full[..k], &u.full[k + 1..]),
+                    None => ("", u.full.as_str()),
+                };
+                let parent = graft_ensure_dir(tx, &keys, &mut w, parent_path, &mut ctx)?;
+                if u.subtree {
+                    graft_copy(tx, &keys, &mut w, rows, children, u.idx, parent, name, &mut ctx)?;
+                } else {
+                    graft_copy_one(tx, &keys, &mut w, rows, u.idx, parent, name, &mut ctx)?;
+                }
+            }
+            finish_rows_tx(tx, &keys, &w)?;
+            Ok(GraftChunk {
+                stats: ctx.stats,
+                next: ctx.next,
+                inos: ctx.inos,
+                blobs: ctx.blobs,
+            })
         })
     }
 
@@ -3825,10 +5399,10 @@ impl FdbStore {
     /// read-only-connection-inside-a-snapshot that `export_view` uses on SQLite:
     /// a concurrent writer cannot make the dump tear.
     ///
-    /// `definition` is the view's own definition text when one exists. The
-    /// control plane stays in local files under `fdb://` (C6), so the CLI passes
-    /// the same `<meta-dir>/meta/views/<view>.layout` content it would read for a
-    /// SQLite view — the header is identical across backends.
+    /// `definition` is the view's own definition text when one exists. The CLI
+    /// reads it from the control-plane store — the cluster's `ctl` subspace under
+    /// `fdb://`, the same text a SQLite `<meta-dir>/meta/views/<view>.layout`
+    /// holds — so the header is identical across backends.
     pub fn export_jsonl(
         &self,
         view: &str,
@@ -3847,9 +5421,10 @@ impl FdbStore {
             ));
         }
         let kind = match definition.as_deref() {
-            // A fork cannot exist on this backend (refused by name, §3.10), so
-            // this arm is reachable only through a stray definition file; naming
-            // it keeps the header honest instead of silently claiming "physical".
+            // A fork tree IS possible here now (see `fork_tree`), and the header
+            // reports what the view actually is so a migration back to SQLite
+            // keeps the definition's meaning. A stray `fork` definition with no
+            // tree behind it exports as what it is: a fork that names nothing.
             Some(t) if t.lines().any(|l| l.trim_start().starts_with("fork ")) => "fork",
             _ => "physical",
         };
@@ -3975,9 +5550,14 @@ impl FdbStore {
         })
     }
 
-    /// Install an export file as this view's tree. One transaction, so the target
-    /// is at every instant either the old tree or the new one — never a mixture,
-    /// which is what SQLite gets from building a scratch db and renaming it.
+    /// Install an export file as this view's tree. One transaction while the dump
+    /// fits one, so the target is at every instant either the old tree or the new
+    /// one — never a mixture, which is what SQLite gets from building a scratch db
+    /// and renaming it. A larger dump is written in several (see
+    /// [`TX_CHUNK_BUDGET`]), root row LAST, so an interrupted run leaves an
+    /// unmountable partial tree rather than half a view a client would read as
+    /// real — and `--replace` picks that shape up again through the chunked
+    /// unwind.
     ///
     /// The caller opens this store WITHOUT seeding a root: the dump carries its
     /// own root row and both allocator water marks, so an invalid dump leaves NO
@@ -4044,18 +5624,9 @@ impl FdbStore {
         // rule, same header-count rule — because a migration that validates less
         // strictly than the tool it replaces would let a tree through that the
         // SQLite backend would refuse.
-        // The root row's portable name is "/", which is precisely the one
-        // spelling that is not a legal directory entry: it names the frozen
-        // root KEY `(ROOT_PARENT, "")` (§1) and nothing else can reach that
-        // key, so every place an imported row is turned back into a stored
-        // name goes through this one rule rather than re-deciding it.
-        fn root_entry_name(parent: i64, name: &str) -> &str {
-            if parent == ROOT_PARENT && name == "/" {
-                ""
-            } else {
-                name
-            }
-        }
+        // The root row's portable name is "/", mapped back to the frozen root
+        // name by `root_entry_name` (see that function); every place a row is
+        // turned into a stored name goes through that one rule.
         let mut rows: Vec<(Option<i64>, String, Rec)> = Vec::new();
         let mut line = String::new();
         let mut lineno = 1usize;
@@ -4129,22 +5700,6 @@ impl FdbStore {
             ));
         }
 
-        // FDB bounds one transaction at 10MB of write state and 5s. An import
-        // writes five to six keys per row, so the honest ceiling is bounded here
-        // rather than discovered as a mid-import abort: refusing before starting
-        // leaves the target untouched, while a slice-wise importer would need a
-        // second format (a resumable one) and is deliberately not invented now.
-        const MAX_IMPORT_ROWS: usize = 20_000;
-        if rows.len() > MAX_IMPORT_ROWS {
-            return Err(std::io::Error::other(format!(
-                "import of {} node(s) exceeds this backend's single-transaction budget \
-                 ({} rows); this build has no slice-wise importer — split the view or \
-                 migrate with the SQLite/PG path",
-                rows.len(),
-                MAX_IMPORT_ROWS
-            )));
-        }
-
         let keys = self.keys.clone();
         let view_name = self.view.clone();
         let input_rows = rows.len() as i64;
@@ -4169,202 +5724,466 @@ impl FdbStore {
                 )));
             }
         }
-        self.with_serial_retry(move |tx| {
-            // Structural validation, mirroring `import_view`'s checks.
-            let ids: std::collections::HashSet<i64> = rows.iter().map(|(_, _, r)| r.id).collect();
-            let roots: Vec<&(Option<i64>, String, Rec)> =
-                rows.iter().filter(|(p, _, _)| p.is_none()).collect();
-            if roots.len() != 1 {
-                return Err(TxErr::Hard(MetaError::Db(format!(
-                    "import rejected: expected exactly one root row (parent_id null), found {}",
-                    roots.len()
-                ))));
-            }
-            if roots[0].2.id != crate::meta::ROOT_INO || !roots[0].2.is_dir {
-                return Err(TxErr::Hard(MetaError::Db(format!(
-                    "import rejected: root row must be id {} and a directory (got id {}, is_dir {})",
-                    crate::meta::ROOT_INO,
-                    roots[0].2.id,
-                    roots[0].2.is_dir
-                ))));
-            }
-            let mut dangling = 0usize;
-            let mut by_parent: std::collections::HashMap<i64, Vec<usize>> = Default::default();
-            for (i, (p, _, _)) in rows.iter().enumerate() {
-                let Some(p) = p else { continue };
-                by_parent.entry(*p).or_default().push(i);
-                let ok = ids.contains(p)
-                    && rows.iter().any(|(_, _, r)| r.id == *p && r.is_dir);
-                if !ok {
-                    dangling += 1;
-                }
-            }
-            if dangling != 0 {
-                return Err(TxErr::Hard(MetaError::Db(format!(
-                    "import rejected: {dangling} node(s) point at a missing or non-directory parent"
-                ))));
-            }
-            if let Some(c) = claimed_nodes {
-                if c != input_rows {
-                    return Err(TxErr::Hard(MetaError::Db(format!(
-                        "import rejected: header declares {c} node(s), file carries {input_rows}"
-                    ))));
-                }
-            }
-            // A subspace that holds keys and NO root row is a CORPSE (`view scan`
-            // names that kind): it counts 0 entries, so the "already holds a tree"
-            // test below would not fire and the import would seed a fresh root on
-            // the leftovers. Measured, not hypothesised: importing onto a corpse
-            // succeeded, the corpse's 9 keys stayed put, the import merely added
-            // its own rows (13 keys / 2 entries) and the shared ledger still
-            // carried BOTH the old and the new ref — so the imported tree claims
-            // bytes it does not own, and the inherited rows keep the old ref
-            // pinned to this view as a held claim no later pass can tell apart.
-            // `view create` refuses this same shape for the same
-            // reason (seeding a root over leftovers resurrects a corpse), so
-            // `import` refuses it too — `--replace` included, because replacing
-            // presupposes a tree whose ledger rows can be given back and a corpse
-            // has no root row for the dump to replace.
-            let mut probe = keys.all_range();
-            probe.limit = Some(1);
-            let has_keys = !tx.get_range(&probe)?.is_empty();
-            if has_keys && tx.get(&keys.name(ROOT_PARENT, ""))?.is_none() {
-                return Err(TxErr::Hard(MetaError::Db(format!(
-                    "target subspace '{view_name}' holds keys but no root row (a corpse — \
-                     nothing can mount it); importing would seed a new root on the old \
-                     tree's leftovers and inherit its booked byte references — clear it \
-                     first with `grovefs view --meta-store fdb://… rm --name {view_name} \
-                     --base`"
-                ))));
-            }
-            // Refuse-not-downgrade on the target, same test the SQLite import
-            // makes with `dst.exists()`: here a healthy subspace always holds the
-            // root row, so "a tree is already there" means "more than the root".
-            let existing = tx.count_range(&keys.all_names_range())?;
-            let replaced = existing > 1;
-            if replaced && !replace {
-                return Err(TxErr::Hard(MetaError::Db(
-                    "target view already holds a tree — pass --replace to overwrite it \
-                     (stop every mount/meta-server using this backend first)"
-                        .to_string(),
-                )));
-            }
-            if replaced {
-                // Release the old tree's ledger units first, in the SAME
-                // transaction that tears it down: one unit per content key per
-                // view (§3.6), so the distinct refs of the `'r` family are what
-                // this view has booked. The re-add for the imported rows happens
-                // below, and a retry of the whole body sees the same old tree
-                // again because none of this commits until it succeeds.
-                let mut released: std::collections::HashSet<String> = Default::default();
-                for (k, _) in tx.scan(&keys.dataref_all_range())? {
-                    if let Some(dr) = keys.decode_dataref(&k) {
-                        if released.insert(dr.clone()) {
-                            // Zero holders is not a count, it is the absence of a
-                            // booking — the same "delete the row at zero" the
-                            // unlink path and `remove_view` do. Leaving it was
-                            // reachable: a replace-import over a tree that was a
-                            // ref's last holder left the row at 0, and a second
-                            // replace over that same view bumped it to -1. The
-                            // row then outlived every tree in the cluster —
-                            // measured as one `refs` key whose value decoded to
-                            // -1 with no view beside it, i.e. a booking no tree
-                            // could ever release again.
-                            let left = tx.bump(&keys.ledger(&dr), -1)?;
-                            if left <= 0 {
-                                tx.clear(&keys.ledger(&dr));
-                            }
-                        }
-                    }
-                }
-                tx.clear_prefix(keys.view_prefix().bytes())?;
-            }
+        // Structural validation is PURE, so a malformed dump writes nothing whether
+        // the write is one transaction or several.
+        validate_import_rows(&rows, claimed_nodes).map_err(std::io::Error::other)?;
 
-            let mut inos: std::collections::BTreeSet<i64> = Default::default();
-            let mut max_id = crate::meta::ROOT_INO;
-            let mut max_ino = crate::meta::ROOT_INO;
-            // ino -> the `(parent, stored_name)` its name key lives at, filled in
-            // as the rows are written (see the `('i',ino)` loop below).
-            let mut dir_entry_of: std::collections::HashMap<i64, (i64, String)> =
-                Default::default();
-            for (parent, name, rec) in &rows {
-                let parent = parent.unwrap_or(ROOT_PARENT);
-                let stored_name = root_entry_name(parent, name);
-                tx.set(
-                    &keys.name(parent, stored_name),
-                    &Rec {
-                        id: rec.id,
-                        is_dir: rec.is_dir,
-                        data_ref: rec.data_ref.clone(),
-                        link_target: rec.link_target.clone(),
-                        mode: rec.mode,
-                        uid: rec.uid,
-                        gid: rec.gid,
-                        mtime: rec.mtime,
-                        atime: rec.atime,
-                        ctime: rec.ctime,
-                        ino: rec.ino,
-                    }
-                    .pack(),
-                );
-                tx.set(&keys.by_id(rec.id), &(parent, stored_name).pack_to_vec());
-                if rec.is_dir {
-                    tx.set(&keys.dir_entry(parent, stored_name), b"");
-                    dir_entry_of.insert(rec.ino, (parent, stored_name.to_string()));
-                } else {
-                    tx.set(&keys.holder(rec.ino, parent, stored_name), b"");
-                }
-                if let Some(dr) = &rec.data_ref {
-                    let first_name = tx.count_range(&keys.dataref_prefix_of(dr))? == 0;
-                    tx.set(&keys.dataref(dr, parent, stored_name), b"");
-                    if first_name {
-                        tx.bump(&keys.ledger(dr), 1)?;
-                    }
-                }
-                inos.insert(rec.ino);
-                max_id = max_id.max(rec.id);
-                max_ino = max_ino.max(rec.ino);
-            }
+        // The root row is written LAST. It is what makes a tree mountable, so a
+        // SPLIT import stays invisible until its final transaction: an interrupted
+        // run leaves keys no mount can reach, not a half-populated tree a client
+        // would read as real.
+        let (mut write_order, root_row) = root_last(rows);
+        write_order.extend(root_row);
+        let total = write_order.len();
+        let chunks = chunk_lengths(total, blobs as usize, 0);
 
-            // The `('i',ino)` pointers: directories have no holder rows, so their
-            // own name is authoritative; files take `first_holder`, the same
-            // smallest-`(parent,name)` rule `link_node` and `unlink` apply.
-            // Directories are their own one-row inode, so their authoritative
-            // pointer comes straight out of the rows in hand — through the SAME
-            // `(parent, stored_name)` pair the name key was written with, because
-            // the root's portable name "/" is not the key it lives at: pointing
-            // `('i',1)` at `(ROOT_PARENT, "/")` would make `getattr` of the root
-            // read a key that does not exist, and the mount would answer ENOENT
-            // for the whole tree while every other key is in place.
-            for ino in inos {
-                if let Some((p, nm)) = first_holder(tx, &keys, ino)? {
-                    tx.set(&keys.ino(ino), &(p, nm.as_str()).pack_to_vec());
-                } else if let Some((p, nm)) = dir_entry_of.get(&ino) {
-                    tx.set(&keys.ino(ino), &(p, nm.as_str()).pack_to_vec());
-                } else {
-                    return Err(TxErr::Hard(MetaError::Db(format!(
-                        "import rejected: inode {ino} has no directory entry to point at"
-                    ))));
-                }
-            }
+        // One transaction is the whole contract whenever the dump fits one: the
+        // target is at every instant either the old tree or the new one. A CORPSE
+        // the dump can adopt (`--replace`) is the exception: the leftovers may be
+        // many transactions' worth of rows, so clearing them inline would hit the
+        // very wall this split exists to get around — take the chunked unwind even
+        // when the dump itself is small.
+        let corpse = self.residue_without_root().map_err(std::io::Error::other)?;
+        let force_split = corpse && replace;
+        if !force_split && chunks.len() <= 1 {
+            let replaced = self
+                .with_serial_retry(move |tx| {
+                    let replaced = prep_import_target(tx, &keys, &view_name, replace, true)?;
+                    // The rows land through the writer shared with `fork_tree` and
+                    // `graft_tree`, so an import books the ledger, names every inode,
+                    // and continues both water marks by exactly the rules a fork does.
+                    write_rows_tx(tx, &keys, &write_order)?;
+                    Ok(replaced)
+                })
+                .map_err(std::io::Error::other)?;
+            return Ok(crate::meta::ViewImportStats {
+                nodes: input_rows,
+                blobs,
+                kind,
+                replaced,
+            });
+        }
 
-            // §4's continuation: the water marks must not go backwards, and a
-            // create after this import must not re-issue an imported id. This is
-            // the `setval(pg_get_serial_sequence(...), MAX(id))` of `pg_store.rs:464`.
-            tx.raise_to_max(&keys.alloc(AllocKind::Id), max_id)?;
-            tx.raise_to_max(&keys.alloc(AllocKind::Ino), max_ino)?;
-            Ok(replaced)
-        })
-        .map(|replaced| crate::meta::ViewImportStats {
+        // Several transactions. The gate runs first, on its own: it is the same
+        // refusal set as the single-transaction path, but the teardown that
+        // follows is chunked, because one transaction touching a million ledger
+        // keys is exactly the wall this branch exists to get around.
+        let replaced = self
+            .with_serial_retry({
+                let (keys, view_name) = (keys.clone(), view_name.clone());
+                move |tx| prep_import_target(tx, &keys, &view_name, replace, false)
+            })
+            .map_err(std::io::Error::other)?;
+        if replaced {
+            let refs = self.booked_refs().map_err(std::io::Error::other)?;
+            self.unbook_refs(refs).map_err(std::io::Error::other)?;
+            self.clear_view_prefix().map_err(std::io::Error::other)?;
+        }
+
+        let tx_count = chunks.len();
+        let mut offset = 0usize;
+        for (i, &len) in chunks.iter().enumerate() {
+            let slice: Vec<(Option<i64>, String, Rec)> = write_order[offset..offset + len].to_vec();
+            let keys = keys.clone();
+            let done = offset;
+            self.with_serial_retry(move |tx| write_rows_tx(tx, &keys, &slice))
+                .map_err(|e| {
+                    std::io::Error::other(format!(
+                        "import aborted after {done} of {total} row(s) (transaction {} of \
+                         {tx_count}): {e} — the root row is written last, so nothing can mount \
+                         the partial tree; re-run with `--replace`, or drop it with `grovefs view \
+                         --meta-store fdb://… rm --name {view_name} --base` and import again",
+                        i + 1
+                    ))
+                })?;
+            offset += len;
+            tracing::info!(
+                rows = offset,
+                total,
+                transaction = i + 1,
+                of = tx_count,
+                "fdb import: transaction committed"
+            );
+        }
+        Ok(crate::meta::ViewImportStats {
             nodes: input_rows,
             blobs,
             kind,
             replaced,
         })
-        .map_err(std::io::Error::other)
     }
 }
 
+
+// ---- graft helpers -----------------------------------------------------------
+//
+// These are the file arm's graft rules (`meta::engine`'s `graft_children` /
+// `graft_resolve` / `graft_ensure_dir` / `graft_copy`) restated for this backend's
+// row shape, which is `(parent, name, Rec)` rather than a SQLite `GraftRow`. The
+// RULES are the contract — a plan means the same thing on every backend — and only
+// the row type is why the code cannot be shared.
+
+/// Mutable state carried through one graft transaction: the id/ino allocator, the
+/// merge rule, the running totals and the inode mapping.
+struct GraftFdbCtx {
+    next: i64,
+    skip_existing: bool,
+    stats: crate::meta::GraftStats,
+    /// Distinct content keys this graft referenced, reported as `blobs` — the file
+    /// arm counts the same set (every inserted `data_ref`), not the ledger delta.
+    blobs: std::collections::HashSet<String>,
+    /// source `ino` -> destination `ino`: names that shared an inode in the source
+    /// stay hard links of each other in the destination.
+    inos: std::collections::HashMap<i64, i64>,
+}
+
+/// Nodes and blob set ONE plan item writes. A directory item brings its whole
+/// subtree, so an item's line count says nothing about its size; `seen` is per
+/// item because the same source may be named twice under two destinations.
+fn graft_item_cost<'a>(
+    rows: &'a [(i64, String, Rec)],
+    children: &std::collections::HashMap<i64, Vec<usize>>,
+    idx: usize,
+) -> (usize, std::collections::HashSet<&'a str>) {
+    let mut nodes = 0usize;
+    let mut blobs: std::collections::HashSet<&'a str> = Default::default();
+    let mut stack = vec![idx];
+    let mut seen: std::collections::HashSet<usize> = Default::default();
+    while let Some(i) = stack.pop() {
+        if !seen.insert(i) {
+            continue;
+        }
+        nodes += 1;
+        if let Some(dr) = rows[i].2.data_ref.as_deref() {
+            blobs.insert(dr);
+        }
+        if let Some(kids) = children.get(&rows[i].2.id) {
+            stack.extend(kids.iter().copied());
+        }
+    }
+    (nodes, blobs)
+}
+
+/// One unit a split graft places on its own. A plan item whose whole subtree fits
+/// one transaction stays a single SUBTREE unit ([`graft_copy`]); one that does not
+/// is split into its own entry (`subtree == false`, so the directory's mode, owner
+/// and timestamps survive the split) followed by one unit per child. That is what
+/// lets a 50,000-entry directory graft at all instead of being refused.
+struct GraftUnit {
+    idx: usize,
+    full: String,
+    subtree: bool,
+    /// Estimated transaction cost of this unit, computed once. Recomputing it
+    /// while packing would be O(subtree) per look at the same item.
+    cost: usize,
+}
+
+fn graft_units(
+    rows: &[(i64, String, Rec)],
+    children: &std::collections::HashMap<i64, Vec<usize>>,
+    plan: &[(usize, String)],
+    budget: usize,
+) -> Vec<GraftUnit> {
+    let mut out = Vec::new();
+    for (idx, full) in plan {
+        graft_units_of(rows, children, *idx, full, budget, &mut out);
+    }
+    out
+}
+
+fn graft_units_of(
+    rows: &[(i64, String, Rec)],
+    children: &std::collections::HashMap<i64, Vec<usize>>,
+    idx: usize,
+    full: &str,
+    budget: usize,
+    out: &mut Vec<GraftUnit>,
+) {
+    let (nodes, blobs) = graft_item_cost(rows, children, idx);
+    let cost = nodes
+        .saturating_mul(TX_ROW_BYTES)
+        .saturating_add(blobs.len().saturating_mul(TX_BLOB_BYTES));
+    // A single entry is one row and always fits, so the recursion always
+    // terminates: split only directories, and only while they are too big.
+    if cost <= budget || !rows[idx].2.is_dir {
+        out.push(GraftUnit {
+            idx,
+            full: full.to_string(),
+            subtree: true,
+            cost,
+        });
+        return;
+    }
+    let own = TX_ROW_BYTES
+        + if rows[idx].2.data_ref.is_some() {
+            TX_BLOB_BYTES
+        } else {
+            0
+        };
+    out.push(GraftUnit {
+        idx,
+        full: full.to_string(),
+        subtree: false,
+        cost: own,
+    });
+    if let Some(kids) = children.get(&rows[idx].2.id) {
+        for k in kids {
+            let child_full = format!("{full}/{}", rows[*k].1);
+            graft_units_of(rows, children, *k, &child_full, budget, out);
+        }
+    }
+}
+
+/// Lengths of the transactions a split graft becomes: greedy packing of its
+/// units, with the FIRST transaction able to reserve `first_read` rows of read
+/// budget. The caller passes the destination's row count when asking "would this
+/// fit ONE transaction" (that path scans the destination inside it), and `0` when
+/// packing the chunks it will actually commit — a split chunk continues the
+/// allocator from a snapshot and scans nothing.
+fn graft_chunk_lengths(units: &[GraftUnit], first_read: usize) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut first = true;
+    while start < units.len() {
+        let mut room = TX_CHUNK_BUDGET.saturating_sub(if first {
+            first_read.saturating_mul(TX_READ_ROW_BYTES)
+        } else {
+            0
+        });
+        let mut n = 0usize;
+        while start + n < units.len() {
+            let cost = units[start + n].cost;
+            if n > 0 && cost > room {
+                break;
+            }
+            room = room.saturating_sub(cost);
+            n += 1;
+        }
+        out.push(n);
+        start += n;
+        first = false;
+    }
+    out
+}
+
+/// One transaction's worth of a split graft, and the state the next one continues
+/// from. Kept out of the loop so a serialization retry re-runs the body from the
+/// same base (`base_next`, `inos`) instead of from a half-advanced one — the
+/// `next` is passed IN and the grown map is passed OUT only after the commit.
+struct GraftChunk {
+    stats: crate::meta::GraftStats,
+    next: i64,
+    inos: std::collections::HashMap<i64, i64>,
+    blobs: std::collections::HashSet<String>,
+}
+
+/// Node count one RESOLVED graft plan will write. A directory item brings its
+/// whole subtree, so the plan's line count is not its size; the same source may
+/// appear twice under two destinations and is then written twice, so `seen` is
+/// per item rather than spanning the plan.
+fn graft_plan_nodes(
+    rows: &[(i64, String, Rec)],
+    children: &std::collections::HashMap<i64, Vec<usize>>,
+    plan: &[(usize, String)],
+) -> usize {
+    plan.iter()
+        .map(|(idx, _)| graft_item_cost(rows, children, *idx).0)
+        .sum()
+}
+
+fn graft_children(
+    rows: &[(i64, String, Rec)],
+) -> std::collections::HashMap<i64, Vec<usize>> {
+    let mut m: std::collections::HashMap<i64, Vec<usize>> = Default::default();
+    for (i, (parent, _, _)) in rows.iter().enumerate() {
+        // `ROOT_PARENT` is not a row id, so the root row (parent = 0) has no
+        // parent to be listed under — the same skip the file arm makes for
+        // `parent_id IS NULL`.
+        if *parent != ROOT_PARENT {
+            m.entry(*parent).or_default().push(i);
+        }
+    }
+    m
+}
+
+/// Resolve a plan path (`a/b/c`) against the source rows. `None` means the path
+/// does not exist in that tree — the caller names the view in the error.
+fn graft_resolve(
+    rows: &[(i64, String, Rec)],
+    children: &std::collections::HashMap<i64, Vec<usize>>,
+    root: i64,
+    path: &str,
+) -> Option<usize> {
+    let mut parent = root;
+    let mut cur: Option<usize> = None;
+    for comp in path.split('/') {
+        let idx = *children
+            .get(&parent)?
+            .iter()
+            .find(|&&k| rows[k].1 == comp)?;
+        parent = rows[idx].2.id;
+        cur = Some(idx);
+    }
+    cur
+}
+
+/// `mkdir -p` inside the destination tree: walk `path` from the root, creating
+/// any missing directory. Returns the directory's row id.
+fn graft_ensure_dir(
+    tx: &Tx,
+    keys: &Keys,
+    w: &mut RowWriter,
+    path: &str,
+    ctx: &mut GraftFdbCtx,
+) -> Result<i64, TxErr> {
+    let mut cur = crate::meta::ROOT_INO;
+    if path.is_empty() {
+        return Ok(cur);
+    }
+    for comp in path.split('/') {
+        let key = keys.name(cur, comp);
+        match tx.get(&key)? {
+            Some(v) => {
+                let rec = Rec::unpack(&v).ok_or_else(|| TxErr::Hard(keys_corrupt(&key)))?;
+                if !rec.is_dir {
+                    return Err(TxErr::Hard(MetaError::Db(format!(
+                        "'{comp}' in the destination path is a file, not a directory"
+                    ))));
+                }
+                cur = rec.id;
+            }
+            None => {
+                let id = ctx.next;
+                ctx.next += 1;
+                let t = secs_now();
+                let rec = Rec {
+                    id,
+                    is_dir: true,
+                    data_ref: None,
+                    link_target: None,
+                    mode: 0o755,
+                    uid: crate::platform::geteuid(),
+                    gid: crate::platform::getgid(),
+                    mtime: t,
+                    atime: t,
+                    ctime: t,
+                    ino: id,
+                };
+                put_row_tx(tx, keys, w, cur, comp, &rec)?;
+                ctx.stats.nodes += 1;
+                ctx.stats.dirs += 1;
+                cur = id;
+            }
+        }
+    }
+    Ok(cur)
+}
+
+/// Copy one source entry (and, for a directory, its whole subtree) under `parent`
+/// as `name`. Rows get fresh ids/ino numbers in the destination; the source's
+/// bytes are referenced, never copied.
+#[allow(clippy::too_many_arguments)]
+fn graft_copy(
+    tx: &Tx,
+    keys: &Keys,
+    w: &mut RowWriter,
+    rows: &[(i64, String, Rec)],
+    children: &std::collections::HashMap<i64, Vec<usize>>,
+    idx: usize,
+    parent: i64,
+    name: &str,
+    ctx: &mut GraftFdbCtx,
+) -> Result<(), TxErr> {
+    let is_dir = rows[idx].2.is_dir;
+    let src_id = rows[idx].2.id;
+    let Some(dir_id) = graft_copy_one(tx, keys, w, rows, idx, parent, name, ctx)? else {
+        return Ok(());
+    };
+    if !is_dir {
+        return Ok(());
+    }
+    if let Some(kids) = children.get(&src_id) {
+        for k in kids {
+            let child_name = rows[*k].1.clone();
+            graft_copy(tx, keys, w, rows, children, *k, dir_id, &child_name, ctx)?;
+        }
+    }
+    Ok(())
+}
+
+/// The entry half of [`graft_copy`]: create this ONE source entry under `parent`
+/// as `name` (or merge into the directory already there), without descending.
+///
+/// Returns the destination directory id children belong under, or `None` when
+/// there are none to copy: a newly created file, or a file `--skip-existing`
+/// skipped. Split grafts call this directly so a directory too large for one
+/// transaction can still be placed, one entry per unit.
+fn graft_copy_one(
+    tx: &Tx,
+    keys: &Keys,
+    w: &mut RowWriter,
+    rows: &[(i64, String, Rec)],
+    idx: usize,
+    parent: i64,
+    name: &str,
+    ctx: &mut GraftFdbCtx,
+) -> Result<Option<i64>, TxErr> {
+    let r = &rows[idx].2;
+    let key = keys.name(parent, name);
+    let dir_id = match tx.get(&key)? {
+        None => {
+            let id = ctx.next;
+            ctx.next += 1;
+            // Hard links: every source name sharing `r.ino` maps to ONE fresh
+            // destination inode (the first one it gets), which is what keeps a
+            // linked pair linked after the graft.
+            let ino = *ctx.inos.entry(r.ino).or_insert(id);
+            let rec = Rec {
+                id,
+                is_dir: r.is_dir,
+                data_ref: r.data_ref.clone(),
+                link_target: r.link_target.clone(),
+                mode: r.mode,
+                uid: r.uid,
+                gid: r.gid,
+                mtime: r.mtime,
+                atime: r.atime,
+                ctime: r.ctime,
+                ino,
+            };
+            put_row_tx(tx, keys, w, parent, name, &rec)?;
+            ctx.stats.nodes += 1;
+            if r.is_dir {
+                ctx.stats.dirs += 1;
+            }
+            if let Some(dr) = &r.data_ref {
+                ctx.blobs.insert(dr.clone());
+            }
+            if !r.is_dir {
+                return Ok(None);
+            }
+            id
+        }
+        Some(v) => {
+            let existing = Rec::unpack(&v).ok_or_else(|| TxErr::Hard(keys_corrupt(&key)))?;
+            if !ctx.skip_existing {
+                return Err(TxErr::Hard(MetaError::Db(format!(
+                    "'{name}' already exists in the destination — rename it in the plan \
+                     or pass --skip-existing"
+                ))));
+            }
+            if !existing.is_dir || !r.is_dir {
+                ctx.stats.skipped += 1;
+                return Ok(None);
+            }
+            // Both are directories: keep the one already there and merge the
+            // missing children into it (re-running a curation script must not
+            // fail on the skeleton it made last time).
+            existing.id
+        }
+    };
+    Ok(Some(dir_id))
+}
 
 impl TxErr {
     /// A non-retriable error from *before* a body could even run (transaction
@@ -4582,6 +6401,88 @@ impl MetaProvider for FdbStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The split planner has one job that must never break: every chunk fits the
+    /// budget, and the chunks together are exactly the rows. A planner that drops a
+    /// row would import a tree with a hole; one that overruns would turn the split
+    /// back into a `2101`.
+    #[test]
+    fn chunk_lengths_cover_every_row_within_budget() {
+        // The frontier case: 7,700 rows with one ref each used to be the ceiling.
+        // Chunked, it must become 2 transactions (70% of 10 MB is 7 MB).
+        for (rows, blobs, read_rows) in [
+            (1usize, 0usize, 0usize),
+            (7_700, 7_699, 0),
+            (17_000, 0, 0),
+            (50_000, 50_000, 0),
+        ] {
+            let lens = chunk_lengths(rows, blobs, read_rows);
+            assert_eq!(lens.iter().sum::<usize>(), rows, "covers {rows} rows");
+            assert!(lens.iter().all(|&n| n > 0), "no empty transaction");
+            let per_row = TX_ROW_BYTES + blobs.saturating_mul(TX_BLOB_BYTES).div_ceil(rows);
+            for (i, &n) in lens.iter().enumerate() {
+                let read = if i == 0 { read_rows } else { 0 };
+                let cost = n * per_row + read * TX_READ_ROW_BYTES;
+                assert!(
+                    cost <= TX_CHUNK_BUDGET.max(per_row),
+                    "chunk {i} costs {cost} > {TX_CHUNK_BUDGET}"
+                );
+            }
+        }
+        // A dump that already fits stays ONE transaction: the split must not
+        // change the all-or-nothing shape of every small import.
+        assert_eq!(chunk_lengths(1_000, 1_000, 0).len(), 1);
+        assert_eq!(chunk_lengths(7_700, 0, 0).len(), 1);
+        assert!(chunk_lengths(0, 0, 0).is_empty());
+    }
+
+    /// One directory too large for a transaction is split into its own entry plus
+    /// its children — the case a plan-item split alone would still refuse.
+    #[test]
+    fn graft_units_split_an_oversized_directory() {
+        let dir = |id: i64, ino: i64| Rec {
+            id,
+            is_dir: true,
+            data_ref: None,
+            link_target: None,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            atime: 0,
+            ctime: 0,
+            ino,
+        };
+        let file = |id: i64| Rec {
+            data_ref: Some(format!("d{id}")),
+            is_dir: false,
+            ..dir(id, id)
+        };
+        // root(1) -> big(2) -> 8,000 files. At 625+660 B/row that subtree is past
+        // the 7 MB budget, so it must split; a small sibling must not.
+        let mut rows: Vec<(i64, String, Rec)> = vec![(ROOT_PARENT, String::new(), dir(1, 1))];
+        rows.push((1, "big".into(), dir(2, 2)));
+        for i in 0..8_000i64 {
+            rows.push((2, format!("f{i}"), file(1_000 + i)));
+        }
+        rows.push((1, "small".into(), dir(9_000, 9_000)));
+        rows.push((9_000, "one".into(), file(9_001)));
+        let children = graft_children(&rows);
+        // The index of "small" is its position in `rows`.
+        let small_idx = rows.iter().position(|(_, n, _)| n == "small").unwrap();
+        let plan = vec![(1usize, "big".to_string()), (small_idx, "small".to_string())];
+        let units = graft_units(&rows, &children, &plan, TX_CHUNK_BUDGET);
+        // big: its own entry (dir keeps its mode/uid) then one unit per child;
+        // small: one untouched subtree unit.
+        assert!(!units[0].subtree, "oversized dir becomes an entry-only unit");
+        assert_eq!(units[0].idx, 1);
+        assert_eq!(units.iter().filter(|u| u.subtree).count(), 8_001);
+        assert_eq!(units.len(), 8_002);
+        assert_eq!(units.last().unwrap().full, "small");
+        let chunks = graft_chunk_lengths(&units, 0);
+        assert_eq!(chunks.iter().sum::<usize>(), units.len());
+        assert!(chunks.len() > 1, "an 8k-file directory needs several transactions");
+    }
 
     /// The on-cluster byte format is irreversible once written (D1/D2), so it is
     /// pinned here rather than left to a prose table. Every expected byte below is

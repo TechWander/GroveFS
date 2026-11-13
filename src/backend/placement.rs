@@ -19,7 +19,7 @@
 //! [`LocalBackend`](super::local::LocalBackend) living on that root; this
 //! decorator only picks the root.
 
-use super::{FsStat, Imported, StorageBackend};
+use super::{FsStat, Imported, ObjectPage, StorageBackend};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -166,6 +166,17 @@ impl StorageBackend for PlacementBackend {
         self.members[self.primary(key)].backend.import_at(key, src)
     }
 
+    fn list_objects(&self, cursor: Option<&str>, limit: usize) -> io::Result<ObjectPage> {
+        // One page may span disks: the shared walker walks members in order and
+        // keeps the cursor opaque, so `gc` never learns about the root list.
+        super::list_across_members(
+            self.members.len(),
+            |i| self.members[i].backend.clone(),
+            cursor,
+            limit,
+        )
+    }
+
     fn statvfs(&self) -> io::Result<FsStat> {
         self.aggregate_statvfs()
     }
@@ -279,5 +290,41 @@ mod tests {
     #[test]
     fn empty_root_list_is_refused() {
         assert!(PlacementBackend::new(&[]).is_err());
+    }
+
+    /// One walk covers every disk: objects live on exactly one root, so the
+    /// member cursor is what lets `gc` see the whole node instead of only the
+    /// disk it happened to be pointed at.
+    #[test]
+    fn list_objects_walks_every_disk_exactly_once() {
+        let roots = tmp_roots("list", 3);
+        let be = PlacementBackend::new(&roots).unwrap();
+        let mut want = std::collections::BTreeSet::new();
+        for i in 0..150u32 {
+            let key = format!("{i:08x}-0000-4000-8000-000000000000");
+            be.create(&key).unwrap();
+            be.write(&key, 0, b"x").unwrap();
+            want.insert(key);
+        }
+        for page_size in [5usize, 37, 149, 150, 151] {
+            let mut seen = std::collections::BTreeSet::new();
+            let mut cursor: Option<String> = None;
+            loop {
+                let page = be.list_objects(cursor.as_deref(), page_size).unwrap();
+                assert!(
+                    page.rows.len() <= page_size.clamp(1, super::super::LIST_LIMIT_MAX),
+                    "page exceeded the requested {page_size}"
+                );
+                for r in page.rows {
+                    assert!(seen.insert(r.key.clone()), "{} listed twice", r.key);
+                }
+                match page.next {
+                    Some(n) => cursor = Some(n),
+                    None => break,
+                }
+            }
+            assert_eq!(seen, want, "page size {page_size} missed a disk's objects");
+        }
+        cleanup(&roots);
     }
 }

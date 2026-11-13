@@ -87,6 +87,10 @@ impl PgPool {
     /// ONE schema owned by two stores; each store hands the statements it
     /// needs at open time.
     pub fn open(uri: &str, ddl: &[&str]) -> Result<Self, String> {
+        // A sharded store spec (`uri,uri,...`) names several instances for the
+        // view trees; the control schema is ONE authoritative record and stays
+        // on the first instance (see `pg_store::control_store`).
+        let uri = crate::pg_store::control_store(uri);
         let mut pool = Vec::new();
         for _ in 0..CONTROL_POOL_SIZE {
             match Client::connect(uri, NoTls) {
@@ -117,7 +121,8 @@ impl PgPool {
                 Some(c) => return Ok(c),
             }
         }
-        Client::connect(&self.uri, NoTls).map_err(|e| format!("postgres connect {e}"))
+        Client::connect(&self.uri, NoTls)
+            .map_err(|e| format!("postgres connect {}: {e}", self.uri))
     }
 
     /// Hand a used client back (bounded; a closed socket is dropped instead of

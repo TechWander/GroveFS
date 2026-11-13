@@ -21,7 +21,7 @@
 //!   on the same fd are safe and race-free.
 //! - `fsync` uses `fdatasync` semantics via `fsync` on the fd.
 
-use super::{FsStat, Imported, StorageBackend};
+use super::{FsStat, Imported, ObjectPage, ObjectRow, StorageBackend};
 use crate::stats;
 use libc::{fstat, fsync, ftruncate, pread, pwrite, statvfs};
 use parking_lot::RwLock;
@@ -374,6 +374,84 @@ impl StorageBackend for LocalBackend {
         Ok(Imported::Copied)
     }
 
+    fn list_objects(&self, cursor: Option<&str>, limit: usize) -> io::Result<ObjectPage> {
+        let limit = limit.clamp(1, super::LIST_LIMIT_MAX);
+        // Cursor = "<bucket hex>\t<last key>". The bucket is the OUTER loop on
+        // purpose: a key's bucket is a HASH of the key, not an ordering, so
+        // walking bucket indices 0..256 is the only order in which every object
+        // can be visited exactly once without holding a directory listing across
+        // pages. Within one bucket the names do have a total order, and the
+        // cursor names the last row already returned, so a delete cannot make a
+        // key come back twice and a create cannot make the walk skip one.
+        let (mut bucket, mut after) = match cursor {
+            None => (0u64, String::new()),
+            Some(c) => {
+                let bad = || {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "list_objects: malformed cursor",
+                    )
+                };
+                let (b, k) = c.split_once('\t').ok_or_else(bad)?;
+                let b = u64::from_str_radix(b, 16).map_err(|_| bad())?;
+                if b >= BUCKETS {
+                    return Err(bad());
+                }
+                (b, k.to_string())
+            }
+        };
+        let blocks = self.root.join("blocks");
+        let mut rows = Vec::with_capacity(limit.min(1024));
+        let mut next = None;
+        'buckets: while bucket < BUCKETS {
+            let dir = blocks.join(std::str::from_utf8(&hex_pair(bucket)).expect("ASCII buckets"));
+            let mut names: Vec<String> = match fs::read_dir(&dir) {
+                Ok(rd) => rd
+                    .flatten()
+                    .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                    .filter(|n| n.as_str() > after.as_str())
+                    .collect(),
+                // A bucket directory that is already gone holds no objects; the
+                // walk continues rather than failing an audit over one missing
+                // directory.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+                Err(e) => return Err(e),
+            };
+            names.sort();
+            for name in names {
+                let path = dir.join(&name);
+                let md = match fs::symlink_metadata(&path) {
+                    Ok(m) => m,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e),
+                };
+                // Only a regular file is an object: the local `gc` scanner skips
+                // a symlink or a stray directory for the same reason — a key it
+                // cannot own bytes under is never reported as reclaimable.
+                if !md.is_file() {
+                    continue;
+                }
+                rows.push(ObjectRow {
+                    key: name.clone(),
+                    size: md.len(),
+                    mtime_secs: md
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0),
+                });
+                if rows.len() == limit {
+                    next = Some(format!("{bucket:02x}\t{name}"));
+                    break 'buckets;
+                }
+            }
+            bucket += 1;
+            after.clear();
+        }
+        Ok(ObjectPage { rows, next })
+    }
+
     fn statvfs(&self) -> io::Result<FsStat> {
         let croot = std::ffi::CString::new(self.root.as_os_str().as_encoded_bytes())
             .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
@@ -599,6 +677,68 @@ mod tests {
             io::Error::last_os_error()
         );
         assert_eq!(&buf, b"payload");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A paged walk visits every object EXACTLY once, whatever the page size:
+    /// the bucket cursor is the only thing standing between "gc saw all the
+    /// bytes" and "gc deleted a live object's page because it never saw the
+    /// reference". Sizes and mtimes travel with the rows.
+    #[test]
+    fn list_objects_pages_every_object_exactly_once() {
+        let root = tmp_root("list");
+        let be = LocalBackend::new(&root).unwrap();
+        let mut want = std::collections::BTreeMap::new();
+        for i in 0..300u32 {
+            let key = format!("{i:08x}-0000-4000-8000-000000000000");
+            let body = vec![b'x'; (i as usize % 17) + 1];
+            be.write(&key, 0, &body).unwrap();
+            want.insert(key, body.len() as u64);
+        }
+        for page_size in [1usize, 7, 64, 299, 300, 301, 4096] {
+            let mut seen = std::collections::BTreeMap::new();
+            let mut cursor: Option<String> = None;
+            let mut pages = 0;
+            loop {
+                let page = be.list_objects(cursor.as_deref(), page_size).unwrap();
+                pages += 1;
+                assert!(pages < 10_000, "walk did not terminate");
+                assert!(
+                    page.rows.len() <= page_size.clamp(1, super::super::LIST_LIMIT_MAX),
+                    "page exceeded the requested {page_size}"
+                );
+                for r in page.rows {
+                    assert!(
+                        seen.insert(r.key.clone(), r.size).is_none(),
+                        "key {} appeared twice in one walk (page size {page_size})",
+                        r.key
+                    );
+                    assert!(r.mtime_secs > 0, "mtime was not reported for {}", r.key);
+                }
+                match page.next {
+                    Some(n) => cursor = Some(n),
+                    None => break,
+                }
+            }
+            assert_eq!(seen, want, "page size {page_size} did not cover the store");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A cursor that did not come from this backend is refused rather than
+    /// silently restarted: "start over" in an auditor is a rewrite of the
+    /// traversal, and a rewrite is how a page gets visited twice or skipped.
+    #[test]
+    fn list_objects_refuses_a_foreign_cursor() {
+        let root = tmp_root("listcursor");
+        let be = LocalBackend::new(&root).unwrap();
+        be.write("k", 0, b"x").unwrap();
+        for bad in ["nonsense", "zz\tk", "100\tk", "00"] {
+            assert!(
+                be.list_objects(Some(bad), 8).is_err(),
+                "cursor {bad:?} was accepted"
+            );
+        }
         let _ = fs::remove_dir_all(&root);
     }
 }

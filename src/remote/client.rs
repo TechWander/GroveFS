@@ -21,7 +21,7 @@
 //!   still in progress.
 
 use super::proto;
-use crate::backend::{FsStat, StorageBackend};
+use crate::backend::{FsStat, ObjectPage, ObjectRow, StorageBackend};
 use crate::platform::{EACCES, EIO, ENOENT, EROFS};
 use parking_lot::Mutex;
 use std::io;
@@ -629,6 +629,36 @@ impl StorageBackend for RemoteBackend {
             return Ok(());
         }
         status_to_io(status)
+    }
+
+    fn list_objects(&self, cursor: Option<&str>, limit: usize) -> io::Result<ObjectPage> {
+        // The cursor is shipped verbatim: its meaning belongs to the server's
+        // storage layout, and this side only knows "keep going with this".
+        let mut body = Vec::new();
+        proto::put_u32(&mut body, limit as u32);
+        proto::put_key(&mut body, cursor.unwrap_or(""));
+        let (status, _, data) = self.round_trip(proto::OP_LIST, &body)?;
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status));
+        }
+        let mut i = 0usize;
+        let n = proto::read_u32(&data, &mut i)? as usize;
+        let mut rows = Vec::with_capacity(n);
+        for _ in 0..n {
+            let key = proto::get_key(&data, &mut i)?;
+            let size = proto::read_u64(&data, &mut i)?;
+            let mtime_secs = proto::read_u64(&data, &mut i)? as i64;
+            rows.push(ObjectRow {
+                key,
+                size,
+                mtime_secs,
+            });
+        }
+        let next = proto::get_key(&data, &mut i)?;
+        Ok(ObjectPage {
+            rows,
+            next: if next.is_empty() { None } else { Some(next) },
+        })
     }
 
     fn statvfs(&self) -> io::Result<FsStat> {

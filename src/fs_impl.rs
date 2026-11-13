@@ -670,20 +670,9 @@ impl fuser::Filesystem for GroveFS {
         }
         match self
             .meta
-            .create_symlink(parent.0 as i64, &name, &tgt, req.uid(), req.gid())
+            .create_symlink_with_attr(parent.0 as i64, &name, &tgt, req.uid(), req.gid())
         {
-            Ok(id) => {
-                match self.meta.getattr(id) {
-                    Some(node) => {
-                        reply.entry(&self.short_ttl(), &self.build_attr(&node), Generation(0))
-                    }
-                    // The just-created inode was concurrently unlinked between
-                    // `create` (which released the meta lock) and this lookup.
-                    // Report it gone rather than unwrapping `None` into a
-                    // FUSE-worker panic; matches getattr/lookup/setattr.
-                    None => reply.error(Errno::ENOENT),
-                }
-            }
+            Ok(node) => reply.entry(&self.short_ttl(), &self.build_attr(&node), Generation(0)),
             Err(e) => reply.error(Self::err_to_errno(e)),
         }
     }
@@ -805,7 +794,7 @@ impl fuser::Filesystem for GroveFS {
         }
         let name_str = name.to_string_lossy().to_string();
         let perm = mode & !umask;
-        match self.meta.create_node(
+        match self.meta.create_node_with_attr(
             parent.0 as i64,
             &name_str,
             true,
@@ -814,18 +803,7 @@ impl fuser::Filesystem for GroveFS {
             req.uid(),
             req.gid(),
         ) {
-            Ok(id) => {
-                match self.meta.getattr(id) {
-                    Some(node) => {
-                        reply.entry(&self.short_ttl(), &self.build_attr(&node), Generation(0))
-                    }
-                    // The just-created inode was concurrently unlinked between
-                    // `create` (which released the meta lock) and this lookup.
-                    // Report it gone rather than unwrapping `None` into a
-                    // FUSE-worker panic; matches getattr/lookup/setattr.
-                    None => reply.error(Errno::ENOENT),
-                }
-            }
+            Ok(node) => reply.entry(&self.short_ttl(), &self.build_attr(&node), Generation(0)),
             Err(e) => reply.error(Self::err_to_errno(e)),
         }
     }
@@ -853,7 +831,7 @@ impl fuser::Filesystem for GroveFS {
             return;
         }
         let perm = mode & !umask;
-        match self.meta.create_node(
+        match self.meta.create_node_with_attr(
             parent.0 as i64,
             &name_str,
             false,
@@ -862,26 +840,18 @@ impl fuser::Filesystem for GroveFS {
             req.uid(),
             req.gid(),
         ) {
-            Ok(id) => {
-                match self.meta.getattr(id) {
-                    Some(node) => {
-                        self.cache_key(id as u64, &key);
-                        let attr = self.build_attr(&node);
-                        // Echo the inode as the handle: IO resolves by inode, so fh is
-                        // opaque here. Returning it keeps the reply shape valid.
-                        reply.created(
-                            &self.short_ttl(),
-                            &attr,
-                            Generation(0),
-                            FileHandle(id as u64),
-                            FopenFlags::empty(),
-                        );
-                    }
-                    // Raced with a concurrent unlink of the just-created name:
-                    // reply ENOENT instead of panicking a FUSE worker on `None`
-                    // (the unlink already GC'd the backing object via gced_key).
-                    None => reply.error(Errno::ENOENT),
-                }
+            Ok(node) => {
+                self.cache_key(node.id as u64, &key);
+                let attr = self.build_attr(&node);
+                // Echo the inode as the handle: IO resolves by inode, so fh is
+                // opaque here. Returning it keeps the reply shape valid.
+                reply.created(
+                    &self.short_ttl(),
+                    &attr,
+                    Generation(0),
+                    FileHandle(node.id as u64),
+                    FopenFlags::empty(),
+                );
             }
             Err(e) => {
                 let _ = self.backend.remove(&key);

@@ -242,6 +242,12 @@ struct MetaRuntime {
     /// (entries stay resident for the process lifetime — the pre-sweeper
     /// behavior every existing test relies on).
     engine_idle_ms: u64,
+    /// The account-key store that gates the CONTROL port, when
+    /// `--control-listen` is set. Deliberately separate from [`Self::keys`]: the
+    /// mount gate (`--require-api-key`) and the governance gate are two
+    /// entrances with different credential scopes, and enabling one must never
+    /// silently enable the other.
+    ctl_keys: Option<Arc<crate::apikeys::ApiKeyStore>>,
 }
 
 impl MetaRuntime {
@@ -371,6 +377,10 @@ pub struct MetaServer {
     store_unavailable: Option<String>,
     /// Idle engine eviction window (ms); see [`MetaRuntime::engine_idle_ms`].
     engine_idle_ms: u64,
+    /// Optional REMOTE CONTROL PLANE address (`--control-listen HOST:PORT`).
+    /// Empty/unset keeps the process exactly as before: no governance port, no
+    /// admin credentials, nothing new to firewall.
+    control_listen: Option<String>,
 }
 
 /// Default idle-engine eviction window for a builder-constructed `MetaServer`
@@ -400,6 +410,7 @@ impl MetaServer {
             store: StoreKind::Sqlite,
             store_unavailable: None,
             engine_idle_ms: DEFAULT_ENGINE_IDLE_MS,
+            control_listen: None,
         }
     }
 
@@ -419,6 +430,7 @@ impl MetaServer {
             store: StoreKind::Sqlite,
             store_unavailable: None,
             engine_idle_ms: DEFAULT_ENGINE_IDLE_MS,
+            control_listen: None,
         }
     }
 
@@ -431,6 +443,20 @@ impl MetaServer {
     /// established mount instead of only refusing the next one.
     pub fn with_api_keys(mut self, store: crate::apikeys::ApiKeyStore) -> Self {
         self.keys = Some(Arc::new(store));
+        self
+    }
+
+    /// Expose the REMOTE CONTROL PLANE on a second listener
+    /// (`--control-listen HOST:PORT`): governance calls (`view`/`apikey`/`refs`)
+    /// arrive as framed requests and are executed HERE, by the process that
+    /// already owns the metadata store — so an operator on any machine needs an
+    /// admin-scope account key instead of a database URI.
+    ///
+    /// The port always authenticates (the server opens the key store itself and
+    /// demands `Scope::Admin`); there is no unauthenticated mode. Unset keeps
+    /// this process byte-for-byte identical to a server without the feature.
+    pub fn with_control_listen(mut self, addr: Option<String>) -> Self {
+        self.control_listen = addr.filter(|a| !a.trim().is_empty());
         self
     }
 
@@ -668,6 +694,27 @@ impl MetaServer {
                 ),
             }
         }
+        // The CONTROL port's own credential store. Built here (and only here)
+        // so `--control-listen` is self-contained: it does NOT reuse
+        // `--require-api-key`'s store object but the same physical rows, and it
+        // does NOT turn on the mount gate. A control port without a key store
+        // would be an unauthenticated administrator entrance, which is why
+        // there is no "open" mode for it at all.
+        let ctl_keys = match &self.control_listen {
+            None => None,
+            Some(_) => {
+                let store_uri = match &self.store {
+                    StoreKind::Pg(u) => Some(u.as_str()),
+                    StoreKind::Sqlite => None,
+                    #[cfg(feature = "fdb")]
+                    StoreKind::Fdb(u) => Some(u.as_str()),
+                };
+                Some(Arc::new(
+                    crate::apikeys::ApiKeyStore::open_for(&self.base, store_uri)
+                        .map_err(io::Error::other)?,
+                ))
+            }
+        };
         let listener = TcpListener::bind(&self.listen)?;
         println!(
             "meta-server listening on {} (base {}, role {:?}{})",
@@ -707,26 +754,25 @@ impl MetaServer {
             None
         };
         // The control plane FOLLOWS the metadata backend: a PG store reads view
-        // definitions/aliases/forks from the shared `grovefs_control` schema, a
-        // SQLite store from the local `meta/views` dir — one system of record per
-        // backend, never a local file the PG deployment would ignore.
+        // definitions/aliases/forks from the shared `grovefs_control` schema, an
+        // FDB store from the cluster's `ctl` tables, a SQLite store from the local
+        // `meta/views` dir — one system of record per backend, never a local file
+        // the PG/FDB deployment would ignore.
         let control = crate::mcp::control_store_for(
             &self.base,
             match &self.store {
                 StoreKind::Pg(uri) => Some(uri.as_str()),
                 StoreKind::Sqlite => None,
-                // FDB: the control plane is still the local system of record here.
-                // Moving view definitions/aliases/api keys into the cluster is P5's
-                // governance work (§ docs/fdb-keyspace.md I1–I4), not something the
-                // dispatch layer may invent a half-measure for; a half-migrated control
-                // plane — metadata authoritative in the cluster, governance local to
-                // this node — is exactly the split-brain the design doc rejects, so
-                // until P5 lands an FDB deployment is single-meta-server by
-                // construction, which is also what the HA refusal above enforces.
-                // The URI is still passed: `control_store_for` keeps every record a
-                // file but lets the CLUSTER decide whether a physical tree exists,
-                // which is the one question a `<view>.db` lookup cannot answer for a
-                // subspace (it would refuse a provisioned view and accept a stale file).
+                // FDB: the control plane is the CLUSTER's, exactly as PG's is.
+                // View definitions/aliases/forks live in `CtlDefTable`, api keys
+                // and audit in `CtlKeyTable`, and physical trees are subspaces —
+                // all under the one `ctl`/root key space every meta-server, MCP
+                // and CLI on the cluster shares (docs/fdb-keyspace.md I1–I4). The
+                // half-migrated shape the design doc rejects — metadata
+                // authoritative in the cluster, governance local to one node — is
+                // gone: there is no local system of record left to split from.
+                // `control_store_for` also runs a one-time best-effort upload of
+                // any pre-existing local definition slots an older build kept.
                 #[cfg(feature = "fdb")]
                 StoreKind::Fdb(uri) => Some(uri.as_str()),
             },
@@ -750,9 +796,36 @@ impl MetaServer {
             bases: Arc::new(Mutex::new(HashMap::new())),
             defs: Arc::new(Mutex::new(HashMap::new())),
             engine_idle_ms: self.engine_idle_ms,
+            ctl_keys,
         });
         if rt.sync_repl {
             println!("meta-server: synchronous replication ON (RPO=0 for mutating ops, ACK timeout {SYNC_REPL_ACK_TIMEOUT:?})");
+        }
+        // ---- remote control plane (governance over the wire) -----------------
+        //
+        // Bound BEFORE the filesystem port accepts anything, so a typo in
+        // `--control-listen` fails the start instead of leaving an operator
+        // with a server that looks up but refuses every governance call. The
+        // listener is a SECOND port on purpose: an admin entrance must be
+        // separable by firewall/netns from the mount plane, and a mount
+        // session must never be able to reach a governance op.
+        if let Some(addr) = &self.control_listen {
+            let cl = TcpListener::bind(addr).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "cannot bind --control-listen {addr}: {e} (the control port is a second \
+                         listener beside --listen; pick a free address, e.g. 127.0.0.1:50154)"
+                    ),
+                )
+            })?;
+            println!(
+                "meta-server: CONTROL plane listening on {addr} (admin-scope api keys only; \
+                 every call is audited as method=control — mint with `grovefs apikey create \
+                 --for admin --owner <account>` on this host)"
+            );
+            let crt = rt.clone();
+            thread::spawn(move || gov_accept(cl, crt));
         }
         // Fail LOUD on a malformed witness list. `split_addrs` collapses a
         // degenerate input (e.g. a lone comma) to a single bogus entry, which
@@ -865,6 +938,7 @@ fn serve_on_meta_full(listener: TcpListener, base: PathBuf, token: &str) {
         // Plain LAN-trusted test server: keep engines resident (no sweeper),
         // exactly the pre-eviction behavior.
         engine_idle_ms: 0,
+        ctl_keys: None,
     });
     serve_runtime(listener, rt);
 }
@@ -901,6 +975,1188 @@ fn serve_runtime(listener: TcpListener, rt: Arc<MetaRuntime>) {
             Err(e) => eprintln!("meta accept failed: {e}"),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// REMOTE CONTROL PLANE (governance over the wire)
+// ---------------------------------------------------------------------------
+//
+// Why a second listener instead of a new op on the filesystem port: an admin
+// entrance must be separable from the mount plane by firewall/netns, and a
+// mount session must never be able to reach a governance op. Why in THIS
+// process: it is the only one that holds the backend connection (a PG URI) or
+// the local `<meta-dir>`, so the operator's credential replaces a database
+// password. Every call is authenticated as `Scope::Admin` and audited.
+//
+// The framing is one request / one response / one governance verb (see
+// `proto::OP_CONTROL`); there is no session state, so there is nothing to
+// expire and nothing a half-open socket can keep alive.
+fn gov_accept(listener: TcpListener, rt: Arc<MetaRuntime>) {
+    for stream in listener.incoming() {
+        match stream {
+            Ok(s) => {
+                let rt = rt.clone();
+                thread::spawn(move || {
+                    if let Err(e) = handle_gov_conn(s, &rt) {
+                        if e.kind() != io::ErrorKind::UnexpectedEof {
+                            eprintln!("control conn error: {e}");
+                        }
+                    }
+                });
+            }
+            Err(e) => eprintln!("control accept failed: {e}"),
+        }
+    }
+}
+
+/// One governance response: `STATUS 0` with an `{ok,r}` / `{ok:false,e}`
+/// envelope in the body. Failures are NEVER a transport-level status, so a
+/// caller can tell "the op said no" from "the server went away".
+fn gov_reply(s: &mut TcpStream, result: serde_json::Value, err: Option<&str>) -> io::Result<()> {
+    let env = match err {
+        Some(e) => serde_json::json!({"ok": false, "e": e}),
+        None => serde_json::json!({"ok": true, "r": result}),
+    };
+    let data = serde_json::to_vec(&env).unwrap_or_default();
+    proto::send_response(s, 0, 0, &data)
+}
+
+fn handle_gov_conn(mut s: TcpStream, rt: &Arc<MetaRuntime>) -> io::Result<()> {
+    let _ = s.set_nodelay(true);
+    let (op_code, body) = proto::recv_request(&mut s)?;
+    if op_code != proto::OP_CONTROL {
+        return gov_reply(
+            &mut s,
+            serde_json::Value::Null,
+            Some(&format!(
+                "this port speaks governance only (expected op {}, got {op_code}) — a mount must use --listen",
+                proto::OP_CONTROL
+            )),
+        );
+    }
+    let req: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return gov_reply(
+                &mut s,
+                serde_json::Value::Null,
+                Some(&format!("malformed control request: {e}")),
+            )
+        }
+    };
+    let key = req.get("k").and_then(|v| v.as_str()).unwrap_or("");
+    let op = req.get("op").and_then(|v| v.as_str()).unwrap_or("");
+    let args = req
+        .get("a")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let Some(keys) = rt.ctl_keys.as_ref() else {
+        return gov_reply(
+            &mut s,
+            serde_json::Value::Null,
+            Some("this meta-server has no control plane (start it with --control-listen HOST:PORT)"),
+        );
+    };
+    let authed = match keys.authenticate_admin(key) {
+        Ok(a) => a,
+        Err(e) => {
+            // An unauthenticated attempt is audited too (keyless), so a wrong
+            // or revoked credential is visible in `apikey calls` instead of
+            // only in the operator's terminal.
+            let _ = keys.log_call(None, "control", op, false, &e);
+            return gov_reply(&mut s, serde_json::Value::Null, Some(&e));
+        }
+    };
+    match control_dispatch(rt, op, &args) {
+        Ok(v) => {
+            let _ = keys.log_call(
+                Some(&authed),
+                "control",
+                op,
+                true,
+                &format!("account={}", authed.owner.as_deref().unwrap_or("-")),
+            );
+            gov_reply(&mut s, v, None)
+        }
+        Err(e) => {
+            let _ = keys.log_call(
+                Some(&authed),
+                "control",
+                op,
+                false,
+                &format!("account={} {e}", authed.owner.as_deref().unwrap_or("-")),
+            );
+            gov_reply(&mut s, serde_json::Value::Null, Some(&e))
+        }
+    }
+}
+
+fn req_str(a: &serde_json::Value, name: &str) -> Result<String, String> {
+    a.get(name)
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| format!("control call is missing the '{name}' argument"))
+}
+
+/// The graft plan as it arrives over the wire: an array of `{"src":…,"dst":…}`
+/// objects. Parsed strictly — a malformed entry is refused rather than skipped,
+/// because a silently dropped plan line would graft a subset the operator never
+/// asked for and still report success.
+fn graft_items(a: &serde_json::Value) -> Result<Vec<crate::meta::GraftItem>, String> {
+    let arr = a
+        .get("items")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "control call is missing the 'items' array".to_string())?;
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, ent) in arr.iter().enumerate() {
+        let src = ent
+            .get("src")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("graft item #{i}: missing 'src'"))?;
+        let dst = ent
+            .get("dst")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("graft item #{i}: missing 'dst'"))?;
+        out.push(crate::meta::GraftItem {
+            src: src.to_string(),
+            dst: dst.to_string(),
+        });
+    }
+    Ok(out)
+}
+
+/// Seed a just-created tree from a manifest that arrived as text. Returns the
+/// suffix appended to the creation report, or an empty string when there was no
+/// manifest. The uid/gid recorded are the SERVER's, because the files are
+/// materialized here — the operator's ids describe a different machine.
+fn seed_if_manifest(
+    meta: &dyn crate::meta::MetaProvider,
+    be: Option<&dyn crate::backend::StorageBackend>,
+    manifest: Option<&str>,
+) -> Result<String, String> {
+    let Some(text) = manifest else {
+        return Ok(String::new());
+    };
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    let (dirs, files) = crate::mcp::seed_tree_from_text(meta, be, text, uid, gid)?;
+    Ok(format!(
+        "\napplied seed manifest: {dirs} dir(s) and {files} file(s) created; names that already existed were left alone"
+    ))
+}
+
+fn is_striped(dr: &str) -> bool {
+    dr.starts_with('s') && dr.matches(':').count() >= 2
+}
+
+/// Free every object the ledger just released, from `droot`. Shared by the two
+/// teardown arms so a striped key (which a plain root cannot reach) is reported
+/// rather than half-deleted in one branch and not the other.
+fn free_unbooked(rep_refs: &[String], droot: &Path) -> String {
+    let (mut freed, mut missing, mut failed) = (0usize, 0usize, 0usize);
+    match crate::backend::open_local(droot) {
+        Ok(be) => {
+            for dr in rep_refs {
+                if is_striped(dr) {
+                    failed += 1;
+                    continue;
+                }
+                if be.len(dr).is_err() {
+                    missing += 1;
+                    continue;
+                }
+                match be.remove(dr) {
+                    Ok(()) => freed += 1,
+                    Err(_) => failed += 1,
+                }
+            }
+        }
+        Err(e) => {
+            return format!(
+                "cannot open data root {} to free {} released object(s): {e} — the tree is gone and its bookings are released, so those bytes are unreferenced now; free them through the data-server or a mount",
+                droot.display(),
+                rep_refs.len()
+            )
+        }
+    }
+    format!(
+        "{freed} object(s) freed from {}, {missing} not found under that data root (they live on another store?), {failed} could not be freed (striped keys move through a data-server)",
+        droot.join("blocks").display()
+    )
+}
+
+fn control_dispatch(
+    rt: &Arc<MetaRuntime>,
+    op: &str,
+    a: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    use serde_json::json;
+    match op {
+        "info" => Ok(json!({
+            "backend": rt.control.backend(),
+            "describe": rt.control.describe(),
+            "base": rt.base.display().to_string(),
+        })),
+        "def.list" => Ok(json!(rt.control.list_defs()?)),
+        "def.get" => {
+            let name = req_str(a, "name")?;
+            Ok(json!(rt.control.get_def_raw(&name)?))
+        }
+        "def.put" => {
+            let name = req_str(a, "name")?;
+            let text = req_str(a, "text")?;
+            rt.control.put_def(&name, &text)?;
+            // A cached lens built from the OLD text must not keep serving: the
+            // same eviction the local CLI relies on for hot reload.
+            rt.evict();
+            Ok(serde_json::Value::Null)
+        }
+        "def.remove" => {
+            let name = req_str(a, "name")?;
+            let removed = rt.control.remove_def(&name)?;
+            rt.evict();
+            Ok(json!(removed))
+        }
+        "stamp" => Ok(json!(rt.control.stamp(&req_str(a, "name")?))),
+        "physical.list" => Ok(json!(rt.control.list_physical()?)),
+        "physical.has" => Ok(json!(rt.control.has_physical(&req_str(a, "name")?)?)),
+        "fork.has" => Ok(json!(rt.control.has_fork_tree(&req_str(a, "name")?)?)),
+        // The tree-copy verbs. They are served HERE — by the process that owns
+        // the store — instead of being refused, because the copy reads and
+        // writes nothing but the metadata store this server is already the only
+        // holder of. Whether a backend CAN fork is the backend's own verdict
+        // (PG has no per-view snapshot path; an `fdb://` view is a subspace),
+        // and that verdict travels back verbatim rather than being re-invented
+        // on the operator's machine.
+        "fork.create" => {
+            let base = req_str(a, "base")?;
+            let name = req_str(a, "name")?;
+            let seed = a.get("seed").and_then(|v| v.as_bool()).unwrap_or(true);
+            let st = rt.control.create_fork_tree(&base, &name, seed)?;
+            // A cached engine for `name` could only be a stale tree handle.
+            rt.evict();
+            Ok(json!({"nodes": st.nodes, "blobs": st.blobs}))
+        }
+        "fork.drop" => {
+            let name = req_str(a, "name")?;
+            rt.control.drop_fork_tree(&name)?;
+            rt.evict();
+            Ok(serde_json::Value::Null)
+        }
+        "fork.graft" => {
+            let dst = req_str(a, "dst")?;
+            let src = req_str(a, "src")?;
+            let items = graft_items(a)?;
+            let dest = a.get("dest").and_then(|v| v.as_str()).unwrap_or("/");
+            let skip = a
+                .get("skip_existing")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let st = rt.control.graft_tree(&dst, &src, &items, dest, skip)?;
+            rt.evict();
+            Ok(json!({
+                "nodes": st.nodes,
+                "dirs": st.dirs,
+                "blobs": st.blobs,
+                "skipped": st.skipped,
+            }))
+        },
+        // The portable-dump verbs. `export`/`import` used to be refused here
+        // because they looked like "move a file on the operator's machine". They
+        // are served now, and the dump travels over this port in CHUNKS: the
+        // operator's `--out`/`--in` stay local paths, the tree stays here, and
+        // neither side ever holds a whole dump in memory. What moves is
+        // metadata only — the `data_ref` keys — so no byte of content crosses
+        // the wire in either direction (see `view.export` in the reply for the
+        // explicit note the CLI prints).
+        "view.export" => view_export_stage(rt, &req_str(a, "view")?),
+        "view.export.chunk" => {
+            let handle = req_str(a, "handle")?;
+            let offset = a.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
+            let max = a.get("max").and_then(|v| v.as_u64()).unwrap_or(XFER_CHUNK);
+            view_export_chunk(rt, &handle, offset, max)
+        }
+        "view.export.done" => view_xfer_drop(rt, &req_str(a, "handle")?),
+        "view.import.begin" => view_import_begin(rt),
+        "view.import.put" => {
+            let handle = req_str(a, "handle")?;
+            let offset = a.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
+            let text = req_str(a, "text")?;
+            view_import_put(rt, &handle, offset, &text)
+        }
+        "view.import.commit" => view_import_commit(rt, a),
+        "view.import.abort" => view_xfer_drop(rt, &req_str(a, "handle")?),
+        "view.create" => {
+            let view = req_str(a, "view")?;
+            // The manifest travels as TEXT: the file lives on the operator's
+            // machine, the tree lives here, and the same `mkdir`/`touch` lines
+            // are interpreted by the process that owns the store.
+            let manifest = a.get("manifest").and_then(|v| v.as_str());
+            if !crate::layout::valid_view_name(&view) {
+                return Err(format!("invalid view name '{view}'"));
+            }
+            if rt.control.has_def(&view)? {
+                return Err(format!(
+                    "view '{view}' already has a derived/alias/fork definition — choose a different base name (`view list` shows it)"
+                ));
+            }
+            if rt.control.has_physical(&view)? {
+                return Err(format!(
+                    "view '{view}' already exists — remove it first (`view rm --name {view} --base`)"
+                ));
+            }
+            let report = match &rt.store {
+                StoreKind::Pg(uri) => {
+                    let eng = crate::pg_store::PgEngine::open(uri, &view, false)
+                        .map_err(|e| format!("view create: {e}"))?;
+                    // A PG deployment's bytes are owned by the data servers, so
+                    // there is no local root to write a manifest file into.
+                    let note = seed_if_manifest(&eng, None, manifest)?;
+                    format!("created BASE view '{view}' in {uri} (schema grovefs_v_<hex>){note}")
+                }
+                StoreKind::Sqlite => {
+                    let mp = rt.base.join("meta").join(format!("{view}.db"));
+                    if let Some(dir) = mp.parent() {
+                        std::fs::create_dir_all(dir)
+                            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+                    }
+                    let eng = crate::meta::MetaEngine::open(&mp)
+                        .map_err(|e| format!("view create: {e}"))?;
+                    // SQLite IS the local byte root: `blocks/` sits beside
+                    // `meta/`, so a `touch` line can create its object here.
+                    let be = crate::backend::open_local(&rt.base).ok();
+                    let note = seed_if_manifest(&eng, be.as_deref(), manifest)?;
+                    format!("created BASE view '{view}' at {}{note}", mp.display())
+                }
+                #[cfg(feature = "fdb")]
+                StoreKind::Fdb(uri) => {
+                    let eng = crate::fdb_store::FdbStore::open(uri, &view, false)
+                        .map_err(|e| format!("view create: {e}"))?;
+                    let note = seed_if_manifest(&eng, None, manifest)?;
+                    format!(
+                        "created BASE view '{view}' in {uri} (subspace under the 'grovefs' root){note}"
+                    )
+                }
+            };
+            rt.evict();
+            Ok(json!(report))
+        }
+        "view.rm_base" => {
+            let view = req_str(a, "view")?;
+            let data_root = a.get("data_root").and_then(|v| v.as_str());
+            view_rm_base(rt, &view, data_root)
+        }
+        "refs.rebuild" => refs_rebuild(rt),
+        "gc.scan" => gc_audit(rt, false, a),
+        "gc.apply" => gc_audit(rt, true, a),
+        "apikey.create" => {
+            let keys = rt
+                .ctl_keys
+                .as_ref()
+                .ok_or_else(|| "no control key store".to_string())?;
+            let label = req_str(a, "label")?;
+            let scope = crate::apikeys::Scope::parse(&req_str(a, "scope")?)?;
+            let view = a.get("view").and_then(|v| v.as_str());
+            let ro = a.get("ro").and_then(|v| v.as_bool()).unwrap_or(false);
+            let owner = a.get("owner").and_then(|v| v.as_str());
+            let (id, full) = keys.create_bound(&label, scope, view, ro, owner)?;
+            Ok(json!({
+                "id": id,
+                "key": full,
+                "label": label,
+                "scope": scope.as_str(),
+                "owner": owner,
+            }))
+        }
+        "apikey.list" => {
+            let keys = rt
+                .ctl_keys
+                .as_ref()
+                .ok_or_else(|| "no control key store".to_string())?;
+            let rows: Vec<serde_json::Value> = keys
+                .list()?
+                .into_iter()
+                .map(|k| {
+                    json!({
+                        "id": k.id,
+                        "owner": k.owner,
+                        "label": k.label,
+                        "scope": k.scope,
+                        "view": k.view,
+                        "ro": k.ro,
+                        "created_at": k.created_at,
+                        "last_used_at": k.last_used_at,
+                        "revoked_at": k.revoked_at,
+                    })
+                })
+                .collect();
+            Ok(json!(rows))
+        }
+        "apikey.revoke" => {
+            let keys = rt
+                .ctl_keys
+                .as_ref()
+                .ok_or_else(|| "no control key store".to_string())?;
+            Ok(json!(keys.revoke(&req_str(a, "id")?)?))
+        }
+        "apikey.set_ro" => {
+            let keys = rt
+                .ctl_keys
+                .as_ref()
+                .ok_or_else(|| "no control key store".to_string())?;
+            let ro = a.get("ro").and_then(|v| v.as_bool()).unwrap_or(false);
+            Ok(json!(keys.set_ro(&req_str(a, "id")?, ro)?))
+        }
+        "apikey.calls" => {
+            let keys = rt
+                .ctl_keys
+                .as_ref()
+                .ok_or_else(|| "no control key store".to_string())?;
+            let limit = a.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+            let rows: Vec<serde_json::Value> = keys
+                .recent_calls(limit)?
+                .into_iter()
+                .map(|c| {
+                    json!({
+                        "ts": c.ts,
+                        "key_id": c.key_id,
+                        "key_label": c.key_label,
+                        "method": c.method,
+                        "tool": c.tool,
+                        "ok": c.ok,
+                        "detail": c.detail,
+                    })
+                })
+                .collect();
+            Ok(json!(rows))
+        }
+        other => Err(format!(
+            "unknown control op '{other}' (known: info, def.list/get/put/remove, stamp, physical.list/has, \
+             fork.has/create/drop/graft, view.create/export/import, view.rm_base, refs.rebuild, \
+             gc.scan/apply, apikey.create/list/revoke/set_ro/calls)"
+        )),
+    }
+}
+
+// ---- portable dumps over the wire (export / import) -----------------------
+//
+// A dump is metadata only (ids, names, inodes, `data_ref` keys), yet it can be
+// large — one line per node. So it moves in CHUNKS through a staging file under
+// `<base>/meta/.xfer/`, which never ends in `.db` and is therefore invisible to
+// every view lister and to `refs rebuild`. Handles are MINTED HERE, so a client
+// cannot name a path at all; the chunk boundary is always a line boundary, so a
+// chunk is always valid UTF-8 and a row is never split across two messages.
+
+/// Default chunk size for one request/reply body (4 MiB). The client asks for
+/// what it wants; this is only the server's default.
+const XFER_CHUNK: u64 = 4 << 20;
+
+fn xfer_dir(rt: &MetaRuntime) -> std::path::PathBuf {
+    rt.base.join("meta").join(".xfer")
+}
+
+/// Strict handle check: minted by [`new_xfer_handle`], so anything else is a
+/// client trying to name a path. `..`, separators and dots are all refused.
+fn xfer_path(rt: &MetaRuntime, handle: &str) -> Result<std::path::PathBuf, String> {
+    let ok = !handle.is_empty()
+        && handle.len() <= 96
+        && handle
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !ok {
+        return Err(format!(
+            "malformed transfer handle '{handle}' — handles are minted by the server"
+        ));
+    }
+    Ok(xfer_dir(rt).join(handle))
+}
+
+fn new_xfer_handle(prefix: char) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{prefix}-{}-{nanos}", std::process::id())
+}
+
+/// Drop staging files nobody finished. Best effort and deliberately age-gated:
+/// a transfer that is in flight MUST survive, so only files older than this are
+/// removed (a crashed client is the case this exists for).
+fn sweep_xfer(dir: &std::path::Path) {
+    const STALE: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for ent in rd.flatten() {
+        let Ok(md) = ent.metadata() else { continue };
+        let old = md
+            .modified()
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > STALE);
+        if old {
+            let _ = std::fs::remove_file(ent.path());
+        }
+    }
+}
+
+/// Refuse to export a name that has no tree of its own, before any staging file
+/// exists — the same guard both other arms apply, stated by name.
+fn refuse_virtual_for_export(view: &str, definition: Option<&str>) -> Result<(), String> {
+    let Some(text) = definition else {
+        return Ok(());
+    };
+    match crate::layout::LayoutRules::parse_def(text)
+        .map_err(|e| format!("bad view definition '{view}': {e}"))?
+    {
+        crate::layout::ViewDef::Alias(real) => Err(format!(
+            "'{view}' is a pure alias of real view '{real}' — export '{real}' instead (an alias \
+             has no metadata tree of its own)"
+        )),
+        crate::layout::ViewDef::Derived(base, _) => Err(format!(
+            "'{view}' is a derived (virtual) view over '{base}' — export '{base}' instead (a \
+             derived view has no metadata tree of its own)"
+        )),
+        crate::layout::ViewDef::Fork(_) => Ok(()),
+    }
+}
+
+/// Render one view's tree into a staging file and hand the client a handle. The
+/// CLI then pulls it in chunks; a failure here leaves no file behind (every
+/// backend's dump writes beside its destination and renames).
+fn view_export_stage(rt: &Arc<MetaRuntime>, view: &str) -> Result<serde_json::Value, String> {
+    use serde_json::json;
+    if !crate::layout::valid_view_name(view) {
+        return Err(format!("invalid view name '{view}'"));
+    }
+    let definition = rt.control.get_def_raw(view)?;
+    refuse_virtual_for_export(view, definition.as_deref())?;
+    let dir = xfer_dir(rt);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    sweep_xfer(&dir);
+    let handle = new_xfer_handle('x');
+    let path = xfer_path(rt, &handle)?;
+    let st = match &rt.store {
+        StoreKind::Sqlite => crate::meta::export_view(&rt.base, view, &path, true)?,
+        StoreKind::Pg(uri) => {
+            crate::pg_store::export_view(uri, view, &path, true, definition.clone())?
+        }
+        #[cfg(feature = "fdb")]
+        StoreKind::Fdb(uri) => crate::fdb_store::FdbStore::open(uri, view, true)
+            .map_err(|e| e.to_string())?
+            .export_jsonl(view, &path, true, definition.clone())
+            .map_err(|e| e.to_string())?,
+    };
+    let size = std::fs::metadata(&path)
+        .map_err(|e| format!("cannot stat staged export {handle}: {e}"))?
+        .len();
+    Ok(json!({
+        "handle": handle,
+        "size": size,
+        "nodes": st.nodes,
+        "blobs": st.blobs,
+        "kind": st.kind,
+    }))
+}
+
+/// Hand back one chunk of a staged export, ending on a line boundary.
+fn view_export_chunk(
+    rt: &Arc<MetaRuntime>,
+    handle: &str,
+    offset: u64,
+    max: u64,
+) -> Result<serde_json::Value, String> {
+    use serde_json::json;
+    use std::io::{Read, Seek, SeekFrom};
+    let path = xfer_path(rt, handle)?;
+    let mut f = std::fs::File::open(&path).map_err(|e| {
+        format!(
+            "no staged export '{handle}' ({e}) — a staged dump does not survive a server restart; \
+             re-run `view export`"
+        )
+    })?;
+    let total = f
+        .metadata()
+        .map_err(|e| format!("cannot stat staged export {handle}: {e}"))?
+        .len();
+    if offset > total {
+        return Err(format!(
+            "chunk offset {offset} is past the end of the staged export ({total} bytes)"
+        ));
+    }
+    f.seek(SeekFrom::Start(offset))
+        .map_err(|e| format!("cannot seek staged export {handle}: {e}"))?;
+    let want = max.clamp(1, 64 << 20).min(total - offset);
+    let mut buf = vec![0u8; want as usize];
+    f.read_exact(&mut buf)
+        .map_err(|e| format!("cannot read staged export {handle}: {e}"))?;
+    let mut next = offset + buf.len() as u64;
+    let mut eof = next >= total;
+    if !eof {
+        // Never split a row (or a UTF-8 sequence): cut at the last newline.
+        // A single row longer than the window grows the read to its end.
+        while !eof && !buf.contains(&b'\n') && buf.len() < (64 << 20) {
+            let mut more = vec![0u8; (buf.len().max(1 << 10)).min((total - next) as usize)];
+            let n = f
+                .read(&mut more)
+                .map_err(|e| format!("cannot read staged export {handle}: {e}"))?;
+            buf.extend_from_slice(&more[..n]);
+            next = offset + buf.len() as u64;
+            eof = next >= total;
+        }
+        if !eof {
+            let cut = buf
+                .iter()
+                .rposition(|&b| b == b'\n')
+                .map(|p| p + 1)
+                .unwrap_or(buf.len());
+            buf.truncate(cut);
+            next = offset + buf.len() as u64;
+        }
+    }
+    let text = String::from_utf8(buf)
+        .map_err(|e| format!("staged export '{handle}' is not valid UTF-8: {e}"))?;
+    Ok(json!({"text": text, "next": next, "eof": next >= total}))
+}
+
+/// Mint a handle for an upload. The file starts empty; every `put` must arrive
+/// at exactly the current length, so a retried or reordered chunk fails loudly
+/// instead of silently corrupting the dump.
+fn view_import_begin(rt: &Arc<MetaRuntime>) -> Result<serde_json::Value, String> {
+    use serde_json::json;
+    let dir = xfer_dir(rt);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    sweep_xfer(&dir);
+    let handle = new_xfer_handle('i');
+    let path = xfer_path(rt, &handle)?;
+    std::fs::File::create(&path).map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+    Ok(json!({"handle": handle}))
+}
+
+fn view_import_put(
+    rt: &Arc<MetaRuntime>,
+    handle: &str,
+    offset: u64,
+    text: &str,
+) -> Result<serde_json::Value, String> {
+    use serde_json::json;
+    use std::io::Write;
+    let path = xfer_path(rt, handle)?;
+    let have = std::fs::metadata(&path)
+        .map_err(|e| format!("no upload staged as '{handle}' ({e}) — call `view.import.begin` first"))?
+        .len();
+    if have != offset {
+        return Err(format!(
+            "upload '{handle}' is at {have} byte(s) but this chunk starts at {offset} — the \
+             previous chunk did not land; restart the import"
+        ));
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    f.write_all(text.as_bytes())
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    let size = have + text.len() as u64;
+    Ok(json!({"size": size}))
+}
+
+/// Install the uploaded dump, then (for `--as-fork`) record the fork definition.
+/// The definition write is part of the SAME verdict: if it fails, the imported
+/// tree is torn down again rather than left as a base view the operator believes
+/// is a fork.
+fn view_import_commit(
+    rt: &Arc<MetaRuntime>,
+    a: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    use serde_json::json;
+    let view = req_str(a, "view")?;
+    let handle = req_str(a, "handle")?;
+    let path = xfer_path(rt, &handle)?;
+    let replace = a.get("replace").and_then(|v| v.as_bool()).unwrap_or(false);
+    let as_fork = a
+        .get("as_fork")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    if !crate::layout::valid_view_name(&view) {
+        return Err(format!("invalid view name '{view}'"));
+    }
+    if rt.control.get_def_raw(&view)?.is_some() {
+        return Err(format!(
+            "view '{view}' already has a definition — remove it first (`view rm --name {view}`) \
+             before importing"
+        ));
+    }
+    if let Some(base) = &as_fork {
+        if !crate::layout::valid_view_name(base) {
+            return Err(format!("invalid base view name '{base}'"));
+        }
+        if base == &view {
+            return Err("fork name must differ from its base".to_string());
+        }
+        if rt.control.get_def_raw(base)?.is_some() {
+            return Err(format!(
+                "base '{base}' is governed by a definition (alias/derived/fork) — fork the \
+                 physical base tree instead"
+            ));
+        }
+        if !rt.control.has_physical(base)? {
+            return Err(format!(
+                "no physical base tree '{base}' — import the base first, or omit --as-fork"
+            ));
+        }
+    }
+    let st = match &rt.store {
+        StoreKind::Sqlite => crate::meta::import_view(&rt.base, &view, &path, replace)?,
+        StoreKind::Pg(uri) => crate::pg_store::import_view(uri, &view, &path, replace)?,
+        #[cfg(feature = "fdb")]
+        StoreKind::Fdb(uri) => crate::fdb_store::FdbStore::open(uri, &view, true)
+            .map_err(|e| e.to_string())?
+            .import_jsonl(&path, replace)
+            .map_err(|e| e.to_string())?,
+    };
+    if let Some(base) = &as_fork {
+        if let Err(e) = rt.control.put_def(&view, &format!("fork {base}\n")) {
+            let rollback = drop_imported_tree(rt, &view);
+            return Err(format!(
+                "imported the tree but cannot record `fork {base}` for '{view}': {e}; {rollback}"
+            ));
+        }
+    }
+    rt.evict();
+    let _ = std::fs::remove_file(&path);
+    Ok(json!({
+        "nodes": st.nodes,
+        "blobs": st.blobs,
+        "kind": st.kind,
+        "replaced": st.replaced,
+        "as_fork": as_fork,
+    }))
+}
+
+/// Undo a just-imported tree (the `--as-fork` rollback). Bytes are NOT touched:
+/// they are still named by whatever the source tree is, and the ledger follows
+/// the trees that exist.
+fn drop_imported_tree(rt: &Arc<MetaRuntime>, view: &str) -> String {
+    match &rt.store {
+        StoreKind::Sqlite => {
+            for ext in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(rt.base.join("meta").join(format!("{view}.db{ext}")));
+            }
+            let _ = crate::meta::rebuild_ledger(&rt.base);
+            "the imported tree was removed again".to_string()
+        }
+        StoreKind::Pg(uri) => match crate::pg_store::PgEngine::remove_view(uri, view) {
+            Ok(_) => "the imported tree was removed again".to_string(),
+            Err(e) => format!("the imported tree could NOT be removed ({e}) — drop schema for '{view}' by hand"),
+        },
+        #[cfg(feature = "fdb")]
+        StoreKind::Fdb(uri) => match crate::fdb_store::FdbStore::drop_tree(uri, view) {
+            Ok(()) => "the imported tree was removed again".to_string(),
+            Err(e) => format!("the imported tree could NOT be removed ({e}) — clear its subspace by hand"),
+        },
+    }
+}
+
+fn view_xfer_drop(rt: &Arc<MetaRuntime>, handle: &str) -> Result<serde_json::Value, String> {
+    let path = xfer_path(rt, handle)?;
+    let _ = std::fs::remove_file(&path);
+    Ok(serde_json::Value::Null)
+}
+
+fn view_rm_base(
+    rt: &Arc<MetaRuntime>,
+    view: &str,
+    data_root: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    use serde_json::json;
+    if !crate::layout::valid_view_name(view) {
+        return Err(format!("invalid view name '{view}'"));
+    }
+    if rt.control.has_def(view)? {
+        return Err(format!(
+            "'{view}' is governed by a view definition — remove it first with `view rm --name {view}` (without --base)"
+        ));
+    }
+    for (dname, text) in rt.control.list_defs()? {
+        let dep = match crate::layout::LayoutRules::parse_def(&text) {
+            Ok(crate::layout::ViewDef::Derived(b, _)) => b == view,
+            Ok(crate::layout::ViewDef::Fork(b)) => b == view,
+            Ok(crate::layout::ViewDef::Alias(r)) => r == view,
+            Err(_) => false,
+        };
+        if dep {
+            return Err(format!(
+                "view '{dname}' is governed by a definition over base '{view}' — remove it first (`view rm --name {dname}`)"
+            ));
+        }
+    }
+    // Mounts on THIS host are visible, mounts on client machines are not —
+    // stated in the reply rather than silently assumed away.
+    if let Some(mp) = mounted_here(view) {
+        return Err(format!(
+            "view '{view}' is mounted ON THE SERVER HOST at {mp} — unmount it first; mounts on other machines are not visible from here, stop them too"
+        ));
+    }
+    let droot = data_root
+        .map(PathBuf::from)
+        .unwrap_or_else(|| rt.base.clone());
+    let report = match &rt.store {
+        StoreKind::Pg(uri) => {
+            let rep = crate::pg_store::PgEngine::remove_view(uri, view)?;
+            let bytes = free_unbooked(&rep.unbooked_refs, &droot);
+            format!(
+                "removed base view '{view}' from {uri}: {} node(s) gone, {} object(s) no longer held by any view{}; {bytes}",
+                rep.entries,
+                rep.unbooked,
+                if rep.still_held > 0 {
+                    format!(", {} still held by other views", rep.still_held)
+                } else {
+                    String::new()
+                }
+            )
+        }
+        StoreKind::Sqlite => {
+            let rm = crate::meta::remove_base_view(&rt.base, view)?;
+            let (mut stayed, mut refs) = (0usize, Vec::new());
+            for dr in &rm.blob_refs {
+                if crate::meta::ledger_holds(&rt.base, dr).unwrap_or(true) {
+                    stayed += 1;
+                    continue;
+                }
+                refs.push(dr.clone());
+            }
+            let bytes = free_unbooked(&refs, &droot);
+            format!(
+                "removed base view '{view}': {} node(s) gone, {} blob reference(s) dropped, {stayed} still held by other views; {bytes}",
+                rm.nodes,
+                rm.blob_refs.len()
+            )
+        }
+        #[cfg(feature = "fdb")]
+        StoreKind::Fdb(uri) => {
+            let st = crate::fdb_store::FdbStore::open(uri, view, true).map_err(|e| e.to_string())?;
+            let rep = st.remove_view().map_err(|e| e.to_string())?;
+            let bytes = free_unbooked(&rep.unbooked_refs, &droot);
+            format!(
+                "removed base view '{view}' from {uri}: {} key(s) gone, {} node(s), {} object(s) not held by any view; {bytes}",
+                rep.keys, rep.entries, rep.unbooked
+            )
+        }
+    };
+    // Drop cached engines: the tree they point at no longer exists.
+    rt.evict();
+    Ok(json!(report))
+}
+
+fn refs_rebuild(rt: &Arc<MetaRuntime>) -> Result<serde_json::Value, String> {
+    use serde_json::json;
+    match &rt.store {
+        StoreKind::Pg(uri) => {
+            let rep = crate::pg_store::rebuild_ledger(uri)?;
+            Ok(json!(format!(
+                "refs ledger rebuilt in {uri}: {} tree(s), {} content key(s), {} holder unit(s); {} row(s) corrected, {} row(s) deleted",
+                rep.trees, rep.refs, rep.holders, rep.rows_fixed, rep.rows_deleted
+            )))
+        }
+        StoreKind::Sqlite => {
+            let n = crate::meta::rebuild_ledger(&rt.base).map_err(|e| e.to_string())?;
+            Ok(json!(format!(
+                "refs ledger rebuilt at {}: {n} holder entries across the surviving views",
+                rt.base.join("meta").join("refs.db").display()
+            )))
+        }
+        #[cfg(feature = "fdb")]
+        StoreKind::Fdb(uri) => {
+            let rep = crate::fdb_store::rebuild_ledger(uri).map_err(|e| e.to_string())?;
+            Ok(json!(format!(
+                "refs ledger rebuilt in {uri}: {} tree(s), {} content key(s), {} holder unit(s); {} row(s) corrected, {} row(s) deleted",
+                rep.trees, rep.refs, rep.holders, rep.rows_fixed, rep.rows_deleted
+            )))
+        }
+    }
+}
+
+/// What this server's store says its trees name, in the one shape the audit
+/// judges: the same [`crate::gc::Picture`] the offline scan builds from
+/// `meta/*.db`. Reading the trees WHERE THEY LIVE is the whole reason this runs
+/// on the server — an operator's machine has neither the schemas nor the
+/// subspaces, only the admin key.
+fn gc_picture(rt: &Arc<MetaRuntime>) -> Result<crate::gc::Picture, String> {
+    match &rt.store {
+        StoreKind::Sqlite => crate::gc::picture_sqlite(&rt.base),
+        StoreKind::Pg(uri) => {
+            let p = crate::pg_store::reference_picture(uri)?;
+            Ok(crate::gc::Picture {
+                refs: crate::gc::Refs::from_keys(p.trees, p.refs.into_keys()),
+                ledger: crate::gc::Ledger::from_keys(
+                    p.booked
+                        .into_iter()
+                        .filter(|(_, h)| *h > 0)
+                        .map(|(k, _)| k),
+                ),
+            })
+        }
+        #[cfg(feature = "fdb")]
+        StoreKind::Fdb(uri) => {
+            let p = crate::fdb_store::ledger_picture(uri).map_err(|e| e.to_string())?;
+            Ok(crate::gc::Picture {
+                refs: crate::gc::Refs::from_keys(p.trees.into_iter().collect(), p.refs.into_keys()),
+                ledger: crate::gc::Ledger::from_keys(
+                    p.booked
+                        .into_iter()
+                        .filter(|(_, h)| *h > 0)
+                        .map(|(k, _)| k),
+                ),
+            })
+        }
+    }
+}
+
+/// Walk ONE data server's object pages to the end.
+///
+/// A server that cannot enumerate (an older build, or a backend with no
+/// listing) ABORTS the audit: reporting a healthy-looking zero for bytes nobody
+/// listed is the one answer worse than an error.
+fn list_server(
+    be: &crate::remote::client::RemoteBackend,
+    addr: &str,
+) -> Result<Vec<crate::backend::ObjectRow>, String> {
+    use crate::backend::StorageBackend;
+    let mut out = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = be.list_objects(cursor.as_deref(), 4096).map_err(|e| {
+            format!(
+                "data server {addr} cannot enumerate its objects ({e}) — refusing to audit bytes nobody listed"
+            )
+        })?;
+        out.extend(page.rows);
+        match page.next {
+            // A cursor that does not advance would make this loop re-judge the
+            // same keys forever, so it is an error rather than a retry.
+            Some(next) if cursor.as_deref() != Some(next.as_str()) => cursor = Some(next),
+            Some(next) => {
+                return Err(format!(
+                    "data server {addr} repeated page cursor '{next}' — it cannot enumerate a stable walk, so the audit would see the same objects twice"
+                ))
+            }
+            None => return Ok(out),
+        }
+    }
+}
+
+/// The control-plane half of `gc`: the TREES are read here, where they live
+/// (this server's backend), and the OBJECTS are listed from the data servers
+/// named in the request — so `gc` works from any machine holding an admin key,
+/// for every backend, instead of demanding a local `<data-dir>` that only exists
+/// on the server host.
+///
+/// Two limits are reported, never papered over: the silence proof covers THIS
+/// server's own sessions plus mounts on this host (a client machine's mount is
+/// invisible here, exactly as it is to `view rm --base`), and the grace window
+/// is judged with this host's clock against the data servers' file mtimes.
+/// Reclaim deletes only orphans older than the window, through the same
+/// [`crate::gc::audit`] verdict the offline scan uses; a ledger-held key is never
+/// touched.
+fn gc_audit(
+    rt: &Arc<MetaRuntime>,
+    apply: bool,
+    a: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    use crate::backend::StorageBackend;
+    use serde_json::json;
+    let servers: Vec<String> = a
+        .get("data_servers")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if servers.is_empty() {
+        return Err(
+            "gc needs at least one `--data-servers HOST:PORT`: the bytes are owned by the data \
+             servers, not by the machine that runs this audit"
+                .to_string(),
+        );
+    }
+    let token = a
+        .get("data_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let api_key = a
+        .get("data_api_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let grace = crate::gc::parse_age(
+        a.get("older_than")
+            .and_then(|v| v.as_str())
+            .unwrap_or("24h"),
+    )?;
+    let force = a.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    let pic = gc_picture(rt)?;
+    // Silence, as far as THIS server can see it: every live mount session it
+    // serves, plus a mount of the same view on its own host.
+    let sessions: Vec<(String, usize)> = rt
+        .subs
+        .lock()
+        .iter()
+        .filter(|(_, m)| !m.is_empty())
+        .map(|(v, m)| (v.clone(), m.len()))
+        .collect();
+    let mounts: Vec<String> = pic
+        .refs
+        .views
+        .iter()
+        .filter_map(|v| mounted_here(v).map(|mp| format!("{v} at {mp}")))
+        .collect();
+    if apply && (!sessions.is_empty() || !mounts.is_empty()) {
+        let mut live: Vec<String> = sessions
+            .iter()
+            .map(|(v, n)| format!("{v} ({n} live session(s) on this server)"))
+            .collect();
+        live.extend(mounts.iter().cloned());
+        return Err(format!(
+            "gc --apply refused: this deployment is in use — {}; stop those mounts first (reclaim \
+             must run offline, and a mount on another machine is not visible from here, so stop it too)",
+            live.join("; ")
+        ));
+    }
+
+    let mut objects: Vec<(String, u64, std::time::SystemTime)> = Vec::new();
+    let mut backends: Vec<crate::remote::client::RemoteBackend> = Vec::new();
+    for addr in &servers {
+        let be = crate::remote::client::RemoteBackend::new_with_creds(addr, token, api_key)
+            .map_err(|e| format!("cannot reach data server {addr}: {e}"))?;
+        for row in list_server(&be, addr)? {
+            let mtime = std::time::UNIX_EPOCH
+                + Duration::from_secs(row.mtime_secs.max(0) as u64);
+            objects.push((row.key, row.size, mtime));
+        }
+        backends.push(be);
+    }
+    let aud = crate::gc::audit(objects, &pic, grace);
+    // The same wrong-root guard the offline scan applies: a data server that
+    // shares ZERO object with any tree here is almost always the wrong
+    // deployment's bytes, and deleting there would kill another store.
+    if aud.objects > 0 && !pic.refs.keys.is_empty() && aud.matched == 0 && !force {
+        return Err(format!(
+            "gc: the data server(s) {} share no object with any view tree on this server ({} \
+             object(s), {} referenced key(s)) — wrong --data-servers? Nothing was deleted; pass \
+             --force only if this is expected",
+            servers.join(","),
+            aud.objects,
+            pic.refs.keys.len()
+        ));
+    }
+    let reclaimed = if apply {
+        let mut rec = crate::gc::Reclaimed::default();
+        for c in &aud.orphans {
+            if c.within_grace {
+                rec.within_grace += 1;
+                continue;
+            }
+            // The key could have landed on any of the roots; the first server
+            // that owns (or no longer has) it decides. Held keys never get here.
+            let (mut gone, mut last) = (false, String::new());
+            for be in &backends {
+                match be.remove(&c.key) {
+                    Ok(()) => {
+                        gone = true;
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        gone = true;
+                        break;
+                    }
+                    Err(e) => last = e.to_string(),
+                }
+            }
+            if gone {
+                rec.deleted += 1;
+                rec.bytes = rec.bytes.saturating_add(c.size);
+            } else {
+                rec.failed.push(format!("{}: {last}", c.key));
+            }
+        }
+        Some(rec)
+    } else {
+        None
+    };
+
+    let meta = match &rt.store {
+        StoreKind::Sqlite => rt.base.display().to_string(),
+        StoreKind::Pg(_) => "PostgreSQL (one schema per view; the URI is never echoed)".to_string(),
+        #[cfg(feature = "fdb")]
+        StoreKind::Fdb(uri) => format!(
+            "FoundationDB ({}; one subspace per view)",
+            uri.trim_start_matches("fdb://")
+        ),
+    };
+    let cand = |c: &crate::gc::Judged| {
+        json!({
+            "key": c.key,
+            "size": c.size,
+            "age_secs": crate::gc::age_secs(c.mtime),
+            "kind": c.kind_str(),
+            "within_grace": c.within_grace,
+        })
+    };
+    Ok(json!({
+        "backend": rt.control.backend(),
+        "meta_root": meta,
+        "data_roots": servers,
+        "views": pic.refs.views,
+        "referenced_keys": pic.refs.keys.len(),
+        "striped_layouts": pic.refs.striped.len(),
+        "objects": aud.objects,
+        "object_bytes": aud.objects_bytes,
+        "matched_objects": aud.matched,
+        "orphans": aud.orphans.iter().map(cand).collect::<Vec<_>>(),
+        "orphan_bytes": aud.orphan_bytes(),
+        "reclaimable": aud.reclaimable(),
+        "reclaimable_bytes": aud.reclaimable_bytes(),
+        "within_grace": aud.within_grace(),
+        "ledger_held": aud.held.iter().map(cand).collect::<Vec<_>>(),
+        "ledger_held_bytes": aud.held_bytes(),
+        "skipped": Vec::<String>::new(),
+        "grace_secs": grace.as_secs(),
+        "applied": reclaimed.is_some(),
+        "deleted": reclaimed.as_ref().map(|r| r.deleted).unwrap_or(0),
+        "deleted_bytes": reclaimed.as_ref().map(|r| r.bytes).unwrap_or(0),
+        "delete_failed": reclaimed.as_ref().map(|r| r.failed.clone()).unwrap_or_default(),
+        "live_sessions": sessions
+            .iter()
+            .map(|(v, n)| json!({"view": v, "sessions": n}))
+            .collect::<Vec<_>>(),
+        "server_mounts": mounts,
+        "note": "the silence proof covers this server's sessions and mounts on its host; a mount on another machine is invisible here, and the grace window is judged with this host's clock against the data servers' mtimes",
+    }))
+}
+
+/// The first mountpoint on THIS host whose FUSE source is `grovefs:<view>`.
+/// Same predicate `view rm --base` uses locally; kept here because the server
+/// must refuse to delete a tree out from under its own mount table.
+fn mounted_here(view: &str) -> Option<String> {
+    let content = std::fs::read_to_string("/proc/mounts").ok()?;
+    let tag = format!("grovefs:{view}");
+    for l in content.lines() {
+        let mut it = l.split_whitespace();
+        let (Some(dev), Some(mp)) = (it.next(), it.next()) else {
+            continue;
+        };
+        if dev == tag {
+            return Some(mp.replace("\\040", " "));
+        }
+    }
+    None
 }
 
 /// Millisecond epoch clock for the engine-cache idle stamps. Coarse is fine:
@@ -1101,9 +2357,10 @@ fn view_provider(rt: &MetaRuntime, view: &str) -> io::Result<Arc<dyn MetaProvide
         });
     if let Some(p) = cached {
         // Hot reload: a cached DERIVED entry is only served while its
-        // definition is unchanged in the control store (a file `size:mtime` or
-        // a PG row `xmin` ticket; a cheap probe per op is negligible next to a
-        // FUSE round trip). An edited definition evicts the lens and every live
+        // definition is unchanged in the control store (a file `size:mtime`, a
+        // PG row `xmin`, or an FDB `view_def_ver` ticket; a cheap probe per op is
+        // negligible next to a FUSE round trip). An edited definition evicts the
+        // lens and every live
         // mount of the name converges on the next op — bounded by the client's
         // attr/dentry TTL (≤2s), no remount needed. A *removed* definition
         // intentionally does NOT yank the shape out from under established
@@ -1135,13 +2392,13 @@ fn view_provider(rt: &MetaRuntime, view: &str) -> io::Result<Arc<dyn MetaProvide
     let (provider, base): (Arc<dyn MetaProvider>, String) = match def {
         Some(ViewDef::Fork(_)) => {
             // A FORK owns an independent metadata tree (a local `<name>.db`
-            // under SQLite; PG has no fork backend and refuses creation, so this
-            // branch only runs on the file store). The definition only records
-            // which physical view seeded it. It is resolved like a physical
-            // store (same cache, same subscriptions) but deliberately NOT
-            // recorded in `defs`: `is_derived` stays false, so structure writes
-            // are admitted while the client-side ack flag (below) keeps content
-            // writes out.
+            // under SQLite, a `grovefs_v_<hex>` schema under PG, a subspace under
+            // FDB — all three backends seed it in one transaction). The
+            // definition only records which physical view seeded it. It is
+            // resolved like a physical store (same cache, same subscriptions) but
+            // deliberately NOT recorded in `defs`: `is_derived` stays false, so
+            // structure writes are admitted while the client-side ack flag
+            // (below) keeps content writes out.
             if !control.has_physical(view).map_err(io::Error::other)? {
                 return Err(io::Error::other(format!(
                     "fork view '{view}' has no tree in {} — removed out-of-band?",
@@ -2529,6 +3786,21 @@ fn start_promotion_watchdog(rt: Arc<MetaRuntime>, ha: Arc<HaState>) {
     });
 }
 
+/// The row a `CREATE`/`SYMLINK` just wrote, serialized into the reply.
+///
+/// The client needs the entry attributes to fill its FUSE reply; shipping them
+/// here removes one `M_GETATTR` round trip per creation (a `touch` used to cost
+/// three metadata RTTs). Empty when the row is already gone (unlinked in
+/// between) — the client then falls back to its own `GETATTR`, so the payload is
+/// purely an optimization and the old client/server pairing keeps working.
+fn node_reply(engine: &dyn MetaProvider, id: i64) -> Vec<u8> {
+    let mut d = Vec::new();
+    if let Some(n) = engine.getattr(id) {
+        put_node(&mut d, &n);
+    }
+    d
+}
+
 /// Execute one metadata operation against the view's engine.
 fn dispatch_meta(
     engine: &dyn MetaProvider,
@@ -2627,7 +3899,7 @@ fn dispatch_meta(
                 Ok(id) => (
                     0,
                     id as u64,
-                    Vec::new(),
+                    node_reply(engine, id),
                     vec![Event::Entry { parent, name }],
                 ),
                 Err(e) => bail!(e),
@@ -2652,7 +3924,7 @@ fn dispatch_meta(
                 Ok(id) => (
                     0,
                     id as u64,
-                    Vec::new(),
+                    node_reply(engine, id),
                     vec![Event::Entry { parent, name }],
                 ),
                 Err(e) => bail!(e),
@@ -3163,6 +4435,56 @@ mod ha_tests {
     }
 
     #[test]
+    fn create_and_symlink_replies_carry_the_row_in_one_round_trip() {
+        // The FUSE layer needs the entry attributes immediately after a create.
+        // The server now ships the row it just wrote inside the CREATE/MKDIR/
+        // SYMLINK reply, so the client needs no follow-up GETATTR — a create
+        // used to cost three metadata round trips, two after this (USAGE §4.1.1).
+        // This pins both the payload and the client's decoding of it.
+        use crate::meta::{NodeKind, ROOT_INO};
+
+        let dir = tempfile::Builder::new()
+            .prefix("yf_createattr_")
+            .tempdir()
+            .unwrap();
+        let base = dir.path().to_path_buf();
+        drop(MetaStore::open_sqlite(&base, "alice", false).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || serve_on_meta_auth(listener, base, ""));
+
+        let meta = RemoteMeta::new(&addr, "alice").expect("handshake with a live server");
+
+        let d = meta
+            .create_node_with_attr(ROOT_INO, "d", true, None, 0o750, 12, 34)
+            .expect("mkdir reply carries the row");
+        assert_eq!(d.name, "d");
+        assert_eq!(d.kind, NodeKind::Dir);
+        assert_eq!(d.mode & 0o777, 0o750, "mode must survive the reply");
+        assert_eq!((d.uid, d.gid), (12, 34));
+
+        let f = meta
+            .create_node_with_attr(d.id, "f", false, None, 0o640, 12, 34)
+            .expect("create reply carries the row");
+        assert_eq!(f.parent_id, d.id);
+        assert_eq!(f.kind, NodeKind::Regular);
+        assert_eq!(f.mode & 0o777, 0o640);
+
+        let l = meta
+            .create_symlink_with_attr(d.id, "l", "f", 12, 34)
+            .expect("symlink reply carries the row");
+        assert_eq!(l.kind, NodeKind::Symlink);
+        assert_eq!(l.link_target.as_deref(), Some("f"));
+
+        // What the reply claimed must be what the store holds: a reply-only
+        // attribute would be worse than the extra round trip it replaced.
+        let stored = meta.getattr(l.id).expect("row exists");
+        assert_eq!(stored.name, "l");
+        assert_eq!(stored.ctime, l.ctime);
+        assert_eq!(stored.mode, l.mode);
+    }
+
+    #[test]
     fn fenced_for_write_demotes_on_higher_witness_epoch() {
         // Zero-window fencing: a primary that has been fenced at the arbiter (a
         // peer promoted past it) must refuse its very NEXT write instead of
@@ -3209,6 +4531,7 @@ mod ha_tests {
             witness: Some(waddr),
             store: StoreKind::Sqlite,
             engine_idle_ms: 0,
+            ctl_keys: None,
         });
 
         // Witness holds nothing above our epoch: the first proof grants a lease
@@ -3372,6 +4695,7 @@ mod ha_tests {
             witness: None,
             store: StoreKind::Sqlite,
             engine_idle_ms: 60_000,
+            ctl_keys: None,
         };
         let a = store_for(&rt, "v1").unwrap();
         assert!(rt.cache.lock().contains_key("v1"));

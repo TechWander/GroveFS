@@ -46,8 +46,10 @@
 use crate::meta::{LockConflict, LockType, MetaError, MetaProvider, NodeInfo, NodeKind};
 use crate::stats;
 use postgres::types::ToSql;
-use postgres::{Client, NoTls};
+use postgres::{Client, IsolationLevel, NoTls, Row, Statement};
 use std::collections::HashMap;
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
 
 /// Default lease for a lock row (seconds), matching [`crate::meta::LockLease`].
@@ -79,6 +81,77 @@ fn schema_for(view: &str) -> Option<String> {
     Some(format!("grovefs_v_{hex}"))
 }
 
+/// Route a store specification that may name several PostgreSQL instances
+/// (`uri,uri,...`) to the one that owns `view`.
+///
+/// This is the seed of view sharding: each view's `grovefs_v_<hex>` schema
+/// lives on exactly one instance, chosen by a stable hash of the view name, so
+/// `view create`, every `meta-server` serving it and cross-view work
+/// (graft/export/rm by name) all agree without a registry. A single URI is
+/// returned verbatim, so nothing changes for a one-instance deployment.
+///
+/// Boundaries (deliberate, see USAGE): the control plane (`grovefs_control`:
+/// keys, view definitions, audit) stays on the FIRST instance —
+/// [`control_store`]; `du`/`gc`/`refs rebuild` still expect one URI. Changing
+/// the instance list re-maps views (the mapping is a pure function of the
+/// names), so re-sharding is a data move, not a flag flip.
+pub fn route_store(store: &str, view: &str) -> String {
+    let uris = store_instances(store);
+    if uris.len() <= 1 {
+        return uris.first().copied().unwrap_or(store.trim()).to_string();
+    }
+    // FNV-1a over the raw view name: stable across processes and rebuilds, and
+    // independent of how many views exist.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in view.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    uris[(h % uris.len() as u64) as usize].to_string()
+}
+
+/// The distinct PostgreSQL instances a store spec names, in the order given.
+/// A single URI yields a one-element list, so callers need no special case.
+pub fn store_instances(store: &str) -> Vec<&str> {
+    store
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Resolve a store spec for an operation that reads/writes SEVERAL trees inside
+/// one transaction (fork: base+target, graft: source+destination). Such a pair
+/// must live on ONE instance — a `postgres://` connection cannot span two
+/// databases — so this returns the routed instance when every name agrees and
+/// refuses with a readable error when they do not.
+pub fn route_multi(store: &str, views: &[&str]) -> Result<String, String> {
+    let mut picked: Option<String> = None;
+    let mut split: Vec<String> = Vec::new();
+    for v in views {
+        let uri = route_store(store, v);
+        match &picked {
+            None => picked = Some(uri),
+            Some(p) if p == &uri => {}
+            Some(p) => split.push(format!("'{}' -> {}, '{}' -> {}", views[0], p, v, uri)),
+        }
+    }
+    match (picked, split.is_empty()) {
+        (Some(uri), true) => Ok(uri),
+        _ => Err(format!(
+            "these trees route to different PostgreSQL instances ({}); a fork/graft copies between schemas of ONE database, so both views must hash to the same instance — rename one, or use a single-instance store for this pair",
+            split.join("; ")
+        )),
+    }
+}
+
+/// The instance that holds the shared control schema of a (possibly sharded)
+/// store spec. Pinned to the first URI: the control plane is ONE authoritative
+/// record shared by every instance (exactly as in a single-instance setup).
+pub fn control_store(store: &str) -> &str {
+    store.split(',').next().unwrap_or(store).trim()
+}
+
 /// One row of the `node` table before nlink/size are computed (the `finalize`
 /// step). Mirrors the SQLite engine's private RawNode.
 struct RawNode {
@@ -105,6 +178,37 @@ const COLS: &str =
 const PG_REFS_SCHEMA: &str = "grovefs_refs";
 const PG_REFS_TABLE: &str = "grovefs_refs.holders";
 
+/// One node row of a PG tree being read for a graft. Same shape as the file
+/// arm's private `GraftRow` (see `meta::engine`), because a graft copies NAMES
+/// between trees and must give the destination the same metadata a SQLite graft
+/// would.
+struct GraftPgRow {
+    id: i64,
+    parent_id: Option<i64>,
+    name: String,
+    is_dir: i64,
+    data_ref: Option<String>,
+    link_target: Option<String>,
+    mode: i64,
+    uid: i64,
+    gid: i64,
+    mtime: i64,
+    atime: i64,
+    ctime: i64,
+    ino: i64,
+}
+
+/// Mutable state of one graft transaction: the id/ino allocator, the merge
+/// rule, the running totals, the blobs to book and the source-ino ->
+/// destination-ino map that keeps hard links hard links.
+struct GraftCtx {
+    next: i64,
+    skip_existing: bool,
+    stats: crate::meta::GraftStats,
+    blobs: std::collections::HashSet<String>,
+    inos: HashMap<i64, i64>,
+}
+
 fn parse_node(r: &postgres::Row) -> RawNode {
     RawNode {
         id: r.get(0),
@@ -120,6 +224,231 @@ fn parse_node(r: &postgres::Row) -> RawNode {
         atime: r.get(10),
         ctime: r.get(11),
         ino: r.get::<_, Option<i64>>(12).unwrap_or(0),
+    }
+}
+
+/// Upper bound on the statements one read connection keeps prepared. A view's
+/// read surface is a handful of texts (`lookup` by `(parent,name)`, `getattr` by
+/// `ino`, the two READDIR pages, the lock probe, the epoch read); the spare room
+/// absorbs the `LIMIT/OFFSET` variant a seekdir miss builds. Bounded on purpose:
+/// a pathological caller must not turn server-side statement memory into a leak.
+const STMT_CACHE_CAP: usize = 16;
+
+/// Upper bound on the statements one writer connection keeps prepared. A view's
+/// write surface is larger than its read surface (insert/lookup-by-name/delete/
+/// set-ino/the four setattr variants/rename/lock ops/three ledger texts), so the
+/// cap is double; overflowing it only means the extra text keeps being parsed
+/// per op, never an error.
+const WRITE_STMT_CACHE_CAP: usize = 32;
+
+/// A pooled read connection plus the statements it has already parsed.
+///
+/// [`Client::query`] sends an *unnamed* statement on every call, so PG re-parses
+/// and re-plans the same SQL text on every `lookup`/`getattr`/`readdir`. Those
+/// texts are stable for the life of a view (only the schema-qualified table name
+/// varies), and a prepared statement is session-scoped, which is why the cache
+/// lives on the connection rather than on the engine: each pooled connection
+/// pays the parse once for its own session and then reuses it.
+struct ReadConn {
+    client: Client,
+    stmts: HashMap<String, Statement>,
+}
+
+impl ReadConn {
+    fn new(client: Client) -> Self {
+        Self {
+            client,
+            stmts: HashMap::new(),
+        }
+    }
+
+    /// Same contract as [`Client::query`], but served from a cached prepared
+    /// statement. A failed `prepare` propagates whatever the parse error was —
+    /// callers already treat a query error as "empty result, degrade quietly".
+    fn query(
+        &mut self,
+        sql: &str,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Vec<Row>, postgres::Error> {
+        if let Some(st) = self.stmts.get(sql) {
+            let st = st.clone();
+            return self.client.query(&st, params);
+        }
+        let st = self.client.prepare(sql)?;
+        if self.stmts.len() < STMT_CACHE_CAP {
+            self.stmts.insert(sql.to_string(), st.clone());
+        }
+        self.client.query(&st, params)
+    }
+}
+
+/// A pooled writer connection plus the statements it has already parsed.
+///
+/// [`postgres::Transaction`]'s `query(&str)`/`execute(&str)` send an *unnamed*
+/// statement, so the server re-parses and re-plans the same write text on every
+/// op. Those parses are not free under SERIALIZABLE: a single-writer insert
+/// loop measured 577us/op unnamed vs 316us/op prepared on this box (-45%), and
+/// 8 concurrent writers went 8.3k -> 9.6k ops/s (+15%). The texts are stable for
+/// the life of a view and a prepared statement is session-scoped, so each
+/// pooled connection carries its own cache, exactly like [`ReadConn`] does for
+/// the read surface.
+struct WriteConn {
+    client: Client,
+    stmts: HashMap<String, Statement>,
+}
+
+impl WriteConn {
+    fn new(client: Client) -> Self {
+        Self {
+            client,
+            stmts: HashMap::new(),
+        }
+    }
+}
+
+impl Deref for WriteConn {
+    type Target = Client;
+    fn deref(&self) -> &Client {
+        &self.client
+    }
+}
+
+impl DerefMut for WriteConn {
+    fn deref_mut(&mut self) -> &mut Client {
+        &mut self.client
+    }
+}
+
+/// A write transaction plus the connection's statement cache.
+///
+/// The inherent `query`/`execute` shadow the ones a `Transaction` provides via
+/// [`Deref`], so a body written as `tx.execute("...", &[..])` transparently
+/// goes through the cached statement — no call site has to opt in. A cache miss
+/// prepares on first use (a prepared statement survives both COMMIT and
+/// ROLLBACK, verified against the server) and keeps it for the session.
+struct WriteTx<'a, 'c> {
+    tx: &'a mut postgres::Transaction<'c>,
+    stmts: &'a mut HashMap<String, Statement>,
+}
+
+impl WriteTx<'_, '_> {
+    fn query(
+        &mut self,
+        sql: &str,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Vec<Row>, postgres::Error> {
+        let st = self.stmt(sql)?;
+        match self.tx.query(&st, params) {
+            // DDL between prepare and execute (a view tree rebuilt by
+            // import/graft) or a server-side DEALLOCATE invalidates the cached
+            // plan; evict and let the server parse the text once more rather
+            // than turning a legitimate op into a hard error.
+            Err(e) if Self::stale_statement(&e) => {
+                self.stmts.remove(sql);
+                self.tx.query(sql, params)
+            }
+            other => other,
+        }
+    }
+
+    fn execute(
+        &mut self,
+        sql: &str,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<u64, postgres::Error> {
+        let st = self.stmt(sql)?;
+        match self.tx.execute(&st, params) {
+            Err(e) if Self::stale_statement(&e) => {
+                self.stmts.remove(sql);
+                self.tx.execute(sql, params)
+            }
+            other => other,
+        }
+    }
+
+    fn stmt(&mut self, sql: &str) -> Result<Statement, postgres::Error> {
+        if let Some(st) = self.stmts.get(sql) {
+            return Ok(st.clone());
+        }
+        let st = self.tx.prepare(sql)?;
+        if self.stmts.len() < WRITE_STMT_CACHE_CAP {
+            self.stmts.insert(sql.to_string(), st.clone());
+        }
+        Ok(st)
+    }
+
+    /// `0A000` = cached plan must not change result type, `26000` = prepared
+    /// statement no longer exists. Both mean "the cached copy is stale", never
+    /// "the op failed", so they are the only errors worth a re-parse.
+    fn stale_statement(e: &postgres::Error) -> bool {
+        matches!(
+            e.code(),
+            Some(&postgres::error::SqlState::FEATURE_NOT_SUPPORTED)
+                | Some(&postgres::error::SqlState::INVALID_SQL_STATEMENT_NAME)
+        )
+    }
+}
+
+// Inherent `query`/`execute` shadow the `Transaction` ones, but the ledger and
+// count helpers further down take a transaction-like argument; deref lets them
+// keep accepting a bare `Transaction` (the cold graft/import path) while the
+// hot path hands them a [`WriteTx`] and keeps the cache.
+impl<'a, 'c> Deref for WriteTx<'a, 'c> {
+    type Target = postgres::Transaction<'c>;
+    fn deref(&self) -> &Self::Target {
+        self.tx
+    }
+}
+
+impl DerefMut for WriteTx<'_, '_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.tx
+    }
+}
+
+/// The statement-execution surface the ledger/count helpers are written
+/// against: [`WriteTx`] serves it from the connection's statement cache, a bare
+/// transaction lets the server parse each time (cold paths only).
+trait TxSql {
+    fn tq(
+        &mut self,
+        sql: &str,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Vec<Row>, postgres::Error>;
+    fn te(&mut self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64, postgres::Error>;
+}
+
+impl TxSql for WriteTx<'_, '_> {
+    fn tq(&mut self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<Row>, postgres::Error> {
+        self.query(sql, params)
+    }
+    fn te(&mut self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64, postgres::Error> {
+        self.execute(sql, params)
+    }
+}
+
+impl TxSql for postgres::Transaction<'_> {
+    fn tq(&mut self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<Row>, postgres::Error> {
+        self.query(sql, params)
+    }
+    fn te(&mut self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64, postgres::Error> {
+        self.execute(sql, params)
+    }
+}
+
+// The write-side helpers ([`PgEngine::finalize`] / [`PgEngine::finalize_batch`])
+// take `&mut Client` and run on both paths; these impls let a read closure hand
+// its `ReadConn` straight to them instead of duplicating the SQL.
+impl Deref for ReadConn {
+    type Target = Client;
+    fn deref(&self) -> &Client {
+        &self.client
+    }
+}
+
+impl DerefMut for ReadConn {
+    fn deref_mut(&mut self) -> &mut Client {
+        &mut self.client
     }
 }
 
@@ -144,18 +473,19 @@ pub struct PgEngine {
     /// permanently unusable until the meta-server process restarts.
     conn_uri: String,
     /// Pool of writer connections, each carrying
-    /// `default_transaction_isolation = 'serializable'` at the session level.
-    /// A [`Self::checkout_writer`] hands one to the calling thread; every
-    /// mutation runs its per-op `Transaction` on that borrowed client, so
-    /// concurrent mutators on disjoint rows genuinely run in parallel PG
-    /// backends. Bounded so a busy meta-server does not exhaust `max_connections`.
-    write_pool: parking_lot::Mutex<Vec<Client>>,
+    /// `default_transaction_isolation = 'serializable'` at the session level and
+    /// its own prepared-statement cache. A [`Self::checkout_writer`] hands one
+    /// to the calling thread; every mutation runs its per-op `Transaction` on
+    /// that borrowed connection, so concurrent mutators on disjoint rows
+    /// genuinely run in parallel PG backends. Bounded so a busy meta-server does
+    /// not exhaust `max_connections`.
+    write_pool: parking_lot::Mutex<Vec<WriteConn>>,
     /// Pooled read connections so concurrent metadata reads (lookup/getattr/
     /// readdir) fan out at READ COMMITTED (cheaper — no SSI predicate locks)
     /// instead of queueing behind an SSI writer. A fresh PostgreSQL backend
     /// started by `Client::connect` sees committed writes in its own read
     /// transaction, so read-your-writes holds.
-    read_pool: parking_lot::Mutex<Vec<Client>>,
+    read_pool: parking_lot::Mutex<Vec<ReadConn>>,
     /// Keyset cursors for sequential READDIR paging, mirroring the SQLite
     /// engine: `(parent, checkpoint offset)` -> the name of the row before it.
     /// Cleared by any name mutation; a miss falls back to `LIMIT/OFFSET`.
@@ -199,14 +529,52 @@ const READDIR_CURSOR_CAP: usize = 65_536;
 /// which rarely lands on our own page boundary (see the SQLite engine).
 const READDIR_CURSOR_STRIDE: usize = 32;
 
-/// Number of pooled writer connections per PG view engine. Bounded by
+/// Default number of pooled writer connections per PG view engine. Bounded by
 /// `max_connections` on the server (default 100); a small per-view pool keeps
 /// total backend pressure predictable when the meta-server hosts many views.
 const PG_WRITE_POOL_SIZE: usize = 8;
 
-/// Number of pooled read connections opened per PG view engine, matching the
-/// SQLite engine's [`crate::meta::READ_POOL_SIZE`].
+/// Default number of pooled read connections opened per PG view engine, matching
+/// the SQLite engine's [`crate::meta::READ_POOL_SIZE`].
 const PG_READ_POOL_SIZE: usize = 4;
+
+/// Runtime knobs for the two per-view pools: `GROVEFS_PG_WRITE_POOL` and
+/// `GROVEFS_PG_READ_POOL` (`0..=64` each). The pool size is what the capacity
+/// formula (active views x pool + burst <= `max_connections`) is planned
+/// against, so an operator who tuned `max_connections` upward can widen the
+/// pool without rebuilding; `0` means "no warm pool" (every checkout connects
+/// fresh), which is legal but pays connect latency per op. Internal tuning
+/// knobs (like `GROVEFS_SQLITE_READ_POOL`), cached on first read; the CLI
+/// surface is unchanged.
+fn pg_write_pool_size() -> usize {
+    static SLOT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+    let cur = SLOT.load(std::sync::atomic::Ordering::Relaxed);
+    if cur != usize::MAX {
+        return cur;
+    }
+    let v = std::env::var("GROVEFS_PG_WRITE_POOL")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|n| n.min(64))
+        .unwrap_or(PG_WRITE_POOL_SIZE);
+    SLOT.store(v, std::sync::atomic::Ordering::Relaxed);
+    v
+}
+
+fn pg_read_pool_size() -> usize {
+    static SLOT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+    let cur = SLOT.load(std::sync::atomic::Ordering::Relaxed);
+    if cur != usize::MAX {
+        return cur;
+    }
+    let v = std::env::var("GROVEFS_PG_READ_POOL")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|n| n.min(64))
+        .unwrap_or(PG_READ_POOL_SIZE);
+    SLOT.store(v, std::sync::atomic::Ordering::Relaxed);
+    v
+}
 
 /// Upper bound on SSI retries per write op. Chosen so that a hot rename
 /// contention across 8 writers still terminates within ~1 second while
@@ -223,6 +591,50 @@ const SERIALIZATION_BACKOFF_MAX: std::time::Duration = std::time::Duration::from
 /// `BEGIN` (implicit or via `Client::transaction()`) opens under SSI.
 const WRITER_ISOLATION_SQL: &str = "SET default_transaction_isolation = 'serializable'";
 
+/// Opt-in per-session durability for writer connections:
+/// `GROVEFS_PG_SYNC_COMMIT=off` makes each COMMIT return once the WAL record is
+/// written, without waiting for the local flush. The visible effect is that the
+/// per-op commit latency stops carrying a disk flush, which is the knob an
+/// operator reaches for when metadata commits are the wall and a crash losing
+/// the last few milliseconds of namespace operations is acceptable.
+///
+/// Default `on` — PostgreSQL's own default. This is a *durability* choice, not a
+/// consistency one: SSI still serialises conflicting writers and no GroveFS
+/// invariant changes. It does reach further than the local disk, though: with
+/// `synchronous_standby_names` configured, `off` also stops waiting for a
+/// standby's acknowledgement, so an RPO=0 deployment must leave it on. GroveFS's
+/// own `--sync-repl` snapshot forwarding is unaffected (it predates the commit
+/// and is mutually exclusive with the PG backend anyway).
+fn pg_sync_commit_off() -> bool {
+    static SLOT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
+    let cur = SLOT.load(std::sync::atomic::Ordering::Relaxed);
+    if cur != u8::MAX {
+        return cur != 0;
+    }
+    let off = std::env::var("GROVEFS_PG_SYNC_COMMIT")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "off" || v == "false" || v == "0" || v == "async"
+        })
+        .unwrap_or(false);
+    SLOT.store(off as u8, std::sync::atomic::Ordering::Relaxed);
+    off
+}
+
+/// Arm a freshly-connected writer session: SSI isolation, plus the optional
+/// async-commit durability downgrade. `false` means the session could not be
+/// configured, so the pool drops it rather than handing out a connection that
+/// silently runs under the wrong isolation.
+fn tune_writer(c: &mut Client) -> bool {
+    if c.batch_execute(WRITER_ISOLATION_SQL).is_err() {
+        return false;
+    }
+    if pg_sync_commit_off() && c.batch_execute("SET synchronous_commit = off").is_err() {
+        return false;
+    }
+    true
+}
+
 impl PgEngine {
     /// Connect to a PostgreSQL server (from a `postgres://user:pw@host/db`
     /// URI), ensure this view's schema exists (idempotent), and seed the root
@@ -232,6 +644,9 @@ impl PgEngine {
     /// effect on the PG path (GroveFS-native HA is disabled on PG, so a
     /// "standby reads only" mode is meaningless here).
     pub fn open(conn_uri: &str, view: &str, _readonly: bool) -> std::io::Result<Self> {
+        // A comma-separated spec (`uri,uri,...`) names several instances; this
+        // view's tree lives on exactly one of them (see [`route_store`]).
+        let conn_uri = route_store(conn_uri, view);
         let schema = schema_for(view).ok_or_else(|| {
             std::io::Error::other(format!(
                 "view name '{view}' incompatible with PG schema naming (empty, or longer than 25 bytes)"
@@ -242,10 +657,10 @@ impl PgEngine {
         // A failed extra connection just shrinks the pool (writes fall back to
         // a fresh connect in `checkout_writer`), never fails open().
         let mut write_pool = Vec::new();
-        for _ in 0..PG_WRITE_POOL_SIZE {
-            if let Ok(mut wc) = Client::connect(conn_uri, NoTls) {
-                if wc.batch_execute(WRITER_ISOLATION_SQL).is_ok() {
-                    write_pool.push(wc);
+        for _ in 0..pg_write_pool_size() {
+            if let Ok(mut wc) = Client::connect(&conn_uri, NoTls) {
+                if tune_writer(&mut wc) {
+                    write_pool.push(WriteConn::new(wc));
                 }
             }
         }
@@ -253,15 +668,15 @@ impl PgEngine {
         // connect latency per page. Reads stay at READ COMMITTED (the PG
         // default) — cheaper and no SSI predicate-lock overhead.
         let mut read_pool = Vec::new();
-        for _ in 0..PG_READ_POOL_SIZE {
-            if let Ok(rc) = Client::connect(conn_uri, NoTls) {
-                read_pool.push(rc);
+        for _ in 0..pg_read_pool_size() {
+            if let Ok(rc) = Client::connect(&conn_uri, NoTls) {
+                read_pool.push(ReadConn::new(rc));
             }
         }
         let this = Self {
             view: view.to_string(),
             schema,
-            conn_uri: conn_uri.to_string(),
+            conn_uri,
             write_pool: parking_lot::Mutex::new(write_pool),
             read_pool: parking_lot::Mutex::new(read_pool),
             cursors: parking_lot::Mutex::new(HashMap::new()),
@@ -314,7 +729,7 @@ impl PgEngine {
     /// via [`Self::requeue_writer`] to keep the pool bounded. Not doing so
     /// leaks one backend per dropped checkout until PG's `max_connections`
     /// trips — bounded usage makes that pattern visible at review time.
-    fn checkout_writer(&self) -> Result<Client, MetaError> {
+    fn checkout_writer(&self) -> Result<WriteConn, MetaError> {
         // Pool-wait window: covers popping a warm writer AND the cold path
         // where the pool is drained and we pay a full `Client::connect` — that
         // fresh-connect latency shows up as the PgPoolWait tail, telling an
@@ -335,22 +750,22 @@ impl PgEngine {
             None => {
                 let mut c = Client::connect(&self.conn_uri, NoTls).map_err(|e| map_db_err(&e))?;
                 // Fresh connect may bypass the pooled PRAGMA path; re-arm so
-                // every writer session is guaranteed SERIALIZABLE regardless
-                // of how it entered the pool.
-                let _ = c.batch_execute(WRITER_ISOLATION_SQL);
-                Ok(c)
+                // every writer session is guaranteed SERIALIZABLE (and the same
+                // commit durability) regardless of how it entered the pool.
+                let _ = tune_writer(&mut c);
+                Ok(WriteConn::new(c))
             }
         }
     }
 
     /// Return a writer connection to the pool (bounded); drop it if the
     /// server closed the socket so a stale handle never gets handed out again.
-    fn requeue_writer(&self, c: Client) {
+    fn requeue_writer(&self, c: WriteConn) {
         if c.is_closed() {
             return;
         }
         let mut p = self.write_pool.lock();
-        if p.len() < PG_WRITE_POOL_SIZE {
+        if p.len() < pg_write_pool_size() {
             p.push(c);
         }
     }
@@ -359,13 +774,13 @@ impl PgEngine {
     /// left by a server restart), else open a fresh one. Returns `None` only
     /// when connecting also fails — the caller then falls back to a checked-out
     /// writer (see [`Self::with_read`]).
-    fn try_read_conn(&self) -> Option<Client> {
+    fn try_read_conn(&self) -> Option<ReadConn> {
         let _pw = stats::start(stats::Stage::PgPoolWait);
         let pooled = {
             let mut p = self.read_pool.lock();
             loop {
                 match p.pop() {
-                    Some(c) if c.is_closed() => continue, // discard stale, try next
+                    Some(c) if c.client.is_closed() => continue, // discard stale, try next
                     Some(c) => break Some(c),
                     None => break None,
                 }
@@ -373,18 +788,20 @@ impl PgEngine {
         };
         match pooled {
             Some(c) => Some(c),
-            None => Client::connect(&self.conn_uri, NoTls).ok(),
+            None => Client::connect(&self.conn_uri, NoTls)
+                .ok()
+                .map(ReadConn::new),
         }
     }
 
     /// Return a used read connection to the pool (bounded); drop it if the
     /// server closed it so a stale socket never gets handed out again.
-    fn requeue_read(&self, c: Client) {
-        if c.is_closed() {
+    fn requeue_read(&self, c: ReadConn) {
+        if c.client.is_closed() {
             return;
         }
         let mut p = self.read_pool.lock();
-        if p.len() < PG_READ_POOL_SIZE {
+        if p.len() < pg_read_pool_size() {
             p.push(c);
         }
     }
@@ -396,7 +813,7 @@ impl PgEngine {
     /// would otherwise work. `T: Default` lets the total-outage branch return
     /// an empty/None result rather than propagating an error type that would
     /// need threading through every read helper.
-    fn with_read<T: Default>(&self, f: impl FnOnce(&mut Client) -> T) -> T {
+    fn with_read<T: Default>(&self, f: impl FnOnce(&mut ReadConn) -> T) -> T {
         if let Some(mut c) = self.try_read_conn() {
             let _q = stats::start(stats::Stage::PgQuery);
             let r = f(&mut c);
@@ -404,10 +821,11 @@ impl PgEngine {
             return r;
         }
         match self.checkout_writer() {
-            Ok(mut c) => {
+            Ok(c) => {
                 let _q = stats::start(stats::Stage::PgQuery);
+                let mut c = ReadConn::new(c.client);
                 let r = f(&mut c);
-                self.requeue_writer(c);
+                self.requeue_writer(WriteConn::new(c.client));
                 r
             }
             Err(_) => T::default(),
@@ -533,7 +951,7 @@ impl PgEngine {
     /// silent stall.
     fn with_serial_retry<T, F>(&self, mut body: F) -> Result<T, MetaError>
     where
-        F: FnMut(&mut postgres::Transaction<'_>) -> Result<T, WriteErr>,
+        F: FnMut(&mut WriteTx<'_, '_>) -> Result<T, WriteErr>,
     {
         let mut delay = SERIALIZATION_BACKOFF_MIN;
         // Total write-transaction latency, retries included: the number that
@@ -541,16 +959,26 @@ impl PgEngine {
         // above PgQuery/PgPoolWait, so comparing the two pinpoints contention.
         let _txn = stats::start(stats::Stage::PgWriteTxn);
         for attempt in 0..SERIALIZATION_MAX_ATTEMPTS {
-            let mut c = self.checkout_writer()?;
+            let mut wc = self.checkout_writer()?;
             let out: Result<T, WriteErr> = (|| {
-                let mut tx = c.transaction().map_err(|e| {
+                // Split the pooled connection so the transaction holds `client`
+                // while the body keeps the statement cache: they are disjoint
+                // fields and `WriteTx` re-joins them for the duration of one op.
+                let WriteConn { client, stmts } = &mut wc;
+                let mut tx = client.transaction().map_err(|e| {
                     if Self::is_serialization_failure(&e) {
                         WriteErr::Serialization
                     } else {
                         WriteErr::Hard(map_db_err(&e))
                     }
                 })?;
-                let v = body(&mut tx)?;
+                let v = {
+                    let mut wtx = WriteTx {
+                        tx: &mut tx,
+                        stmts,
+                    };
+                    body(&mut wtx)?
+                };
                 tx.commit().map_err(|e| {
                     if Self::is_serialization_failure(&e) {
                         WriteErr::Serialization
@@ -560,7 +988,7 @@ impl PgEngine {
                 })?;
                 Ok(v)
             })();
-            self.requeue_writer(c);
+            self.requeue_writer(wc);
             match out {
                 Ok(v) => return Ok(v),
                 Err(WriteErr::Hard(me)) => return Err(me),
@@ -1283,6 +1711,9 @@ impl PgEngine {
     /// read as a successful removal (the same rule the file arm applies to a
     /// missing `meta/<view>.db`).
     pub fn remove_view(conn_uri: &str, view: &str) -> Result<PgPurgeReport, String> {
+        // A sharded spec names several instances; this tree lives on one of
+        // them, and so does the ledger it has to unbook (see [`route_store`]).
+        let conn_uri = &route_store(conn_uri, view);
         let schema = schema_for(view).ok_or_else(|| {
             format!(
                 "view name '{view}' incompatible with PG schema naming (empty, or longer than 25 bytes)"
@@ -1359,6 +1790,482 @@ impl PgEngine {
             unbooked_refs,
             still_held,
         })
+    }
+
+    // ---- tree copies (fork / graft) ---------------------------------------
+    //
+    // The file arm's copies (`meta::fork_view_with` / `meta::graft_view`) read
+    // and write SEPARATE SQLite databases. Under PG the two trees are two
+    // schemas of one database, so the same semantics land as SQL: `fork` is one
+    // `INSERT ... SELECT` plus one ledger statement, and `graft` walks the
+    // source rows in Rust and inserts fresh rows exactly like the file arm.
+    // Because PostgreSQL's DDL is transactional, the fork's copy+booking and
+    // the graft's rows+booking each live in ONE transaction: a crash leaves
+    // either no tree or a fully copied one, never a half tree with unbooked
+    // blobs.
+    //
+    // Shared on purpose with the SQLite arm: a fork preserves ids AND inode
+    // numbers (hard links in the base stay hard links), `seed == false` creates
+    // the fork's own empty tree (root only) for a later graft, and both book
+    // ONE ledger holder per DISTINCT blob the destination now names.
+
+    /// Does `schema` exist? Asked of `information_schema`, never of a cached
+    /// engine: a fork/graft must answer about the store as it is NOW.
+    pub fn tree_exists(conn_uri: &str, view: &str) -> Result<bool, String> {
+        let conn_uri = &route_store(conn_uri, view);
+        let schema = schema_for(view).ok_or_else(|| {
+            format!(
+                "view name '{view}' incompatible with PG schema naming (empty, or longer than 25 bytes)"
+            )
+        })?;
+        let mut c =
+            Client::connect(conn_uri, NoTls).map_err(|e| format!("postgres connect {e}"))?;
+        schema_exists(&mut c, &schema)
+    }
+
+    /// Seed an independent tree `name` as a point-in-time copy of the physical
+    /// view `base`'s tree. Content bytes are SHARED, not copied: every distinct
+    /// `data_ref` in the copy is booked once against the new view in the
+    /// cross-view ledger, so a delete in either tree frees a blob only when its
+    /// last name in the last holding view disappears.
+    ///
+    /// Not copied on purpose: `ctrl` (the HA fencing epoch — a fork is a new
+    /// view, not a standby replica) and `locks` (transient leases of the source
+    /// mount). Inode numbers ARE copied, so hard links inside the base stay hard
+    /// links in the fork; new nodes in the fork allocate `ino == row id` off the
+    /// sequence this function re-points above the copied ids.
+    ///
+    /// `seed == false` creates the fork's OWN tree (schema + root) and copies
+    /// nothing, so the caller can place a curated subset with [`graft_tree`].
+    pub fn fork_tree(
+        conn_uri: &str,
+        base: &str,
+        name: &str,
+        seed: bool,
+    ) -> Result<crate::meta::ForkStats, String> {
+        // Both trees must sit on ONE instance: the copy is a single
+        // `INSERT ... SELECT` between two schemas (see [`route_multi`]).
+        let conn_uri = &route_multi(conn_uri, &[base, name])?;
+        let src = schema_for(base).ok_or_else(|| {
+            format!(
+                "view name '{base}' incompatible with PG schema naming (empty, or longer than 25 bytes)"
+            )
+        })?;
+        let dst = schema_for(name).ok_or_else(|| {
+            format!(
+                "view name '{name}' incompatible with PG schema naming (empty, or longer than 25 bytes)"
+            )
+        })?;
+        let mut c =
+            Client::connect(conn_uri, NoTls).map_err(|e| format!("postgres connect {e}"))?;
+        if !schema_exists(&mut c, &src)? {
+            return Err(format!(
+                "no physical base tree '{base}' in {conn_uri} — a fork copies a physical view tree"
+            ));
+        }
+        if schema_exists(&mut c, &dst)? {
+            return Err(format!(
+                "fork target '{name}' already exists in {conn_uri}"
+            ));
+        }
+        // Parity with the file arm: an empty source (no root row) is a store
+        // shape a fork must refuse, not copy as a tree with no root.
+        let has_root: bool = !c
+            .query(
+                &format!("SELECT 1 FROM {src}.node WHERE parent_id IS NULL LIMIT 1"),
+                &[],
+            )
+            .map_err(|e| format!("postgres {e}"))?
+            .is_empty();
+        if !has_root {
+            return Err(format!(
+                "base tree '{base}' has no root row — refusing to fork an empty store"
+            ));
+        }
+        // Create the destination (schema + root + ledger attached), exactly the
+        // shape `view create` makes; `seed == false` stops here.
+        {
+            let eng = PgEngine::open(conn_uri, name, false)
+                .map_err(|e| format!("cannot create fork tree '{name}': {e}"))?;
+            drop(eng);
+        }
+        if !seed {
+            return Ok(crate::meta::ForkStats { nodes: 1, blobs: 0 });
+        }
+        let mut tx = c
+            .transaction()
+            .map_err(|e| format!("postgres begin {e}"))?;
+        // REPLACE the seeded root with the copied rows: ids and inos travel, so
+        // the copy is the same tree, not a re-numbered imitation.
+        tx.execute(&format!("DELETE FROM {dst}.node"), &[])
+            .map_err(|e| format!("postgres {e}"))?;
+        tx.execute(
+            &format!(
+                "INSERT INTO {dst}.node ({COLS}) SELECT {COLS} FROM {src}.node ORDER BY id"
+            ),
+            &[],
+        )
+        .map_err(|e| format!("postgres copy into {name}: {e}"))?;
+        // Explicit ids do not advance BIGSERIAL; re-point it above the copied
+        // maximum or the first new node in the fork collides with a copy.
+        let _ = tx
+            .query(
+                &format!(
+                    "SELECT setval(pg_get_serial_sequence('{dst}.node','id'), \
+                     COALESCE((SELECT MAX(id) FROM {dst}.node), 1))"
+                ),
+                &[],
+            )
+            .map_err(|e| format!("postgres sequence {name}: {e}"))?;
+        let nodes: i64 = tx
+            .query(&format!("SELECT COUNT(*) FROM {dst}.node"), &[])
+            .map_err(|e| format!("postgres {e}"))?[0]
+            .get(0);
+        let blobs: i64 = tx
+            .query(
+                &format!("SELECT COUNT(DISTINCT data_ref) FROM {dst}.node WHERE data_ref IS NOT NULL"),
+                &[],
+            )
+            .map_err(|e| format!("postgres {e}"))?[0]
+            .get(0);
+        // Book the fork's own hold on every distinct blob. One row per content
+        // key per VIEW (the base already holds its own), exactly like
+        // `ledger_add_tx` on a 0->1 name count.
+        tx.execute(
+            &format!(
+                "INSERT INTO {PG_REFS_TABLE} (data_ref, holders) \
+                 SELECT data_ref, 1 FROM (SELECT DISTINCT data_ref FROM {dst}.node \
+                 WHERE data_ref IS NOT NULL) s \
+                 ON CONFLICT (data_ref) DO UPDATE SET holders = {PG_REFS_TABLE}.holders + 1"
+            ),
+            &[],
+        )
+        .map_err(|e| format!("cannot book the fork's blobs in the ledger: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("postgres commit (fork and ledger rolled back): {e}"))?;
+        Ok(crate::meta::ForkStats { nodes, blobs })
+    }
+
+    /// One node row of a PG tree being read for a graft (same shape as the file
+    /// arm's private `GraftRow`): see the module-level [`GraftPgRow`].
+    ///
+    /// Mutable state of one graft transaction: see the module-level
+    /// [`GraftCtx`].
+
+    /// Graft a curated subset of `src`'s tree into the tree of `dst`: for every
+    /// [`crate::meta::GraftItem`], copy that entry (a directory brings its
+    /// subtree) to `dest/<dst>`, renaming it to the destination basename.
+    /// Bytes are shared — every distinct `data_ref` is booked exactly like a
+    /// fork's, so the destination never owns a delete the source does not know
+    /// about and the object is freed only when no view names it.
+    ///
+    /// All-or-nothing: the source is read first (one statement, so one
+    /// snapshot) and the whole plan lands in ONE transaction; a bad line writes
+    /// nothing. Missing parent directories under `dest` are created (0755).
+    /// `skip_existing` turns a conflict into "leave what is there and keep
+    /// going", merging into an existing directory and skipping colliding files.
+    pub fn graft_tree(
+        conn_uri: &str,
+        dst: &str,
+        src: &str,
+        items: &[crate::meta::GraftItem],
+        dest: &str,
+        skip_existing: bool,
+    ) -> Result<crate::meta::GraftStats, String> {
+        if items.is_empty() {
+            return Err("empty graft plan — nothing to copy".to_string());
+        }
+        // Same one-instance rule as a fork: the plan is read from one schema and
+        // written into another schema of the SAME database (see [`route_multi`]).
+        let conn_uri = &route_multi(conn_uri, &[src, dst])?;
+        let src_s = schema_for(src).ok_or_else(|| {
+            format!(
+                "view name '{src}' incompatible with PG schema naming (empty, or longer than 25 bytes)"
+            )
+        })?;
+        let dst_s = schema_for(dst).ok_or_else(|| {
+            format!(
+                "view name '{dst}' incompatible with PG schema naming (empty, or longer than 25 bytes)"
+            )
+        })?;
+        let mut c =
+            Client::connect(conn_uri, NoTls).map_err(|e| format!("postgres connect {e}"))?;
+        if !schema_exists(&mut c, &src_s)? {
+            return Err(format!(
+                "no source tree '{src}' in {conn_uri} — a graft copies names out of a physical view tree"
+            ));
+        }
+        if !schema_exists(&mut c, &dst_s)? {
+            return Err(format!(
+                "no destination tree '{dst}' in {conn_uri} — a graft lands in a base view or a fork (a lens/alias has no tree of its own)"
+            ));
+        }
+        let dest_prefix = if dest.trim().is_empty() {
+            String::new()
+        } else {
+            crate::meta::normalize_plan_path(dest)?
+        };
+        let rows = read_graft_rows(&mut c, &src_s)?;
+        let root = rows
+            .iter()
+            .find(|r| r.parent_id.is_none())
+            .map(|r| r.id)
+            .ok_or_else(|| {
+                format!("source tree '{src}' has no root row — refusing to graft from an empty store")
+            })?;
+        let children = graft_children(&rows);
+        // Resolve every source path BEFORE writing anything, so a typo on line
+        // 900 of a 100k-line plan cannot leave a half-grafted tree behind.
+        let mut plan: Vec<(usize, String)> = Vec::with_capacity(items.len());
+        for it in items {
+            let idx = graft_resolve(&rows, &children, root, &it.src)
+                .ok_or_else(|| format!("'{}' does not exist in view '{src}'", it.src))?;
+            let full = if dest_prefix.is_empty() {
+                it.dst.clone()
+            } else {
+                format!("{dest_prefix}/{}", it.dst)
+            };
+            plan.push((idx, full));
+        }
+        let mut tx = c
+            .transaction()
+            .map_err(|e| format!("postgres begin {e}"))?;
+        let dst_root: i64 = tx
+            .query(
+                &format!("SELECT id FROM {dst_s}.node WHERE parent_id IS NULL ORDER BY id LIMIT 1"),
+                &[],
+            )
+            .map_err(|e| format!("postgres {e}"))?
+            .first()
+            .map(|r| r.get::<_, i64>(0))
+            .ok_or_else(|| {
+                format!("destination tree '{dst}' has no root row — refusing to graft into it")
+            })?;
+        // Fresh ids/ino numbers start ABOVE both existing id space and existing
+        // inode numbers, so a graft never collides with rows copied by an
+        // earlier fork (whose inos came from another tree).
+        let max_id: i64 = tx
+            .query(&format!("SELECT COALESCE(MAX(id),0) FROM {dst_s}.node"), &[])
+            .map_err(|e| format!("postgres {e}"))?[0]
+            .get(0);
+        let max_ino: i64 = tx
+            .query(&format!("SELECT COALESCE(MAX(ino),0) FROM {dst_s}.node"), &[])
+            .map_err(|e| format!("postgres {e}"))?[0]
+            .get(0);
+        let mut ctx = GraftCtx {
+            next: max_id.max(max_ino) + 1,
+            skip_existing,
+            stats: crate::meta::GraftStats::default(),
+            blobs: std::collections::HashSet::new(),
+            inos: HashMap::new(),
+        };
+        // What the destination ALREADY names, read before a single grafted row
+        // lands: the ledger counts holders per view, so these blobs must not be
+        // booked again by this graft (see the booking loop below).
+        let held_before: std::collections::HashSet<String> = tx
+            .query(
+                &format!("SELECT DISTINCT data_ref FROM {dst_s}.node WHERE data_ref IS NOT NULL"),
+                &[],
+            )
+            .map_err(|e| format!("cannot size the destination tree: {e}"))?
+            .iter()
+            .map(|r| r.get::<_, String>(0))
+            .collect();
+        for (idx, full) in &plan {
+            let (parent_path, name) = match full.rfind('/') {
+                Some(k) => (&full[..k], &full[k + 1..]),
+                None => ("", full.as_str()),
+            };
+            let parent =
+                Self::graft_ensure_dir(&mut tx, &dst_s, parent_path, dst_root, &mut ctx)?;
+            Self::graft_copy(
+                &mut tx, &dst_s, &rows, &children, *idx, parent, name, &mut ctx,
+            )?;
+        }
+        // Book the destination's hold on every blob it now names. The ledger
+        // counts HOLDERS PER VIEW, not names, so a blob the destination already
+        // named before this graft (a second graft into the same fork, or a
+        // curated copy beside an earlier one) must NOT be booked again — that
+        // would leave a holder nobody ever unbooks and the object would never be
+        // freed. If the SOURCE view was never booked (a store predating the
+        // ledger and never rebuilt), book it first — otherwise its last-name
+        // delete would free a blob this graft still names.
+        for dr in &ctx.blobs {
+            let booked: bool = !tx
+                .query(
+                    &format!("SELECT 1 FROM {PG_REFS_TABLE} WHERE data_ref=$1 LIMIT 1"),
+                    &[dr],
+                )
+                .map_err(|e| format!("postgres {e}"))?
+                .is_empty();
+            if !booked {
+                ledger_add_tx(&mut tx, dr).map_err(write_err_str)?;
+                ledger_add_tx(&mut tx, dr).map_err(write_err_str)?;
+            } else if !held_before.contains(dr) {
+                ledger_add_tx(&mut tx, dr).map_err(write_err_str)?;
+            }
+        }
+        // The rows carried explicit ids: re-point the sequence so the next
+        // create_node in the destination cannot collide with a grafted row.
+        let _ = tx
+            .query(
+                &format!(
+                    "SELECT setval(pg_get_serial_sequence('{dst_s}.node','id'), \
+                     COALESCE((SELECT MAX(id) FROM {dst_s}.node), 1))"
+                ),
+                &[],
+            )
+            .map_err(|e| format!("postgres sequence {dst}: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("postgres commit (graft and ledger rolled back): {e}"))?;
+        ctx.stats.blobs = ctx.blobs.len() as i64;
+        Ok(ctx.stats)
+    }
+
+    /// `mkdir -p` inside the destination tree: walk `path` from `root`, creating
+    /// any missing directory. Returns the directory's row id.
+    fn graft_ensure_dir(
+        tx: &mut postgres::Transaction<'_>,
+        schema: &str,
+        path: &str,
+        root: i64,
+        ctx: &mut GraftCtx,
+    ) -> Result<i64, String> {
+        let mut cur = root;
+        if path.is_empty() {
+            return Ok(cur);
+        }
+        for comp in path.split('/') {
+            let found: Option<(i64, i64)> = tx
+                .query(
+                    &format!("SELECT id,is_dir FROM {schema}.node WHERE parent_id=$1 AND name=$2"),
+                    &[&cur, &comp],
+                )
+                .map_err(|e| format!("cannot read the destination tree: {e}"))?
+                .first()
+                .map(|r| (r.get(0), r.get(1)));
+            match found {
+                Some((id, is_dir)) if is_dir != 0 => cur = id,
+                Some(_) => {
+                    return Err(format!(
+                        "'{comp}' in the destination path is a file, not a directory"
+                    ))
+                }
+                None => {
+                    let id = ctx.next;
+                    ctx.next += 1;
+                    let t = now();
+                    let uid = crate::platform::getuid() as i64;
+                    let gid = crate::platform::getgid() as i64;
+                    let no_ref: Option<String> = None;
+                    let no_link: Option<String> = None;
+                    tx.execute(
+                        &format!(
+                            "INSERT INTO {schema}.node ({COLS}) \
+                             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)"
+                        ),
+                        &[
+                            &id, &cur, &comp, &1i64, &no_ref, &no_link, &0o0755i64, &uid, &gid,
+                            &t, &t, &t, &id,
+                        ],
+                    )
+                    .map_err(|e| {
+                        format!("cannot create directory '{comp}' in the destination: {e}")
+                    })?;
+                    ctx.stats.nodes += 1;
+                    ctx.stats.dirs += 1;
+                    cur = id;
+                }
+            }
+        }
+        Ok(cur)
+    }
+
+    /// Copy one source entry (and, for a directory, its whole subtree) under
+    /// `parent` as `name`. Rows get fresh ids/ino numbers in the destination;
+    /// the source's bytes are referenced, never copied.
+    #[allow(clippy::too_many_arguments)]
+    fn graft_copy(
+        tx: &mut postgres::Transaction<'_>,
+        schema: &str,
+        rows: &[GraftPgRow],
+        children: &HashMap<i64, Vec<usize>>,
+        idx: usize,
+        parent: i64,
+        name: &str,
+        ctx: &mut GraftCtx,
+    ) -> Result<(), String> {
+        let r = &rows[idx];
+        let existing: Option<(i64, i64)> = tx
+            .query(
+                &format!("SELECT id,is_dir FROM {schema}.node WHERE parent_id=$1 AND name=$2"),
+                &[&parent, &name],
+            )
+            .map_err(|e| format!("cannot read the destination tree: {e}"))?
+            .first()
+            .map(|x| (x.get(0), x.get(1)));
+        let dir_id = match existing {
+            None => {
+                let id = ctx.next;
+                ctx.next += 1;
+                let ino = *ctx.inos.entry(r.ino).or_insert(id);
+                tx.execute(
+                    &format!(
+                        "INSERT INTO {schema}.node ({COLS}) \
+                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)"
+                    ),
+                    &[
+                        &id,
+                        &parent,
+                        &name,
+                        &r.is_dir,
+                        &r.data_ref,
+                        &r.link_target,
+                        &r.mode,
+                        &r.uid,
+                        &r.gid,
+                        &r.mtime,
+                        &r.atime,
+                        &r.ctime,
+                        &ino,
+                    ],
+                )
+                .map_err(|e| format!("cannot graft '{name}': {e}"))?;
+                ctx.stats.nodes += 1;
+                if r.is_dir != 0 {
+                    ctx.stats.dirs += 1;
+                }
+                if let Some(dr) = &r.data_ref {
+                    ctx.blobs.insert(dr.clone());
+                }
+                if r.is_dir == 0 {
+                    return Ok(());
+                }
+                id
+            }
+            Some((id, is_dir)) => {
+                if !ctx.skip_existing {
+                    return Err(format!(
+                        "'{name}' already exists in the destination — rename it in the plan or pass --skip-existing"
+                    ));
+                }
+                if is_dir == 0 || r.is_dir == 0 {
+                    ctx.stats.skipped += 1;
+                    return Ok(());
+                }
+                // Both are directories: keep the one already there and merge the
+                // missing children into it (re-running a curation script must not
+                // fail on the skeleton it made last time).
+                id
+            }
+        };
+        if let Some(kids) = children.get(&r.id) {
+            for k in kids {
+                let child_name = rows[*k].name.clone();
+                Self::graft_copy(tx, schema, rows, children, *k, dir_id, &child_name, ctx)?;
+            }
+        }
+        Ok(())
     }
 
     // ---- POSIX advisory locks ---------------------------------------------
@@ -1569,13 +2476,13 @@ fn is_descendant_tx(
 /// How many names THIS view still holds for `dr` (inside the caller's tx,
 /// before/after the node write it brackets). Used to detect the 0->1 and 1->0
 /// transitions that decide when the shared ledger is booked/released.
-fn view_name_count(
-    tx: &mut postgres::Transaction<'_>,
+fn view_name_count<T: TxSql>(
+    tx: &mut T,
     node: &str,
     dr: &str,
 ) -> Result<i64, WriteErr> {
     Ok(tx
-        .query(
+        .tq(
             &format!("SELECT COUNT(*) FROM {node} WHERE data_ref=$1"),
             &[&dr],
         )?
@@ -1588,8 +2495,8 @@ fn view_name_count(
 /// the same tx as the node INSERT). `ON CONFLICT DO UPDATE` keeps the row
 /// atomic under concurrent holders from other views; an SSI clash retries the
 /// whole body.
-fn ledger_add_tx(tx: &mut postgres::Transaction<'_>, dr: &str) -> Result<(), WriteErr> {
-    tx.execute(
+fn ledger_add_tx<T: TxSql>(tx: &mut T, dr: &str) -> Result<(), WriteErr> {
+    tx.te(
         &format!(
             "INSERT INTO {PG_REFS_TABLE} (data_ref, holders) VALUES ($1, 1)
              ON CONFLICT (data_ref) DO UPDATE SET holders = {PG_REFS_TABLE}.holders + 1"
@@ -1603,12 +2510,12 @@ fn ledger_add_tx(tx: &mut postgres::Transaction<'_>, dr: &str) -> Result<(), Wri
 /// removed, same tx as the node DELETE). Returns `Some(dr)` when no view holds
 /// it anymore (caller GCs) and `None` when another still does. A missing row is
 /// "no other holder", matching the pre-ledger single-view behaviour.
-fn ledger_remove_tx(
-    tx: &mut postgres::Transaction<'_>,
+fn ledger_remove_tx<T: TxSql>(
+    tx: &mut T,
     dr: &str,
 ) -> Result<Option<String>, WriteErr> {
     let left: Option<i64> = tx
-        .query(
+        .tq(
             &format!("UPDATE {PG_REFS_TABLE} SET holders = holders - 1 WHERE data_ref=$1 RETURNING holders"),
             &[&dr],
         )?
@@ -1617,7 +2524,7 @@ fn ledger_remove_tx(
         .map(|r| r.get::<_, i64>(0));
     match left {
         Some(h) if h <= 0 => {
-            tx.execute(
+            tx.te(
                 &format!("DELETE FROM {PG_REFS_TABLE} WHERE data_ref=$1"),
                 &[&dr],
             )?;
@@ -1628,6 +2535,79 @@ fn ledger_remove_tx(
         // pre-ledger engine did for every private object.
         None => Ok(Some(dr.to_string())),
     }
+}
+
+/// What the surviving PG trees name and what the shared ledger books, for an
+/// audit that runs OUTSIDE this process's view cache (`gc` served over the
+/// control plane).
+///
+/// A pure READ: no transaction, nothing written. Only our own deterministic
+/// `grovefs_v_<hex>` schemas are read as trees (a foreign schema that merely
+/// starts with the prefix is not one), and an unreadable tree ABORTS the
+/// picture: a skipped tree would make every blob it names look unreferenced,
+/// which is exactly the direction that deletes live bytes.
+#[derive(Clone, Debug, Default)]
+pub struct PgPicture {
+    /// View names decoded from the schemas that were actually read.
+    pub trees: Vec<String>,
+    /// Content key → number of trees naming it.
+    pub refs: std::collections::BTreeMap<String, i64>,
+    /// Content key → holder count currently booked (a missing ledger = none).
+    pub booked: std::collections::BTreeMap<String, i64>,
+}
+
+pub fn reference_picture(conn_uri: &str) -> Result<PgPicture, String> {
+    let mut c = Client::connect(conn_uri, NoTls).map_err(|e| format!("postgres connect {e}"))?;
+    let schemas: Vec<String> = c
+        .query(
+            "SELECT schema_name FROM information_schema.schemata \
+             WHERE schema_name LIKE 'grovefs_v_%' ORDER BY schema_name",
+            &[],
+        )
+        .map_err(|e| format!("postgres {e}"))?
+        .iter()
+        .map(|r| r.get::<_, String>(0))
+        .collect();
+    let mut trees = Vec::new();
+    let mut refs: std::collections::BTreeMap<String, i64> = Default::default();
+    for s in &schemas {
+        let Some(view) = crate::control::view_from_schema_name(s) else {
+            continue;
+        };
+        let rows = c
+            .query(
+                &format!("SELECT DISTINCT data_ref FROM {s}.node WHERE data_ref IS NOT NULL"),
+                &[],
+            )
+            .map_err(|e| {
+                format!(
+                    "cannot read tree {s}: {e} — refusing to audit from a partial view of the store (a skipped tree would make every blob it names look unreferenced)"
+                )
+            })?;
+        trees.push(view);
+        for r in rows {
+            *refs.entry(r.get::<_, String>(0)).or_insert(0) += 1;
+        }
+    }
+    // A database that never opened a view has no ledger table yet: that is
+    // "nothing booked", not an error (the same rule the local scanner applies
+    // to a missing `refs.db`).
+    let booked: std::collections::BTreeMap<String, i64> = match c.query(
+        &format!("SELECT data_ref, holders FROM {PG_REFS_TABLE}"),
+        &[],
+    ) {
+        Ok(rows) => rows
+            .iter()
+            .map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1)))
+            .collect(),
+        Err(e) if is_undefined_table(&e) => Default::default(),
+        Err(e) => return Err(format!("postgres read {PG_REFS_TABLE}: {e}")),
+    };
+    Ok(PgPicture {
+        trees,
+        refs,
+        booked,
+    })
 }
 
 /// Recompute `grovefs_refs.holders` from the `grovefs_v_*` TREES.
@@ -1647,6 +2627,15 @@ fn ledger_remove_tx(
 /// overwritten with the pre-booking count. Nothing here frees object bytes;
 /// that belongs to the data servers.
 pub fn rebuild_ledger(conn_uri: &str) -> Result<PgLedgerReport, String> {
+    // One database holds one `grovefs_refs.holders`. A sharded spec names
+    // several databases with one ledger EACH, so a single run would recount
+    // only the first — say it instead of silently half-repairing the store.
+    if store_instances(conn_uri).len() > 1 {
+        return Err(format!(
+            "{conn_uri} names {} PostgreSQL instances; the cross-view ledger lives INSIDE each database, so recount one instance at a time — run `grovefs refs rebuild --meta-store <one uri>` once per shard",
+            store_instances(conn_uri).len()
+        ));
+    }
     let mut c = Client::connect(conn_uri, NoTls).map_err(|e| format!("postgres connect {e}"))?;
     let schemas: Vec<String> = c
         .query(
@@ -1754,6 +2743,456 @@ pub fn rebuild_ledger(conn_uri: &str) -> Result<PgLedgerReport, String> {
         holders: truth.values().sum(),
         rows_fixed,
         rows_deleted,
+    })
+}
+
+// ---- portable dumps (export / import) ------------------------------------
+//
+// The SAME `grovefs-view-metadata` v1 line format the SQLite arm
+// (`meta::export_view`/`import_view`) and the cluster arm
+// (`FdbStore::export_jsonl`/`import_jsonl`) speak: a header line, then one JSON
+// object per node. What travels is the NAME SPACE (ids, inode numbers, modes,
+// times, `data_ref` keys) — never bytes. Content is located by `data_ref` alone,
+// whose bucket path is a pure function of the key, so the same dump loads into
+// any of the three backends and the bytes are found (or missing) the same way.
+
+/// One row of `node`, in the export's column order (`COLS`).
+fn pg_node_row_json(r: &postgres::Row) -> serde_json::Value {
+    serde_json::json!({
+        "id": r.get::<_, i64>(0),
+        "parent_id": r.get::<_, Option<i64>>(1),
+        "name": r.get::<_, String>(2),
+        "is_dir": r.get::<_, i64>(3),
+        "data_ref": r.get::<_, Option<String>>(4),
+        "link_target": r.get::<_, Option<String>>(5),
+        "mode": r.get::<_, i64>(6),
+        "uid": r.get::<_, i64>(7),
+        "gid": r.get::<_, i64>(8),
+        "mtime": r.get::<_, i64>(9),
+        "atime": r.get::<_, i64>(10),
+        "ctime": r.get::<_, i64>(11),
+        "ino": r.get::<_, Option<i64>>(12).unwrap_or(0),
+    })
+}
+
+/// Dump one view's tree to `out` in the portable format. The read is one
+/// `REPEATABLE READ` transaction, i.e. a real point-in-time snapshot: a mount
+/// writing to this view meanwhile cannot make the dump tear (SQLite gets the
+/// same from a read-only connection inside one snapshot; FoundationDB from one
+/// read version).
+///
+/// A name with no schema is REFUSED rather than exported as an empty tree — the
+/// exact rule both other arms apply, because a dump claiming `nodes:0` would
+/// later import as a provisioned-but-empty tree that reads as success.
+pub fn export_view(
+    conn_uri: &str,
+    view: &str,
+    out: &Path,
+    force: bool,
+    definition: Option<String>,
+) -> Result<crate::meta::ViewExportStats, String> {
+    let schema = schema_for(view).ok_or_else(|| {
+        format!(
+            "view name '{view}' incompatible with PG schema naming (empty, or longer than 25 bytes)"
+        )
+    })?;
+    let mut c = Client::connect(conn_uri, NoTls).map_err(|e| format!("postgres connect {e}"))?;
+    if !schema_exists(&mut c, &schema)? {
+        return Err(format!(
+            "no base tree '{view}' in {conn_uri} (schema {schema}) — a PostgreSQL-backed view is \
+             created with `view create`; a name the database never had is not exported, it is refused"
+        ));
+    }
+    if out.exists() && !force {
+        return Err(format!(
+            "output {} already exists — pass --force to overwrite it",
+            out.display()
+        ));
+    }
+    let kind = match definition.as_deref() {
+        Some(t) if t.lines().any(|l| l.trim_start().starts_with("fork ")) => "fork",
+        _ => "physical",
+    };
+    let mut tx = c
+        .build_transaction()
+        .isolation_level(IsolationLevel::RepeatableRead)
+        .read_only(true)
+        .start()
+        .map_err(|e| format!("cannot start export snapshot: {e}"))?;
+    let rows = tx
+        .query(
+            &format!("SELECT {COLS} FROM {schema}.node ORDER BY id"),
+            &[],
+        )
+        .map_err(|e| format!("cannot read tree '{view}': {e}"))?;
+    let blobs = {
+        let mut set: std::collections::HashSet<String> = Default::default();
+        for r in &rows {
+            if let Some(dr) = r.get::<_, Option<String>>(4) {
+                set.insert(dr);
+            }
+        }
+        set.len() as i64
+    };
+    // Write beside the destination and rename, exactly like the two other arms:
+    // an interrupted export never leaves a half file at the requested path.
+    let mut tmp = out.to_path_buf();
+    let name = out.file_name().and_then(|n| n.to_str()).unwrap_or("export");
+    tmp.set_file_name(format!(".{name}.tmp-{}", std::process::id()));
+    let write = (|| -> Result<(), String> {
+        let f = std::fs::File::create(&tmp).map_err(|e| format!("cannot create {}: {e}", tmp.display()))?;
+        let mut w = BufWriter::new(f);
+        let header = serde_json::json!({
+            "format": crate::meta::VIEW_EXPORT_FORMAT,
+            "version": crate::meta::VIEW_EXPORT_VERSION,
+            "view": view,
+            "kind": kind,
+            "definition": definition,
+            "exported_at": now(),
+            "nodes": rows.len() as i64,
+            "blobs": blobs,
+        });
+        writeln!(w, "{header}").map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+        for r in &rows {
+            let row = pg_node_row_json(r);
+            writeln!(w, "{row}").map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+        }
+        w.flush()
+            .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+        w.get_ref()
+            .sync_all()
+            .map_err(|e| format!("cannot flush {}: {e}", tmp.display()))
+    })();
+    let _ = tx.commit();
+    if let Err(e) = write {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    std::fs::rename(&tmp, out).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("cannot move export into {}: {e}", out.display())
+    })?;
+    Ok(crate::meta::ViewExportStats {
+        nodes: rows.len() as i64,
+        blobs,
+        kind: kind.to_string(),
+    })
+}
+
+/// Install a portable dump as this view's tree.
+///
+/// Unlike the file arm (build a scratch db, rename it) PostgreSQL has
+/// transactional DDL, so the whole install is ONE transaction: the tree is at
+/// every instant either the old one or the new one. The dump's ids and inode
+/// numbers are kept (hard links stay hard links, no cached handle is
+/// invalidated by renumbering), the ``id`` sequence is re-pointed above the
+/// imported maximum, and the cross-view ledger is adjusted from the OLD refs to
+/// the NEW ones in the same transaction.
+///
+/// A schema that did not exist before is provisioned first (that is the only
+/// tree-building entry besides `view create`); if the dump then turns out to be
+/// invalid the schema is DROPPED again, so a refused import never leaves a
+/// provisioned-but-empty tree behind — the shape both other arms avoid.
+pub fn import_view(
+    conn_uri: &str,
+    view: &str,
+    input: &Path,
+    replace: bool,
+) -> Result<crate::meta::ViewImportStats, String> {
+    let schema = schema_for(view).ok_or_else(|| {
+        format!(
+            "view name '{view}' incompatible with PG schema naming (empty, or longer than 25 bytes)"
+        )
+    })?;
+    let f = std::fs::File::open(input).map_err(|e| format!("cannot open {}: {e}", input.display()))?;
+    let mut rdr = BufReader::new(f);
+    let mut header_line = String::new();
+    if rdr
+        .read_line(&mut header_line)
+        .map_err(|e| format!("cannot read {}: {e}", input.display()))?
+        == 0
+    {
+        return Err(format!(
+            "{} is empty — not a grovefs view export",
+            input.display()
+        ));
+    }
+    if header_line.len() > (1 << 20) {
+        return Err(format!("{}:1: header line too long", input.display()));
+    }
+    let header: serde_json::Value = serde_json::from_str(header_line.trim_end()).map_err(|e| {
+        format!(
+            "{}:1: not a grovefs view export header ({e})",
+            input.display()
+        )
+    })?;
+    if header["format"] != crate::meta::VIEW_EXPORT_FORMAT {
+        return Err(format!(
+            "{}:1: unknown format '{}' (expected '{}')",
+            input.display(),
+            header["format"].as_str().unwrap_or("<missing>"),
+            crate::meta::VIEW_EXPORT_FORMAT
+        ));
+    }
+    let version = header["version"].as_u64().unwrap_or(0);
+    if version != crate::meta::VIEW_EXPORT_VERSION {
+        return Err(format!(
+            "{}:1: unsupported export version {version} (this build reads {})",
+            input.display(),
+            crate::meta::VIEW_EXPORT_VERSION
+        ));
+    }
+    let claimed_nodes = header["nodes"].as_i64();
+    let claimed_blobs = header["blobs"].as_i64();
+    let kind = header["kind"].as_str().unwrap_or("physical").to_string();
+
+    let mut c = Client::connect(conn_uri, NoTls).map_err(|e| format!("postgres connect {e}"))?;
+    let existed = schema_exists(&mut c, &schema)?;
+    if existed && !replace {
+        return Err(format!(
+            "target tree '{view}' already exists in {conn_uri} (schema {schema}) — pass --replace to \
+             overwrite it (stop every mount/meta-server using this store first)"
+        ));
+    }
+    let created = !existed;
+    if created {
+        // Provisions the schema, its tables, the root row and the ledger table.
+        drop(
+            PgEngine::open(conn_uri, view, false)
+                .map_err(|e| format!("cannot create target tree '{view}': {e}"))?,
+        );
+    }
+    let built = (|| -> Result<(i64, i64), String> {
+        let mut tx = c
+            .transaction()
+            .map_err(|e| format!("cannot start import transaction: {e}"))?;
+        // Read what the tree held BEFORE clearing it: those holds are about to
+        // become false, and the ledger is adjusted (not rebuilt) so a
+        // concurrent `fork`/`graft` elsewhere is not overwritten.
+        let old_refs: Vec<String> = tx
+            .query(
+                &format!(
+                    "SELECT DISTINCT data_ref FROM {schema}.node WHERE data_ref IS NOT NULL"
+                ),
+                &[],
+            )
+            .map_err(|e| format!("cannot read the target tree: {e}"))?
+            .iter()
+            .map(|r| r.get::<_, String>(0))
+            .collect();
+        tx.execute(&format!("DELETE FROM {schema}.node"), &[])
+            .map_err(|e| format!("cannot clear the target tree: {e}"))?;
+        let mut nodes = 0i64;
+        let mut blobs: std::collections::HashSet<String> = Default::default();
+        {
+            let sql = format!(
+                "INSERT INTO {schema}.node ({COLS}) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)"
+            );
+            let mut line = String::new();
+            let mut lineno = 1usize;
+            loop {
+                line.clear();
+                let n = rdr
+                    .read_line(&mut line)
+                    .map_err(|e| format!("cannot read {}: {e}", input.display()))?;
+                if n == 0 {
+                    break;
+                }
+                lineno += 1;
+                if line.len() > (4 << 20) {
+                    return Err(format!("{}:{lineno}: line too long", input.display()));
+                }
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let v: serde_json::Value = serde_json::from_str(line.trim_end())
+                    .map_err(|e| format!("{}:{lineno}: invalid JSON: {e}", input.display()))?;
+                let id = v["id"].as_i64().ok_or_else(|| {
+                    format!("{}:{lineno}: missing integer \"id\"", input.display())
+                })?;
+                let parent_id = match v.get("parent_id") {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(x) => Some(x.as_i64().ok_or_else(|| {
+                        format!(
+                            "{}:{lineno}: \"parent_id\" must be an integer or null",
+                            input.display()
+                        )
+                    })?),
+                };
+                let name = v["name"].as_str().ok_or_else(|| {
+                    format!("{}:{lineno}: missing string \"name\"", input.display())
+                })?;
+                if name.is_empty() {
+                    return Err(format!("{}:{lineno}: empty name", input.display()));
+                }
+                let is_dir = v["is_dir"].as_i64().ok_or_else(|| {
+                    format!("{}:{lineno}: missing integer \"is_dir\"", input.display())
+                })?;
+                if is_dir != 0 && is_dir != 1 {
+                    return Err(format!(
+                        "{}:{lineno}: \"is_dir\" must be 0 or 1, got {is_dir}",
+                        input.display()
+                    ));
+                }
+                let data_ref = v["data_ref"].as_str().map(str::to_string);
+                let link_target = v["link_target"].as_str().map(str::to_string);
+                let mode = v["mode"].as_i64().unwrap_or(if is_dir == 1 { 0o755 } else { 0o644 });
+                let uid = v["uid"].as_i64().unwrap_or(0);
+                let gid = v["gid"].as_i64().unwrap_or(0);
+                let t = now();
+                let mtime = v["mtime"].as_i64().unwrap_or(t);
+                let atime = v["atime"].as_i64().unwrap_or(mtime);
+                let ctime = v["ctime"].as_i64().unwrap_or(mtime);
+                let ino = v["ino"].as_i64().ok_or_else(|| {
+                    format!("{}:{lineno}: missing integer \"ino\"", input.display())
+                })?;
+                tx.execute(
+                    &sql,
+                    &[
+                        &id,
+                        &parent_id,
+                        &name,
+                        &is_dir,
+                        &data_ref,
+                        &link_target,
+                        &mode,
+                        &uid,
+                        &gid,
+                        &mtime,
+                        &atime,
+                        &ctime,
+                        &ino,
+                    ],
+                )
+                .map_err(|e| {
+                    format!("{}:{lineno}: cannot insert node {id}: {e}", input.display())
+                })?;
+                if let Some(dr) = &data_ref {
+                    blobs.insert(dr.clone());
+                }
+                nodes += 1;
+            }
+        }
+        // The same three structural checks the file arm runs before it lets the
+        // imported tree become the view: one root, it IS the root, no dangling
+        // parent, and the header's counts must match what the file carried.
+        let root: Vec<(i64, i64)> = tx
+            .query(
+                &format!("SELECT id, is_dir FROM {schema}.node WHERE parent_id IS NULL"),
+                &[],
+            )
+            .map_err(|e| format!("cannot validate the imported tree: {e}"))?
+            .iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect();
+        if root.len() != 1 {
+            return Err(format!(
+                "import rejected: expected exactly one root row (parent_id NULL), found {}",
+                root.len()
+            ));
+        }
+        if root[0].0 != crate::meta::ROOT_INO || root[0].1 != 1 {
+            return Err(format!(
+                "import rejected: root row must be id {} and a directory (got id {}, is_dir {})",
+                crate::meta::ROOT_INO,
+                root[0].0,
+                root[0].1
+            ));
+        }
+        let dangling: i64 = tx
+            .query(
+                &format!(
+                    "SELECT COUNT(*) FROM {schema}.node c LEFT JOIN {schema}.node p ON c.parent_id=p.id \
+                     WHERE c.parent_id IS NOT NULL AND (p.id IS NULL OR p.is_dir=0)"
+                ),
+                &[],
+            )
+            .map_err(|e| format!("cannot validate the imported tree: {e}"))?[0]
+            .get(0);
+        if dangling != 0 {
+            return Err(format!(
+                "import rejected: {dangling} node(s) point at a missing or non-directory parent"
+            ));
+        }
+        if let Some(cn) = claimed_nodes {
+            if cn != nodes {
+                return Err(format!(
+                    "import rejected: header declares {cn} node(s), file carries {nodes}"
+                ));
+            }
+        }
+        if let Some(cb) = claimed_blobs {
+            if cb != blobs.len() as i64 {
+                return Err(format!(
+                    "import rejected: header declares {cb} blob reference(s), file carries {}",
+                    blobs.len()
+                ));
+            }
+        }
+        // Explicit ids do not advance BIGSERIAL: re-point it above the imported
+        // maximum or the next create collides with a row the dump brought.
+        let _ = tx
+            .query(
+                &format!(
+                    "SELECT setval(pg_get_serial_sequence('{schema}.node','id'), \
+                     COALESCE((SELECT MAX(id) FROM {schema}.node), 1))"
+                ),
+                &[],
+            )
+            .map_err(|e| format!("postgres sequence {view}: {e}"))?;
+        // Ledger: the holds the OLD tree had leave, the NEW tree's distinct refs
+        // book one holder each — the same "per view, per content key" rule a
+        // fork books with, so a blob shared with another view never drops to 0.
+        for dr in &old_refs {
+            let left: Option<i64> = tx
+                .query(
+                    &format!(
+                        "UPDATE {PG_REFS_TABLE} SET holders = holders - 1 WHERE data_ref=$1 RETURNING holders"
+                    ),
+                    &[dr],
+                )
+                .map_err(|e| format!("postgres {e}"))?
+                .into_iter()
+                .next()
+                .map(|r| r.get::<_, i64>(0));
+            if !matches!(left, Some(h) if h > 0) {
+                tx.execute(
+                    &format!("DELETE FROM {PG_REFS_TABLE} WHERE data_ref=$1"),
+                    &[dr],
+                )
+                .map_err(|e| format!("postgres {e}"))?;
+            }
+        }
+        for dr in &blobs {
+            tx.execute(
+                &format!(
+                    "INSERT INTO {PG_REFS_TABLE} (data_ref, holders) VALUES ($1, 1) \
+                     ON CONFLICT (data_ref) DO UPDATE SET holders = {PG_REFS_TABLE}.holders + 1"
+                ),
+                &[dr],
+            )
+            .map_err(|e| format!("cannot book the imported tree's blobs: {e}"))?;
+        }
+        tx.commit()
+            .map_err(|e| format!("cannot commit the imported tree: {e}"))?;
+        Ok((nodes, blobs.len() as i64))
+    })();
+    let (nodes, blobs) = match built {
+        Ok(v) => v,
+        Err(e) => {
+            if created {
+                // A refused import must not leave the schema it provisioned: the
+                // next mount would read it as a real (empty) view.
+                let _ = c.batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"));
+            }
+            return Err(e);
+        }
+    };
+    Ok(crate::meta::ViewImportStats {
+        nodes,
+        blobs,
+        kind,
+        replaced: existed,
     })
 }
 
@@ -1948,5 +3387,175 @@ impl MetaProvider for PgEngine {
                 })
                 .unwrap_or_default()
         })
+    }
+}
+
+// ---- helpers shared by the tree-copy verbs --------------------------------
+
+/// Does `schema` exist in `c`? The single existence question both copy verbs
+/// ask, always of `information_schema` (never of a cached engine handle).
+fn schema_exists(c: &mut Client, schema: &str) -> Result<bool, String> {
+    Ok(!c
+        .query(
+            "SELECT 1 FROM information_schema.schemata WHERE schema_name = $1",
+            &[&schema],
+        )
+        .map_err(|e| format!("postgres {e}"))?
+        .is_empty())
+}
+
+/// Snapshot one tree's rows for a graft. One statement, so one consistent
+/// point-in-time read even while the source view is mounted elsewhere.
+fn read_graft_rows(c: &mut Client, schema: &str) -> Result<Vec<GraftPgRow>, String> {
+    let rows = c
+        .query(
+            &format!("SELECT {COLS} FROM {schema}.node ORDER BY id"),
+            &[],
+        )
+        .map_err(|e| format!("cannot read source tree '{schema}': {e}"))?
+        .iter()
+        .map(|r| GraftPgRow {
+            id: r.get(0),
+            parent_id: r.get(1),
+            name: r.get(2),
+            is_dir: r.get(3),
+            data_ref: r.get(4),
+            link_target: r.get(5),
+            mode: r.get(6),
+            uid: r.get(7),
+            gid: r.get(8),
+            mtime: r.get(9),
+            atime: r.get(10),
+            ctime: r.get(11),
+            ino: r.get::<_, Option<i64>>(12).unwrap_or(0),
+        })
+        .collect();
+    Ok(rows)
+}
+
+/// `parent id -> row indices`, exactly like the file arm's `graft_children`, so
+/// a directory can be walked into its subtree without re-querying the source.
+fn graft_children(rows: &[GraftPgRow]) -> HashMap<i64, Vec<usize>> {
+    let mut m: HashMap<i64, Vec<usize>> = HashMap::new();
+    for (i, r) in rows.iter().enumerate() {
+        if let Some(p) = r.parent_id {
+            m.entry(p).or_default().push(i);
+        }
+    }
+    m
+}
+
+/// Resolve a plan path (`a/b/c`) against the source rows. `None` means the
+/// path does not exist in that tree — the caller names the view in the error.
+fn graft_resolve(
+    rows: &[GraftPgRow],
+    children: &HashMap<i64, Vec<usize>>,
+    root: i64,
+    path: &str,
+) -> Option<usize> {
+    let mut parent = root;
+    let mut cur: Option<usize> = None;
+    for comp in path.split('/') {
+        let idx = *children.get(&parent)?.iter().find(|&&k| rows[k].name == comp)?;
+        parent = rows[idx].id;
+        cur = Some(idx);
+    }
+    cur
+}
+
+/// Render the internal write marker as the operator-facing text the file arm's
+/// `rusqlite` errors already produce ("serialization failure" / the mapped
+/// POSIX-visible message).
+fn write_err_str(e: WriteErr) -> String {
+    match e {
+        WriteErr::Serialization => "postgres serialization failure (retry)".to_string(),
+        WriteErr::Hard(me) => me.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod shard_tests {
+    use super::{control_store, route_multi, route_store, store_instances};
+
+    /// Same spec + same view must always pick the same instance (that equality
+    /// is what lets `view create`, every meta-server and cross-view ops agree
+    /// without a registry), and a realistic view set must actually spread.
+    #[test]
+    fn route_store_is_stable_and_spreads_views() {
+        let spec = "postgres://a@h/db1, postgres://a@h/db2,postgres://a@h/db3";
+        for v in ["alice", "bob", "carol", "dave", "erin"] {
+            assert_eq!(route_store(spec, v), route_store(spec, v));
+            assert!(route_store(spec, v).starts_with("postgres://a@h/db"));
+        }
+        let mut happy = 0;
+        for i in 0..64 {
+            let v = format!("team{i}");
+            if route_store(spec, &v) == "postgres://a@h/db1" {
+                happy += 1;
+            }
+        }
+        assert!(happy > 8 && happy < 40, "lopsided spread: {happy}/64 on db1");
+    }
+
+    /// A single URI must come back verbatim — the unimplemented (one-instance)
+    /// deployment keeps byte-identical behaviour, whitespace included is
+    /// trimmed so `--meta-store " uri "` still connects.
+    #[test]
+    fn route_store_passes_a_single_uri_through() {
+        assert_eq!(route_store("postgres://a@h/db", "alice"), "postgres://a@h/db");
+        assert_eq!(route_store(" postgres://a@h/db ", "alice"), "postgres://a@h/db");
+        assert_eq!(route_store("", "alice"), "");
+    }
+
+    /// The control plane is pinned to the first instance of a sharded spec.
+    #[test]
+    fn control_store_pins_the_first_instance() {
+        assert_eq!(control_store("postgres://a@h/db1,postgres://a@h/db2"), "postgres://a@h/db1");
+        assert_eq!(control_store("postgres://a@h/db1"), "postgres://a@h/db1");
+    }
+
+    /// A fork/graft pair may only run when both names hash to the SAME
+    /// instance (one connection cannot span two databases); the error names the
+    /// split instead of connecting to the wrong server.
+    #[test]
+    fn route_multi_requires_one_instance_per_pair() {
+        let spec = "postgres://a@h/db1,postgres://a@h/db2";
+        // Same view twice is trivially one instance.
+        assert_eq!(route_multi(spec, &["x", "x"]).unwrap(), route_store(spec, "x"));
+        // Find a pair that the hash actually splits, then require a refusal.
+        let mut split = None;
+        for i in 0..64 {
+            for j in 0..64 {
+                let (a, b) = (format!("v{i}"), format!("v{j}"));
+                if route_store(spec, &a) != route_store(spec, &b) {
+                    split = Some((a, b));
+                    break;
+                }
+            }
+            if split.is_some() {
+                break;
+            }
+        }
+        let (a, b) = split.expect("64 names must not all hash to one instance");
+        let err = route_multi(spec, &[&a, &b]).unwrap_err();
+        assert!(err.contains("different PostgreSQL instances"), "{err}");
+        // ... and a same-instance pair is accepted and yields that URI.
+        let mut same = None;
+        for i in 0..64 {
+            if route_store(spec, &format!("v{i}")) == route_store(spec, &a) {
+                same = Some(format!("v{i}"));
+                break;
+            }
+        }
+        let s = same.expect("some name must share an instance with itself");
+        assert_eq!(route_multi(spec, &[&a, &s]).unwrap(), route_store(spec, &a));
+    }
+
+    /// Instances are split on commas and trimmed; blanks are never an instance.
+    #[test]
+    fn store_instances_skips_blanks() {
+        assert_eq!(store_instances("postgres://a/d1, ,postgres://a/d2 "), vec!["postgres://a/d1", "postgres://a/d2"]);
+        assert_eq!(store_instances(" postgres://a/d1 "), vec!["postgres://a/d1"]);
+        assert!(store_instances("").is_empty());
     }
 }
