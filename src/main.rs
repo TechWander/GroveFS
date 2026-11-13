@@ -2074,6 +2074,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 None => Arc::from(backend::open_local(&base)?),
             };
+            let meta_for_pool = meta_provider.clone();
             let fs = GroveFS::new(
                 meta_provider,
                 backend,
@@ -2143,6 +2144,15 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             };
             cfg.n_threads = if effective_threads > 1 { Some(effective_threads) } else { None };
             cfg.clone_fd = effective_threads > 1;
+            // Match the metadata read pool to the dispatch width: at most
+            // `effective_threads` requests are ever in flight, so a narrower pool
+            // makes every surplus read OPEN a SQLite connection on the spot. That
+            // was measured as the wall in front of parallel small-file creation
+            // (one view, 16 workers: 2.6k -> 6.3k files/s). The env knob still
+            // wins when set, so the pool stays tunable per deployment.
+            if std::env::var_os("GROVEFS_SQLITE_READ_POOL").is_none() {
+                meta_for_pool.set_read_pool(effective_threads.max(1) as usize);
+            }
             // Only print `base` when the mount actually reads/writes under it:
             // a fully remote mount (`--data-servers` + `--meta-server`) touches no local store
             // at all, so naming a base there would mislead (mirrors the

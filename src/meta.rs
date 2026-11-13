@@ -197,8 +197,26 @@ pub const REFS_DB: &str = "refs.db";
 /// The schema name every engine connection ATTACHes the ledger under.
 pub const REFS_SCHEMA: &str = "refs";
 
-/// Process-wide lock ordering for ledger writes (taken BEFORE the engine lock).
-/// implemented locally by [`MetaEngine`] (a direct per-view SQLite file) and
+/// One `CREATE` request in a batch (see [`MetaProvider::create_nodes_batch`]).
+///
+/// Borrowed, because the caller keeps the owned names in its queue and only
+/// lends them to the store for the duration of one commit — no copies on the
+/// hot path.
+#[derive(Clone, Copy)]
+pub struct NewNode<'a> {
+    pub parent: i64,
+    pub name: &'a str,
+    pub is_dir: bool,
+    pub data_ref: Option<&'a str>,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// One view's tree as the FUSE layer sees it: name/attribute/listing operations
+/// over a per-view directory tree.
+///
+/// Implemented locally by [`MetaEngine`] (a direct per-view SQLite file) and
 /// remotely by [`crate::remote::meta::RemoteMeta`] (TCP to a central
 /// `MetaServer`). The same FUSE code therefore drives either a view that lives
 /// only on one machine or a *single authoritative* view shared by many clients
@@ -307,6 +325,40 @@ pub trait MetaProvider: Send + Sync {
         // outcome (the caller reports ENOENT), not a provider failure.
         self.getattr(id).ok_or(MetaError::NotFound)
     }
+    /// Whether [`Self::create_nodes_batch`] really amortizes the commit.
+    ///
+    /// `GroveFS` groups concurrent `CREATE`s only when the store says yes: for a
+    /// store that would merely loop `create_node_with_attr`, grouping turns N
+    /// parallel commits into N *sequential* ones — strictly worse than letting
+    /// every FUSE worker pay its own.
+    fn supports_create_batch(&self) -> bool {
+        false
+    }
+    /// Create several nodes, returning one result per item in input order.
+    ///
+    /// The default keeps per-item semantics (one commit each). A store with a
+    /// local transaction overrides it so a burst of creates costs ONE commit
+    /// instead of one per file: with a single-writer + global-ledger-lock engine
+    /// that is the difference between a flat ~2k creates/s and a curve that
+    /// scales with the number of writers. A failed item must not fail its
+    /// siblings — the error stays in its own slot.
+    fn create_nodes_batch(&self, items: &[NewNode<'_>]) -> Vec<Result<NodeInfo, MetaError>> {
+        items
+            .iter()
+            .map(|it| {
+                self.create_node_with_attr(
+                    it.parent, it.name, it.is_dir, it.data_ref, it.mode, it.uid, it.gid,
+                )
+            })
+            .collect()
+    }
+    /// Size any warm read parallelism to `n` concurrent readers.
+    ///
+    /// Only the embedded SQLite engine has such a pool; remote/external stores
+    /// already fan out over their own connections, so the default is a no-op. A
+    /// mount calls this with its FUSE worker count, which is exactly the most
+    /// requests that can be in flight at once.
+    fn set_read_pool(&self, _n: usize) {}
     /// Same idea for symlinks: the reply needs the entry attributes and the
     /// remote provider can fetch them without a second trip.
     fn create_symlink_with_attr(

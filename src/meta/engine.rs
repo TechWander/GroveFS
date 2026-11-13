@@ -1398,6 +1398,63 @@ fn now() -> i64 {
         .unwrap_or(0)
 }
 
+/// Insert one node row inside an already-open transaction, keeping the inode
+/// bookkeeping and the cross-view ledger in step with it.
+///
+/// Split out of `MetaEngine::insert` so a single-row create and a batched
+/// [`MetaEngine::create_nodes_batch`] share one implementation (and therefore
+/// one set of semantics: `ino = rowid`, ledger hold only on the view's FIRST
+/// name for a `data_ref`, constraint violations surface as `Exists`).
+#[allow(clippy::too_many_arguments)]
+fn insert_row(
+    tx: &rusqlite::Transaction<'_>,
+    parent: i64,
+    name: &str,
+    is_dir: bool,
+    data_ref: Option<&str>,
+    link_target: Option<&str>,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    t: i64,
+) -> Result<i64, MetaError> {
+    // Is this the view's FIRST name for the key (count before the INSERT)?
+    // Only then does the cross-view ledger take a new hold.
+    let first_name = data_ref
+        .map(|dr| {
+            tx.query_row(
+                "SELECT COUNT(*) FROM node WHERE data_ref=?1",
+                params![dr],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+                == 0
+        })
+        .unwrap_or(false);
+    tx.execute(
+        "INSERT INTO node (parent_id,name,is_dir,data_ref,link_target,mode,uid,gid,mtime,atime,ctime)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?9)",
+        params![parent, name, is_dir as i64, data_ref, link_target, mode, uid, gid, t],
+    )
+    .map_err(|e| match e {
+        rusqlite::Error::SqliteFailure(f, _)
+            if f.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            MetaError::Exists
+        }
+        other => MetaError::Db(other.to_string()),
+    })?;
+    let rowid = tx.last_insert_rowid();
+    // A brand-new name owns a fresh inode: ino == its own row id.
+    tx.execute("UPDATE node SET ino=?1 WHERE id=?1", params![rowid])?;
+    if first_name {
+        if let Some(dr) = data_ref {
+            ledger_add(tx, dr)?;
+        }
+    }
+    Ok(rowid)
+}
+
 pub struct MetaEngine {
     // A single connection, serialized behind a fast parking_lot mutex. The fuser
     // high-level session is already single-threaded, so this lock mainly guards
@@ -1412,6 +1469,13 @@ pub struct MetaEngine {
     /// SELECT) so concurrent metadata reads fan out instead of serializing
     /// behind the single writer's `conn` mutex.
     read_pool: parking_lot::Mutex<Vec<Connection>>,
+    /// How many connections [`Self::read_pool`] may hold. Starts at
+    /// [`read_pool_size`] and is raised by [`Self::set_read_pool_size`] so an
+    /// embedded mount can size the pool to its FUSE worker count: at most that
+    /// many requests are ever served at once, and a pool undersized against the
+    /// workers makes every surplus read OPEN A CONNECTION on the spot — which
+    /// measured as the dominant cost of parallel create (2 ms reads).
+    pool_max: std::sync::atomic::AtomicUsize,
     /// DB path, kept so the pool can open extra read connections when drained.
     path: std::path::PathBuf,
     /// Present only on a *writable* engine: the shutdown handle for this view's
@@ -1528,7 +1592,7 @@ impl Drop for ReadGuard<'_> {
     fn drop(&mut self) {
         if let Some(c) = self.conn.take() {
             let mut pool = self.eng.read_pool.lock();
-            if pool.len() < read_pool_size() {
+            if pool.len() < self.eng.pool_max() {
                 pool.push(c);
             }
         }
@@ -1623,6 +1687,7 @@ impl MetaEngine {
             return Ok(Self {
                 conn: parking_lot::Mutex::new(conn),
                 read_pool: parking_lot::Mutex::new(Vec::new()),
+                pool_max: std::sync::atomic::AtomicUsize::new(read_pool_size()),
                 path: path.to_path_buf(),
                 ckpt: None,
                 cursors: parking_lot::Mutex::new(HashMap::new()),
@@ -1717,6 +1782,7 @@ impl MetaEngine {
         Ok(Self {
             conn: parking_lot::Mutex::new(conn),
             read_pool: parking_lot::Mutex::new(pool),
+            pool_max: std::sync::atomic::AtomicUsize::new(read_pool_size()),
             path: path.to_path_buf(),
             ckpt,
             cursors: parking_lot::Mutex::new(HashMap::new()),
@@ -1822,6 +1888,32 @@ impl MetaEngine {
             conn: Some(c),
             eng: self,
         }
+    }
+
+    fn pool_max(&self) -> usize {
+        self.pool_max.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Size the warm read pool to the caller's real concurrency (a FUSE mount
+    /// passes its worker count). Raising it warms the missing connections right
+    /// away so the first parallel burst does not pay an open per surplus read.
+    /// Lowering it only shrinks what [`ReadGuard`] will keep; surplus handles
+    /// are closed as they are returned. `n = 0` turns pooling off entirely.
+    pub fn set_read_pool_size(&self, n: usize) {
+        let n = n.min(64);
+        self.pool_max
+            .store(n, std::sync::atomic::Ordering::Relaxed);
+        let mut pool = self.read_pool.lock();
+        while pool.len() < n {
+            match Connection::open(&self.path) {
+                Ok(rc) => {
+                    apply_read_pragmas(&rc);
+                    pool.push(rc);
+                }
+                Err(_) => break,
+            }
+        }
+        pool.truncate(n);
     }
 
     /// Resolve (parent, name) -> node. This is the FUSE `lookup` hot path.
@@ -2028,43 +2120,59 @@ impl MetaEngine {
             // open's back-fill. A failed INSERT (constraint) rolls the tx back and
             // still surfaces as Exists; the UPDATE's error is propagated, not swallowed.
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            // Is this the view's FIRST name for the key (count before the INSERT)?
-            // Only then does the cross-view ledger take a new hold.
-            let first_name = data_ref
-                .map(|dr| {
-                    tx.query_row(
-                        "SELECT COUNT(*) FROM node WHERE data_ref=?1",
-                        params![dr],
-                        |r| r.get::<_, i64>(0),
-                    )
-                    .unwrap_or(0)
-                        == 0
-                })
-                .unwrap_or(false);
-            tx.execute(
-            "INSERT INTO node (parent_id,name,is_dir,data_ref,link_target,mode,uid,gid,mtime,atime,ctime)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?9)",
-            params![parent, name, is_dir as i64, data_ref, link_target, mode, uid, gid, t],
-        )
-        .map_err(|e| match e {
-            rusqlite::Error::SqliteFailure(f, _)
-                if f.code == rusqlite::ErrorCode::ConstraintViolation =>
-            {
-                MetaError::Exists
-            }
-            other => MetaError::Db(other.to_string()),
-        })?;
-            let rowid = tx.last_insert_rowid();
-            // A brand-new name owns a fresh inode: ino == its own row id.
-            tx.execute("UPDATE node SET ino=?1 WHERE id=?1", params![rowid])?;
-            if first_name {
-                if let Some(dr) = data_ref {
-                    ledger_add(&tx, dr)?;
-                }
+            let id = insert_row(
+                &tx, parent, name, is_dir, data_ref, link_target, mode, uid, gid, t,
+            )?;
+            tx.commit()?;
+            Ok(id)
+        })
+    }
+
+    /// Create a burst of nodes in ONE IMMEDIATE transaction: one ledger-lock
+    /// acquisition and one commit for the whole group instead of one each.
+    ///
+    /// This is what makes a parallel build / `rsync` burst scale: the single
+    /// writer connection and the process-wide ledger lock serialize writes, so
+    /// without grouping every extra FUSE worker only queues behind the same
+    /// commit. A duplicate name keeps its own `Exists` and does not fail its
+    /// siblings (a constraint violation aborts the statement, not the tx).
+    pub fn create_nodes_batch(&self, items: &[NewNode<'_>]) -> Vec<Result<NodeInfo, MetaError>> {
+        let _t = stats::start(stats::Stage::MetaCreate);
+        self.drop_cursors();
+        let t = now();
+        let ids = with_ledger_serial(|| -> Result<Vec<Result<i64, MetaError>>, MetaError> {
+            let mut conn = self.conn.lock();
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let mut out = Vec::with_capacity(items.len());
+            for it in items {
+                out.push(insert_row(
+                    &tx,
+                    it.parent,
+                    it.name,
+                    it.is_dir,
+                    it.data_ref,
+                    None,
+                    it.mode,
+                    it.uid,
+                    it.gid,
+                    t,
+                ));
             }
             tx.commit()?;
-            Ok(rowid)
-        })
+            Ok(out)
+        });
+        match ids {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|r| r.and_then(|id| self.getattr(id).ok_or(MetaError::NotFound)))
+                .collect(),
+            Err(e) => {
+                let msg = e.to_string();
+                (0..items.len())
+                    .map(|_| Err(MetaError::Db(msg.clone())))
+                    .collect()
+            }
+        }
     }
 
     /// Create a hard link: a new directory entry that SHARES `src_ino`'s inode
@@ -2772,6 +2880,15 @@ impl MetaProvider for MetaEngine {
     ) -> Result<i64, MetaError> {
         MetaEngine::create_symlink(self, parent, name, target, uid, gid)
     }
+    fn supports_create_batch(&self) -> bool {
+        true
+    }
+    fn create_nodes_batch(&self, items: &[NewNode<'_>]) -> Vec<Result<NodeInfo, MetaError>> {
+        MetaEngine::create_nodes_batch(self, items)
+    }
+    fn set_read_pool(&self, n: usize) {
+        MetaEngine::set_read_pool_size(self, n)
+    }
     fn link_node(&self, src_ino: i64, new_parent: i64, new_name: &str) -> Result<i64, MetaError> {
         MetaEngine::link_node(self, src_ino, new_parent, new_name)
     }
@@ -2983,6 +3100,30 @@ impl MetaProvider for MetaStore {
             MetaStore::Pg(p) => p.readdir_page(parent, offset, limit),
             #[cfg(feature = "fdb")]
             MetaStore::Fdb(f) => f.readdir_page(parent, offset, limit),
+        }
+    }
+    fn create_nodes_batch(&self, items: &[NewNode<'_>]) -> Vec<Result<NodeInfo, MetaError>> {
+        match self {
+            MetaStore::Sqlite(m) => MetaProvider::create_nodes_batch(m, items),
+            MetaStore::Pg(p) => MetaProvider::create_nodes_batch(&**p, items),
+            #[cfg(feature = "fdb")]
+            MetaStore::Fdb(f) => MetaProvider::create_nodes_batch(&**f, items),
+        }
+    }
+    fn supports_create_batch(&self) -> bool {
+        match self {
+            MetaStore::Sqlite(m) => MetaProvider::supports_create_batch(m),
+            MetaStore::Pg(p) => MetaProvider::supports_create_batch(&**p),
+            #[cfg(feature = "fdb")]
+            MetaStore::Fdb(f) => MetaProvider::supports_create_batch(&**f),
+        }
+    }
+    fn set_read_pool(&self, n: usize) {
+        match self {
+            MetaStore::Sqlite(m) => MetaProvider::set_read_pool(m, n),
+            MetaStore::Pg(p) => MetaProvider::set_read_pool(&**p, n),
+            #[cfg(feature = "fdb")]
+            MetaStore::Fdb(f) => MetaProvider::set_read_pool(&**f, n),
         }
     }
     fn supports_paged_readdir(&self) -> bool {
@@ -3251,6 +3392,115 @@ mod tests {
             refs_sync, main_sync,
             "ledger must carry the same durability setting as the view db"
         );
+    }
+
+    /// A batch is one transaction, so every item in it lands: the ids differ,
+    /// each name resolves, and the namespace sees all of them at the same
+    /// instant (a reader never catches half a burst).
+    #[test]
+    fn create_nodes_batch_commits_every_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = MetaEngine::open(&dir.path().join("view.db")).unwrap();
+        let specs: Vec<NewNode<'_>> = (0..3)
+            .map(|i| NewNode {
+                parent: ROOT_INO,
+                name: ["a", "b", "c"][i],
+                is_dir: false,
+                data_ref: Some(["ka", "kb", "kc"][i]),
+                mode: 0o644,
+                uid: 1000,
+                gid: 1000,
+            })
+            .collect();
+        let out = e.create_nodes_batch(&specs);
+        assert_eq!(out.len(), 3);
+        let nodes: Vec<NodeInfo> = out.into_iter().map(|r| r.unwrap()).collect();
+        let ids: std::collections::HashSet<i64> = nodes.iter().map(|n| n.id).collect();
+        assert_eq!(ids.len(), 3, "each item owns a distinct inode");
+        for (name, n) in ["a", "b", "c"].iter().zip(&nodes) {
+            assert_eq!(e.lookup(ROOT_INO, name).unwrap().id, n.id);
+        }
+    }
+
+    /// A duplicate name inside a batch fails only its own statement: the
+    /// siblings still commit, and the write-ahead constraint error becomes the
+    /// per-item `Exists` the CREATE reply maps to EEXIST — not a dead batch.
+    #[test]
+    fn create_nodes_batch_isolates_a_duplicate_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = MetaEngine::open(&dir.path().join("view.db")).unwrap();
+        let specs = [
+            NewNode {
+                parent: ROOT_INO,
+                name: "x",
+                is_dir: false,
+                data_ref: Some("k1"),
+                mode: 0o644,
+                uid: 1000,
+                gid: 1000,
+            },
+            NewNode {
+                parent: ROOT_INO,
+                name: "x",
+                is_dir: false,
+                data_ref: Some("k2"),
+                mode: 0o644,
+                uid: 1000,
+                gid: 1000,
+            },
+            NewNode {
+                parent: ROOT_INO,
+                name: "y",
+                is_dir: false,
+                data_ref: Some("k3"),
+                mode: 0o644,
+                uid: 1000,
+                gid: 1000,
+            },
+        ];
+        let out = e.create_nodes_batch(&specs);
+        assert!(out[0].is_ok(), "first x wins");
+        assert!(matches!(out[1], Err(MetaError::Exists)), "second x is EEXIST");
+        assert!(out[2].is_ok(), "y must not be collateral damage");
+        assert_eq!(
+            e.lookup(ROOT_INO, "x").unwrap().data_ref.as_deref(),
+            Some("k1"),
+            "the surviving entry is the first one committed"
+        );
+    }
+
+    /// The ledger is booked per transaction, so a batch that shares one object
+    /// (a tree copy / hard-link storm carrying the same `data_ref`) must hold it
+    /// ONCE, not once per row — otherwise the refcount never returns to zero and
+    /// the blob is never collectable.
+    #[test]
+    fn create_nodes_batch_books_a_shared_data_ref_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = MetaEngine::open(&dir.path().join("view.db")).unwrap();
+        let specs: Vec<NewNode<'_>> = ["h1", "h2", "h3"]
+            .iter()
+            .map(|name| NewNode {
+                parent: ROOT_INO,
+                name,
+                is_dir: false,
+                data_ref: Some("shared"),
+                mode: 0o644,
+                uid: 1000,
+                gid: 1000,
+            })
+            .collect();
+        for r in e.create_nodes_batch(&specs) {
+            r.unwrap();
+        }
+        let conn = e.conn.lock();
+        let holders: i64 = conn
+            .query_row(
+                &format!("SELECT holders FROM {REFS_SCHEMA}.holders WHERE data_ref='shared'"),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(holders, 1, "one view-level hold for the shared object");
     }
 
     /// Renaming a directory over an EXISTING NON-EMPTY directory must fail
