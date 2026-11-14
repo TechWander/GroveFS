@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# GroveFS 文档口径检查 —— 改过 README.md / USAGE.md / docs.html 后跑一遍。
+# GroveFS 文档口径检查 —— 改过 README.md / README.en.md / USAGE.md / USAGE.en.md / docs.html 后跑一遍。
 # 用法: bash skills/grovefs-docs/scripts/doccheck.sh [仓库根目录]
 #   GROVEFS_BIN=/path/to/grovefs  指定用来跑 --help 的二进制(默认 target/release/grovefs)
 # 退出码: 0=干净; 1=有需处理的命中或结构错误。
@@ -7,7 +7,7 @@ set -uo pipefail
 
 # 用 readlink -f 解链:.qoder/skills/ 下是符号链,不解会算错仓库根
 ROOT="${1:-$(cd "$(dirname "$(readlink -f "$0")")/../../.." && pwd)}"
-DOCS=("$ROOT/README.md" "$ROOT/README.en.md" "$ROOT/USAGE.md" "$ROOT/docs.html")
+DOCS=("$ROOT/README.md" "$ROOT/README.en.md" "$ROOT/USAGE.md" "$ROOT/USAGE.en.md" "$ROOT/docs.html")
 BIN="${GROVEFS_BIN:-$ROOT/target/release/grovefs}"
 rc=0
 say() { printf '\n== %s ==\n' "$1"; }
@@ -133,7 +133,7 @@ if command -v git >/dev/null 2>&1 && git -C "$ROOT" rev-parse --git-dir >/dev/nu
   python3 - "$ROOT" <<'PY' || rc=1
 import subprocess, sys, re
 root = sys.argv[1]
-files = ["README.md", "README.en.md", "USAGE.md", "docs.html"]
+files = ["README.md", "README.en.md", "USAGE.md", "USAGE.en.md", "docs.html"]
 diff = subprocess.run(["git", "-C", root, "diff", "-U0", "--"] + files,
                       capture_output=True, text=True).stdout
 added = [l[1:] for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++")]
