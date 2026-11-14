@@ -1828,27 +1828,32 @@ impl fuser::Filesystem for GroveFS {
             reply.ok();
             return;
         }
-        let parent_ino = if ino == INodeNo::ROOT {
-            ino.0
-        } else {
-            node.parent_id as u64
-        };
-        let parent_attr = match self.meta.getattr(parent_ino as i64) {
-            Some(p) => self.build_attr(&p),
-            None => self_attr,
-        };
-        if skip <= 1
-            && reply.add(
+        // ".." occupies slot 1, so it is emitted only on the first two resume
+        // positions (`skip <= 1`); a continuation page (`skip >= 2`) has already
+        // returned it. Guard the whole block so those pages don't pay a
+        // `getattr(parent)` round-trip (two FDB hops) for an entry they won't
+        // add — otherwise a large directory leaks one parent fetch per page.
+        if skip <= 1 {
+            let parent_ino = if ino == INodeNo::ROOT {
+                ino.0
+            } else {
+                node.parent_id as u64
+            };
+            let parent_attr = match self.meta.getattr(parent_ino as i64) {
+                Some(p) => self.build_attr(&p),
+                None => self_attr,
+            };
+            if reply.add(
                 INodeNo(parent_ino),
                 2,
                 "..",
                 &ttl,
                 &parent_attr,
                 Generation(0),
-            )
-        {
-            reply.ok();
-            return;
+            ) {
+                reply.ok();
+                return;
+            }
         }
         // Children are streamed a SQL page at a time until the reply buffer
         // fills or the listing ends, so one kernel READDIRPLUS request costs
