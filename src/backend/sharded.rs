@@ -346,6 +346,18 @@ impl ShardedBackend {
         out
     }
 
+    /// Number of worker threads to fan a multi-chunk op out across. One per
+    /// chunk is ideal, but a huge fan-out (a large single I/O over a small
+    /// `--stripe-bytes`) must not spawn thousands of threads and hold one
+    /// in-flight `Vec<u8>` per chunk at once. Concurrency beyond the `n` member
+    /// servers buys nothing — ops to one server serialize on its socket — so the
+    /// ceiling scales with the member count and is capped by a fixed bound.
+    /// Small spans (the common FUSE read/write, ≤ a few chunks) are unchanged:
+    /// the result equals `span` whenever `span` fits the cap.
+    fn fanout(&self, n: usize, span: usize) -> usize {
+        span.min((n * 8).clamp(16, 64))
+    }
+
     /// Restore the contiguity invariant `read`/`len` rely on (only the *trailing*
     /// chunk may be short or absent) before a write lands in chunk `i0`.
     ///
@@ -568,14 +580,25 @@ impl StorageBackend for ShardedBackend {
             }
         } else {
             let servers = &self.servers;
+            let n = l.n.min(servers.len());
             let errs = std::sync::Mutex::new(None::<io::Error>);
+            let collected = std::sync::Mutex::new(Vec::<(u64, Vec<u8>)>::with_capacity(ranges.len()));
+            let cursor = std::sync::atomic::AtomicUsize::new(0);
+            let base = l.base.as_str();
+            let ranges_ref = &ranges;
+            let workers = self.fanout(n, ranges.len());
             thread::scope(|scope| {
-                let mut handles = Vec::with_capacity(ranges.len());
-                for (i, sub_off, sub_len) in ranges {
-                    let errs = &errs;
-                    let base = l.base.clone();
-                    let n = l.n.min(servers.len());
-                    handles.push(scope.spawn(move || -> (u64, Vec<u8>) {
+                // Fixed pool; each worker pulls chunk indices off the shared
+                // cursor until exhausted, so threads = `workers`, not `ranges.len()`.
+                for _ in 0..workers {
+                    let (errs, collected, cursor, ranges_ref, servers, base) =
+                        (&errs, &collected, &cursor, ranges_ref, servers, base);
+                    scope.spawn(move || loop {
+                        let k = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if k >= ranges_ref.len() {
+                            break;
+                        }
+                        let (i, sub_off, sub_len) = ranges_ref[k];
                         let idx = i as usize % n;
                         let ck = format!("{}#{}", base, i);
                         let rd = {
@@ -583,20 +606,18 @@ impl StorageBackend for ShardedBackend {
                             servers[idx].read(&ck, sub_off, sub_len)
                         };
                         match rd {
-                            Ok(buf) => (i, buf),
-                            Err(e) if e.kind() == io::ErrorKind::NotFound => (i, Vec::new()),
+                            Ok(buf) => collected.lock().unwrap().push((i, buf)),
+                            // Trailing / readahead-past-EOF chunk: read as EOF,
+                            // contribute nothing (an empty chunk adds no bytes).
+                            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                             Err(e) => {
                                 let mut g = errs.lock().unwrap();
                                 if g.is_none() {
                                     *g = Some(e);
                                 }
-                                (i, Vec::new())
                             }
                         }
-                    }));
-                }
-                for h in handles {
-                    results.push(h.join().unwrap());
+                    });
                 }
             });
             // Scope the guard so it drops before `errs` goes out of life here.
@@ -604,6 +625,7 @@ impl StorageBackend for ShardedBackend {
             if let Some(e) = first_err {
                 return Err(e);
             }
+            results = collected.into_inner().unwrap();
         }
         results.sort_by_key(|(i, _)| *i);
         let out = {
@@ -652,22 +674,30 @@ impl StorageBackend for ShardedBackend {
             return Ok(written);
         }
         let servers = &self.servers;
+        let n = l.n.min(servers.len());
         let total = std::sync::atomic::AtomicUsize::new(0);
         let errs = std::sync::Mutex::new(None::<io::Error>);
+        let cursor = std::sync::atomic::AtomicUsize::new(0);
+        let stripe = l.stripe;
+        let base = l.base.as_str();
+        let ranges_ref = &ranges;
+        let workers = self.fanout(n, ranges.len());
         thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(ranges.len());
-            for (i, sub_off, sub_len) in ranges {
-                let total = &total;
-                let errs = &errs;
-                let base = l.base.clone();
-                let n = l.n.min(servers.len());
-                handles.push(scope.spawn(move || {
+            for _ in 0..workers {
+                let (total, errs, cursor, ranges_ref, servers, base) =
+                    (&total, &errs, &cursor, ranges_ref, servers, base);
+                scope.spawn(move || loop {
+                    let k = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if k >= ranges_ref.len() {
+                        break;
+                    }
+                    let (i, sub_off, sub_len) = ranges_ref[k];
                     let idx = i as usize % n;
                     let ck = format!("{}#{}", base, i);
                     // Slice of `data` belonging to this chunk: its logical start
                     // is `i*stripe + sub_off`, so the data offset is that minus
                     // the overall write offset.
-                    let dstart = (i * l.stripe + sub_off - offset) as usize;
+                    let dstart = (i * stripe + sub_off - offset) as usize;
                     let sub = &data[dstart..dstart + sub_len];
                     let r = {
                         let _t = stats::start(stats::Stage::IoShardServerOp);
@@ -684,10 +714,7 @@ impl StorageBackend for ShardedBackend {
                             }
                         }
                     }
-                }));
-            }
-            for h in handles {
-                let _ = h.join();
+                });
             }
         });
         let first_err = { errs.lock().unwrap().take() };
@@ -711,11 +738,30 @@ impl StorageBackend for ShardedBackend {
             None => return self.servers[0].fsync(key),
         };
         let size = self.len(key)?;
-        let chunks = size.div_ceil(l.stripe).max(1);
-        for i in 0..chunks {
-            let (s, ck) = self.chunk(&l, i);
-            let _ = self.servers[s].fsync(&ck); // best-effort: a missing chunk has nothing to flush
-        }
+        let chunks = (size.div_ceil(l.stripe).max(1)) as usize;
+        // Each chunk flushes independently and errors are deliberately ignored
+        // (a missing chunk has nothing to flush), so fan the remote flushes out
+        // over the same bounded pool `read`/`write` use instead of issuing
+        // `chunks` serial round-trips. A FUSE flush/close of a large or small-
+        // stripe file previously paid one blocking RTT per chunk back-to-back.
+        let servers = &self.servers;
+        let n = l.n.min(servers.len());
+        let base = l.base.as_str();
+        let cursor = std::sync::atomic::AtomicUsize::new(0);
+        let workers = self.fanout(n, chunks);
+        thread::scope(|scope| {
+            for _ in 0..workers {
+                let (cursor, servers, base) = (&cursor, servers, base);
+                scope.spawn(move || loop {
+                    let k = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if k >= chunks {
+                        break;
+                    }
+                    let ck = format!("{}#{}", base, k as u64);
+                    let _ = servers[k % n].fsync(&ck); // best-effort
+                });
+            }
+        });
         Ok(())
     }
 
@@ -765,11 +811,44 @@ impl StorageBackend for ShardedBackend {
             }
         };
         // Bring chunks 0..=last_chunk to their target sizes (sparse growth is
-        // free; shrinking just trims the tail).
-        for i in 0..=last_chunk {
-            let want = if i == last_chunk { last_len } else { l.stripe };
-            let (s, ck) = self.chunk(&l, i);
-            self.servers[s].truncate(&ck, want)?;
+        // free; shrinking just trims the tail). Each is an independent positional
+        // truncate, so fan them over the bounded pool rather than issuing one
+        // remote round-trip per chunk serially. The beyond-the-end removal walk
+        // below stays serial: it stops at the first absent chunk (a contiguity
+        // dependency, not an independent op).
+        {
+            let servers = &self.servers;
+            let n = l.n.min(servers.len());
+            let base = l.base.as_str();
+            let stripe = l.stripe;
+            let count = (last_chunk + 1) as usize;
+            let cursor = std::sync::atomic::AtomicUsize::new(0);
+            let errs = std::sync::Mutex::new(None::<io::Error>);
+            let workers = self.fanout(n, count);
+            thread::scope(|scope| {
+                for _ in 0..workers {
+                    let (cursor, errs, servers, base) = (&cursor, &errs, servers, base);
+                    scope.spawn(move || loop {
+                        let k = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if k >= count {
+                            break;
+                        }
+                        let i = k as u64;
+                        let want = if i == last_chunk { last_len } else { stripe };
+                        let ck = format!("{}#{}", base, i);
+                        if let Err(e) = servers[k % n].truncate(&ck, want) {
+                            let mut g = errs.lock().unwrap();
+                            if g.is_none() {
+                                *g = Some(e);
+                            }
+                        }
+                    });
+                }
+            });
+            let first_err = errs.lock().unwrap().take();
+            if let Some(e) = first_err {
+                return Err(e);
+            }
         }
         // Remove any chunk beyond the new end (old file was longer).
         let mut i = last_chunk + 1;
@@ -1089,6 +1168,34 @@ mod tests {
         assert_eq!(slice, &data[4000..4500]);
         sb.remove(&key).unwrap();
         assert_eq!(sb.len(&key).unwrap(), 0);
+        for r in roots {
+            let _ = std::fs::remove_dir_all(r);
+        }
+    }
+
+    /// A tiny stripe makes one I/O span far more chunks than the fan-out cap,
+    /// exercising the bounded worker-pool (each worker pulls many chunks off the
+    /// shared cursor). Guards that capping thread count did not change results:
+    /// byte totals, the sort-by-chunk-index in `read`, and straddling partial
+    /// reads must match the one-thread-per-chunk path exactly.
+    #[test]
+    fn large_fanout_bounded_workers_reads_back() {
+        let roots = tmp_root("fanout", 2);
+        let stripe = 64u64;
+        let sb = ShardedBackend::new(members(&roots), stripe);
+        let key = sb.new_key("big");
+        sb.create(&key).unwrap();
+        let data: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect(); // 64 chunks
+        // The whole span must be routed through a CAPPED pool, not 64 threads.
+        let workers = sb.fanout(2, data.len() / stripe as usize);
+        assert!(workers > 0 && workers < 64, "fan-out must be capped, got {workers}");
+        let w = sb.write(&key, 0, &data).unwrap();
+        assert_eq!(w, data.len());
+        assert_eq!(sb.len(&key).unwrap(), data.len() as u64);
+        assert_eq!(sb.read(&key, 0, data.len()).unwrap(), data, "capped read must reorder correctly");
+        // a straddling partial read landing mid-chunk across the capped range
+        assert_eq!(sb.read(&key, 3000, 500).unwrap(), &data[3000..3500]);
+        sb.remove(&key).unwrap();
         for r in roots {
             let _ = std::fs::remove_dir_all(r);
         }
