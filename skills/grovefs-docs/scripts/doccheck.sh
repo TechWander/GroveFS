@@ -7,7 +7,7 @@ set -uo pipefail
 
 # 用 readlink -f 解链:.qoder/skills/ 下是符号链,不解会算错仓库根
 ROOT="${1:-$(cd "$(dirname "$(readlink -f "$0")")/../../.." && pwd)}"
-DOCS=("$ROOT/README.md" "$ROOT/README.en.md" "$ROOT/USAGE.md" "$ROOT/USAGE.en.md" "$ROOT/docs.html")
+DOCS=("$ROOT/README.md" "$ROOT/README.en.md" "$ROOT/USAGE.md" "$ROOT/USAGE.en.md" "$ROOT/docs/docs.html")
 BIN="${GROVEFS_BIN:-$ROOT/target/release/grovefs}"
 rc=0
 say() { printf '\n== %s ==\n' "$1"; }
@@ -105,7 +105,7 @@ fi
 
 # ---------- 3. docs.html 结构 ----------
 say "3. docs.html 标签闭合"
-python3 - "$ROOT/docs.html" <<'PY' || rc=1
+python3 - "$ROOT/docs/docs.html" <<'PY' || rc=1
 import sys, html.parser
 VOID = {"area","base","br","col","embed","hr","img","input","link","meta","param","source","track","wbr"}
 class P(html.parser.HTMLParser):
@@ -133,7 +133,7 @@ if command -v git >/dev/null 2>&1 && git -C "$ROOT" rev-parse --git-dir >/dev/nu
   python3 - "$ROOT" <<'PY' || rc=1
 import subprocess, sys, re
 root = sys.argv[1]
-files = ["README.md", "README.en.md", "USAGE.md", "USAGE.en.md", "docs.html"]
+files = ["README.md", "README.en.md", "USAGE.md", "USAGE.en.md", "docs/docs.html"]
 diff = subprocess.run(["git", "-C", root, "diff", "-U0", "--"] + files,
                       capture_output=True, text=True).stdout
 added = [l[1:] for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++")]

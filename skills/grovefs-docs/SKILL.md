@@ -1,6 +1,6 @@
 ---
 name: grovefs-docs
-description: Keeps GroveFS documentation (README.md, README.en.md, USAGE.md, USAGE.en.md, docs.html) stating only current-version behavior — no migration history, no removed flags/env vars, no before/after baselines, no "newly added / now supports / identical to the old / falls back to old behavior" change narration. Use when editing, rewriting, or reviewing these files, when auditing whether docs match `grovefs --help`, or when asked to "按最新版本写文档" / "排查文档里的历史叙述" / "参数对账".
+description: Keeps GroveFS documentation (README.md, README.en.md, USAGE.md, USAGE.en.md, docs/docs.html) stating only current-version behavior — no migration history, no removed flags/env vars, no before/after baselines, no "newly added / now supports / identical to the old / falls back to old behavior" change narration. Use when editing, rewriting, or reviewing these files, when auditing whether docs match `grovefs --help`, or when asked to "按最新版本写文档" / "排查文档里的历史叙述" / "参数对账".
 ---
 
 # GroveFS 文档口径（只写当前版本）
@@ -11,7 +11,7 @@ description: Keeps GroveFS documentation (README.md, README.en.md, USAGE.md, USA
 - `README.en.md` — 英文简介（`README.md` 的对译，口径段在末段）
 - `USAGE.md` — 使用说明，§14.4 末尾写有口径原文
 - `USAGE.en.md` — 使用说明英文版（`USAGE.md` 的对译，§14.4 末尾同样写有口径原文；代码块与真实回显逐字保留）
-- `docs.html` — 单文件手册，§21 末尾写有口径原文（两条 `.ok` div）
+- `docs/docs.html` — 单文件手册，§21 末尾写有口径原文（两条 `.ok` div）
 
 口径原文本身在每份文档里各写了一次（README 与 USAGE 各有中英两份都要改），改口径要**各处同步**。
 
@@ -34,10 +34,10 @@ description: Keeps GroveFS documentation (README.md, README.en.md, USAGE.md, USA
 1. 先扫再改，不要凭印象。按这四族关键词分别定位（终端在 CJK 换行处会插假空格，**别把显示出来的空格抄进锚点**）：
 
    ```bash
-   cd grovefs && grep -nE '已从代码|已移除|不再提供|strict-view|ALLOW_LAZY_VIEW' README.md README.en.md USAGE.md USAGE.en.md docs.html
-   grep -nE '改造前|旧版|旧行为|退回旧|与旧.*一致' README.md README.en.md USAGE.md USAGE.en.md docs.html
-   grep -nE '新增了|新增的|现已|已落地|已经落地|now also|gained' README.md README.en.md USAGE.md USAGE.en.md docs.html
-   grep -nE '[0-9]+(\.[0-9]+)?s? *(→|->|降到)|基线' README.md README.en.md USAGE.md USAGE.en.md docs.html   # 历史基线数字
+   cd grovefs && grep -nE '已从代码|已移除|不再提供|strict-view|ALLOW_LAZY_VIEW' README.md README.en.md USAGE.md USAGE.en.md docs/docs.html
+   grep -nE '改造前|旧版|旧行为|退回旧|与旧.*一致' README.md README.en.md USAGE.md USAGE.en.md docs/docs.html
+   grep -nE '新增了|新增的|现已|已落地|已经落地|now also|gained' README.md README.en.md USAGE.md USAGE.en.md docs/docs.html
+   grep -nE '[0-9]+(\.[0-9]+)?s? *(→|->|降到)|基线' README.md README.en.md USAGE.md USAGE.en.md docs/docs.html   # 历史基线数字
    ```
 
 2. 改前先核实语义，别用印象填空。行为表述以源码为准（例：空账本的含义查 `src/meta.rs` 模块注释，分页能力查 `MetaProvider::supports_paged_readdir()`）。
@@ -48,7 +48,7 @@ description: Keeps GroveFS documentation (README.md, README.en.md, USAGE.md, USA
    bash skills/grovefs-docs/scripts/doccheck.sh
    ```
 
-   四项：变更史扫描、参数对账（文档 `--xxx` ↔ `grovefs --help` 真实参数差集）、docs.html 标签闭合、新增用字校验（抓自己打错的汉字）。退出码 0 才算收工。
+   四项：变更史扫描、参数对账（文档 `--xxx` ↔ `grovefs --help` 真实参数差集）、docs/docs.html 标签闭合、新增用字校验（抓自己打错的汉字）。退出码 0 才算收工。
 
 ## Repo Wiki（`.qoder/repowiki/`）同步
 
