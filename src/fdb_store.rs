@@ -4004,6 +4004,18 @@ impl FdbStore {
         }
     }
 
+    /// The `NodeInfo` a create reply needs, assembled in memory from the row just
+    /// written — the read-free counterpart of [`Self::info`] for a brand-new
+    /// inode. A fresh directory owns no children (`count` 0) and a fresh file or
+    /// symlink has exactly the one holder name the create wrote (`count` 1), so
+    /// the range count `info` would pay for is already known; every other field
+    /// is the record's own. This is the correctness contract behind the
+    /// single-transaction `create_node_with_attr` / `create_symlink_with_attr`.
+    fn fresh_info(parent: i64, name: &str, rec: &Rec) -> NodeInfo {
+        let count = if rec.is_dir { 0 } else { 1 };
+        Self::entry_info(parent, name, rec, count)
+    }
+
     pub fn lookup(&self, parent: i64, name: &str) -> Option<NodeInfo> {
         self.touch();
         // One point read for the record; nlink then costs its own range count.
@@ -4176,6 +4188,50 @@ impl FdbStore {
         uid: u32,
         gid: u32,
     ) -> Result<i64, MetaError> {
+        self.create_node_rec(parent, name, is_dir, data_ref, mode, uid, gid)
+            .map(|r| r.id)
+    }
+
+    /// Create and return the full `NodeInfo` in ONE committed transaction.
+    ///
+    /// The trait default runs `create_node` and then a separate `getattr`; on a
+    /// network store that follow-up is a whole extra snapshot-read round trip —
+    /// precisely the cost [`MetaProvider::create_node_with_attr`] documents for
+    /// remote clients. A brand-new inode's `nlink`/`size` are deterministic, so
+    /// [`Self::fresh_info`] builds the reply from the row already in hand and no
+    /// read is needed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_node_with_attr(
+        &self,
+        parent: i64,
+        name: &str,
+        is_dir: bool,
+        data_ref: Option<&str>,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<NodeInfo, MetaError> {
+        let rec = self.create_node_rec(parent, name, is_dir, data_ref, mode, uid, gid)?;
+        Ok(Self::fresh_info(parent, name, &rec))
+    }
+
+    /// The single-transaction create shared by [`Self::create_node`] and
+    /// [`Self::create_node_with_attr`]. Returns the row as written (carrying the
+    /// exact `now` it stored) so a caller needing the attributes never pays a
+    /// second round trip. Write set matches §5's ceiling: the name record, the
+    /// `by_id` and `ino` pointers, one `holder`/`dir_entry`, plus a `dataref` key
+    /// and a first-holder ledger bump when a `data_ref` is supplied.
+    #[allow(clippy::too_many_arguments)]
+    fn create_node_rec(
+        &self,
+        parent: i64,
+        name: &str,
+        is_dir: bool,
+        data_ref: Option<&str>,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Rec, MetaError> {
         self.touch();
         if name.is_empty() || name.contains('/') {
             return Err(MetaError::Db("create_node: empty or slashed name".to_string()));
@@ -4184,6 +4240,9 @@ impl FdbStore {
         let keys = self.keys.clone();
         let name_owned = name.to_string();
         let ref_owned = data_ref.map(|s| s.to_string());
+        // One timestamp for the whole row: mtime/atime/ctime must agree, and a
+        // serialization retry spanning a second boundary must not drift them.
+        let now = secs_now();
         let out = self.with_serial_retry(move |tx| {
             let nk = keys.name(parent, &name_owned);
             if tx.get(&nk)?.is_some() {
@@ -4205,53 +4264,42 @@ impl FdbStore {
             // is decided during path resolution above the store. Adding a check
             // would give FDB an error surface the two backends it must match do not
             // have.
-
-            let mut wrote = 0usize; // §5 write-set accounting, asserted in tests
-            tx.set(
-                &nk,
-                &Rec {
-                    id,
-                    is_dir,
-                    data_ref: ref_owned.clone(),
-                    link_target: None,
-                    mode,
-                    uid,
-                    gid,
-                    mtime: secs_now(),
-                    atime: secs_now(),
-                    ctime: secs_now(),
-                    ino: id,
-                }
-                .pack(),
-            );
-            wrote += 1;
+            let rec = Rec {
+                id,
+                is_dir,
+                data_ref: ref_owned.clone(),
+                link_target: None,
+                mode,
+                uid,
+                gid,
+                mtime: now,
+                atime: now,
+                ctime: now,
+                ino: id,
+            };
+            tx.set(&nk, &rec.pack());
             // Secondary keys, one per index the SQL backends carry.
             tx.set(&keys.by_id(id), &(parent, name_owned.as_str()).pack_to_vec());
             tx.set(&keys.ino(id), &(parent, name_owned.as_str()).pack_to_vec());
-            wrote += 2;
             if is_dir {
                 tx.set(&keys.dir_entry(parent, &name_owned), b"");
-                wrote += 1;
             } else {
                 tx.set(&keys.holder(id, parent, &name_owned), b"");
-                wrote += 1;
             }
             if let Some(dr) = &ref_owned {
                 tx.set(&keys.dataref(dr, parent, &name_owned), b"");
-                wrote += 1;
                 // 0 -> 1 first holder in this view books the shared ledger, in the
                 // SAME transaction (pg_store.rs:847-850 / §3.6).
                 if tx.count_range(&keys.dataref_prefix_of(dr))? == 1 {
                     tx.bump(&keys.ledger(dr), 1)?;
-                    wrote += 1;
                 }
             }
-            Ok(wrote)
+            Ok(rec)
         });
         match out {
-            Ok(_) => {
+            Ok(rec) => {
                 self.drop_cursors();
-                Ok(id)
+                Ok(rec)
             }
             Err(e) => Err(e),
         }
@@ -4265,6 +4313,33 @@ impl FdbStore {
         uid: u32,
         gid: u32,
     ) -> Result<i64, MetaError> {
+        self.create_symlink_rec(parent, name, target, uid, gid)
+            .map(|r| r.id)
+    }
+
+    /// Single-transaction symlink create that also returns the entry attributes,
+    /// sparing the trait default's follow-up `getattr` round trip. See
+    /// [`Self::create_node_with_attr`] for why a fresh node needs no read.
+    pub fn create_symlink_with_attr(
+        &self,
+        parent: i64,
+        name: &str,
+        target: &str,
+        uid: u32,
+        gid: u32,
+    ) -> Result<NodeInfo, MetaError> {
+        let rec = self.create_symlink_rec(parent, name, target, uid, gid)?;
+        Ok(Self::fresh_info(parent, name, &rec))
+    }
+
+    fn create_symlink_rec(
+        &self,
+        parent: i64,
+        name: &str,
+        target: &str,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Rec, MetaError> {
         self.touch();
         if name.is_empty() || name.contains('/') || target.is_empty() {
             return Err(MetaError::Db("create_symlink: bad name or target".to_string()));
@@ -4273,7 +4348,8 @@ impl FdbStore {
         let keys = self.keys.clone();
         let n = name.to_string();
         let t = target.to_string();
-        self.with_serial_retry(move |tx| {
+        let now = secs_now();
+        let out = self.with_serial_retry(move |tx| {
             let nk = keys.name(parent, &n);
             if tx.get(&nk)?.is_some() {
                 return Err(MetaError::Exists.into());
@@ -4288,33 +4364,34 @@ impl FdbStore {
             if praw.is_none() {
                 return Err(TxErr::Hard(MetaError::NotFound));
             }
-            let now = secs_now();
-            tx.set(
-                &nk,
-                &Rec {
-                    id,
-                    is_dir: false,
-                    data_ref: None,
-                    link_target: Some(t.clone()),
-                    // Symlinks carry mode 0777 in the other backends; the caller
-                    // never chmods through a symlink (POSIX follows it).
-                    mode: 0o777,
-                    uid,
-                    gid,
-                    mtime: now,
-                    atime: now,
-                    ctime: now,
-                    ino: id,
-                }
-                .pack(),
-            );
+            let rec = Rec {
+                id,
+                is_dir: false,
+                data_ref: None,
+                link_target: Some(t.clone()),
+                // Symlinks carry mode 0777 in the other backends; the caller
+                // never chmods through a symlink (POSIX follows it).
+                mode: 0o777,
+                uid,
+                gid,
+                mtime: now,
+                atime: now,
+                ctime: now,
+                ino: id,
+            };
+            tx.set(&nk, &rec.pack());
             tx.set(&keys.by_id(id), &(parent, n.as_str()).pack_to_vec());
             tx.set(&keys.ino(id), &(parent, n.as_str()).pack_to_vec());
             tx.set(&keys.holder(id, parent, &n), b"");
-            Ok(())
-        })?;
-        self.drop_cursors();
-        Ok(id)
+            Ok(rec)
+        });
+        match out {
+            Ok(rec) => {
+                self.drop_cursors();
+                Ok(rec)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// One unlink = one transaction, ending in "is this content key now unheld".
@@ -6479,6 +6556,29 @@ impl MetaProvider for FdbStore {
     ) -> Result<i64, MetaError> {
         self.create_symlink(parent, name, target, uid, gid)
     }
+    #[allow(clippy::too_many_arguments)]
+    fn create_node_with_attr(
+        &self,
+        parent: i64,
+        name: &str,
+        is_dir: bool,
+        data_ref: Option<&str>,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<NodeInfo, MetaError> {
+        self.create_node_with_attr(parent, name, is_dir, data_ref, mode, uid, gid)
+    }
+    fn create_symlink_with_attr(
+        &self,
+        parent: i64,
+        name: &str,
+        target: &str,
+        uid: u32,
+        gid: u32,
+    ) -> Result<NodeInfo, MetaError> {
+        self.create_symlink_with_attr(parent, name, target, uid, gid)
+    }
     fn link_node(&self, src_ino: i64, new_parent: i64, new_name: &str) -> Result<i64, MetaError> {
         self.link_node(src_ino, new_parent, new_name)
     }
@@ -6957,6 +7057,58 @@ mod tests {
         assert_eq!(prefix_upper_bound(b"grovefs\x00").unwrap(), b"grovefs\x01".to_vec());
         assert!(prefix_upper_bound(b"grovefs\xff").is_none());
         assert!(prefix_upper_bound(b"").is_none(), "an empty prefix is every key");
+    }
+
+    /// A brand-new node's `nlink`/`size` are deterministic — a fresh directory
+    /// owns no children, a fresh file/symlink has the single holder name the
+    /// create just wrote — so `fresh_info` must reproduce exactly what `info`
+    /// (and thus `getattr`) would return after the create, WITHOUT the range
+    /// count that read pays for. This is the correctness contract behind the
+    /// single-transaction `create_node_with_attr`/`create_symlink_with_attr`
+    /// overrides: the reply must match a follow-up `getattr` byte for byte.
+    #[test]
+    fn fresh_info_matches_entry_info_for_new_nodes() {
+        let base = |is_dir: bool, data_ref: Option<&str>, link: Option<&str>| Rec {
+            id: 42,
+            is_dir,
+            data_ref: data_ref.map(String::from),
+            link_target: link.map(String::from),
+            mode: 0o640,
+            uid: 7,
+            gid: 9,
+            mtime: 111,
+            atime: 222,
+            ctime: 333,
+            ino: 42,
+        };
+        // Fresh directory: no children yet -> nlink 2, size 4096.
+        let d = base(true, None, None);
+        let di = FdbStore::fresh_info(5, "subdir", &d);
+        assert_eq!(di.kind, NodeKind::Dir);
+        assert_eq!((di.nlink, di.size), (2, 4096));
+        // A `getattr` on the same row would run the same `entry_info` with the
+        // child count it reads back (0), so the read-free path is identical.
+        assert_eq!(format!("{di:?}"), format!("{:?}", FdbStore::entry_info(5, "subdir", &d, 0)));
+
+        // Fresh regular file: exactly one holder -> nlink 1, size 0.
+        let f = base(false, Some("s1:16777216:u"), None);
+        let fi = FdbStore::fresh_info(5, "f.bin", &f);
+        assert_eq!(fi.kind, NodeKind::Regular);
+        assert_eq!((fi.nlink, fi.size), (1, 0));
+        assert_eq!(format!("{fi:?}"), format!("{:?}", FdbStore::entry_info(5, "f.bin", &f, 1)));
+
+        // Fresh symlink: one holder -> nlink 1, size = target length.
+        let s = base(false, None, Some("/tmp/x"));
+        let si = FdbStore::fresh_info(5, "lnk", &s);
+        assert_eq!(si.kind, NodeKind::Symlink);
+        assert_eq!((si.nlink, si.size), (1, 6));
+        assert_eq!(format!("{si:?}"), format!("{:?}", FdbStore::entry_info(5, "lnk", &s, 1)));
+
+        // Every non-derived field passes straight through from the row, so the
+        // reply's identity/timestamp columns agree with what was stored.
+        assert_eq!((di.id, di.parent_id, di.name.as_str()), (42, 5, "subdir"));
+        assert_eq!((fi.data_ref.as_deref(), fi.mode, fi.uid, fi.gid), (Some("s1:16777216:u"), 0o640, 7, 9));
+        assert_eq!((si.mtime, si.atime, si.ctime), (111, 222, 333));
     }
 }
 
