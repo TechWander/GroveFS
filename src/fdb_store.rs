@@ -41,7 +41,12 @@
 //!   VALUE, so no batching can overlap them. [`FdbStore::getattr`] issues the two
 //!   reads inside one transaction and accepts the dependency; [`Tx::get_multi`]
 //!   is kept as the primitive for reads that genuinely are independent, which is
-//!   what a range-less multi-get needs.
+//!   what a range-less multi-get needs. The nlink COUNT is the exception worth
+//!   taking: for a NON-directory its key `holder_prefix(ino)` is the caller's own
+//!   `ino`, so [`Tx::get_and_holder_count`] rides it on the first wave beside the
+//!   pointer read, and a file/symlink `getattr` costs two round trips, not three.
+//!   A directory's count still keys on the row id only the second hop yields, so
+//!   that path stays serial and discards the speculative number.
 //!
 //! Two more landed with the later milestones, same rule — recorded as C4/C5 in
 //! the design doc's version notes, not kept implicit here:
@@ -2235,6 +2240,51 @@ impl Tx {
         ))
     }
 
+    /// Issue the `ino`→pointer point read together with the holder-prefix nlink
+    /// count in ONE wave, so the count is already in flight while the two-hop
+    /// pointer chain (`ino`→`ptr`→`row`) resolves.
+    ///
+    /// This is the read counterpart of the `getattr` single-trip story that
+    /// [`Tx::get_multi`] deliberately left on the table: that helper cannot batch the
+    /// pointer hops ("its second key is its first value"), but a NON-directory's
+    /// nlink is `count_range(holder_prefix(ino))` — keyed by the caller's own
+    /// `ino`, which no earlier read has to produce. So the count rides the first
+    /// wave instead of trailing the row read, cutting a file/symlink `getattr`
+    /// from three serial round-trips to two. A directory's nlink instead needs
+    /// `dir_children_prefix(rec.id)`, whose key is the row id only the second hop
+    /// yields, so `getattr` keeps the serial `FdbStore::info` count there and
+    /// discards this speculative number — a directory's holder prefix is a single
+    /// key, so the wasted read costs at most one short page, hidden in the wave.
+    ///
+    /// Paging past one reply follows `next_range` exactly as [`Self::scan`] does,
+    /// so a heavily hard-linked inode still counts fully.
+    pub fn get_and_holder_count(
+        &self,
+        key: &[u8],
+        opt: &RangeOption,
+    ) -> Result<(Option<Vec<u8>>, u64), TxErr> {
+        debug_assert!(self.keys.permits(key), "read outside the view: {key:?}");
+        self.assert_range(opt);
+        // `join` polls both futures before blocking, so both are in flight at
+        // once against the transaction's single read version — the same property
+        // `get_multi` relies on.
+        let (v, page) = futures::executor::block_on(futures::future::join(
+            self.inner.get(key, false),
+            self.inner.get_range(opt, 1, false),
+        ));
+        let val = v.map_err(TxErr::from)?.map(|b| b.to_vec());
+        let mut page = page.map_err(TxErr::from)?;
+        let mut count = page.len() as u64;
+        let mut next = opt.clone().next_range(&page);
+        while let Some(page_opt) = next {
+            page = futures::executor::block_on(self.inner.get_range(&page_opt, 1, false))
+                .map_err(TxErr::from)?;
+            count += page.len() as u64;
+            next = page_opt.next_range(&page);
+        }
+        Ok((val, count))
+    }
+
     /// The range form of [`Keys::permits`]: both bounds must sit inside the
     /// view (or the ledger), so a range built from the wrong `Keys` cannot read
     /// — or be cleared — across a view boundary.
@@ -4028,11 +4078,23 @@ impl FdbStore {
     pub fn getattr(&self, ino: i64) -> Option<NodeInfo> {
         self.touch();
         let tx = self.read_tx().ok()?;
-        let ptr = tx.get(&self.keys.ino(ino)).ok()??;
+        // Overlap the nlink count with the pointer hop: a non-directory's count
+        // is keyed by this very `ino`, so it is in flight while `ino`→`ptr`→`row`
+        // resolves (see [`Tx::get_and_holder_count`]). A directory's count needs
+        // the row id (only the second hop yields it), so it ignores the
+        // speculative number and counts serially via `info`.
+        let (ptr, holder_count) = tx
+            .get_and_holder_count(&self.keys.ino(ino), &self.keys.holder_prefix(ino))
+            .ok()?;
+        let ptr = ptr?;
         let (parent, name) = unpack_ptr(&ptr)?;
         let raw = tx.get(&self.keys.name(parent, &name)).ok()??;
         let rec = Rec::unpack(&raw)?;
-        self.info(&tx, parent, &name, &rec).ok()
+        if rec.is_dir {
+            self.info(&tx, parent, &name, &rec).ok()
+        } else {
+            Some(Self::entry_info(parent, &name, &rec, holder_count))
+        }
     }
 
     pub fn readdir(&self, parent: i64) -> Vec<NodeInfo> {
