@@ -1046,24 +1046,19 @@ impl PgEngine {
         }
     }
 
-    /// Compute nlink/size for ONE raw row and produce the NodeInfo. Runs on the
-    /// caller's already-held connection to avoid re-locking. The directory-
-    /// listing path uses [`Self::finalize_batch`] instead, which collapses the
-    /// per-row `COUNT` this issues into a single grouped query.
-    fn finalize(&self, c: &mut Client, raw: RawNode) -> NodeInfo {
-        let kind = Self::node_kind(&raw);
-        let node = self.t("node");
+    /// Compute nlink/size for ONE raw row from counts the caller already
+    /// fetched, and produce the NodeInfo. This is the single source of truth for
+    /// the kind -> nlink/size mapping: `getattr`/`lookup` reach it by folding the
+    /// two `COUNT`s into the row `SELECT` as correlated scalar subqueries (one
+    /// server round-trip per stat instead of two), and `finalize_batch` by
+    /// looking each row's count up in a grouped `COUNT ... GROUP BY` it fetched
+    /// for the whole page. Only the count the row's kind needs is applied: a
+    /// directory's nlink is `2 +` its child-directory count, a regular file's is
+    /// its hard-link (holder) count, a symlink needs neither.
+    fn finalize_counts(raw: &RawNode, subdir_count: i64, holder_count: i64) -> NodeInfo {
+        let kind = Self::node_kind(raw);
         let (nlink, size) = match kind {
-            NodeKind::Dir => {
-                let subdirs: i64 = c
-                    .query(
-                        &format!("SELECT COUNT(*) FROM {node} WHERE parent_id=$1 AND is_dir=1"),
-                        &[&raw.id],
-                    )
-                    .map(|rows| rows.first().map(|r| r.get::<_, i64>(0)).unwrap_or(0))
-                    .unwrap_or(0);
-                (2 + subdirs as u64, 4096u64)
-            }
+            NodeKind::Dir => (2 + subdir_count as u64, 4096u64),
             NodeKind::Symlink => (
                 1,
                 raw.link_target
@@ -1071,18 +1066,9 @@ impl PgEngine {
                     .map(|s| s.len() as u64)
                     .unwrap_or(0),
             ),
-            NodeKind::Regular => {
-                let links: i64 = c
-                    .query(
-                        &format!("SELECT COUNT(*) FROM {node} WHERE ino=$1"),
-                        &[&raw.ino],
-                    )
-                    .map(|rows| rows.first().map(|r| r.get::<_, i64>(0)).unwrap_or(1))
-                    .unwrap_or(1);
-                (links.max(1) as u64, 0u64)
-            }
+            NodeKind::Regular => (holder_count.max(1) as u64, 0u64),
         };
-        Self::build_info(&raw, kind, nlink, size)
+        Self::build_info(raw, kind, nlink, size)
     }
 
     /// Finalize a whole directory listing with at most two grouped `COUNT`
@@ -1131,19 +1117,12 @@ impl PgEngine {
         }
         raws.iter()
             .map(|r| {
-                let kind = Self::node_kind(r);
-                let (nlink, size) = match kind {
-                    NodeKind::Dir => (2 + *subdir_map.get(&r.id).unwrap_or(&0) as u64, 4096u64),
-                    NodeKind::Symlink => (
-                        1,
-                        r.link_target.as_ref().map(|s| s.len() as u64).unwrap_or(0),
-                    ),
-                    NodeKind::Regular => {
-                        let links = *nlink_map.get(&r.ino).unwrap_or(&1);
-                        (links.max(1) as u64, 0u64)
-                    }
-                };
-                Self::build_info(r, kind, nlink, size)
+                // Look up the row's page-batched counts and hand them to the one
+                // scalar mapping — identical output to the old per-kind inline
+                // match, with the formula kept in a single place.
+                let subdir_count = *subdir_map.get(&r.id).unwrap_or(&0);
+                let holder_count = *nlink_map.get(&r.ino).unwrap_or(&1);
+                Self::finalize_counts(r, subdir_count, holder_count)
             })
             .collect()
     }
@@ -1151,28 +1130,43 @@ impl PgEngine {
     pub fn lookup(&self, parent: i64, name: &str) -> Option<NodeInfo> {
         let _t = stats::start(stats::Stage::MetaLookup);
         let node = self.t("node");
-        let sql = format!("SELECT {COLS} FROM {node} WHERE parent_id=$1 AND name=$2");
+        // Row + both candidate counts in ONE round-trip; `finalize_counts` applies
+        // only the one the kind needs. Folding the counts here is what keeps a
+        // `lookup` a single server trip instead of a `SELECT` plus a follow-up
+        // `COUNT`.
+        let sql = format!(
+            "SELECT {COLS},
+               (SELECT COUNT(*) FROM {node} d WHERE d.parent_id = nd.id AND d.is_dir = 1),
+               (SELECT COUNT(*) FROM {node} h WHERE h.ino = nd.ino)
+             FROM {node} nd WHERE nd.parent_id = $1 AND nd.name = $2"
+        );
         self.with_read(|c| {
-            let raw = c
-                .query(&sql, &[&parent, &name])
-                .ok()
-                .and_then(|rows| rows.into_iter().next())
-                .map(|r| parse_node(&r))?;
-            Some(self.finalize(c, raw))
+            let row = c.query(&sql, &[&parent, &name]).ok()?.into_iter().next()?;
+            let raw = parse_node(&row);
+            let subdir_count: i64 = row.get(13);
+            let holder_count: i64 = row.get(14);
+            Some(Self::finalize_counts(&raw, subdir_count, holder_count))
         })
     }
 
     pub fn getattr(&self, ino: i64) -> Option<NodeInfo> {
         let _t = stats::start(stats::Stage::MetaGetattr);
         let node = self.t("node");
-        let sql = format!("SELECT {COLS} FROM {node} WHERE ino=$1 LIMIT 1");
+        // One round-trip, as in `lookup`. `ino` is shared by a hard link's names,
+        // so `LIMIT 1` picks one row while the holder `COUNT` still sees all N —
+        // matching the pre-fold `finalize` that counted on the row's own `ino`.
+        let sql = format!(
+            "SELECT {COLS},
+               (SELECT COUNT(*) FROM {node} d WHERE d.parent_id = nd.id AND d.is_dir = 1),
+               (SELECT COUNT(*) FROM {node} h WHERE h.ino = nd.ino)
+             FROM {node} nd WHERE nd.ino = $1 LIMIT 1"
+        );
         self.with_read(|c| {
-            let raw = c
-                .query(&sql, &[&ino])
-                .ok()
-                .and_then(|rows| rows.into_iter().next())
-                .map(|r| parse_node(&r))?;
-            Some(self.finalize(c, raw))
+            let row = c.query(&sql, &[&ino]).ok()?.into_iter().next()?;
+            let raw = parse_node(&row);
+            let subdir_count: i64 = row.get(13);
+            let holder_count: i64 = row.get(14);
+            Some(Self::finalize_counts(&raw, subdir_count, holder_count))
         })
     }
 
@@ -1288,7 +1282,7 @@ impl PgEngine {
         mode: u32,
         uid: u32,
         gid: u32,
-    ) -> Result<i64, MetaError> {
+    ) -> Result<RawNode, MetaError> {
         self.drop_cursors();
         let t = now();
         let node = self.t("node");
@@ -1338,7 +1332,28 @@ impl PgEngine {
                     ledger_add_tx(tx, dr)?;
                 }
             }
-            Ok(id)
+            // Return the row as just written. Every scalar column is known from
+            // the INSERT arguments and the generated id (a brand-new name owns a
+            // brand-new inode, ino == id), and mtime/atime/ctime are the single
+            // `t` written above — so a caller that needs the full `NodeInfo` can
+            // finalize it in memory instead of paying a second `getattr` round
+            // trip to the server. `nlink`/`size` for a fresh node are derived by
+            // [`Self::fresh_info`].
+            Ok(RawNode {
+                id,
+                parent_id: Some(parent),
+                name: name.to_string(),
+                is_dir: is_dir as i64,
+                data_ref: data_ref.map(|s| s.to_string()),
+                link_target: link_target.map(|s| s.to_string()),
+                mode: mode as i64,
+                uid: uid as i64,
+                gid: gid as i64,
+                mtime: t,
+                atime: t,
+                ctime: t,
+                ino: id,
+            })
         })
     }
 
@@ -1355,6 +1370,7 @@ impl PgEngine {
     ) -> Result<i64, MetaError> {
         let _t = stats::start(stats::Stage::MetaCreate);
         self.insert(parent, name, is_dir, data_ref, None, mode, uid, gid)
+            .map(|r| r.id)
     }
 
     pub fn create_symlink(
@@ -1367,6 +1383,70 @@ impl PgEngine {
     ) -> Result<i64, MetaError> {
         let _t = stats::start(stats::Stage::MetaCreate);
         self.insert(parent, name, false, None, Some(target), 0o0777, uid, gid)
+            .map(|r| r.id)
+    }
+
+    /// Create and return the full `NodeInfo` in ONE write round-trip.
+    ///
+    /// The trait default would follow the INSERT with a `getattr`, i.e. check
+    /// out a read connection and re-SELECT + `COUNT` the row back — a second
+    /// network round-trip to the database server on every `CREATE`. Since a
+    /// fresh node's every field is known from the write (see [`PgEngine::insert`]`
+    /// ’s returned `RawNode`) and its `nlink`/`size` are deterministic (see
+    /// [`Self::fresh_info`]), we assemble the reply in memory and skip the
+    /// read trip entirely — the same contract the `RemoteMeta` client override
+    /// ships. Reporting the created node (rather than re-reading) also matches
+    /// that override: the create committed, so it succeeded.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_node_with_attr(
+        &self,
+        parent: i64,
+        name: &str,
+        is_dir: bool,
+        data_ref: Option<&str>,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<NodeInfo, MetaError> {
+        let _t = stats::start(stats::Stage::MetaCreate);
+        let raw = self.insert(parent, name, is_dir, data_ref, None, mode, uid, gid)?;
+        Ok(Self::fresh_info(&raw))
+    }
+
+    pub fn create_symlink_with_attr(
+        &self,
+        parent: i64,
+        name: &str,
+        target: &str,
+        uid: u32,
+        gid: u32,
+    ) -> Result<NodeInfo, MetaError> {
+        let _t = stats::start(stats::Stage::MetaCreate);
+        let raw = self.insert(parent, name, false, None, Some(target), 0o0777, uid, gid)?;
+        Ok(Self::fresh_info(&raw))
+    }
+
+    /// `NodeInfo` for a just-created node, computed WITHOUT a store read. Its
+    /// `nlink`/`size` are exactly what [`Self::finalize`] derives for a node
+    /// that has no other names and no children yet — which is guaranteed for
+    /// a brand-new inode (`create` always mints a fresh inode; hard links go
+    /// through `link_node`): a fresh directory is `2 + 0` subdirs / size 4096,
+    /// a fresh regular file is 1 name / size 0 (bytes land later, via write),
+    /// a fresh symlink is 1 name / size = target length.
+    fn fresh_info(raw: &RawNode) -> NodeInfo {
+        let kind = Self::node_kind(raw);
+        let (nlink, size) = match kind {
+            NodeKind::Dir => (2u64, 4096u64),
+            NodeKind::Symlink => (
+                1,
+                raw.link_target
+                    .as_ref()
+                    .map(|s| s.len() as u64)
+                    .unwrap_or(0),
+            ),
+            NodeKind::Regular => (1, 0),
+        };
+        Self::build_info(raw, kind, nlink, size)
     }
 
     pub fn link_node(
@@ -3310,6 +3390,29 @@ impl MetaProvider for PgEngine {
     ) -> Result<i64, MetaError> {
         PgEngine::create_symlink(self, parent, name, target, uid, gid)
     }
+    #[allow(clippy::too_many_arguments)]
+    fn create_node_with_attr(
+        &self,
+        parent: i64,
+        name: &str,
+        is_dir: bool,
+        data_ref: Option<&str>,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<NodeInfo, MetaError> {
+        PgEngine::create_node_with_attr(self, parent, name, is_dir, data_ref, mode, uid, gid)
+    }
+    fn create_symlink_with_attr(
+        &self,
+        parent: i64,
+        name: &str,
+        target: &str,
+        uid: u32,
+        gid: u32,
+    ) -> Result<NodeInfo, MetaError> {
+        PgEngine::create_symlink_with_attr(self, parent, name, target, uid, gid)
+    }
     fn link_node(&self, src_ino: i64, new_parent: i64, new_name: &str) -> Result<i64, MetaError> {
         PgEngine::link_node(self, src_ino, new_parent, new_name)
     }
@@ -3557,5 +3660,109 @@ mod shard_tests {
         assert_eq!(store_instances("postgres://a/d1, ,postgres://a/d2 "), vec!["postgres://a/d1", "postgres://a/d2"]);
         assert_eq!(store_instances(" postgres://a/d1 "), vec!["postgres://a/d1"]);
         assert!(store_instances("").is_empty());
+    }
+
+    /// A brand-new node's `nlink`/`size` are deterministic, and `fresh_info`
+    /// must return exactly what `finalize` would after a create — without any
+    /// store read. This is the correctness contract behind the single-round-trip
+    /// `create_node_with_attr` override (a fresh inode has one name and no
+    /// children, so a `COUNT` would yield the same). Scalar fields pass through
+    /// straight from the row the INSERT wrote.
+    #[test]
+    fn fresh_info_matches_finalize_for_new_nodes() {
+        use super::{PgEngine, RawNode};
+        use crate::meta::NodeKind;
+        let base = |is_dir: i64, data_ref: Option<&str>, link: Option<&str>| RawNode {
+            id: 7,
+            parent_id: Some(3),
+            name: "n".into(),
+            is_dir,
+            data_ref: data_ref.map(str::to_string),
+            link_target: link.map(str::to_string),
+            mode: 0o640,
+            uid: 12,
+            gid: 34,
+            mtime: 99,
+            atime: 99,
+            ctime: 99,
+            ino: 7,
+        };
+        let reg = PgEngine::fresh_info(&base(0, None, None));
+        assert_eq!(reg.kind, NodeKind::Regular);
+        assert_eq!((reg.nlink, reg.size), (1, 0));
+        // A fresh file already naming a shared blob still reports size 0, and
+        // carries the data_ref through — parity with what getattr returns.
+        let reg2 = PgEngine::fresh_info(&base(0, Some("k"), None));
+        assert_eq!((reg2.nlink, reg2.size), (1, 0));
+        assert_eq!(reg2.data_ref.as_deref(), Some("k"));
+        let dir = PgEngine::fresh_info(&base(1, None, None));
+        assert_eq!(dir.kind, NodeKind::Dir);
+        assert_eq!((dir.nlink, dir.size), (2, 4096));
+        let sym = PgEngine::fresh_info(&base(0, None, Some("target")));
+        assert_eq!(sym.kind, NodeKind::Symlink);
+        assert_eq!((sym.nlink, sym.size), (1, 6));
+        // scalar fields straight from the written row
+        assert_eq!(
+            (reg.id, reg.parent_id, reg.name.as_str(), reg.mode, reg.uid, reg.gid, reg.mtime, reg.ctime),
+            (7, 3, "n", 0o640, 12, 34, 99, 99),
+        );
+    }
+
+    /// `finalize_counts` is the single kind -> nlink/size mapping that both the
+    /// folded `getattr`/`lookup` (counts arrive as scalar subqueries on the row)
+    /// and `finalize_batch` (counts from a grouped `COUNT ... GROUP BY`) feed.
+    /// It must apply ONLY the count the kind needs — the other count is computed
+    /// by the shared SQL shape but discarded — and reproduce the pre-fold scalar
+    /// `finalize` byte for byte. Pure, so no store is needed.
+    #[test]
+    fn finalize_counts_applies_only_the_kinds_count() {
+        use super::{PgEngine, RawNode};
+        use crate::meta::NodeKind;
+        let base = |is_dir: i64, link: Option<&str>| RawNode {
+            id: 7,
+            parent_id: Some(3),
+            name: "n".into(),
+            is_dir,
+            data_ref: None,
+            link_target: link.map(str::to_string),
+            mode: 0o640,
+            uid: 12,
+            gid: 34,
+            mtime: 99,
+            atime: 99,
+            ctime: 99,
+            ino: 7,
+        };
+        // Directory: nlink is 2 + child-dir count; the holder count (garbage
+        // here) must NOT leak in. size is the fixed 4096.
+        let dir = PgEngine::finalize_counts(&base(1, None), 3, 999);
+        assert_eq!(dir.kind, NodeKind::Dir);
+        assert_eq!((dir.nlink, dir.size), (5, 4096));
+
+        // Regular file: nlink is the hard-link (holder) count; the subdir count
+        // (garbage here) must NOT leak in. size is 0.
+        let file = PgEngine::finalize_counts(&base(0, None), 999, 4);
+        assert_eq!(file.kind, NodeKind::Regular);
+        assert_eq!((file.nlink, file.size), (4, 0));
+        // The `.max(1)` guard: a holder count of 0 (never real, but the fold
+        // could see it mid-unlink) still reports nlink 1, matching `finalize`.
+        assert_eq!(PgEngine::finalize_counts(&base(0, None), 0, 0).nlink, 1);
+
+        // Symlink: nlink 1, size = target length; BOTH counts are ignored.
+        let sym = PgEngine::finalize_counts(&base(0, Some("/a/b")), 999, 999);
+        assert_eq!(sym.kind, NodeKind::Symlink);
+        assert_eq!((sym.nlink, sym.size), (1, 4));
+
+        // A fresh node (child-dir count 0, holder count 1) must match what
+        // `fresh_info` claims for the same row — the two entry points into the
+        // same mapping agree, so create and a later getattr never disagree.
+        let fresh_dir = PgEngine::finalize_counts(&base(1, None), 0, 1);
+        assert_eq!((fresh_dir.nlink, fresh_dir.size), (2, 4096));
+        assert_eq!(
+            format!("{fresh_dir:?}"),
+            format!("{:?}", PgEngine::fresh_info(&base(1, None)))
+        );
+        // non-derived columns pass straight through from the row
+        assert_eq!((dir.id, dir.parent_id, dir.mode, dir.uid, dir.gid, dir.mtime), (7, 3, 0o640, 12, 34, 99));
     }
 }
