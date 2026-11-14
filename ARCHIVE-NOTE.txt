@@ -1,0 +1,49 @@
+GroveFS × FoundationDB 实验档安装包 —— 归档说明（ARCHIVE-NOTE）
+===================================================================
+
+本文件只存在于 `dist/fdb-experimental` 这个孤儿分支，不属于安装包本身，也不在
+包内 `SHA256SUMS.txt` 的清单里。它记录"这份实物为什么在这里、按什么口径封的"。
+
+## 1. 被取代的一句原话
+
+包内 `BUILDINFO.txt` 的「源码坐标」段写着：
+
+    ⇒ 因此本包仍不是发布版：没有对应 tag，也不推到 dist 分支；它是实验档的取证产物。
+
+那一句成立时，FoundationDB 还是主干上活着的第三档后端。**2026-11-14 该后端已从主干
+整体移除**（代码、feature、vendor 绑定、测试、回归脚本、文档口径与配方脚本一并清除），
+这份实物不再有任何"下一版会转正"的前景，于是改为按取证产物封进本孤儿分支。
+
+`BUILDINFO.txt` 的内容**未被改写**，字节仍是打包时那份（sha256
+`b3c14023797fcd6cfdd0e6f0de43b6febbf08bd874b214da22ba20d9c2d4fee4`，可在解包后用包内
+`SHA256SUMS.txt` 验回）。取代关系记在本文件，不靠改历史文档来圆。
+
+## 2. 实物坐标
+
+| 项 | 值 |
+|---|---|
+| 源码提交（含 FDB 后端） | `ed87cbc`（包内 BUILDINFO 记的构建时 master HEAD，工作树 clean） |
+| 主干移除后的 HEAD | `f9abe19`（该提交 message 本身仍写着"SQLite/PG/FDB 三档"，属提交记录，未改写历史） |
+| 那套 FDB 源码现在在哪 | 远端 `fdb-test` 分支：gitee = `f9abe19`，GitHub = `f052a39` |
+| tar 包 | `grovefs-fdb-experimental-linux-x86_64.tar.gz`，60,098,093 字节 |
+| tar sha256 | `789163c8812cf1757302a476ca91779cc3f6b3a9bfbc83fb70ab9d7d98fdce8b` |
+| 主二进制 sha256 | `5806b071c0367f0682875b30a1fdc6456c563438fb4d29109f7f28108d984458`（`grovefs`） |
+| `libfdb_c.so` sha256 | `c5293cdefbf462449914321bb60686e90a047318b5444f9714abef8d58ad620f` |
+| 工具链 | rustc / cargo 1.99.0，glibc 2.31，x86_64-unknown-linux-gnu |
+
+## 3. 归档前做过的两项校验（2026-11-14）
+
+1. **tar 与解包树逐文件一致**：`tar tzf` 清单与 `find` 目录清单做 diff，零差异；
+   `sha256sum -c` 对 tar 与包内两份清单全部通过。因此本地那份解包目录随后被删除，
+   不丢东西——需要时 `tar xzf` 即可原样复现。
+2. **自足性与凭据扫描**：空环境（`env -i PATH=/usr/bin:/bin`）下 `ldd ./grovefs` 把
+   `libfdb_c.so` 解析到包内；包内文档只含 `127.0.0.1` 与 `token`/`secret` 这类普通词，
+   无私钥块、无内网地址、无明文口令；官方 FDB 制品内不含本机路径。
+   `grovefs` 二进制里确实带一条构建机路径串 `/data/grovefs/.fdbbin/lib`，它是 RUNPATH
+   的第三段兜底（排在 `$ORIGIN` 两段之后，实测不参与解析），随本次清理该目录已不存在。
+
+## 4. 这一档的结论没变过
+
+它当初就没通过性能门（G3 实测：同机同场同 op 序列下 FDB 臂峰值未达转正门槛），
+所以移除它不是"砍掉一个在用的后端"，而是撤掉一档从未进入 CANON 门控的实验档。
+主干现在的两档口径与硬指标见 master 上的 `USAGE.md` §4.1.1 与 `docs/docs.html` §22.1。
