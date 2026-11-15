@@ -1710,11 +1710,11 @@ ps aux | grep grovefs                     # 查看在跑的 server / mount
 
 ## 10. Verification and regression
 
-The full board is **38 stages** in all: `build` → `unit` → **35 suites** → `bench`. **The first 37 stages gate GREEN; `bench` only prints throughput reference numbers and never gates** (for pure functional regression only, use `SKIP_BENCH=1`). `pg`/`pg_parallel`/`evict`/`control`/`forksrv` auto-SKIP their whole stage on hosts with no reachable PostgreSQL, and `xfer`/`gcremote` skip just their PG arm and run the SQLite arm — none of them lower GREEN.
+The full board is **39 stages** in all: `build` → `unit` → **36 suites** → `bench`. **The first 38 stages gate GREEN; `bench` only prints throughput reference numbers and never gates** (for pure functional regression only, use `SKIP_BENCH=1`). `pg`/`pg_parallel`/`evict`/`control`/`forksrv` auto-SKIP their whole stage on hosts with no reachable PostgreSQL, and `xfer`/`gcremote` skip just their PG arm and run the SQLite arm — and `client` skips its whole stage on a host without the sibling `grovefs-client` checkout, its binary, or the `fusermount` helper — none of them lower GREEN.
 
 ```bash
 export LC_ALL=C LANG=C                                 # 仓库根目录下执行(PKG_CONFIG 不必设:无 crate 查 pkg-config,§1)
-bash .build-bin/run_all.sh                # 全板 38 段(37 门控 + bench)
+bash .build-bin/run_all.sh                # 全板 39 段(38 门控 + bench)
                                           #   build unit
                                           #   posix edge e2e remote errors resilience concurrent
                                           #   metasrv ha striping locks freshness disp_fresh
@@ -1970,7 +1970,7 @@ sudo systemctl restart grove-data-server && cat /mnt/alice/from_a.txt
 sudo systemctl stop grove-mount@alice && findmnt -T /mnt/alice | grep -q grovefs && echo "残留!" || echo "已卸载"
 ```
 
-All passing means the deployment is complete. To run the full regression (37 gated stages) see §10 and §12.7.
+All passing means the deployment is complete. To run the full regression (38 gated stages) see §10 and §12.7.
 
 ### 11.8 HA primary/standby topology (modified from §11.4)
 
@@ -2177,7 +2177,7 @@ HA topology rolling upgrade (writes uninterrupted, except the instant of switcho
 
 ### 12.7 Regression verification after changes
 
-After any upgrade/config change, run the full board (37 gated stages) on a machine with a build environment, or only the planes you care about:
+After any upgrade/config change, run the full board (38 gated stages) on a machine with a build environment, or only the planes you care about:
 
 ```bash
 bash .build-bin/run_all.sh                    # 全板(build 自动前置)
