@@ -87,7 +87,7 @@ if [ -x "$BIN" ]; then
     | grep -oE -- '--[a-z][a-z0-9-]*' | sed 's/^--//' | sort -u > "$neg"
   comm -23 "$docf" "$real" > "$orph"
   comm -23 "$orph" "$neg" > "${orph}.2" && mv "${orph}.2" "$orph"
-  # 噪声两类:别家工具的参数(rsync/cargo/systemd/journalctl/firewalld/pg_dump/fdbcli…),
+  # 噪声两类:别家工具的参数(rsync/cargo/systemd/journalctl/firewalld/pg_dump…),
   # 以及文档里的占位与通配写法(--xxx、--bw-*)。运维配方的选项不在这里,见上面的按行剥离。
   FOREIGN='delete-after|delete-before|delete-during|exclude|include|inplace|info|progress|partial|times|whole-file|verbose|release|nocapture|bench|features|ignored|now|since|until|no-pager|reload|enable|disable|status|full|state|format|permanent|add-rich-rule|zone|type|set-profile|daemon-reload|json-pretty|exec|xxx|bw-'
   nf=$(grep -cvE "^($FOREIGN)$" "$orph" || true)

@@ -13,6 +13,10 @@
 #   GROVEFS_BIN=/path/to/grovefs  指定跑 --help 的二进制(默认 <code>/target/release/grovefs)
 #   WIKI_DIR=/path/to/.qoder/repowiki/zh/content  指定 wiki 正文目录
 # 退出码: 0=干净; 1=有需处理的漂移。
+#
+# §4 是后端口径硬门禁:元数据后端只有 SQLite / PostgreSQL 两档,wiki 正文/知识卡/
+#   元数据明文中再出现 FoundationDB、fdb:// 等字样一律 FAIL —— 防止 IDE 重新生成
+#   时把已删除的第三后端又写回来(此前本脚本对此类漂移是「假绿」的)。
 set -uo pipefail
 
 ROOT="${1:-$(cd "$(dirname "$(readlink -f "$0")")/../../.." && pwd)}"   # grovefs 仓库根(代码所在)
@@ -156,6 +160,64 @@ for entry in "${CHECKS[@]}"; do
     printf '  [需处理] %s 缺少关键词: %s\n' "$f" "${missing[*]}"; rc=1
   fi
 done
+
+# ---------- 4. 后端口径门禁:wiki 不得再出现 FoundationDB/FDB ----------
+say "4. 后端口径门禁(元数据仅 SQLite / PostgreSQL 两档)"
+FDBRX='FoundationDB|foundationdb|fdb://|libfdb_c|GROVEFS_FDB|FDB_TEST|fdbbackup|fdbcli|fdb_store|fdb_tree|fdb_spike|fdb_env|fdb-keyspace|\.fdb[a-z]*[/.]|\bfdb\b|\bFDB\b'
+RW="$(cd "$WIKI/../.." && pwd)"          # .qoder/repowiki
+fdb_hits=""
+# 知识卡目录名位置不能猜死:多候选探测,一个都没找到则 fail-closed(否则路径变更会把门禁静默变成假绿)
+kdirs=()
+for k in "$RW/knowledge" "$WIKI/../knowledge" "$RW/zh/knowledge"; do
+  [ -d "$k" ] && kdirs+=("$(cd "$k" && pwd)")
+done
+scanned=("$WIKI")
+if [ "${#kdirs[@]}" = 0 ]; then
+  printf '  [需处理] 未定位到知识卡目录(在 %s 下找 knowledge)—— 门禁未能覆盖\n' "$RW"
+  rc=1
+else
+  scanned+=("${kdirs[@]}")
+fi
+for dir in "${scanned[@]}"; do
+  h=$(grep -rnE "$FDBRX" --include='*.md' --include='*.yaml' "$dir" 2>/dev/null)
+  [ -n "$h" ] && fdb_hits="${fdb_hits}${h}"$'\n'
+done
+# 元数据 JSON:只扫明文,WikiEncrypted: 密文原样保留(不在此门禁职责内)
+if [ -z "${meta:-}" ]; then
+  printf '  [需处理] 未定位到 repowiki-metadata.json —— 门禁未能覆盖\n'; rc=1
+elif ! command -v python3 >/dev/null 2>&1; then
+  printf '  [需处理] 缺 python3,无法扫元数据明文 —— 门禁未能覆盖\n'; rc=1
+else
+  h=$(FDBRX="$FDBRX" python3 -c '
+import json, os, re, sys
+rx = re.compile(os.environ["FDBRX"])
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+out = []
+def walk(o, p=""):
+    if isinstance(o, dict):
+        for k, v in o.items():
+            walk(v, p + "/" + k)
+    elif isinstance(o, list):
+        for i, v in enumerate(o):
+            walk(v, p + "/%d" % i)
+    elif isinstance(o, str):
+        if o.startswith("WikiEncrypted:"):
+            return
+        for ln in re.split(r"\\n|\n", o):
+            if rx.search(ln):
+                out.append("%s: %s" % (p, ln.strip()[:140]))
+walk(d)
+print("\n".join(out))' "$meta" 2>/dev/null)
+  [ -n "$h" ] && fdb_hits="${fdb_hits}${h}"$'\n'
+fi
+if [ -n "$fdb_hits" ]; then
+  printf '  [需处理] wiki 中残留已删除的 FoundationDB/FDB 后端表述:\n'
+  printf '%s\n' "$fdb_hits" | sed '/^$/d' | sed 's/^/    /' | cut -c1-180
+  rc=1
+else
+  printf '  [OK] 正文/知识卡(%s)/元数据明文均无 FoundationDB、fdb:// 等字样\n' \
+    "$(printf '%s ' "${scanned[@]:1}" | sed "s|$RW/||g")"
+fi
 
 say "结论"
 if [ "$rc" = 0 ]; then echo "  OK —— wiki 与代码事实一致"; else echo "  需处理(见上面 [需处理])"; fi
