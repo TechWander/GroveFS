@@ -121,7 +121,10 @@ fn parts_request_frame_matches_contiguous_frame() {
     proto::send_request_parts(&mut parts, proto::OP_WRITE, &[head, &[], &offset, &payload])
         .unwrap();
 
-    assert_eq!(parts, contiguous, "parts frame differs from contiguous frame");
+    assert_eq!(
+        parts, contiguous,
+        "parts frame differs from contiguous frame"
+    );
     let mut r = &parts[..];
     let (op, got) = proto::recv_request(&mut r).unwrap();
     assert_eq!(op, proto::OP_WRITE);
@@ -141,7 +144,10 @@ fn parts_response_frame_matches_contiguous_frame() {
 
     let mut parts = Vec::new();
     proto::send_response_parts(&mut parts, 0, 77, &[a, &[], &b]).unwrap();
-    assert_eq!(parts, contiguous, "parts response differs from contiguous response");
+    assert_eq!(
+        parts, contiguous,
+        "parts response differs from contiguous response"
+    );
 
     let mut r = &parts[..];
     let (status, val, got) = proto::recv_response(&mut r).unwrap();

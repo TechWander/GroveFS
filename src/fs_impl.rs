@@ -17,9 +17,9 @@ use crate::meta::{LockType, MetaError, MetaProvider, NewNode, NodeInfo, NodeKind
 use fuser::{
     AccessFlags, BsdFileFlags, Errno, FileAttr, FileHandle, FileType, FopenFlags, Generation,
     INodeNo, InitFlags, IoctlFlags, KernelConfig, LockOwner, OpenAccMode, OpenFlags, RenameFlags,
-    ReplyAttr,
-    ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyIoctl,
-    ReplyLock, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
+    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry,
+    ReplyIoctl, ReplyLock, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
+    WriteFlags,
 };
 use parking_lot::{Condvar, Mutex, RwLock};
 use std::ffi::OsStr;
@@ -163,7 +163,7 @@ pub struct GroveFS {
     /// (and are carried by that drain, so they add no latency of their own).
     create_leader: std::sync::atomic::AtomicBool,
     /// Whether the store can commit a burst of creates as one transaction. A
-    /// per-op store (PG / FDB / remote) keeps the plain one-commit-per-create
+    /// per-op store (PG / remote) keeps the plain one-commit-per-create
     /// path: grouping there would serialize what is already parallel.
     batch_creates: bool,
     /// Group-commit queue for `UNLINK`/`RMDIR` (see `drain_unlinks`), the delete
@@ -340,9 +340,7 @@ impl GroveFS {
     /// Called on every Read/Write grant; inserting an already-present `fh` is
     /// a no-op, so repeat locks (same-owner convert) do not inflate the set.
     fn note_posix_lock(&self, fh: u64, ino: i64, owner: u64) {
-        self.posix_lock_fh_owner
-            .write()
-            .insert(fh, (ino, owner));
+        self.posix_lock_fh_owner.write().insert(fh, (ino, owner));
         self.posix_lock_owner_fds
             .write()
             .entry((ino, owner))
@@ -430,7 +428,7 @@ impl GroveFS {
     /// `first` is the first page of the calling callback, sized to what a 4 KiB
     /// kernel reply buffer actually holds: a plain READDIR record is ~40 B, so
     /// ~102 names fit and asking for 32/64/128 in turn spends three fetches —
-    /// three scans, and on FoundationDB three nlink count waves — to deliver one
+    /// three scans — to deliver one
     /// buffer (32 + 64 + 128 rows fetched for ~102 delivered).
     fn fetch_policy(&self, first: usize) -> (usize, usize) {
         if self.meta.supports_paged_readdir() {
@@ -724,10 +722,7 @@ impl GroveFS {
     /// One transaction for the whole batch; every request keeps its own outcome
     /// (a missing name or a non-empty directory costs only that request).
     fn commit_unlinks(&self, batch: Vec<PendingUnlink>) {
-        let items: Vec<(i64, &str)> = batch
-            .iter()
-            .map(|p| (p.parent, p.name.as_str()))
-            .collect();
+        let items: Vec<(i64, &str)> = batch.iter().map(|p| (p.parent, p.name.as_str())).collect();
         let results = self.meta.unlink_nodes_batch(&items);
         for (p, res) in batch.iter().zip(results) {
             p.slot.deliver(res.map_err(Self::err_to_errno));
@@ -818,7 +813,10 @@ impl fuser::Filesystem for GroveFS {
         // save). If an old kernel denies this bit `open` never fires the truncate
         // because the kernel still sends SETATTR, so this is safe-degrade only and
         // both truncate paths coexist correctly.
-        if config.add_capabilities(InitFlags::FUSE_ATOMIC_O_TRUNC).is_ok() {
+        if config
+            .add_capabilities(InitFlags::FUSE_ATOMIC_O_TRUNC)
+            .is_ok()
+        {
             enabled |= InitFlags::FUSE_ATOMIC_O_TRUNC;
         }
         // AUTO_INVAL_DATA (kernel >= 3.15): when a cached attr is refreshed and
@@ -827,7 +825,10 @@ impl fuser::Filesystem for GroveFS {
         // bumps size/mtime still invalidates a peer's stale pages on next access,
         // complementing our notify-invalidation push. Its own call so an older
         // kernel that lacks it drops only this bit.
-        if config.add_capabilities(InitFlags::FUSE_AUTO_INVAL_DATA).is_ok() {
+        if config
+            .add_capabilities(InitFlags::FUSE_AUTO_INVAL_DATA)
+            .is_ok()
+        {
             enabled |= InitFlags::FUSE_AUTO_INVAL_DATA;
         }
         // READDIRPLUS (kernel >= 4.6): reply a directory listing with per-entry
@@ -1831,7 +1832,7 @@ impl fuser::Filesystem for GroveFS {
         // ".." occupies slot 1, so it is emitted only on the first two resume
         // positions (`skip <= 1`); a continuation page (`skip >= 2`) has already
         // returned it. Guard the whole block so those pages don't pay a
-        // `getattr(parent)` round-trip (two FDB hops) for an entry they won't
+        // `getattr(parent)` round-trip for an entry they won't
         // add — otherwise a large directory leaks one parent fetch per page.
         if skip <= 1 {
             let parent_ino = if ino == INodeNo::ROOT {

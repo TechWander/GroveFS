@@ -23,11 +23,9 @@
 //! view-binding refusal) rather than guessing from the status code alone.
 
 use super::proto;
-use crate::meta::{
-    LockConflict, LockType, MetaError, MetaProvider, NodeInfo, NodeKind,
-};
-use crate::stats;
+use crate::meta::{LockConflict, LockType, MetaError, MetaProvider, NodeInfo, NodeKind};
 use crate::platform::EIO;
+use crate::stats;
 use parking_lot::Mutex;
 use std::io;
 use std::net::TcpStream;
@@ -651,8 +649,10 @@ impl RemoteMeta {
                         // meta-server <addr>: Connection refused" instead of a
                         // bare errno (§5-12); ErrorKind is preserved for the
                         // failover/retry logic above.
-                        last_err =
-                            io::Error::new(e.kind(), format!("cannot reach meta-server {addr}: {e}"))
+                        last_err = io::Error::new(
+                            e.kind(),
+                            format!("cannot reach meta-server {addr}: {e}"),
+                        )
                     }
                 }
                 if attempt + 1 < self.connect_retries {
@@ -901,9 +901,7 @@ impl MetaProvider for RemoteMeta {
         match self.create_node_rpc(parent, name, is_dir, data_ref, mode, uid, gid)? {
             (_, Some(node)) => Ok(node),
             // Old server: its reply carries only the id, so read the row back.
-            (id, None) => self
-                .getattr(id)
-                .ok_or(MetaError::NotFound),
+            (id, None) => self.getattr(id).ok_or(MetaError::NotFound),
         }
     }
 

@@ -27,7 +27,7 @@
 //! `grovefs refs rebuild` first and the same object becomes reclaimable.
 //!
 //! The same verdict serves deployments whose trees are NOT local files: the
-//! control plane reads a PG/`fdb://` store where it lives ([`Picture`]) and
+//! control plane reads a PG store where it lives ([`Picture`]) and
 //! lists the objects through the data servers, so an operator on another machine
 //! audits the deployment's real bytes instead of a `<data-dir>` that does not
 //! exist on their host. Only the listing changes; [`audit`] is the one rule that
@@ -249,8 +249,8 @@ pub struct Refs {
 }
 
 impl Refs {
-    /// Build the tree side from an already-read key set. The PG and `fdb://`
-    /// arms hand over decoded content keys, so the striped-base rule has to be
+    /// Build the tree side from an already-read key set. The PG arm
+    /// hands over decoded content keys, so the striped-base rule has to be
     /// applied here — identically to [`collect_refs`], which is the whole point
     /// of every backend sharing one [`Picture`].
     pub fn from_keys(views: Vec<String>, keys: impl IntoIterator<Item = String>) -> Self {
@@ -339,10 +339,7 @@ impl Ledger {
             }
             set.insert(k);
         }
-        Self {
-            keys: set,
-            striped,
-        }
+        Self { keys: set, striped }
     }
 }
 
@@ -389,9 +386,9 @@ fn collect_ledger(meta_root: &Path) -> Result<Ledger, String> {
 /// live.
 ///
 /// The SQLite arm fills this from `meta/*.db` ([`picture_sqlite`]); the control
-/// plane fills it from a PG schema set or an `fdb://` root walk. Keeping the
-/// three sets identical is what lets one deployment audit be the same decision
-/// in a file store, a database and a cluster.
+/// plane fills it from a PG schema set. Keeping the
+/// two sets identical is what lets one deployment audit be the same decision
+/// in a file store and a database.
 pub struct Picture {
     pub refs: Refs,
     pub ledger: Ledger,
@@ -778,9 +775,15 @@ mod tests {
         // buckets, or a remote `gc --apply` would delete by a different rule
         // than the offline scan the operator validated with.
         let pic = picture_sqlite(&base).unwrap();
-        let listed = ["k-live", "k-orphan", "base-live#0", "base-orphan#0", "k-held"]
-            .iter()
-            .map(|k| (k.to_string(), 1u64, SystemTime::UNIX_EPOCH));
+        let listed = [
+            "k-live",
+            "k-orphan",
+            "base-live#0",
+            "base-orphan#0",
+            "k-held",
+        ]
+        .iter()
+        .map(|k| (k.to_string(), 1u64, SystemTime::UNIX_EPOCH));
         let aud = audit(listed, &pic, Duration::ZERO);
         assert_eq!(aud.objects, 5);
         assert_eq!(aud.matched, 2);

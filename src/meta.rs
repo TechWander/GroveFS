@@ -347,7 +347,13 @@ pub trait MetaProvider: Send + Sync {
             .iter()
             .map(|it| {
                 self.create_node_with_attr(
-                    it.parent, it.name, it.is_dir, it.data_ref, it.mode, it.uid, it.gid,
+                    it.parent,
+                    it.name,
+                    it.is_dir,
+                    it.data_ref,
+                    it.mode,
+                    it.uid,
+                    it.gid,
                 )
             })
             .collect()
@@ -388,10 +394,7 @@ pub trait MetaProvider: Send + Sync {
     /// without grouping a burst of `rm` costs a full commit per name and the
     /// rate stays flat however many FUSE workers join. A failing item stays in
     /// its own slot (`ENOENT`, `ENOTEMPTY`) and never fails its siblings.
-    fn unlink_nodes_batch(
-        &self,
-        items: &[(i64, &str)],
-    ) -> Vec<Result<Option<String>, MetaError>> {
+    fn unlink_nodes_batch(&self, items: &[(i64, &str)]) -> Vec<Result<Option<String>, MetaError>> {
         items.iter().map(|(p, n)| self.unlink(*p, n)).collect()
     }
     fn rename(

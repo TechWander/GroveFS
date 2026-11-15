@@ -202,7 +202,11 @@ fn remote_chunked_read_matches_piecewise_single_reads() {
             piecewise.extend_from_slice(&c.read(key, (off + done) as u64, n).unwrap());
             done += n;
         }
-        assert_eq!(chunked.len(), len, "chunked read len mismatch at {off}+{len}");
+        assert_eq!(
+            chunked.len(),
+            len,
+            "chunked read len mismatch at {off}+{len}"
+        );
         assert_eq!(chunked, piecewise, "chunked != piecewise at {off}+{len}");
         assert_eq!(chunked, data[off..off + len], "wrong bytes at {off}+{len}");
     }

@@ -162,17 +162,6 @@ fn gather_nodes(opts: &DuOpts) -> io::Result<Vec<FlatNode>> {
     }
     let store = resolve_store(&opts.store);
     match store.as_deref() {
-        #[cfg(feature = "fdb")]
-        Some(uri) if uri.starts_with("fdb://") => gather_fdb(uri, &opts.view),
-        #[cfg(not(feature = "fdb"))]
-        Some(uri) if uri.starts_with("fdb://") => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "{uri} names the FoundationDB backend, but this binary was built without \
-                 `--features fdb`; run `du --meta-server` against an FDB meta-server instead, \
-                 or drop --meta-store for a local SQLite view"
-            ),
-        )),
         Some(uri) => gather_pg(uri, &opts.view),
         None => {
             let db_path = opts.db_path.as_ref().ok_or_else(|| {
@@ -186,42 +175,17 @@ fn gather_nodes(opts: &DuOpts) -> io::Result<Vec<FlatNode>> {
     }
 }
 
-/// The FDB counterpart of `gather_pg`: one read-only subspace scan, no meta-server
-/// round trip. Opening read-only matters — `du` must not seed a root row for a
-/// view name that does not exist (the same "a probe must not create" rule
-/// `crate::mcp` applies to its PG probe), and the same existence probe decides
-/// whether this is a tree at all or a misspelt name.
-#[cfg(feature = "fdb")]
-fn gather_fdb(uri: &str, view: &str) -> io::Result<Vec<FlatNode>> {
-    if !crate::fdb_store::FdbStore::subspace_exists(uri, view).map_err(io::Error::other)? {
-        return Err(no_tree(view, uri));
-    }
-    let store = crate::fdb_store::FdbStore::open(uri, view, true)?;
-    Ok(store
-        .dump_tree()
-        .into_iter()
-        .map(|(id, parent_id, name, is_dir, data_ref)| FlatNode {
-            id,
-            parent_id,
-            name,
-            is_dir,
-            data_ref: data_ref.filter(|d| !d.is_empty()),
-        })
-        .collect())
-}
-
 fn resolve_store(explicit: &Option<String>) -> Option<String> {
     explicit
         .clone()
         .or_else(|| std::env::var("GROVEFS_META_STORE").ok())
 }
 
-/// One sentence for "this name has no tree here", raised by all three gatherers.
+/// One sentence for "this name has no tree here", raised by every gatherer.
 ///
-/// Without it a misspelt `--view` was answered three different ways: SQLite said
-/// `sqlite open ...: No such file or directory`, PG said `pg query: db error`
-/// (SQLSTATE 42P01 in disguise) and FDB said nothing at all — 0 B, byte-identical
-/// to a genuinely empty view. A measuring tool must not be able to report "empty"
+/// Without it a misspelt `--view` was answered two different ways: SQLite said
+/// `sqlite open ...: No such file or directory` and PG said `pg query: db error`
+/// (SQLSTATE 42P01 in disguise). A measuring tool must not be able to report "empty"
 /// for a name that does not exist.
 fn no_tree(view: &str, store: &str) -> io::Error {
     io::Error::other(format!(
@@ -685,9 +649,8 @@ fn resolve_remote(
                 // is never read as "move the root / pass --data-dir".
                 Err(e) if crate::backend::ShardedBackend::is_damaged(&e) => {
                     damaged += 1;
-                    first_damaged.get_or_insert_with(|| {
-                        crate::backend::ShardedBackend::damage_reason(&e)
-                    });
+                    first_damaged
+                        .get_or_insert_with(|| crate::backend::ShardedBackend::damage_reason(&e));
                 }
                 Err(e) => {
                     unconfirmed += 1;
@@ -867,8 +830,14 @@ mod tests {
     #[test]
     fn an_explicit_data_server_wins() {
         assert_eq!(
-            data_source_at(Some("h:1"), Some(&p("/r")), Some("m:2"), Some("pg"), Some(&p("/r")))
-                .unwrap(),
+            data_source_at(
+                Some("h:1"),
+                Some(&p("/r")),
+                Some("m:2"),
+                Some("pg"),
+                Some(&p("/r"))
+            )
+            .unwrap(),
             DataSource::Remote(vec!["h:1".into()])
         );
     }
@@ -916,8 +885,14 @@ mod tests {
     #[test]
     fn a_remote_tree_without_a_data_source_is_refused() {
         for (label, res) in [
-            ("--meta-server", data_source_at(None, None, Some("m:2"), None, Some(&p("/store")))),
-            ("--meta-store", data_source_at(None, None, None, Some("postgres://x"), Some(&p("/store")))),
+            (
+                "--meta-server",
+                data_source_at(None, None, Some("m:2"), None, Some(&p("/store"))),
+            ),
+            (
+                "--meta-store",
+                data_source_at(None, None, None, Some("postgres://x"), Some(&p("/store"))),
+            ),
         ] {
             let err = res.expect_err(&format!("{label} must not infer a local root"));
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{label}");
@@ -926,9 +901,7 @@ mod tests {
     }
 
     fn stripe(n: usize, keys: &[&str]) -> Vec<String> {
-        keys.iter()
-            .map(|k| format!("s{n}:16777216:{k}"))
-            .collect()
+        keys.iter().map(|k| format!("s{n}:16777216:{k}")).collect()
     }
 
     fn addrs(n: usize) -> Vec<String> {
@@ -942,7 +915,10 @@ mod tests {
         let err = check_server_count(&addrs(1), &stripe(2, &["a", "b"])).unwrap_err();
         let msg = err.to_string();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-        assert!(msg.contains("written across 2 data-servers but --data-servers names 1"), "{msg}");
+        assert!(
+            msg.contains("written across 2 data-servers but --data-servers names 1"),
+            "{msg}"
+        );
         assert!(msg.contains("host1:port,host2:port"), "{msg}");
     }
 
@@ -955,7 +931,10 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("extra addresses"), "{msg}");
         assert!(msg.contains("pass exactly the 2 addresses"), "{msg}");
-        assert!(!msg.contains("host1:port,host2:port"), "wrong direction: {msg}");
+        assert!(
+            !msg.contains("host1:port,host2:port"),
+            "wrong direction: {msg}"
+        );
     }
 
     /// Matching counts pass, including a legacy key with no layout prefix, which
@@ -965,7 +944,10 @@ mod tests {
         assert!(check_server_count(&addrs(2), &stripe(2, &["a"])).is_ok());
         let legacy = "550e8400-e29b-41d4-a716-446655440000".to_string();
         for n in 1..=3 {
-            assert!(check_server_count(&addrs(n), std::slice::from_ref(&legacy)).is_ok(), "{n} addrs");
+            assert!(
+                check_server_count(&addrs(n), std::slice::from_ref(&legacy)).is_ok(),
+                "{n} addrs"
+            );
         }
         // A striped tree plus legacy objects is measured by the striped list.
         let mut mixed = vec![legacy];
@@ -1002,7 +984,11 @@ mod tests {
             io::Error::new(K::TimedOut, "slow data-server"),
             io::Error::other("refusing to remap"),
         ] {
-            assert!(!confirmed_missing(&e), "{:?} is not an absent object", e.kind());
+            assert!(
+                !confirmed_missing(&e),
+                "{:?} is not an absent object",
+                e.kind()
+            );
         }
     }
 }

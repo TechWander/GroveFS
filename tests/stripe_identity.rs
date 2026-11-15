@@ -54,7 +54,11 @@ fn member(id: u64) -> String {
 fn remote_advertises_member_id_and_positional_server_advertises_none() {
     let with_id = member(7);
     let c = client(&with_id);
-    assert_eq!(c.placement_key(), Some(7), "server --member-id 7 must surface");
+    assert_eq!(
+        c.placement_key(),
+        Some(7),
+        "server --member-id 7 must surface"
+    );
 
     let plain = {
         let dir = tempfile::Builder::new()
@@ -80,8 +84,10 @@ fn reordered_identity_data_servers_read_a_striped_object_identically() {
     let data: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
 
     // Write through the canonical id order (a=id0, b=id1).
-    let canonical: Vec<Arc<dyn StorageBackend>> =
-        vec![client(&a) as Arc<dyn StorageBackend>, client(&b) as Arc<dyn StorageBackend>];
+    let canonical: Vec<Arc<dyn StorageBackend>> = vec![
+        client(&a) as Arc<dyn StorageBackend>,
+        client(&b) as Arc<dyn StorageBackend>,
+    ];
     let sb = ShardedBackend::new(canonical, stripe);
     let key = sb.new_key("obj");
     assert_eq!(
@@ -95,8 +101,10 @@ fn reordered_identity_data_servers_read_a_striped_object_identically() {
     // Reopen the SAME two servers but feed them in the REVERSED list order —
     // the misconfiguration that silently corrupts a positional stripe. Sorting
     // by id restores canonical placement, so reads are identical and no error.
-    let flipped: Vec<Arc<dyn StorageBackend>> =
-        vec![client(&b) as Arc<dyn StorageBackend>, client(&a) as Arc<dyn StorageBackend>];
+    let flipped: Vec<Arc<dyn StorageBackend>> = vec![
+        client(&b) as Arc<dyn StorageBackend>,
+        client(&a) as Arc<dyn StorageBackend>,
+    ];
     let sb2 = ShardedBackend::new(flipped, stripe);
     assert_eq!(sb2.len(&key).unwrap(), data.len() as u64);
     assert_eq!(

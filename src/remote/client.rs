@@ -159,11 +159,7 @@ impl RemoteBackend {
     /// [`Self::round_trip_write`] for a body supplied as slices: the epoch is
     /// prepended as a separate part, so a bulk `OP_WRITE` payload is never
     /// copied just to make room for the 8-byte prologue.
-    fn round_trip_write_parts(
-        &self,
-        op: u8,
-        parts: &[&[u8]],
-    ) -> io::Result<(i32, u64, Vec<u8>)> {
+    fn round_trip_write_parts(&self, op: u8, parts: &[&[u8]]) -> io::Result<(i32, u64, Vec<u8>)> {
         let epoch = self.fence_epoch.load(Ordering::SeqCst).to_be_bytes();
         let mut framed: Vec<&[u8]> = Vec::with_capacity(parts.len() + 1);
         framed.push(&epoch);
@@ -375,11 +371,7 @@ impl RemoteBackend {
     }
 
     /// One send + one recv on a borrowed socket, body supplied as slices.
-    fn call_parts(
-        s: &mut TcpStream,
-        op: u8,
-        parts: &[&[u8]],
-    ) -> io::Result<(i32, u64, Vec<u8>)> {
+    fn call_parts(s: &mut TcpStream, op: u8, parts: &[&[u8]]) -> io::Result<(i32, u64, Vec<u8>)> {
         proto::send_request_parts(s, op, parts)?;
         proto::recv_response(s)
     }

@@ -41,18 +41,12 @@
 //! - under PostgreSQL (`--meta-store postgres://…`) the SAME two tables live in the
 //!   shared `grovefs_control` schema ([`crate::control`]) — a key minted or
 //!   revoked against the URI is authoritative for every meta-server, MCP
-//!   server and CLI pointing at it, with no per-node file to colocate;
-//! - under FoundationDB (`--meta-store fdb://…`) they live IN that cluster, under
-//!   the `(root,'ctl',…)` sibling of the view prefixes
-//!   ([`crate::fdb_store::CtlKeyTable`]) — the credential plane travels with the
-//!   trees it governs, so a key minted against the URI admits a mount, an MCP
-//!   session and the governance port on every node aimed at that cluster, and a
-//!   revoke is one row edit for all of them.
+//!   server and CLI pointing at it, with no per-node file to colocate.
 //!
 //! The backend is picked once at open time ([`ApiKeyStore::open`] for the
-//! local file, [`ApiKeyStore::open_pg`] for a PG URI, [`ApiKeyStore::open_fdb`]
-//! for `fdb://`; [`ApiKeyStore::open_for`] routes like the view backend). All
-//! three expose identical columns, semantics and refusal strings.
+//! local file, [`ApiKeyStore::open_pg`] for a PG URI;
+//! [`ApiKeyStore::open_for`] routes like the view backend). Both
+//! expose identical columns, semantics and refusal strings.
 //! Mount gating reuses one store per metadata root (or per URI); a
 //! `data-server` on a node without the control plane sets `--meta-dir
 //! <base>` (see the CLI help).
@@ -289,8 +283,7 @@ const KEYS_DDL_PG: &str = "CREATE TABLE IF NOT EXISTS grovefs_control.api_keys (
 /// table upgrade (nothing is rewritten, no row is touched): it only makes the
 /// `owner` column visible so the single SELECT/INSERT spelling above works
 /// against an old file/schema.
-const OWNER_MIGRATE_SQLITE: &str =
-    "ALTER TABLE api_keys ADD COLUMN owner TEXT";
+const OWNER_MIGRATE_SQLITE: &str = "ALTER TABLE api_keys ADD COLUMN owner TEXT";
 const OWNER_MIGRATE_PG: &str =
     "ALTER TABLE grovefs_control.api_keys ADD COLUMN IF NOT EXISTS owner TEXT";
 const CALLS_DDL_PG: &str = "CREATE TABLE IF NOT EXISTS grovefs_control.mcp_calls (
@@ -308,9 +301,6 @@ const CALLS_DDL_PG: &str = "CREATE TABLE IF NOT EXISTS grovefs_control.mcp_calls
 enum Backend {
     Sqlite(parking_lot::Mutex<Connection>),
     Pg(PgPool),
-    /// The cluster-side tables of an `fdb://` deployment.
-    #[cfg(feature = "fdb")]
-    Fdb(crate::fdb_store::CtlKeyTable),
 }
 
 /// One credential row as the VERIFICATION path reads it: the column subset
@@ -382,33 +372,19 @@ impl ApiKeyStore {
         })
     }
 
-    /// Open the CLUSTER-side store of an `fdb://` deployment: the same two
-    /// tables as `(root,'ctl',…)` in the cluster the trees live in
-    /// ([`crate::fdb_store::CtlKeyTable`]). Same contract as the PG arm — a key
-    /// minted or revoked against the URI is authoritative for every node aimed at
-    /// it, and there is no per-node file to colocate.
-    #[cfg(feature = "fdb")]
-    pub fn open_fdb(uri: &str) -> Result<Self, String> {
-        Ok(Self {
-            backend: Backend::Fdb(crate::fdb_store::CtlKeyTable::open(uri)?),
-        })
-    }
-
     /// The store for a metadata-backend selection: a `postgres[ql]://` URI
-    /// routes to the PG control schema, an `fdb://` URI to the cluster's own
-    /// credential tables, anything else (including `None`) to the local file
-    /// under `base` — the same routing rule the view definitions follow
-    /// ([`crate::mcp::control_store_for`]).
+    /// routes to the PG control schema, anything else (including `None`) to the
+    /// local file under `base` — the same routing rule the view definitions
+    /// follow ([`crate::mcp::control_store_for`]). A `scheme://` URI neither
+    /// backend serves is refused rather than quietly read from a local file.
     pub fn open_for(base: &Path, store_uri: Option<&str>) -> Result<Self, String> {
         match store_uri {
             Some(u) if u.starts_with("postgres://") || u.starts_with("postgresql://") => {
                 Self::open_pg(u)
             }
-            // An `fdb://` deployment keeps ONE system of record too. Without the
-            // `fdb` feature such a store cannot have been opened at all, so the
-            // local file arm below is what remains for every buildable case.
-            #[cfg(feature = "fdb")]
-            Some(u) if u.starts_with("fdb://") => Self::open_fdb(u),
+            Some(u) if u.contains("://") => Err(format!(
+                "`{u}` is not a --meta-store scheme GroveFS supports: credentials live in a local SQLite file or PostgreSQL (`postgres://…`)"
+            )),
             _ => Self::open(base),
         }
     }
@@ -417,18 +393,6 @@ impl ApiKeyStore {
     /// verification rules themselves live in [`Self::authenticate_for`] and
     /// [`Self::live_state`], so they cannot drift per backend.
     fn fetch_key(&self, id: &str) -> Result<Option<StoredKey>, String> {
-        #[cfg(feature = "fdb")]
-        if let Backend::Fdb(t) = &self.backend {
-            return Ok(t.lookup(id)?.map(|r| StoredKey {
-                label: r.label,
-                secret_hash: r.secret_hash,
-                scope: r.scope,
-                revoked_at: r.revoked_at,
-                view: r.view,
-                ro: r.ro,
-                owner: r.owner,
-            }));
-        }
         let mut rows = self.query2(
             "SELECT label, secret_hash, scope, revoked_at, view, ro, owner FROM api_keys WHERE id = ?1",
             params![id],
@@ -457,18 +421,17 @@ impl ApiKeyStore {
                 )
             },
         )?;
-        Ok(
-            rows.pop()
-                .map(|(label, secret_hash, scope, revoked_at, view, ro, owner)| StoredKey {
-                    label,
-                    secret_hash,
-                    scope,
-                    revoked_at,
-                    view,
-                    ro: ro != 0,
-                    owner,
-                }),
-        )
+        Ok(rows.pop().map(
+            |(label, secret_hash, scope, revoked_at, view, ro, owner)| StoredKey {
+                label,
+                secret_hash,
+                scope,
+                revoked_at,
+                view,
+                ro: ro != 0,
+                owner,
+            },
+        ))
     }
 
     /// Record that `id` just authenticated. A no-op for an id that vanished
@@ -476,10 +439,6 @@ impl ApiKeyStore {
     /// the same behaviour a revoke racing an authentication has always had.
     fn stamp_used(&self, id: &str) -> Result<(), String> {
         let ts = now_iso();
-        #[cfg(feature = "fdb")]
-        if let Backend::Fdb(t) = &self.backend {
-            return t.stamp_used(id, &ts);
-        }
         self.exec2(
             "UPDATE api_keys SET last_used_at = ?1 WHERE id = ?2",
             params![ts, id],
@@ -509,10 +468,6 @@ impl ApiKeyStore {
             // cluster table before it reaches a SQL spelling. Reported instead of
             // `unreachable!()` so a future method that forgot the delegation is a
             // refusal rather than a panic inside a server.
-            #[cfg(feature = "fdb")]
-            Backend::Fdb(_) => {
-                Err("internal: the cluster key table does not speak SQL".to_string())
-            }
         }
     }
 
@@ -543,10 +498,6 @@ impl ApiKeyStore {
             }
             Backend::Pg(pool) => pool.query(sql_p, pp, mp),
             // See `exec2`: the public verbs route around this.
-            #[cfg(feature = "fdb")]
-            Backend::Fdb(_) => {
-                Err("internal: the cluster key table does not speak SQL".to_string())
-            }
         }
     }
 
@@ -582,22 +533,6 @@ impl ApiKeyStore {
         let full_key = format!("{id}:{secret}");
         let ts = now_iso();
         let sc = scope.as_str();
-        #[cfg(feature = "fdb")]
-        if let Backend::Fdb(t) = &self.backend {
-            t.insert_key(&crate::fdb_store::CtlKeyRow {
-                id: id.clone(),
-                label: label.to_string(),
-                secret_hash: hash,
-                created_at: ts,
-                last_used_at: None,
-                revoked_at: None,
-                scope: sc.to_string(),
-                view: view.map(str::to_string),
-                ro,
-                owner: owner.map(str::to_string),
-            })?;
-            return Ok((id, full_key));
-        }
         self.exec2(
             "INSERT INTO api_keys (id, label, secret_hash, created_at, scope, view, ro, owner) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![id, label, hash, ts, sc, view, ro as i64, owner],
@@ -715,10 +650,6 @@ impl ApiKeyStore {
     /// ([`Self::live_state`]); a session established AFTER this call reads
     /// the flag at `authenticate_for` as usual.
     pub fn set_ro(&self, id: &str, ro: bool) -> Result<bool, String> {
-        #[cfg(feature = "fdb")]
-        if let Backend::Fdb(t) = &self.backend {
-            return t.set_ro(id, ro);
-        }
         // Same rows-affected path shape as `revoke`: one conditional UPDATE
         // whose count distinguishes "flipped now" from "no active row".
         let n = match &self.backend {
@@ -733,34 +664,12 @@ impl ApiKeyStore {
                 "UPDATE grovefs_control.api_keys SET ro = $1 WHERE id = $2 AND revoked_at IS NULL",
                 &[&ro, &id],
             )? as usize,
-            #[cfg(feature = "fdb")]
-            Backend::Fdb(_) => {
-                return Err("internal: the cluster key table does not speak SQL".to_string())
-            }
         };
         Ok(n > 0)
     }
 
     /// Every key, newest first (secrets never leave the store).
     pub fn list(&self) -> Result<Vec<KeyInfo>, String> {
-        #[cfg(feature = "fdb")]
-        if let Backend::Fdb(t) = &self.backend {
-            return Ok(t
-                .list()?
-                .into_iter()
-                .map(|r| KeyInfo {
-                    id: r.id,
-                    owner: r.owner,
-                    label: r.label,
-                    scope: r.scope,
-                    view: r.view,
-                    ro: r.ro,
-                    created_at: r.created_at,
-                    last_used_at: r.last_used_at,
-                    revoked_at: r.revoked_at,
-                })
-                .collect());
-        }
         let rows = self.query2(
             "SELECT id, label, scope, view, ro, created_at, last_used_at, revoked_at, owner
              FROM api_keys ORDER BY created_at DESC",
@@ -802,10 +711,6 @@ impl ApiKeyStore {
     /// so historical `mcp_calls` rows keep their attribution.
     pub fn revoke(&self, id: &str) -> Result<bool, String> {
         let ts = now_iso();
-        #[cfg(feature = "fdb")]
-        if let Backend::Fdb(t) = &self.backend {
-            return t.revoke(id, &ts);
-        }
         let n = match &self.backend {
             Backend::Sqlite(m) => m
                 .lock()
@@ -819,10 +724,6 @@ impl ApiKeyStore {
                     "UPDATE grovefs_control.api_keys SET revoked_at = $1 WHERE id = $2 AND revoked_at IS NULL",
                     &[&ts, &id],
                 )? as usize,
-            #[cfg(feature = "fdb")]
-            Backend::Fdb(_) => {
-                return Err("internal: the cluster key table does not speak SQL".to_string())
-            }
         };
         Ok(n > 0)
     }
@@ -845,18 +746,6 @@ impl ApiKeyStore {
         let key_id = key.map(|k| k.id.clone());
         let key_label = key.map(|k| k.label.clone());
         let ts = now_iso();
-        #[cfg(feature = "fdb")]
-        if let Backend::Fdb(t) = &self.backend {
-            return t.append_call(&crate::fdb_store::CtlCallRow {
-                ts,
-                key_id,
-                key_label,
-                method: method.to_string(),
-                tool: tool.to_string(),
-                ok,
-                detail: detail.to_string(),
-            });
-        }
         self.exec2(
             "INSERT INTO mcp_calls (ts, key_id, key_label, method, tool, ok, detail)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -870,22 +759,6 @@ impl ApiKeyStore {
     /// Most recent `limit` audit rows (newest first — insertion order, which
     /// is the storage identity on both backends: SQLite `rowid`, PG `seq`).
     pub fn recent_calls(&self, limit: usize) -> Result<Vec<CallLog>, String> {
-        #[cfg(feature = "fdb")]
-        if let Backend::Fdb(t) = &self.backend {
-            return Ok(t
-                .recent_calls(limit)?
-                .into_iter()
-                .map(|r| CallLog {
-                    ts: r.ts,
-                    key_id: r.key_id,
-                    key_label: r.key_label,
-                    method: r.method,
-                    tool: r.tool,
-                    ok: r.ok,
-                    detail: r.detail,
-                })
-                .collect());
-        }
         let rows = self.query2(
             "SELECT ts, key_id, key_label, method, tool, ok, detail
              FROM mcp_calls ORDER BY rowid DESC LIMIT ?1",
@@ -956,8 +829,6 @@ mod tests {
                 )
                 .unwrap(),
             Backend::Pg(_) => unreachable!("unit store is the file backend"),
-            #[cfg(feature = "fdb")]
-            Backend::Fdb(_) => unreachable!("unit store is the file backend"),
         };
         assert_eq!(stored.len(), 64);
         assert_ne!(stored, key.split_once(':').unwrap().1);
@@ -1052,7 +923,9 @@ mod tests {
     #[test]
     fn live_state_carries_the_current_ro_flag() {
         let s = store();
-        let (id, _k) = s.create_bound("toggler", Scope::Mount, None, true, None).unwrap();
+        let (id, _k) = s
+            .create_bound("toggler", Scope::Mount, None, true, None)
+            .unwrap();
         assert!(s.live_state(&id, Scope::Mount).unwrap().ro, "minted --ro");
         assert!(s.set_ro(&id, false).unwrap());
         assert!(
@@ -1084,7 +957,9 @@ mod tests {
     #[test]
     fn set_ro_refuses_revoked_and_unknown_ids() {
         let s = store();
-        let (id, _k) = s.create_bound("gone", Scope::Mount, None, false, None).unwrap();
+        let (id, _k) = s
+            .create_bound("gone", Scope::Mount, None, false, None)
+            .unwrap();
         assert!(!s.set_ro("nosuchid", true).unwrap());
         assert!(s.revoke(&id).unwrap());
         assert!(
@@ -1165,7 +1040,9 @@ mod tests {
         assert_eq!(row.owner.as_deref(), Some("alice"));
         assert_eq!(row.scope, "admin");
         // …and the reverse direction is closed.
-        let (_mid, mkey) = s.create_bound("phone", Scope::Mount, None, false, Some("bob")).unwrap();
+        let (_mid, mkey) = s
+            .create_bound("phone", Scope::Mount, None, false, Some("bob"))
+            .unwrap();
         assert!(
             s.authenticate_admin(&mkey).is_err(),
             "a mount key must not open the governance entrance"

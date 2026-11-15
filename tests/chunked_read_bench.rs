@@ -165,7 +165,9 @@ fn run_round(round: &str) {
     });
     let dt = t0.elapsed();
     // Cheap order-sensitive checksum, so a mis-stitched buffer can't pass.
-    let sum: u64 = out.iter().fold(0u64, |a, &b| a.wrapping_mul(131).wrapping_add(b as u64));
+    let sum: u64 = out
+        .iter()
+        .fold(0u64, |a, &b| a.wrapping_mul(131).wrapping_add(b as u64));
     println!(
         "{round:>7}: {:>7.1} MiB/s  elapsed {:>6.3}s  rss {} -> {} MiB (peak +{} MiB)  len {}  sum {:#x}",
         SIZE as f64 / dt.as_secs_f64() / MIB as f64,
@@ -204,7 +206,12 @@ fn chunked_read_direct_vs_stitch_ab() {
         let line = stdout
             .lines()
             .find(|l| l.trim_start().starts_with(round))
-            .unwrap_or_else(|| panic!("{round}: no result line in\n{stdout}{}", String::from_utf8_lossy(&out.stderr)));
+            .unwrap_or_else(|| {
+                panic!(
+                    "{round}: no result line in\n{stdout}{}",
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            });
         println!("{line}");
         sums.push(
             line.rsplit("sum ")

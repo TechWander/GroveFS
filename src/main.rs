@@ -395,8 +395,8 @@ enum Cmd {
         /// view DB lives under `<meta-dir>/meta/<view>.db` (created explicitly
         /// by `view create` / `init` / `view import`, never by a mount) and
         /// the API-key/audit store lives at `<meta-dir>/meta/api_keys.db`;
-        /// under PostgreSQL (`--meta-store postgres://…`) or FoundationDB
-        /// (`--meta-store fdb://…`) the view trees AND the control plane
+        /// under PostgreSQL (`--meta-store postgres://…`) the view trees AND the
+        /// control plane
         /// (definitions, keys, audit) live in that engine, making `<meta-dir>` a
         /// config-only directory (logs, scratch — no authoritative record). Takes
         /// precedence over the global `--home` when both are given.
@@ -486,21 +486,14 @@ enum Cmd {
         /// shipping available. Set to `postgres://user:pw@host:port/db`
         /// (`postgresql://…` also accepted) to place the authoritative view
         /// tree in PostgreSQL: one `grovefs_v_<hex(view)>` schema per view,
-        /// transactions for rename/unlink/lock. Set to
-        /// `fdb://<path-to-cluster-file>` (accepted only by a binary built
-        /// `--features fdb`) to place it in FoundationDB — EXPERIMENTAL, kept out
-        /// of the supported surface because the throughput gate measured fail
-        /// (see USAGE §6.3): one tuple-layer
-        /// subspace per view, native strict serializability with OCC at commit
-        /// for rename/unlink/lock, and no local `meta/` tree at all. An
-        /// `fdb://` URI handed to a binary built WITHOUT the feature is refused
-        /// at startup — it is never silently served by SQLite. Note that BOTH
-        /// non-SQLite modes are **incompatible** with `--role standby` /
+        /// transactions for rename/unlink/lock. Note that the PostgreSQL mode
+        /// is **incompatible** with `--role standby` /
         /// `--peer` / `--witness`: GroveFS-native HA snapshot shipping is
         /// `VACUUM INTO`-based and only makes sense on the embedded SQLite
         /// backend; under PG, run PostgreSQL's own streaming/logical replication
-        /// for HA instead, and under FDB the cluster already replicates and
-        /// snapshots itself (`fdbbackup`).
+        /// for HA instead.
+        /// Any other `scheme://` URI is refused at startup — it is never
+        /// silently served by SQLite.
         #[arg(long = "meta-store", value_name = "URI")]
         store: Option<String>,
         /// Retire a view's cached metadata engine — its PG connection pool
@@ -509,10 +502,7 @@ enum Cmd {
         /// stay resident for the process lifetime). Idle views re-open
         /// transparently on the next op, so resident PG connections scale
         /// with RECENTLY USED views instead of every view opened since start:
-        /// the view-count ceiling stops being `max_connections / 12`. Under
-        /// `fdb://` there is no per-view connection to close — one cluster
-        /// handle serves every view — so the same knob reclaims in-process
-        /// memory only: a memory bound rather than a scalability gate.
+        /// the view-count ceiling stops being `max_connections / 12`.
         #[arg(long = "engine-idle-secs", value_name = "SECS", default_value_t = 300)]
         engine_idle_secs: u64,
         /// Expose the REMOTE CONTROL PLANE on a second listener
@@ -547,8 +537,8 @@ enum Cmd {
     /// mountable); a FORK is an independent metadata tree seeded from a base —
     /// structure writable, content read-only (EROFS), deletes touch only the
     /// fork. Definitions live in the control-plane store (SQLite
-    /// `<meta-dir>/meta/views/<name>.layout`, PG `grovefs_control.view_defs`,
-    /// `fdb://` the cluster's `ctl` subspace), clients simply mount
+    /// `<meta-dir>/meta/views/<name>.layout`, PG `grovefs_control.view_defs`),
+    /// clients simply mount
     /// `--view <name>` and need no local rules file. A `meta-server` resolves
     /// them at `M_OPEN`; a local mount resolves them from `--home`. Rules are
     /// display customization, NOT a security boundary — hard isolation stays
@@ -563,16 +553,14 @@ enum Cmd {
     View {
         /// The metadata root — same option name and directory as `meta-server
         /// --meta-dir` / `grovefs apikey --meta-dir`; falls back to the global
-        /// `--home` when omitted. Under SQLite it holds `meta/views/*.layout`;
-        /// under `fdb://` the definitions are cluster rows and this root is only
-        /// a scratch/config directory (no authoritative record).
+        /// `--home` when omitted. Under SQLite it holds `meta/views/*.layout`.
         #[arg(long = "meta-dir", value_name = "DIR")]
         db_path: Option<PathBuf>,
         /// Control-plane backend. Unset / `"sqlite"` governs the local
         /// `<meta-dir>/meta/views/*.layout` files; a `postgres://…`
         /// (`postgresql://…` too) URI governs the shared `grovefs_control.view_defs`
-        /// table; an `fdb://…` URI governs the cluster's `ctl` subspace. Either
-        /// URI — or the `GROVEFS_META_STORE` env — makes definitions and the
+        /// table. A `postgres://…` URI — or the `GROVEFS_META_STORE` env — makes
+        /// definitions and the
         /// meta-server's own resolver read/write ONE system of record. Must
         /// match the `meta-server --meta-store` this root is served by.
         #[arg(long = "meta-store", value_name = "URI")]
@@ -718,18 +706,18 @@ NOTES
     /// every create/delete — but a view db removed OUT-OF-BAND (`rm meta/x.db`,
     /// a fresh `--home`) never released its holds, so the ledger over-counts and
     /// keeps bytes too long. `refs rebuild` rewrites it from the trees that
-    /// actually exist. SQLite-backed stores (and, with `--meta-store fdb://…`,
-    /// the cluster's own shared ledger — the one backend that otherwise had no
-    /// repair path at all). See `grovefs view create`.
+    /// actually exist. Works on the SQLite store (`meta/refs.db`) and, through
+    /// `--meta-store postgres://…`, on the ledger that lives IN the PostgreSQL
+    /// schemas. See `grovefs view create`.
     Refs {
         /// The metadata root holding `meta/refs.db` and the per-view trees
         /// `meta/*.db` — same option name and directory as `meta-server
         /// --meta-dir`; falls back to the global `--home`.
         #[arg(long = "meta-dir", value_name = "DIR")]
         db_path: Option<PathBuf>,
-        /// Metadata STORE URI: `fdb://<cluster-file>` rebuilds the ledger that
-        /// lives IN the cluster instead of `meta/refs.db`. Falls back to
-        /// `$GROVEFS_META_STORE`, exactly like `gc`'s backend guards.
+        /// Metadata STORE URI: a `postgres://…` URI rebuilds the ledger that
+        /// lives IN the PostgreSQL schemas instead of `meta/refs.db`. Falls back
+        /// to `$GROVEFS_META_STORE`, exactly like `gc`'s backend guards.
         #[arg(long = "meta-store", value_name = "URI")]
         store: Option<String>,
         /// Rebuild the ledger on the REMOTE deployment behind `meta-server
@@ -755,9 +743,9 @@ NOTES
     ///
     /// Two ways to reach the store. `<data-dir>/blocks/` is audited in place,
     /// which is the local deployment. With `--control-server` the TREES are read
-    /// by the server that owns them — SQLite, PostgreSQL or FoundationDB — and
+    /// by the server that owns them — SQLite or PostgreSQL — and
     /// the objects are listed from `--data-servers`, so any machine holding an
-    /// admin key runs the same audit for any backend.
+    /// admin key runs the same audit for either backend.
     ///
     /// `--apply` deletes only objects older than `--older-than` (a hard-linked
     /// import inherits the SOURCE file's mtime, so young-object filtering alone
@@ -826,13 +814,13 @@ NOTES
     /// source. The target must be a PHYSICAL view — importing into a derived
     /// (virtual) name is refused, since virtual views mount read-only. Live
     /// `meta-server` mounts converge within their attr/dentry TTL (≤2s, no
-    /// remount); a non-SQLite deployment is REFUSED outright — under
-    /// `--meta-store postgres://…` the authoritative tree is a PG schema and
-    /// under `fdb://…` it is one subspace of the cluster, so in both cases the
+    /// remount); a PostgreSQL deployment is REFUSED outright — under
+    /// `--meta-store postgres://…`
+    /// the authoritative tree is a PG schema, so the
     /// bytes move through a mounted path (rsync into the mount), not through
     /// this command. `--meta-store` (or `GROVEFS_META_STORE`) declares the
-    /// deployment's backend, and a non-SQLite URI is refused rather than served
-    /// as a local import the deployment never sees.
+    /// deployment's backend, and a `postgres://…` URI is refused rather than
+    /// served as a local import the deployment never sees.
     Import {
         /// Metadata root holding `meta/<view>.db` — same option name and
         /// directory as `meta-server --meta-dir`; falls back to `--home`.
@@ -853,7 +841,7 @@ NOTES
         source: PathBuf,
         /// Metadata backend of the deployment this import would write into. The
         /// command produces a LOCAL SQLite tree (`meta/<view>.db` plus hardlinks
-        /// or copies under `blocks/`), so a `postgres://…` or `fdb://…` store —
+        /// or copies under `blocks/`), so a `postgres://…` store —
         /// given here or through `GROVEFS_META_STORE` — is REFUSED with the
         /// alternative named (rsync/cp through a mounted path), never silently
         /// served as a SQLite import the deployment's meta-server cannot see.
@@ -929,7 +917,9 @@ NOTES
 }
 
 #[derive(Subcommand)]
-#[command(after_help = "Four view kinds - the verb that creates each:\n  base     -> view create --view V                 (or: grovefs init --view V)\n  derived  -> view define  --base B --name D --rules F   (read-only lens)\n  alias    -> view alias   --real R --name A             (public name, writable)\n  fork     -> view fork    --base B --name F             (fill it with: view graft)\nOnly a BASE view owns physical deletion; derived/alias/fork reshape or rename one.")]
+#[command(
+    after_help = "Four view kinds - the verb that creates each:\n  base     -> view create --view V                 (or: grovefs init --view V)\n  derived  -> view define  --base B --name D --rules F   (read-only lens)\n  alias    -> view alias   --real R --name A             (public name, writable)\n  fork     -> view fork    --base B --name F             (fill it with: view graft)\nOnly a BASE view owns physical deletion; derived/alias/fork reshape or rename one."
+)]
 enum ViewAction {
     /// Create a NEW BASE (physical) view named `--view`, seeding its empty tree
     /// root (optionally from `--manifest`). This is the deliberate, explicit
@@ -966,11 +956,9 @@ enum ViewAction {
     /// names stay.
     ///
     /// The base must be a PHYSICAL view (a name with a tree of its own and no
-    /// definition). Every metadata backend can fork: SQLite copies a `.db`
-    /// file's rows, PostgreSQL copies one `grovefs_v_<hex>` schema into another,
-    /// FoundationDB copies one subspace into another — each in one transaction,
-    /// or in several when the tree exceeds one (the FDB arm splits it at 70% of
-    /// its 10 MB limit, root row LAST).
+    /// definition). Both metadata backends can fork: SQLite copies a `.db`
+    /// file's rows, PostgreSQL copies one `grovefs_v_<hex>` schema into another
+    /// — each in one transaction.
     Fork {
         #[arg(long)]
         name: String,
@@ -987,12 +975,12 @@ enum ViewAction {
     /// `<src>` (keep its basename, placed in `--dest`) or `<src>TAB<dst>`
     /// (rename and/or another directory). `--map -` reads the plan from
     /// stdin, so an external program can generate it on the fly. A directory
-    /// source brings its whole subtree; the placement is all-or-nothing while it
-    /// fits one transaction and copies no bytes — rows enter the fork, objects
-    /// stay shared through the cross-view ledger. A plan too large for one
-    /// transaction (FDB's 10 MB limit) is placed in several, an oversized
-    /// directory included; the batches already committed stay if a later one
-    /// fails, and re-running the same plan with `--skip-existing` continues
+    /// source brings its whole subtree; the placement is all-or-nothing — one
+    /// transaction on either backend — and copies no
+    /// bytes: rows enter the fork, objects
+    /// stay shared through the cross-view ledger. A plan that does not fit one
+    /// transaction fails whole and writes nothing; re-running a partially
+    /// applied plan with `--skip-existing` continues
     /// where it stopped. An existing name refuses the
     /// plan unless `--skip-existing` leaves it alone. Only a view that OWNS
     /// its tree (a fork) can receive.
@@ -1019,7 +1007,7 @@ enum ViewAction {
     /// from `--rules FILE` (same verbs as `mount --layout`: hide/only/map/link).
     /// Against a `meta-server`, live mounts of that name pick the new shape up
     /// automatically (the server re-checks the definition's change ticket per op
-    /// — mtime under SQLite, the cluster write version under `fdb://`; the
+    /// — mtime under SQLite; the
     /// client converges within its attr/dentry TTL, ≤2s — no remount). A local
     /// (`--home`) mount resolves the definition once at mount time. Mounts of
     /// the derived name are READ-ONLY (writes belong to the base view).
@@ -1038,49 +1026,6 @@ enum ViewAction {
     /// trees, structure writable / content read-only) and pure aliases
     /// (name → real view, writable).
     List,
-    /// Inventory the CLUSTER instead of this meta-dir: every subspace under the
-    /// `grovefs` root, with key count, entry count and prefix hex. `--meta-store
-    /// fdb://…` only.
-    ///
-    /// The two answers differ in KIND: under `fdb://` both the definitions and
-    /// the trees are cluster rows, but `view list` is the GOVERNANCE catalog (the
-    /// derived/alias/fork definitions and the base names they resolve to), while
-    /// this walks every physical subspace under the root with its key and entry
-    /// counts and prefix hex — so it surfaces a subspace no definition references
-    /// (a test run, an abandoned migration, an import nobody mounted) and the
-    /// non-view subspaces (ledger, writer lease, credentials). This is the command
-    /// that makes those visible, and the one to run before/after `view rm --base`.
-    Scan,
-    /// Inspect or clear the CLUSTER's writer leases: the rows that say which
-    /// meta-server may write a given deployment (`--meta-dir`). `--meta-store
-    /// fdb://…` only.
-    ///
-    /// A `fdb://` meta-server takes one lease row per deployment at startup and
-    /// renews it while it serves, so two servers behind the SAME control plane
-    /// cannot both write the cluster; the second one waits up to one TTL for a
-    /// crashed holder's row to expire and then refuses. This command is the
-    /// operator's half of that contract: it shows who holds what and how long is
-    /// left, and it clears a row whose holder will never come back (a machine
-    /// that was destroyed, not merely stopped).
-    ///
-    /// Releasing a LIVE row is refused unless `--force` says so explicitly — a
-    /// live holder is still renewing, and dropping its row would let a second
-    /// server start while the first keeps writing. With `--force` the fence is
-    /// deliberate: the old holder notices on its next renewal and exits instead
-    /// of continuing beside the new one.
-    Lease {
-        /// The deployment to act on: the server's `--meta-dir`, canonicalized the
-        /// same way the server canonicalizes it. Default: list every row.
-        #[arg(long = "deployment", value_name = "DIR")]
-        deployment: Option<PathBuf>,
-        /// Clear the row for `--deployment` (an expired row clears without
-        /// `--force`; a live one needs it).
-        #[arg(long)]
-        release: bool,
-        /// Clear even a LIVE row — fences a holder that cannot be stopped.
-        #[arg(long)]
-        force: bool,
-    },
     /// Remove a view. WITHOUT `--base`: remove the view DEFINITION `--name`
     /// (derived, fork or alias — the file slot is shared). For derived/alias
     /// the underlying data is untouched; already-mounted clients keep their
@@ -1097,11 +1042,8 @@ enum ViewAction {
     /// root/data-server that actually stores the objects).
     ///
     /// What "the tree" is depends on the backend the name lives in. A local
-    /// store loses `meta/<name>.db` (+ WAL/SHM); with `--meta-store fdb://…`
-    /// the tree IS one subspace of the cluster, so the command clears the whole
-    /// subspace, recomputes the shared `refs` ledger from the trees that
-    /// survive, and then frees the objects nothing names any more — the same
-    /// one-range operation `docs/fdb-keyspace.md` §3.3 describes. With
+    /// store loses `meta/<name>.db` (+ WAL/SHM) and the shared `refs` ledger is
+    /// recomputed from the trees that survive. With
     /// `--meta-store postgres://…` the tree is a `grovefs_v_<hex>` schema, so
     /// the command unbooks what the schema held and drops it in ONE
     /// transaction (PostgreSQL's DDL is transactional), then frees the same
@@ -1158,9 +1100,9 @@ enum ViewAction {
     /// the export reproduces the view on another machine. No host path, device
     /// id or hostname is stored. Virtual names (alias/derived) have no tree of
     /// their own and are refused — export the physical base they resolve to.
-    /// With `--meta-store fdb://…` the same command reads that view's subspace
-    /// instead of a local tree; a name the cluster never provisioned is refused
-    /// outright, so no empty dump is written for it.
+    /// With `--meta-store postgres://…` the same command reads that view's PG
+    /// schema instead of a local tree; a name the schema set never provisioned
+    /// is refused outright, so no empty dump is written for it.
     Export {
         #[arg(long)]
         view: String,
@@ -1178,14 +1120,12 @@ enum ViewAction {
     /// stopped first. Content bytes are not in the file: copy the referenced
     /// `blocks/` tree to the target store. Add `--as-fork <base>` to record
     /// `fork <base>` after a successful import (the imported tree then keeps
-    /// fork semantics: structure writable, content EROFS). With
-    /// `--meta-store fdb://…` the import instead OPENS that view's subspace in
-    /// the cluster — the only tree-building entry besides `view create` — and
-    /// `--as-fork` records the definition there too (the tree is the subspace
-    /// the dump just filled; if writing `fork <base>` fails, the subspace is
-    /// cleared again). A dump larger than one transaction is written in several
-    /// under `fdb://`, root row LAST, so an interrupted import leaves an
-    /// unmountable partial tree a later `--replace` continues from.
+    /// fork semantics: structure writable, content EROFS). Under
+    /// `--meta-store postgres://…` the import instead OPENS that view's schema
+    /// in the database — the only tree-building entry besides `view create` —
+    /// and `--as-fork` records the definition there too (the tree is the schema
+    /// the dump just filled; if writing `fork <base>` fails, the schema is
+    /// dropped again).
     Import {
         #[arg(long)]
         view: String,
@@ -1396,16 +1336,14 @@ fn resolve_bw(flag: Option<u64>, env_key: &str) -> Result<u64, Box<dyn std::erro
 /// new `data_ref`). When neither is given, the built-in default
 /// (`backend::STRIPE_BYTES`, 16 MiB) is returned. A `0` value is refused by
 /// the parser (a zero stripe is meaningless).
-fn resolve_stripe(
-    flag: Option<u64>,
-    env_key: &str,
-) -> Result<u64, Box<dyn std::error::Error>> {
+fn resolve_stripe(flag: Option<u64>, env_key: &str) -> Result<u64, Box<dyn std::error::Error>> {
     if let Some(v) = flag {
         return Ok(v);
     }
     match std::env::var(env_key) {
-        Ok(s) if !s.trim().is_empty() => grovefs::bwlimit::parse_size_bytes(&s)
-            .map_err(|e| format!("{env_key}: {e}").into()),
+        Ok(s) if !s.trim().is_empty() => {
+            grovefs::bwlimit::parse_size_bytes(&s).map_err(|e| format!("{env_key}: {e}").into())
+        }
         _ => Ok(grovefs::backend::STRIPE_BYTES),
     }
 }
@@ -1445,21 +1383,18 @@ fn open_existing_view(base: &Path, view: &str) -> Result<MetaEngine, Box<dyn std
 
 /// Resolve the metadata backend URI for a CONTROL-plane command. The explicit
 /// `--meta-store` flag wins; otherwise the `GROVEFS_META_STORE` env fills the default
-/// (same flag > env chain as `--token`/`--home`). `None` / a value that is neither
-/// `postgres[ql]://` nor `fdb://` means the local SQLite/file control plane; a
+/// (same flag > env chain as `--token`/`--home`). `None` / a value that is not a
+/// `postgres[ql]://` URI means the local SQLite/file control plane; a
 /// `postgres[ql]://` URI routes api_keys and view definitions to the shared
-/// `grovefs_control` schema, and an `fdb://` URI routes them to the cluster's
-/// `ctl` subspace. This is what makes the control plane FOLLOW the metadata
-/// backend — one system of record, never a local file a PG or FDB deployment
+/// `grovefs_control` schema. This is what makes the control plane FOLLOW the
+/// metadata backend — one system of record, never a local file a PG deployment
 /// would silently ignore.
 ///
-/// All three backends govern from one place: SQLite from `<meta-dir>` files, PG
-/// from `grovefs_control`, FDB from the cluster `ctl` subspace — definitions in
-/// `CtlDefTable`, keys/audit in `CtlKeyTable`, the I1–I4 invariants over FDB keys
-/// — so every meta-server/MCP/CLI on the cluster shares one authoritative record
-/// exactly as PG. `MetaServer::serve()` still refuses to pair `fdb://` with
-/// `--peer`/`--role standby`: GroveFS-native HA snapshot shipping is SQLite-only,
-/// and the cluster already replicates and snapshots itself (`fdbbackup`).
+/// Both backends govern from one place: SQLite from `<meta-dir>` files, PG from
+/// `grovefs_control` — so every meta-server/MCP/CLI on a deployment shares one
+/// authoritative record. `MetaServer::serve()` still refuses to pair
+/// `--meta-store postgres://…` with `--peer`/`--role standby`: GroveFS-native HA
+/// snapshot shipping is SQLite-only, and PostgreSQL has its own replication.
 fn resolve_store(explicit: Option<String>) -> Option<String> {
     explicit.or_else(|| std::env::var("GROVEFS_META_STORE").ok())
 }
@@ -1486,7 +1421,9 @@ fn remote_control(
              `grovefs apikey --meta-dir <server-meta-dir> create --for admin --owner <account>`."
         )
     })?;
-    Ok(grovefs::control_remote::RemoteControlStore::connect(addr, &key)?)
+    Ok(grovefs::control_remote::RemoteControlStore::connect(
+        addr, &key,
+    )?)
 }
 
 /// The control plane a governance command should talk to: the remote one when
@@ -1502,9 +1439,7 @@ fn control_store_for_target(
 ) -> Result<Arc<dyn grovefs::mcp::ControlStore>, Box<dyn std::error::Error>> {
     match control_server {
         Some(addr) => Ok(Arc::new(remote_control(addr, control_key)?)),
-        None => {
-            Ok(grovefs::mcp::control_store_for(vbase, store)?)
-        }
+        None => Ok(grovefs::mcp::control_store_for(vbase, store)?),
     }
 }
 
@@ -1528,51 +1463,19 @@ fn refuse_local_with_remote(
     Ok(())
 }
 
-/// The `view` verb a refusal message should name. Kept separate from the
-/// dispatch so the "this one needs the bytes' host" error reads like the
-/// subcommand the operator typed.
-fn view_action_name(a: &ViewAction) -> &'static str {
-    match a {
-        ViewAction::Create { .. } => "create",
-        ViewAction::Fork { .. } => "fork",
-        ViewAction::Graft { .. } => "graft",
-        ViewAction::Define { .. } => "define",
-        ViewAction::List => "list",
-        ViewAction::Scan => "scan",
-        ViewAction::Lease { .. } => "lease",
-        ViewAction::Rm { .. } => "rm",
-        ViewAction::Alias { .. } => "alias",
-        ViewAction::Export { .. } => "export",
-        ViewAction::Import { .. } => "import",
-    }
-}
-
 /// Undo a just-imported tree whose `fork <base>` definition could not be
 /// recorded. The tree exists on whichever backend the store names, so the undo
-/// has to be backend-aware: a `<view>.db` file, a PG schema, an FDB subspace.
+/// has to be backend-aware: a `<view>.db` file or a PG schema.
 /// Bytes are never touched — they are still named by the source tree, and the
 /// ledger follows the trees that exist.
 fn rollback_imported_tree(vbase: &Path, store: Option<&str>, view: &str) -> String {
     let uri = store.unwrap_or("");
-    if uri.starts_with("fdb://") {
-        #[cfg(feature = "fdb")]
-        {
-            return match grovefs::fdb_store::FdbStore::drop_tree(uri, view) {
-                Ok(()) => "the imported tree was removed again".to_string(),
-                Err(e) => format!(
-                    "the imported tree could NOT be removed ({e}) — clear its subspace by hand"
-                ),
-            };
-        }
-        #[cfg(not(feature = "fdb"))]
-        return "the imported tree could not be removed by this build (no --features fdb)".to_string();
-    }
     if uri.starts_with("postgres://") || uri.starts_with("postgresql://") {
         return match grovefs::pg_store::PgEngine::remove_view(uri, view) {
             Ok(_) => "the imported tree was removed again".to_string(),
-            Err(e) => format!(
-                "the imported tree could NOT be removed ({e}) — drop its schema by hand"
-            ),
+            Err(e) => {
+                format!("the imported tree could NOT be removed ({e}) — drop its schema by hand")
+            }
         };
     }
     for ext in ["", "-wal", "-shm"] {
@@ -1602,9 +1505,9 @@ impl KeyAdmin {
             Self::Local(k) => k.list(),
             Self::Remote(c) => {
                 let rows = c.call("apikey.list", serde_json::json!({}))?;
-                let arr = rows
-                    .as_array()
-                    .ok_or_else(|| "malformed control reply: apikey.list is not an array".to_string())?;
+                let arr = rows.as_array().ok_or_else(|| {
+                    "malformed control reply: apikey.list is not an array".to_string()
+                })?;
                 let s = |v: &serde_json::Value, f: &str| -> Result<String, String> {
                     v.get(f)
                         .and_then(|x| x.as_str())
@@ -1657,14 +1560,12 @@ impl KeyAdmin {
                         "owner": owner,
                     }),
                 )?;
-                let id = r
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| "malformed control reply: apikey.create without an id".to_string())?;
-                let key = r
-                    .get("key")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| "malformed control reply: apikey.create without a key".to_string())?;
+                let id = r.get("id").and_then(|v| v.as_str()).ok_or_else(|| {
+                    "malformed control reply: apikey.create without an id".to_string()
+                })?;
+                let key = r.get("key").and_then(|v| v.as_str()).ok_or_else(|| {
+                    "malformed control reply: apikey.create without a key".to_string()
+                })?;
                 Ok((id.to_string(), key.to_string()))
             }
         }
@@ -1695,9 +1596,9 @@ impl KeyAdmin {
             Self::Local(k) => k.recent_calls(limit),
             Self::Remote(c) => {
                 let rows = c.call("apikey.calls", serde_json::json!({ "limit": limit }))?;
-                let arr = rows
-                    .as_array()
-                    .ok_or_else(|| "malformed control reply: apikey.calls is not an array".to_string())?;
+                let arr = rows.as_array().ok_or_else(|| {
+                    "malformed control reply: apikey.calls is not an array".to_string()
+                })?;
                 let opt = |v: &serde_json::Value, f: &str| -> Option<String> {
                     v.get(f).and_then(|x| x.as_str()).map(str::to_string)
                 };
@@ -1765,14 +1666,6 @@ fn main() {
     // operator and the test board read, and a refused command is judged by it.
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
-    // A command that talked to a FoundationDB cluster started the client's
-    // network thread; `libfdb_c` wants that thread stopped and joined before the
-    // process exits, and an early exit (a refusal that returns before its first
-    // round trip) used to race the teardown instead — an intermittent SIGSEGV
-    // where the refusal's rc=1 belongs. A daemon does not come here until its
-    // serve loop has really returned. No-op without `--features fdb`.
-    #[cfg(all(feature = "native", feature = "fdb"))]
-    grovefs::fdb_store::shutdown_network();
     std::process::exit(rc);
 }
 
@@ -2207,7 +2100,11 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 threads
             };
-            cfg.n_threads = if effective_threads > 1 { Some(effective_threads) } else { None };
+            cfg.n_threads = if effective_threads > 1 {
+                Some(effective_threads)
+            } else {
+                None
+            };
             cfg.clone_fd = effective_threads > 1;
             // Match the metadata read pool to the dispatch width: at most
             // `effective_threads` requests are ever in flight, so a narrower pool
@@ -2334,9 +2231,11 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             let member_id = match member_id {
                 Some(v) => Some(v),
                 None => match std::env::var("GROVEFS_MEMBER_ID") {
-                    Ok(s) if !s.trim().is_empty() => Some(s.trim().parse::<u64>().map_err(|_| {
-                        format!("GROVEFS_MEMBER_ID: invalid integer '{}'", s.trim())
-                    })?),
+                    Ok(s) if !s.trim().is_empty() => {
+                        Some(s.trim().parse::<u64>().map_err(|_| {
+                            format!("GROVEFS_MEMBER_ID: invalid integer '{}'", s.trim())
+                        })?)
+                    }
                     _ => None,
                 },
             };
@@ -2436,13 +2335,6 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             let store_is_pg = store
                 .as_deref()
                 .is_some_and(|u| u.starts_with("postgres://") || u.starts_with("postgresql://"));
-            // `fdb://` is detected whether or not the binary links libfdb_c: the
-            // CLI must never fall through to the SQLite branch and write a local
-            // `<view>.db` that an FDB meta-server will not read (refuse-not-
-            // downgrade, the same rule `with_store` applies).
-            let store_is_fdb = store
-                .as_deref()
-                .is_some_and(|u| u.starts_with("fdb://"));
             // The same `ControlStore` the MCP server drives — except that with
             // `--control-server` it is a thin client of the meta-server's
             // governance port, so the definitions/aliases of a PG *or SQLite*
@@ -2453,32 +2345,10 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                 control_server.as_deref(),
                 resolve_control_key(control_key.clone()),
             )?;
-            // The ops that are NOT governance (they walk a local byte root or a
-            // local cluster handle) cannot be served remotely; name them instead
-            // of silently operating on this machine's empty `--home`. Notably
-            // `export`/`import` are NOT on this list any more: the dump travels
-            // in chunks and only the operator's path is local (see the arms).
             let remote_ctl = control_server.as_deref().map(|a| {
                 let key = resolve_control_key(control_key).unwrap_or_default();
                 grovefs::control_remote::ControlClient::new(a, &key)
             });
-            if let Some(rc) = &remote_ctl {
-                match &action {
-                    ViewAction::Scan | ViewAction::Lease { .. } => {
-                        return Err(format!(
-                            "`view {}` is not a governance op: it moves or inspects TREE BYTES or \
-                             cluster state on this machine, so it cannot run through --control-server {}. \
-                             Governance over the wire covers view create/define/alias/list/rm \
-                             (including --base), fork/graft, export/import, apikey and refs; run this one \
-                             on the server host with --meta-dir/--meta-store.",
-                            view_action_name(&action),
-                            rc.addr(),
-                        )
-                        .into());
-                    }
-                    _ => {}
-                }
-            }
             // A PG deployment has no local per-view db file: a base tree is a
             // `grovefs_v_<hex(view)>` schema that `view create` provisions
             // explicitly, and its bytes move through a mount — so the file-level
@@ -2488,11 +2358,6 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                 if store_is_pg {
                     Err(format!(
                         "{op} operates on a local SQLite view db; under `--meta-store postgres://…` a base tree is a PG schema (create one with `view create`) and its bytes move through a mounted path — drop --meta-store for a local store"
-                    )
-                    .into())
-                } else if store_is_fdb {
-                    Err(format!(
-                        "{op} operates on a local SQLite view db; under `--meta-store fdb://…` a base tree is a subspace of the FoundationDB cluster (create one with `view create`) and its bytes move through a mounted path — drop --meta-store for a local store"
                     )
                     .into())
                 } else {
@@ -2537,55 +2402,6 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                             .call("view.create", args)
                             .map_err(Box::<dyn std::error::Error>::from)?;
                         println!("{} (via {})", r.as_str().unwrap_or("created"), rc.addr());
-                    } else if store_is_fdb {
-                        if manifest.is_some() {
-                            return Err("`view create --manifest` seeds a SQLite db file; under `--meta-store fdb://…` mount the view and write the files instead".into());
-                        }
-                        let uri = store.as_deref().expect("fdb:// is a store uri");
-                        #[cfg(feature = "fdb")]
-                        {
-                            // `has_physical` above already asks the CLUSTER for the root
-                            // row, so a healthy subspace — one restored from a backup, or
-                            // one whose definitions were lost with the control plane — is
-                            // refused above as "already exists" and never reaches here.
-                            // What reaches here is a subspace with keys and NO root row,
-                            // and seeding a root on its leftovers would resurrect a corpse
-                            // as a tree whose inode table already had rows. The condition
-                            // is written as that question (keys AND no root row) rather
-                            // than "any keys", so it cannot contradict its own message if
-                            // the order of the checks ever changes.
-                            if grovefs::fdb_store::FdbStore::subspace_has_keys(uri, &view)
-                                .map_err(|e| {
-                                    format!("cannot ask the cluster about view '{view}': {e}")
-                                })?
-                                && !grovefs::fdb_store::FdbStore::subspace_exists(uri, &view)
-                                    .map_err(|e| {
-                                        format!("cannot ask the cluster about view '{view}': {e}")
-                                    })?
-                            {
-                                return Err(format!(
-                                    "a subspace named '{view}' already holds keys in {uri} but has no root row (a corpse — nothing can mount it) — clear it first with `grovefs view --meta-store {uri} rm --name {view} --base`"
-                                )
-                                .into());
-                            }
-                            // An FDB base view is ONE SUBSPACE: `FdbStore::open`
-                            // writes the root row plus the two allocator
-                            // watermarks, idempotently, which is all "provision a
-                            // tree" can mean when there is no schema and no file
-                            // to create. Dropping the handle leaves the subspace
-                            // in the cluster for mounts to open.
-                            drop(grovefs::fdb_store::FdbStore::open(uri, &view, false)?);
-                            println!(
-                                "created BASE view '{view}' in {uri} (subspace under the 'grovefs' root)"
-                            );
-                        }
-                        #[cfg(not(feature = "fdb"))]
-                        return Err(format!(
-                            "{uri} names the FoundationDB backend, but this binary was built \
-                             without `--features fdb` (it does not link libfdb_c); rebuild with \
-                             the feature, or drop --meta-store to create a local SQLite view"
-                        )
-                        .into());
                     } else if store_is_pg {
                         // A PG base view is one `grovefs_v_<hex(view)>` schema.
                         // `PgEngine::open` creates the schema, its three tables
@@ -2695,192 +2511,6 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                             vbase.display()
                         ),
                     }
-                    if store_is_fdb {
-                        // Definitions and trees are both cluster rows now; this
-                        // listing is the governance catalog, `view scan` the raw
-                        // physical inventory (counts + prefix hex per subspace).
-                        println!(
-                            "note: this list is the cluster's governance catalog (definitions + base view names); for the raw physical inventory — every subspace with key/entry counts and prefix hex — run `grovefs view --meta-store {} scan`",
-                            store.as_deref().unwrap_or("fdb://…")
-                        );
-                    }
-                }
-                ViewAction::Scan => {
-                    // Cluster inventory: deliberately NOT the same question as
-                    // `view list`. That is the governance catalog (definitions +
-                    // base names); this walks every physical subspace, so it sees
-                    // one nothing defines (a test run, an abandoned migration).
-                    let Some(uri) = store.as_deref() else {
-                        return Err("`view scan` reads the metadata CLUSTER; give `--meta-store fdb://<cluster-file>` (for a local SQLite store, `view list` already lists meta/*.db)".into());
-                    };
-                    if !store_is_fdb {
-                        return Err(format!(
-                            "`{uri}` is not an fdb:// cluster — `view scan` inventories FoundationDB subspaces; `view list` is the equivalent for this store"
-                        )
-                        .into());
-                    }
-                    #[cfg(feature = "fdb")]
-                    {
-                        let subs = grovefs::fdb_store::list_subspaces(uri)?;
-                        let ledgers = subs.iter().filter(|s| s.ledger).count();
-                        // A "corpse" is a subspace that still holds keys but has
-                        // lost its root row, so no mount can open it again while it
-                        // keeps its content keys booked — counting it as a tree
-                        // would hide the only ones that need a decision.
-                        let corpses = subs.iter().filter(|s| s.kind() == "corpse").count();
-                        // The writer-lease table is a root sibling like `refs`: it
-                        // is counted (so "N subspace(s)" stays true) but never as a
-                        // tree — it has no root row and would otherwise read as a
-                        // corpse.
-                        let leases = subs.iter().filter(|s| s.lease).count();
-                        // The credential/audit tables are the third root sibling:
-                        // counted for the same reason, never as a tree, and never
-                        // offered for removal.
-                        let ctls = subs.iter().filter(|s| s.ctl).count();
-                        if subs.is_empty() {
-                            println!("no subspaces under the 'grovefs' root in {uri}");
-                        } else {
-                            println!(
-                                "{:<28} {:>8} {:>8}  {:<7} {}",
-                                "SUBSPACE", "KEYS", "ENTRIES", "KIND", "PREFIX"
-                            );
-                            for s in &subs {
-                                println!(
-                                    "{:<28} {:>8} {:>8}  {:<7} {}",
-                                    s.name,
-                                    s.keys,
-                                    s.entries,
-                                    s.kind(),
-                                    s.prefix_hex
-                                );
-                            }
-                            println!(
-                                "\n{} subspace(s) under the 'grovefs' root in {uri}: {} tree(s){} + {} ledger subspace(s){}{}",
-                                subs.len(),
-                                subs.len() - ledgers - corpses - leases - ctls,
-                                if corpses > 0 {
-                                    format!(" ({corpses} corpse(s): keys but no root row, unmountable)")
-                                } else {
-                                    String::new()
-                                },
-                                ledgers,
-                                if leases > 0 {
-                                    format!(" + {leases} writer-lease subspace (see `view lease`)")
-                                } else {
-                                    String::new()
-                                },
-                                if ctls > 0 {
-                                    format!(" + {ctls} credential/audit subspace (see `apikey list`)")
-                                } else {
-                                    String::new()
-                                }
-                            );
-                            println!(
-                                "a subspace is a TREE, not a definition — `view list` shows the cluster's governance catalog (definitions + base view names), this shows the physical subspaces the cluster holds; remove one with `view rm --name <name> --base` (that also works on a corpse, and is the only way to unbook its objects; the PREFIX column is what `fdbcli clearrange` takes for a name this build cannot open)"
-                            );
-                        }
-                        return Ok(());
-                    }
-                    #[cfg(not(feature = "fdb"))]
-                    return Err(format!(
-                        "{uri} names the FoundationDB backend, but this binary was built \
-                         without `--features fdb` (it does not link libfdb_c); rebuild with the \
-                         feature to read the cluster inventory"
-                    )
-                    .into());
-                }
-                ViewAction::Lease {
-                    deployment,
-                    release,
-                    force,
-                } => {
-                    // Without the feature there is no cluster to read, and the
-                    // refusal below says so — the fields are still parsed (the
-                    // help text and errors must stay identical) but never read.
-                    #[cfg(not(feature = "fdb"))]
-                    let _ = (deployment, release, force);
-                    let Some(uri) = store.as_deref() else {
-                        return Err("`view lease` reads the metadata CLUSTER; give `--meta-store fdb://<cluster-file>` (SQLite and PostgreSQL deployments have no cluster to lease)".into());
-                    };
-                    if !store_is_fdb {
-                        return Err(format!(
-                            "`{uri}` is not an fdb:// cluster — writer leases exist only for the FoundationDB backend"
-                        )
-                        .into());
-                    }
-                    #[cfg(feature = "fdb")]
-                    {
-                        use grovefs::fdb_store;
-                        let rows = fdb_store::list_writer_leases(uri)?;
-                        if release {
-                            let Some(dir) = deployment.as_deref() else {
-                                return Err("`view lease --release` needs `--deployment <the server's --meta-dir>` — the listing form takes no flag".into());
-                            };
-                            let dep = fdb_store::deployment_id(dir);
-                            let Some(row) = rows.iter().find(|r| r.deployment == dep) else {
-                                println!("no writer lease for deployment '{dep}' — nothing to release");
-                                return Ok(());
-                            };
-                            if row.is_live() && !force {
-                                return Err(format!(
-                                    "deployment '{dep}' is HELD by '{}' ({}s left): that server is still renewing, so removing its row would let a second writer start beside it — stop it first, or pass --force to fence it",
-                                    row.owner,
-                                    row.remaining_ms() / 1000
-                                )
-                                .into());
-                            }
-                            let cleared = fdb_store::release_writer_lease(uri, &dep, None)?;
-                            println!(
-                                "released the writer lease for '{dep}' (holder '{}', {})",
-                                row.owner,
-                                if row.is_live() {
-                                    "LIVE — fenced by --force"
-                                } else {
-                                    "already expired"
-                                }
-                            );
-                            if !cleared {
-                                println!("note: the row was taken over meanwhile and was left in place");
-                            }
-                            return Ok(());
-                        }
-                        if rows.is_empty() {
-                            println!(
-                                "no writer leases on {uri} — no `fdb://` meta-server has written here, or the lease is disabled with `GROVEFS_FDB_WRITER_LEASE_SECS=0`"
-                            );
-                        } else {
-                            println!(
-                                "{:<8} {:<44} {:<32} {}",
-                                "STATE", "DEPLOYMENT", "HOLDER", "EXPIRES"
-                            );
-                            for r in &rows {
-                                let live = r.is_live();
-                                let when = if live {
-                                    format!("in {}s", (r.remaining_ms() + 999) / 1000)
-                                } else {
-                                    format!("{}s ago", (-r.remaining_ms() + 999) / 1000)
-                                };
-                                println!(
-                                    "{:<8} {:<44} {:<32} {}",
-                                    if live { "HELD" } else { "expired" },
-                                    r.deployment,
-                                    r.owner,
-                                    when
-                                );
-                            }
-                            println!(
-                                "\none meta-server per deployment may write this cluster: a starting server waits up to one TTL for an expired row and refuses while a live one is renewed. Clear a row that will never be released with `lease --release --deployment <dir>` (a live one also needs `--force`)."
-                            );
-                        }
-                        return Ok(());
-                    }
-                    #[cfg(not(feature = "fdb"))]
-                    return Err(format!(
-                        "{uri} names the FoundationDB backend, but this binary was built \
-                         without `--features fdb` (it does not link libfdb_c); rebuild with the \
-                         feature to read the cluster's leases"
-                    )
-                    .into());
                 }
                 ViewAction::Alias { name, real, retire } => {
                     // Same shared implementation as the MCP `alias_view` tool
@@ -2913,7 +2543,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                     // then byte reclaim through the store's data root. The guards
                     // below read the LOCAL control plane and this machine's mount
                     // table, so they are backend-independent and run before the
-                    // backend split: an fdb:// removal is refused for exactly the
+                    // backend split: a PG removal is refused for exactly the
                     // same reasons a SQLite one is.
                     if ctrl.has_def(&name)? {
                         return Err(format!(
@@ -2963,108 +2593,6 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                             .map_err(Box::<dyn std::error::Error>::from)?;
                         println!("{}", r.as_str().unwrap_or("removed"));
                         return Ok(());
-                    }
-                    if store_is_fdb {
-                        // Under `fdb://` the tree IS a subspace and the cross-view
-                        // ledger lives in the cluster, so this is the ONE backend
-                        // where teardown is a range clear plus a ledger unwind with
-                        // no file to unlink — and the one where a bookkeeping slip
-                        // has no `refs rebuild` to repair it afterwards. That is
-                        // why the unwind is inside `remove_view` rather than left
-                        // to the caller.
-                        let uri = store.as_deref().expect("fdb:// is a store uri");
-                        #[cfg(feature = "fdb")]
-                        {
-                            use grovefs::fdb_store::FdbStore;
-                            // "No such subspace" is an error, not a cheerful zero:
-                            // a typo would otherwise look like a successful removal
-                            // and the operator would stop looking. The predicate is
-                            // "any key under the prefix", NOT "a mountable root row":
-                            // a subspace that lost its root row still books content
-                            // keys, and refusing to remove it would leave the bytes
-                            // unreclaimable forever (no `refs rebuild` here).
-                            let there = FdbStore::subspace_has_keys(uri, &name).map_err(|e| {
-                                format!("cannot ask the cluster about view '{name}': {e}")
-                            })?;
-                            if !there {
-                                return Err(format!(
-                                    "no key under a subspace named '{name}' in {uri} — nothing to remove (`grovefs view --meta-store {uri} scan` lists what is there; a DEFINITION slot is removed by `view rm --name {name}` without --base)"
-                                )
-                                .into());
-                            }
-                            let st = FdbStore::open(uri, &name, true)?;
-                            let rep = st.remove_view()?;
-                            // Bytes: the ledger just took those refs to zero, so no
-                            // view in the cluster names them any more. Freeing them
-                            // needs a data root, which the metadata URI cannot
-                            // carry — same default and the same honest accounting as
-                            // the SQLite arm.
-                            let droot = data_root.clone().unwrap_or_else(|| vbase.clone());
-                            let (mut freed, mut missing, mut failed) = (0usize, 0usize, 0usize);
-                            let mut root_error = None;
-                            match backend::open_local(&droot) {
-                                Ok(be) => {
-                                    for dr in &rep.unbooked_refs {
-                                        // Striped keys live as chunks on the
-                                        // data-servers; a plain local root cannot
-                                        // free them — report, never half-delete.
-                                        if dr.starts_with('s') && dr.matches(':').count() >= 2 {
-                                            failed += 1;
-                                            eprintln!("note: striped object {dr} not freed from a plain local root — reclaim it through a mount or the data-servers");
-                                            continue;
-                                        }
-                                        if be.len(dr).is_err() {
-                                            missing += 1;
-                                            continue;
-                                        }
-                                        match be.remove(dr) {
-                                            Ok(()) => freed += 1,
-                                            Err(e) => {
-                                                failed += 1;
-                                                eprintln!("warning: cannot free blob {dr}: {e}");
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(e) => root_error = Some(e),
-                            }
-                            println!(
-                                "removed base view '{name}' from {uri}: {} key(s) gone, {} node(s), {} object(s) no longer held by any view{}",
-                                rep.keys,
-                                rep.entries,
-                                rep.unbooked,
-                                if rep.still_held > 0 {
-                                    format!(", {} still held by other views", rep.still_held)
-                                } else {
-                                    String::new()
-                                }
-                            );
-                            match root_error {
-                                Some(e) => eprintln!(
-                                    "note: cannot open data root {} to free {} object(s): {e} — the subspace and its bookings are gone and those refs are unreferenced now; free them through the data-server or a mount",
-                                    droot.display(),
-                                    rep.unbooked
-                                ),
-                                None => println!(
-                                    "{} object(s) freed from {}, {} not found under that data root (wrong --data-dir? they live on another store), {} could not be freed",
-                                    freed,
-                                    droot.join("blocks").display(),
-                                    missing,
-                                    failed
-                                ),
-                            }
-                            eprintln!(
-                                "note: new mounts of '{name}' are now refused — `view create` starts over; the cluster's view definitions were not touched (`view scan` confirms the subspace is gone)"
-                            );
-                            return Ok(());
-                        }
-                        #[cfg(not(feature = "fdb"))]
-                        return Err(format!(
-                            "{uri} names the FoundationDB backend, but this binary was built \
-                             without `--features fdb` (it does not link libfdb_c); rebuild with the \
-                             feature to remove a subspace"
-                        )
-                        .into());
                     }
                     if store_is_pg {
                         // A PG base view IS a `grovefs_v_<hex>` schema and the
@@ -3138,8 +2666,8 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         );
                         return Ok(());
                     }
-                    // SQLite arm. (The PG arm above owns a schema and the
-                    // `fdb://` one returned before it; by here the tree really is
+                    // SQLite arm. (The PG arm above owns a schema and returned
+                    // before it; by here the tree really is
                     // the local file `meta/<name>.db`.)
                     require_sqlite("`view rm --base`")?;
                     let rm = meta::remove_base_view(&vbase, &name)?;
@@ -3224,15 +2752,15 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     // Where does this view's tree live? Under `--control-server`
                     // the SERVER owns it and the dump is pulled over the wire in
-                    // chunks (only `--out` is local). Otherwise every backend
-                    // dumps here, through its own reader: a SQLite file, a PG
-                    // schema, an FDB subspace — one portable format, one tool.
+                    // chunks (only `--out` is local). Otherwise either backend
+                    // dumps here, through its own reader: a SQLite file or a PG
+                    // schema — one portable format, one tool.
                     let st = if let Some(rc) = &remote_ctl {
                         rc.export_view(&view, &out, force)?
                     } else {
                         // The definition lives in the control store, not
                         // necessarily in `meta/views/*.layout`: asking it is what
-                        // makes the alias/derived refusal right on all three
+                        // makes the alias/derived refusal right on both
                         // backends instead of only on the file one.
                         let definition = ctrl.get_def_raw(&view)?;
                         if let Some(text) = definition.as_deref() {
@@ -3254,23 +2782,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                                 grovefs::layout::ViewDef::Fork(_) => {}
                             }
                         }
-                        if store_is_fdb {
-                            #[cfg(feature = "fdb")]
-                            {
-                                let uri = store.as_deref().expect("fdb:// is a store uri");
-                                // READ-ONLY open: exporting a name that was
-                                // never provisioned must report that, not seed a
-                                // subspace as a side effect of being asked.
-                                grovefs::fdb_store::FdbStore::open(uri, &view, true)?
-                                    .export_jsonl(&view, &out, force, definition)?
-                            }
-                            #[cfg(not(feature = "fdb"))]
-                            return Err(format!(
-                                "{store:?} names the FoundationDB backend, but this binary was built \
-                                 without `--features fdb` (it does not link libfdb_c)"
-                            )
-                            .into());
-                        } else if store_is_pg {
+                        if store_is_pg {
                             let uri = store.as_deref().expect("postgres:// is a store uri");
                             grovefs::pg_store::export_view(uri, &view, &out, force, definition)?
                         } else {
@@ -3305,9 +2817,9 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         return Err(format!("invalid view name '{view}'").into());
                     }
                     // The control store is the system of record for definitions
-                    // on EVERY backend (files, `grovefs_control`, the FDB control
-                    // subspace), so the guards below are asked of it rather than
-                    // of a `meta/views/*.layout` file a PG/FDB deployment may not
+                    // on BOTH backends (files and `grovefs_control`), so the
+                    // guards below are asked of it rather than
+                    // of a `meta/views/*.layout` file a PG deployment may not
                     // even keep.
                     if ctrl.get_def_raw(&view)?.is_some() {
                         return Err(format!(
@@ -3340,29 +2852,17 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                     let def_written = remote_ctl.is_some();
                     let st = if let Some(rc) = &remote_ctl {
                         rc.import_view(&view, &input, replace, as_fork.as_deref())?
-                    } else if store_is_fdb {
-                        #[cfg(feature = "fdb")]
-                        {
-                            let uri = store.as_deref().expect("fdb:// is a store uri");
-                            // `true` here means "do not provision" rather than
-                            // "cannot write": the dump brings its own root row and
-                            // both allocator water marks.
-                            grovefs::fdb_store::FdbStore::open(uri, &view, true)?
-                                .import_jsonl(&input, replace)?
-                        }
-                        #[cfg(not(feature = "fdb"))]
-                        return Err(format!(
-                            "{store:?} names the FoundationDB backend, but this binary was built \
-                             without `--features fdb` (it does not link libfdb_c)"
-                        )
-                        .into());
                     } else if store_is_pg {
                         let uri = store.as_deref().expect("postgres:// is a store uri");
                         grovefs::pg_store::import_view(uri, &view, &input, replace)?
                     } else {
                         grovefs::meta::import_view(&vbase, &view, &input, replace)?
                     };
-                    let kind_word = if as_fork.is_some() { "view" } else { "BASE view" };
+                    let kind_word = if as_fork.is_some() {
+                        "view"
+                    } else {
+                        "BASE view"
+                    };
                     println!(
                         "imported {kind_word} '{view}' from {}: {} node(s), {} blob reference(s){}; cross-view ledger adjusted",
                         input.display(),
@@ -3384,7 +2884,8 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(base) = &as_fork {
                         if !def_written {
                             if let Err(e) = ctrl.put_def(&view, &format!("fork {base}\n")) {
-                                let rollback = rollback_imported_tree(&vbase, store.as_deref(), &view);
+                                let rollback =
+                                    rollback_imported_tree(&vbase, store.as_deref(), &view);
                                 return Err(format!(
                                     "cannot record fork definition for '{view}': {e}; {rollback}"
                                 )
@@ -3518,7 +3019,9 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     if scope == grovefs::apikeys::Scope::Admin {
                         println!("Admin scope also governs a `meta-server --control-listen` from any machine, with");
-                        println!("  grovefs view --control-server HOST:PORT --api-key '{full}' list");
+                        println!(
+                            "  grovefs view --control-server HOST:PORT --api-key '{full}' list"
+                        );
                         println!("  grovefs apikey --control-server HOST:PORT --api-key '{full}' create --label k2 --for mount");
                         println!("(or export GROVEFS_CONTROL_KEY='{full}'). The operator never needs the store URI —");
                         println!("the server performs the work and audits every call under account '{}'.", owner.as_deref().unwrap_or("-"));
@@ -3528,13 +3031,14 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         println!("credential out of the governance API (and vice versa); `--for admin` is the");
                         println!("governance credential and is never implied by `any`.");
                     }
-                    println!("Revoke later with: grovefs apikey {}", match &remote {
-                        Some(rc) => format!(
-                            "--control-server {} revoke --id {id}",
-                            rc.client().addr()
-                        ),
-                        None => format!("--meta-dir {} revoke --id {id}", ak_base.display()),
-                    });
+                    println!(
+                        "Revoke later with: grovefs apikey {}",
+                        match &remote {
+                            Some(rc) =>
+                                format!("--control-server {} revoke --id {id}", rc.client().addr()),
+                            None => format!("--meta-dir {} revoke --id {id}", ak_base.display()),
+                        }
+                    );
                 }
                 ApikeyAction::List { view } => {
                     let all = keys.list()?;
@@ -3550,7 +3054,9 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                             // in this machine's `--home`.
                             let cs: Arc<dyn grovefs::mcp::ControlStore> = match &remote {
                                 Some(rc) => Arc::new(rc.clone()),
-                                None => grovefs::mcp::control_store_for(&ak_base, store.as_deref())?,
+                                None => {
+                                    grovefs::mcp::control_store_for(&ak_base, store.as_deref())?
+                                }
                             };
                             cs.load_alias_map()
                                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?
@@ -3764,36 +3270,9 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             let store = resolve_store(store);
             match action {
                 RefsAction::Rebuild => {
-                    // Under fdb:// the ledger is `grovefs/refs` IN the cluster, not
-                    // a file, so the SQLite arm below (which would happily rebuild
-                    // a `meta/refs.db` this deployment never reads) is the wrong
-                    // store rather than a harmless no-op.
-                    if let Some(uri) = store.as_deref().filter(|u| u.starts_with("fdb://")) {
-                        #[cfg(feature = "fdb")]
-                        {
-                            let rep = grovefs::fdb_store::rebuild_ledger(uri)?;
-                            println!(
-                                "refs ledger rebuilt in {uri}: {} tree(s), {} content key(s), {} holder unit(s); {} row(s) corrected, {} row(s) deleted",
-                                rep.trees, rep.refs, rep.holders, rep.rows_fixed, rep.rows_deleted
-                            );
-                            println!(
-                                "  the recount reads the TREES, not the ledger — so a lost booking is restored (the unsafe direction) as well as an over-count dropped; nothing here frees object bytes (that is `gc`, which refuses fdb://)"
-                            );
-                            println!(
-                                "  run it QUIESCED: a booking committed between the read pass and the write pass would be overwritten with the pre-booking count"
-                            );
-                            return Ok(());
-                        }
-                        #[cfg(not(feature = "fdb"))]
-                        return Err(format!(
-                            "{uri} names the FoundationDB backend, but this binary was built without `--features fdb` (it does not link libfdb_c); rebuild with the feature, or drop --meta-store to rewrite a local `meta/refs.db`"
-                        )
-                        .into());
-                    }
-                    if store
-                        .as_deref()
-                        .is_some_and(|u| u.starts_with("postgres://") || u.starts_with("postgresql://"))
-                    {
+                    if store.as_deref().is_some_and(|u| {
+                        u.starts_with("postgres://") || u.starts_with("postgresql://")
+                    }) {
                         // The ledger is `grovefs_refs.holders` IN the database, so
                         // the recount has to happen there too: the same "read the
                         // TREES, not the ledger" rule as the two arms above, and
@@ -3837,8 +3316,8 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             data_api_key,
         } => {
             // The REMOTE audit: the server reads the trees where they live and
-            // we only name the bytes. This is the one form that works under PG
-            // and `fdb://`, where no `<data-dir>` on this machine holds them.
+            // we only name the bytes. This is the one form that works under PG,
+            // where no `<data-dir>` on this machine holds them.
             if let Some(addr) = control_server.as_deref() {
                 refuse_local_with_remote(addr, &db_path, &None)?;
                 if data_root.is_some() {
@@ -3899,21 +3378,14 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             }
             // The trees this command audits are local `<view>.db` files. Under
             // PG they are schemas and the bytes belong to the data servers —
-            // there is no offline page tree to walk here. The same argument is
-            // stronger under FDB, where the trees are subspaces inside a live
-            // cluster: scanning `<data-dir>/blocks` for orphan objects while the
-            // authoritative name space is somewhere else entirely would DELETE
-            // bytes that a subspace still names, so this too refuses rather than
-            // reporting "nothing to reclaim".
+            // there is no offline page tree to walk here, so this refuses rather
+            // than reporting "nothing to reclaim".
             let offline_store = resolve_store(None);
             if offline_store
                 .as_deref()
                 .is_some_and(|u| u.starts_with("postgres://") || u.starts_with("postgresql://"))
             {
                 return Err("`gc` audits LOCAL page files under <data-dir>/blocks; a PostgreSQL deployment's trees are schemas and its bytes are owned by the data servers — reclaim there with the DBA/data-server tooling, not this command".into());
-            }
-            if offline_store.as_deref().is_some_and(|u| u.starts_with("fdb://")) {
-                return Err("`gc` audits LOCAL page files under <data-dir>/blocks; a FoundationDB deployment's trees are subspaces in the cluster and its bytes are owned by the data servers — reclaim there with the data-server tooling (and back the cluster up with `fdbbackup`), not this command".into());
             }
             let mbase = db_path.unwrap_or_else(|| base.clone());
             let root_arg = data_root.unwrap_or_else(|| mbase.clone());
@@ -4004,12 +3476,6 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                 if u.starts_with("postgres://") || u.starts_with("postgresql://") {
                     return Err(
                         "import operates on a local SQLite view db; under a PostgreSQL deployment (--meta-store postgres://…, or GROVEFS_META_STORE) a base tree is a PG schema (create one with `view create`) and its bytes move through a mounted path — drop --meta-store for a local store"
-                            .into(),
-                    );
-                }
-                if u.starts_with("fdb://") {
-                    return Err(
-                        "import operates on a local SQLite view db; under a FoundationDB deployment (--meta-store fdb://…, or GROVEFS_META_STORE) a base tree is a subspace of the cluster (create one with `view create`) and its bytes move through a mounted path — drop --meta-store for a local store"
                             .into(),
                     );
                 }
@@ -4145,7 +3611,11 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let opts = grovefs::du::DuOpts {
                 view,
-                meta: meta.or_else(|| std::env::var("GROVEFS_META_SERVER").ok().filter(|s| !s.is_empty())),
+                meta: meta.or_else(|| {
+                    std::env::var("GROVEFS_META_SERVER")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                }),
                 meta_token: meta_token.or_else(|| {
                     std::env::var("GROVEFS_TOKEN")
                         .ok()
@@ -4158,7 +3628,11 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                 }),
                 store: resolve_store(store),
                 db_path: db_path.or_else(|| Some(base.clone())),
-                data: data.or_else(|| std::env::var("GROVEFS_DATA_SERVERS").ok().filter(|s| !s.is_empty())),
+                data: data.or_else(|| {
+                    std::env::var("GROVEFS_DATA_SERVERS")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                }),
                 data_root,
                 api_key: api_key.or_else(|| {
                     std::env::var("GROVEFS_API_KEY")
@@ -4829,7 +4303,11 @@ fn proc_store_hit(pid: u32, mbase: &Path, roots: &[PathBuf]) -> bool {
     // Which knobs were given on the command line; a flag overrides its env twin.
     let mut seen = (false, false, false); // --home, --meta-dir, --data-dir
     for (i, a) in args.iter().enumerate() {
-        if a == "--meta-server" || a == "--data-servers" || a.starts_with("--meta-server=") || a.starts_with("--data-servers=") {
+        if a == "--meta-server"
+            || a == "--data-servers"
+            || a.starts_with("--meta-server=")
+            || a.starts_with("--data-servers=")
+        {
             remote = true;
         }
         let (flag, val) = if let Some(eq) = a.find('=') {
@@ -5099,7 +4577,12 @@ fn gc_json(rep: &grovefs::gc::Report, rec: Option<&grovefs::gc::Reclaimed>) -> s
 fn print_gc_remote(rep: &serde_json::Value) {
     let num = |k: &str| rep.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
     let txt = |k: &str| rep.get(k).and_then(|v| v.as_str()).unwrap_or("");
-    let arr = |k: &str| -> Vec<serde_json::Value> { rep.get(k).and_then(|v| v.as_array()).cloned().unwrap_or_default() };
+    let arr = |k: &str| -> Vec<serde_json::Value> {
+        rep.get(k)
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+    };
     let servers: Vec<&str> = rep
         .get("data_roots")
         .and_then(|v| v.as_array())
@@ -5175,7 +4658,11 @@ fn print_gc_remote(rep: &serde_json::Value) {
             "  a mount on another machine is not visible from the server host; stop it too before --apply"
         );
     }
-    if rep.get("applied").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if rep
+        .get("applied")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         let failed = arr("delete_failed");
         println!(
             "reclaimed: {} object(s), {} freed; {} within grace kept; {} failed",

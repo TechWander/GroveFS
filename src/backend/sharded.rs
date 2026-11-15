@@ -111,7 +111,11 @@ fn parse_layout(key: &str) -> Option<Layout> {
         // s<N>:<stripe>:<base> — positional, no fingerprint.
         2 => (segs[0], None, segs[1]),
         // s<N>:<stripe>:<fp>:<base> — identity-pinned.
-        3 => (segs[0], Some(u64::from_str_radix(segs[1], 16).ok()?), segs[2]),
+        3 => (
+            segs[0],
+            Some(u64::from_str_radix(segs[1], 16).ok()?),
+            segs[2],
+        ),
         _ => return None,
     };
     let stripe: u64 = stripe_str.parse().ok()?;
@@ -145,14 +149,12 @@ impl ShardedBackend {
         // Identity-pinned only when there is more than one member AND every one
         // advertises a UNIQUE id; a single member never stripes, so its keys
         // stay fingerprint-free for interoperability with positional mounts.
-        let identified = servers.len() > 1
-            && keys.iter().all(|k| k.is_some())
-            && {
-                let mut v: Vec<u64> = keys.iter().filter_map(|k| *k).collect();
-                v.sort_unstable();
-                v.dedup();
-                v.len() == servers.len()
-            };
+        let identified = servers.len() > 1 && keys.iter().all(|k| k.is_some()) && {
+            let mut v: Vec<u64> = keys.iter().filter_map(|k| *k).collect();
+            v.sort_unstable();
+            v.dedup();
+            v.len() == servers.len()
+        };
         let (servers, membership) = if identified {
             let mut pairs: Vec<(u64, Arc<dyn StorageBackend>)> = servers
                 .into_iter()
@@ -309,14 +311,12 @@ impl ShardedBackend {
         let ck = self.chunk(l, 0).1;
         for i in 1..self.servers.len() {
             match self.probe(i, &ck) {
-                Probe::Present(_) => {
-                    return Err(io::Error::other(format!(
-                        "object {} keeps chunk #0 on data-server #{i}, but this --data-servers list \
+                Probe::Present(_) => return Err(io::Error::other(format!(
+                    "object {} keeps chunk #0 on data-server #{i}, but this --data-servers list \
                          orders it at #0: the servers are right and their order is not, so \
                          sizes and reads would be attributed to the wrong member",
-                        l.base
-                    )))
-                }
+                    l.base
+                ))),
                 // A definite miss elsewhere is consistent with an empty object.
                 Probe::Absent => {}
                 // Nothing was confirmed, so emptiness is not established either.
@@ -523,7 +523,13 @@ impl StorageBackend for ShardedBackend {
         // mount with a DIFFERENT set is refused by `check_layout`; a positional
         // stripe keeps the compact 3-field form for interoperability.
         match self.membership {
-            Some(fp) => format!("s{}:{}:{:016x}:{}", self.servers.len(), self.stripe, fp, uuid),
+            Some(fp) => format!(
+                "s{}:{}:{:016x}:{}",
+                self.servers.len(),
+                self.stripe,
+                fp,
+                uuid
+            ),
             None => format!("s{}:{}:{}", self.servers.len(), self.stripe, uuid),
         }
     }
@@ -582,7 +588,8 @@ impl StorageBackend for ShardedBackend {
             let servers = &self.servers;
             let n = l.n.min(servers.len());
             let errs = std::sync::Mutex::new(None::<io::Error>);
-            let collected = std::sync::Mutex::new(Vec::<(u64, Vec<u8>)>::with_capacity(ranges.len()));
+            let collected =
+                std::sync::Mutex::new(Vec::<(u64, Vec<u8>)>::with_capacity(ranges.len()));
             let cursor = std::sync::atomic::AtomicUsize::new(0);
             let base = l.base.as_str();
             let ranges_ref = &ranges;
@@ -1186,13 +1193,20 @@ mod tests {
         let key = sb.new_key("big");
         sb.create(&key).unwrap();
         let data: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect(); // 64 chunks
-        // The whole span must be routed through a CAPPED pool, not 64 threads.
+                                                                             // The whole span must be routed through a CAPPED pool, not 64 threads.
         let workers = sb.fanout(2, data.len() / stripe as usize);
-        assert!(workers > 0 && workers < 64, "fan-out must be capped, got {workers}");
+        assert!(
+            workers > 0 && workers < 64,
+            "fan-out must be capped, got {workers}"
+        );
         let w = sb.write(&key, 0, &data).unwrap();
         assert_eq!(w, data.len());
         assert_eq!(sb.len(&key).unwrap(), data.len() as u64);
-        assert_eq!(sb.read(&key, 0, data.len()).unwrap(), data, "capped read must reorder correctly");
+        assert_eq!(
+            sb.read(&key, 0, data.len()).unwrap(),
+            data,
+            "capped read must reorder correctly"
+        );
         // a straddling partial read landing mid-chunk across the capped range
         assert_eq!(sb.read(&key, 3000, 500).unwrap(), &data[3000..3500]);
         sb.remove(&key).unwrap();
@@ -1250,7 +1264,9 @@ mod tests {
 
         let m = members(&roots);
         let flipped = ShardedBackend::new(vec![m[1].clone(), m[0].clone()], stripe);
-        let err = flipped.len(&key).expect_err("a reversed list must not answer 0");
+        let err = flipped
+            .len(&key)
+            .expect_err("a reversed list must not answer 0");
         let msg = err.to_string();
         assert!(msg.contains("order"), "{msg}");
         assert!(msg.contains("wrong member"), "{msg}");
@@ -1339,10 +1355,7 @@ mod tests {
         //    so strict must agree with len and NOT call it damaged.
         let key = build("tail");
         remove_chunk(&key, nchunks - 1);
-        assert_eq!(
-            reopen().len_strict(&key).unwrap(),
-            stripe * (nchunks - 1)
-        );
+        assert_eq!(reopen().len_strict(&key).unwrap(), stripe * (nchunks - 1));
 
         for r in roots {
             let _ = std::fs::remove_dir_all(r);

@@ -1969,8 +1969,7 @@ impl MetaEngine {
     /// are closed as they are returned. `n = 0` turns pooling off entirely.
     pub fn set_read_pool_size(&self, n: usize) {
         let n = n.min(64);
-        self.pool_max
-            .store(n, std::sync::atomic::Ordering::Relaxed);
+        self.pool_max.store(n, std::sync::atomic::Ordering::Relaxed);
         let mut pool = self.read_pool.lock();
         while pool.len() < n {
             match Connection::open(&self.path) {
@@ -2189,7 +2188,16 @@ impl MetaEngine {
             // still surfaces as Exists; the UPDATE's error is propagated, not swallowed.
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let id = insert_row(
-                &tx, parent, name, is_dir, data_ref, link_target, mode, uid, gid, t,
+                &tx,
+                parent,
+                name,
+                is_dir,
+                data_ref,
+                link_target,
+                mode,
+                uid,
+                gid,
+                t,
             )?;
             tx.commit()?;
             Ok(id)
@@ -2956,10 +2964,7 @@ impl MetaProvider for MetaEngine {
     fn supports_unlink_batch(&self) -> bool {
         true
     }
-    fn unlink_nodes_batch(
-        &self,
-        items: &[(i64, &str)],
-    ) -> Vec<Result<Option<String>, MetaError>> {
+    fn unlink_nodes_batch(&self, items: &[(i64, &str)]) -> Vec<Result<Option<String>, MetaError>> {
         MetaEngine::unlink_nodes_batch(self, items)
     }
     fn rename(
@@ -3021,7 +3026,7 @@ impl MetaProvider for MetaEngine {
         // `Option<i64>` and maps NULL to 0, so the two dumps were different
         // artifacts — visible to `du` (whose `find_root` happens to fall back to id
         // 1) and fatal to a differential comparison, which is P3/P6's whole point.
-        // Read it the PG way so one name means one thing in all three backends.
+        // Read it the PG way so one name means one thing in both backends.
         let mut stmt = match conn
             .prepare("SELECT id, parent_id, name, is_dir, data_ref FROM node ORDER BY id")
         {
@@ -3064,12 +3069,6 @@ impl MetaProvider for MetaEngine {
 pub enum MetaStore {
     Sqlite(MetaEngine),
     Pg(Box<crate::pg_store::PgEngine>),
-    /// The FoundationDB backend (`--meta-store fdb://<cluster file>`). The variant
-    /// itself is feature-gated, so a build without `--features fdb` does not name
-    /// `FdbStore`, does not link `libfdb_c`, and cannot reach an `fdb://` dispatch
-    /// arm at all — the two backends that ship today compile exactly as before.
-    #[cfg(feature = "fdb")]
-    Fdb(Box<crate::fdb_store::FdbStore>),
 }
 
 impl MetaStore {
@@ -3092,24 +3091,10 @@ impl MetaStore {
             .map(|p| MetaStore::Pg(Box::new(p)))
     }
 
-    /// Open a FoundationDB store for `view` against the cluster named by
-    /// `uri` (`fdb://<path-to-cluster-file>`). `readonly` is passed straight to
-    /// [`crate::fdb_store::FdbStore::open`], where it suppresses the root seed: a
-    /// read-only handle probes, it does not provision. The GroveFS-native standby
-    /// path is refused for this backend at `serve()` (an FDB deployment gets its
-    /// replicas and its `fdbbackup` from the cluster, not from `--role standby`),
-    /// so the flag here exists for probes such as `du`.
-    #[cfg(feature = "fdb")]
-    pub fn open_fdb(uri: &str, view: &str, readonly: bool) -> std::io::Result<Self> {
-        crate::fdb_store::FdbStore::open(uri, view, readonly).map(|f| MetaStore::Fdb(Box::new(f)))
-    }
-
     pub fn get_epoch(&self) -> i64 {
         match self {
             MetaStore::Sqlite(m) => m.get_epoch(),
             MetaStore::Pg(p) => p.get_epoch(),
-            #[cfg(feature = "fdb")]
-            MetaStore::Fdb(f) => f.get_epoch(),
         }
     }
 
@@ -3119,8 +3104,6 @@ impl MetaStore {
                 .set_epoch(e)
                 .map_err(|err| std::io::Error::other(err.to_string())),
             MetaStore::Pg(p) => p.set_epoch(e),
-            #[cfg(feature = "fdb")]
-            MetaStore::Fdb(f) => f.set_epoch(e),
         }
     }
 
@@ -3130,8 +3113,6 @@ impl MetaStore {
                 .backup_to_bytes()
                 .map_err(|err| std::io::Error::other(err.to_string())),
             MetaStore::Pg(p) => p.backup_to_bytes(),
-            #[cfg(feature = "fdb")]
-            MetaStore::Fdb(f) => f.backup_to_bytes(),
         }
     }
 }
@@ -3141,63 +3122,48 @@ impl MetaProvider for MetaStore {
         match self {
             MetaStore::Sqlite(m) => m.lookup(parent, name),
             MetaStore::Pg(p) => p.lookup(parent, name),
-            #[cfg(feature = "fdb")]
-            MetaStore::Fdb(f) => f.lookup(parent, name),
         }
     }
     fn getattr(&self, ino: i64) -> Option<NodeInfo> {
         match self {
             MetaStore::Sqlite(m) => m.getattr(ino),
             MetaStore::Pg(p) => p.getattr(ino),
-            #[cfg(feature = "fdb")]
-            MetaStore::Fdb(f) => f.getattr(ino),
         }
     }
     fn readdir(&self, parent: i64) -> Vec<NodeInfo> {
         match self {
             MetaStore::Sqlite(m) => m.readdir(parent),
             MetaStore::Pg(p) => p.readdir(parent),
-            #[cfg(feature = "fdb")]
-            MetaStore::Fdb(f) => f.readdir(parent),
         }
     }
     fn readdir_page(&self, parent: i64, offset: usize, limit: usize) -> Vec<NodeInfo> {
         match self {
             MetaStore::Sqlite(m) => m.readdir_page(parent, offset, limit),
             MetaStore::Pg(p) => p.readdir_page(parent, offset, limit),
-            #[cfg(feature = "fdb")]
-            MetaStore::Fdb(f) => f.readdir_page(parent, offset, limit),
         }
     }
     fn create_nodes_batch(&self, items: &[NewNode<'_>]) -> Vec<Result<NodeInfo, MetaError>> {
         match self {
             MetaStore::Sqlite(m) => MetaProvider::create_nodes_batch(m, items),
             MetaStore::Pg(p) => MetaProvider::create_nodes_batch(&**p, items),
-            #[cfg(feature = "fdb")]
-            MetaStore::Fdb(f) => MetaProvider::create_nodes_batch(&**f, items),
         }
     }
     fn supports_create_batch(&self) -> bool {
         match self {
             MetaStore::Sqlite(m) => MetaProvider::supports_create_batch(m),
             MetaStore::Pg(p) => MetaProvider::supports_create_batch(&**p),
-            #[cfg(feature = "fdb")]
-            MetaStore::Fdb(f) => MetaProvider::supports_create_batch(&**f),
         }
     }
     fn set_read_pool(&self, n: usize) {
         match self {
             MetaStore::Sqlite(m) => MetaProvider::set_read_pool(m, n),
             MetaStore::Pg(p) => MetaProvider::set_read_pool(&**p, n),
-            #[cfg(feature = "fdb")]
-            MetaStore::Fdb(f) => MetaProvider::set_read_pool(&**f, n),
         }
     }
     fn supports_paged_readdir(&self) -> bool {
-        // All three concrete stores page inside their own store: SQLite and PG
-        // through LIMIT/OFFSET on their read pool, FDB through a `start_after`
-        // key-selector range plus the same stride-32 checkpoints (§3.3 of
-        // `docs/fdb-keyspace.md`). So a meta-server backed by any of them can
+        // Both concrete stores page inside their own store: SQLite and PG
+        // through LIMIT/OFFSET on their read pool. So a meta-server backed by
+        // either can
         // serve M_READDIRP and offer READDIRPLUS to its clients. A derived view
         // served through a [`crate::layout::LayoutMeta`] lens does NOT reach
         // here — the lens keeps the trait default (false) because its
@@ -3205,8 +3171,6 @@ impl MetaProvider for MetaStore {
         match self {
             MetaStore::Sqlite(m) => MetaProvider::supports_paged_readdir(m),
             MetaStore::Pg(p) => MetaProvider::supports_paged_readdir(&**p),
-            #[cfg(feature = "fdb")]
-            MetaStore::Fdb(f) => MetaProvider::supports_paged_readdir(&**f),
         }
     }
     #[allow(clippy::too_many_arguments)]
@@ -3223,8 +3187,6 @@ impl MetaProvider for MetaStore {
         match self {
             MetaStore::Sqlite(m) => m.create_node(parent, name, is_dir, data_ref, mode, uid, gid),
             MetaStore::Pg(p) => p.create_node(parent, name, is_dir, data_ref, mode, uid, gid),
-            #[cfg(feature = "fdb")]
-            MetaStore::Fdb(f) => f.create_node(parent, name, is_dir, data_ref, mode, uid, gid),
         }
     }
     fn create_symlink(
@@ -3238,43 +3200,30 @@ impl MetaProvider for MetaStore {
         match self {
             MetaStore::Sqlite(m) => m.create_symlink(parent, name, target, uid, gid),
             MetaStore::Pg(p) => p.create_symlink(parent, name, target, uid, gid),
-            #[cfg(feature = "fdb")]
-            MetaStore::Fdb(f) => f.create_symlink(parent, name, target, uid, gid),
         }
     }
     fn link_node(&self, src_ino: i64, new_parent: i64, new_name: &str) -> Result<i64, MetaError> {
         match self {
             MetaStore::Sqlite(m) => m.link_node(src_ino, new_parent, new_name),
             MetaStore::Pg(p) => p.link_node(src_ino, new_parent, new_name),
-            #[cfg(feature = "fdb")]
-            MetaStore::Fdb(f) => f.link_node(src_ino, new_parent, new_name),
         }
     }
     fn unlink(&self, parent: i64, name: &str) -> Result<Option<String>, MetaError> {
         match self {
             MetaStore::Sqlite(m) => m.unlink(parent, name),
             MetaStore::Pg(p) => p.unlink(parent, name),
-            #[cfg(feature = "fdb")]
-            MetaStore::Fdb(f) => f.unlink(parent, name),
         }
     }
     fn supports_unlink_batch(&self) -> bool {
         match self {
             MetaStore::Sqlite(m) => MetaProvider::supports_unlink_batch(m),
             MetaStore::Pg(p) => MetaProvider::supports_unlink_batch(&**p),
-            #[cfg(feature = "fdb")]
-            MetaStore::Fdb(f) => MetaProvider::supports_unlink_batch(&**f),
         }
     }
-    fn unlink_nodes_batch(
-        &self,
-        items: &[(i64, &str)],
-    ) -> Vec<Result<Option<String>, MetaError>> {
+    fn unlink_nodes_batch(&self, items: &[(i64, &str)]) -> Vec<Result<Option<String>, MetaError>> {
         match self {
             MetaStore::Sqlite(m) => MetaProvider::unlink_nodes_batch(m, items),
             MetaStore::Pg(p) => MetaProvider::unlink_nodes_batch(&**p, items),
-            #[cfg(feature = "fdb")]
-            MetaStore::Fdb(f) => MetaProvider::unlink_nodes_batch(&**f, items),
         }
     }
     fn rename(
@@ -3288,40 +3237,30 @@ impl MetaProvider for MetaStore {
         match self {
             MetaStore::Sqlite(m) => m.rename(parent, name, new_parent, new_name, noreplace),
             MetaStore::Pg(p) => p.rename(parent, name, new_parent, new_name, noreplace),
-            #[cfg(feature = "fdb")]
-            MetaStore::Fdb(f) => f.rename(parent, name, new_parent, new_name, noreplace),
         }
     }
     fn set_mode(&self, ino: i64, mode: u32) {
         match self {
             MetaStore::Sqlite(m) => m.set_mode(ino, mode),
             MetaStore::Pg(p) => p.set_mode(ino, mode),
-            #[cfg(feature = "fdb")]
-            MetaStore::Fdb(f) => f.set_mode(ino, mode),
         }
     }
     fn set_uid_gid(&self, ino: i64, uid: u32, gid: u32) {
         match self {
             MetaStore::Sqlite(m) => m.set_uid_gid(ino, uid, gid),
             MetaStore::Pg(p) => p.set_uid_gid(ino, uid, gid),
-            #[cfg(feature = "fdb")]
-            MetaStore::Fdb(f) => f.set_uid_gid(ino, uid, gid),
         }
     }
     fn set_times(&self, ino: i64, atime: Option<i64>, mtime: Option<i64>) {
         match self {
             MetaStore::Sqlite(m) => m.set_times(ino, atime, mtime),
             MetaStore::Pg(p) => p.set_times(ino, atime, mtime),
-            #[cfg(feature = "fdb")]
-            MetaStore::Fdb(f) => f.set_times(ino, atime, mtime),
         }
     }
     fn touch_mtime(&self, ino: i64) {
         match self {
             MetaStore::Sqlite(m) => m.touch_mtime(ino),
             MetaStore::Pg(p) => p.touch_mtime(ino),
-            #[cfg(feature = "fdb")]
-            MetaStore::Fdb(f) => f.touch_mtime(ino),
         }
     }
     #[allow(clippy::too_many_arguments)]
@@ -3338,8 +3277,6 @@ impl MetaProvider for MetaStore {
         match self {
             MetaStore::Sqlite(m) => m.lock_op(ino, owner, start, end, ty, pid, sid),
             MetaStore::Pg(p) => p.lock_op(ino, owner, start, end, ty, pid, sid),
-            #[cfg(feature = "fdb")]
-            MetaStore::Fdb(f) => f.lock_op(ino, owner, start, end, ty, pid, sid),
         }
     }
     fn get_lock(
@@ -3353,40 +3290,30 @@ impl MetaProvider for MetaStore {
         match self {
             MetaStore::Sqlite(m) => m.get_lock(ino, owner, start, end, ty),
             MetaStore::Pg(p) => p.get_lock(ino, owner, start, end, ty),
-            #[cfg(feature = "fdb")]
-            MetaStore::Fdb(f) => f.get_lock(ino, owner, start, end, ty),
         }
     }
     fn release_locks_of_owner(&self, owner: u64) {
         match self {
             MetaStore::Sqlite(m) => m.release_locks_of_owner(owner),
             MetaStore::Pg(p) => p.release_locks_of_owner(owner),
-            #[cfg(feature = "fdb")]
-            MetaStore::Fdb(f) => f.release_locks_of_owner(owner),
         }
     }
     fn renew_locks(&self, sid: u64) {
         match self {
             MetaStore::Sqlite(m) => m.renew_locks(sid),
             MetaStore::Pg(p) => p.renew_locks(sid),
-            #[cfg(feature = "fdb")]
-            MetaStore::Fdb(f) => f.renew_locks(sid),
         }
     }
     fn fence_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
         match self {
             MetaStore::Sqlite(m) => m.fence_handle(),
             MetaStore::Pg(p) => p.fence_handle(),
-            #[cfg(feature = "fdb")]
-            MetaStore::Fdb(f) => f.fence_handle(),
         }
     }
     fn dump_tree(&self) -> Vec<(i64, i64, String, bool, Option<String>)> {
         match self {
             MetaStore::Sqlite(m) => MetaProvider::dump_tree(m),
             MetaStore::Pg(p) => MetaProvider::dump_tree(&**p),
-            #[cfg(feature = "fdb")]
-            MetaStore::Fdb(f) => MetaProvider::dump_tree(&**f),
         }
     }
 }
@@ -3471,7 +3398,9 @@ mod tests {
             .query_row("PRAGMA main.synchronous", [], |r| r.get(0))
             .unwrap();
         let refs_sync: i64 = conn
-            .query_row(&format!("PRAGMA {REFS_SCHEMA}.synchronous"), [], |r| r.get(0))
+            .query_row(&format!("PRAGMA {REFS_SCHEMA}.synchronous"), [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(main_sync, 1, "view db runs NORMAL in WAL mode");
         assert_eq!(
@@ -3546,7 +3475,10 @@ mod tests {
         ];
         let out = e.create_nodes_batch(&specs);
         assert!(out[0].is_ok(), "first x wins");
-        assert!(matches!(out[1], Err(MetaError::Exists)), "second x is EEXIST");
+        assert!(
+            matches!(out[1], Err(MetaError::Exists)),
+            "second x is EEXIST"
+        );
         assert!(out[2].is_ok(), "y must not be collateral damage");
         assert_eq!(
             e.lookup(ROOT_INO, "x").unwrap().data_ref.as_deref(),

@@ -121,8 +121,7 @@ impl PgPool {
                 Some(c) => return Ok(c),
             }
         }
-        Client::connect(&self.uri, NoTls)
-            .map_err(|e| format!("postgres connect {}: {e}", self.uri))
+        Client::connect(&self.uri, NoTls).map_err(|e| format!("postgres connect {}: {e}", self.uri))
     }
 
     /// Hand a used client back (bounded; a closed socket is dropped instead of

@@ -164,7 +164,17 @@ mod tests {
     #[test]
     fn parse_size_bytes_refuses_zero_garbage_and_overflow() {
         // `0` is refused here but valid for parse_rate (where it means "off").
-        for bad in ["", "0", "0M", "abc", "12Z", "1.5M", "-4", "M", "99999999999999999999G"] {
+        for bad in [
+            "",
+            "0",
+            "0M",
+            "abc",
+            "12Z",
+            "1.5M",
+            "-4",
+            "M",
+            "99999999999999999999G",
+        ] {
             assert!(parse_size_bytes(bad).is_err(), "{bad:?} should be refused");
         }
     }

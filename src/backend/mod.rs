@@ -96,7 +96,14 @@ where
             if i >= count {
                 return Err(bad());
             }
-            (i, if rest.is_empty() { None } else { Some(rest.to_string()) })
+            (
+                i,
+                if rest.is_empty() {
+                    None
+                } else {
+                    Some(rest.to_string())
+                },
+            )
         }
     };
     let limit = limit.clamp(1, LIST_LIMIT_MAX);

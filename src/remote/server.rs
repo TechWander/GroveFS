@@ -380,14 +380,7 @@ pub fn serve_on_auth(
     token: &str,
     fence: Arc<Fence>,
 ) {
-    serve_auth_keys(
-        listener,
-        backend,
-        token,
-        fence,
-        None,
-        proto::NO_MEMBER_ID,
-    )
+    serve_auth_keys(listener, backend, token, fence, None, proto::NO_MEMBER_ID)
 }
 
 /// Accept loop that advertises a stable `member_id` in every `OP_OPEN` ack, so

@@ -30,7 +30,7 @@
 //! the bytes, and every entry point that cannot be served remotely says so by
 //! name rather than doing something half-right. `fork` and `graft` ARE served
 //! here: they only copy metadata inside the store the server already owns, and
-//! every backend can now do both (SQLite rows, a PG schema, an FDB subspace).
+//! every backend can now do both (SQLite rows or a PG schema).
 //! `export`/`import` are served here too — the operator's `--out`/`--in` stays a
 //! path on the operator's machine while the dump travels in line-aligned chunks
 //! through the server's staging area. What crosses the wire is METADATA only
@@ -49,8 +49,8 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use crate::meta::{GraftItem, GraftStats, ForkStats, MetaProvider};
 use crate::mcp::ControlStore;
+use crate::meta::{ForkStats, GraftItem, GraftStats, MetaProvider};
 use crate::remote::proto;
 
 /// A governance client bound to one `meta-server --control-listen` address and
@@ -147,10 +147,7 @@ impl ControlClient {
             ));
         }
         let begin = self.call("view.export", json!({"view": view}))?;
-        let handle = as_str(
-            begin.get("handle").unwrap_or(&Value::Null),
-            "export handle",
-        )?;
+        let handle = as_str(begin.get("handle").unwrap_or(&Value::Null), "export handle")?;
         let nodes = count_field(&begin, "nodes")?;
         let blobs = count_field(&begin, "blobs")?;
         let kind = begin
@@ -203,11 +200,7 @@ impl ControlClient {
             let _ = std::fs::remove_file(&tmp);
             format!("cannot move export into {}: {e}", out.display())
         })?;
-        Ok(crate::meta::ViewExportStats {
-            nodes,
-            blobs,
-            kind,
-        })
+        Ok(crate::meta::ViewExportStats { nodes, blobs, kind })
     }
 
     /// Push a local dump to the server and install it as `view` there.
@@ -227,10 +220,7 @@ impl ControlClient {
         let mut f = std::fs::File::open(input)
             .map_err(|e| format!("cannot open {}: {e}", input.display()))?;
         let begin = self.call("view.import.begin", json!({}))?;
-        let handle = as_str(
-            begin.get("handle").unwrap_or(&Value::Null),
-            "import handle",
-        )?;
+        let handle = as_str(begin.get("handle").unwrap_or(&Value::Null), "import handle")?;
         let chunk = xfer_chunk();
         let pushed = (|| -> Result<(), String> {
             use std::io::Read;
@@ -268,7 +258,10 @@ impl ControlClient {
                     "view.import.put",
                     json!({"handle": handle, "offset": off, "text": text}),
                 )?;
-                off = r.get("size").and_then(Value::as_u64).unwrap_or(off + cut as u64);
+                off = r
+                    .get("size")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(off + cut as u64);
                 carry.drain(..cut);
                 if eof {
                     break;
@@ -333,7 +326,7 @@ fn count_field(v: &Value, what: &str) -> Result<i64, String> {
 pub struct RemoteControlStore {
     ctl: Arc<ControlClient>,
     /// The control plane's backend name, as reported by `info` at construction
-    /// (`"postgres"`/`"sqlite"`/`"foundationdb"`) — surfaced in `view list` and
+    /// (`"postgres"`/`"sqlite"`) — surfaced in `view list` and
     /// tool JSON so an operator can tell what the server actually governs.
     backend: &'static str,
 }
@@ -354,7 +347,6 @@ impl RemoteControlStore {
         let backend: &'static str = match name {
             "postgres" => "postgres",
             "sqlite" => "sqlite",
-            "foundationdb" => "foundationdb",
             _ => "remote",
         };
         Ok(Self {
@@ -458,14 +450,8 @@ impl ControlStore for RemoteControlStore {
             .unwrap_or(false))
     }
 
-    fn create_fork_tree(
-        &self,
-        base: &str,
-        name: &str,
-        seed: bool,
-    ) -> Result<ForkStats, String> {
-        // The server performs the copy; a backend that cannot fork (PG has no
-        // per-view snapshot path, an `fdb://` view is a subspace) answers with
+    fn create_fork_tree(&self, base: &str, name: &str, seed: bool) -> Result<ForkStats, String> {
+        // The server performs the copy; a backend that cannot fork answers with
         // its own refusal text, which is what the caller prints. Nothing is
         // re-derived here — the point of the control plane is ONE verdict.
         let r = self.ctl.call(

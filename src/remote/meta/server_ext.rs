@@ -98,19 +98,10 @@ impl HaState {
 /// replication/logical decoding for durability, so GroveFS-native HA
 /// (`--role standby`/`--peer`/`--witness`) is rejected at `serve()` time and
 /// [`MetaStore::backup_to_bytes`] reports unsupported for this variant.
-/// [`StoreKind::Fdb`] — present only in a `--features fdb` build — drives
-/// [`MetaStore::Fdb`]/[`crate::fdb_store::FdbStore`] against the cluster named by
-/// its cluster file. Per-view isolation is a tuple-layer subspace, so no local
-/// `meta/` tree exists. HA here is FoundationDB's own (replication across
-/// storage servers, plus `fdbbackup` for snapshots): GroveFS-native snapshot
-/// shipping is SQLite-only exactly as under PG, so the same `serve()` refusal
-/// applies, and `backup_to_bytes` reports unsupported.
 #[derive(Clone, Debug)]
 pub enum StoreKind {
     Sqlite,
     Pg(String),
-    #[cfg(feature = "fdb")]
-    Fdb(String),
 }
 
 impl StoreKind {
@@ -124,8 +115,6 @@ impl StoreKind {
         match self {
             StoreKind::Sqlite => "sqlite",
             StoreKind::Pg(_) => "postgres",
-            #[cfg(feature = "fdb")]
-            StoreKind::Fdb(_) => "foundationdb",
         }
     }
 
@@ -136,13 +125,9 @@ impl StoreKind {
     pub(crate) fn backend_layout(&self) -> String {
         match self {
             StoreKind::Sqlite => "one db file per view under <base>/meta/".to_string(),
-            StoreKind::Pg(_) => "one schema per view in PostgreSQL; <base> holds no trees"
-                .to_string(),
-            #[cfg(feature = "fdb")]
-            StoreKind::Fdb(uri) => format!(
-                "one subspace per view in FoundationDB (cluster file {}); <base> holds no trees",
-                uri.trim_start_matches("fdb://")
-            ),
+            StoreKind::Pg(_) => {
+                "one schema per view in PostgreSQL; <base> holds no trees".to_string()
+            }
         }
     }
 }
@@ -370,8 +355,8 @@ pub struct MetaServer {
     sync_repl: bool,
     witness: Option<String>,
     store: StoreKind,
-    /// Set when `--meta-store` named a backend this binary cannot provide (an
-    /// `fdb://` uri in a build without `--features fdb`). `serve()` refuses on a
+    /// Set when `--meta-store` named a scheme this binary cannot provide (any
+    /// `scheme://` URI other than the PostgreSQL ones). `serve()` refuses on a
     /// non-empty value, which is what keeps an unsupported backend from being
     /// silently served by SQLite.
     store_unavailable: Option<String>,
@@ -527,41 +512,29 @@ impl MetaServer {
     }
 
     /// Choose the metadata backend. `uri` accepts:
-    /// * `None` or `"sqlite"` (or anything not a recognised scheme URI) — the
-    ///   default embedded-SQLite backend, one db per view under `<base>/meta/`.
+    /// * `None` or `"sqlite"` — the default embedded-SQLite backend, one db per
+    ///   view under `<base>/meta/`.
     /// * `postgres://user:pw@host:port/db` (or `postgresql://...`) — the
     ///   PostgreSQL backend, one PG schema per view. Combined with
     ///   `--role/--peer/--witness` at `serve()` time this returns an
     ///   [`io::ErrorKind::InvalidInput`] because GroveFS-native HA snapshot
     ///   shipping (`VACUUM INTO`) is a SQLite-specific mechanism; run PG with
     ///   PostgreSQL's own streaming/logical replication instead.
-    /// * `fdb://<path-to-cluster-file>` — the FoundationDB backend, one subspace
-    ///   per view, in a build with `--features fdb`. Same HA refusal as PG for
-    ///   the same reason (FDB replicates internally; `fdbbackup` is its snapshot
-    ///   mechanism).
     ///
-    /// An `fdb://` URI handed to a build WITHOUT the feature is not silently
-    /// demoted to SQLite: it is remembered and refused by `serve()`. Falling back
-    /// would start a server that stores metadata somewhere other than where the
-    /// operator said, which is the one outcome a `--meta-store` flag must never
-    /// produce.
+    /// Any OTHER `scheme://` URI is not silently demoted to SQLite: it is
+    /// remembered and refused by `serve()`. Falling back would start a server
+    /// that stores metadata somewhere other than where the operator said, which
+    /// is the one outcome a `--meta-store` flag must never produce.
     pub fn with_store(mut self, uri: Option<String>) -> Self {
         match uri {
-            #[cfg(feature = "fdb")]
-            Some(u) if u.starts_with("fdb://") => {
-                self.store = StoreKind::Fdb(u);
-            }
-            #[cfg(not(feature = "fdb"))]
-            Some(u) if u.starts_with("fdb://") => {
-                self.store_unavailable = Some(format!(
-                    "{u} names the FoundationDB backend, but this binary was built \
-                     without `--features fdb` (it does not link libfdb_c). Rebuild \
-                     with the feature, or drop --meta-store to use the default \
-                     SQLite backend — an fdb:// uri is never served by SQLite."
-                ));
-            }
             Some(u) if u.starts_with("postgres://") || u.starts_with("postgresql://") => {
                 self.store = StoreKind::Pg(u);
+            }
+            Some(u) if u.contains("://") => {
+                self.store_unavailable = Some(format!(
+                    "`{u}` is not a --meta-store scheme this build serves: GroveFS metadata lives in SQLite (the local trees under --meta-dir) or PostgreSQL (`--meta-store postgres://…`)"
+                ));
+                self.store = StoreKind::Sqlite;
             }
             _ => self.store = StoreKind::Sqlite,
         }
@@ -573,28 +546,18 @@ impl MetaServer {
     /// resident connections to RECENTLY USED views instead of every view
     /// opened since start — the difference between "views a server can host"
     /// and PG's `max_connections`.
-    ///
-    /// Under the FDB backend the same knob degrades on purpose, and the
-    /// degradation is the honest one: there is no per-view connection pool to
-    /// release, because one `Database` handle per cluster file is shared by every
-    /// view and the socket state lives in the client's own network thread.
-    /// Evicting therefore frees the per-view engine (its allocator block, its
-    /// readdir cursor map, its last-touch stamp) and nothing else; the resident
-    /// cost of a view here is in-process memory, not a server-side slot, so
-    /// `--engine-idle-secs` is a memory bound under FDB rather than the
-    /// scalability gate it is under PG.
     pub fn with_engine_idle_secs(mut self, secs: u64) -> Self {
         self.engine_idle_ms = secs.saturating_mul(1000);
         self
     }
 
     pub fn serve(&self) -> io::Result<()> {
-        // An `fdb://` request against a binary that was not built with the
-        // feature is refused rather than downgraded: see `with_store`.
+        // A --meta-store scheme this binary cannot serve is refused rather than
+        // downgraded: see `with_store`.
         if let Some(msg) = &self.store_unavailable {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, msg.clone()));
         }
-        // Neither PG nor FDB exercises the GroveFS-native HA pipeline: the
+        // PG does not exercise the GroveFS-native HA pipeline: the
         // `VACUUM INTO` snapshot mechanism and the fencing-witness lease are
         // SQLite-specific. Refuse the combination at startup instead of letting
         // a caller assume `--peer` still replicates (it silently wouldn't).
@@ -605,11 +568,6 @@ impl MetaServer {
                 StoreKind::Pg(_) => (
                     "postgres://…",
                     "Run PostgreSQL's own streaming / logical replication for HA,\n                     or keep the meta-server single-instance under PG.",
-                ),
-                #[cfg(feature = "fdb")]
-                StoreKind::Fdb(_) => (
-                    "fdb://…",
-                    "FoundationDB replicates inside the cluster (and snapshots with `fdbbackup`),\n                     so GroveFS-native HA has nothing to ship here; run the meta-server\n                     without --role standby / --peer / --witness.",
                 ),
                 // The guard above already excluded SQLite, and the arms cover
                 // every non-Sqlite variant this build has; naming that here
@@ -630,70 +588,6 @@ impl MetaServer {
         if matches!(self.store, StoreKind::Sqlite) {
             std::fs::create_dir_all(self.base.join("meta"))?;
         }
-        // ---- FoundationDB: cluster gate + writer lease ----------------------
-        //
-        // A `fdb://` server must establish two facts BEFORE it binds, because
-        // both used to be discovered the hard way:
-        //
-        // 1. The cluster is available. Starting against an unreachable or
-        //    unconfigured cluster printed the normal banners and then the first
-        //    mount blocked for ~150s with no output at all (measured); the probe
-        //    below reads the cluster's own status with a bounded timeout and
-        //    refuses instead, naming the timeout knob.
-        // 2. No other meta-server behind the same control plane is writing. The
-        //    view definitions/keys of an `fdb://` deployment are LOCAL files
-        //    (P5 has not moved governance into the cluster), so two servers
-        //    sharing a `--meta-dir` would each keep their own definitions while
-        //    writing the same trees — the one shape no amount of replication can
-        //    repair. The lease row in the cluster makes that shape refuse to start
-        //    instead of diverging silently.
-        #[cfg(feature = "fdb")]
-        if let StoreKind::Fdb(uri) = &self.store {
-            // The lease id is the canonical `--meta-dir`, and `canonicalize`
-            // needs the path to exist; creating it here is not a footprint — the
-            // local control plane of an FDB deployment lives in this directory
-            // (`meta/views/*.layout`, `api_keys.db`) and would be created by the
-            // first `view create` anyway.
-            std::fs::create_dir_all(&self.base)?;
-            let status = crate::fdb_store::cluster_status(
-                uri,
-                crate::fdb_store::cluster_open_timeout(),
-            )?;
-            if !status.available {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    format!(
-                        "--meta-store {uri}: the cluster reports its database as UNAVAILABLE ({}) — \
-                         a meta-server cannot serve a mount from it; check \
-                         `fdbcli -C <cluster file> --exec 'status minimal'`",
-                        if status.message.is_empty() {
-                            "no message from the cluster"
-                        } else {
-                            &status.message
-                        }
-                    ),
-                ));
-            }
-            // Printed even when the lease is disabled: this line is how an
-            // operator tells a single-node test cluster from a replicated one
-            // without reaching for `fdbcli`.
-            println!("meta-server: fdb cluster up — {}", status.topology());
-            let deployment = crate::fdb_store::deployment_id(&self.base);
-            match crate::fdb_store::hold_writer_lease(uri, &deployment)? {
-                Some(lease) => println!(
-                    "meta-server: writer lease HELD for deployment {} (holder {}, renewed every {}s, expires {}s after the last renewal); a second meta-server on this --meta-dir waits, then refuses — `grovefs view --meta-store {uri} lease` shows holders",
-                    lease.deployment,
-                    lease.owner,
-                    crate::fdb_store::writer_lease_ttl().map_or(0, |t| (t.as_secs() / 3).max(1)),
-                    crate::fdb_store::writer_lease_ttl().map_or(0, |t| t.as_secs()),
-                ),
-                None => println!(
-                    "meta-server: writer lease DISABLED ({}={}); nothing now stops a second meta-server on this --meta-dir from writing the same trees",
-                    crate::fdb_store::WRITER_LEASE_ENV,
-                    0
-                ),
-            }
-        }
         // The CONTROL port's own credential store. Built here (and only here)
         // so `--control-listen` is self-contained: it does NOT reuse
         // `--require-api-key`'s store object but the same physical rows, and it
@@ -706,8 +600,6 @@ impl MetaServer {
                 let store_uri = match &self.store {
                     StoreKind::Pg(u) => Some(u.as_str()),
                     StoreKind::Sqlite => None,
-                    #[cfg(feature = "fdb")]
-                    StoreKind::Fdb(u) => Some(u.as_str()),
                 };
                 Some(Arc::new(
                     crate::apikeys::ApiKeyStore::open_for(&self.base, store_uri)
@@ -727,7 +619,7 @@ impl MetaServer {
                 .unwrap_or_default()
         );
         // Second banner line: the backend. `base` alone used to imply the engine
-        // (a SQLite base IS the trees); with three backends it no longer does,
+        // (a SQLite base IS the trees); with two backends it no longer does,
         // and an operator debugging "where did my tree go" must be able to tell
         // from the log. Printed as its own line rather than folded into the
         // listening line so the historical `…(base …, role …)` transcript shape
@@ -754,27 +646,14 @@ impl MetaServer {
             None
         };
         // The control plane FOLLOWS the metadata backend: a PG store reads view
-        // definitions/aliases/forks from the shared `grovefs_control` schema, an
-        // FDB store from the cluster's `ctl` tables, a SQLite store from the local
-        // `meta/views` dir — one system of record per backend, never a local file
-        // the PG/FDB deployment would ignore.
+        // definitions/aliases/forks from the shared `grovefs_control` schema, a
+        // SQLite store from the local `meta/views` dir — one system of record per
+        // backend, never a local file the PG deployment would ignore.
         let control = crate::mcp::control_store_for(
             &self.base,
             match &self.store {
                 StoreKind::Pg(uri) => Some(uri.as_str()),
                 StoreKind::Sqlite => None,
-                // FDB: the control plane is the CLUSTER's, exactly as PG's is.
-                // View definitions/aliases/forks live in `CtlDefTable`, api keys
-                // and audit in `CtlKeyTable`, and physical trees are subspaces —
-                // all under the one `ctl`/root key space every meta-server, MCP
-                // and CLI on the cluster shares (docs/fdb-keyspace.md I1–I4). The
-                // half-migrated shape the design doc rejects — metadata
-                // authoritative in the cluster, governance local to one node — is
-                // gone: there is no local system of record left to split from.
-                // `control_store_for` also runs a one-time best-effort upload of
-                // any pre-existing local definition slots an older build kept.
-                #[cfg(feature = "fdb")]
-                StoreKind::Fdb(uri) => Some(uri.as_str()),
             },
         )
         .map_err(io::Error::other)?;
@@ -1046,15 +925,14 @@ fn handle_gov_conn(mut s: TcpStream, rt: &Arc<MetaRuntime>) -> io::Result<()> {
     };
     let key = req.get("k").and_then(|v| v.as_str()).unwrap_or("");
     let op = req.get("op").and_then(|v| v.as_str()).unwrap_or("");
-    let args = req
-        .get("a")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
+    let args = req.get("a").cloned().unwrap_or(serde_json::Value::Null);
     let Some(keys) = rt.ctl_keys.as_ref() else {
         return gov_reply(
             &mut s,
             serde_json::Value::Null,
-            Some("this meta-server has no control plane (start it with --control-listen HOST:PORT)"),
+            Some(
+                "this meta-server has no control plane (start it with --control-listen HOST:PORT)",
+            ),
         );
     };
     let authed = match keys.authenticate_admin(key) {
@@ -1224,7 +1102,7 @@ fn control_dispatch(
         // the store — instead of being refused, because the copy reads and
         // writes nothing but the metadata store this server is already the only
         // holder of. Whether a backend CAN fork is the backend's own verdict
-        // (PG has no per-view snapshot path; an `fdb://` view is a subspace),
+        // (PG has no per-view snapshot path),
         // and that verdict travels back verbatim rather than being re-invented
         // on the operator's machine.
         "fork.create" => {
@@ -1326,15 +1204,6 @@ fn control_dispatch(
                     let be = crate::backend::open_local(&rt.base).ok();
                     let note = seed_if_manifest(&eng, be.as_deref(), manifest)?;
                     format!("created BASE view '{view}' at {}{note}", mp.display())
-                }
-                #[cfg(feature = "fdb")]
-                StoreKind::Fdb(uri) => {
-                    let eng = crate::fdb_store::FdbStore::open(uri, &view, false)
-                        .map_err(|e| format!("view create: {e}"))?;
-                    let note = seed_if_manifest(&eng, None, manifest)?;
-                    format!(
-                        "created BASE view '{view}' in {uri} (subspace under the 'grovefs' root){note}"
-                    )
                 }
             };
             rt.evict();
@@ -1531,8 +1400,7 @@ fn view_export_stage(rt: &Arc<MetaRuntime>, view: &str) -> Result<serde_json::Va
     let definition = rt.control.get_def_raw(view)?;
     refuse_virtual_for_export(view, definition.as_deref())?;
     let dir = xfer_dir(rt);
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     sweep_xfer(&dir);
     let handle = new_xfer_handle('x');
     let path = xfer_path(rt, &handle)?;
@@ -1541,11 +1409,6 @@ fn view_export_stage(rt: &Arc<MetaRuntime>, view: &str) -> Result<serde_json::Va
         StoreKind::Pg(uri) => {
             crate::pg_store::export_view(uri, view, &path, true, definition.clone())?
         }
-        #[cfg(feature = "fdb")]
-        StoreKind::Fdb(uri) => crate::fdb_store::FdbStore::open(uri, view, true)
-            .map_err(|e| e.to_string())?
-            .export_jsonl(view, &path, true, definition.clone())
-            .map_err(|e| e.to_string())?,
     };
     let size = std::fs::metadata(&path)
         .map_err(|e| format!("cannot stat staged export {handle}: {e}"))?
@@ -1625,8 +1488,7 @@ fn view_export_chunk(
 fn view_import_begin(rt: &Arc<MetaRuntime>) -> Result<serde_json::Value, String> {
     use serde_json::json;
     let dir = xfer_dir(rt);
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     sweep_xfer(&dir);
     let handle = new_xfer_handle('i');
     let path = xfer_path(rt, &handle)?;
@@ -1644,7 +1506,9 @@ fn view_import_put(
     use std::io::Write;
     let path = xfer_path(rt, handle)?;
     let have = std::fs::metadata(&path)
-        .map_err(|e| format!("no upload staged as '{handle}' ({e}) — call `view.import.begin` first"))?
+        .map_err(|e| {
+            format!("no upload staged as '{handle}' ({e}) — call `view.import.begin` first")
+        })?
         .len();
     if have != offset {
         return Err(format!(
@@ -1710,11 +1574,6 @@ fn view_import_commit(
     let st = match &rt.store {
         StoreKind::Sqlite => crate::meta::import_view(&rt.base, &view, &path, replace)?,
         StoreKind::Pg(uri) => crate::pg_store::import_view(uri, &view, &path, replace)?,
-        #[cfg(feature = "fdb")]
-        StoreKind::Fdb(uri) => crate::fdb_store::FdbStore::open(uri, &view, true)
-            .map_err(|e| e.to_string())?
-            .import_jsonl(&path, replace)
-            .map_err(|e| e.to_string())?,
     };
     if let Some(base) = &as_fork {
         if let Err(e) = rt.control.put_def(&view, &format!("fork {base}\n")) {
@@ -1749,12 +1608,9 @@ fn drop_imported_tree(rt: &Arc<MetaRuntime>, view: &str) -> String {
         }
         StoreKind::Pg(uri) => match crate::pg_store::PgEngine::remove_view(uri, view) {
             Ok(_) => "the imported tree was removed again".to_string(),
-            Err(e) => format!("the imported tree could NOT be removed ({e}) — drop schema for '{view}' by hand"),
-        },
-        #[cfg(feature = "fdb")]
-        StoreKind::Fdb(uri) => match crate::fdb_store::FdbStore::drop_tree(uri, view) {
-            Ok(()) => "the imported tree was removed again".to_string(),
-            Err(e) => format!("the imported tree could NOT be removed ({e}) — clear its subspace by hand"),
+            Err(e) => format!(
+                "the imported tree could NOT be removed ({e}) — drop schema for '{view}' by hand"
+            ),
         },
     }
 }
@@ -1834,16 +1690,6 @@ fn view_rm_base(
                 rm.blob_refs.len()
             )
         }
-        #[cfg(feature = "fdb")]
-        StoreKind::Fdb(uri) => {
-            let st = crate::fdb_store::FdbStore::open(uri, view, true).map_err(|e| e.to_string())?;
-            let rep = st.remove_view().map_err(|e| e.to_string())?;
-            let bytes = free_unbooked(&rep.unbooked_refs, &droot);
-            format!(
-                "removed base view '{view}' from {uri}: {} key(s) gone, {} node(s), {} object(s) not held by any view; {bytes}",
-                rep.keys, rep.entries, rep.unbooked
-            )
-        }
     };
     // Drop cached engines: the tree they point at no longer exists.
     rt.evict();
@@ -1867,22 +1713,14 @@ fn refs_rebuild(rt: &Arc<MetaRuntime>) -> Result<serde_json::Value, String> {
                 rt.base.join("meta").join("refs.db").display()
             )))
         }
-        #[cfg(feature = "fdb")]
-        StoreKind::Fdb(uri) => {
-            let rep = crate::fdb_store::rebuild_ledger(uri).map_err(|e| e.to_string())?;
-            Ok(json!(format!(
-                "refs ledger rebuilt in {uri}: {} tree(s), {} content key(s), {} holder unit(s); {} row(s) corrected, {} row(s) deleted",
-                rep.trees, rep.refs, rep.holders, rep.rows_fixed, rep.rows_deleted
-            )))
-        }
     }
 }
 
 /// What this server's store says its trees name, in the one shape the audit
 /// judges: the same [`crate::gc::Picture`] the offline scan builds from
 /// `meta/*.db`. Reading the trees WHERE THEY LIVE is the whole reason this runs
-/// on the server — an operator's machine has neither the schemas nor the
-/// subspaces, only the admin key.
+/// on the server — an operator's machine has neither the local trees nor the
+/// PG schemas, only the admin key.
 fn gc_picture(rt: &Arc<MetaRuntime>) -> Result<crate::gc::Picture, String> {
     match &rt.store {
         StoreKind::Sqlite => crate::gc::picture_sqlite(&rt.base),
@@ -1891,23 +1729,7 @@ fn gc_picture(rt: &Arc<MetaRuntime>) -> Result<crate::gc::Picture, String> {
             Ok(crate::gc::Picture {
                 refs: crate::gc::Refs::from_keys(p.trees, p.refs.into_keys()),
                 ledger: crate::gc::Ledger::from_keys(
-                    p.booked
-                        .into_iter()
-                        .filter(|(_, h)| *h > 0)
-                        .map(|(k, _)| k),
-                ),
-            })
-        }
-        #[cfg(feature = "fdb")]
-        StoreKind::Fdb(uri) => {
-            let p = crate::fdb_store::ledger_picture(uri).map_err(|e| e.to_string())?;
-            Ok(crate::gc::Picture {
-                refs: crate::gc::Refs::from_keys(p.trees.into_iter().collect(), p.refs.into_keys()),
-                ledger: crate::gc::Ledger::from_keys(
-                    p.booked
-                        .into_iter()
-                        .filter(|(_, h)| *h > 0)
-                        .map(|(k, _)| k),
+                    p.booked.into_iter().filter(|(_, h)| *h > 0).map(|(k, _)| k),
                 ),
             })
         }
@@ -2036,8 +1858,7 @@ fn gc_audit(
         let be = crate::remote::client::RemoteBackend::new_with_creds(addr, token, api_key)
             .map_err(|e| format!("cannot reach data server {addr}: {e}"))?;
         for row in list_server(&be, addr)? {
-            let mtime = std::time::UNIX_EPOCH
-                + Duration::from_secs(row.mtime_secs.max(0) as u64);
+            let mtime = std::time::UNIX_EPOCH + Duration::from_secs(row.mtime_secs.max(0) as u64);
             objects.push((row.key, row.size, mtime));
         }
         backends.push(be);
@@ -2094,11 +1915,6 @@ fn gc_audit(
     let meta = match &rt.store {
         StoreKind::Sqlite => rt.base.display().to_string(),
         StoreKind::Pg(_) => "PostgreSQL (one schema per view; the URI is never echoed)".to_string(),
-        #[cfg(feature = "fdb")]
-        StoreKind::Fdb(uri) => format!(
-            "FoundationDB ({}; one subspace per view)",
-            uri.trim_start_matches("fdb://")
-        ),
     };
     let cand = |c: &crate::gc::Judged| {
         json!({
@@ -2179,12 +1995,9 @@ fn now_millis() -> u64 {
 /// know what an engine holds), and that is the right seam, but WHAT it frees
 /// differs per backend and the difference is not cosmetic: under PG a dropped
 /// entry closes 8 writers + 4 readers, which is why the knob is the PG
-/// scalability gate at all; under FDB one `Database` handle per cluster file is
-/// shared by every view and no per-view connection exists to close, so the same
-/// drop frees only in-process memory (the engine, its readdir cursors, its
-/// stamp). See [`MetaServer::with_engine_idle_secs`]. No branch is needed here
-/// precisely because eviction is "forget the entry, reopen on next op" for all
-/// three stores.
+/// scalability gate at all. See [`MetaServer::with_engine_idle_secs`]. No branch
+/// is needed here precisely because eviction is "forget the entry, reopen on
+/// next op" for both stores.
 ///
 /// In-flight ops are safe by construction: they hold their own `Arc` clones, so
 /// removing a map entry only releases the CONNECTIONS once the last clone
@@ -2270,9 +2083,6 @@ fn store_for(rt: &MetaRuntime, view: &str) -> io::Result<Arc<MetaStore>> {
         }
         StoreKind::Pg(uri) => MetaStore::open_pg(uri, view, false)
             .map_err(|e| io::Error::other(format!("pg open for view='{view}' uri='{uri}': {e}")))?,
-        #[cfg(feature = "fdb")]
-        StoreKind::Fdb(uri) => MetaStore::open_fdb(uri, view, false)
-            .map_err(|e| io::Error::other(format!("fdb open for view='{view}' uri='{uri}': {e}")))?,
     };
     let engine = Arc::new(store);
     m.insert(
@@ -2347,18 +2157,14 @@ fn view_provider(rt: &MetaRuntime, view: &str) -> io::Result<Arc<dyn MetaProvide
     // would keep the guard alive through the whole block (temporary lifetime
     // rules), and the eviction path below locks `views` again — a non-reentrant
     // mutex would self-deadlock the connection.
-    let cached = rt
-        .views
-        .lock()
-        .get(view)
-        .map(|(p, stamp)| {
-            stamp.store(now_millis(), Ordering::Relaxed);
-            p.clone()
-        });
+    let cached = rt.views.lock().get(view).map(|(p, stamp)| {
+        stamp.store(now_millis(), Ordering::Relaxed);
+        p.clone()
+    });
     if let Some(p) = cached {
         // Hot reload: a cached DERIVED entry is only served while its
         // definition is unchanged in the control store (a file `size:mtime`, a
-        // PG row `xmin`, or an FDB `view_def_ver` ticket; a cheap probe per op is
+        // PG row `xmin`; a cheap probe per op is
         // negligible next to a FUSE round trip). An edited definition evicts the
         // lens and every live
         // mount of the name converges on the next op — bounded by the client's
@@ -2392,8 +2198,8 @@ fn view_provider(rt: &MetaRuntime, view: &str) -> io::Result<Arc<dyn MetaProvide
     let (provider, base): (Arc<dyn MetaProvider>, String) = match def {
         Some(ViewDef::Fork(_)) => {
             // A FORK owns an independent metadata tree (a local `<name>.db`
-            // under SQLite, a `grovefs_v_<hex>` schema under PG, a subspace under
-            // FDB — all three backends seed it in one transaction). The
+            // under SQLite, a `grovefs_v_<hex>` schema under PG — both seed it in
+            // one transaction). The
             // definition only records which physical view seeded it. It is
             // resolved like a physical store (same cache, same subscriptions) but
             // deliberately NOT recorded in `defs`: `is_derived` stays false, so
@@ -2890,12 +2696,6 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
             let root = rt.base.display();
             let hint = if rt.control.backend() == "postgres" {
                 format!("a PG base view is a schema: create it first with `grovefs view --meta-store postgres://… --meta-dir {root} create --view {view}`, or restore the schema from a dump")
-            } else if rt.control.backend() == "foundationdb" {
-                // Same shape as the PG arm, and for the same reason: under this
-                // backend "create the view" means "provision the subspace", and a
-                // hint that omitted `--meta-store` would tell the operator to build
-                // a local db file this server will never read.
-                format!("an FDB base view is a subspace of the cluster: create it first with `grovefs view --meta-store fdb://<cluster-file> --meta-dir {root} create --view {view}`")
             } else {
                 format!("create it first: `grovefs view --meta-dir {root} create --view {view}` (or `grovefs --home {root} init --view {view}`, or seed it with `grovefs view import`)")
             };
@@ -4700,7 +4500,8 @@ mod ha_tests {
         let a = store_for(&rt, "v1").unwrap();
         assert!(rt.cache.lock().contains_key("v1"));
         // Age the base stamp to epoch 0: idle under any real window.
-        rt.cache.lock()
+        rt.cache
+            .lock()
             .get("v1")
             .unwrap()
             .1
@@ -4734,7 +4535,8 @@ mod ha_tests {
         assert!(!Arc::ptr_eq(&a, &b), "eviction must actually replace");
         assert!(rt.cache.lock().contains_key("v1"));
         // `0` disables the sweeper outright (embedder / test-server shape).
-        rt.cache.lock()
+        rt.cache
+            .lock()
             .get("v1")
             .unwrap()
             .1
@@ -4776,10 +4578,14 @@ mod store_dispatch_tests {
     }
 
     #[test]
-    fn fdb_dispatch_defaults_to_sqlite_when_no_fdb_uri() {
-        // The three shapes that existed before this backend: none of them may
-        // now land anywhere other than SQLite, and none may raise a refusal.
-        for uri in [None, Some("sqlite".to_string()), Some("file.db".to_string())] {
+    fn store_dispatch_selects_sqlite_or_pg_and_refuses_other_schemes() {
+        // The shapes that must land on SQLite, and none of them may raise a
+        // refusal.
+        for uri in [
+            None,
+            Some("sqlite".to_string()),
+            Some("file.db".to_string()),
+        ] {
             let s = server().with_store(uri.clone());
             assert!(
                 matches!(s.store, StoreKind::Sqlite),
@@ -4807,42 +4613,23 @@ mod store_dispatch_tests {
             assert_eq!(s.store.backend_name(), "postgres");
             assert!(s.store_unavailable.is_none());
         }
-        // The new scheme, in a build that has it, is a third arm — not a PG or
-        // SQLite rewrite.
-        #[cfg(feature = "fdb")]
-        {
-            let s = server().with_store(Some("fdb:///etc/fdb.cluster".to_string()));
+        // Any other scheme is refused rather than quietly served by SQLite.
+        for uri in ["other://host/db", "mysql://user@host/db"] {
+            let s = server().with_store(Some(uri.to_string()));
             assert!(
-                matches!(&s.store, StoreKind::Fdb(u) if u == "fdb:///etc/fdb.cluster"),
-                "fdb:// must select FDB verbatim, got {:?}",
-                s.store
+                s.store_unavailable.is_some(),
+                "{uri} must arm the refusal path, got {:?}",
+                s.store_unavailable
             );
-            assert_eq!(s.store.backend_name(), "foundationdb");
-            assert!(s.store_unavailable.is_none());
-        }
-        #[cfg(not(feature = "fdb"))]
-        {
-            // And in a build without it, it is refused rather than downgraded:
-            // the store field may read Sqlite (nothing else exists to hold it),
-            // but `serve()` must fail on the refusal marker instead of starting
-            // a SQLite server for an operator who asked for FDB.
-            let s = server().with_store(Some("fdb:///etc/fdb.cluster".to_string()));
-            let msg = s
-                .store_unavailable
-                .clone()
-                .expect("an fdb:// uri must leave a refusal reason in a non-fdb build");
-            assert!(msg.contains("--features fdb"), "refusal must say how to fix it: {msg}");
-            let err = s.serve().expect_err("serve() must refuse, not fall back");
-            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-            assert!(err.to_string().contains("FoundationDB"));
+            let err = refused(s.with_ha(Role::Primary, None), "unsupported scheme");
+            assert!(err.contains("not a --meta-store scheme"), "{err}");
         }
     }
 
     #[test]
     fn ha_refusal_text_is_per_backend() {
-        // One refusal site, three backends: each message has to name ITS own
-        // remedy. Borrowing PG's "run streaming replication" advice for an FDB
-        // deployment would send an operator to a tool that does not exist here.
+        // One refusal site: the message has to name the remedy of the backend
+        // actually in use.
         let base = tempfile::tempdir().expect("tempdir");
         let peer = || Some("127.0.0.1:1".to_string());
         let pg = refused(
@@ -4853,31 +4640,6 @@ mod store_dispatch_tests {
         );
         assert!(pg.contains("postgres://…"), "{pg}");
         assert!(pg.contains("streaming"), "{pg}");
-
-        #[cfg(feature = "fdb")]
-        {
-            let fdb = refused(
-                MetaServer::new("127.0.0.1:0", base.path())
-                    .with_store(Some("fdb:///etc/fdb.cluster".to_string()))
-                    .with_ha(Role::Primary, peer()),
-                "FDB + --peer",
-            );
-            assert!(fdb.contains("fdb://…"), "{fdb}");
-            assert!(fdb.contains("fdbbackup"), "{fdb}");
-            assert!(
-                !fdb.contains("streaming"),
-                "the FDB refusal must not reuse PG's remedy: {fdb}"
-            );
-            // The standby role refuses too, and with the SAME per-backend text:
-            // `--role standby` is the third way to ask for HA shipping.
-            let stdby = refused(
-                MetaServer::new("127.0.0.1:0", base.path())
-                    .with_store(Some("fdb:///etc/fdb.cluster".to_string()))
-                    .with_ha(Role::Standby, None),
-                "FDB + --role standby",
-            );
-            assert!(stdby.contains("fdbbackup"), "{stdby}");
-        }
     }
 
     #[test]
@@ -4885,21 +4647,15 @@ mod store_dispatch_tests {
         // The banner is stdout → the journal. A PG URI routinely carries the
         // password, so the layout line must describe the backend without
         // echoing the credential-bearing string.
-        let s = server().with_store(Some("postgres://grovefs:s3cr3t@db.internal/grovefs".to_string()));
+        let s = server().with_store(Some(
+            "postgres://grovefs:s3cr3t@db.internal/grovefs".to_string(),
+        ));
         let layout = s.store.backend_layout();
         assert!(layout.contains("PostgreSQL"), "{layout}");
-        assert!(!layout.contains("s3cr3t"), "banner must not leak the password");
+        assert!(
+            !layout.contains("s3cr3t"),
+            "banner must not leak the password"
+        );
         assert!(!layout.contains("grovefs:s3cr3t"), "{layout}");
-        // An FDB cluster FILE is a path, not a credential: echoing it is the
-        // useful thing to do, since three hosts can point at three different
-        // clusters with the same-looking uri.
-        #[cfg(feature = "fdb")]
-        {
-            let s = server().with_store(Some("fdb:///data/grovefs/.fdbtest/test.cluster".to_string()));
-            assert!(
-                s.store.backend_layout().contains("/data/grovefs/.fdbtest/test.cluster"),
-                "the FDB line must name the cluster file the operator passed"
-            );
-        }
     }
 }

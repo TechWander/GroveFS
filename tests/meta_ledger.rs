@@ -191,13 +191,16 @@ fn concurrent_metadata_keeps_ledger_invariants() {
                         .unwrap();
                     // Hard link to the same inode, then drop both extra names:
                     // names 2 and 3 in this view must neither book nor unbook.
-                    assert_eq!(
-                        eng.link_node(ino, ROOT_INO, &format!("b{j}")).unwrap(),
-                        ino
-                    );
+                    assert_eq!(eng.link_node(ino, ROOT_INO, &format!("b{j}")).unwrap(), ino);
                     assert!(eng.unlink(ROOT_INO, &alias).unwrap().is_none());
                     let gc = eng
-                        .rename(ROOT_INO, &format!("b{j}"), ROOT_INO, &format!("c{j}"), false)
+                        .rename(
+                            ROOT_INO,
+                            &format!("b{j}"),
+                            ROOT_INO,
+                            &format!("c{j}"),
+                            false,
+                        )
                         .unwrap();
                     assert!(gc.is_none());
                     assert!(eng.unlink(ROOT_INO, &format!("c{j}")).unwrap().is_none());
@@ -346,12 +349,26 @@ fn ledger_write_scaling_probe() {
 
         let create = timed(&views, PER_VIEW, |v, eng, i| {
             let dr = format!("dr-{v}-{i}");
-            eng.create_node(ROOT_INO, &format!("c{i}"), false, Some(&dr), 0o644, 1000, 1000)
-                .unwrap();
+            eng.create_node(
+                ROOT_INO,
+                &format!("c{i}"),
+                false,
+                Some(&dr),
+                0o644,
+                1000,
+                1000,
+            )
+            .unwrap();
         });
         let rename = timed(&views, PER_VIEW, |_v, eng, i| {
-            eng.rename(ROOT_INO, &format!("c{i}"), ROOT_INO, &format!("r{i}"), false)
-                .unwrap();
+            eng.rename(
+                ROOT_INO,
+                &format!("c{i}"),
+                ROOT_INO,
+                &format!("r{i}"),
+                false,
+            )
+            .unwrap();
         });
         let unlink = timed(&views, PER_VIEW, |_v, eng, i| {
             eng.unlink(ROOT_INO, &format!("r{i}")).unwrap();

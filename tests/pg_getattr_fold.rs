@@ -70,7 +70,10 @@ fn eq_getattr_lookup(eng: &PgEngine, ino: i64, parent: i64, name: &str) {
 #[test]
 fn pg_getattr_lookup_fold_matches_counts() {
     if !pg_ready() {
-        eprintln!("SKIP pg_getattr_fold: no PostgreSQL at {}", hostport(&uri()));
+        eprintln!(
+            "SKIP pg_getattr_fold: no PostgreSQL at {}",
+            hostport(&uri())
+        );
         return;
     }
     let view = fresh_view();
@@ -97,13 +100,25 @@ fn pg_getattr_lookup_fold_matches_counts() {
     // 3) A grandchild dir under `sub` must NOT touch d.nlink (parent_id corr).
     eng.create_node_with_attr(subdir_id, "ssub", true, None, 0o755, 1000, 1000)
         .unwrap();
-    assert_eq!(eng.getattr(did).unwrap().nlink, 3, "grandchild dir leaks into d");
-    assert_eq!(eng.getattr(subdir_id).unwrap().nlink, 3, "sub gains its child dir");
+    assert_eq!(
+        eng.getattr(did).unwrap().nlink,
+        3,
+        "grandchild dir leaks into d"
+    );
+    assert_eq!(
+        eng.getattr(subdir_id).unwrap().nlink,
+        3,
+        "sub gains its child dir"
+    );
 
     // 4) A child FILE must NOT count toward a dir's nlink (is_dir=1 predicate).
     eng.create_node_with_attr(did, "cf", false, Some("blob-cf"), 0o644, 1000, 1000)
         .unwrap();
-    assert_eq!(eng.getattr(did).unwrap().nlink, 3, "child file counted as dir");
+    assert_eq!(
+        eng.getattr(did).unwrap().nlink,
+        3,
+        "child file counted as dir"
+    );
 
     // 5) Fresh regular FILE: nlink=1, size=0.
     let f = eng
@@ -126,7 +141,11 @@ fn pg_getattr_lookup_fold_matches_counts() {
 
     // 7) A third name -> nlink=3.
     eng.link_node(fino, ROOT_INO, "f_link2").unwrap();
-    assert_eq!(eng.getattr(fino).unwrap().nlink, 3, "holder count with 3 names");
+    assert_eq!(
+        eng.getattr(fino).unwrap().nlink,
+        3,
+        "holder count with 3 names"
+    );
 
     // 8) Fresh SYMLINK via single-trip create: nlink=1, size=target len.
     let s = eng
@@ -134,7 +153,11 @@ fn pg_getattr_lookup_fold_matches_counts() {
         .unwrap();
     assert_eq!(s.kind, NodeKind::Symlink);
     assert_eq!(s.nlink, 1, "symlink nlink");
-    assert_eq!(s.size, "/some/target".len() as u64, "symlink size = target len");
+    assert_eq!(
+        s.size,
+        "/some/target".len() as u64,
+        "symlink size = target len"
+    );
 
     // 9) Cross-check fold agreement on the whole spread.
     eq_getattr_lookup(&eng, did, ROOT_INO, "d");
@@ -148,7 +171,11 @@ fn pg_getattr_lookup_fold_matches_counts() {
         Err(MetaError::NotFound) => panic!("unlink f_link: not found"),
         Err(e) => panic!("unlink: {e}"),
     }
-    assert_eq!(eng.getattr(fino).unwrap().nlink, 2, "nlink after unlink one name");
+    assert_eq!(
+        eng.getattr(fino).unwrap().nlink,
+        2,
+        "nlink after unlink one name"
+    );
 
     eprintln!("PASS pg_getattr_lookup_fold_matches_counts");
 }

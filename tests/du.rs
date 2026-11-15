@@ -36,7 +36,15 @@ fn populated(dir: &Path) -> std::path::PathBuf {
     let h = home.to_str().unwrap();
     let (ok, o, e) = gv(&["init", "--home", h, "--view", "v"]);
     assert!(ok, "init: {o}{e}");
-    let (ok, o, e) = gv(&["import", "--home", h, "--view", "v", "--source", src.to_str().unwrap()]);
+    let (ok, o, e) = gv(&[
+        "import",
+        "--home",
+        h,
+        "--view",
+        "v",
+        "--source",
+        src.to_str().unwrap(),
+    ]);
     assert!(ok, "import: {o}{e}");
     home
 }
@@ -111,7 +119,14 @@ fn an_object_that_is_not_found_is_announced_not_silently_zero() {
     let gone = fs::metadata(&objs[0]).unwrap().len();
     fs::remove_file(&objs[0]).unwrap();
 
-    let args = vec!["du", "--home", home.to_str().unwrap(), "--view", "v", "--bytes"];
+    let args = vec![
+        "du",
+        "--home",
+        home.to_str().unwrap(),
+        "--view",
+        "v",
+        "--bytes",
+    ];
     let (ok, o, e) = gv(&args);
     assert!(ok, "still a usable report: {o}{e}");
     assert!(e.contains("warning:"), "gap announced on stderr: {e}");
@@ -135,7 +150,14 @@ fn a_root_without_blocks_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let home = populated(dir.path());
     fs::remove_dir_all(home.join("blocks")).unwrap();
-    let (ok, o, e) = gv(&["du", "--home", home.to_str().unwrap(), "--view", "v", "--bytes"]);
+    let (ok, o, e) = gv(&[
+        "du",
+        "--home",
+        home.to_str().unwrap(),
+        "--view",
+        "v",
+        "--bytes",
+    ]);
     assert!(!ok, "refuses instead of printing zeros; stdout was: {o}");
     assert!(e.contains("no blocks/"), "says which root failed: {e}");
     assert!(e.contains("blocks/"), "and what to pass: {e}");
