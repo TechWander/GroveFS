@@ -8,41 +8,14 @@ set -u
 cd "$(dirname "$0")/.."
 export PKG_CONFIG="$PWD/.build-bin/pkg-config"
 Y=./target/release/grovefs
-# The metadata backend is a PARAMETER (P5): `LAYOUT_BACKEND=fdb` re-runs every
-# assertion below against a FoundationDB-backed meta-server instead of the local
-# SQLite trees. Only two things change, and neither is an assertion: how a mount
-# reaches the authoritative tree (a local `--home` mount vs. a mount of one remote
-# view), and how the tree comes into existence (`init --manifest` writing a db
-# file vs. `view create` provisioning a subspace that is then seeded THROUGH the
-# mount, because a subspace has no file to write).
-BACKEND="${LAYOUT_BACKEND:-sqlite}"
+. .build-bin/suite_helpers.sh
 TEAM=team
-. .build-bin/fdb_scaffold.sh
-fdb_gate
-fdb_binary
-if [ "$BACKEND" = fdb ]; then
-    # A subspace outlives a run until something removes it, so the view name is
-    # per-run: a second run of this suite must not inherit the first one's tree
-    # and read a stale listing as a pass. The cleanup trap drops it again with
-    # `fdb_drop_views`, so a successful run hands the cluster back exactly what
-    # it took; the per-run name is what keeps a CRASHED run from poisoning the
-    # next one.
-    TEAM="lt$(date +%s)"
-fi
 rm -rf .ltest; mkdir -p .ltest/home .ltest/mnt_base .ltest/mnt_a .ltest/mnt_b .ltest/mnt_c .ltest/mnt_d
 export GROVEFS_HOME=$PWD/.ltest/home
-if [ "$BACKEND" = fdb ]; then
-    # One meta-server + one data-server for the whole run: sections 9 and 11 below
-    # would start their own pair on SQLite, where the mounts of sections 1-8 need
-    # no server at all. Under `fdb://` every mount has to reach the cluster through
-    # a server, and the DEFINITIONS are cluster-wide too (the ctl subspace), so one
-    # server pair serving one scratch root carries the whole run.
-    fdb_up .ltest/home "$TEAM" 127.0.0.1:15400 127.0.0.1:15401
-fi
-# Server pids start EMPTY: sections 9/11 spawn their own pair on SQLite and reuse
-# fdb_up's EARLY pair on fdb, so a `kill $MSP` reached as `kill` with no argument
-# (harmless) or, worse, `kill 0` (signals the whole process group, harness
-# included) depending on how far the run got. Every signal goes through kp()/wk().
+# Server pids start EMPTY: sections 9/11 spawn their own pair, so a `kill $MSP`
+# must never reach `kill` with no argument (harmless) or, worse, `kill 0`
+# (signals the whole process group, harness included) depending on how far the
+# run got. Every signal goes through kp()/wk().
 MSP=""; DSP=""; MSP2=""; DSP2=""; MSP3=""; DSP3=""
 
 cat > .ltest/team.manifest <<'EOF'
@@ -61,13 +34,9 @@ mkdir shared
 mkdir shared/lib
 touch shared/lib/lib.a
 EOF
-# A tree comes into existence differently per backend: `init --manifest` writes a
-# SQLite db file, and a subspace has NO file to write — so the fdb run provisions
-# with `view create` (done by fdb_up above) and applies the very same manifest
-# through the base mount below. One description of the shape, two backends.
-if [ "$BACKEND" != fdb ]; then
-    $Y init --view $TEAM --manifest .ltest/team.manifest >/dev/null
-fi
+# The tree comes into existence from the manifest: `init --manifest` writes the
+# SQLite db file that every mount below then serves.
+$Y init --view $TEAM --manifest .ltest/team.manifest >/dev/null
 
 # Layout rule files: each is one client's lens over the SAME stored tree.
 cat > .ltest/a.layout <<'EOF'
@@ -88,15 +57,15 @@ cat > .ltest/d.layout <<'EOF'
 link /shared/lib /proj/mylib
 EOF
 
-$Y mount --view $TEAM --mountpoint .ltest/mnt_base --no-cache $REMOTE --foreground > .ltest/base.log 2>&1 &
-$Y mount --view $TEAM --mountpoint .ltest/mnt_a   --no-cache --layout .ltest/a.layout $REMOTE --foreground > .ltest/a.log 2>&1 &
-$Y mount --view $TEAM --mountpoint .ltest/mnt_b   --no-cache --layout .ltest/b.layout $REMOTE --foreground > .ltest/b.log 2>&1 &
-$Y mount --view $TEAM --mountpoint .ltest/mnt_c   --no-cache --layout .ltest/c.layout $REMOTE --foreground > .ltest/c.log 2>&1 &
-$Y mount --view $TEAM --mountpoint .ltest/mnt_d   --no-cache --layout .ltest/d.layout $REMOTE --foreground > .ltest/d.log 2>&1 &
+$Y mount --view $TEAM --mountpoint .ltest/mnt_base --no-cache --foreground > .ltest/base.log 2>&1 &
+$Y mount --view $TEAM --mountpoint .ltest/mnt_a   --no-cache --layout .ltest/a.layout --foreground > .ltest/a.log 2>&1 &
+$Y mount --view $TEAM --mountpoint .ltest/mnt_b   --no-cache --layout .ltest/b.layout --foreground > .ltest/b.log 2>&1 &
+$Y mount --view $TEAM --mountpoint .ltest/mnt_c   --no-cache --layout .ltest/c.layout --foreground > .ltest/c.log 2>&1 &
+$Y mount --view $TEAM --mountpoint .ltest/mnt_d   --no-cache --layout .ltest/d.layout --foreground > .ltest/d.log 2>&1 &
 PIDS=$(jobs -p)
 sleep 1.5
 
-cleanup(){ for d in .ltest/mnt_*; do fusermount -u "$d" 2>/dev/null; done; kp $PIDS $MSP $DSP $MSP2 $DSP2 $MSP3 $DSP3 $FDB_MP $FDB_DP; fdb_drop_views .ltest/home .ltest/home/data "${TEAM:-}"; }
+cleanup(){ for d in .ltest/mnt_*; do fusermount -u "$d" 2>/dev/null; done; kp $PIDS $MSP $DSP $MSP2 $DSP2 $MSP3 $DSP3; }
 trap cleanup EXIT
 
 BASE=.ltest/mnt_base; A=.ltest/mnt_a; B=.ltest/mnt_b; C=.ltest/mnt_c; D=.ltest/mnt_d
@@ -105,19 +74,6 @@ ok(){ echo "  OK: $1"; pass=$((pass+1)); }
 bad(){ echo "  FAIL: $1"; fail=$((fail+1)); }
 chk(){ if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got '$1' want '$2')"; fi; }
 T(){ timeout 5 "$@"; }
-
-if [ "$BACKEND" = fdb ]; then
-    # The board's standing fail-fast gate: a mount that never came up must abort
-    # the section, not let the writes below land in a bare directory and print
-    # green numbers about nothing. Then the manifest — the SAME file the SQLite
-    # `init --manifest` consumed — is applied through the base mount.
-    for mp in mnt_base mnt_a mnt_b mnt_c mnt_d; do
-        mnt_gate .ltest/$mp || bad ".ltest/$mp never came up"
-    done
-    seed_through_mount .ltest/mnt_base .ltest/team.manifest \
-        && ok "the manifest was applied through the mount (subspace tree seeded)" \
-        || bad "seeding the subspace tree failed"
-fi
 
 # Give the source data real content on the base (unlensed) mount.
 T sh -c "printf 'report-body' > $BASE/docs/2026/a.md"
@@ -166,35 +122,27 @@ T ls "$C/team/raw" >/dev/null && ok "relocated dir traversable" || bad "relocate
 
 echo "===== 8) bad layout file fails fast ====="
 echo "bogus /x" > .ltest/bad.layout
-$Y mount --view $TEAM --mountpoint .ltest/mnt_e --layout .ltest/bad.layout $REMOTE --foreground > .ltest/e.log 2>&1
+$Y mount --view $TEAM --mountpoint .ltest/mnt_e --layout .ltest/bad.layout --foreground > .ltest/e.log 2>&1
 grep -q "unknown layout verb" .ltest/e.log && ok "invalid rules rejected at mount time" || bad "invalid rules not rejected"
 
 echo "===== 9) server-side derived views: --view <name>, no client rules file ====="
 wait_port(){ local a=$1; for _ in $(seq 1 100); do (echo >/dev/tcp/${a%%:*}/${a##*:}) 2>/dev/null && return 0; sleep 0.05; done; return 1; }
-if [ "$EARLY" = 1 ]; then
-    # fdb run: the run's single pair already serves this root, and a second pair
-    # would be a second server over the SAME cluster and the SAME definition dir
-    # — nothing about the assertions needs two of them, while a second ROOT would
-    # have split the control plane away from the trees.
-    META=$FDB_META; DATA=$FDB_DATA
-else
-    META=127.0.0.1:15162; DATA=127.0.0.1:15163
-    $Y meta-server $MSARG --meta-dir .ltest/home --listen $META > .ltest/meta_srv.log 2>&1 &
-    MSP=$!
-    $Y data-server --listen $DATA --data-dir .ltest/home > .ltest/data_srv.log 2>&1 &
-    DSP=$!
-fi
+META=127.0.0.1:15162; DATA=127.0.0.1:15163
+$Y meta-server --meta-dir .ltest/home --listen $META > .ltest/meta_srv.log 2>&1 &
+MSP=$!
+$Y data-server --listen $DATA --data-dir .ltest/home > .ltest/data_srv.log 2>&1 &
+DSP=$!
 wait_port $META && wait_port $DATA || bad "derived-view servers failed to start"
 
 # define TWO derived views over the SAME physical base tree 'team'
-$Y view $MSARG --meta-dir .ltest/home define --name docsonly  --base $TEAM --rules .ltest/a.layout > .ltest/def1.log 2>&1 \
+$Y view --meta-dir .ltest/home define --name docsonly  --base $TEAM --rules .ltest/a.layout > .ltest/def1.log 2>&1 \
   && ok "view define docsonly" || bad "define docsonly: $(cat .ltest/def1.log)"
-$Y view $MSARG --meta-dir .ltest/home define --name trimphotos --base $TEAM --rules .ltest/b.layout > .ltest/def2.log 2>&1 \
+$Y view --meta-dir .ltest/home define --name trimphotos --base $TEAM --rules .ltest/b.layout > .ltest/def2.log 2>&1 \
   && ok "view define trimphotos" || bad "define trimphotos: $(cat .ltest/def2.log)"
 # guard rails at define time: name must differ from base, rules must parse
-$Y view $MSARG --meta-dir .ltest/home define --name "$TEAM" --base $TEAM --rules .ltest/a.layout > .ltest/def3.log 2>&1
+$Y view --meta-dir .ltest/home define --name "$TEAM" --base $TEAM --rules .ltest/a.layout > .ltest/def3.log 2>&1
 [ $? -ne 0 ] && ok "define rejects a name equal to its base" || bad "define should reject name==base"
-$Y view $MSARG --meta-dir .ltest/home list > .ltest/vlist.log 2>&1
+$Y view --meta-dir .ltest/home list > .ltest/vlist.log 2>&1
 grep -q "docsonly' -> base '$TEAM'" .ltest/vlist.log && grep -q "trimphotos" .ltest/vlist.log \
   && ok "view list shows both derived views with their base" || bad "view list wrong: $(cat .ltest/vlist.log)"
 
@@ -239,12 +187,12 @@ cat > .ltest/broader.layout <<'EOF'
 only /docs
 only /photos
 EOF
-$Y view $MSARG --meta-dir .ltest/home define --name docsonly --base $TEAM --rules .ltest/broader.layout > .ltest/def5.log 2>&1 \
+$Y view --meta-dir .ltest/home define --name docsonly --base $TEAM --rules .ltest/broader.layout > .ltest/def5.log 2>&1 \
   && ok "re-define broadens the derived view" || bad "re-define: $(cat .ltest/def5.log)"
 sleep 5
 chk "$(T ls $SV | tr '\n' ' ')" "docs photos " "live mount picked up the broadened shape (no remount)"
 # narrow it back — hot reload works in both directions
-$Y view $MSARG --meta-dir .ltest/home define --name docsonly --base $TEAM --rules .ltest/a.layout > .ltest/def6.log 2>&1
+$Y view --meta-dir .ltest/home define --name docsonly --base $TEAM --rules .ltest/a.layout > .ltest/def6.log 2>&1
 sleep 5
 chk "$(T ls $SV | tr '\n' ' ')" "docs " "live mount narrowed back after the next edit"
 # after a hot swap the read-only contract still holds, and base writes show
@@ -256,13 +204,13 @@ T sh -c "printf 'x' > $SV/docs/2026/ro_after_reload.md" 2>/dev/null \
 
 # a bad definition is refused at mount time (fail fast, server resolves it)
 echo "bogus /x" > .ltest/broken.rules
-$Y view $MSARG --meta-dir .ltest/home define --name broken --base $TEAM --rules .ltest/broken.rules > .ltest/def4.log 2>&1
+$Y view --meta-dir .ltest/home define --name broken --base $TEAM --rules .ltest/broken.rules > .ltest/def4.log 2>&1
 ! grep -q "defined derived view" .ltest/def4.log && ok "define rejects non-parseable rules" || bad "define accepted bad rules"
 
 # the SAME read-only contract applies to a LOCAL (--home) derived mount: no
 # server involved, the definition itself forces kernel RO
 mkdir -p .ltest/mnt_ld
-$Y mount --view docsonly -m .ltest/mnt_ld $REMOTE --foreground > .ltest/ld.log 2>&1 &
+$Y mount --view docsonly -m .ltest/mnt_ld --foreground > .ltest/ld.log 2>&1 &
 LDP=$!
 sleep 1.5
 grep -q "read-only" .ltest/ld.log \
@@ -272,9 +220,9 @@ T sh -c "printf 'x' > .ltest/mnt_ld/docs/2026/ld.md" 2>/dev/null \
   && bad "local derived write should be refused" || ok "local derived mount is read-only too"
 fusermount -u .ltest/mnt_ld 2>/dev/null; kp $LDP; wk $LDP
 
-$Y view $MSARG --meta-dir .ltest/home rm --name docsonly > .ltest/rm1.log 2>&1 \
+$Y view --meta-dir .ltest/home rm --name docsonly > .ltest/rm1.log 2>&1 \
   && ok "view rm drops the definition" || bad "view rm: $(cat .ltest/rm1.log)"
-$Y view $MSARG --meta-dir .ltest/home list > .ltest/vlist2.log 2>&1
+$Y view --meta-dir .ltest/home list > .ltest/vlist2.log 2>&1
 ! grep -q "docsonly" .ltest/vlist2.log && ok "view list no longer shows removed view" || bad "removed view still listed"
 
 fusermount -u $SV $SB 2>/dev/null
@@ -285,29 +233,29 @@ echo "===== 10) pure alias (name governance): local --home first ====="
 # `alias <real>` carries NO rules: the alias IS the real view under a public
 # name — full tree, WRITABLE — and the governed real name stops being a local
 # mount entry point (mirrors the meta-server contract without a wire).
-$Y view $MSARG --meta-dir .ltest/home alias --name pub --real $TEAM > .ltest/al1.log 2>&1 \
+$Y view --meta-dir .ltest/home alias --name pub --real $TEAM > .ltest/al1.log 2>&1 \
   && ok "view alias pub -> team" || bad "alias pub: $(cat .ltest/al1.log)"
-$Y view $MSARG --meta-dir .ltest/home list > .ltest/vlist3.log 2>&1
+$Y view --meta-dir .ltest/home list > .ltest/vlist3.log 2>&1
 grep -q "alias 'pub' -> real view '$TEAM'" .ltest/vlist3.log \
   && ok "view list shows the alias with its real view" || bad "alias missing from list: $(cat .ltest/vlist3.log)"
 # define guards around the alias slot
-$Y view $MSARG --meta-dir .ltest/home define --name pub --base $TEAM --rules .ltest/a.layout > .ltest/ag1.log 2>&1
+$Y view --meta-dir .ltest/home define --name pub --base $TEAM --rules .ltest/a.layout > .ltest/ag1.log 2>&1
 [ $? -ne 0 ] && ok "define refuses to shadow an existing alias name" || bad "define overwrote an alias"
 # the derived-view guard needs a LIVE derived definition: docsonly was rm'd at
 # the end of section 9, trimphotos is still defined
-$Y view $MSARG --meta-dir .ltest/home alias --name pub --real trimphotos > .ltest/ag2.log 2>&1
+$Y view --meta-dir .ltest/home alias --name pub --real trimphotos > .ltest/ag2.log 2>&1
 [ $? -ne 0 ] && ok "alias refuses a derived-view target" || bad "alias accepted a derived target"
 # mount by ALIAS: full shape and writable
 mkdir -p .ltest/mnt_al
 grep -q "trimphotos" .ltest/ag2.log && ok "guard names the refused target view" || bad "guard message unclear: $(cat .ltest/ag2.log)"
-$Y mount --view pub -m .ltest/mnt_al $REMOTE --foreground > .ltest/al_mount.log 2>&1 &
+$Y mount --view pub -m .ltest/mnt_al --foreground > .ltest/al_mount.log 2>&1 &
 ALP=$!
 sleep 1.5
 chk "$(T ls .ltest/mnt_al | tr '\n' ' ')" "data docs photos shared " "alias mount shows the FULL tree (no shape, unlike a derived view)"
 T sh -c "printf 'aw' > .ltest/mnt_al/docs/2026/aliaswrite.md" && ok "alias mount is WRITABLE (name governance, not shape)" || bad "alias mount refused writes"
 T cat .ltest/mnt_al/docs/2026/aliaswrite.md | grep -q aw && ok "alias write reads back" || bad "alias write lost"
 # mounting the governed REAL name locally is refused (the alias is the entry)
-$Y mount --view $TEAM -m .ltest/mnt_al $REMOTE --foreground 2> .ltest/al_denied.log
+$Y mount --view $TEAM -m .ltest/mnt_al --foreground 2> .ltest/al_denied.log
 [ $? -ne 0 ] && grep -q "governed by an alias" .ltest/al_denied.log \
   && ok "local mount of the governed real name is refused" || bad "real name mounted despite governance: $(cat .ltest/al_denied.log)"
 T rm .ltest/mnt_al/docs/2026/aliaswrite.md
@@ -316,15 +264,15 @@ fusermount -u .ltest/mnt_al 2>/dev/null; kp $ALP; wk $ALP
 # --- gapless name rotation (--retire): the leak-response workflow ---
 # A leaked public name must swap in ONE step with no window where the real
 # view 'team' becomes mountable by its own name.
-$Y view $MSARG --meta-dir .ltest/home alias --name pubnew --real $TEAM --retire pub > .ltest/rot1.log 2>&1 \
+$Y view --meta-dir .ltest/home alias --name pubnew --real $TEAM --retire pub > .ltest/rot1.log 2>&1 \
   && grep -q "gapless" .ltest/rot1.log \
   && ok "gapless rotation pub -> pubnew (--retire)" || bad "rotation failed: $(cat .ltest/rot1.log)"
-$Y view $MSARG --meta-dir .ltest/home list > .ltest/vlist_rot.log 2>&1
+$Y view --meta-dir .ltest/home list > .ltest/vlist_rot.log 2>&1
 grep -q "alias 'pubnew'" .ltest/vlist_rot.log && ! grep -q "alias 'pub'" .ltest/vlist_rot.log \
   && ok "list shows the new alias only (old name retired)" || bad "list after rotation: $(cat .ltest/vlist_rot.log)"
 # the leaked OLD name no longer reaches the real tree
 mkdir -p .ltest/mnt_old
-$Y mount --view pub -m .ltest/mnt_old $REMOTE --foreground > .ltest/rot_old.log 2>&1 &
+$Y mount --view pub -m .ltest/mnt_old --foreground > .ltest/rot_old.log 2>&1 &
 OLDP=$!; sleep 1.5
 [ ! -d .ltest/mnt_old/docs ] && ok "leaked old alias no longer resolves to the real tree" || bad "old alias still exposes team"
 fusermount -u .ltest/mnt_old 2>/dev/null; kp $OLDP; wk $OLDP; rm -rf .ltest/mnt_old
@@ -333,30 +281,26 @@ fusermount -u .ltest/mnt_old 2>/dev/null; kp $OLDP; wk $OLDP; rm -rf .ltest/mnt_
 rm -f .ltest/home/meta/pub.db
 # the NEW name is the live entry: full tree
 mkdir -p .ltest/mnt_new
-$Y mount --view pubnew -m .ltest/mnt_new $REMOTE --foreground > .ltest/rot_new.log 2>&1 &
+$Y mount --view pubnew -m .ltest/mnt_new --foreground > .ltest/rot_new.log 2>&1 &
 NEWP=$!; sleep 1.5
 chk "$(T ls .ltest/mnt_new | tr '\n' ' ')" "data docs photos shared " "rotated alias pubnew serves the full tree"
 fusermount -u .ltest/mnt_new 2>/dev/null; kp $NEWP; wk $NEWP; rm -rf .ltest/mnt_new
 # --retire guards: never drop a derived shape def or a non-alias
-$Y view $MSARG --meta-dir .ltest/home alias --name rr1 --real $TEAM --retire trimphotos > .ltest/rotg1.log 2>&1
+$Y view --meta-dir .ltest/home alias --name rr1 --real $TEAM --retire trimphotos > .ltest/rotg1.log 2>&1
 [ $? -ne 0 ] && grep -qiE "not a pure alias" .ltest/rotg1.log \
   && ok "--retire refuses a derived view (would drop a shape def)" || bad "retire guard (derived): $(cat .ltest/rotg1.log)"
-$Y view $MSARG --meta-dir .ltest/home alias --name rr2 --real $TEAM --retire nosuch > .ltest/rotg2.log 2>&1
+$Y view --meta-dir .ltest/home alias --name rr2 --real $TEAM --retire nosuch > .ltest/rotg2.log 2>&1
 [ $? -ne 0 ] && ok "--retire refuses a non-existent alias" || bad "retire guard (missing): $(cat .ltest/rotg2.log)"
 # restore the entry name for the remote section (rotate pubnew -> pub)
-$Y view $MSARG --meta-dir .ltest/home alias --name pub --real $TEAM --retire pubnew > .ltest/rot2.log 2>&1 \
+$Y view --meta-dir .ltest/home alias --name pub --real $TEAM --retire pubnew > .ltest/rot2.log 2>&1 \
   && ok "rotate back to pub for the remote section" || bad "rotate back: $(cat .ltest/rot2.log)"
 
 echo "===== 11) pure alias over a meta-server: real name refused, alias writable ====="
-if [ "$EARLY" = 1 ]; then
-    META2=$FDB_META; DATA2=$FDB_DATA
-else
-    META2=127.0.0.1:15164; DATA2=127.0.0.1:15165
-    $Y meta-server $MSARG --meta-dir .ltest/home --listen $META2 > .ltest/meta_srv2.log 2>&1 &
-    MSP2=$!
-    $Y data-server --listen $DATA2 --data-dir .ltest/home > .ltest/data_srv2.log 2>&1 &
-    DSP2=$!
-fi
+META2=127.0.0.1:15164; DATA2=127.0.0.1:15165
+$Y meta-server --meta-dir .ltest/home --listen $META2 > .ltest/meta_srv2.log 2>&1 &
+MSP2=$!
+$Y data-server --listen $DATA2 --data-dir .ltest/home > .ltest/data_srv2.log 2>&1 &
+DSP2=$!
 wait_port $META2 && wait_port $DATA2 || bad "alias servers failed to start"
 mkdir -p .ltest/mnt_ra .ltest/mnt_rr
 # alias mount through the server: full tree, writable (M_OPEN resolved the name)
@@ -376,7 +320,7 @@ kp $RRP; wk $RRP
 T cat .ltest/mnt_ra/docs/2026/ralias.md | grep -q rw && ok "alias write reads back through the wire" || bad "alias remote write lost"
 T rm .ltest/mnt_ra/docs/2026/ralias.md
 # --- gapless rotation over the wire: 'team' never becomes mountable ---
-$Y view $MSARG --meta-dir .ltest/home alias --name pubr --real $TEAM --retire pub > .ltest/rot3.log 2>&1 \
+$Y view --meta-dir .ltest/home alias --name pubr --real $TEAM --retire pub > .ltest/rot3.log 2>&1 \
   && grep -q gapless .ltest/rot3.log \
   && ok "remote: gapless rotation pub -> pubr (--retire)" || bad "remote rotation: $(cat .ltest/rot3.log)"
 # right after rotation the real name is STILL refused (governed by pubr) — zero window
@@ -392,23 +336,17 @@ RPP=$!; sleep 2
 chk "$(T ls .ltest/mnt_rp | tr '\n' ' ')" "data docs photos shared " "remote: rotated alias pubr serves the full tree"
 fusermount -u .ltest/mnt_rp 2>/dev/null; kp $RPP; wk $RPP
 # rotate back so the next steps (which use 'pub') still hold
-$Y view $MSARG --meta-dir .ltest/home alias --name pub --real $TEAM --retire pubr > /dev/null 2>&1
+$Y view --meta-dir .ltest/home alias --name pub --real $TEAM --retire pubr > /dev/null 2>&1
 # removing the alias reopens the real name for NEW mounts
 fusermount -u .ltest/mnt_ra 2>/dev/null; kp $RAP $MSP2 $DSP2; wk $RAP $MSP2 $DSP2
-$Y view $MSARG --meta-dir .ltest/home rm --name pub > .ltest/al_rm.log 2>&1 \
+$Y view --meta-dir .ltest/home rm --name pub > .ltest/al_rm.log 2>&1 \
   && ok "view rm removes an alias definition too" || bad "alias rm: $(cat .ltest/al_rm.log)"
-if [ "$EARLY" = 1 ]; then
-    # The run's pair stays up (killing it would take the other sections' state
-    # with it), so this assertion runs against the SAME server process that
-    # refused `team` above: on fdb the alias governance is re-resolved per mount
-    # from the control plane, so the removal must take effect without a restart.
-    :
-else
-    $Y meta-server $MSARG --meta-dir .ltest/home --listen $META2 > .ltest/meta_srv3.log 2>&1 &
-    MSP3=$!
-    $Y data-server --listen $DATA2 --data-dir .ltest/home > .ltest/data_srv3.log 2>&1 &
-    DSP3=$!
-fi
+# The pair is restarted on the same ports so this assertion runs against a
+# server that never saw the alias definition when it started.
+$Y meta-server --meta-dir .ltest/home --listen $META2 > .ltest/meta_srv3.log 2>&1 &
+MSP3=$!
+$Y data-server --listen $DATA2 --data-dir .ltest/home > .ltest/data_srv3.log 2>&1 &
+DSP3=$!
 wait_port $META2 && wait_port $DATA2 || bad "post-rm servers failed to start"
 $Y mount --view $TEAM -m .ltest/mnt_rr --meta-server $META2 --data-servers $DATA2 --foreground > .ltest/rr2.log 2>&1 &
 RRP2=$!
@@ -417,13 +355,12 @@ chk "$(T ls .ltest/mnt_rr | tr '\n' ' ')" "data docs photos shared " "real name 
 fusermount -u .ltest/mnt_rr 2>/dev/null
 kp $RRP2 $MSP3 $DSP3; wk $RRP2 $MSP3 $DSP3
 # The offline ingest path guards the NAME (an alias is not a storage identity) and
-# the BACKEND (a non-SQLite deployment has no local tree to write). `import` is the
-# SQLite-only ingest verb: it refuses fdb:// and postgres:// outright (the BACKEND
-# guard, below), and its NAME guard reads the LOCAL `meta/views/<name>.layout` slot
-# directly — it never consults the cluster. So the alias-name guard is exercised
-# against an isolated local SQLite home of its own, on EVERY backend: under fdb://
-# the run's definitions live in the cluster's ctl subspace, where a local-file
-# command like `import` never looks, so the guard needs a real local base to alias.
+# the BACKEND (a deployment whose trees are not local files has no local tree to
+# write). `import` is the SQLite-only ingest verb: it refuses postgres:// outright
+# (the BACKEND guard, below), and its NAME guard reads the LOCAL
+# `meta/views/<name>.layout` slot directly. So the alias-name guard is exercised
+# against an isolated local SQLite home of its own, where a real local base exists
+# to alias.
 mkdir -p .ltest/src_dir .ltest/imp_home && touch .ltest/src_dir/f1
 $Y --home .ltest/imp_home init --view impbase > /dev/null 2>&1
 $Y view --meta-dir .ltest/imp_home alias --name pub2 --real impbase > /dev/null 2>&1
@@ -436,13 +373,7 @@ rc=$?
 dbs_before=$(cd .ltest/home/meta && ls *.db 2>/dev/null | sort)
 # A deployment whose trees are NOT local files must be refused outright, even for
 # a perfectly legal physical name — writing `meta/<view>.db` beside a root whose
-# meta-server serves the cluster (or Postgres) would report success about a tree
-# nothing reads.
-GROVEFS_META_STORE="fdb://$CLUSTER" $Y import --meta-dir .ltest/home --view "$TEAM" \
-    --source .ltest/src_dir > .ltest/fdb_imp.log 2>&1
-rc=$?
-[ $rc -ne 0 ] && grep -q "subspace of the cluster" .ltest/fdb_imp.log \
-  && ok "import refuses an fdb:// deployment (no local tree to write)" || bad "import should refuse fdb://: $(cat .ltest/fdb_imp.log)"
+# meta-server serves Postgres would report success about a tree nothing reads.
 GROVEFS_META_STORE="postgres://nope:nope@127.0.0.1:1/nope" $Y import --meta-dir .ltest/home \
     --view "$TEAM" --source .ltest/src_dir > .ltest/pg_imp.log 2>&1
 rc=$?

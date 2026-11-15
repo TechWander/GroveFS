@@ -19,24 +19,20 @@
 #     (like the pg suite skips when no PG host) rather than fake a result.
 #
 # Assertion-based like the other suites; emits a SUMMARY line for run_all.sh.
-# The metadata BACKEND is a parameter (P5): `GOVCHECK_BACKEND=fdb` re-runs the
-# GroveFS half (B) with the authoritative tree in a FoundationDB cluster. Sections
-# A1-A3 are untouched by that choice — they falsify KERNEL stacks (overlayfs,
-# symlink, bind), which have no metadata backend. In (B) the invariants under test
-# are properties of the FUSE/protocol layer (one inode across two presentations,
-# one fate, write-through, no stored duplicate entry), so every assertion is kept
-# verbatim; only the deployment changes, plus the one cell that is genuinely a
-# file-store property: zero-copy `import` (see B4).
+#
+# Runs the GroveFS half (B) against the local SQLite deployment. Sections A1-A3
+# are deployment-independent — they falsify KERNEL stacks (overlayfs, symlink,
+# bind), which have no metadata backend. In (B) the invariants under test are
+# properties of the FUSE/protocol layer (one inode across two presentations, one
+# fate, write-through, no stored duplicate entry); the zero-copy `import` cell
+# (see B4) is genuinely a file-store property, which is exactly what the SQLite
+# arm measures.
 set -u
 cd "$(dirname "$0")/.."
 export PKG_CONFIG="$PWD/.build-bin/pkg-config"
 Y=./target/release/grovefs
-BACKEND="${GOVCHECK_BACKEND:-sqlite}"
 VIEW=gov
-. .build-bin/fdb_scaffold.sh
-fdb_gate
-fdb_binary
-if [ "$BACKEND" = fdb ]; then VIEW="gc$(date +%s)"; fi
+. .build-bin/suite_helpers.sh
 HOME_DIR=$PWD/.govcheck/home
 rm -rf .govcheck; mkdir -p .govcheck/home .govcheck/mnt_base .govcheck/mnt_lens .govcheck/mnt_map
 export GROVEFS_HOME=$HOME_DIR
@@ -157,19 +153,10 @@ mkdir docs
 touch docs/f
 mkdir inbox
 EOF
-# The tree comes into existence per backend: `init --manifest` WRITES a SQLite db
-# file, while a subspace has no file to write — so the fdb run provisions with
-# `view create` (inside fdb_up) and applies the SAME manifest through the base
-# mount below. One description of the shape, two backends.
-if [ "$BACKEND" != fdb ]; then
-    $Y init --view "$VIEW" --manifest .govcheck/gov.manifest >/dev/null \
-        || { echo "init failed"; exit 1; }
-else
-    # The central pair comes up with the subspace: under `fdb://` every mount
-    # reaches the authoritative tree through a server, which is the only
-    # deployment difference in the sections below.
-    fdb_up "$HOME_DIR" "$VIEW" 127.0.0.1:15404 127.0.0.1:15405
-fi
+# The tree comes into existence from the manifest: `init --manifest` WRITES the
+# SQLite db file that every mount below serves.
+$Y init --view "$VIEW" --manifest .govcheck/gov.manifest >/dev/null \
+    || { echo "init failed"; exit 1; }
 
 # lens rule: 'link' keeps the source spot AND shows an alias under /inbox.
 cat > .govcheck/link.layout <<'EOF'
@@ -180,28 +167,17 @@ cat > .govcheck/map.layout <<'EOF'
 map /docs/hold /docs/renamed
 EOF
 
-$Y mount --view "$VIEW" --mountpoint .govcheck/mnt_base --no-cache $REMOTE --foreground > .govcheck/base.log 2>&1 &
+$Y mount --view "$VIEW" --mountpoint .govcheck/mnt_base --no-cache --foreground > .govcheck/base.log 2>&1 &
 BASEP=$!
-$Y mount --view "$VIEW" --mountpoint .govcheck/mnt_lens --no-cache --layout .govcheck/link.layout $REMOTE --foreground > .govcheck/lens.log 2>&1 &
+$Y mount --view "$VIEW" --mountpoint .govcheck/mnt_lens --no-cache --layout .govcheck/link.layout --foreground > .govcheck/lens.log 2>&1 &
 LENP=$!
 PIDS=$(jobs -p)
 MAPP=""   # B3's map mount exists only later; the trap must never signal a name that was never set
-cleanup(){ for d in .govcheck/mnt_*; do fusermount -u "$d" 2>/dev/null; done; kp $PIDS $BASEP $LENP $MAPP $FDB_MP $FDB_DP; fdb_drop_views "${HOME_DIR:-}" "${HOME_DIR:-}/data" "${VIEW:-}"; }
+cleanup(){ for d in .govcheck/mnt_*; do fusermount -u "$d" 2>/dev/null; done; kp $PIDS $BASEP $LENP $MAPP; }
 trap cleanup EXIT
 sleep 1.5
 
 BASE=.govcheck/mnt_base; LENS=.govcheck/mnt_lens
-if [ "$BACKEND" = fdb ]; then
-    # Seed the subspace THROUGH the live base mount, from the very manifest file
-    # the SQLite run fed to `init --manifest` above. The mount must be up first:
-    # a write into a bare directory would otherwise leave the sections below
-    # measuring nothing while still printing green numbers.
-    mnt_gate .govcheck/mnt_base && ok "base mount came up over the cluster" \
-        || bad ".govcheck/mnt_base never came up: $(cat .govcheck/base.log)"
-    seed_through_mount .govcheck/mnt_base .govcheck/gov.manifest \
-        && ok "the manifest was applied through the mount (subspace tree seeded)" \
-        || bad "seeding the subspace tree failed"
-fi
 # Give the single real entry content on the base (unlensed) mount.
 T sh -c "printf 'hello' > $BASE/docs/f" && ok "seed content on the real entry" || bad "seed write failed"
 
@@ -227,7 +203,7 @@ fi
 echo "===== B3) map relocation keeps a single object and vacates the source spot ====="
 # Fresh tree for map: rebuild the file (docs/f was deleted above).
 T sh -c "printf 'ren' > $BASE/docs/hold" && ok "seed a file for the map check" || bad "seed hold failed"
-$Y mount --view "$VIEW" --mountpoint .govcheck/mnt_map --no-cache --layout .govcheck/map.layout $REMOTE --foreground > .govcheck/map.log 2>&1 &
+$Y mount --view "$VIEW" --mountpoint .govcheck/mnt_map --no-cache --layout .govcheck/map.layout --foreground > .govcheck/map.log 2>&1 &
 MAPP=$!
 sleep 1.5
 MAP=.govcheck/mnt_map
@@ -237,37 +213,11 @@ fusermount -u $MAP 2>/dev/null; kp $MAPP; wk $MAPP
 
 echo "===== B4) zero-copy import: the view and the source share ONE inode, source is never hurt ====="
 mkdir -p .govcheck/src && printf 'LEGACY' > .govcheck/src/legacy.bin
-if [ "$BACKEND" = fdb ]; then
-    # THE ONE CELL THAT IS A FILE-STORE PROPERTY, NOT A PROTOCOL PROPERTY. The
-    # measurement above (source inode == blocks/ object inode) only means
-    # something when the objects and the source share a filesystem under the
-    # store root; `import` writes a LOCAL SQLite tree, so on this backend it is
-    # refused by role with the alternative named — never a silent write of a tree
-    # nothing reads. The capability boundary (paper Table tab:expr, GroveFS
-    # "zero-copy legacy onboarding") is therefore claimed for the file-store
-    # deployment envelope; under `fdb://` onboarding goes through a mounted path.
-    $Y import $MSARG --meta-dir "$HOME_DIR" --view "$VIEW" --source .govcheck/src > .govcheck/import.log 2>&1
-    rc=$?
-    [ $rc -ne 0 ] && grep -q "subspace of the cluster" .govcheck/import.log \
-      && ok "import refuses an fdb:// deployment outright and names the alternative (no shadow tree)" \
-      || bad "import should refuse under fdb://: $(cat .govcheck/import.log)"
-    [ ! -e "$HOME_DIR/meta/$VIEW.db" ] \
-      && ok "the refusal created no local view db (refuse really means refuse)" \
-      || bad "import wrote a shadow tree despite refusing"
-    # The same bytes onboarding through the documented alternative DOES preserve
-    # I1/I2/I4: one entry, one fate, in-place write-through — which B1-B3 already
-    # measured over the mount, so nothing here is asserted on authority alone.
-    T sh -c "printf 'LEGACY' > $BASE/docs/onboarded.bin" \
-      && chk "$(T cat $BASE/docs/onboarded.bin)" "LEGACY" \
-          "onboarding through the mounted path lands the same bytes (the fdb:// alternative)" \
-      || bad "writing through the mount (the documented fdb:// onboarding path) failed"
-    fusermount -u $LENS $BASE 2>/dev/null; kp $BASEP $LENP; wk $BASEP $LENP
-else
 $Y import --meta-dir "$HOME_DIR" --view "$VIEW" --source .govcheck/src > .govcheck/import.log 2>&1 \
   && ok "import legacy tree into view $VIEW" || bad "import failed: $(cat .govcheck/import.log)"
 # Re-mount base so imported entries are visible fresh.
 fusermount -u $BASE 2>/dev/null; kp $BASEP; wk $BASEP
-$Y mount --view "$VIEW" --mountpoint .govcheck/mnt_base --no-cache $REMOTE --foreground > .govcheck/base2.log 2>&1 &
+$Y mount --view "$VIEW" --mountpoint .govcheck/mnt_base --no-cache --foreground > .govcheck/base2.log 2>&1 &
 BASEP=$!; trap 'cleanup' EXIT; sleep 1.5
 BASE=.govcheck/mnt_base
 if [ -e "$BASE/src/legacy.bin" ]; then
@@ -288,7 +238,6 @@ if [ -e "$BASE/src/legacy.bin" ]; then
 else
   bad "imported file not visible under the mounted view"
 fi
-fi
 
 echo "===== C) expressiveness matrix (mirrors paper Table tab:expr) ====="
 cat <<'TABLE' | sed 's/^/  /'
@@ -307,15 +256,9 @@ echo "      A2 symlink dup-entry/dangling/leak, A3 bind single-inode/through/fat
 echo "  (unstarred Subtree/Bind rows, and all server-side shape / gapless rotation /"
 echo "      governed zero-copy cells, are ARCHITECTURAL limitations: documented, not measured.)"
 echo "  (GroveFS is the only column with all YES; the others violate one or more invariants.)"
-if [ "$BACKEND" = fdb ]; then
-  echo "  (On an fdb:// deployment the last row is offered in the FILE-STORE envelope only:"
-  echo '      B4 above measured that `import` refuses by role there, so the row reads'
-  echo "      'yes (local store) / refused-with-alternative (fdb://)' — a boundary of where"
-  echo "      the operation is offered, not a violation of I1/I2/I4 by the fdb backend.)"
-fi
 
 fusermount -u $LENS $BASE .govcheck/mnt_map 2>/dev/null
-kp $PIDS $BASEP $LENP $MAPP $FDB_MP $FDB_DP; wk $PIDS $BASEP $LENP $MAPP $FDB_MP $FDB_DP
+kp $PIDS $BASEP $LENP $MAPP; wk $PIDS $BASEP $LENP $MAPP
 
 echo
 echo "==================== SUMMARY: pass=$pass fail=$fail skip=$skip ===================="

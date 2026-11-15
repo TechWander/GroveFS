@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# REMOTE `gc` e2e — the orphan audit served by the control plane, for EVERY
-# backend.
+# REMOTE `gc` e2e — the orphan audit served by the control plane, for BOTH
+# metadata backends.
 #
 # The claim under test: an operator on ANY machine audits and reclaims a
 # deployment's orphan objects with an admin account key. The SERVER reads the
-# trees where they live (SQLite files, PG schemas, FDB subspaces) and the bytes
+# trees where they live (SQLite files, PG schemas) and the bytes
 # are listed from `--data-servers`, so the operator needs neither `<meta-dir>`
 # nor `<data-dir>` on their host — the two things that made `gc` host-only.
 #
-# What is asserted, once per backend (SQLite always; PG and FDB self-skip when
-# their infrastructure is absent):
+# What is asserted, once per backend (SQLite always; PG self-skips when
+# its infrastructure is absent):
 #   - a remote scan sees the same tree/object counts the bytes deserve, with the
 #     operator home holding NO metadata at all;
 #   - a live mount session on the SERVER blocks `--apply` ("in use") and a scan
@@ -44,21 +44,6 @@ if [ -z "${PGPORT:-}" ]; then
 fi
 PGURI="postgres://grove:grovepw@${PGHOST}:${PGPORT}/grovefs"
 if (exec 3<>/dev/tcp/${PGHOST}/${PGPORT}) 2>/dev/null; then PG_OK=1; else PG_OK=0; fi
-
-# ---- FoundationDB reachability (self-skip) --------------------------------
-FDB_HOME="${FDB_HOME:-/data/grovefs/.fdbbin}"
-FDB_RUN_DIR="${FDB_RUN_DIR:-/data/grovefs/.fdbtest}"
-CLUSTER="${GROVEFS_FDB_CLUSTER_FILE:-$FDB_RUN_DIR/test.cluster}"
-FDBURI="fdb://$CLUSTER"
-FDBBIN="${GROVEFS_FDB_BIN:-./target/fdb/release/grovefs}"
-FDB_OK=0
-if [ -x "$FDBBIN" ] && [ -x "$FDB_HOME/fdbcli.x86_64" ] && [ -f "$CLUSTER" ]; then
-    if "$FDB_HOME/fdbcli.x86_64" -C "$CLUSTER" --exec "status minimal" 2>&1 \
-        | grep -q "The database is available"; then
-        FDB_OK=1
-        export LD_LIBRARY_PATH="$FDB_HOME/lib:${LD_LIBRARY_PATH:-}"
-    fi
-fi
 
 pass=0; fail=0; skip=0
 ok(){ echo "  OK: $1"; pass=$((pass+1)); }
@@ -113,7 +98,7 @@ exercise(){
     fi
 
     # The first admin key is minted on the server host, against the SAME store
-    # the server serves (files, schemas or subspaces).
+    # the server serves (files or schemas).
     local kargs=()
     if [ "$MSTOR" = "-" ]; then kargs=(--meta-dir "$H/srv"); else kargs=(--meta-store "$MSTOR"); fi
     local OUT KEY
@@ -170,7 +155,7 @@ d = json.load(open(sys.argv[1]))
 assert d["objects"] >= 1 and d["matched_objects"] >= 1, d
 assert d["orphans"] == [] and d["reclaimable"] == 0, d
 assert d["applied"] is False and d["deleted"] == 0, d
-assert d["backend"] in ("sqlite", "postgres", "foundationdb"), d["backend"]
+assert d["backend"] in ("sqlite", "postgres"), d["backend"]
 assert d["data_roots"], d
 PY
 
@@ -229,7 +214,7 @@ PY
     deny "[$label] --control-server + --data-dir refused" "--data-dir" \
         $Y gc "${CTL[@]}" --data-dir "$H/data" --data-servers 127.0.0.1:$DP
 
-    # Leave the store as found: a PG schema / FDB subspace outlives the run's
+    # Leave the store as found: a PG schema outlives the run's
     # temp dir, and a stale tree would make the NEXT run's create fail on a
     # collision instead of testing anything.
     good "[$label] remote 'view rm --base' drops the tree again" \
@@ -246,12 +231,6 @@ if [ "$PG_OK" = 1 ]; then
     exercise postgres "$Y" "$PGURI" 15220 15221 15222 15223
 else
     skp "PostgreSQL arm (no server on ${PGHOST}:${PGPORT})"
-fi
-
-if [ "$FDB_OK" = 1 ]; then
-    exercise fdb "$FDBBIN" "$FDBURI" 15230 15231 15232 15233
-else
-    skp "FoundationDB arm (no cluster at $CLUSTER or no $FDBBIN)"
 fi
 
 echo

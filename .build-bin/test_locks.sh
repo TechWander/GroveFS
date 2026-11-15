@@ -20,15 +20,10 @@
 #
 # Assertion-based (pass/fail counters + real exit code) like every other suite.
 #
-# The backend is a parameter: `LOCKS_BACKEND=fdb` re-runs every assertion above
-# (1-4c) against a FoundationDB-backed meta-server instead of a local SQLite
-# store. Sections 1-4c only ever touch the two mounts, so the same flock/fcntl
-# probes decide the same things — what changes is HOW two clients end up on one
-# authoritative tree (local mounts vs. two mounts of one remote view) and where
-# the seed files come from (a manifest vs. writing them through the mount).
-# Section 5 is deliberately SQLite-only: it reads a standby's `meta/alice.db`
-# through sqlite3, i.e. it asserts GroveFS-native HA, which an FDB deployment
-# refuses at startup by design (the cluster replicates instead).
+# Runs on the local SQLite store (two mounts of one view home). Section 5 is
+# deliberately SQLite-only: it reads a standby's `meta/alice.db` through sqlite3,
+# i.e. it asserts GroveFS-native HA, which a shared-backend deployment refuses at
+# startup by design.
 set -u
 cd "$(dirname "$0")/.."
 export LC_ALL=C LANG=C
@@ -37,29 +32,7 @@ export PKG_CONFIG="$PWD/.build-bin/pkg-config"
 # this up through `LockLease::secs()` reading the env at first call.
 export GROVEFS_LOCK_LEASE_SECS=3
 
-BACKEND="${LOCKS_BACKEND:-sqlite}"
 Y=./target/release/grovefs
-
-lport(){ local a=$1; for _ in $(seq 1 100); do (echo >/dev/tcp/${a%%:*}/${a##*:}) 2>/dev/null && return 0; sleep 0.05; done; return 1; }
-
-if [ "$BACKEND" = fdb ]; then
-    FDB_HOME="${FDB_HOME:-/data/grovefs/.fdbbin}"
-    CLUSTER="${GROVEFS_FDB_CLUSTER_FILE:-/data/grovefs/.fdbtest/test.cluster}"
-    FDBURI="fdb://$CLUSTER"
-    export LD_LIBRARY_PATH="$FDB_HOME/lib:${LD_LIBRARY_PATH:-}"
-    if ! ( [ -x "$FDB_HOME/fdbcli.x86_64" ] && [ -f "$CLUSTER" ] \
-           && "$FDB_HOME/fdbcli.x86_64" -C "$CLUSTER" --exec "status minimal" 2>&1 \
-                | grep -q "The database is available" ); then
-        if [ "${FDB_TEST:-0}" = 1 ]; then
-            echo "SUMMARY: pass=0 fail=1 SKIP=0 (FDB_TEST=1 but no cluster at $CLUSTER)"; exit 1
-        fi
-        echo "SUMMARY: pass=0 fail=0 SKIP=1 (no FoundationDB cluster)"; exit 0
-    fi
-    # The lock ops run inside the meta-server process under this backend, so the
-    # lease the sections below reason about has to be the one that process read —
-    # which it is, because GROVEFS_LOCK_LEASE_SECS is exported above and inherited.
-    Y="${GROVEFS_FDB_BIN:-./target/fdb/release/grovefs}"
-fi
 
 rm -rf .locks; mkdir -p .locks/home .locks/m1 .locks/m2
 export GROVEFS_HOME=$PWD/.locks/home
@@ -70,8 +43,8 @@ bad(){ echo "  FAIL: $1"; fail=$((fail+1)); }
 chk(){ if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got '$1' want '$2')"; fi; }
 T(){ timeout 10 "$@"; }
 
-# Two mounts of one view, wired per backend; the assertions below never learn
-# which one they are on.
+# Two mounts of one view, both on the local SQLite store; the assertions below
+# never depend on the store they are on.
 M1=.locks/m1
 M2=.locks/m2
 # `kill 0` is not "kill nothing": signal 0-carrying PID 0 means the WHOLE process
@@ -87,95 +60,29 @@ _reap(){ local p; for p in $(pgrep -f 'grovefs.*[. ]\.locks' 2>/dev/null || true
         case " $$ $PPID " in *" $p "*) continue ;; esac
         kill "$p" 2>/dev/null || true
     done; }
-cleanup(){ fusermount -u $M1 2>/dev/null; fusermount -u $M2 2>/dev/null; fusermount -u .locks/ha/mnt 2>/dev/null; kill_pids "${P1:-}" "${P2:-}" "${DP:-}" "${MP:-}"; _reap
-    # This suite stands its own server pair rather than going through fdb_up, so
-    # it also drops its own tree: a subspace OUTLIVES the run, and unmounting
-    # alone leaves it (plus every object it booked) in the cluster for
-    # `view scan` to find. Measured 2026-11-11: the four parameterised arms left
-    # one tree each; this is the same leak in the arm that does not use the
-    # scaffold's hook.
-    if [ "$BACKEND" = fdb ] && [ -n "${VIEW:-}" ]; then
-        $Y view --meta-store "$FDBURI" --meta-dir .locks/srv/home rm --name "$VIEW" --base \
-            --data-dir .locks/srv/data >/dev/null 2>&1 || true
-    fi
+cleanup(){ fusermount -u $M1 2>/dev/null; fusermount -u $M2 2>/dev/null; fusermount -u .locks/ha/mnt 2>/dev/null; kill_pids "${P1:-}" "${P2:-}"; _reap
     return 0; }
 # Armed before the first mount: a fail-fast gate below exits non-zero, and
 # without the trap that would leave FUSE mounts and servers behind for the
 # next run of the suite.
 trap cleanup EXIT
 
-if [ "$BACKEND" = fdb ]; then
-    META=127.0.0.1:15406
-    DATA=127.0.0.1:15407
-    SRV=.locks/srv
-    VIEW="lk$(date +%s)"
-    # Ask whether the port is FREE before binding, not just whether something
-    # answers afterwards: `lport` is satisfied by a listener a previous run left
-    # behind, and the suite would then take its lock assertions from a stranger's
-    # deployment (the failure mode that turned `grovesci` red once).
-    for P in $META $DATA; do
-        if (echo >/dev/tcp/${P%%:*}/${P##*:}) 2>/dev/null; then
-            echo "FAIL: port $P is already listening; refusing to lock against a stranger's server"
-            exit 1
-        fi
-    done
-    mkdir -p $SRV/data $SRV/home $SRV/h1 $SRV/h2
-    $Y view --meta-store "$FDBURI" --meta-dir $SRV/home create --view "$VIEW" > .locks/create.log 2>&1 \
-        || { echo "FAIL: view create for the lock suite: $(cat .locks/create.log)"; exit 1; }
-    $Y data-server --listen $DATA --data-dir $SRV/data > .locks/data.log 2>&1 & DP=$!
-    $Y meta-server --listen $META --home $SRV/home --meta-store "$FDBURI" > .locks/meta.log 2>&1 & MP=$!
-    lport $DATA || { echo "FAIL: data-server did not bind"; cat .locks/data.log; exit 1; }
-    # The meta-server may legitimately wait out a lingering writer lease from a
-    # previous run of this suite (same --meta-dir => same deployment): the lease
-    # TTL is 10s and a starting server waits TTL+2s for it (fdb_store.rs
-    # writer_lease_wait). Give the bind a budget that covers that window instead
-    # of the data-server's 5s, so a back-to-back re-run is not mistaken for a dead
-    # server. This only extends a wait; the mount gate below still fail-fasts and
-    # every lock assertion is unchanged. SQLite has no such lease.
-    meta_up=0
-    for _ in $(seq 1 400); do
-        (echo >/dev/tcp/${META%%:*}/${META##*:}) 2>/dev/null && { meta_up=1; break; }
-        sleep 0.05
-    done
-    [ "$meta_up" = 1 ] || { echo "FAIL: meta-server did not bind"; cat .locks/meta.log; exit 1; }
-    $Y --home $SRV/h1 mount --view "$VIEW" --mountpoint $M1 --meta-server $META \
-        --data-servers $DATA --foreground > .locks/m1.log 2>&1 &
-    P1=$!
-    $Y --home $SRV/h2 mount --view "$VIEW" --mountpoint $M2 --meta-server $META \
-        --data-servers $DATA --foreground > .locks/m2.log 2>&1 &
-    P2=$!
-    # Fail-fast mount gate: a mount that never came up would let every lock below
-    # be taken on a bare directory and still print green numbers.
-    for mp in $M1 $M2; do
-        gated=0
-        for _ in $(seq 1 60); do
-            findmnt -rn --mountpoint "$PWD/$mp" >/dev/null 2>&1 && { gated=1; break; }
-            sleep 0.25
-        done
-        [ "$gated" = 1 ] || { echo "FAIL: $mp never mounted (no fake lock numbers)"; cat ".locks/$(basename $mp).log"; exit 1; }
-    done
-    # Same seed the manifest gives the SQLite arm, written through the mount.
-    mkdir -p "$M1/seed" && : > "$M1/seed/f1.bin" && : > "$M1/seed/f2.bin" \
-        || { echo "FAIL: seeding the fdb lock view"; exit 1; }
-    sleep 1.0
-else
-    # Two mounts of the *same* user against the same view DB. Both processes
-    # carry GROVEFS_LOCK_LEASE_SECS=3 through the exported env, so their
-    # MetaEngine instances agree on lease duration and cross-process visibility
-    # is guaranteed by the shared `locks` SQLite table (WAL + busy_timeout
-    # already proven by the `concurrent` suite).
-    cat > .locks/alice.manifest <<'EOF'
+# Two mounts of the *same* user against the same view DB. Both processes
+# carry GROVEFS_LOCK_LEASE_SECS=3 through the exported env, so their
+# MetaEngine instances agree on lease duration and cross-process visibility
+# is guaranteed by the shared `locks` SQLite table (WAL + busy_timeout
+# already proven by the `concurrent` suite).
+cat > .locks/alice.manifest <<'EOF'
 mkdir seed
 touch seed/f1.bin
 touch seed/f2.bin
 EOF
-    $Y init --view alice --manifest .locks/alice.manifest >/dev/null
-    $Y mount --view alice --mountpoint $M1 --foreground > .locks/m1.log 2>&1 &
-    P1=$!
-    $Y mount --view alice --mountpoint $M2 --foreground > .locks/m2.log 2>&1 &
-    P2=$!
-    sleep 1.5
-fi
+$Y init --view alice --manifest .locks/alice.manifest >/dev/null
+$Y mount --view alice --mountpoint $M1 --foreground > .locks/m1.log 2>&1 &
+P1=$!
+$Y mount --view alice --mountpoint $M2 --foreground > .locks/m2.log 2>&1 &
+P2=$!
+sleep 1.5
 
 # ---------------------------------------------------------------------------
 echo "===== 1) flock -x: exclusive lock blocks second holder ====="
@@ -193,10 +100,10 @@ else
   [ "$rc" = "124" ] && ok "second flock -x blocked (timeout rc=124)" || bad "second flock -x rc=$rc want 124"
 fi
 wait $H 2>/dev/null
-# After holder exits, a fresh request must succeed. On a remote (fdb://) store
-# the release is a distributed commit that can lag the holder's exit by a beat,
-# so poll for visibility within a bounded window instead of a single zero-wait
-# probe. The assertion is unchanged; on SQLite the first attempt succeeds.
+# After holder exits, a fresh request must succeed. The release is committed
+# before the holder's `release` callback returns, but a poll within a bounded
+# window keeps the assertion robust against a slow filesystem; on SQLite the
+# first attempt succeeds.
 granted1=0
 for _ in $(seq 1 10); do
   if timeout 2 bash -c "exec 200>'$M2/seed/f1.bin'; flock -x 200"; then granted1=1; break; fi
@@ -370,7 +277,7 @@ else
   ok "live lock still held at 5s (> lease): renewal keeps live holders alive"
 fi
 kill -9 $HP2 2>/dev/null; wait $HP2 2>/dev/null
-# release-driven reap is a distributed commit on fdb://; poll for visibility
+# release-driven reap is a commit-then-visible path; poll for visibility
 # exactly as section 4 does, instead of a single zero-wait probe.
 reaped2=0
 for _ in $(seq 1 25); do
@@ -424,7 +331,7 @@ PY
 # (a) holder acquires on M1, then closes+exits; a fresh process must get the lock.
 python3 .locks/posix_hold.py "$M1/seed/f1.bin" 0 > .locks/ph.out 2>&1
 grep -q acquired .locks/ph.out && ok "posix holder acquired whole-file W" || bad "posix holder failed to acquire"
-# post-close reap visibility (distributed commit on fdb://): bounded poll, same
+# post-close reap visibility (commit-then-visible, as above): bounded poll, same
 # rationale as sections 1/4/4b. The leak assertion itself is unchanged.
 ra=""
 for _ in $(seq 1 25); do
@@ -451,12 +358,10 @@ esac
 # ---------------------------------------------------------------------------
 echo "===== 5) HA: locks table replicates to standby via existing backup channel ====="
 # SQLite-only by construction: the probe reads the standby's `meta/alice.db`
-# with sqlite3, i.e. it asserts GroveFS-native HA. An FDB deployment has no
-# GroveFS standby (the cluster itself replicates, and the meta-server refuses
-# --peer on an fdb:// store), so there is no equivalent artifact to open here.
-if [ "$BACKEND" != sqlite ]; then
-  echo "  SKIP: section 5 asserts SQLite standby replication (backend=$BACKEND)"
-else
+# with sqlite3, i.e. it asserts GroveFS-native HA, which a shared PostgreSQL
+# deployment refuses at startup (--peer/--role standby cannot be combined
+# with --meta-store postgres://), so there is no equivalent artifact to open
+# here.
 META_A=127.0.0.1:15116
 META_B=127.0.0.1:15117
 DATA=127.0.0.1:15118
@@ -505,7 +410,6 @@ wait $HAH 2>/dev/null
 # ---- teardown only the HA sub-processes; m1/m2 cleanup stays with trap ----
 fusermount -u .locks/ha/mnt 2>/dev/null
 kill_pids "$CP" "$DP" "$AP" "$BP"
-fi
 
 echo
 echo "==================== SUMMARY: pass=$pass fail=$fail ===================="

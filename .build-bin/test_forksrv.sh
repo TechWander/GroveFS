@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
-# REMOTE `view fork` / `view graft` e2e — the two tree-copy verbs, for EVERY
+# REMOTE `view fork` / `view graft` e2e — the two tree-copy verbs, for the
 # server-side backend that keeps trees outside the operator's machine.
 #
 # The claim under test: fork and graft work over the governance port exactly as
-# they do on the local SQLite file store, for the backends where a "tree" is not
-# a file: a `grovefs_v_<hex>` SCHEMA under PostgreSQL, a SUBSPACE under
-# FoundationDB. A fork is a copy of one whole tree into another in ONE
-# transaction (PG: `INSERT ... SELECT` between schemas; FDB: a `'n'`-family read
-# plus one write transaction), a graft places a curated subset with fresh
+# they do on the local SQLite file store, for the backend where a "tree" is not
+# a file: a `grovefs_v_<hex>` SCHEMA under PostgreSQL. A fork is a copy of one
+# whole tree into another in ONE transaction (`INSERT ... SELECT` between
+# schemas), a graft places a curated subset with fresh
 # ids/inodes — and in both cases the operator's host holds no metadata at all.
 #
-# What is asserted, once per backend (PG and FDB; each self-skips when its
+# What is asserted (PG; the arm self-skips when its
 # infrastructure is absent — the SQLite arm is `test_fork.sh`):
 #   - `view fork` (remote) copies the whole tree, ZERO bytes are copied on the
 #     data server, and every shared object gets a second ledger holder;
@@ -49,21 +48,6 @@ fi
 PGURI="postgres://grove:grovepw@${PGHOST}:${PGPORT}/grovefs"
 if (exec 3<>/dev/tcp/${PGHOST}/${PGPORT}) 2>/dev/null; then PG_OK=1; else PG_OK=0; fi
 
-# ---- FoundationDB reachability (self-skip) --------------------------------
-FDB_HOME="${FDB_HOME:-/data/grovefs/.fdbbin}"
-FDB_RUN_DIR="${FDB_RUN_DIR:-/data/grovefs/.fdbtest}"
-CLUSTER="${GROVEFS_FDB_CLUSTER_FILE:-$FDB_RUN_DIR/test.cluster}"
-FDBURI="fdb://$CLUSTER"
-FDBBIN="${GROVEFS_FDB_BIN:-./target/fdb/release/grovefs}"
-FDB_OK=0
-if [ -x "$FDBBIN" ] && [ -x "$FDB_HOME/fdbcli.x86_64" ] && [ -f "$CLUSTER" ]; then
-    if "$FDB_HOME/fdbcli.x86_64" -C "$CLUSTER" --exec "status minimal" 2>&1 \
-        | grep -q "The database is available"; then
-        FDB_OK=1
-        export LD_LIBRARY_PATH="$FDB_HOME/lib:${LD_LIBRARY_PATH:-}"
-    fi
-fi
-
 pass=0; fail=0; skip=0
 ok(){ echo "  OK: $1"; pass=$((pass+1)); }
 bad(){ echo "  FAIL: $1"; fail=$((fail+1)); }
@@ -82,9 +66,8 @@ PIDS=""; MOUNTS=""
 cleanup(){ for m in $MOUNTS; do fusermount -u "$m" 2>/dev/null || true; done; for p in $PIDS; do kill "$p" 2>/dev/null || true; done; }
 trap cleanup EXIT
 
-# One full cycle against one server-side backend. $1 label, $2 server binary
-# (the one that links the backend), $3 meta-store URI, $4 metaport, $5 control
-# port, $6 dataport.
+# One full cycle against the server-side backend. $1 label, $2 server binary,
+# $3 meta-store URI, $4 metaport, $5 control port, $6 dataport.
 exercise(){
     local label=$1 SBIN=$2 MSTOR=$3 MP=$4 CP=$5 DP=$6
     local S=$(date +%s)
@@ -265,12 +248,6 @@ if [ "$PG_OK" = 1 ]; then
     exercise postgres "$Y" "$PGURI" 15310 15311 15312
 else
     skp "PostgreSQL fork/graft arm (no server on ${PGHOST}:${PGPORT})"
-fi
-
-if [ "$FDB_OK" = 1 ]; then
-    exercise fdb "$FDBBIN" "$FDBURI" 15320 15321 15322
-else
-    skp "FoundationDB fork/graft arm (no cluster at $CLUSTER or no $FDBBIN)"
 fi
 
 echo

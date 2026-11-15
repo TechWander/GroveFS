@@ -29,8 +29,7 @@
 set -u
 cd "$(dirname "$0")/.."
 export LC_ALL=C LANG=C
-Y=${Y:-./target/fdb/release/grovefs}
-[ -x "$Y" ] || Y=./target/release/grovefs
+Y=${Y:-./target/release/grovefs}
 
 PGHOST=${PGHOST:-127.0.0.1}
 PGPORT=${PGPORT:-5433}

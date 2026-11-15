@@ -1,14 +1,12 @@
 #!/usr/bin/env bash
-# Tear down the grovefs test cluster on the three gfs VMs so the same three
-# guests can host a real 3-node FoundationDB cluster instead (user authorisation
-# 2026-11-10: "把 gfs 的集群先撤掉 ... 不用考虑介质问题, 先功能跑通").
+# Tear down the grovefs test cluster on the three gfs VMs and free their data
+# roots for the next deployment.
 #
 # Depth chosen by the user: stop services + wipe data roots ONLY.  Nothing here
 # touches the guest OS disks, the grovefs binaries, the unit files or
 # /etc/grovefs/cluster.env, so the old deployment is one `systemctl enable
-# --now` away from coming back.  Rollback of the whole experiment is
-# documented in .bneck/vm_rollback.md (managedsave snapshot + qcow2 copies in
-# /data/grovefs/vmbak/).
+# --now` away from coming back.  The rollback path is the guests themselves:
+# managedsave snapshots plus the qcow2 copies in /data/grovefs/vmbak/.
 #
 # usage: bash .bneck/vm_gfs_teardown.sh          # does the work
 #        bash .bneck/vm_gfs_teardown.sh --dry-run  # only prints what would run
@@ -50,7 +48,7 @@ for h in $VMS; do
       2>/dev/null | grep -v setlocale
 done
 
-echo "-- host-side reachability of the guests (for the FDB cluster file) --"
+echo "-- host-side reachability of the guests --"
 for h in $VMS; do
   printf '%s = %s\n' "$h" "$(ssh "$h" 'hostname -I | cut -d" " -f1' 2>/dev/null | tr -d '\r')"
 done

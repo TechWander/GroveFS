@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# REMOTE `view export` / `view import` e2e — the portable-dump verbs, for EVERY
-# backend, over the governance port.
+# REMOTE `view export` / `view import` e2e — the portable-dump verbs, for BOTH
+# metadata backends, over the governance port.
 #
 # The claim under test: a metadata dump can LEAVE and ENTER a deployment from an
-# operator machine that holds no store credential and no tree, for all three
-# backends (SQLite files, a `grovefs_v_<hex>` schema under PostgreSQL, a SUBSPACE
-# under FoundationDB). The dump travels in line-aligned CHUNKS through the
+# operator machine that holds no store credential and no tree, for both
+# backends (SQLite files, a `grovefs_v_<hex>` schema under PostgreSQL). The dump
+# travels in line-aligned CHUNKS through the
 # server's staging area, so neither side ever holds it whole and a chunk never
 # splits a row — proven by exporting the same tree with a 60-byte window and with
 # the default 4 MiB window and comparing the bytes.
@@ -27,7 +27,7 @@
 #   - the ledger is exact: after the imported copies are removed, deleting the
 #     base's names frees every object (no holder leaked through import);
 #   - the LOCAL CLI form (`--meta-dir/--meta-store` on the store's host) works on
-#     all three backends too, and produces the same dump body as the remote one.
+#     both backends too, and produces the same dump body as the remote one.
 set -u
 cd "$(dirname "$0")/.."
 export LC_ALL=C LANG=C
@@ -50,20 +50,6 @@ if [ -z "${PGPORT:-}" ]; then
 fi
 PGURI="postgres://grove:grovepw@${PGHOST}:${PGPORT}/grovefs"
 if (exec 3<>/dev/tcp/${PGHOST}/${PGPORT}) 2>/dev/null; then PG_OK=1; else PG_OK=0; fi
-
-FDB_HOME="${FDB_HOME:-/data/grovefs/.fdbbin}"
-FDB_RUN_DIR="${FDB_RUN_DIR:-/data/grovefs/.fdbtest}"
-CLUSTER="${GROVEFS_FDB_CLUSTER_FILE:-$FDB_RUN_DIR/test.cluster}"
-FDBURI="fdb://$CLUSTER"
-FDBBIN="${GROVEFS_FDB_BIN:-./target/fdb/release/grovefs}"
-FDB_OK=0
-if [ -x "$FDBBIN" ] && [ -x "$FDB_HOME/fdbcli.x86_64" ] && [ -f "$CLUSTER" ]; then
-    if "$FDB_HOME/fdbcli.x86_64" -C "$CLUSTER" --exec "status minimal" 2>&1 \
-        | grep -q "The database is available"; then
-        FDB_OK=1
-        export LD_LIBRARY_PATH="$FDB_HOME/lib:${LD_LIBRARY_PATH:-}"
-    fi
-fi
 
 pass=0; fail=0; skip=0
 ok(){ echo "  OK: $1"; pass=$((pass+1)); }
@@ -120,8 +106,8 @@ exercise(){
     local CTL=(--control-server 127.0.0.1:$CP --api-key "$KEY")
     V(){ $Y --home "$H/op" view "${CTL[@]}" "$@"; }
     # The same verbs run ON the store's host, with no control plane in between.
-    # The binary must be the one that LINKS the backend ($SBIN), exactly as the
-    # server is: a plain build refuses `fdb://` by name.
+    # The binary must be the one that SERVES the backend ($SBIN), exactly as the
+    # server is, so the CLI and the server reach the store through one code path.
     L(){ $SBIN --home "$H/op" view --meta-dir "$H/srv" ${MSTOR:+--meta-store "$MSTOR"} "$@"; }
 
     echo "----- [$label] 1) seed a BASE view with real content ====="
@@ -167,8 +153,8 @@ exercise(){
         || bad "[$label] something was written under the operator's meta/"
     GROVEFS_XFER_CHUNK=4194304 V export --view $B --out "$H/op/export1b.jsonl" > /dev/null 2>&1
     # The header carries `exported_at`, so a byte-for-byte cmp of two exports is
-    # a coin flip (measured: it went red for FDB alone, where the two exports
-    # straddled a second boundary). What must not differ is everything ELSE:
+    # a coin flip — the two exports can straddle a second boundary. What must not
+    # differ is everything ELSE:
     # the header without its timestamp, and every node row.
     head -1 "$D1" | sed -E 's/"exported_at":[^,]*/"exported_at":0/' > "$H/op/h1.txt"
     head -1 "$H/op/export1b.jsonl" | sed -E 's/"exported_at":[^,]*/"exported_at":0/' > "$H/op/h2.txt"
@@ -179,8 +165,8 @@ exercise(){
     deny "[$label] an existing --out needs --force" "already exists" \
         V export --view $B --out "$D1"
     good "[$label] --force overwrites it" V export --view $B --out "$D1" --force
-    # The three backends word this differently (SQLite/PG: "no metadata|base
-    # tree '…'"; FDB: "is not a provisioned subspace"), so assert on the ONE
+    # The two backends word this differently (SQLite: "no metadata tree for
+    # view '…'"; PG: "no base tree '…'"), so assert on the ONE
     # thing they share: the refusal names the view the operator asked for.
     deny "[$label] exporting a name the store never provisioned is refused" "'nosuch$S'" \
         V export --view nosuch$S --out "$H/op/none.jsonl"
@@ -293,7 +279,7 @@ exercise(){
     echo
 }
 
-ARMS="${ARMS:-sqlite postgres fdb}"
+ARMS="${ARMS:-sqlite postgres}"
 has(){ case " $ARMS " in (*" $1 "*) return 0;; (*) return 1;; esac; }
 
 if has sqlite; then
@@ -307,14 +293,6 @@ if has postgres; then
         exercise postgres "$Y" "$PGURI" 15340 15341 15342
     else
         skp "PostgreSQL export/import arm (no server on ${PGHOST}:${PGPORT})"
-    fi
-fi
-
-if has fdb; then
-    if [ "$FDB_OK" = 1 ]; then
-        exercise fdb "$FDBBIN" "$FDBURI" 15350 15351 15352
-    else
-        skp "FoundationDB export/import arm (no cluster at $CLUSTER or no $FDBBIN)"
     fi
 fi
 
