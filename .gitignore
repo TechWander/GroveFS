@@ -1,3 +1,10 @@
+# 内容边界（用户规则）：以 . 开头的目录与 paper/ 一律不入跟踪、不推送。
+# 覆盖台架取证(.bneck)、回归/台架脚本(.build-bin)、IDE 配置(.qoder)、
+# 论文源(paper/) 等；本地文件保留，仅从索引移除。
+/.*/
+!/.gitignore
+/paper/
+
 # Rust build artifacts
 /target/
 
