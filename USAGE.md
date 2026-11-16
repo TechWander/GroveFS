@@ -28,6 +28,7 @@
 | 性能观测与限速(分阶段延迟 / 带宽 / 缓存 TTL) | `mount --stats*` / `--bw-read|--bw-write` / `--cache-ttl` | §8 |
 | 多台机器共享同一棵视图 | `data-server` + `meta-server` | §4、§11 |
 | 元数据换 PostgreSQL 后端 | 各处 `--meta-store postgres://…` | §4.1、§6.2、§15.3 |
+| PG 连接数封顶了：多实例扩容 / 把已存在视图搬到另一实例 | `--meta-store file:注册表` + `--pg-instance` / `view move` | §6.2 |
 | 任意机器治理同一份元数据(不发数据库密码) | `meta-server --control-listen` + `view`/`apikey`/`refs --control-server --api-key` | §3.5.2 |
 | 主备高可用与真 fencing | `meta-server --role/--peer/--sync-repl/--witness` | §5.5、§11.8 |
 | 回收账本不一致 / 审计谁在调用 | `refs rebuild` / `apikey calls` | §5.3、§3.5.1 |
@@ -1330,7 +1331,7 @@ $Y mount --view alice \
 
 > **常见误解纠正**：
 > - 「PG 是客户端跟服务端都要装」→ 错,**只在服务端**(meta-server 进程连 PG),客户端只装 `grovefs` 二进制、只说 GroveFS 的 TCP 帧协议。
-> - 「上了 PG 写并发会更高」→ **部分对**：默认 SQLite 仍单写者；但 `--meta-store postgres://…` 会把写改为 SERIALIZABLE 写连接池（至多 8 连接，HopsFS 路线），不相交行上的并发写并行提交、冲突由 SSI 透明重试（`pg_ssi`/`pg_parallel` 套件实测）。并行仅限单个 PG 集群内，不跨集群分区元数据权威；跨集群扩展仍交 PG 自身复制/分片。
+> - 「上了 PG 写并发会更高」→ **部分对**：默认 SQLite 仍单写者；但 `--meta-store postgres://…` 会把写改为 SERIALIZABLE 写连 接池（至多 8 连接，HopsFS 路线），不相交行上的并发写并行提交、冲突由 SSI 透明重试（`pg_ssi`/`pg_parallel` 套件实测）。并行仅限单 个 PG  集群内，不跨集群分区元数据权威；连接数封顶时的横向扩容见 §6.2 的「实例注册表 + 视图放置」（不同视图落不同实例，容量线性增长）。
 > - 「共享一棵树必须先有 PG」→ 错,默认 SQLite 就支持,`metasrv`/`freshness`/`locks` 三个套件全部纯 SQLite。
 
 ### 跨客户端一致性:两种模式
@@ -1574,8 +1575,7 @@ $Y mount --view alice --data-servers 10.0.0.5:50100 --meta-server 10.0.0.5:50110
 `meta-server` 默认将权威 view 树存在 embedded SQLite（一 view 一 `<meta-dir>/meta/<view>.db`）；可将它切为 PostgreSQL：
 
 ```bash
-$Y meta-server --meta-dir /data/cluster --listen 0.0.0.0:50110 \
-     --meta-store postgres://user:pw@10.0.0.9:5432/grovefs
+$Y meta-server --meta-store postgres://user:pw@10.0.0.9:5432/grovefs --listen 0.0.0.0:50110   # PG 下不需要 --meta-dir：权威树与控制面都在库里
 ```
 
 客户端挂载命令完全一致(`--meta-server host:port --view alice`),线协议不变。服务端内部将每个 view 映射到一个 `grovefs_v_<hex(view)>` schema（hex 保证 identifier 安全、注入无关）,根节点固定 id=1,`ROOT_INO` 与 SQLite 行为一致。建表为幂等 `CREATE ... IF NOT EXISTS`,无需预迁移脚本。rename/unlink/lock 等需多语句原子性的 op 走显式事务。
@@ -1585,11 +1585,38 @@ $Y meta-server --meta-dir /data/cluster --listen 0.0.0.0:50110 \
 - **删视图是一条命令**：`view --meta-store postgres://… rm --name V --base --data-dir R` 在**一个事务**里逐 key 减 `grovefs_refs.holders`（归零即删除）再 `DROP SCHEMA … CASCADE`，提交后回收无人持有的 `blocks/` 对象；`refs --meta-store … rebuild` 在静止时按存活树重算整本账。PG 的 DDL 是事务性的，所以这一档不存在 SQLite 档“删 db → 重建账本”的中间态（§15.8）。
 - **空闲视图自动释放连接**：每个被挂载过的视图在 meta-server 里常驻一套引擎池（默认 8 写 + 4 读连接，`GROVEFS_PG_WRITE_POOL`/`GROVEFS_PG_READ_POOL` 可调）。`meta-server --engine-idle-secs N`（默认 300，`0` 关闭）在视图的最后一个挂载会话结束且静默 N 秒后回收引擎，连接随之关闭；下次访问自动重开，客户端无感（`evict` 套件实证：6 视图 76 连接 → 卸载回收后 4）。于是 PG 侧规划公式从「视图总数 × 12 ≤ max_connections」变为「**最近 N 分钟活跃视图数** × (写池+读池) + 突发溢出 ≤ max_connections」——视图总数不再被连接数封顶。挂载中的视图永不被回收（会话计数钉住引擎，哪怕无人读写）。
 - **写路径也缓存 prepared statement**：读路径每连接缓存 ≤16 条（上面 §8），写路径对等——每个写连接缓存 ≤32 条（`WRITE_STMT_CACHE_CAP`，`INSERT`/按名 `lookup`/`DELETE`/`SET ino`/四种 `setattr`/`rename`/锁 op/三条账本语句）。`tokio-postgres`/`postgres` 0.19 **没有** `prepare_cached`，所以缓存是自建的：`WriteConn` 持有 `HashMap<String, Statement>`，`WriteTx` 用固有方法遮蔽 `Transaction::query/execute`，**事务体内的 SQL 一字不改**即命中缓存；预编译语句在 `COMMIT`/`ROLLBACK` 后仍存活（实测），只有 DDL 改了结果类型才会报 `0A000`，此时驱逐该条并回落一次 unnamed。实测（`bench_pg_conc.sh`，N∈{1,4,8}、T=8、6s、默认 `sync_commit=on`，两轮）：FUSE 台架写吞吐 **3,048–3,118 / 4,784–5,202 / 4,518–4,680 ops/s**；缓存是代码内置的（`WRITE_STMT_CACHE_CAP`，没有开关），对照组是同台架、同一 op 序列、无缓存构建的读数 **2,556–2,577 / 4,131–4,200 / 3,350–3,497**，单连接一次事务 577–670µs → 316–330µs，即 N=1 +18–21%、N=4 +15–24%、N=8 **+30–36%**，叠加 `GROVEFS_PG_SYNC_COMMIT=off` 只在 N=4 稳定有益（5,225 → 6,142，+18%；N=1/N=8 在抖动内，见 §8）；争用用例 180/180 单一赢家，`test_pg.sh` 24/24。
-- **多个 PG 实例分片（原型，不是承诺面）**：`--meta-store` 接受逗号分隔的多个 URI，`postgres://…/db1,postgres://…/db2`。每个视图的 `grovefs_v_<hex>` schema 落在**恰好一个**实例上，选择是视图名的纯函数（FNV-1a 哈希取模），所以 `view create`、任意一台 meta-server、以及跨视图操作（graft/export/rm by name）**不需要注册表**就能指向同一处；`PgEngine::open` 是唯一的路由入口，`view list` 跨实例合并，控制面（`grovefs_control` 的定义/key/审计）钉在**第一个**实例上。单 URI 原样透传，一实例部署行为逐字节不变。
+- **多个 PG 实例：实例注册表 + 视图放置（解决连接数上限）**：PG 档每活跃视图占 12 条连接（8 写 + 4 读），单个 PG 集群能同时存活的视图数被封在 `max_connections` 里；多实例扩容的答案是**把不同视图放到不同数据库上**（一个视图的树永远只落在一个实例上，不复制），容量随实例数线性增长。`--meta-store` 两种写法：内联逗号列表 `postgres://…/db1,postgres://…/db2`（自动命名 `pg1..pgN`，名字只在列表顺序不变时稳定，适合不再增长的小集合）或 **`file:` 实例注册表**（推荐）：
 
-  边界（刻意如此，别当成还差一个开关）：① **一个分片 = 一份独立的「元数据 + 内容」域**——`grovefs_refs.holders` 这本跨视图账本在每个数据库里各有一本（SQL 事务不能跨库），所以共享同一批 blob 的两个实例会各自记账、互相不知道对方还持有，因此每个分片必须配自己的 data-server；② `refs rebuild` 因此**按实例运行**（多 URI 会被明确拒绝并给出逐实例的命令），`gc` 同理；③ fork/graft 的源与目标必须在同一实例（一条 `INSERT … SELECT` 跨不了库），不同实例会给出点名两个落点的错误而不是连错服务器；④ 改实例列表会**重映射**视图——重分片是一次数据搬迁，不是改个 flag。
+  ```text
+  # /etc/grovefs/instances.conf  — 每行 `名字 = postgres://…`，`#` 注释；第一条 = 控制面
+  main  = postgres://grove:pw@10.0.0.1:5433/grovefs
+  team1 = postgres://grove:pw@10.0.0.2:5433/grovefs
+  ```
 
-  取证（`.build-bin/probe_pg_shard.sh`，两库 `grovefs` + `grovefs_shard2`、8 个视图）：s1–s8 的 schema 在 db1/db2 上「一个且仅一个」（`db1 + db2 == 1` 逐视图），4/4 分散；**同一个 meta-server** 服务两侧视图（db2 的 s7 与 db1 的 s8 各写 200 个 4KiB 文件，2.67–2.87ms/op），行数落在被路由的 schema；删空 db1 分片的全部名字后 db1 账本用到的 200 行归零而 db2 的账本总数一字未动（跨分片不串账）；`refs --meta-store "a,b" rebuild` 被拒绝并提示逐实例重跑。路由函数另有 6 条单测（稳定性与分散度、单 URI 透传、控制面首实例、fork/graft 同实例约束、空实例跳空）。
+  注册表把凭据留在文件里（不进 argv、不进 journal、不进库——放置表只存**名字**），并给每个实例一个稳定名字供放置表引用。注册表读不了 = fail-fast 拒绝启动，绝不静默降级；meta-server 启动横幅会打印 `N PG instance(s) [main, team1] — control plane on 'main'`（只有名字，没有 URI）。
+
+  **放置**：`view create` 自动选**放置数最少**的实例（并列取注册表顺序）；`view create --pg-instance team1` 显式钉住（移动一个已存在视图的落点也用它，是唯一会改写放置行的入口）；fork 跟随基视图、`import` 自动放置、`view rm` 忘记放置行。放置表 `grovefs_control.view_placement` 在控制面实例上，`write`/`delete` 与控制面 DDL 同一把 advisory lock 序列化。**挂载怎么找到对库**：客户端永远只连 meta-server，不感知实例——meta-server 在 `M_OPEN` 时经放置表把视图解析到实例，由**服务端**向各实例扇出 PG 连接（所以担心的「都经一个服务的负载」只是元数据 RPC 负载，本来就是轻量路径；PG 连接不是经它中转的，是它替你选路）。视图→实例的解析顺序：放置行 → **扩容自愈**（无行但 schema 在控制面实例上 = 单实例升注册表前的旧视图，pin 回原库一次）→ 老哈希分片部署的 FNV-1a 回退（见 `probe_pg_shard.sh`）；控制面不可达时**拒绝而非猜**——猜错库会种下没人再找得到的 schema。单 URI 原样透传，一实例部署零额外查询。
+
+  语义不变量：`view list` 跨实例合并；`refs --meta-store … rebuild` **逐实例重算后求和**（不再拒绝多实例）；服务端 `gc`（`gc.scan`/`gc.apply`）**跨实例并集扫描**，所有实例的账本与树都数完才判孤儿；fork/graft 的源与目标必须在同一实例（一条 `INSERT … SELECT` 跨不了库），不同实例会点名两个落点拒绝而不是连错服务器。给实例集合加一台机器**不影响**已放置视图的落点（放置行说了算），只影响新视图的均衡。
+
+  边界（刻意如此）：① **一个实例 = 一份独立的「元数据 + 内容」域**——`grovefs_refs.holders` 账本在每个实例里各有一本（SQL 事务不能跨库），但 fork/graft 拒绝跨实例对保证了**账本对它能看到的所有共享都是完备的**（与树写同事务），所以每实例必须配自己的 data-server；② 容量公式：`Σ实例 (max_connections − 运维余量) / 12` 个同时存活视图——**同一集群建第二个库不提升容量**（`max_connections` 是 per cluster process），真实扩容是独立 PG 进程/主机；③ 基视图删文件后引用失效问题不存在（派生/别名/fork 与基同实例放置，跨实例拒绝在先）。
+
+  **切换机制：把已存在的视图搬到另一实例（`view move`）**——放置只在创建时自动选，事后调整用这条命令：
+
+  ```bash
+  $Y view --meta-store file:/etc/grovefs/instances.conf move --view V --pg-instance team1
+  $Y view --meta-store file:/etc/grovefs/instances.conf move --view V --pg-instance team1 --keep-source   # 源留作回滚点
+  ```
+
+  四步切换（snapshot → build → flip → retire）：① 对源 schema 做 RepeatableRead 快照导出（挂载仍在写也不撕裂）；② 在目标实例建副本并按 dump 头部行数自验（**不触碰放置**——失败时没有任何观察得到的变化）；③ 改写放置行，这是**唯一原子切换点**（与控制面 DDL 同一把 advisory lock；此步失败会把刚建的副本 `DROP SCHEMA CASCADE` 回滚，重试安全）；④ 默认退役源（schema + 它的账本持有，一个事务）——除非 `--keep-source`。全程 **metadata only**：内容字节留在各自 data 域不动（gc 跨实例并集扫描账本，源域字节不判孤儿）；挂载客户端无感，下次 `M_OPEN` 即路由到新家。
+
+  回退路径：`--keep-source` 留下的源 schema 就是回滚点——对同一视图反向 `move` 回原实例即可。反向 move 识别到目标已有同名 schema **且行数匹配**时跳过建树直接切行（幂等复用），所以回滚不复制数据、只动一次放置行。确认稳定后想清理残源：再来一次不带 `--keep-source` 的 move 或直接 `rm`（源 schema 已无放置行指向，不会双活）。
+
+  守卫与边界：视图挂载中拒绝（先卸载；其他机器上挂载的要自己静默）；必须在存储机上跑（带 `--control-server` 拒绝）；SQLite 档拒绝（每视图本来就只有一个家）；alias/derived 拒绝（它们不拥有树）；**fork 可以搬，但基视图不跟随**——搬家后的 fork 与基视图分属两实例，后续 `graft` 这一对会被跨实例拒绝（§6.2 边界①的推论，搬家前想清楚）。
+
+  扩容全流程串起来：① 新 PG 实例装好库与账号；② 注册表文件加一行；③ 重启 meta-server（横幅报新实例清单）；④ 此后**新视图**自动向新机器均衡，**旧视图原地不动**（放置行/自愈 pin 说了算）；⑤ 想把热点视图搬过去减负，用上面的 `view move`。给实例集合加机器不影响已放置视图，容量只随新视图增长。
+
+  取证：哈希路由机制（`.build-bin/probe_pg_shard.sh`，两库 8 视图：schema「一个且仅一个」、同一 meta-server 服务两侧、跨分片不串账）；注册表与放置 + 切换机制（`test_pg.sh` 第 8 节 55 项断言：横幅报两实例、自动放置落 main、`--pg-instance team` 落 team 库、跨实例挂载经**同一** meta-server 读写成功、rm 后 schema 与放置行同清、未知实例名拒绝；move 四步实测——main→team 切换且源 schema 消失、already-lives 拒绝并点名状态、搬回成功、`--keep-source` 残留 schema=1、rollback 复用副本只切行、搬家后挂载写读全通）；解析/放置纯逻辑 13 条单测（`shard_tests`：注册表解析与错误行号、单实例直传、控制面钉首条、控制面不可达拒绝、自动命名、后端判定）。
 - 为什么不提供 Redis：K/V+TTL 与视图树不同构（事务/行锁/多列索引都是自然需要,硬塞只会同实例重建一个更弱的 PG）。
 - 分场景的可执行命令（单机验证 / 生产 systemd / 巡检 / 备份恢复 / 删视图 / 能力边界）见 **§15.3–§15.9**。
 
@@ -1621,7 +1648,7 @@ $Y --home $BASE mount --view alice --mountpoint /mnt/alice_ro --ro
 - **元数据读并行**(SQLite 写不并行;PG 写并行见 §6.2):每个视图的 `MetaEngine` 除单条写连接外开一池暖读连接(**本地挂载 = `--threads`(默认 4);库内嵌/meta-server 默认 `READ_POOL_SIZE = 1`;`GROVEFS_SQLITE_READ_POOL` 覆盖,0–16,池空时按需开、用完归还**),`lookup`/`getattr`/`readdir` 与 nlink 解析走池,因此同视图并发读不必排在写锁后面;SQLite **写仍串行在同一权威连接上**(单写者语义不变),PG 写则另走 SERIALIZABLE 写池(§6.2)。池连接按 WAL 读事务读已提交数据,自己的写立刻可见(`cargo test` 内 `reads_through_the_pool_observe_committed_writes` 钉住这一点)。HA 备机/只读打开的引擎不预开池,首次读按需建立并归还,同样有界。PG 引擎(`PgEngine`)同样持一条对等的 `PG_READ_POOL_SIZE = 4` 只读连接池(`GROVEFS_PG_READ_POOL`,按 PG 事务读已提交数据,取不到只读连接时回退写连接以如实暴露故障),且每条读连接缓存自己的 prepared statement(每连接 ≤ 16 条:lookup/getattr/两个 readdir 页/锁探测/epoch 读),不再每次读都发 unnamed 语句让 PG 重解析重规划——同一挂载点 `--no-cache` 下连续 `stat` 实测 0.820ms → 0.528ms/op(−36% 延迟、+55% 吞吐,三次复测稳定);写侧 PG 另由 `PG_WRITE_POOL_SIZE = 8` 的 SERIALIZABLE 写池并行提交(§6.2)。
 - **PG 提交耐久档**（`GROVEFS_PG_SYNC_COMMIT=off`，默认 `on`）:PG 写连接在会话级执行 `SET synchronous_commit = off`，COMMIT 返回时不再等本地 WAL 落盘。同台架对照（`bench_pg_conc.sh`，N∈{1,4,8}、T=8、6s，写语句缓存已在位）：**3,305 / 5,225 / 4,284 → 3,194 / 6,142 / 4,180 ops/s**——唯一稳定的收益是 **N=4（写池打满）的 +18%**，N=1/N=8 落在单点抖动内（−3% / −2%；更早一轮同样的格局是 N=4 独赢 +29%）。代价是**崩溃可丢最近若干已提交事务**，且配了 `synchronous_standby_names` 时也不再等备机确认——承诺 RPO=0 的部署必须留默认 `on`。SSI 隔离、跨视图账本、治理不变量与 `--sync-repl` 快照转发都不受影响（后者与 PG 后端本就互斥）；默认档下 `test_pg.sh` 与 `GROVEFS_PG_SYNC_COMMIT=off` 下各 24/24 通过。
 - **目录列举分页 + READDIRPLUS**(不带开关即生效):`MetaProvider::readdir_page(parent, offset, limit)` 在 SQLite 与 PG 引擎里都下推成 SQL 页,FUSE 回调按几何块（READDIRPLUS 32→1024、普通 READDIR 128→1024）流式填回复缓冲,因此一个内核 READDIR/READDIRPLUS 请求付 `O(缓冲)` 而不是 `O(整棵目录)`;属性随目录项一次带回(内核 ≥4.6 的 `FUSE_DO_READDIRPLUS`,与上面能力位分属不同的 all-or-nothing 协商组,内核不支持则自然回退普通 READDIR)。三处关键实现:① **keyset 续读**——内核在「回复缓冲填满处」续读,偏移量与我们的页边界对不上,所以每 32 行记一个游标 `(parent, n) -> 第 n-1 行的名字`:任意续读先 `WHERE parent_id=? AND name>? ORDER BY name LIMIT n` 定位,再在内存丢掉不足 32 行的前缀;OFFSET 只作没有游标时(seekdir、游标被清)的回落,任何名字变更(create/unlink/rename/link)立即清空游标,绝不返回旧顺序。② **查询计划钉死**——列表 SQL 都带一个恒真的 `name>''`(名字不可能为空),它只负责把计划钉在 `UNIQUE(parent_id,name)` 上;否则 SQLite 会退到 `(parent_id,is_dir)` 前缀索引 + 临时 B 树排序,一次 OFFSET 页 13–55ms。③ **目录 nlink 走覆盖索引**——`getattr` 与 READDIRPLUS 的 `.`/`..` 要算目录 nlink(`2 + 子目录数`),靠 `idx_node_parent_kind(parent_id, is_dir)` 做纯索引扫描,100k 子项 **0.02ms**(逐行回表要 9.6ms/次,而且每个回复都要算)。实测(单机 release,同机同盘):含 10,002 个条目的目录 `ls -f` 基视图 **131ms**、100 规则派生 **105ms**,`ls -l` **162ms**;含 100,002 个条目的目录 `ls -f` 基视图 **1.19s**、fork **1.19s**、100 规则派生 **1.01s**(2s 内重读 **0.12s**)。5001 条目录 `ls -l` 本地 **2.56s**(`--no-readdirplus` 只留分页 5.22s);远端经 `M_READDIRP` 同目录 **2.29s**(只留分页 4.22s),输出均逐字节相同。
-- **作用范围**(与上条同口径):只读连接池与 SQL 分页在两个存储引擎上都有——SQLite `MetaEngine` 与 PG `PgEngine`(前者按上一条口径定宽、后者 4 条只读连接且各自缓存 prepared statement,两者均可用 `GROVEFS_SQLITE_READ_POOL` / `GROVEFS_PG_READ_POOL` 调)。本地 `--home`(SQLite 或 PG)吃满分页与 PLUS;`meta-server` 侧并发 RPC 处理器吃各自后端读池,且 `M_READDIRP` 帧把分页下推到服务端,远端客户端每缓冲只取一页并协商 PLUS(同数据集远端实测 2.29s)。`--layout`/派生视图的 `LayoutMeta` 也覆写了 `readdir_page`:它把「按规则裁剪后的形状」**按父目录物化一份**(最多 4 个目录 / 40 万行,TTL 2s),每个内核缓冲只切一片——所以 100k + 100 规则首次 1.01s、2s 内重读 0.12s;超过 40 万行的大目录仍逐缓冲现算(正确,只是不缓存)。仍走 trait 默认实现(每缓冲一次全量列表、不协商 PLUS)的只剩没有覆写 `readdir_page` 的自定义 provider。元数据**写**并行只在 PG 后端(单集群内 SERIALIZABLE 写池,见 §6.2),SQLite 写仍串行;跨节点多权威仍未做,单权威下的**多 PG 实例分片**只有原型(`--meta-store a,b` 按视图路由,边界见 §6.2)。判据由 `cargo test` 内 `store_level_paging_is_advertised_only_by_providers_that_page_in_sql` 与 `readdir_page_resumes_at_arbitrary_offsets_and_drops_stale_checkpoints` 钉住。
+- **作用范围**(与上条同口径):只读连接池与 SQL 分页在两个存储引擎上都有——SQLite `MetaEngine` 与 PG `PgEngine`(前者按上一条口径定宽、后者 4 条只读连接且各自缓存 prepared statement,两者均可用 `GROVEFS_SQLITE_READ_POOL` / `GROVEFS_PG_READ_POOL` 调)。本地 `--home`(SQLite 或 PG)吃满分页与 PLUS;`meta-server` 侧并发 RPC 处理器吃各自后端读池,且 `M_READDIRP` 帧把分页下推到服务端,远端客户端每缓冲只取一页并协商 PLUS(同数据集远端实测 2.29s)。`--layout`/派生视图的 `LayoutMeta` 也覆写了 `readdir_page`:它把「按规则裁剪后的形状」**按父目录物化一份**(最多 4 个目录 / 40 万行,TTL 2s),每个内核缓冲只切一片——所以 100k + 100 规则首次 1.01s、2s 内重读 0.12s;超过 40 万行的大目录仍逐缓冲现算(正确,只是不缓存)。仍走 trait 默认实现(每缓冲一次全量列表、不协商 PLUS)的只剩没有覆写 `readdir_page` 的自定义 provider。元数据**写**并行只在 PG 后端(单集群内 SERIALIZABLE 写池,见 §6.2),SQLite 写仍串行;跨节点多权威仍未做;单权威下的**多 PG 实例放置**已正式(`--meta-store file:注册表`,不同视图落不同实例,边界见 §6.2)。判据由 `cargo test` 内 `store_level_paging_is_advertised_only_by_providers_that_page_in_sql` 与 `readdir_page_resumes_at_arbitrary_offsets_and_drops_stale_checkpoints` 钉住。
 - `--no-readdirplus`:关闭 READDIRPLUS 协商,强制回退普通 READDIR+逐条 `LOOKUP`,供 A/B 基准排障(内核不认该能力时本来就是这个行为,此开关只是强制)。
 - `--o allow_other` 等额外 fuser 选项透传给挂载。
 
@@ -2012,8 +2039,7 @@ RPO 与 fencing 的取舍、fail-safe 写冻结的预期行为见 §5.5;巡检�
 # 1) 准备一个 PG(自建或发行版包均可),建库并给连接角色建 schema 的权限:
 #    createdb grovefs;  psql -c "GRANT CREATE,CONNECT ON DATABASE grovefs TO grovefs;"
 # 2) meta-server 启动参数加 --meta-store(与 --role standby/--peer/--witness 互斥,同时给会启动即 fail-fast):
-$Y meta-server --meta-dir /data/cluster --listen 0.0.0.0:50110 \
-     --meta-store postgres://grove:pw@10.0.0.9:5432/grovefs --token $TOK
+$Y meta-server --meta-store postgres://grove:pw@10.0.0.9:5432/grovefs --listen 0.0.0.0:50110 --token $TOK
 ```
 
 客户端命令一字不变(见 §4.1:客户机不装 PG、不持连接串、不感知后端)。每个 view 的 `grovefs_v_<hex(view)>` schema 必须先用 `view --meta-store … create` 显式建好(挂载只打开已存在的 schema,不会就地创建),无需预迁移脚本;控制面随 `--meta-store` 一起进 PG:key 与审计落 `grovefs_control.api_keys`/`mcp_calls`、视图定义落 `grovefs_control.view_defs`,`grovefs view`/`apikey`/`mcp` 加同一 `--meta-store`(或 env `GROVEFS_META_STORE`)即接同一份记录,本地不落任何控制面文件(`control` 套件逐节实证)。备份/HA 改走 PG 自己的工具链(一次 `pg_dump` 同时覆盖树+锁+控制面;`pg_basebackup`/流复制/PITR),见 §12.3。为什么上/不上 PG 的诚实边界见 §4.1。**巡检 SQL、备份恢复、删视图与 PG 下的能力边界（含实测拒绝原文）见 §15.6–§15.9。**
@@ -2985,21 +3011,25 @@ select n.nspname,
                       false, true, '')))[1]::text::bigint as nodes
 from pg_namespace n where n.nspname like 'grovefs_v_%' order by 1;
 
--- 3) 连接数:活跃视图各自持有 8 写 + 4 读池(共 12 条);空闲超 --engine-idle-secs(默认 300s)且无挂载会话的视图会被回收、连接随之释放
+-- 3) 连接数:活跃视图各自持有 8 写 + 4 读池(共 12 条);空闲超 --engine-idle-secs(默认 300s)且无挂载会话的视图会被回收、连接随之释 放
 --    → 规划 PG max_connections 按「最近 N 分钟活跃视图数 × 12 + 突发溢出 + 运维连接」留量,不是视图总数;卸载潮后本查询应自己回落
 select state, count(*) from pg_stat_activity where datname='grovefs' group by 1 order by 2 desc;
 
--- 4) 提交/回滚比:40001/40P01 冲突会在客户端透明重试,PG 侧体现为回滚计数
+-- 4) 多实例部署(§6.2 注册表+放置):控制面库里的放置表 —— 每个视图落在哪个实例(存名字,凭据在注册表文件里)
+--    容量 = Σ实例 (max_connections − 运维余量) / 12;同一集群建第二个库不提升容量,加实例 = 加独立 PG 进程/主机
+select instance, count(*) as views from grovefs_control.view_placement group by 1 order by 2 desc;
+
+-- 5) 提交/回滚比:40001/40P01 冲突会在客户端透明重试,PG 侧体现为回滚计数
 select datname, xact_commit, xact_rollback,
        round(100.0 * xact_rollback / nullif(xact_commit + xact_rollback, 0), 2) as rollback_pct
 from pg_stat_database where datname = 'grovefs';
 
--- 5) 谁在跑长查询(卡住会拖住对应视图的写)
+-- 6) 谁在跑长查询(卡住会拖住对应视图的写)
 select pid, now() - query_start as dur, state, left(query, 60) as q
 from pg_stat_activity where datname='grovefs' and state <> 'idle'
 order by dur desc limit 5;
 
--- 6) 体积 top10(单视图三张表:node/ctrl/locks,大的一定是 node)
+-- 7) 体积 top10(单视图三张表:node/ctrl/locks,大的一定是 node)
 select schemaname || '.' || relname as tbl, pg_size_pretty(pg_total_relation_size(relid)) as size
 from pg_statio_user_tables order by pg_total_relation_size(relid) desc limit 10;
 ```
@@ -3256,6 +3286,66 @@ $G meta-server --listen 0.0.0.0:50110
 | 挂载后 2 秒内别的客户端看不到变化 | 不是 bug：TTL ≤2s；若一直不同步，查两地是否连的**同一个** meta | §4 的“两种一致性模式” |
 | `connection refused` / 握手超时 | 防火墙只开了其一，或 token 不一致 | §11.6、§11.7 的验收清单 |
 
+### 15.17 按后端完整路径（SQLite / PG 各自：部署→使用→运维→验收一整条照抄）
+
+上面按「要办的事」切场景；这一节换视角：**每种数据库一整条完整路径**，从头抄到尾，不必在 §15.2–§15.16 之间跳转。两档只有 **3 处落点不同**（原生 HA、目录零拷贝入库 `grovefs import`、就地 `gc`），其余命令同名同参、只把 `--meta-dir` 换成 `--meta-store <URI>`；客户端挂载命令两档逐字相同。拓扑沿用 §13：存储机 `192.168.1.10`、客户端 A/B、PG 主机 `192.168.1.20`，IP/路径/口令按实际替换。
+
+#### 15.17.1 SQLite（默认档，不装任何数据库服务）
+
+**部署**（细节 §15.2，systemd 常驻单元 §11）：
+
+```bash
+grovefs data-server --listen 0.0.0.0:50100 --data-dir /data --token "$TOK"        # 字节落 /data/blocks
+grovefs meta-server --meta-dir /data --listen 0.0.0.0:50110 --token "$TOK"       # 不给 --meta-store = SQLite
+grovefs view --meta-dir /data create --view share                                 # 视图先显式建，不建就挂被拒
+```
+
+**使用**（客户端挂载，权限分档 §15.11，视图三件套选择 §15.13；远程挂载不需 `--home`）：
+
+```bash
+grovefs mount --view share --data-servers 192.168.1.10:50100 --meta-server 192.168.1.10:50110 --token "$TOK" -m /mnt/da
+```
+
+**运维**（判据详表 §12）：
+
+```bash
+grovefs du   --view share --meta-dir /data --total                       # 用量：子树字节汇总
+grovefs refs --meta-dir /data rebuild                                    # 库被外部 rm 后重算账本（静止时跑）
+grovefs gc   --meta-dir /data --data-dir /data --older-than 24h --apply  # 就地回收孤儿对象（仅 SQLite）
+# 备份：停机冷拷 meta/*.db(+WAL) + rsync -a -H blocks/；原生主备 HA 加 --role/--peer/--witness（§11）
+```
+
+**验收**：两端口 LISTEN + `findmnt` 显示 `grovefs:share` + A 写 B 秒读 + B 写 `EROFS` + 重启 data-server 客户端自连。
+
+#### 15.17.2 PostgreSQL 档（元数据进共享 schema，HA/备份交给 PG）
+
+**部署**（单机跑通 §15.3；systemd + 最小权限 + 连接串不落 argv §15.4）：
+
+```bash
+# PG 主机一次性：建库 + 角色 + 授权（无需预建表，首挂时服务端幂等建 schema）
+sudo -u postgres createdb grovefs
+sudo -u postgres psql -c "CREATE ROLE grove LOGIN PASSWORD 'pw';"
+sudo -u postgres psql -c "GRANT CREATE, CONNECT ON DATABASE grovefs TO grove;"
+# 存储机：data-server 一字不变；meta-server 把 --meta-dir 换成 --meta-store（PG 下服务端本地不落权威数据；与 --role/--peer/--witness 互斥）
+grovefs data-server --listen 0.0.0.0:50100 --data-dir /data --token "$TOK"
+grovefs meta-server --meta-store postgres://grove:pw@192.168.1.20:5432/grovefs --listen 0.0.0.0:50110 --token "$TOK"
+grovefs view --meta-store postgres://grove:pw@192.168.1.20:5432/grovefs create --view share   # 显式建出 PG schema
+```
+
+**使用**：客户端挂载命令与 SQLite 逐字相同；治理命令把 `--meta-dir` 换成 `--meta-store`（或统一 `GROVEFS_META_STORE` env），key/定义/审计都落 `grovefs_control`（§15.4）。
+
+**运维**（巡检 §15.6、备份/恢复 §15.7、删视图/清 schema §15.8、能力边界 §15.9）：
+
+```bash
+grovefs du   --view share --meta-store postgres://grove:pw@192.168.1.20:5432/grovefs --data-servers 192.168.1.10:50100 --total
+grovefs refs --meta-store postgres://grove:pw@192.168.1.20:5432/grovefs rebuild
+# 回收孤儿对象：PG 无就地形态，走远程 gc（经 --control-server 治理口 + admin key，§15.9）
+grovefs gc --control-server 192.168.1.10:50112 --api-key <id:secret> --data-servers 192.168.1.10:50100 --older-than 24h --apply
+# 备份：pg_dump（一次覆盖树+锁+控制面）+ rsync -a -H blocks/；HA/PITR 交给 PG 流复制/pg_basebackup
+```
+
+**验收**：`psql -c '\dn grovefs_v_*'` 出现 share 的 hex schema + 客户端挂载命令未变 + 卸载静默后 `pg_stat_activity` 连接自行回落（`--engine-idle-secs` 驱逐，§15.6）。
+
 ---
 
 ## 16. 内部机制速览与扩展开发(改代码的读者)
@@ -3326,6 +3416,6 @@ $G meta-server --listen 0.0.0.0:50110
 | 任意机器治理同一份元数据(用账号密钥代替数据库密码) | `grovefs view --control-server H --api-key K create\|define\|alias\|list\|rm`(`--meta-store` 换成 `--control-server` 同上) |
 | 账号密钥(治理口) | `grovefs --home H apikey create --label L --for admin --owner ACCT`(首把在持盘主机铸造) / `apikey --control-server H --api-key K list\|create\|revoke\|set-ro\|calls` |
 | 开远程治理口 | `grovefs meta-server --meta-dir D --listen IP:PORT --control-listen IP:PORT`(第二个端口只跑治理动词、只认 admin key、逐调用审计) |
-| 元数据服务（PostgreSQL 后端） | `grovefs meta-server --meta-dir D --listen IP:PORT --meta-store postgres://user:pw@host:5432/db` |
+| 元数据服务（PostgreSQL 后端） | `grovefs meta-server --meta-store postgres://user:pw@host:5432/db --listen IP:PORT`（PG 下 `--meta-dir` 可省，服务端本地不落权威数据） |
 | 铸造接入 key | `grovefs apikey --meta-dir D create --label L [--for any\|mcp\|mount\|admin] [--owner ACCT] [--view V] [--ro]`(明文只打印一次;`mount` = 只开挂载/数据面,`mcp` = 只开治理接口,`admin` = 只开治理端口且放行前两者、`--owner` 必填) |
 | 列出/撤销/审计 key | `grovefs apikey --meta-dir D list [--view V]`(带 `--view` 时只列能开 V 的 key,纯别名也匹配绑定到真实名的 key) / `revoke --id ID`(精确 id 或唯一前缀;撤销会封停该 key 的**活挂载**) / `calls --limit N`(含被拒的挂载连接) |

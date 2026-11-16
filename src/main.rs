@@ -940,6 +940,13 @@ enum ViewAction {
         /// freshly created base view with, exactly like `init --manifest`.
         #[arg(long)]
         manifest: Option<PathBuf>,
+        /// With a multi-instance PostgreSQL store (`--meta-store file:/path/…`)
+        /// the instance (registry name) to place this view's tree on; without
+        /// it the view lands on the instance carrying the fewest placed views.
+        /// Single-instance stores accept the flag only if it names their one
+        /// instance.
+        #[arg(long = "pg-instance", value_name = "NAME")]
+        pg_instance: Option<String>,
     },
     /// Create a FORK `--name` of the physical base view `--base`: an
     /// INDEPENDENT metadata tree seeded with a point-in-time copy of the base's
@@ -1138,6 +1145,29 @@ enum ViewAction {
         /// (the base tree must already exist in the target store).
         #[arg(long = "as-fork")]
         as_fork: Option<String>,
+    },
+    /// Move a view's tree to another instance of a multi-instance PostgreSQL
+    /// store (`--meta-store file:/path/…`): snapshot the source schema, build
+    /// the copy on `--pg-instance`, verify it against the dump's own header,
+    /// then flip the placement row (the atomic cutover) and retire the source
+    /// (schema + its ledger holds, one transaction) unless `--keep-source`
+    /// leaves it as a rollback point. Metadata only — content bytes stay in
+    /// the data domain they live in (the server-side gc unions ALL instances'
+    /// ledgers, so nothing is reclaimed out from under the moved view); mounts
+    /// keep pointing at the same `--data-servers`. Refuses a view mounted on
+    /// this machine; quiesce other machines yourself.
+    Move {
+        #[arg(long)]
+        view: String,
+        /// Target instance (registry name). A `--keep-source` move can be
+        /// rolled back by re-running the command with the original home.
+        #[arg(long = "pg-instance", value_name = "NAME")]
+        pg_instance: String,
+        /// Leave the source schema on its instance as a rollback point
+        /// instead of dropping it (and unbooking its ledger holds) after the
+        /// cutover succeeds.
+        #[arg(long)]
+        keep_source: bool,
     },
 }
 
@@ -1470,7 +1500,7 @@ fn refuse_local_with_remote(
 /// ledger follows the trees that exist.
 fn rollback_imported_tree(vbase: &Path, store: Option<&str>, view: &str) -> String {
     let uri = store.unwrap_or("");
-    if uri.starts_with("postgres://") || uri.starts_with("postgresql://") {
+    if grovefs::pg_store::is_pg_store(uri) {
         return match grovefs::pg_store::PgEngine::remove_view(uri, view) {
             Ok(_) => "the imported tree was removed again".to_string(),
             Err(e) => {
@@ -2332,9 +2362,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let vbase = db_path.unwrap_or_else(|| base.clone());
             let store = resolve_store(store);
-            let store_is_pg = store
-                .as_deref()
-                .is_some_and(|u| u.starts_with("postgres://") || u.starts_with("postgresql://"));
+            let store_is_pg = store.as_deref().is_some_and(grovefs::pg_store::is_pg_store);
             // The same `ControlStore` the MCP server drives — except that with
             // `--control-server` it is a thin client of the meta-server's
             // governance port, so the definitions/aliases of a PG *or SQLite*
@@ -2365,7 +2393,11 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             match action {
-                ViewAction::Create { view, manifest } => {
+                ViewAction::Create {
+                    view,
+                    manifest,
+                    pg_instance,
+                } => {
                     // Base (physical) view creation — the same authoritative
                     // tree `init` produces, framed as an explicit first-class
                     // step so the "only base views GC for real" rule has an
@@ -2392,6 +2424,9 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         // server: the tree it seeds lives on the server's store,
                         // so the lines travel and the seeding happens there.
                         let mut args = serde_json::json!({ "view": view });
+                        if let Some(pgi) = pg_instance.as_deref() {
+                            args["pg_instance"] = serde_json::json!(pgi);
+                        }
                         if let Some(mf) = manifest.as_ref() {
                             let text = std::fs::read_to_string(mf).map_err(|e| {
                                 format!("cannot read manifest {}: {e}", mf.display())
@@ -2410,9 +2445,19 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         if manifest.is_some() {
                             return Err("`view create --manifest` seeds a SQLite db file; under `--meta-store postgres://…` mount the view and write the files instead".into());
                         }
-                        let uri = store.as_deref().expect("store_is_pg implies a URI");
-                        drop(grovefs::pg_store::PgEngine::open(uri, &view, false)?);
-                        println!("created BASE view '{view}' in {uri} (schema grovefs_v_<hex>)");
+                        let spec = store.as_deref().expect("store_is_pg implies a store spec");
+                        // Place BEFORE the first open: the home row decides which
+                        // instance every later resolve binds this view to. An
+                        // explicit `--pg-instance` pins; otherwise least-loaded.
+                        let (home, _) = grovefs::pg_store::place_new_view(
+                            spec,
+                            &view,
+                            pg_instance.as_deref(),
+                        )?;
+                        drop(grovefs::pg_store::PgEngine::open(spec, &view, false)?);
+                        println!(
+                            "created BASE view '{view}' (schema grovefs_v_<hex>) on instance '{home}'"
+                        );
                     } else {
                         let mp = meta_path(&vbase, &view);
                         if let Some(dir) = mp.parent() {
@@ -2898,6 +2943,79 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     println!("note: content bytes are not in the export — make sure `blocks/` from the source store is present under the target data root before mounting; a cross-machine import copies METADATA only and the CLI never silently copies bytes");
                 }
+                ViewAction::Move {
+                    view,
+                    pg_instance,
+                    keep_source,
+                } => {
+                    // Move a tree between instances of a multi-instance store.
+                    // This talks to the PostgreSQL instances DIRECTLY (snapshot,
+                    // build, cutover, retire), so it runs on the storage host
+                    // with --meta-store — not through --control-server — and
+                    // only under a PG backend at all.
+                    if !grovefs::layout::valid_view_name(&view) {
+                        return Err(format!("invalid view name '{view}'").into());
+                    }
+                    if remote_ctl.is_some() {
+                        return Err("view move talks to the PostgreSQL instances directly — run it on the storage host with --meta-store (drop --control-server)".into());
+                    }
+                    if !store_is_pg {
+                        return Err("view move moves a tree between instances of a multi-instance PostgreSQL store (--meta-store file:/path/…); this store is SQLite and has exactly one home per view — there is nothing to move".into());
+                    }
+                    if let Some(mp) = view_mounted_at(&view) {
+                        return Err(format!(
+                            "view '{view}' is mounted here at {mp} — unmount it first (`grovefs umount -m {mp}`); mounts on OTHER machines are not visible in this mount table, quiesce them too (a stale copy is the failure mode)"
+                        )
+                        .into());
+                    }
+                    // An alias/derived name has no tree of its own (it renders
+                    // another view's) — nothing to move. A fork owns a tree and
+                    // moves like any other; its definition stays in the control
+                    // plane, but its BASE does not follow: a later graft into
+                    // this fork from its base would be a cross-instance pair
+                    // and refused (move the base too, or graft from a view on
+                    // the fork's new instance).
+                    if let Some(text) = ctrl.get_def_raw(&view)? {
+                        match grovefs::layout::LayoutRules::parse_def(&text)
+                            .map_err(|e| format!("bad view definition '{view}': {e}"))?
+                        {
+                            grovefs::layout::ViewDef::Alias(real) => {
+                                return Err(format!(
+                                    "'{view}' is a pure alias of real view '{real}' — an alias has no metadata tree of its own, nothing to move"
+                                )
+                                .into())
+                            }
+                            grovefs::layout::ViewDef::Derived(base, _) => {
+                                return Err(format!(
+                                    "'{view}' is a derived (virtual) view over '{base}' — a derived view has no metadata tree of its own, nothing to move"
+                                )
+                                .into())
+                            }
+                            grovefs::layout::ViewDef::Fork(_) => {
+                                println!("note: '{view}' is a fork — its tree moves with it, but its base stays where it is; a later graft from the base would be a cross-instance pair and refused");
+                            }
+                        }
+                    }
+                    let spec = store.as_deref().expect("store_is_pg implies a store spec");
+                    let rep = grovefs::pg_store::move_view(spec, &view, &pg_instance, keep_source)?;
+                    println!(
+                        "moved view '{view}': {} node(s), {} blob reference(s), instance '{}' -> '{}'",
+                        rep.nodes, rep.blobs, rep.from, rep.to
+                    );
+                    if rep.source_dropped {
+                        println!(
+                            "  source schema dropped on '{}', its ledger holds unbooked (one transaction); cutover is complete and idempotent to re-run",
+                            rep.from
+                        );
+                    } else {
+                        println!(
+                            "  source copy left behind — see the note above for the rollback/cleanup path"
+                        );
+                    }
+                    println!(
+                        "  metadata only: content bytes stay in the data domain — keep mounts pointed at the same --data-servers (server-side gc unions all instances' ledgers, so nothing is reclaimed out from under this view)"
+                    );
+                }
             }
         }
         Cmd::Mcp {
@@ -3270,9 +3388,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             let store = resolve_store(store);
             match action {
                 RefsAction::Rebuild => {
-                    if store.as_deref().is_some_and(|u| {
-                        u.starts_with("postgres://") || u.starts_with("postgresql://")
-                    }) {
+                    if store.as_deref().is_some_and(grovefs::pg_store::is_pg_store) {
                         // The ledger is `grovefs_refs.holders` IN the database, so
                         // the recount has to happen there too: the same "read the
                         // TREES, not the ledger" rule as the two arms above, and
@@ -3282,7 +3398,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         let uri = store.as_deref().expect("just matched a pg uri");
                         let rep = grovefs::pg_store::rebuild_ledger(uri)?;
                         println!(
-                            "refs ledger rebuilt in {uri}: {} tree(s), {} content key(s), {} holder unit(s); {} row(s) corrected, {} row(s) deleted",
+                            "refs ledger rebuilt across every instance of {uri}: {} tree(s), {} content key(s), {} holder unit(s); {} row(s) corrected, {} row(s) deleted",
                             rep.trees, rep.refs, rep.holders, rep.rows_fixed, rep.rows_deleted
                         );
                         println!(
@@ -3381,10 +3497,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             // there is no offline page tree to walk here, so this refuses rather
             // than reporting "nothing to reclaim".
             let offline_store = resolve_store(None);
-            if offline_store
-                .as_deref()
-                .is_some_and(|u| u.starts_with("postgres://") || u.starts_with("postgresql://"))
-            {
+            if offline_store.as_deref().is_some_and(grovefs::pg_store::is_pg_store) {
                 return Err("`gc` audits LOCAL page files under <data-dir>/blocks; a PostgreSQL deployment's trees are schemas and its bytes are owned by the data servers — reclaim there with the DBA/data-server tooling, not this command".into());
             }
             let mbase = db_path.unwrap_or_else(|| base.clone());
@@ -3473,7 +3586,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             // same refuse-not-downgrade rule `Cmd::View` applies to the other
             // file-level physical ops.
             if let Some(u) = resolve_store(store).as_deref() {
-                if u.starts_with("postgres://") || u.starts_with("postgresql://") {
+                if grovefs::pg_store::is_pg_store(u) {
                     return Err(
                         "import operates on a local SQLite view db; under a PostgreSQL deployment (--meta-store postgres://…, or GROVEFS_META_STORE) a base tree is a PG schema (create one with `view create`) and its bytes move through a mounted path — drop --meta-store for a local store"
                             .into(),

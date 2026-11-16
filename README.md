@@ -287,8 +287,7 @@ $Y apikey --meta-dir /data/cluster set-ro --id <ID> --rw                        
   $Y meta-server --meta-dir /data/cluster --listen 0.0.0.0:50110
 
   # PostgreSQL：一 view 一个 schema `grovefs_v_<hex(view)>`，事务化 rename/unlink/lock
-  $Y meta-server --meta-dir /data/cluster --listen 0.0.0.0:50110 \
-       --meta-store postgres://user:pw@10.0.0.9:5432/grovefs
+  $Y meta-server --meta-store postgres://user:pw@10.0.0.9:5432/grovefs --listen 0.0.0.0:50110   # PG 下 --meta-dir 可省，服务端本地不落权威数据
   ```
 
   客户端挂载命令**完全一致**（仍 `--meta-server host:port --view alice`）——线协议不变。注意：
@@ -769,6 +768,15 @@ grovefs --home /data/dst mount --view team -m /mnt/team   # 树、硬链接、�
 
 **多个基视图**：可以建任意多个基视图，每个一棵自己的 `meta/<name>.db`，树、字节引用、权限和删除都各自独立（`grovefs view create --view A` / `init --view A`，`view list` 会把未定义的裸基视图全部列出）。`view export/import` 也是**按视图**进行的，迁移时可以只搬其中一棵；不同基视图可以绑定不同的 API key（`apikey create --view A`），互不影响。
 
+## 选一种数据库，照一条路走
+
+GroveFS 元数据两档：SQLite 与 PostgreSQL。选定一种就照着**一整条完整路径**（部署 → 使用 → 运维 → 验收）走即可，不必在章节间跳转：
+
+- **SQLite（默认）**：零依赖单二进制，单写者、原生主备 HA。完整路径：[USAGE.md §15.2 / §15.17.1](USAGE.md)，网页版 [docs.html §6.9.1](docs/docs.html#case-backend-paths)。
+- **PostgreSQL**：并行写（每视图 8 写连接），HA / 备份 / PITR 交给 PG 自身。完整路径：[USAGE.md §15.3–§15.4 / §15.17.2](USAGE.md)，网页版 [docs.html §6.9.2](docs/docs.html#case-backend-paths)。
+
+两档只有 **3 处不一样**：原生 HA、目录零拷贝入库 `grovefs import`、就地 `gc` 仅 SQLite；其余命令同名同参，只把寻址旋钮 `--meta-dir` 换成 `--meta-store <URI>`，客户端挂载命令两档逐字相同。选型依据见 [docs.html §4.1](docs/docs.html#prod)，逐命令对照见 [docs.html §22.1](docs/docs.html#ref)。
+
 ## 部署与维护（手把手）
 
 完整的分阶段教程在 **[USAGE.md](USAGE.md) §11–§14**（网页版 [docs.html](docs/docs.html) 同步覆盖，并按读者阶段重排为「零基础→专家」四档：新增零基础预备知识、内部机制与扩展开发、性能调优方法论三章，支持自动/浅色/深色阅读主题）：§11 从环境预检 → 构建安装 → 拓扑规划 → token → systemd 常驻（中心双服务 + 客户端模板挂载单元）→ 防火墙 → 8 步验收清单 → HA / PostgreSQL 变体；§12 给日常巡检（日志关键字→处置对照表）、备份恢复（单机 / SQLite+HA / PG 三流程）、滚动升级、故障速查表与变更后回归；§13 是一组**固定 IP 的完整案例实操**（存储机 192.168.1.10 存 /data、SQLite 后端，客户端读写挂 /mnt/da、只读挂 /mnt/db），手把手逐参数解释；§14 进阶回答“数据目录怎么定制/存量大数据怎么导入（首选 `grovefs import` 零拷贝登记，备选经挂载 rsync 灌入，硬链接多入口、拆 view、未实现清单）/不同客户端想要不同显示方式”。最短生产路径六步：
@@ -840,7 +848,7 @@ SKIP_BENCH=1 bash .build-bin/run_all.sh   # 跳过吞吐基准（纯功能回归
 | 卸载 | `grovefs umount -m MP` |
 | 数据服务 | `grovefs data-server --listen IP:PORT --data-dir DIR [--token T] [--require-api-key [--meta-dir D]]` |
 | 元数据服务（默认 SQLite） | `grovefs meta-server --meta-dir D --listen IP:PORT [--token T] [--require-api-key] [--role primary\|standby --peer ADDR [--sync-repl] [--witness DATA_ADDR]]` |
-| 元数据服务（PostgreSQL 后端） | `grovefs meta-server --meta-dir D --listen IP:PORT --meta-store postgres://user:pw@host:5432/dbname`（先用 `grovefs view --meta-store <同 URI> create --view V` 显式建 schema；`view`/`apikey`/`mcp`/`data-server` 用同一 `--meta-store` URI 或 env `GROVEFS_META_STORE` 接同一控制面） |
+| 元数据服务（PostgreSQL 后端） | `grovefs meta-server --meta-store postgres://user:pw@host:5432/dbname --listen IP:PORT`（PG 下 `--meta-dir` 可省，服务端本地不落权威数据；先用 `grovefs view --meta-store <同 URI> create --view V` 显式建 schema；`view`/`apikey`/`mcp`/`data-server` 用同一 `--meta-store` URI 或 env `GROVEFS_META_STORE` 接同一控制面） |
 
 ## 诚实标注的边界
 

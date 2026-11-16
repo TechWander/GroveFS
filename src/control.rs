@@ -40,8 +40,10 @@ const CONTROL_POOL_SIZE: usize = 4;
 /// statements from different sessions can deadlock in PG (a known catalog
 /// race), so initializer processes take a transactionless advisory lock on a
 /// fixed class number first — released unconditionally in `finally` style
-/// below (every exit path executes the unlock).
-const DDL_LOCK_CLASS: i64 = 7100_0001;
+/// below (every exit path executes the unlock). The view-placement DDL in
+/// [`crate::pg_store`] shares this class: it creates a table in the SAME
+/// schema, so the same race applies and the same lock must serialize it.
+pub(crate) const DDL_LOCK_CLASS: i64 = 7100_0001;
 
 /// Lowercase hex of the raw view bytes — the same encoding
 /// [`crate::pg_store`] uses for per-view schema names (`schema_for`), exposed
@@ -87,13 +89,15 @@ impl PgPool {
     /// ONE schema owned by two stores; each store hands the statements it
     /// needs at open time.
     pub fn open(uri: &str, ddl: &[&str]) -> Result<Self, String> {
-        // A sharded store spec (`uri,uri,...`) names several instances for the
-        // view trees; the control schema is ONE authoritative record and stays
-        // on the first instance (see `pg_store::control_store`).
-        let uri = crate::pg_store::control_store(uri);
+        // A sharded store spec (`uri,uri,...` or a `file:` instance registry)
+        // names several databases for the view trees; the control schema is
+        // ONE authoritative record and stays on the FIRST instance (see
+        // `pg_store::control_store`). The expansion is fallible for `file:`
+        // specs — an unreadable registry fails the open, loud.
+        let uri = crate::pg_store::control_store(uri)?;
         let mut pool = Vec::new();
         for _ in 0..CONTROL_POOL_SIZE {
-            match Client::connect(uri, NoTls) {
+            match Client::connect(&uri, NoTls) {
                 Ok(c) => pool.push(c),
                 // Fewer warm connections is fine: `checkout` opens on demand,
                 // and a total outage surfaces on the first real query.

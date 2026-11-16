@@ -549,7 +549,9 @@ impl PgControlStore {
     /// instance returns the shared pool; any other instance is opened on demand
     /// WITHOUT the control DDL (that schema exists once, on instance one).
     fn shard_pool(&self, view: &str) -> Result<Arc<PgPool>, String> {
-        let uri = crate::pg_store::route_store(&self.spec, view);
+        // Placement first, name hash for views that predate the table (see
+        // [`crate::pg_store::resolve_view_uri`]).
+        let uri = crate::pg_store::resolve_view_uri(&self.spec, view)?;
         if uri == self.pool.uri() {
             return Ok(Arc::clone(&self.pool));
         }
@@ -585,13 +587,22 @@ impl ControlStore for PgControlStore {
     }
 
     fn describe(&self) -> String {
-        if self.shards.lock().is_empty() && !self.spec.contains(',') {
-            return format!("{} (PostgreSQL grovefs_control)", self.pool.uri());
-        }
+        // The spec may be a `file:` registry; if it cannot be expanded here,
+        // say so instead of a wrong instance count (the pool's own URI is
+        // always printable).
+        let shard_note = match crate::pg_store::store_uris(&self.spec) {
+            Ok(uris) if uris.len() > 1 => {
+                format!(", view trees placed across {} instance(s)", uris.len())
+            }
+            Ok(_) if !self.shards.lock().is_empty() => {
+                ", view trees placed across multiple instance(s)".to_string()
+            }
+            Ok(_) => String::new(),
+            Err(e) => format!(", instance registry unreadable: {e}"),
+        };
         format!(
-            "{} (PostgreSQL grovefs_control, view trees sharded over {} instances)",
-            self.pool.uri(),
-            crate::pg_store::store_instances(&self.spec).len()
+            "{} (PostgreSQL grovefs_control{shard_note})",
+            self.pool.uri()
         )
     }
 
@@ -638,7 +649,7 @@ impl ControlStore for PgControlStore {
         // view's schema exists on exactly one of them, and `view list` must
         // show every tree, not only the control instance's.
         let mut out: Vec<String> = Vec::new();
-        for (i, uri) in crate::pg_store::store_instances(&self.spec)
+        for (i, uri) in crate::pg_store::store_uris(&self.spec)?
             .iter()
             .enumerate()
         {
@@ -646,7 +657,7 @@ impl ControlStore for PgControlStore {
                 Arc::clone(&self.pool)
             } else {
                 let mut m = self.shards.lock();
-                match m.get(*uri) {
+                match m.get(uri) {
                     Some(p) => Arc::clone(p),
                     None => {
                         let p = Arc::new(PgPool::open(uri, &[])?);
@@ -752,7 +763,7 @@ impl ControlStore for PgControlStore {
         if !self.has_physical(view)? {
             return Err(format!(
                 "no metadata tree for view '{view}' ({} schema {}) — list_view_tree walks this store's own backend; a remote tree not reachable from here is not",
-                crate::pg_store::route_store(&self.spec, view),
+                crate::pg_store::resolve_view_uri(&self.spec, view).unwrap_or_else(|e| e),
                 schema_name_for(view)
             ));
         }
@@ -778,7 +789,9 @@ pub fn control_store_for(
     store_uri: Option<&str>,
 ) -> Result<Arc<dyn ControlStore>, String> {
     match store_uri {
-        Some(u) if u.starts_with("postgres://") || u.starts_with("postgresql://") => {
+        // `postgres://…` or a `file:` instance registry (see
+        // [`crate::pg_store::is_pg_store`] for why `file:` is PG by contract).
+        Some(u) if crate::pg_store::is_pg_store(u) => {
             PgControlStore::new(u).map(|s| Arc::new(s) as Arc<dyn ControlStore>)
         }
         Some(u) if u.contains("://") => Err(format!(

@@ -297,8 +297,7 @@ The unit of isolated storage is the *view*, not the client; content bytes live i
   $Y meta-server --meta-dir /data/cluster --listen 0.0.0.0:50110
 
   # PostgreSQL: one `grovefs_v_<hex(view)>` schema per view, tx-guarded rename/unlink/lock
-  $Y meta-server --meta-dir /data/cluster --listen 0.0.0.0:50110 \
-       --meta-store postgres://user:pw@10.0.0.9:5432/grovefs
+  $Y meta-server --meta-store postgres://user:pw@10.0.0.9:5432/grovefs --listen 0.0.0.0:50110   # under PG --meta-dir is optional: the server writes no authoritative data locally
   ```
 
   Clients mount exactly the same way (`--meta-server host:port --view alice`). Notes that matter:
@@ -652,6 +651,15 @@ The two substantive differences from a token: ① refusal reasons travel byte-fo
 **Read-only**: `mount ... --ro` → every mutating op returns `EROFS` (kernel `MS_RDONLY` + filesystem-side guard).
 
 **Performance knobs**: `--threads N` (default 4, per-thread `/dev/fuse` fd), chunked parallel IO (reads ≥1MiB, writes ≥4MiB), large-file striping (≥16MiB), `touch_mtime` debouncing (one write per inode per epoch second, which is the store's whole resolution; a fresh file starts with its creation second already stamped, and the kernel's close-time `SETATTR` echo is dropped when its mtime falls in the stored second and its size already matches the object, so create+write+close pays no extra metadata write at all), creates that reserve only the name (the backend object is opened by the first `write`/`truncate`, so a `touch`-style create never opens a file at all — 0.177ms/op single-threaded, and 3.3k files/s at T=1 / 12.2–12.6k at T=8 with one parent dir per thread; an unwritten file simply reads back as 0 bytes), a warm read pool per view engine on both backends (SQLite: the mount sizes it to `--threads`, default 4, embedded/meta-server 1, `GROVEFS_SQLITE_READ_POOL` overrides 0–16; PG: `PG_READ_POOL_SIZE` = 4; drained slots open lazily and are returned on drop, and each PG read connection caches its own prepared statements, ≤16) that unblocks concurrent metadata reads while writes stay serialized, an opt-in async-commit durability tier for PostgreSQL writers (`GROVEFS_PG_SYNC_COMMIT=off`, default on: +29% at N=4, at the cost of losing the last commits on a crash), creation replies that carry the new row so a create costs two metadata round trips instead of three, SQL-paged directory listings (`readdir_page`, `LIMIT/OFFSET` filled into the reply buffer in geometric chunks — 32→1024 for READDIRPLUS, 128→1024 for plain READDIR), and `FUSE_READDIRPLUS` negotiation (on by default wherever the provider pages in its own store — SQLite/PG local, and remote against a capable `meta-server` via `M_READDIRP`; `--no-readdirplus` to fall back to plain READDIR + per-entry LOOKUP).
+
+## Pick a database and follow one track
+
+GroveFS has two metadata backends: SQLite and PostgreSQL. Pick one and follow **one complete path** (deployment → usage → operations → acceptance) without jumping between sections:
+
+- **SQLite (default)**: zero-dependency single binary, single writer, native primary/standby HA. Full path: [USAGE.en.md §15.2 / §15.17.1](USAGE.en.md), web edition [docs.html §6.9.1](docs/docs.html#case-backend-paths).
+- **PostgreSQL**: parallel writes (8 write connections per view), HA / backup / PITR delegated to PG itself. Full path: [USAGE.en.md §15.3–§15.4 / §15.17.2](USAGE.en.md), web edition [docs.html §6.9.2](docs/docs.html#case-backend-paths).
+
+The two tiers differ in only **3 landing points**: native HA, zero-copy directory ingest `grovefs import`, and in-place `gc` are SQLite-only; every other command keeps the same name and arguments, just swapping the addressing knob `--meta-dir` for `--meta-store <URI>`, and the client mount command is byte-for-byte identical across both tiers. See [docs.html §4.1](docs/docs.html#prod) for the selection rationale and [docs.html §22.1](docs/docs.html#ref) for a per-command comparison.
 
 ## Deployment & operations (hands-on)
 

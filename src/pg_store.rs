@@ -81,33 +81,496 @@ fn schema_for(view: &str) -> Option<String> {
     Some(format!("grovefs_v_{hex}"))
 }
 
-/// Route a store specification that may name several PostgreSQL instances
-/// (`uri,uri,...`) to the one that owns `view`.
+// ---- store spec: instance book, routing, placement -------------------------
+//
+// A store spec names the PostgreSQL DATABASE(S) that carry view trees:
+//
+//   postgres://user:pw@host:port/db[,postgres://…,...]   inline list
+//   file:/abs/path/instances.conf                        registry file
+//
+// A registry file keeps credentials out of argv and gives every instance a
+// STABLE NAME the placement table can reference:
+//
+//   # name = postgres://user:pw@host:port/db   (the FIRST entry = control plane)
+//   main  = postgres://grove:pw@10.0.0.1:5433/grovefs
+//   team1 = postgres://grove:pw@10.0.0.2:5433/grovefs
+//
+// Why placement on top of the hash: [`route_store`] maps a view by a pure
+// function of its name, which is collision-free but FIXED — adding an instance
+// re-maps every view, a data move rather than a flag flip. With placement,
+// `view create` records the chosen home in `grovefs_control.view_placement`
+// (on the control instance), and every later open resolves view → instance
+// through that row: growing the instance set only affects NEW views, and an
+// operator can pin a home with `view create --pg-instance <name>`. Views that
+// predate the table keep hash routing, so their mapping never moves behind
+// their back.
+//
+// What this does NOT do: replicate one view across databases. A view's tree
+// lives on exactly ONE instance, writable there; spreads come from placing
+// DIFFERENT views on different instances (the per-view engine holds a fixed
+// pool, so live-view capacity scales linearly with instances). The control
+// plane (`grovefs_control`: keys, definitions, audit, placement) stays on the
+// FIRST instance — one authoritative record, exactly as in a single-DB setup.
+// The per-instance `grovefs_refs.holders` ledger stays too: a shared-bytes op
+// (fork/graft) is refused across instances by [`route_multi`], so an
+// instance's ledger is complete for every share it can ever see, transactional
+// with its own tree writes; `gc` union-scans ALL instances before calling any
+// byte an orphan.
+
+/// One named PostgreSQL database a store spec can route view trees to.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PgInstance {
+    /// Placement-table name (registry `name =`; positional `pgN` for a bare
+    /// comma list). Identifiers only — the placement table references it.
+    pub name: String,
+    /// Connection URI, verbatim to [`postgres::Client`]. Never echoed to logs
+    /// (it embeds the password); placement rows store the NAME only.
+    pub uri: String,
+}
+
+/// The parsed form of a store spec: every database it names, in order.
+#[derive(Clone, Debug)]
+pub struct PgBook {
+    pub instances: Vec<PgInstance>,
+    /// The spec the book was parsed from — error messages quote it.
+    pub origin: String,
+}
+
+impl PgBook {
+    /// The instance that owns the control plane (`grovefs_control`): always
+    /// the FIRST entry, exactly as [`control_store`] pins it.
+    pub fn control(&self) -> &PgInstance {
+        &self.instances[0]
+    }
+
+    /// Look an instance up by placement name.
+    pub fn by_name(&self, name: &str) -> Option<&PgInstance> {
+        self.instances.iter().find(|i| i.name == name)
+    }
+
+    /// The names, in registry order (error messages / the startup banner).
+    pub fn names(&self) -> String {
+        self.instances
+            .iter()
+            .map(|i| i.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// The instance-name shape the registry file and the placement table share:
+/// a plain identifier, no quoting, so a row can never forge a different
+/// instance by smuggled punctuation.
+fn valid_instance_name(name: &str) -> bool {
+    (1..=24).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Parse a store spec into its instance book.
 ///
-/// This is the seed of view sharding: each view's `grovefs_v_<hex>` schema
-/// lives on exactly one instance, chosen by a stable hash of the view name, so
-/// `view create`, every `meta-server` serving it and cross-view work
-/// (graft/export/rm by name) all agree without a registry. A single URI is
-/// returned verbatim, so nothing changes for a one-instance deployment.
+/// `file:` specs read the registry (one `name = postgres://…` per line, `#`
+/// comments, blank lines skipped; the FIRST entry carries the control plane).
+/// A bare or comma list auto-names the databases `pg1..pgN` positionally —
+/// those names are stable only while the list order is, which is why an
+/// operator who intends to GROW the set should switch to a registry file:
+/// placement rows there survive reordering.
+///
+/// A file the process cannot read is an ERROR here, never a silent downgrade
+/// to SQLite (or to the first inline URI): `--meta-store` must never store
+/// metadata somewhere other than where the operator said.
+pub fn expand_store_spec(spec: &str) -> Result<PgBook, String> {
+    let spec = spec.trim();
+    if let Some(path) = spec.strip_prefix("file:") {
+        let path = path.trim();
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read --meta-store registry {path}: {e}"))?;
+        let mut instances: Vec<PgInstance> = Vec::new();
+        for (ln, raw) in text.lines().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let bad = |msg: String| format!("{path}:{}: {msg}", ln + 1);
+            let Some((name, uri)) = line.split_once('=') else {
+                return Err(bad(
+                    "expected `name = postgres://…` — instance lines are named, the placement table references the name".into(),
+                ));
+            };
+            let (name, uri) = (name.trim(), uri.trim());
+            if !valid_instance_name(name) {
+                return Err(bad(format!(
+                    "instance name '{name}' must be 1-24 chars of [A-Za-z0-9_-]"
+                )));
+            }
+            if !uri.starts_with("postgres://") && !uri.starts_with("postgresql://") {
+                return Err(bad(format!(
+                    "instance '{name}': `{uri}` is not a postgres:// URI"
+                )));
+            }
+            if instances.iter().any(|i| i.name == name) {
+                return Err(bad(format!("duplicate instance name '{name}'")));
+            }
+            instances.push(PgInstance {
+                name: name.to_string(),
+                uri: uri.to_string(),
+            });
+        }
+        if instances.is_empty() {
+            return Err(format!(
+                "{path}: no instance lines — one `name = postgres://…` per line, the FIRST entry carries the control plane"
+            ));
+        }
+        return Ok(PgBook {
+            instances,
+            origin: spec.to_string(),
+        });
+    }
+    let instances: Vec<PgInstance> = store_instances(spec)
+        .into_iter()
+        .enumerate()
+        .map(|(i, uri)| PgInstance {
+            name: format!("pg{}", i + 1),
+            uri: uri.to_string(),
+        })
+        .collect();
+    if instances.is_empty() {
+        return Err("empty --meta-store spec".into());
+    }
+    Ok(PgBook {
+        instances,
+        origin: spec.to_string(),
+    })
+}
+
+/// Does this spec select the PostgreSQL backend (as opposed to the local
+/// SQLite store)? `file:` is PG by contract — the registry lists postgres://
+/// URIs — and deciding by READING the file here would turn a missing file
+/// into a silent backend downgrade; the real open fails loud instead.
+pub fn is_pg_store(spec: &str) -> bool {
+    let s = spec.trim();
+    s.starts_with("postgres://") || s.starts_with("postgresql://") || s.starts_with("file:")
+}
+
+/// The URIs a spec names, in order (instance one = control plane). The
+/// expansion is fallible for `file:` specs, so callers that iterate instances
+/// (`view list` under PG, [`reference_picture`]) propagate the error.
+pub fn store_uris(spec: &str) -> Result<Vec<String>, String> {
+    Ok(expand_store_spec(spec)?
+        .instances
+        .into_iter()
+        .map(|i| i.uri)
+        .collect())
+}
+
+/// Where a view's tree lives, as (instance name, URI). Resolution order:
+///
+/// 0. a single-instance spec routes to itself without any lookup, so the
+///    overwhelmingly common deployment pays zero extra queries;
+/// 1. a placement row in `grovefs_control.view_placement` (written by
+///    `view create` / fork seeding / import);
+/// 1b. MIGRATION BOOTSTRAP: no row, but the schema exists on the control
+///     instance — a view created before the store grew a second instance is
+///     pinned to the control instance once (that was its only home), so a
+///     single-instance → registry upgrade never re-routes old views;
+/// 2. the pure name hash (the same FNV-1a as [`route_store`], over the
+///    expanded book) — views of a legacy multi-instance hash deployment keep
+///    their historical mapping.
+///
+/// The lookup talks ONLY to the control instance (placement is control-plane
+/// state). An unreachable control plane FAILS the open: a guessed route could
+/// open a view's tree against the wrong database and seed a schema nobody
+/// would ever find again — the one outcome worse than a refused mount.
+pub fn resolve_view_home(spec: &str, view: &str) -> Result<(String, String), String> {
+    let book = expand_store_spec(spec)?;
+    if book.instances.len() == 1 {
+        let i = &book.instances[0];
+        return Ok((i.name.clone(), i.uri.clone()));
+    }
+    let (placed, on_control) = lookup_placement(&book, view)?;
+    match placed {
+        Some(name) => {
+            let i = book.by_name(&name).ok_or_else(|| {
+                format!(
+                    "view '{view}' is placed on instance '{name}', which the store spec {} does not define (instances: {}) — fix the registry file or re-create the view with --pg-instance",
+                    book.origin,
+                    book.names()
+                )
+            })?;
+            Ok((i.name.clone(), i.uri.clone()))
+        }
+        None if on_control => {
+            // Bootstrap a single-instance → registry migration: the view was
+            // created before the store grew a second instance, and its schema
+            // still sits on the control instance (= its old, only home). Pin
+            // that once, so every later open skips the probe; a NEW view never
+            // lands here (it is placed at create time). A legacy multi-instance
+            // HASH deployment is untouched: its schemas sit on whichever
+            // instance the hash picked, so unless that is the control instance
+            // the probe finds nothing and the hash below keeps deciding.
+            let ctl = book.control();
+            write_placement(&book, view, &ctl.name, false)?;
+            Ok((ctl.name.clone(), ctl.uri.clone()))
+        }
+        None => {
+            // Same FNV-1a mapping as [`route_store`], but over the EXPANDED
+            // book: a `file:` registry is one opaque token to `route_store`'s
+            // comma splitter, which would hand back the spec itself as the
+            // connection URI. For an inline comma list the two agree exactly
+            // (same order, same URIs), so legacy mapping never moves.
+            let i =
+                &book.instances[(view_hash(view) % book.instances.len() as u64) as usize];
+            Ok((i.name.clone(), i.uri.clone()))
+        }
+    }
+}
+
+/// The URI alone — the shape every engine-open path consumes.
+pub fn resolve_view_uri(spec: &str, view: &str) -> Result<String, String> {
+    Ok(resolve_view_home(spec, view)?.1)
+}
+
+/// The placement table: one row per placed view, on the control instance.
+/// Names reference the registry, never URIs — credentials never enter the
+/// database.
+const PG_PLACEMENT_TABLE: &str = "grovefs_control.view_placement";
+
+/// Idempotent DDL for the placement table. Serialized by the SAME advisory
+/// lock class the control schema's own DDL uses: concurrent creators from
+/// several processes line up instead of racing the catalog.
+const PLACEMENT_DDL: &str = "CREATE TABLE IF NOT EXISTS grovefs_control.view_placement (
+    view       TEXT PRIMARY KEY,
+    instance   TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)";
+
+/// Read the placement row for `view` and whether its schema exists on the
+/// control instance (the bootstrap probe behind the single-instance → registry
+/// migration, see [`resolve_view_home`]). Ensures the table first — engine
+/// opens must not depend on which store initialized the control schema first.
+fn lookup_placement(book: &PgBook, view: &str) -> Result<(Option<String>, bool), String> {
+    let ctl = book.control();
+    let mut c = Client::connect(&ctl.uri, NoTls).map_err(|e| {
+        format!(
+            "cannot reach the control instance {} for view placement ({e}) — view '{view}' routing is undecided, refusing to guess",
+            ctl.name
+        )
+    })?;
+    let mut tx = c
+        .transaction()
+        .map_err(|e| format!("postgres begin: {e}"))?;
+    tx.execute(
+        "SELECT pg_advisory_xact_lock($1)",
+        &[&crate::control::DDL_LOCK_CLASS],
+    )
+    .map_err(|e| format!("postgres advisory lock: {e}"))?;
+    tx.execute(PLACEMENT_DDL, &[])
+        .map_err(|e| format!("postgres ensure {PG_PLACEMENT_TABLE}: {e}"))?;
+    let rows = tx
+        .query(
+            &format!("SELECT instance FROM {PG_PLACEMENT_TABLE} WHERE view = $1"),
+            &[&view],
+        )
+        .map_err(|e| format!("postgres read {PG_PLACEMENT_TABLE}: {e}"))?;
+    // Same transaction, same lock: the schema probe rides along for free.
+    let on_control = !tx
+        .query(
+            "SELECT 1 FROM information_schema.schemata WHERE schema_name = $1",
+            &[&schema_for(view).unwrap_or_default()],
+        )
+        .map_err(|e| format!("postgres probe schema: {e}"))?
+        .is_empty();
+    tx.commit()
+        .map_err(|e| format!("postgres commit (placement read): {e}"))?;
+    Ok((
+        rows.into_iter().next().map(|r| r.get::<_, String>(0)),
+        on_control,
+    ))
+}
+
+/// Record (or update) `view`'s home instance. `upsert` moves an existing
+/// placement; the default `DO NOTHING` keeps an old row so re-creating a
+/// view never silently moves its home away from a schema that already lives
+/// there (an explicit `--pg-instance` is the documented way to move one).
+fn write_placement(
+    book: &PgBook,
+    view: &str,
+    instance: &str,
+    upsert: bool,
+) -> Result<(), String> {
+    let ctl = book.control();
+    let mut c = Client::connect(&ctl.uri, NoTls)
+        .map_err(|e| format!("postgres connect {}: {e}", ctl.name))?;
+    let mut tx = c
+        .transaction()
+        .map_err(|e| format!("postgres begin: {e}"))?;
+    tx.execute(
+        "SELECT pg_advisory_xact_lock($1)",
+        &[&crate::control::DDL_LOCK_CLASS],
+    )
+    .map_err(|e| format!("postgres advisory lock: {e}"))?;
+    tx.execute(PLACEMENT_DDL, &[])
+        .map_err(|e| format!("postgres ensure {PG_PLACEMENT_TABLE}: {e}"))?;
+    let now = chrono::Local::now().to_rfc3339();
+    let conflict = if upsert {
+        "DO UPDATE SET instance = EXCLUDED.instance, updated_at = EXCLUDED.updated_at"
+    } else {
+        "DO NOTHING"
+    };
+    tx.execute(
+        &format!(
+            "INSERT INTO {PG_PLACEMENT_TABLE} (view, instance, updated_at) VALUES ($1, $2, $3)
+             ON CONFLICT (view) {conflict}"
+        ),
+        &[&view, &instance, &now],
+    )
+    .map_err(|e| format!("postgres write {PG_PLACEMENT_TABLE}: {e}"))?;
+    tx.commit()
+        .map_err(|e| format!("postgres commit (placement): {e}"))
+}
+
+/// Choose and RECORD the home instance for a view being created. `request`
+/// (`view create --pg-instance NAME`) pins an operator-chosen instance;
+/// otherwise the instance with the fewest placed views wins (ties → registry
+/// order), which greedily balances new views across the set. Returns
+/// (instance name, connection URI).
+///
+/// Single-instance specs skip the table entirely: nothing to balance, no
+/// extra writes, and a legacy store never grows placement rows it does not
+/// need.
+pub fn place_new_view(
+    spec: &str,
+    view: &str,
+    request: Option<&str>,
+) -> Result<(String, String), String> {
+    let book = expand_store_spec(spec)?;
+    if book.instances.len() == 1 {
+        let i = &book.instances[0];
+        return Ok((i.name.clone(), i.uri.clone()));
+    }
+    if let Some(req) = request {
+        let i = book.by_name(req).ok_or_else(|| {
+            format!(
+                "--pg-instance '{req}' is not an instance of {} (instances: {})",
+                book.origin,
+                book.names()
+            )
+        })?;
+        // The operator NAMED the instance, so this wins over any stale row:
+        // re-creating a view with an explicit home is the documented move.
+        write_placement(&book, view, &i.name, true)?;
+        return Ok((i.name.clone(), i.uri.clone()));
+    }
+    let counts = placement_counts(&book)?;
+    let pick = book
+        .instances
+        .iter()
+        .enumerate()
+        .min_by_key(|(idx, i)| (counts.get(&i.name).copied().unwrap_or(0), *idx))
+        .expect("book is non-empty")
+        .1;
+    write_placement(&book, view, &pick.name, false)?;
+    Ok((pick.name.clone(), pick.uri.clone()))
+}
+
+/// Placed-view count per instance name, for least-loaded placement.
+fn placement_counts(book: &PgBook) -> Result<HashMap<String, i64>, String> {
+    let ctl = book.control();
+    let mut c = Client::connect(&ctl.uri, NoTls)
+        .map_err(|e| format!("postgres connect {}: {e}", ctl.name))?;
+    match c.query(
+        &format!(
+            "SELECT instance, COUNT(*) FROM {PG_PLACEMENT_TABLE} GROUP BY instance"
+        ),
+        &[],
+    ) {
+        Ok(rows) => Ok(rows
+            .iter()
+            .map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1)))
+            .collect()),
+        // No table yet = nothing placed anywhere.
+        Err(e) if is_undefined_table(&e) => Ok(Default::default()),
+        Err(e) => Err(format!("postgres read {PG_PLACEMENT_TABLE}: {e}")),
+    }
+}
+
+/// Drop the placement row of a removed view (best effort, called by
+/// [`PgEngine::remove_view`]): the name should stop counting against its old
+/// instance's balance. The tree is already gone at this point, so an
+/// unreachable control plane only skews future balancing — never an error.
+fn forget_view_placement(spec: &str, view: &str) {
+    let Ok(book) = expand_store_spec(spec) else {
+        return;
+    };
+    if book.instances.len() <= 1 {
+        return;
+    }
+    if let Ok(mut c) = Client::connect(&book.control().uri, NoTls) {
+        let _ = c.execute(
+            &format!("DELETE FROM {PG_PLACEMENT_TABLE} WHERE view = $1"),
+            &[&view],
+        );
+    }
+}
+
+/// Record a home for a tree a fork/import is ABOUT to create, without the
+/// least-loaded choice — the home is dictated by the tree it copies from
+/// (fork) or by the caller. `DO NOTHING` keeps a stale row: re-creating a
+/// name onto a different home would orphan a schema that already lives on
+/// the old one.
+fn place_with_home(spec: &str, view: &str, home: &str) -> Result<(), String> {
+    let book = expand_store_spec(spec)?;
+    if book.instances.len() <= 1 {
+        return Ok(());
+    }
+    if book.by_name(home).is_none() {
+        return Err(format!(
+            "home instance '{home}' is not an instance of {} (instances: {})",
+            book.origin,
+            book.names()
+        ));
+    }
+    write_placement(&book, view, home, false)
+}
+
+/// Route a store specification that may name several PostgreSQL instances
+/// (an inline `uri,uri,...` list or a `file:` registry) to the one that owns
+/// `view`.
+///
+/// This is the pure-FALLBACK half of view routing: each view's
+/// `grovefs_v_<hex>` schema lives on exactly one instance, chosen by a stable
+/// hash of the view name, so unplaced views keep agreeing across `view create`,
+/// every `meta-server` and cross-view work (graft/export/rm by name) without a
+/// registry. A single URI is returned verbatim, so nothing changes for a
+/// one-instance deployment. Production opens go through [`resolve_view_uri`],
+/// which consults a placement row first and falls back to THIS mapping for
+/// views that predate the table.
 ///
 /// Boundaries (deliberate, see USAGE): the control plane (`grovefs_control`:
 /// keys, view definitions, audit) stays on the FIRST instance —
-/// [`control_store`]; `du`/`gc`/`refs rebuild` still expect one URI. Changing
-/// the instance list re-maps views (the mapping is a pure function of the
-/// names), so re-sharding is a data move, not a flag flip.
+/// [`control_store`]; changing the instance list re-maps unplaced views (the
+/// mapping is a pure function of the names), so re-sharding them is a data
+/// move, not a flag flip.
 pub fn route_store(store: &str, view: &str) -> String {
     let uris = store_instances(store);
     if uris.len() <= 1 {
         return uris.first().copied().unwrap_or(store.trim()).to_string();
     }
-    // FNV-1a over the raw view name: stable across processes and rebuilds, and
-    // independent of how many views exist.
+    uris[(view_hash(view) % uris.len() as u64) as usize].to_string()
+}
+
+/// FNV-1a over the raw view name: stable across processes and rebuilds, and
+/// independent of how many views exist. Shared by [`route_store`] and the
+/// hash-fallback arm of [`resolve_view_home`] so both arms of view routing
+/// stay one pure function.
+fn view_hash(view: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in view.as_bytes() {
         h ^= *b as u64;
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    uris[(h % uris.len() as u64) as usize].to_string()
+    h
 }
 
 /// The distinct PostgreSQL instances a store spec names, in the order given.
@@ -129,7 +592,7 @@ pub fn route_multi(store: &str, views: &[&str]) -> Result<String, String> {
     let mut picked: Option<String> = None;
     let mut split: Vec<String> = Vec::new();
     for v in views {
-        let uri = route_store(store, v);
+        let uri = resolve_view_uri(store, v)?;
         match &picked {
             None => picked = Some(uri),
             Some(p) if p == &uri => {}
@@ -139,7 +602,7 @@ pub fn route_multi(store: &str, views: &[&str]) -> Result<String, String> {
     match (picked, split.is_empty()) {
         (Some(uri), true) => Ok(uri),
         _ => Err(format!(
-            "these trees route to different PostgreSQL instances ({}); a fork/graft copies between schemas of ONE database, so both views must hash to the same instance — rename one, or use a single-instance store for this pair",
+            "these trees route to different PostgreSQL instances ({}); a fork/graft copies between schemas of ONE database, so both views must live on the same instance — place them there (view create --pg-instance), or use a single-instance store for this pair",
             split.join("; ")
         )),
     }
@@ -148,8 +611,10 @@ pub fn route_multi(store: &str, views: &[&str]) -> Result<String, String> {
 /// The instance that holds the shared control schema of a (possibly sharded)
 /// store spec. Pinned to the first URI: the control plane is ONE authoritative
 /// record shared by every instance (exactly as in a single-instance setup).
-pub fn control_store(store: &str) -> &str {
-    store.split(',').next().unwrap_or(store).trim()
+/// `file:` specs expand to their registry first, so a pool opened with the
+/// spec binds to the registry's FIRST entry.
+pub fn control_store(store: &str) -> Result<String, String> {
+    Ok(expand_store_spec(store)?.control().uri.clone())
 }
 
 /// One row of the `node` table before nlink/size are computed (the `finalize`
@@ -645,16 +1110,19 @@ fn tune_writer(c: &mut Client) -> bool {
 
 impl PgEngine {
     /// Connect to a PostgreSQL server (from a `postgres://user:pw@host/db`
-    /// URI), ensure this view's schema exists (idempotent), and seed the root
-    /// row (id=1). The URI is passed through verbatim to [`postgres::Client`].
+    /// URI, a `uri,uri,...` sharding spec, or a `file:` instance registry),
+    /// ensure this view's schema exists (idempotent), and seed the root row
+    /// (id=1). The RESOLVED instance URI is passed through verbatim to
+    /// [`postgres::Client`].
     ///
     /// `readonly` is accepted for API parity with the SQLite engine but has no
     /// effect on the PG path (GroveFS-native HA is disabled on PG, so a
     /// "standby reads only" mode is meaningless here).
     pub fn open(conn_uri: &str, view: &str, _readonly: bool) -> std::io::Result<Self> {
-        // A comma-separated spec (`uri,uri,...`) names several instances; this
-        // view's tree lives on exactly one of them (see [`route_store`]).
-        let conn_uri = route_store(conn_uri, view);
+        // A sharded spec routes this view's tree to ONE instance — by its
+        // recorded placement, or by the name hash for views that predate the
+        // table (see [`resolve_view_uri`]).
+        let conn_uri = resolve_view_uri(conn_uri, view).map_err(std::io::Error::other)?;
         let schema = schema_for(view).ok_or_else(|| {
             std::io::Error::other(format!(
                 "view name '{view}' incompatible with PG schema naming (empty, or longer than 25 bytes)"
@@ -1796,9 +2264,13 @@ impl PgEngine {
     /// read as a successful removal (the same rule the file arm applies to a
     /// missing `meta/<view>.db`).
     pub fn remove_view(conn_uri: &str, view: &str) -> Result<PgPurgeReport, String> {
-        // A sharded spec names several instances; this tree lives on one of
-        // them, and so does the ledger it has to unbook (see [`route_store`]).
-        let conn_uri = &route_store(conn_uri, view);
+        // A sharded spec names several instances; this tree lives on the one
+        // its placement (or its name hash) says, and so does the ledger it
+        // has to unbook (see [`resolve_view_uri`]). The ORIGINAL spec stays
+        // reachable: the placement row lives on the control instance, not on
+        // the resolved one.
+        let spec = conn_uri;
+        let conn_uri = &resolve_view_uri(conn_uri, view)?;
         let schema = schema_for(view).ok_or_else(|| {
             format!(
                 "view name '{view}' incompatible with PG schema naming (empty, or longer than 25 bytes)"
@@ -1870,6 +2342,10 @@ impl PgEngine {
             .map_err(|e| format!("postgres drop schema {schema}: {e}"))?;
         tx.commit()
             .map_err(|e| format!("postgres commit (schema and ledger rolled back): {e}"))?;
+        // The name is gone: release its placement so it stops counting
+        // against the old instance's balance (best effort, see
+        // [`forget_view_placement`]).
+        forget_view_placement(spec, view);
         Ok(PgPurgeReport {
             entries: entries.max(0) as u64,
             unbooked: unbooked_refs.len(),
@@ -1898,7 +2374,7 @@ impl PgEngine {
     /// Does `schema` exist? Asked of `information_schema`, never of a cached
     /// engine: a fork/graft must answer about the store as it is NOW.
     pub fn tree_exists(conn_uri: &str, view: &str) -> Result<bool, String> {
-        let conn_uri = &route_store(conn_uri, view);
+        let conn_uri = &resolve_view_uri(conn_uri, view)?;
         let schema = schema_for(view).ok_or_else(|| {
             format!(
                 "view name '{view}' incompatible with PG schema naming (empty, or longer than 25 bytes)"
@@ -1929,6 +2405,11 @@ impl PgEngine {
         name: &str,
         seed: bool,
     ) -> Result<crate::meta::ForkStats, String> {
+        // The fork is a NEW tree: it must land on its base's instance, so
+        // record that home BEFORE routing (an unplaced name would hash
+        // anywhere, and [`route_multi`] would then refuse the pair).
+        let (home, _) = resolve_view_home(conn_uri, base)?;
+        place_with_home(conn_uri, name, &home)?;
         // Both trees must sit on ONE instance: the copy is a single
         // `INSERT ... SELECT` between two schemas (see [`route_multi`]).
         let conn_uri = &route_multi(conn_uri, &[base, name])?;
@@ -2636,53 +3117,66 @@ pub struct PgPicture {
     pub booked: std::collections::BTreeMap<String, i64>,
 }
 
-pub fn reference_picture(conn_uri: &str) -> Result<PgPicture, String> {
-    let mut c = Client::connect(conn_uri, NoTls).map_err(|e| format!("postgres connect {e}"))?;
-    let schemas: Vec<String> = c
-        .query(
-            "SELECT schema_name FROM information_schema.schemata \
-             WHERE schema_name LIKE 'grovefs_v_%' ORDER BY schema_name",
-            &[],
-        )
-        .map_err(|e| format!("postgres {e}"))?
-        .iter()
-        .map(|r| r.get::<_, String>(0))
-        .collect();
+pub fn reference_picture(spec: &str) -> Result<PgPicture, String> {
+    // The audit judges bytes of the WHOLE deployment: identical content
+    // written by independent views can name one key from instances that never
+    // shared a ledger row, so the union of EVERY instance's trees decides
+    // what is referenced, and every instance's booked rows count as held.
+    // One unreadable instance aborts the picture — the same
+    // partial-visibility refusal as a skipped tree (a missed instance would
+    // make every blob its trees name look unreferenced).
+    let book = expand_store_spec(spec)?;
     let mut trees = Vec::new();
     let mut refs: std::collections::BTreeMap<String, i64> = Default::default();
-    for s in &schemas {
-        let Some(view) = crate::control::view_from_schema_name(s) else {
-            continue;
-        };
-        let rows = c
+    let mut booked: std::collections::BTreeMap<String, i64> = Default::default();
+    for inst in &book.instances {
+        let mut c = Client::connect(&inst.uri, NoTls)
+            .map_err(|e| format!("postgres connect {}: {e}", inst.name))?;
+        let schemas: Vec<String> = c
             .query(
-                &format!("SELECT DISTINCT data_ref FROM {s}.node WHERE data_ref IS NOT NULL"),
+                "SELECT schema_name FROM information_schema.schemata \
+                 WHERE schema_name LIKE 'grovefs_v_%' ORDER BY schema_name",
                 &[],
             )
-            .map_err(|e| {
-                format!(
-                    "cannot read tree {s}: {e} — refusing to audit from a partial view of the store (a skipped tree would make every blob it names look unreferenced)"
+            .map_err(|e| format!("postgres {e}"))?
+            .iter()
+            .map(|r| r.get::<_, String>(0))
+            .collect();
+        for s in &schemas {
+            let Some(view) = crate::control::view_from_schema_name(s) else {
+                continue;
+            };
+            let rows = c
+                .query(
+                    &format!("SELECT DISTINCT data_ref FROM {s}.node WHERE data_ref IS NOT NULL"),
+                    &[],
                 )
-            })?;
-        trees.push(view);
-        for r in rows {
-            *refs.entry(r.get::<_, String>(0)).or_insert(0) += 1;
+                .map_err(|e| {
+                    format!(
+                        "cannot read tree {s}: {e} — refusing to audit from a partial view of the store (a skipped tree would make every blob it names look unreferenced)"
+                    )
+                })?;
+            trees.push(view);
+            for r in rows {
+                *refs.entry(r.get::<_, String>(0)).or_insert(0) += 1;
+            }
+        }
+        // A database that never opened a view has no ledger table yet: that
+        // is "nothing booked", not an error (the same rule the local scanner
+        // applies to a missing `refs.db`).
+        match c.query(&format!("SELECT data_ref, holders FROM {PG_REFS_TABLE}"), &[]) {
+            Ok(rows) => {
+                for r in rows {
+                    *booked.entry(r.get::<_, String>(0)).or_insert(0) +=
+                        r.get::<_, i64>(1);
+                }
+            }
+            Err(e) if is_undefined_table(&e) => {}
+            Err(e) => return Err(format!("postgres read {PG_REFS_TABLE}: {e}")),
         }
     }
-    // A database that never opened a view has no ledger table yet: that is
-    // "nothing booked", not an error (the same rule the local scanner applies
-    // to a missing `refs.db`).
-    let booked: std::collections::BTreeMap<String, i64> = match c.query(
-        &format!("SELECT data_ref, holders FROM {PG_REFS_TABLE}"),
-        &[],
-    ) {
-        Ok(rows) => rows
-            .iter()
-            .map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1)))
-            .collect(),
-        Err(e) if is_undefined_table(&e) => Default::default(),
-        Err(e) => return Err(format!("postgres read {PG_REFS_TABLE}: {e}")),
-    };
+    trees.sort();
+    trees.dedup();
     Ok(PgPicture {
         trees,
         refs,
@@ -2706,16 +3200,32 @@ pub fn reference_picture(conn_uri: &str) -> Result<PgPicture, String> {
 /// a booking committed between the read pass and the write pass would be
 /// overwritten with the pre-booking count. Nothing here frees object bytes;
 /// that belongs to the data servers.
-pub fn rebuild_ledger(conn_uri: &str) -> Result<PgLedgerReport, String> {
-    // One database holds one `grovefs_refs.holders`. A sharded spec names
-    // several databases with one ledger EACH, so a single run would recount
-    // only the first — say it instead of silently half-repairing the store.
-    if store_instances(conn_uri).len() > 1 {
-        return Err(format!(
-            "{conn_uri} names {} PostgreSQL instances; the cross-view ledger lives INSIDE each database, so recount one instance at a time — run `grovefs refs rebuild --meta-store <one uri>` once per shard",
-            store_instances(conn_uri).len()
-        ));
+pub fn rebuild_ledger(spec: &str) -> Result<PgLedgerReport, String> {
+    // Every instance holds its OWN `grovefs_refs.holders`, and that ledger is
+    // complete for every share the instance can see (fork/graft refuse
+    // cross-instance pairs), so the recount runs per instance and the report
+    // sums the runs — no more "recount one shard at a time" refusal.
+    let book = expand_store_spec(spec)?;
+    let mut total = PgLedgerReport {
+        trees: 0,
+        refs: 0,
+        holders: 0,
+        rows_fixed: 0,
+        rows_deleted: 0,
+    };
+    for inst in &book.instances {
+        let rep = rebuild_ledger_one(&inst.uri)?;
+        total.trees += rep.trees;
+        total.refs += rep.refs;
+        total.holders += rep.holders;
+        total.rows_fixed += rep.rows_fixed;
+        total.rows_deleted += rep.rows_deleted;
     }
+    Ok(total)
+}
+
+/// Recount ONE instance's ledger against that instance's own schemas.
+fn rebuild_ledger_one(conn_uri: &str) -> Result<PgLedgerReport, String> {
     let mut c = Client::connect(conn_uri, NoTls).map_err(|e| format!("postgres connect {e}"))?;
     let schemas: Vec<String> = c
         .query(
@@ -2874,6 +3384,9 @@ pub fn export_view(
             "view name '{view}' incompatible with PG schema naming (empty, or longer than 25 bytes)"
         )
     })?;
+    // An export reads ONE tree: resolve its home first (a sharded spec names
+    // several databases, and a `postgres://` connection cannot span them).
+    let conn_uri = &resolve_view_uri(conn_uri, view)?;
     let mut c = Client::connect(conn_uri, NoTls).map_err(|e| format!("postgres connect {e}"))?;
     if !schema_exists(&mut c, &schema)? {
         return Err(format!(
@@ -2973,6 +3486,26 @@ pub fn export_view(
 /// invalid the schema is DROPPED again, so a refused import never leaves a
 /// provisioned-but-empty tree behind — the shape both other arms avoid.
 pub fn import_view(
+    spec: &str,
+    view: &str,
+    input: &Path,
+    replace: bool,
+) -> Result<crate::meta::ViewImportStats, String> {
+    // An import BUILDS a tree, so it places first: least-loaded across the
+    // spec's instances, or the home a previous create/import already
+    // recorded for the name (`DO NOTHING`). A refused import may leave the
+    // placement row behind — a name reservation, not a tree; the next
+    // successful build of this name lands on the same home, which is the
+    // point.
+    let (_, conn_uri) = place_new_view(spec, view, None)?;
+    import_into(&conn_uri, view, input, replace)
+}
+
+/// Install a portable dump into ONE database (a resolved URI, not a spec —
+/// placement already happened, or the caller picked the instance itself, as
+/// [`move_view`] does). All of the build, validation and ledger booking
+/// described on [`import_view`] happens here.
+fn import_into(
     conn_uri: &str,
     view: &str,
     input: &Path,
@@ -3273,6 +3806,147 @@ pub fn import_view(
         blobs,
         kind,
         replaced: existed,
+    })
+}
+
+// ---- moving a tree between instances --------------------------------------
+
+/// One move's outcome: the counts that were verified against the dump's own
+/// header, the instance NAMES involved (registry names, never URIs), and
+/// whether the source schema went away.
+pub struct PgMoveReport {
+    pub nodes: i64,
+    pub blobs: i64,
+    pub from: String,
+    pub to: String,
+    pub source_dropped: bool,
+}
+
+/// Move a view's tree from its current home instance to another instance of a
+/// multi-instance store (load rebalancing, instance decommissioning, hardware
+/// replacement). METADATA ONLY: what travels is the name space (ids, inodes,
+/// modes, times, `data_ref` keys) — the content bytes stay in the data domain
+/// they already live in, which is safe precisely because the server-side gc
+/// unions ALL instances' ledgers before calling any byte an orphan (the moved
+/// view's holds are booked on the target, so nothing is reclaimed out from
+/// under it). Mounts just keep pointing at the same `--data-servers`.
+///
+/// Steps: snapshot the source (RepeatableRead dump) → build the copy on the
+/// target WITHOUT touching placement (a failure here changes nothing
+/// observable) → verify against the dump's own header (import does this) →
+/// flip the placement row (the atomic cutover point) → retire the source
+/// (unbook its ledger holds in one transaction, `DROP SCHEMA CASCADE`). A
+/// target schema that already exists is accepted only when its node count
+/// matches the dump — that makes a `--keep-source` move's rollback (re-run
+/// with the original home) and a retry after a failed cutover both idempotent.
+/// The CLI must refuse locally-mounted views first; mounts on other machines
+/// are the operator's job to quiesce (a stale copy is the failure mode).
+pub fn move_view(spec: &str, view: &str, target: &str, keep_source: bool) -> Result<PgMoveReport, String> {
+    let book = expand_store_spec(spec)?;
+    if book.instances.len() <= 1 {
+        return Err("view move needs a multi-instance store (a `file:` registry, or a comma list naming at least two databases) — a single-instance view already lives on its only home".into());
+    }
+    let tgt = book.by_name(target).ok_or_else(|| {
+        format!(
+            "--pg-instance '{target}' is not an instance of {} (instances: {})",
+            book.origin,
+            book.names()
+        )
+    })?;
+    let schema = schema_for(view).ok_or_else(|| {
+        format!(
+            "view name '{view}' incompatible with PG schema naming (empty, or longer than 25 bytes)"
+        )
+    })?;
+    let (from, from_uri) = resolve_view_home(spec, view)?;
+    if from == target {
+        return Err(format!(
+            "view '{view}' already lives on instance '{target}' — nothing to move"
+        ));
+    }
+    // 1) Snapshot the source. A RepeatableRead dump cannot tear, but a live
+    //    mount makes the copy stale the moment it commits — the CLI's mount
+    //    guard runs before this; nothing here re-checks it.
+    let dump = std::env::temp_dir().join(format!(
+        ".grovefs-move-{}-{}.jsonl",
+        schema, std::process::id()
+    ));
+    let stats = export_view(spec, view, &dump, true, None)?;
+    // 2) The copy on the target. An existing schema there is a rollback point
+    //    or a retry's leftover: only a row-count match may be switched to.
+    let built = (|| -> Result<(), String> {
+        let mut tc = Client::connect(&tgt.uri, NoTls)
+            .map_err(|e| format!("postgres connect {}: {e}", tgt.name))?;
+        if schema_exists(&mut tc, &schema)? {
+            let n: i64 = tc
+                .query(&format!("SELECT COUNT(*) FROM {schema}.node"), &[])
+                .map_err(|e| format!("postgres count {schema}: {e}"))?[0]
+                .get(0);
+            if n != stats.nodes {
+                return Err(format!(
+                    "instance '{target}' already holds schema {schema} with {n} node(s) while the source has {} — refusing to switch to a mismatched copy (drop one side first)",
+                    stats.nodes
+                ));
+            }
+            return Ok(()); // the copy is already there; just switch below
+        }
+        drop(tc);
+        import_into(&tgt.uri, view, &dump, false).map(|_| ())
+    })();
+    if let Err(e) = built {
+        let _ = std::fs::remove_file(&dump);
+        return Err(e);
+    }
+    // 3) Cutover: the placement row flips, so every later resolve (mounts,
+    //    cross-view ops, rm) lands on the target from now on. A failure here
+    //    rolls the target side back — a provisioned-but-unreferenced schema
+    //    would refuse the retry (a row-count mismatch) and confuse the
+    //    operator more than a clean "nothing changed".
+    if let Err(e) = write_placement(&book, view, target, true) {
+        if let Ok(mut c) = Client::connect(&tgt.uri, NoTls) {
+            let _ = c.batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"));
+        }
+        let _ = std::fs::remove_file(&dump);
+        return Err(format!(
+            "{e}; the provisioned target tree was dropped and nothing changed — safe to retry"
+        ));
+    }
+    // 4) Retire the source: the schema AND its ledger holds go in one
+    //    transaction. `remove_view` resolves a BARE URI to itself (the
+    //    single-instance early return), so this drops exactly the copy that
+    //    still lives on `from` — the placement row is not consulted, and not
+    //    forgotten (it now names the target). A failed retirement is NOT a
+    //    failed move: the switch is done, the leftover is a stale copy the
+    //    operator cleans by hand.
+    let mut source_dropped = false;
+    let mut source_note = String::new();
+    if keep_source {
+        source_note = format!(
+            "source schema {schema} KEPT on '{from}' (--keep-source): its ledger holds stay booked there, so the source data domain's gc will not reclaim the view's bytes; roll back by re-running this command with --pg-instance {from}, clean up by dropping the schema there and running `refs rebuild`"
+        );
+    } else {
+        match PgEngine::remove_view(&from_uri, view) {
+            Ok(_) => source_dropped = true,
+            Err(e) => {
+                source_note = format!(
+                    "the source schema on '{from}' could NOT be removed ({e}) — the move is COMPLETE (resolves land on '{target}'), but '{from}' now holds a stale copy: drop schema {schema} there by hand, then `refs rebuild`"
+                );
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&dump);
+    Ok(PgMoveReport {
+        nodes: stats.nodes,
+        blobs: stats.blobs,
+        from,
+        to: target.to_string(),
+        source_dropped,
+    })
+    .map(|r| {
+        if !source_note.is_empty() {
+            eprintln!("note: {source_note}");
+        }
+        r
     })
 }
 
@@ -3581,7 +4255,9 @@ fn write_err_str(e: WriteErr) -> String {
 
 #[cfg(test)]
 mod shard_tests {
-    use super::{control_store, route_multi, route_store, store_instances};
+    use super::{
+        control_store, expand_store_spec, is_pg_store, route_multi, route_store, store_instances,
+    };
 
     /// Same spec + same view must always pick the same instance (that equality
     /// is what lets `view create`, every meta-server and cross-view ops agree
@@ -3622,54 +4298,125 @@ mod shard_tests {
         assert_eq!(route_store("", "alice"), "");
     }
 
-    /// The control plane is pinned to the first instance of a sharded spec.
+    /// The control plane is pinned to the first instance of a sharded spec
+    /// (both spellings), and a `file:` registry pins its first entry.
     #[test]
     fn control_store_pins_the_first_instance() {
         assert_eq!(
-            control_store("postgres://a@h/db1,postgres://a@h/db2"),
+            control_store("postgres://a@h/db1,postgres://a@h/db2").unwrap(),
             "postgres://a@h/db1"
         );
-        assert_eq!(control_store("postgres://a@h/db1"), "postgres://a@h/db1");
+        assert_eq!(control_store("postgres://a@h/db1").unwrap(), "postgres://a@h/db1");
     }
 
-    /// A fork/graft pair may only run when both names hash to the SAME
-    /// instance (one connection cannot span two databases); the error names the
-    /// split instead of connecting to the wrong server.
+    /// A fork/graft pair on a SINGLE-instance store never refuses and yields
+    /// that instance verbatim — the overwhelmingly common deployment pays no
+    /// resolution at all.
     #[test]
-    fn route_multi_requires_one_instance_per_pair() {
-        let spec = "postgres://a@h/db1,postgres://a@h/db2";
-        // Same view twice is trivially one instance.
+    fn route_multi_passes_a_single_instance_pair_through() {
         assert_eq!(
-            route_multi(spec, &["x", "x"]).unwrap(),
-            route_store(spec, "x")
+            route_multi("postgres://a@h/db", &["x", "y"]).unwrap(),
+            "postgres://a@h/db"
         );
-        // Find a pair that the hash actually splits, then require a refusal.
-        let mut split = None;
-        for i in 0..64 {
-            for j in 0..64 {
-                let (a, b) = (format!("v{i}"), format!("v{j}"));
-                if route_store(spec, &a) != route_store(spec, &b) {
-                    split = Some((a, b));
-                    break;
-                }
-            }
-            if split.is_some() {
-                break;
-            }
-        }
-        let (a, b) = split.expect("64 names must not all hash to one instance");
-        let err = route_multi(spec, &[&a, &b]).unwrap_err();
-        assert!(err.contains("different PostgreSQL instances"), "{err}");
-        // ... and a same-instance pair is accepted and yields that URI.
-        let mut same = None;
-        for i in 0..64 {
-            if route_store(spec, &format!("v{i}")) == route_store(spec, &a) {
-                same = Some(format!("v{i}"));
-                break;
-            }
-        }
-        let s = same.expect("some name must share an instance with itself");
-        assert_eq!(route_multi(spec, &[&a, &s]).unwrap(), route_store(spec, &a));
+    }
+
+    /// A multi-instance pair resolves through placement, which talks to the
+    /// control instance; with no server there the route is UNDECIDED and the
+    /// pair is refused instead of guessed (the hash-split refusal wording is
+    /// exercised by the live-registry integration run).
+    #[test]
+    fn route_multi_refuses_an_undecided_route() {
+        // Port 1 on loopback: no server listens there, so connect fails fast.
+        let spec =
+            "postgres://grove:pw@127.0.0.1:1/db1,postgres://grove:pw@127.0.0.1:1/db2";
+        let err = route_multi(spec, &["x", "x"]).unwrap_err();
+        assert!(err.contains("cannot reach the control instance"), "{err}");
+    }
+
+    /// A `file:` registry expands to its named instances in order, the first
+    /// one carrying the control plane; comments, blank lines and whitespace
+    /// around `=` are not part of the identity.
+    #[test]
+    fn expand_store_spec_reads_a_registry_file() {
+        let path = std::env::temp_dir().join(format!("grovefs_reg_ok_{}.conf", std::process::id()));
+        std::fs::write(
+            &path,
+            "# first entry = control plane\n\
+             main  = postgres://grove:pw@10.0.0.1:5433/grovefs\n\n\
+             team1 = postgres://grove:pw@10.0.0.2:5433/grovefs\n",
+        )
+        .unwrap();
+        let book = expand_store_spec(&format!("file:{}", path.display()));
+        let _ = std::fs::remove_file(&path);
+        let book = book.unwrap();
+        assert_eq!(book.names(), "main, team1");
+        assert_eq!(
+            book.control().uri,
+            "postgres://grove:pw@10.0.0.1:5433/grovefs"
+        );
+        assert_eq!(book.by_name("team1").unwrap().name, "team1");
+        assert!(book.by_name("nope").is_none());
+    }
+
+    /// A registry the process cannot read is an ERROR — never a silent
+    /// downgrade to SQLite or to the first inline URI.
+    #[test]
+    fn expand_store_spec_refuses_an_unreadable_registry() {
+        let err = expand_store_spec("file:/nonexistent/grovefs-registry-nosuch.conf")
+            .unwrap_err();
+        assert!(err.contains("cannot read"), "{err}");
+    }
+
+    /// Bad registry lines carry their line number, and the failure classes
+    /// stay distinct: missing `=`, invalid name, non-postgres URI, duplicate
+    /// name, no instances at all.
+    #[test]
+    fn expand_store_spec_reports_bad_registry_lines() {
+        let dir = std::env::temp_dir();
+        let probe = |tag: &str, text: &str| {
+            let path = dir.join(format!("grovefs_reg_bad_{}_{}.conf", std::process::id(), tag));
+            std::fs::write(&path, text).unwrap();
+            let r = expand_store_spec(&format!("file:{}", path.display()));
+            let _ = std::fs::remove_file(&path);
+            r.unwrap_err()
+        };
+        let e = probe("noeq", "postgres://a@h/db\n");
+        assert!(e.contains(":1: expected `name = postgres://"), "{e}");
+        let e = probe("badname", "bad name = postgres://a@h/db\n");
+        assert!(e.contains("must be 1-24 chars"), "{e}");
+        let e = probe("notpg", "x = sqlite://a@h/db\n");
+        assert!(e.contains("is not a postgres:// URI"), "{e}");
+        let e = probe("dup", "a = postgres://a@h/db\na = postgres://a@h/db2\n");
+        assert!(e.contains(":2: duplicate instance name 'a'"), "{e}");
+        let e = probe("empty", "# only a comment\n");
+        assert!(e.contains("no instance lines"), "{e}");
+    }
+
+    /// A bare comma list auto-names its databases pg1..pgN positionally; the
+    /// first one is the control plane, exactly as with a registry.
+    #[test]
+    fn expand_store_spec_names_inline_uris_positionally() {
+        let book = expand_store_spec("postgres://a@h/db1,postgres://a@h/db2").unwrap();
+        assert_eq!(book.names(), "pg1, pg2");
+        assert_eq!(book.control().uri, "postgres://a@h/db1");
+        assert_eq!(
+            expand_store_spec("postgres://a@h/db")
+                .unwrap()
+                .names(),
+            "pg1"
+        );
+    }
+
+    /// The backend-selection predicate: both postgres:// spellings and `file:`
+    /// registries are PG; everything else (a SQLite path, empty) is not.
+    #[test]
+    fn is_pg_store_accepts_uris_and_registries() {
+        assert!(is_pg_store("postgres://a@h/db"));
+        assert!(is_pg_store("postgresql://a@h/db"));
+        assert!(is_pg_store("file:/etc/grovefs/instances.conf"));
+        assert!(is_pg_store(" postgres://a@h/db "));
+        assert!(!is_pg_store("/var/lib/grovefs"));
+        assert!(!is_pg_store(""));
     }
 
     /// Instances are split on commas and trimmed; blanks are never an instance.

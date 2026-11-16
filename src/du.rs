@@ -194,7 +194,12 @@ fn no_tree(view: &str, store: &str) -> io::Error {
     ))
 }
 
-fn gather_pg(uri: &str, view: &str) -> io::Result<Vec<FlatNode>> {
+fn gather_pg(spec: &str, view: &str) -> io::Result<Vec<FlatNode>> {
+    // A sharded spec (`uri,uri,...` / `file:` registry) routes the view's tree
+    // to one instance; a `postgres://` connection cannot span databases, so
+    // resolve the home first.
+    let uri = crate::pg_store::resolve_view_uri(spec, view).map_err(io::Error::other)?;
+    let uri = &uri;
     let schema = grovefs_pg_schema(view);
     // Ask the catalog BEFORE selecting from it: the schema is the tree, so a
     // missing one is "no such view", not a query failure to be quoted raw.

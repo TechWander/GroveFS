@@ -1574,8 +1574,7 @@ The uid a client reports defaults to `geteuid()`, overridable explicitly with `m
 `meta-server` stores the authoritative view tree in embedded SQLite by default (one `<meta-dir>/meta/<view>.db` per view); you can switch it to PostgreSQL:
 
 ```bash
-$Y meta-server --meta-dir /data/cluster --listen 0.0.0.0:50110 \
-     --meta-store postgres://user:pw@10.0.0.9:5432/grovefs
+$Y meta-server --meta-store postgres://user:pw@10.0.0.9:5432/grovefs --listen 0.0.0.0:50110   # under PG no --meta-dir is needed: trees and control plane live in the database
 ```
 
 The client mount command is exactly the same (`--meta-server host:port --view alice`), the wire protocol unchanged. Internally the server maps each view to a `grovefs_v_<hex(view)>` schema (hex guarantees identifier safety, injection-agnostic), the root node fixed at id=1, `ROOT_INO` consistent with SQLite behavior. Table creation is idempotent `CREATE ... IF NOT EXISTS`, no pre-migration script needed. Ops needing multi-statement atomicity (rename/unlink/lock) go through explicit transactions.
@@ -2002,8 +2001,7 @@ For the RPO-vs-fencing trade-off and the expected behavior of fail-safe write fr
 # 1) 准备一个 PG(自建或发行版包均可),建库并给连接角色建 schema 的权限:
 #    createdb grovefs;  psql -c "GRANT CREATE,CONNECT ON DATABASE grovefs TO grovefs;"
 # 2) meta-server 启动参数加 --meta-store(与 --role standby/--peer/--witness 互斥,同时给会启动即 fail-fast):
-$Y meta-server --meta-dir /data/cluster --listen 0.0.0.0:50110 \
-     --meta-store postgres://grove:pw@10.0.0.9:5432/grovefs --token $TOK
+$Y meta-server --meta-store postgres://grove:pw@10.0.0.9:5432/grovefs --listen 0.0.0.0:50110 --token $TOK
 ```
 
 Client commands are unchanged (see §4.1: clients don't install PG, don't hold a connection string, don't sense the backend). Each view's `grovefs_v_<hex(view)>` schema must first be explicitly created via `view --meta-store … create` (a mount only opens an existing schema, never creating it in place), no pre-migration script needed; the control plane follows `--meta-store` into PG too: keys and audit land in `grovefs_control.api_keys`/`mcp_calls`, view definitions in `grovefs_control.view_defs`, and `grovefs view`/`apikey`/`mcp` with the same `--meta-store` (or env `GROVEFS_META_STORE`) connect to the same record, writing no control-plane files locally (the `control` suite proves it section by section). Backup/HA move to PG's own toolchain (one `pg_dump` covers tree + locks + control plane together; `pg_basebackup`/streaming replication/PITR), see §12.3. For the honest boundary on why to/not to go with PG, see §4.1. **For inspection SQL, backup/restore, view deletion, and the PG capability boundaries (incl. measured refusal wording), see §15.6–§15.9.**
@@ -3244,6 +3242,66 @@ $G meta-server --listen 0.0.0.0:50110
 | Within 2 seconds after a mount, other clients don't see the change | Not a bug: TTL ≤2s; if it never syncs, check whether both places connect to the **same** meta | §4's "two consistency modes" |
 | `connection refused` / handshake timeout | The firewall opened only one of them, or the tokens differ | §11.6, §11.7 acceptance checklists |
 
+### 15.17 Per-backend full tracks (SQLite / PG each: one complete path from deployment to acceptance)
+
+The scenarios above split by "what you want to do"; this section switches viewpoint: **one complete path per database** — deployment → usage → operations → acceptance, copyable start to finish without jumping between §15.2–§15.16. The two tiers differ in only **3 landing points** (native HA, zero-copy directory ingest `grovefs import`, in-place `gc`); every other command keeps the same name and arguments, just swapping `--meta-dir` for `--meta-store <URI>`. The client mount command is byte-for-byte identical across both tiers. Topology follows §13: storage host `192.168.1.10`, clients A/B, PG host `192.168.1.20`; replace IP/paths/passwords with your own.
+
+#### 15.17.1 SQLite (default tier, no database service installed)
+
+**Deployment** (details §15.2, systemd units §11):
+
+```bash
+grovefs data-server --listen 0.0.0.0:50100 --data-dir /data --token "$TOK"        # bytes land in /data/blocks
+grovefs meta-server --meta-dir /data --listen 0.0.0.0:50110 --token "$TOK"       # no --meta-store = SQLite
+grovefs view --meta-dir /data create --view share                                 # create the view explicitly, or the mount is refused
+```
+
+**Usage** (client mount; permission tiers §15.11, the view trio choice §15.13; remote mount needs no `--home`):
+
+```bash
+grovefs mount --view share --data-servers 192.168.1.10:50100 --meta-server 192.168.1.10:50110 --token "$TOK" -m /mnt/da
+```
+
+**Operations** (full criteria §12):
+
+```bash
+grovefs du   --view share --meta-dir /data --total                       # usage: subtree byte total
+grovefs refs --meta-dir /data rebuild                                    # recompute the ledger after an out-of-band rm (run when quiescent)
+grovefs gc   --meta-dir /data --data-dir /data --older-than 24h --apply  # reclaim orphan objects in place (SQLite only)
+# backup: stop and cold-copy meta/*.db(+WAL) + rsync -a -H blocks/; native primary/standby HA adds --role/--peer/--witness (§11)
+```
+
+**Acceptance**: both ports LISTEN + `findmnt` shows `grovefs:share` + A writes, B reads instantly + B write returns `EROFS` + after restarting data-server the client reconnects on its own.
+
+#### 15.17.2 PostgreSQL tier (metadata into a shared schema, HA/backup delegated to PG)
+
+**Deployment** (single-machine smoke test §15.3; systemd + least privilege + connection string kept out of argv §15.4):
+
+```bash
+# one-time on the PG host: create DB + role + grants (no pre-created tables; the server creates the schema idempotently at first open)
+sudo -u postgres createdb grovefs
+sudo -u postgres psql -c "CREATE ROLE grove LOGIN PASSWORD 'pw';"
+sudo -u postgres psql -c "GRANT CREATE, CONNECT ON DATABASE grovefs TO grove;"
+# storage host: data-server is unchanged; meta-server swaps --meta-dir for --meta-store (under PG the server writes no authoritative data locally; mutually exclusive with --role/--peer/--witness)
+grovefs data-server --listen 0.0.0.0:50100 --data-dir /data --token "$TOK"
+grovefs meta-server --meta-store postgres://grove:pw@192.168.1.20:5432/grovefs --listen 0.0.0.0:50110 --token "$TOK"
+grovefs view --meta-store postgres://grove:pw@192.168.1.20:5432/grovefs create --view share   # creates the PG schema explicitly
+```
+
+**Usage**: the client mount command is identical to SQLite; governance commands swap `--meta-dir` for `--meta-store` (or set `GROVEFS_META_STORE` once), and keys/definitions/audit all land in `grovefs_control` (§15.4).
+
+**Operations** (patrol §15.6, backup/restore §15.7, drop view/clean schema §15.8, capability boundary §15.9):
+
+```bash
+grovefs du   --view share --meta-store postgres://grove:pw@192.168.1.20:5432/grovefs --data-servers 192.168.1.10:50100 --total
+grovefs refs --meta-store postgres://grove:pw@192.168.1.20:5432/grovefs rebuild
+# reclaim orphans: PG has no in-place form; use remote gc (via the --control-server governance port + an admin key, §15.9)
+grovefs gc --control-server 192.168.1.10:50112 --api-key <id:secret> --data-servers 192.168.1.10:50100 --older-than 24h --apply
+# backup: pg_dump (one shot covers tree + locks + control plane) + rsync -a -H blocks/; HA/PITR delegated to PG streaming replication/pg_basebackup
+```
+
+**Acceptance**: `psql -c '\dn grovefs_v_*'` shows share's hex schema + the client mount command unchanged + after unmount and quiescence the `pg_stat_activity` connections fall back on their own (`--engine-idle-secs` eviction, §15.6).
+
 ---
 
 ## 16. Internal-mechanism overview and extension development (for readers who change the code)
@@ -3314,7 +3372,7 @@ Development reference: `src/` (10 main modules + `remote/` + `backend/`), protoc
 | Govern the same metadata from any machine (using an account key instead of the db password) | `grovefs view --control-server H --api-key K create\|define\|alias\|list\|rm` (with `--meta-store` replaced by `--control-server`, same as above) |
 | Account key (governance port) | `grovefs --home H apikey create --label L --for admin --owner ACCT` (the first key minted on the disk-holding host) / `apikey --control-server H --api-key K list\|create\|revoke\|set-ro\|calls` |
 | Open a remote governance port | `grovefs meta-server --meta-dir D --listen IP:PORT --control-listen IP:PORT` (the second port runs only governance verbs, accepts only admin keys, audits per call) |
-| Metadata service (PostgreSQL backend) | `grovefs meta-server --meta-dir D --listen IP:PORT --meta-store postgres://user:pw@host:5432/db` |
+| Metadata service (PostgreSQL backend) | `grovefs meta-server --meta-store postgres://user:pw@host:5432/db --listen IP:PORT` (under PG `--meta-dir` is optional — the server writes no authoritative data locally) |
 | Mint an access key | `grovefs apikey --meta-dir D create --label L [--for any\|mcp\|mount\|admin] [--owner ACCT] [--view V] [--ro]` (plaintext printed once; `mount` = opens only mount/data plane, `mcp` = opens only the governance interface, `admin` = opens the governance port and admits the prior two, `--owner` required) |
 | List/revoke/audit keys | `grovefs apikey --meta-dir D list [--view V]` (with `--view`, lists only keys that can open V; a pure alias also matches keys bound to the real name) / `revoke --id ID` (exact id or unique prefix; revoking seals the key's **live mounts**) / `calls --limit N` (includes rejected mount connections) |
 

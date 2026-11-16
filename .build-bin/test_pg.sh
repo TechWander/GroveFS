@@ -93,7 +93,7 @@ MP=$!
 wait_port $DATA || { echo "data-server failed"; cat .pgtest/data.log; }
 wait_port $META || { echo "meta-server failed"; cat .pgtest/meta.log; }
 
-cleanup(){ for d in .pgtest/mnt_a .pgtest/mnt_b; do fusermount -u "$d" 2>/dev/null; done; for p in "${RAP:-0}" "${RBP:-0}" "${DP:-0}" "${MP:-0}"; do [ "$p" != 0 ] && kill "$p" 2>/dev/null; done; true; }
+cleanup(){ for d in .pgtest/mnt_a .pgtest/mnt_b .pgtest/mnt_c; do fusermount -u "$d" 2>/dev/null; done; for p in "${RAP:-0}" "${RBP:-0}" "${DP:-0}" "${MP:-0}" "${RAP2:-0}" "${MP2:-0}"; do [ "$p" != 0 ] && kill "$p" 2>/dev/null; done; true; }
 RAP=0; RBP=0
 trap cleanup EXIT
 
@@ -197,6 +197,156 @@ fi
 $Y view --meta-dir .pgtest/home --meta-store "$PGURI" rm --name "$VIEW" --base > .pgtest/rm2.log 2>&1
 [ $? != 0 ] && ok "a second removal is refused (a typo never reads as success)" \
     || bad "a second removal of the same view returned 0"
+
+echo "===== 8) multi-instance registry (file: spec): placement, routing, forget-on-rm ====="
+# A second DATABASE on the same cluster stands in for a second INSTANCE: this
+# section verifies the routing/placement MECHANISM — registry expansion, the
+# startup banner, least-loaded placement at create, a --pg-instance pin, the
+# schema landing on the home the placement picked, a mount served through the
+# SAME meta-server (the client never sees a database URI), and rm forgetting
+# the placement row. Real capacity growth means SEPARATE clusters (PG caps
+# connections per cluster process, not per database) — that is deployment
+# topology, not something a CI box can assert.
+if ! command -v psql >/dev/null; then
+    echo "  INFO: host psql unavailable — multi-instance registry section skipped"
+else
+    TEAMDB="grovefs_team_$(date +%s | tail -c 6)"
+    if ! psql "postgres://grove:grovepw@${PGHOST}:${PGPORT}/postgres" -qtA \
+         -c "CREATE DATABASE $TEAMDB" > /dev/null 2>&1; then
+        echo "  INFO: cannot create the second database — registry section skipped"
+    else
+        TEAMURI="postgres://grove:grovepw@${PGHOST}:${PGPORT}/${TEAMDB}"
+        REG="$PWD/.pgtest/registry.conf"
+        printf '# first entry = control plane\nmain = %s\nteam = %s\n' "$PGURI" "$TEAMURI" > "$REG"
+        FREG="file:$REG"
+        PGQ2(){ psql "postgres://grove:grovepw@${PGHOST}:${PGPORT}/$1" -qtA -c "$2" 2>/dev/null; }
+        VIEW_A="regA$(date +%s)"   # auto-placed: least-loaded, ties -> registry order
+        VIEW_B="regB$(date +%s)"   # pinned to 'team' with --pg-instance
+        META2=127.0.0.1:15098
+        mkdir -p .pgtest/mnt_c .pgtest/mnt_a2
+        # Section 7 killed the data-server; restart it so this section's data-
+        # plane assertions are REAL (a dead server would still pass the write/
+        # read pair out of its own page cache, proving nothing).
+        if [ "${DP:-0}" = 0 ]; then
+            $Y data-server --listen $DATA --data-dir .pgtest/central/data > .pgtest/data2.log 2>&1 &
+            DP=$!
+            wait_port $DATA || { echo "  FAIL: data-server restart failed"; cat .pgtest/data2.log; fail=$((fail+1)); }
+        fi
+        $Y meta-server --listen $META2 --home .pgtest/home --meta-store "$FREG" > .pgtest/meta2.log 2>&1 &
+        MP2=$!
+        wait_port $META2 || { echo "  FAIL: registry meta-server failed"; cat .pgtest/meta2.log; fail=$((fail+1)); }
+        grep -q "2 PG instance(s) \[main, team\]" .pgtest/meta2.log \
+            && ok "startup banner names both registry instances" \
+            || bad "startup banner wrong: $(grep 'PG instance' .pgtest/meta2.log)"
+        grep -q "control plane on 'main'" .pgtest/meta2.log \
+            && ok "control plane pinned to the first registry entry" \
+            || bad "control plane banner missing"
+
+        $Y view --meta-store "$FREG" create --view "regBad$(date +%s)" --pg-instance nosuch > .pgtest/createBad.log 2>&1 \
+            && bad "an unknown --pg-instance was accepted" \
+            || ok "an unknown --pg-instance is refused"
+
+        $Y view --meta-store "$FREG" create --view "$VIEW_A" > .pgtest/createA.log 2>&1 \
+            && ok "registry create (auto placement) succeeded" \
+            || bad "registry create failed: $(cat .pgtest/createA.log)"
+        HOME_A=$(sed -n "s/.*on instance '\([^']*\)'.*/\1/p" .pgtest/createA.log | head -1)
+        DB_A=grovefs; [ "$HOME_A" = team ] && DB_A=$TEAMDB
+        [ -n "$HOME_A" ] && ok "create reported its home: '$HOME_A'" \
+            || bad "create did not report a home: $(cat .pgtest/createA.log)"
+        if [ -n "$HOME_A" ]; then
+            SCHA=$(printf '%s' "$VIEW_A" | od -An -tx1 | tr -d ' \n')
+            chk "$(PGQ2 "$DB_A" "select count(*) from information_schema.schemata where schema_name='grovefs_v_${SCHA}'")" "1" \
+                "auto-placed schema really sits on '$HOME_A'"
+        fi
+
+        $Y view --meta-store "$FREG" create --view "$VIEW_B" --pg-instance team > .pgtest/createB.log 2>&1 \
+            && ok "pinned create (--pg-instance team) succeeded" \
+            || bad "pinned create failed: $(cat .pgtest/createB.log)"
+        grep -q "on instance 'team'" .pgtest/createB.log \
+            && ok "pinned create reports 'team'" \
+            || bad "pinned create home wrong: $(cat .pgtest/createB.log)"
+        SCHB=$(printf '%s' "$VIEW_B" | od -An -tx1 | tr -d ' \n')
+        chk "$(PGQ2 "$TEAMDB" "select count(*) from information_schema.schemata where schema_name='grovefs_v_${SCHB}'")" "1" \
+            "pinned schema sits on the team database"
+
+        $Y --home .pgtest/m1 mount --view "$VIEW_B" --mountpoint .pgtest/mnt_c --meta-server $META2 --data-servers $DATA --foreground > .pgtest/mnt_c.log 2>&1 &
+        RAP2=$!
+        sleep 1.5
+        C=.pgtest/mnt_c
+        [ -d "$C" ] && ok "C mounted on the team instance via the SAME meta-server" \
+            || bad "C not mounted ($(cat .pgtest/mnt_c.log))"
+        T sh -c "printf 'gamma' > $C/in_team" && ok "C writes (team-side data plane)" || bad "C write failed"
+        sync "$C" 2>/dev/null; sleep 1.5
+        chk "$(T cat $C/in_team)" "gamma" "C reads back its own file"
+
+        fusermount -u .pgtest/mnt_c 2>/dev/null; kill $RAP2 2>/dev/null; RAP2=0; sleep 0.5
+        $Y view --meta-dir .pgtest/home --meta-store "$FREG" rm --name "$VIEW_B" --base --data-dir .pgtest/central/data > .pgtest/rmB.log 2>&1
+        RRC=$?
+        chk "$RRC" "0" "view rm on the registry spec succeeds"
+        chk "$(PGQ2 "$TEAMDB" "select count(*) from information_schema.schemata where schema_name='grovefs_v_${SCHB}'")" "0" \
+            "team schema dropped"
+        chk "$(PGQ2 grovefs "select count(*) from grovefs_control.view_placement where view='$VIEW_B'")" "0" \
+            "placement row forgotten on rm"
+
+        echo "  --- move: the cutover mechanism (snapshot -> build -> flip -> retire) ---"
+        SCHA=$(printf '%s' "$VIEW_A" | od -An -tx1 | tr -d ' \n')
+        $Y view --meta-dir .pgtest/home --meta-store "$FREG" move --view "$VIEW_A" --pg-instance team > .pgtest/moveA.log 2>&1
+        RRC=$?
+        chk "$RRC" "0" "view move main->team succeeds"
+        grep -q "instance 'main' -> 'team'" .pgtest/moveA.log \
+            && ok "move reports the cutover" \
+            || bad "move output wrong: $(cat .pgtest/moveA.log)"
+        chk "$(PGQ2 grovefs "select count(*) from information_schema.schemata where schema_name='grovefs_v_${SCHA}'")" "0" \
+            "source schema dropped on main"
+        chk "$(PGQ2 "$TEAMDB" "select count(*) from information_schema.schemata where schema_name='grovefs_v_${SCHA}'")" "1" \
+            "target schema exists on team"
+
+        $Y view --meta-dir .pgtest/home --meta-store "$FREG" move --view "$VIEW_A" --pg-instance team > .pgtest/moveSame.log 2>&1
+        [ $? != 0 ] && ok "a move to the current home is refused" \
+            || bad "a move to the current home was accepted"
+        grep -q "already lives on" .pgtest/moveSame.log \
+            && ok "the refusal names the state" \
+            || bad "refusal unclear: $(cat .pgtest/moveSame.log)"
+
+        $Y view --meta-dir .pgtest/home --meta-store "$FREG" move --view "$VIEW_A" --pg-instance main > .pgtest/moveBack.log 2>&1
+        RRC=$?
+        chk "$RRC" "0" "move back team->main succeeds"
+
+        $Y view --meta-dir .pgtest/home --meta-store "$FREG" move --view "$VIEW_A" --pg-instance team --keep-source > .pgtest/moveKeep.log 2>&1
+        RRC=$?
+        chk "$RRC" "0" "--keep-source move succeeds"
+        chk "$(PGQ2 grovefs "select count(*) from information_schema.schemata where schema_name='grovefs_v_${SCHA}'")" "1" \
+            "kept source schema still on main"
+
+        $Y view --meta-dir .pgtest/home --meta-store "$FREG" move --view "$VIEW_A" --pg-instance main > .pgtest/moveRollback.log 2>&1
+        RRC=$?
+        chk "$RRC" "0" "rollback move reuses the matching copy on main"
+        grep -q "instance 'team' -> 'main'" .pgtest/moveRollback.log \
+            && ok "rollback cutover reported" \
+            || bad "rollback output wrong: $(cat .pgtest/moveRollback.log)"
+
+        $Y --home .pgtest/m1 mount --view "$VIEW_A" --mountpoint .pgtest/mnt_a2 --meta-server $META2 --data-servers $DATA --foreground > .pgtest/mnt_a2.log 2>&1 &
+        RAP3=$!
+        sleep 1.5
+        A2=.pgtest/mnt_a2
+        [ -d "$A2" ] && ok "moved view mounts (placement resolves to main)" \
+            || bad "moved view not mounted ($(cat .pgtest/mnt_a2.log))"
+        T sh -c "printf 'delta' > $A2/after_move" && ok "moved view writes" || bad "moved view write failed"
+        sync "$A2" 2>/dev/null; sleep 1.5
+        chk "$(T cat $A2/after_move)" "delta" "moved view reads back its own write"
+        fusermount -u .pgtest/mnt_a2 2>/dev/null; kill $RAP3 2>/dev/null; RAP3=0; sleep 0.5
+
+        $Y view --meta-dir .pgtest/home --meta-store "$FREG" rm --name "$VIEW_A" --base --data-dir .pgtest/central/data > .pgtest/rmA.log 2>&1
+        RRC=$?
+        chk "$RRC" "0" "registry rm of the auto-placed view succeeds"
+
+        kill $MP2 2>/dev/null; MP2=0
+        psql "postgres://grove:grovepw@${PGHOST}:${PGPORT}/postgres" -qtA \
+            -c "DROP DATABASE $TEAMDB" > /dev/null 2>&1 \
+            && ok "second database dropped" \
+            || echo "  INFO: dropdb $TEAMDB failed (leftover; harmless, next run uses a fresh name)"
+    fi
+fi
 
 # ---- summary ----
 echo

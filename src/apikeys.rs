@@ -379,9 +379,10 @@ impl ApiKeyStore {
     /// backend serves is refused rather than quietly read from a local file.
     pub fn open_for(base: &Path, store_uri: Option<&str>) -> Result<Self, String> {
         match store_uri {
-            Some(u) if u.starts_with("postgres://") || u.starts_with("postgresql://") => {
-                Self::open_pg(u)
-            }
+            // `postgres://…` — or a `file:` instance registry listing them
+            // ([`crate::pg_store::is_pg_store`]); the pool binds the registry's
+            // FIRST entry, where the control schema lives.
+            Some(u) if crate::pg_store::is_pg_store(u) => Self::open_pg(u),
             Some(u) if u.contains("://") => Err(format!(
                 "`{u}` is not a --meta-store scheme GroveFS supports: credentials live in a local SQLite file or PostgreSQL (`postgres://…`)"
             )),

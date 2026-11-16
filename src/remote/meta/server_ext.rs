@@ -121,10 +121,14 @@ impl StoreKind {
     /// Where a view's tree physically lives under this backend, in the one line
     /// an operator needs when the banner's `base` path is misleading — under
     /// SQLite `base` is the tree's home, under the others it is a config-only
-    /// directory holding nothing but view definitions and logs.
+    /// directory holding nothing but view definitions and logs. A `file:`
+    /// registry names itself (a PATH, never a credential).
     pub(crate) fn backend_layout(&self) -> String {
         match self {
             StoreKind::Sqlite => "one db file per view under <base>/meta/".to_string(),
+            StoreKind::Pg(u) if u.starts_with("file:") => format!(
+                "one schema per view in PostgreSQL; instances from registry {u}; <base> holds no trees"
+            ),
             StoreKind::Pg(_) => {
                 "one schema per view in PostgreSQL; <base> holds no trees".to_string()
             }
@@ -515,7 +519,12 @@ impl MetaServer {
     /// * `None` or `"sqlite"` — the default embedded-SQLite backend, one db per
     ///   view under `<base>/meta/`.
     /// * `postgres://user:pw@host:port/db` (or `postgresql://...`) — the
-    ///   PostgreSQL backend, one PG schema per view. Combined with
+    ///   PostgreSQL backend, one PG schema per view. A comma list
+    ///   (`postgres://…,postgres://…`) or a `file:/abs/path` INSTANCE REGISTRY
+    ///   (one `name = postgres://…` per line, the first entry = control plane;
+    ///   keeps credentials out of argv and names instances stably enough for
+    ///   the placement table) spreads view trees across several databases —
+    ///   see [`crate::pg_store::resolve_view_uri`]. Combined with
     ///   `--role/--peer/--witness` at `serve()` time this returns an
     ///   [`io::ErrorKind::InvalidInput`] because GroveFS-native HA snapshot
     ///   shipping (`VACUUM INTO`) is a SQLite-specific mechanism; run PG with
@@ -527,7 +536,7 @@ impl MetaServer {
     /// is the one outcome a `--meta-store` flag must never produce.
     pub fn with_store(mut self, uri: Option<String>) -> Self {
         match uri {
-            Some(u) if u.starts_with("postgres://") || u.starts_with("postgresql://") => {
+            Some(u) if crate::pg_store::is_pg_store(&u) => {
                 self.store = StoreKind::Pg(u);
             }
             Some(u) if u.contains("://") => {
@@ -629,6 +638,25 @@ impl MetaServer {
             self.store.backend_name(),
             self.store.backend_layout()
         );
+        // Instance registry, NAMES only (URIs embed passwords and the banner
+        // lands in the journal): an operator running a multi-instance
+        // deployment must see at startup which instance carries the control
+        // plane and whether every registry line parsed. An unreadable
+        // registry fails the start — a server that cannot answer "where does
+        // view X live" must not come up looking healthy.
+        if let StoreKind::Pg(spec) = &self.store {
+            let book = crate::pg_store::expand_store_spec(spec).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidInput, format!("--meta-store: {e}"))
+            })?;
+            if book.instances.len() > 1 {
+                println!(
+                    "meta-server: {} PG instance(s) [{}] — control plane on '{}', view homes recorded in grovefs_control.view_placement (`view create` balances; `--pg-instance` pins)",
+                    book.instances.len(),
+                    book.names(),
+                    book.control().name
+                );
+            }
+        }
         if self.keys.is_some() {
             // Same honesty line as the data plane: an operator reading the log
             // must know why the next mount got refused.
@@ -1169,6 +1197,9 @@ fn control_dispatch(
             // machine, the tree lives here, and the same `mkdir`/`touch` lines
             // are interpreted by the process that owns the store.
             let manifest = a.get("manifest").and_then(|v| v.as_str());
+            // Same semantics as the CLI's `view create --pg-instance`: an
+            // explicit instance name pins the home, otherwise least-loaded.
+            let pg_instance = a.get("pg_instance").and_then(|v| v.as_str());
             if !crate::layout::valid_view_name(&view) {
                 return Err(format!("invalid view name '{view}'"));
             }
@@ -1184,12 +1215,18 @@ fn control_dispatch(
             }
             let report = match &rt.store {
                 StoreKind::Pg(uri) => {
+                    // Place BEFORE the first open: the home row decides which
+                    // instance every later resolve binds this view to.
+                    let (home, _) = crate::pg_store::place_new_view(uri, &view, pg_instance)
+                        .map_err(|e| format!("view create: {e}"))?;
                     let eng = crate::pg_store::PgEngine::open(uri, &view, false)
                         .map_err(|e| format!("view create: {e}"))?;
                     // A PG deployment's bytes are owned by the data servers, so
                     // there is no local root to write a manifest file into.
                     let note = seed_if_manifest(&eng, None, manifest)?;
-                    format!("created BASE view '{view}' in {uri} (schema grovefs_v_<hex>){note}")
+                    format!(
+                        "created BASE view '{view}' (schema grovefs_v_<hex>) on instance '{home}'{note}"
+                    )
                 }
                 StoreKind::Sqlite => {
                     let mp = rt.base.join("meta").join(format!("{view}.db"));
