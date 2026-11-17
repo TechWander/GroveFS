@@ -155,11 +155,20 @@ impl StorageBackend for PlacementBackend {
     }
 
     fn remove(&self, key: &str) -> io::Result<()> {
-        // GC is idempotent: an object absent at its home root is success.
-        match self.backend(key).remove(key) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            r => r,
+        // GC is idempotent — and it deletes on EVERY root, not just the hashed
+        // home. An out-of-band copy can plant an object on a root other than
+        // `backend(key)` picks; the audit already judged the KEY orphan across
+        // all roots, so any name for it on this node is reclaimable there.
+        // Absent everywhere is still success.
+        let mut res = Ok(());
+        for m in &self.members {
+            match m.backend.remove(key) {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => res = Err(e),
+                Ok(()) => {}
+            }
         }
+        res
     }
 
     fn import_at(&self, key: &str, src: &Path) -> io::Result<Imported> {

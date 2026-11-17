@@ -4808,16 +4808,55 @@ fn print_gc_remote(rep: &serde_json::Value) {
 }
 
 fn run_fusermount(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
-    let bin = if Path::new("/usr/bin/fusermount3").exists() {
+    let status = std::process::Command::new(fusermount_bin()).args(args).status()?;
+    if !status.success() {
+        return Err(format!("{} exited with {status}", fusermount_bin()).into());
+    }
+    Ok(())
+}
+
+fn fusermount_bin() -> &'static str {
+    if Path::new("/usr/bin/fusermount3").exists() {
         "fusermount3"
     } else {
         "fusermount"
-    };
-    let status = std::process::Command::new(bin).args(args).status()?;
-    if !status.success() {
-        return Err(format!("{bin} exited with {status}").into());
     }
-    Ok(())
+}
+
+/// [`run_fusermount`] with a deadline. A plain `fusermount -u` on a busy FUSE
+/// mount BLOCKS in the kernel's `umount()` until every in-flight request is
+/// answered — and a daemon tearing itself down stops answering nothing only
+/// while that helper blocks, so an unbounded wait here is one edge of a real
+/// three-way deadlock (helper blocked on umount ⇄ reverse-inval blocked on
+/// the busy directory ⇄ new ops queued behind it). Bounding the wait turns
+/// the deadlock into a timeout that escalates to the lazy path.
+fn run_fusermount_timeout(
+    args: &[&str],
+    wait: std::time::Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::process::Stdio;
+    let mut child = std::process::Command::new(fusermount_bin())
+        .args(args)
+        .stdin(Stdio::null())
+        .spawn()?;
+    let born = std::time::Instant::now();
+    loop {
+        match child.try_wait()? {
+            Some(status) => {
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(format!("{} exited with {status}", fusermount_bin()).into())
+                }
+            }
+            None if born.elapsed() >= wait => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("timed out after {}ms", wait.as_millis()).into());
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
 }
 
 // ---- Graceful termination (signal handling) --------------------------------
@@ -4893,23 +4932,53 @@ fn wait_for_termination() {
 /// operation, so the kernel is still finishing that open when we ask for the
 /// umount and a plain umount answers `EBUSY`. Stopping there would leave a live
 /// mountpoint whose backend is gone (and exiting anyway would leave the classic
-/// stale `Transport endpoint is not connected`), so: retry briefly, then `-u -z`,
-/// which detaches the mountpoint even while busy and still ends the session. If
-/// even that fails we keep serving — a mount that answers with an error is
-/// recoverable by an operator, a dead endpoint is not.
+/// stale `Transport endpoint is not connected`), so: retry (each attempt
+/// TIME-BOUNDED — a busy umount does not merely answer EBUSY, it can block
+/// forever inside the syscall, which is how a revoke landing on a mount under
+/// live traffic once deadlocked its own teardown), then `-u -z`, which detaches
+/// the mountpoint even while busy and still ends the session. If even the lazy
+/// detach wedges (or errors), a detached watchdog repeats it — the helper's
+/// blocked `umount()` completes on its own once the queued requests drain, so
+/// re-asking without owning the session's exit path guarantees the mountpoint
+/// eventually goes down instead of hanging the escalation here. If nothing
+/// works we keep serving — a mount that answers with an error is recoverable by
+/// an operator, a dead endpoint is not.
 fn spawn_term_unmounter(mountpoint: PathBuf) {
     std::thread::spawn(move || {
         install_termination_handlers();
         wait_for_termination();
         let mp = mountpoint.to_string_lossy();
-        for attempt in 0..5 {
-            if attempt > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(200));
-            }
-            if run_fusermount(&["-u", &mp]).is_ok() {
-                return;
-            }
+        // Go straight to the lazy detach. A plain `fusermount -u` is NOT a
+        // safe first try on a terminating daemon: on a busy mountpoint its
+        // `umount()` BLOCKS in the kernel until every queued request drains —
+        // and the drain needs this very call to return, so a revoke landing
+        // under live traffic once deadlocked its own teardown (helper in
+        // `umount()` ⇄ reverse-inval on the busy directory ⇄ new ops queued
+        // behind it). Killing a blocked helper is worse (it can strand
+        // fusermount's mount lock). `umount2(MNT_DETACH)` never blocks on
+        // busy refs and the kernel aborts the connection's pending requests
+        // once the last opener goes away, which the watchdog below confirms.
+        if run_fusermount_timeout(&["-u", "-z", &mp], std::time::Duration::from_secs(2)).is_err() {
+            let mp = mountpoint.clone();
+            std::thread::spawn(move || {
+                let mp = mp.to_string_lossy().into_owned();
+                for _ in 0..30 {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    let held = std::fs::read_to_string("/proc/mounts")
+                        .map(|m| {
+                            m.lines()
+                                .any(|l| l.split_whitespace().nth(1) == Some(mp.as_str()))
+                        })
+                        .unwrap_or(false);
+                    if !held {
+                        break;
+                    }
+                    let _ = run_fusermount_timeout(
+                        &["-u", "-z", &mp],
+                        std::time::Duration::from_secs(2),
+                    );
+                }
+            });
         }
-        let _ = run_fusermount(&["-u", "-z", &mp]);
     });
 }

@@ -197,24 +197,11 @@ fn chunk_base(key: &str) -> Option<&str> {
     Some(base)
 }
 
-/// `s<N>:<stripe>:<base>` -> `Some(base)`, matching
-/// `backend::sharded::parse_layout` exactly (N > 0, stripe > 0).
-fn layout_base(key: &str) -> Option<&str> {
-    let rest = key.strip_prefix('s')?;
-    let (n, tail) = rest.split_once(':')?;
-    let (stripe, base) = tail.split_once(':')?;
-    if n.is_empty()
-        || !n.bytes().all(|b| b.is_ascii_digit())
-        || stripe.is_empty()
-        || !stripe.bytes().all(|b| b.is_ascii_digit())
-        || base.is_empty()
-    {
-        return None;
-    }
-    if n.parse::<usize>().ok()? == 0 || stripe.parse::<u64>().ok()? == 0 {
-        return None;
-    }
-    Some(base)
+/// `s<N>:<stripe>[:<fp>]:<base>` -> `Some(base)`. Delegates to the ONE grammar
+/// reader in `backend::sharded` — a local re-parse here once silently missed
+/// the identity-pinned 4-field form and made every striped chunk look orphaned.
+fn layout_base(key: &str) -> Option<String> {
+    crate::backend::sharded::layout_base(key)
 }
 
 /// Every physical view tree kept beside the ledger (sorted, control dbs out).
@@ -258,7 +245,7 @@ impl Refs {
         let mut set = HashSet::new();
         for k in keys {
             if let Some(base) = layout_base(&k) {
-                striped.insert(base.to_string());
+                striped.insert(base);
             }
             set.insert(k);
         }
@@ -308,7 +295,7 @@ fn collect_refs(meta_root: &Path) -> Result<Refs, String> {
             .map_err(|e| format!("cannot read view tree {}: {e}", p.display()))?;
         for dr in rows.flatten() {
             if let Some(base) = layout_base(&dr) {
-                striped.insert(base.to_string());
+                striped.insert(base);
             }
             keys.insert(dr);
         }
@@ -335,7 +322,7 @@ impl Ledger {
         let mut set = HashSet::new();
         for k in keys {
             if let Some(base) = layout_base(&k) {
-                striped.insert(base.to_string());
+                striped.insert(base);
             }
             set.insert(k);
         }
@@ -374,7 +361,7 @@ fn collect_ledger(meta_root: &Path) -> Result<Ledger, String> {
         .map_err(|e| format!("cannot read the ledger {}: {e}", p.display()))?;
     for dr in rows.flatten() {
         if let Some(base) = layout_base(&dr) {
-            striped.insert(base.to_string());
+            striped.insert(base);
         }
         keys.insert(dr);
     }
@@ -695,8 +682,20 @@ mod tests {
 
     #[test]
     fn key_shapes_match_the_sharded_backend() {
-        assert_eq!(layout_base("s2:1024:abcd-uuid"), Some("abcd-uuid"));
-        assert_eq!(layout_base("s1:1:a:b"), Some("a:b"));
+        assert_eq!(layout_base("s2:1024:abcd-uuid"), Some("abcd-uuid".to_string()));
+        // The identity-pinned 4-field form (a `--member-id` stripe): the GC side
+        // must read the SAME base the data plane names its chunk files by, or
+        // every striped chunk of such a deployment looks orphaned (the drift a
+        // local re-parse once caused).
+        assert_eq!(
+            layout_base("s2:16777216:692558b056101a44:f0739fca-5dfd-4b92-8ed0-2995f070dcdc"),
+            Some("f0739fca-5dfd-4b92-8ed0-2995f070dcdc".to_string())
+        );
+        assert_eq!(
+            layout_base("s1:1:a:b"),
+            Some("b".to_string()),
+            "a single hex digit is a valid fingerprint: 4-field identity-pinned"
+        );
         assert_eq!(layout_base("s0:1:x"), None, "N=0 is not a layout");
         assert_eq!(layout_base("s2:0:x"), None, "stripe=0 is not a layout");
         assert_eq!(layout_base("s2:x:y"), None);

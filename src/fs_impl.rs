@@ -153,6 +153,16 @@ pub struct GroveFS {
     /// Last second the write path stamped per inode, for the `write()` gate below
     /// (epoch seconds, the resolution the metadata stores keep).
     last_write_touch: RwLock<std::collections::HashMap<u64, u64>>,
+    /// Inodes THIS mount has written at least one byte to, not yet released.
+    /// Drives the authoritative close-time invalidation in `release`: the
+    /// steady-append `touch_mtime` is rate-gated (~1/s) to cap metadata writes,
+    /// so the last size-growing flush of a write can land between two gates and
+    /// — because a peer under `FUSE_WRITEBACK_CACHE` refreshes its cached
+    /// `i_size` ONLY on an `inval_inode` push, never on the attr TTL — leave that
+    /// peer permanently truncated at the last-touched length. One unconditional
+    /// push at last-close makes the committed size visible; keyed by write
+    /// activity (a read-only open never enters this set, so it costs no RPC).
+    written_inos: RwLock<std::collections::HashSet<u64>>,
     /// Group-commit queue for `CREATE` (see `drain_creates`): with the local
     /// single-writer engine every create otherwise pays its own commit, so
     /// concurrent creates would only queue behind the same serialized write and
@@ -289,6 +299,7 @@ impl GroveFS {
             backend,
             ino_to_key: RwLock::new(std::collections::HashMap::new()),
             last_write_touch: RwLock::new(std::collections::HashMap::new()),
+            written_inos: RwLock::new(std::collections::HashSet::new()),
             create_q: Mutex::new(Vec::new()),
             create_leader: std::sync::atomic::AtomicBool::new(false),
             batch_creates,
@@ -1446,6 +1457,16 @@ impl fuser::Filesystem for GroveFS {
         // require immediacy.
         {
             let _t = stats::start(stats::Stage::WriteTouchMtime);
+            // Record that THIS mount dirtied the inode, so `release` can push a
+            // final invalidation even when every append write below was gated.
+            // Read-guarded: a steady append to an already-recorded inode takes a
+            // SHARED lock, not the exclusive one, so a streaming writer does not
+            // serialize every mount thread on this map an extra time (on top of
+            // `should_touch_write`). The first write to an inode still takes the
+            // write lock; the set is otherwise empty for read-only files.
+            if !self.written_inos.read().contains(&ino.0) {
+                self.written_inos.write().insert(ino.0);
+            }
             if self.should_touch_write(ino.0) {
                 self.meta.touch_mtime(ino.0 as i64);
             }
@@ -1476,13 +1497,31 @@ impl fuser::Filesystem for GroveFS {
     fn release(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
         _flags: OpenFlags,
         lock_owner: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        // Authoritative close-time invalidation for THIS mount's writes: the
+        // steady-append `touch_mtime` is rate-gated (~1/s), so the final bytes of
+        // a write can land after the last pushed event. A peer under
+        // `FUSE_WRITEBACK_CACHE` refreshes its cached `i_size` only on an
+        // `inval_inode` push (never on the attr TTL), so without this a peer that
+        // cached the file mid-write stays truncated at the last-touched length
+        // forever. One ungated `touch_mtime` at last-close (which broadcasts
+        // `Event::Inode`) publishes the committed size. Drained from the set so a
+        // file written, closed, reopened and read costs no extra RPC. Read-guarded
+        // so a read-only close (never written on this mount) takes only a SHARED
+        // lock — read-heavy mounts open/close constantly and must not serialize on
+        // this map's exclusive lock. A concurrent double-release is safe: only the
+        // `remove` that actually returns `true` pushes.
+        if self.written_inos.read().contains(&ino.0)
+            && self.written_inos.write().remove(&ino.0)
+        {
+            self.meta.touch_mtime(ino.0 as i64);
+        }
         // Intentionally keep the ino->key entry: with writeback cache the kernel
         // may still flush this inode's dirty pages after close. `forget` prunes it
         // once the inode is truly dead.
@@ -1721,6 +1760,7 @@ impl fuser::Filesystem for GroveFS {
     fn forget(&self, _req: &Request, ino: INodeNo, _nlookup: u64) {
         self.ino_to_key.write().remove(&ino.0);
         self.last_write_touch.write().remove(&ino.0);
+        self.written_inos.write().remove(&ino.0);
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {

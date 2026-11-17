@@ -1921,20 +1921,18 @@ fn gc_audit(
                 rec.within_grace += 1;
                 continue;
             }
-            // The key could have landed on any of the roots; the first server
-            // that owns (or no longer has) it decides. Held keys never get here.
-            let (mut gone, mut last) = (false, String::new());
+            // The key could have landed on any server AND any of its roots; ask
+            // EVERY backend to drop it — a server that has it reclaims it, one
+            // that has not answers "already gone". An Ok from the FIRST server
+            // alone proved nothing about the others (and their roots), which is
+            // exactly how a planted mis-rooted orphan stayed on disk while the
+            // report claimed it freed. Held keys never get here.
+            let mut last = String::new();
+            let mut gone = true;
             for be in &backends {
-                match be.remove(&c.key) {
-                    Ok(()) => {
-                        gone = true;
-                        break;
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        gone = true;
-                        break;
-                    }
-                    Err(e) => last = e.to_string(),
+                if let Err(e) = be.remove(&c.key) {
+                    gone = false;
+                    last = e.to_string();
                 }
             }
             if gone {

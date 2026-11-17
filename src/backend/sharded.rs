@@ -130,6 +130,14 @@ fn parse_layout(key: &str) -> Option<Layout> {
     })
 }
 
+/// The physical object base carried by a layouted key (`s<N>:<stripe>[:<fp>]:<base>`),
+/// or `None` for an unstriped key. This is the ONE grammar reader for the whole
+/// crate: the GC audit ([`crate::gc`]) resolves tree-side keys through it so the
+/// identity-pinned 4-field form can never drift out of a second hand-rolled parser.
+pub(crate) fn layout_base(key: &str) -> Option<String> {
+    parse_layout(key).map(|l| l.base)
+}
+
 impl ShardedBackend {
     /// Build a stripe over `servers`. Placement is IDENTITY-pinned when every
     /// member reports a distinct [`StorageBackend::placement_key`] (a remote
