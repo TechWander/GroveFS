@@ -1,0 +1,733 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GroveFS 部署与命令实操演示</title>
+<style>
+:root{
+  --bg:#fafaf7; --panel:#ffffff; --ink:#1d2530; --ink2:#5b6572; --line:#e3e1d8;
+  --accent:#0b7a5e; --accent2:#0a5c8a; --warn-bg:#fff7e6; --warn-line:#e6c26a;
+  --code-bg:#101820; --code-ink:#d7e2ea; --code-dim:#7d8c99;
+  --ok-bg:#eef7f2; --tag-bg:#eef1f5;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#14171c; --panel:#1b2028; --ink:#d8dde3; --ink2:#98a2ad; --line:#2b323c;
+    --accent:#3ecf9e; --accent2:#5db3e8; --warn-bg:#2a2415; --warn-line:#8a7433;
+    --code-bg:#0c1116; --code-ink:#c9d6df; --code-dim:#6b7885;
+    --ok-bg:#16241e; --tag-bg:#232a33;
+  }
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:15px/1.75 "PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC",system-ui,sans-serif}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+.layout{display:flex;max-width:1560px;margin:0 auto}
+nav.toc{position:sticky;top:0;align-self:flex-start;width:300px;flex:none;
+  max-height:100vh;overflow-y:auto;padding:28px 20px 60px;border-right:1px solid var(--line);background:var(--panel)}
+nav.toc h1{font-size:17px;margin:0 0 2px}
+nav.toc .sub{font-size:12px;color:var(--ink2);margin-bottom:18px}
+nav.toc h2{font-size:13px;margin:22px 0 6px;color:var(--ink2);letter-spacing:.08em}
+nav.toc ol{list-style:none;margin:0;padding:0}
+nav.toc li{margin:3px 0}
+nav.toc a{display:block;font-size:13.5px;color:var(--ink);padding:3px 8px;border-radius:6px}
+nav.toc a:hover{background:var(--tag-bg);text-decoration:none}
+nav.toc a.l2{padding-left:22px;color:var(--ink2);font-size:13px}
+main{flex:1;min-width:0;padding:40px 48px 100px;max-width:1010px}
+header.hero h1{font-size:30px;margin:6px 0 10px;line-height:1.3}
+header.hero p{color:var(--ink2);max-width:70em}
+.badges{margin:14px 0 6px;display:flex;flex-wrap:wrap;gap:8px}
+.badges span{background:var(--tag-bg);border:1px solid var(--line);border-radius:999px;
+  padding:3px 12px;font-size:12.5px;color:var(--ink2)}
+section{margin:52px 0 0}
+h2.part{font-size:23px;border-top:3px solid var(--accent);padding-top:16px;margin-top:64px}
+h3{font-size:19px;margin:44px 0 10px}
+h4{font-size:15.5px;margin:28px 0 8px;color:var(--accent2)}
+p{margin:10px 0}
+.lead{font-size:14px;color:var(--ink2);border-left:3px solid var(--line);padding:2px 0 2px 14px;margin:14px 0}
+pre{background:var(--code-bg);color:var(--code-ink);border-radius:10px;padding:14px 16px;
+  overflow-x:auto;font:12.5px/1.65 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;margin:12px 0}
+pre .cmt{color:var(--code-dim)}
+pre .out{color:#9fc4a2}
+code{background:var(--tag-bg);border-radius:5px;padding:1px 6px;font:0.92em ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+pre code{background:none;padding:0;font-size:inherit}
+table{border-collapse:collapse;width:100%;margin:14px 0;font-size:13.5px}
+th,td{border:1px solid var(--line);padding:7px 11px;text-align:left;vertical-align:top}
+th{background:var(--tag-bg);font-weight:600}
+tr:nth-child(even) td{background:color-mix(in srgb,var(--tag-bg) 45%,transparent)}
+.warn{background:var(--warn-bg);border:1px solid var(--warn-line);border-radius:10px;padding:10px 16px;margin:14px 0}
+.ok{background:var(--ok-bg);border:1px solid var(--accent);border-radius:10px;padding:10px 16px;margin:14px 0}
+.scene{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--accent2);
+  border-radius:10px;padding:12px 18px;margin:16px 0}
+.scene b{color:var(--accent2)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media (max-width:960px){.grid2{grid-template-columns:1fr}}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 16px;margin:10px 0}
+.card h5{margin:2px 0 8px;font-size:14px}
+footer{border-top:1px solid var(--line);margin-top:80px;padding-top:20px;color:var(--ink2);font-size:13px}
+.chnav{display:flex;justify-content:space-between;margin-top:34px;font-size:13.5px;color:var(--ink2)}
+@media (max-width:1100px){
+  .layout{flex-direction:column}
+  nav.toc{position:relative;width:auto;max-height:none;border-right:none;border-bottom:1px solid var(--line)}
+  main{padding:30px 22px 80px}
+}
+</style>
+</head>
+<body>
+<div class="layout">
+<nav class="toc">
+  <h1>GroveFS 部署与命令实操</h1>
+  <div class="sub">三套部署 · 三套按功能划分的命令演示</div>
+  <h2>第一部分 · 部署方法</h2>
+  <ol>
+    <li><a href="#s11">1.1 本机部署（单机单盘）</a></li>
+    <li><a href="#s12">1.2 SQLite 分布式部署</a></li>
+    <li><a href="#s13">1.3 PostgreSQL 分布式部署</a></li>
+  </ol>
+  <h2>第二部分 · 命令演示</h2>
+  <ol>
+    <li><a href="#s21">2.1 本机部署 · 命令演示</a></li>
+    <li><a class="l2" href="#s21-view">2.1.1 建基视图</a></li>
+    <li><a class="l2" href="#s21-mount">2.1.2 挂载与读写</a></li>
+    <li><a class="l2" href="#s21-kinds">2.1.3 四种视图</a></li>
+    <li><a class="l2" href="#s21-auth">2.1.4 授权边界</a></li>
+    <li><a class="l2" href="#s21-conf">2.1.5 配置文件</a></li>
+    <li><a class="l2" href="#s21-ops">2.1.6 清点与删除</a></li>
+    <li><a href="#s22">2.2 SQLite 分布式 · 命令演示</a></li>
+    <li><a class="l2" href="#s22-serve">2.2.1 起服务</a></li>
+    <li><a class="l2" href="#s22-view">2.2.2 建基视图</a></li>
+    <li><a class="l2" href="#s22-auth">2.2.3 授权</a></li>
+    <li><a class="l2" href="#s22-kinds">2.2.4 四种视图</a></li>
+    <li><a class="l2" href="#s22-conf">2.2.5 配置文件</a></li>
+    <li><a class="l2" href="#s22-ops">2.2.6 运维与验收</a></li>
+    <li><a href="#s23">2.3 PG 分布式 · 命令演示</a></li>
+    <li><a class="l2" href="#s23-pg">2.3.1 准备 PG</a></li>
+    <li><a class="l2" href="#s23-serve">2.3.2 起服务</a></li>
+    <li><a class="l2" href="#s23-view">2.3.3 建基视图</a></li>
+    <li><a class="l2" href="#s23-auth">2.3.4 授权</a></li>
+    <li><a class="l2" href="#s23-kinds">2.3.5 四种视图</a></li>
+    <li><a class="l2" href="#s23-scale">2.3.6 多实例扩容与搬家</a></li>
+    <li><a class="l2" href="#s23-ops">2.3.7 运维与巡检</a></li>
+  </ol>
+</nav>
+
+<main>
+<header class="hero">
+  <h1>GroveFS 部署与命令实操演示</h1>
+  <p>本页是<b>面向上手实操</b>的独立教程：第一部分给出三套部署的拓扑与步骤（每套都先设定好节点数、硬盘数等示例环境，命令可直接照抄后改地址）；第二部分在每套部署上按功能划分演示全部常用命令——建基视图、授权、四种视图（基 / 派生 / 别名 / fork）的创建与验证、配置文件写法、日常运维。</p>
+  <div class="badges">
+    <span>本机部署 = 1 台机器 0 个服务进程</span>
+    <span>SQLite 分布式 = 1 台存储机 + N 台客户机</span>
+    <span>PG 分布式 = 元数据进 PostgreSQL</span>
+    <span>示例环境均为虚构内网 10.0.0.x</span>
+  </div>
+  <p class="lead">约定：下文 <code>$G</code> 指 GroveFS 可执行文件（<code>./target/release/grovefs</code> 或安装后的 <code>grovefs</code>）。三套部署使用<b>同一个二进制</b>，差别只在「元数据存哪、谁起服务」。端口约定：数据服务 <code>50100</code>、元数据服务 <code>50110</code>。所有示例 IP 为虚构内网地址，照抄时替换为自己的。</p>
+</header>
+
+<!-- ============================================================ 第一部分 -->
+<section id="p1">
+<h2 class="part">第一部分 · 三套部署方法</h2>
+<p>三套部署的差别，一句话说清：<b>本机部署</b>连服务进程都没有，一个命令挂载即可；<b>SQLite 分布式</b>把存储与元数据拆成两个中心服务（data-server + meta-server），客户机远程挂载、本地什么都不落；<b>PG 分布式</b>只改 meta-server 一处——把元数据从本地 SQLite 文件换成 PostgreSQL 库，客户机挂载命令一字不差。</p>
+
+<h3 id="s11">1.1 本机部署（单机单盘，无服务进程）</h3>
+<div class="scene">
+  <b>示例环境</b>：一台开发机（8 核 / 32GB / 1TB NVMe），操作系统 Linux，已安装 GroveFS 二进制。数据与元数据全部落在同一块盘的 <code>/data/gfs</code> 目录下。<b>不需要任何服务进程、不需要网络端口、不需要数据库</b>——元数据是内嵌 SQLite（编译进二进制，零外部依赖），字节直接写本地对象目录。
+</div>
+<p>存储根（<code>--home</code>）的内部结构由 GroveFS 自动维护，无需预建：</p>
+<pre><code>/data/gfs/
+├─ blocks/&lt;2hex&gt;/&lt;key&gt;   <span class="cmt"># 文件字节：按 key 哈希分 256 个桶目录，key 是 UUID</span>
+└─ meta/
+   ├─ &lt;视图名&gt;.db         <span class="cmt"># 每个基视图一棵独立 SQLite 树（node/ctrl/locks 三张表）</span>
+   ├─ refs.db             <span class="cmt"># 跨视图引用账本：谁还在引用哪个对象（删除回收的依据）</span>
+   └─ views/&lt;名&gt;.layout   <span class="cmt"># 派生/别名/fork 的定义文本（纯文本，可手改可 git diff）</span></code></pre>
+
+<h4>部署步骤（两条命令即成）</h4>
+<pre><code><span class="cmt"># 1) 建基视图（显式创建——挂载从不自动建树，名字不存在直接拒绝，无开关）</span>
+$G --home /data/gfs init --view team
+
+<span class="cmt"># 2) 挂载（默认转后台：挂载点就绪即返回；要前台调试加 --foreground，Ctrl-C 即卸载）</span>
+$G --home /data/gfs mount --view team -m /mnt/team</code></pre>
+
+<div class="ok">验收：挂载命令返回一行摘要（含 pid 与日志路径）；<code>mkdir -p /mnt/team/docs && echo hello > /mnt/team/docs/a.txt && cat /mnt/team/docs/a.txt</code> 输出 <code>hello</code>；<code>ls /data/gfs/blocks | head</code> 能看到至少一个对象文件——字节确实落在存储根，不在挂载点。卸载用 <code>$G umount -m /mnt/team</code>（同时收掉后台挂载进程，别用系统 <code>umount</code> 命令）。</div>
+
+<p>本机模式的特点：</p>
+<table>
+  <tr><th>维度</th><th>本机部署的行为</th></tr>
+  <tr><td>元数据</td><td>内嵌 SQLite，一视图一个 <code>meta/&lt;名&gt;.db</code> 文件，无需安装任何数据库</td></tr>
+  <tr><td>写入模型</td><td>单写者（同一时刻一个写事务）；读走 WAL 可并行</td></tr>
+  <tr><td>准入</td><td>没有 token、没有 API key 门——挂载点权限就是 OS 权限，谁有挂载点访问权谁就能读写</td></tr>
+  <tr><td>多用户</td><td>任意多个基视图各自一棵树互不可见；派生/别名/fork 在本机同样全部可用（见 2.1.3）</td></tr>
+  <tr><td>边界</td><td>单机、单写者；要跨机器共享一棵树，进入 1.2 / 1.3 的分布式部署</td></tr>
+</table>
+
+<h3 id="s12">1.2 SQLite 作为后端的分布式部署</h3>
+<div class="scene">
+  <b>示例环境</b>：共 3 台机器的内网（10.0.0.0/24）。<br>
+  · <b>node1</b>（10.0.0.5）——存储中心：4 块 8TB HDD（系统盘之外组一个数据盘挂 <code>/data/cluster</code>），跑 <b>data-server</b>（管字节）+ <b>meta-server</b>（管元数据），两个服务同机同盘起步；<br>
+  · <b>node2</b>（10.0.0.6）——客户机 A：读写挂载，不落任何数据；<br>
+  · <b>node3</b>（10.0.0.7）——客户机 B：读写/只读挂载，不落任何数据。<br>
+  后置扩展（可选）：加 <b>node0</b>（10.0.0.4）做 meta-server 主备 HA；或让 node0 兼任第二台 data-server 做条带聚合。
+</div>
+<pre><code>          ┌────────────── node1 (10.0.0.5) 存储中心 ──────────────┐
+          │  /data/cluster（4×8TB 数据盘）                        │
+          │   ├─ blocks/   ← data-server :50100 收到的字节         │
+          │   └─ meta/     ← meta-server :50110 托管的权威视图树    │
+          └──────────────┬───────────────────────┬───────────────┘
+                 50100+50110 │                       │ 50100+50110
+                   ┌─────────┴─────────┐   ┌─────────┴─────────┐
+                   │ node2 10.0.0.6    │   │ node3 10.0.0.7    │
+                   │ 客户机 A（读写）    │   │ 客户机 B（读写/RO） │
+                   │ 本地不落盘         │   │ 本地不落盘         │
+                   └───────────────────┘   └───────────────────┘</code></pre>
+
+<p>多机共享一棵树的能力来自「同一个 meta-server + 同一个 --view」，与后端无关——<b>默认 SQLite 已经足够</b>，PG 不是分布式的前提。拆开的两个服务各管一摊：</p>
+<table>
+  <tr><th>服务</th><th>职责</th><th>关键参数</th></tr>
+  <tr><td><code>data-server</code></td><td>收发文件字节，把物理对象写进本节点硬盘目录</td><td><code>--listen</code>、<code>--data-dir</code>、<code>--token</code>、<code>--require-api-key</code>（配 <code>--meta-dir</code> 读注册表）</td></tr>
+  <tr><td><code>meta-server</code></td><td>托管每视图权威树，多客户机挂同一 <code>--view</code> 即共享同一棵；负责锁仲裁、失效推送、API key 门</td><td><code>--listen</code>、<code>--meta-dir</code>（元数据根，视图库在其 <code>meta/</code> 下）、<code>--token</code>、<code>--require-api-key</code>、HA 时 <code>--role/--peer/--witness</code></td></tr>
+  <tr><td>客户机 <code>mount</code></td><td>远程挂载：<b>不需要 <code>--home</code></b>，本地什么都不落</td><td><code>--view</code>、<code>--meta-server</code>、<code>--data-servers</code>、<code>--token</code>、<code>--api-key</code>、<code>--ro</code></td></tr>
+</table>
+
+<h4>部署步骤（node1 上三条命令起步）</h4>
+<pre><code><span class="cmt"># 0) 生成共享 token（强烈建议；三台机器用同一个值）</span>
+TOK=$(head -c 24 /dev/urandom | base64)
+
+<span class="cmt"># 1) 先建基视图，再起服务（视图只能显式创建——不建就挂会被拒，且什么都不写）</span>
+$G init --view team --home /data/cluster
+
+<span class="cmt"># 2) 数据服务：把对象存到本节点数据盘</span>
+$G data-server --listen 0.0.0.0:50100 --data-dir /data/cluster --token "$TOK"
+
+<span class="cmt"># 3) 元数据服务：托管权威视图树</span>
+$G meta-server --meta-dir /data/cluster --listen 0.0.0.0:50110 --token "$TOK"</code></pre>
+<p class="cmt">生产环境把两个服务写成 systemd 常驻单元（<code>grovefs-data.service</code> / <code>grovefs-meta.service</code>，token 走 <code>EnvironmentFile</code> 指向的 root-only env 文件，不进命令行），并只对内网网段开放 50100/50110 两个端口。</p>
+
+<h4>客户机挂载（node2 / node3）</h4>
+<pre><code><span class="cmt"># 同一份 token；远程挂载不需要 --home，本地什么都不落</span>
+export GROVEFS_TOKEN=&lt;与 node1 相同的串&gt;
+$G mount --view team -m /mnt/team \
+   --data-servers 10.0.0.5:50100 --meta-server 10.0.0.5:50110          <span class="cmt"># 读写</span>
+$G mount --view team -m /mnt/team_ro \
+   --data-servers 10.0.0.5:50100 --meta-server 10.0.0.5:50110 --ro     <span class="cmt"># 本机只读（服务端硬只读另见 2.2.3）</span></code></pre>
+
+<div class="ok">验收（node2 写、node3 立刻读）：node2 上 <code>echo x > /mnt/team/t.txt</code>，node3 上 <code>cat /mnt/team/t.txt</code> 在 2 秒内可见——失效推送是实时的，无需轮询、无需重挂。分布式锁也跨机生效：<code>flock -x /mnt/team/lk -c 'sleep 30'</code> 期间，另一台 <code>flock -x /mnt/team/lk -c 'echo got'</code> 会等前一个退出才打印。</div>
+
+<h4>可选扩展 A：meta-server 主备 HA（加 node0）</h4>
+<pre><code><span class="cmt"># node1（10.0.0.5）：主，读写，周期推快照给备；两节点各用独立的 --meta-dir</span>
+$G meta-server --meta-dir /data/cluster --listen 10.0.0.5:50110 \
+     --role primary --peer 10.0.0.4:50111 --token "$TOK"
+<span class="cmt"># node0（10.0.0.4）：备，只读服务，主心跳丢失后自动提升</span>
+$G meta-server --meta-dir /data/ha     --listen 10.0.0.4:50111 \
+     --role standby --peer 10.0.0.5:50110 --token "$TOK"
+
+<span class="cmt"># 客户端把两个地址都写进 --meta-server 故障转移列表，主挂自动切备</span>
+$G mount --view team --meta-server 10.0.0.5:50110,10.0.0.4:50111 \
+     --data-servers 10.0.0.5:50100 -m /mnt/team</code></pre>
+<p class="cmt">默认异步复制 RPO≈500ms（极端故障丢最后半秒内的写）；加 <code>--sync-repl</code> 把 RPO 降到 0（写返回前等备落盘 ACK）；加 <code>--witness &lt;data-server 仲裁者列表&gt;</code>（推荐奇数个）获得真 fencing：组不成多数派租约时冻结写而非双写。诚实边界：严格两节点不配 witness 时无法防脑裂，这是 CAP 硬边界。</p>
+
+<h4>可选扩展 B：多 data-server 条带（聚合容量）</h4>
+<pre><code><span class="cmt"># 让 node0（10.0.0.4）也跑一台 data-server，配稳定成员 id（消除列表顺序隐患）</span>
+$G data-server --listen 0.0.0.0:50100 --data-dir /data/cluster2 --member-id 2 --token "$TOK"
+<span class="cmt"># 客户端逗号分隔多个地址 → 大文件（≥16MiB）自动确定性条带；小文件只落一台</span>
+$G mount --view team --meta-server 10.0.0.5:50110 \
+     --data-servers 10.0.0.5:50100,10.0.0.4:50100 -m /mnt/team</code></pre>
+
+<h3 id="s13">1.3 PostgreSQL 作为后端的分布式部署</h3>
+<div class="scene">
+  <b>示例环境</b>：共 4 台机器。<br>
+  · <b>db1</b>（10.0.0.9）——独立 PG 服务器：16 核 / 64GB / 2TB NVMe，PostgreSQL 16，<code>max_connections=200</code>；只跑数据库，<b>客户机与服务机都不装 PG</b>；<br>
+  · <b>node1</b>（10.0.0.5）——存储中心：同 1.2（4×8TB 数据盘），跑 data-server + meta-server；meta-server 改连 db1，本地不再落任何权威元数据；<br>
+  · <b>node2</b>（10.0.0.6）/ <b>node3</b>（10.0.0.7）——客户机，同 1.2。<br>
+  后置扩展（可选）：加 <b>db2</b>（10.0.0.11）做第二个 PG 实例，走「实例注册表 + 视图放置」扩容（2.3.6 演示）。
+</div>
+<pre><code>  ┌──────────── db1 (10.0.0.9) ────────────┐
+  │  PostgreSQL 16 · grovefs 库             │
+  │   grovefs_v_&lt;hex(视图名)&gt;  ← 一视图一个 schema │
+  │   grovefs_refs             ← 跨视图引用账本（共享表）   │
+  │   grovefs_control          ← 控制面（key/定义/放置表/审计）│
+  └──────────────┬─────────────────────────┘
+                 │ 5432（只有 node1 的 meta-server 连它）
+  ┌──────────────┴── node1 (10.0.0.5) ──────────┐
+  │  data-server :50100 → /data/cluster/blocks/  │   ← 字节仍在本地数据盘
+  │  meta-server  :50110 ── PG 后端（--meta-store）│   ← 元数据在 db1
+  └──────────────┬───────────────┬──────────────┘
+        ┌────────┴──────┐  ┌─────┴─────────┐
+        │ node2 10.0.0.6│  │ node3 10.0.0.7│   ← 客户机：命令与 SQLite 档一字不差
+        └───────────────┘  └───────────────┘</code></pre>
+
+<p>PG 档的本质：<b>只改 meta-server 一处</b>——把权威树从本地 SQLite 文件换成 PG schema（每视图一个 <code>grovefs_v_&lt;hex(视图名)&gt;</code>），控制面（API key、视图定义、放置表、审计）也跟着进库。客户机只说 GroveFS 的 TCP 帧协议，完全不感知后端是什么。何时值得上 PG：要 8 路并行写（实测 ~4.6k vs SQLite ~0.8–1.1k ops/s），或想把备份 / PITR / 高可用交给数据库自身。</p>
+
+<h4>部署步骤</h4>
+<pre><code><span class="cmt"># ===== db1 上（一次性）：建角色与库，最小权限 =====</span>
+sudo -u postgres psql -c "CREATE ROLE grove LOGIN PASSWORD '换成强口令';"
+sudo -u postgres createdb grovefs
+sudo -u postgres psql -d grovefs -c "GRANT CREATE,CONNECT ON DATABASE grovefs TO grove;"
+<span class="cmt"># 只需 CREATE（建 schema/表）+ CONNECT：不需要 SUPERUSER，不需要预建任何表</span>
+
+<span class="cmt"># ===== node1 上：起服务（meta-server 只多一个 --meta-store）=====</span>
+TOK=$(head -c 24 /dev/urandom | base64)
+$G data-server --listen 0.0.0.0:50100 --data-dir /data/cluster --token "$TOK"
+$G meta-server --listen 0.0.0.0:50110 \
+   --meta-store postgres://grove:pw@10.0.0.9:5432/grovefs --token "$TOK"
+<span class="cmt"># PG 下不需要 --meta-dir：权威树与控制面都在库里，服务端本地不落权威数据</span>
+
+<span class="cmt"># ===== node1 上：显式建视图（PG 下 = 建一个 schema，挂载不会建）=====</span>
+$G view --meta-store postgres://grove:pw@10.0.0.9:5432/grovefs create --view team
+
+<span class="cmt"># ===== 客户机：与 SQLite 后端一字不差（线协议不变）=====</span>
+$G mount --view team --data-servers 10.0.0.5:50100 --meta-server 10.0.0.5:50110 -m /mnt/team</code></pre>
+
+<div class="warn"><b>三条硬规则</b>：① 视图必须显式创建（两种后端同一纪律），且 PG 下视图名 ≤ 25 字节（PG 标识符 63 字符上限，hex 编码翻倍；中文约 8 个字）；② <code>--meta-store</code> 与自研 HA 的 <code>--role/--peer/--witness</code> <b>互斥</b>，同时给启动即失败——PG 档的高可用交给 PG 自身的流复制 / PITR；③ 连接串别进命令行（argv 在 <code>ps</code> 里全网可见），生产做法见 2.3.2 的 env 文件。</div>
+
+<p>PG 档与 SQLite 档的形态差异（选型时对照）：</p>
+<table>
+  <tr><th>维度</th><th>SQLite（1.2）</th><th>PostgreSQL（1.3）</th></tr>
+  <tr><td>写入模型</td><td>单写者</td><td>每视图 8 写（SERIALIZABLE）+ 4 读连接，不相交行并行提交，冲突由 SSI 透明重试</td></tr>
+  <tr><td>高可用</td><td>原生主备（--role/--peer/--witness，快照转发）</td><td>交给 PG 自身（流复制 / PITR），GroveFS 不再管</td></tr>
+  <tr><td>视图规模上限</td><td>一视图一文件一引擎，fd/内存线性涨</td><td>一视图 12 条连接；<code>--engine-idle-secs</code> 驱逐空闲视图后按「最近活跃视图数」计，扩容用多实例注册表（2.3.6）</td></tr>
+  <tr><td>控制面落点</td><td><code>meta/views/*.layout</code>、<code>meta/api_keys.db</code> 本地文件</td><td>全部在 <code>grovefs_control</code>，任意可达节点带同一 <code>--meta-store</code> 即可治理，无本地文件要同步</td></tr>
+  <tr><td>独有命令</td><td>目录零拷贝 <code>import</code>、离线 <code>gc</code> 扫本机 blocks、原生 HA</td><td>无（同名命令不同壳：--meta-dir 换 --meta-store）</td></tr>
+</table>
+
+<div class="chnav"><span>第一部分完</span><a href="#p2">进入第二部分 ↓</a></div>
+</section>
+
+<section id="p2">
+<h2 class="part">第二部分 · 命令演示（按功能划分）</h2>
+<p>三套部署各演示一遍。同一功能在不同部署下的差异只有<b>寻址旋钮</b>：本机用 <code>--home</code>，SQLite 分布式用 <code>--meta-dir</code>（在存储机上执行）或 <code>--meta-server/--data-servers</code>（在客户机上挂载），PG 分布式用 <code>--meta-store</code>。每节都给出可照抄的命令与预期输出。</p>
+
+<h3 id="s21">2.1 本机部署 · 命令演示</h3>
+<p class="lead">场景沿用 1.1：一台 devbox，存储根 <code>/data/gfs</code>。演示团队视图 <code>team</code> 与个人视图 <code>alice</code>。</p>
+
+<h4 id="s21-view">2.1.1 建基视图</h4>
+<p>基视图是真正存数据的物理树，建树入口两条等价：<code>init --view</code> 与 <code>view create --view</code>。最常见的误解是「往挂载点里写文件 = 建视图」——<b>不是</b>：写入只是往已存在的树里加节点，名字不存在时本地挂载直接拒绝，从不自动建空树。</p>
+<pre><code>$G --home /data/gfs init --view team          <span class="cmt"># 建团队基视图 → /data/gfs/meta/team.db</span>
+$G --home /data/gfs init --view alice         <span class="cmt"># 再建一个；两棵树互不可见</span>
+
+<span class="cmt"># 用种子清单一次性铺好目录骨架（每行 mkdir / touch 两种指令，# 注释，幂等可重跑）</span>
+cat > seed.txt <<'EOF'
+mkdir docs
+touch docs/README.txt
+mkdir photos
+EOF
+$G --home /data/gfs init --view team --manifest ./seed.txt
+<span class="cmt"># 输出: applied seed manifest ./seed.txt</span></code></pre>
+
+<h4 id="s21-mount">2.1.2 挂载与读写</h4>
+<pre><code>$G --home /data/gfs mount --view team -m /mnt/team     <span class="cmt"># 默认转后台，挂载点就绪即返回</span>
+$G --home /data/gfs mount --view alice -m /mnt/alice
+
+mkdir -p /mnt/team/docs/2026 && echo 年度报告 > /mnt/team/docs/2026/report.txt
+cat /mnt/team/docs/2026/report.txt      <span class="out"># 年度报告</span>
+ls /mnt/alice                           <span class="out"># 空：alice 看不到 team 的文件</span>
+
+$G umount -m /mnt/team                  <span class="cmt"># 卸载（后台挂载进程随之退出）</span>
+fusermount -u /mnt/alice                <span class="cmt"># 等价写法</span></code></pre>
+<p>后台挂载的输出追加进日志文件（默认 <code>$TMPDIR/grovefs-mount-&lt;挂载点&gt;.log</code>）；systemd/调试场景用 <code>--foreground</code> 保持终端附着，Ctrl-C 即卸载。</p>
+
+<h4 id="s21-kinds">2.1.3 四种视图的创建与演示（派生 / 别名 / fork / graft）</h4>
+<p>除基视图外还有三种治理形态，加上 fork 的「选择性接枝」 graft，覆盖绝大多数分发需求。一张表先看懂：</p>
+<table>
+<tr><th></th><th>基视图</th><th>派生视图</th><th>纯别名</th><th>fork</th></tr>
+<tr><td><b>本质</b></td><td>真实物理树</td><td>基树 + 规则（不建树）</td><td>名字 → 真实视图（不建树）</td><td>独立物理树（目录项从基树复制）</td></tr>
+<tr><td><b>创建命令</b></td><td><code>init --view V</code></td><td><code>view define --name D --base B --rules F</code></td><td><code>view alias --name A --real R</code></td><td><code>view fork --name F --base B</code></td></tr>
+<tr><td><b>目录可改</b></td><td>能</td><td>不能（只读）</td><td>能</td><td>能</td></tr>
+<tr><td><b>内容可写</b></td><td>能</td><td>不能（EROFS）</td><td>能</td><td>不能（EROFS）</td></tr>
+<tr><td><b>落盘</b></td><td><code>meta/V.db</code></td><td><code>meta/views/D.layout</code></td><td><code>meta/views/A.layout</code>（仅一行）</td><td><code>meta/F.db</code> + <code>meta/views/F.layout</code></td></tr>
+<tr><td><b>典型用途</b></td><td>真正存数据</td><td>团队共享一份只读形状</td><td>隐藏存储真名 / 换公开名</td><td>在基数据上做可整理的独立分支</td></tr>
+</table>
+
+<p><b>① 派生视图（只读透镜）</b>：规则文件是纯文本，四个动词 <code>only / hide / map / link</code>。</p>
+<pre><code>cat > docsonly.rules <<'EOF'
+<span class="cmt"># 只显示 /docs 子树</span>
+only /docs
+EOF
+$G view --home /data/gfs define --name docsonly --base team --rules docsonly.rules
+<span class="cmt"># 输出: defined derived view 'docsonly' over base 'team': 0 hide, 1 only, 0 reloc rule(s)</span>
+$G --home /data/gfs mount --view docsonly -m /mnt/lens &amp;
+ls /mnt/lens            <span class="out"># docs            ← 只有 docs，其余子树连存在性都不泄露</span>
+echo x > /mnt/lens/docs/new.md
+<span class="out"># bash: Read-only file system   ← 派生一律只读（硬契约）；写走基名 /mnt/team</span></code></pre>
+
+<p><b>② 纯别名（公开名，全树可写）</b>：挂别名 = 挂真实视图；别名存在期间，真实名 <code>team</code> 从此不可直挂（本地与服务端均拒）。</p>
+<pre><code>$G view --home /data/gfs alias --name pub --real team
+<span class="cmt"># 输出: defined pure alias 'pub' -> real view 'team' + 治理提示</span>
+$G --home /data/gfs mount --view pub -m /mnt/pub &amp;
+echo hello > /mnt/pub/docs/note.md      <span class="cmt"># 可写；写入即落在 team 的同一棵树上</span>
+ls /mnt/team/docs                       <span class="out"># 2026 note.md README.txt   ← 同一份数据</span>
+
+<span class="cmt"># 公开名泄露后一条命令原子轮换：先写新名再删旧名，真实名全程被治理、无裸露窗口</span>
+$G view --home /data/gfs alias --name pub2 --real team --retire pub</code></pre>
+
+<p><b>③ fork（独立树：结构可写、内容只读、字节零复制）</b>：目录项复制一份，字节经跨视图账本共享；在 fork 里删名字只摘自己的，基树分毫不动。</p>
+<pre><code>$G view --home /data/gfs fork --name lab --base team
+<span class="cmt"># 输出: forked view 'lab' from base 'team': 42 entries, 37 shared object(s)</span>
+$G --home /data/gfs mount --view lab -m /mnt/lab &amp;
+mkdir /mnt/lab/docs/review                       <span class="cmt"># 结构操作放行</span>
+mv /mnt/lab/docs/2026/report.txt /mnt/lab/docs/review/   <span class="cmt"># 改名放行（只改 lab 自己的树）</span>
+echo x > /mnt/lab/docs/new.md
+<span class="out"># bash: Read-only file system   ← 内容写拒绝；自己 touch 出来的空文件同样写不进</span>
+cat /mnt/team/docs/review/report.txt     <span class="out"># 不存在——lab 的整理不回写基树，两边各自演化</span></code></pre>
+
+<p><b>④ graft（把基视图的选中条目接进 fork 的任意目录并逐条改名）</b>：先 <code>fork --empty</code> 只建空树，再用计划文件（纯文本，<code>源路径⇥目标名</code>，目标名可省略）按需装入子集——字节依旧零复制。</p>
+<pre><code>$G view --home /data/gfs fork --name picks --base team --empty     <span class="cmt"># 只建根、不复制目录项</span>
+printf 'docs/2026/report.txt\t季度报告.txt\ndocs/README.txt\n' > plan.tsv
+$G view --home /data/gfs graft --name picks --src team --map plan.tsv
+<span class="cmt"># report.txt 接进根目录并改名为 季度报告.txt；README.txt 原名接入；可加 --dest DIR 指定落点、--skip-existing 跳过同名</span></code></pre>
+
+<div class="ok">验收：<code>$G view --home /data/gfs list</code> 一次列出全部形态——派生（base + 规则计数）、别名（→ 真实视图）、fork（→ 基视图）与未定义的裸基视图；<code>ls /data/gfs/meta/views/</code> 里是三个纯文本 <code>.layout</code>，而 <code>lab.db</code>/<code>picks.db</code> 是 fork 各自的树。</div>
+
+<h4 id="s21-auth">2.1.4 授权边界（本机模式）</h4>
+<p>本机部署<b>没有 token、没有 API key 门</b>：准入由挂载点的文件系统权限把关，谁有挂载点访问权谁就能读写。<code>apikey set-ro</code> 对本机已建挂载不生效（没有服务端凭据门）。控制访问的手段就是普通 OS 手段：</p>
+<pre><code>chmod 750 /mnt/team                     <span class="cmt"># 用目录权限控制谁能进</span>
+sudo -u alice ls /mnt/team              <span class="cmt"># 以另一 OS 用户验证</span></code></pre>
+<div class="warn">需要<b>逐调用方可撤销凭据、视图绑定、服务端强制只读、调用审计</b>时，本机模式给不了——这正是分布式部署（2.2.3 / 2.3.4）的 API key 体系存在的意义。</div>
+
+<h4 id="s21-conf">2.1.5 配置文件：把 <code>--home</code> 也省掉</h4>
+<p>每个旋钮的取值优先级恒为：<b>命令行参数 > 环境变量 > 配置文件 > 内置默认值</b>。grovefs 启动时自动加载一个 <code>KEY=VALUE</code> 配置文件填入尚未设置的变量：</p>
+<pre><code><span class="cmt"># 查找顺序: $GROVEFS_CONFIG 指定路径 > $HOME/.config/grovefs/grovefs.conf</span>
+<span class="cmt"># 只认 GROVEFS_* 键；支持 # 注释、空行、可选 export 前缀、引号包裹的值</span>
+cat > ~/.config/grovefs/grovefs.conf <<'EOF'
+GROVEFS_HOME=/data/gfs
+EOF
+
+<span class="cmt"># 之前: $G --home /data/gfs mount --view team -m /mnt/team</span>
+<span class="cmt"># 之后: 只剩「这次挂哪个视图到哪儿」</span>
+$G mount --view team -m /mnt/team</code></pre>
+<p>注意：<code>--view</code>/<code>-m</code> 刻意不被收录——每次挂载都不同，写进默认值是错的。文件里有口令就 <code>chmod 600</code>。切多套环境用逐次 <code>GROVEFS_CONFIG=~/gfs-B.conf $G …</code>（每套一份文件），不要常驻 export——已导出的同名变量会静默压过配置文件。</p>
+
+<h4 id="s21-ops">2.1.6 清点、用量与删除</h4>
+<pre><code>$G view --home /data/gfs list                    <span class="cmt"># 清点：全部定义 + 裸基视图</span>
+$G du --home /data/gfs --view team --total       <span class="cmt"># 用量：批量取对象字节汇总，不走逐文件 stat</span>
+
+<span class="cmt"># 删除规则：派生/别名只删定义；fork 连自己的树一起删；只有删基视图才回收字节</span>
+$G view --home /data/gfs rm --name docsonly      <span class="cmt"># 删派生定义，数据分毫不动</span>
+$G view --home /data/gfs rm --name pub           <span class="cmt"># 删别名，team 真名恢复可挂</span>
+$G view --home /data/gfs rm --name lab           <span class="cmt"># 删 fork：定义 + 自己的树 + 重算账本；基树与共享字节不动</span>
+$G view --home /data/gfs rm --name team --base   <span class="cmt"># 删基视图：删树 + 回收无人持有的字节（有守卫：被定义治理/仍被指向/还挂着都会拒）</span></code></pre>
+<div class="chnav"><span>2.1 本机演示完</span><a href="#s22">继续 2.2：SQLite 分布式演示 ↓</a></div>
+
+<h3 id="s22">2.2 SQLite 分布式 · 命令演示</h3>
+<p class="lead">场景沿用 1.2：node1（10.0.0.5，存储中心，4×8TB 数据盘挂 /data/cluster）+ node2/node3 客户机。演示视图 <code>team</code> 与 <code>alice</code>。</p>
+
+<h4 id="s22-serve">2.2.1 起服务：先验后常驻</h4>
+<p>两个服务都是前台阻塞式进程，<code>SIGTERM</code> 即干净退出，systemd <code>Type=simple</code> 直接托管。第一次先用手工命令验证连通性，再交给 systemd：</p>
+<pre><code><span class="cmt"># node1 手工验证（两个窗口）</span>
+$G data-server --listen 0.0.0.0:50100 --data-dir /data/cluster --token "$TOK"
+$G meta-server --meta-dir /data/cluster --listen 0.0.0.0:50110 --token "$TOK"
+<span class="cmt"># 成功标志：各自打印一行 listening …；ss -lntp 里看到 50100/50110</span></code></pre>
+<p>验证通过后写 systemd 常驻。先建一份 root-only 的 env 文件（token 不进命令行，避免 <code>ps</code> 泄露），两个服务共用：</p>
+<pre><code>sudo install -d -m 700 /etc/grovefs
+sudo sh -c 'cat > /etc/grovefs/grovefs.env' <<'EOF'
+GROVE_TOKEN=换成你的24字节随机串
+EOF
+sudo chmod 600 /etc/grovefs/grovefs.env</code></pre>
+<pre><code><span class="cmt"># /etc/systemd/system/grove-data-server.service</span>
+[Unit]
+Description=GroveFS data-server
+After=local-fs.target
+[Service]
+EnvironmentFile=/etc/grovefs/grovefs.env
+ExecStart=/usr/local/bin/grovefs data-server --listen 0.0.0.0:50100 --data-dir /data/cluster --token ${GROVE_TOKEN}
+Restart=on-failure
+RestartSec=2
+[Install]
+WantedBy=multi-user.target</code></pre>
+<pre><code><span class="cmt"># /etc/systemd/system/grove-meta-server.service</span>
+[Unit]
+Description=GroveFS meta-server
+After=local-fs.target
+[Service]
+EnvironmentFile=/etc/grovefs/grovefs.env
+ExecStart=/usr/local/bin/grovefs meta-server --meta-dir /data/cluster --listen 0.0.0.0:50110 --token ${GROVE_TOKEN}
+Restart=on-failure
+RestartSec=2
+[Install]
+WantedBy=multi-user.target</code></pre>
+<pre><code>sudo systemctl daemon-reload && sudo systemctl enable --now grove-data-server grove-meta-server
+systemctl status grove-data-server grove-meta-server --no-pager | grep Active   <span class="out"># 两个 active (running)</span>
+ss -lntp | grep -E '50100|50110'                                                <span class="out"># 两个端口在听</span></code></pre>
+<p class="cmt">防火墙只对内网网段开两个端口（ufw：<code>sudo ufw allow from 10.0.0.0/24 to any port 50100:50110 proto tcp</code>）。</p>
+
+<h4 id="s22-view">2.2.2 建基视图（含存量数据零拷贝导入）</h4>
+<pre><code><span class="cmt"># 在 node1（存储机）上：--meta-dir 指向元数据根，与 meta-server 同一路径</span>
+cat > seed.txt <<'EOF'
+mkdir docs
+mkdir raw
+EOF
+$G view --meta-dir /data/cluster create --view team --manifest ./seed.txt
+
+<span class="cmt"># 已有一批现成数据（如 /data/legacy）想让客户端直接用：零拷贝登记，字节原地不动</span>
+$G import --view legacy --source /data/legacy --meta-dir /data/cluster --dry-run
+<span class="out"># dry run: view 'legacy' under /legacy would mirror 3 dir(s) and 2 file(s) …</span>
+$G import --view legacy --source /data/legacy --meta-dir /data/cluster
+<span class="out"># created BASE view 'legacy' …; imported … (2 hardlinked zero-copy, 0 copied)</span></code></pre>
+<p>import 的要点：对象就是源文件的硬链接（零额外字节、双向实时可见，跨设备自动退化为流式拷贝并如实计数）；重跑即增量；GC 只摘链接、源文件永不因视图操作被删。客户机靠 TTL（≤2s）自动收敛看到新树。</p>
+
+<h4 id="s22-auth">2.2.3 授权：token + 逐调用方 API key</h4>
+<p><b>token</b> 是集群准入的共享口令（1.2 已配）；但它是共享密钥——审计上分不出谁挂的，踢一个人只能轮换断全部。需要<b>逐调用方凭据</b>时启用 API key 体系：</p>
+<pre><code><span class="cmt"># node1：铸造三把 key（--meta-dir 与 meta-server 同一路径；明文只在铸造时打印一次）</span>
+$G apikey --meta-dir /data/cluster create --label node2-rw  --for mount --view team
+$G apikey --meta-dir /data/cluster create --label node3-ro  --for mount --view team --ro
+$G apikey --meta-dir /data/cluster create --label alice-key --for mount --view alice
+<span class="out"># apikey created — shown ONCE (only its SHA-256 is stored; save it now):</span>
+<span class="out">#   id: aac1f51a…  label: node2-rw  scope: mount  view: team  rw: rw</span>
+<span class="out">#   key: aac1f51a…:64位hexsecret</span>
+
+<span class="cmt"># 查看注册表：绝不落密文，只有摘要</span>
+$G apikey --meta-dir /data/cluster list
+<span class="cmt"># 按视图过滤、原地切读写/只读、撤销：</span>
+$G apikey --meta-dir /data/cluster list --view team
+$G apikey --meta-dir /data/cluster set-ro --id aac1 --rw      <span class="cmt"># 只读 key 热切回读写，活挂载 1s 内生效</span>
+$G apikey --meta-dir /data/cluster set-ro --id aac1            <span class="cmt"># 不带 --rw 即切回只读</span>
+$G apikey --meta-dir /data/cluster revoke --id 7c0e            <span class="cmt"># 撤销：活挂载在下一次服务端往返被封停、自卸载</span></code></pre>
+<p>开服务端门（<b>两道都要开</b>，且 <b>fail-closed</b>——先铸好 key 再上 flag，否则谁都进不来）：meta-server 加 <code>--require-api-key</code>；data-server 加 <code>--require-api-key --meta-dir /data/cluster</code>（读同一份 key 注册表）。客户端把 token 换成 key：</p>
+<pre><code><span class="cmt"># node2（读写 key）</span>
+export GROVEFS_API_KEY='aac1f51a…:64位hexsecret'      <span class="cmt"># 走 env，不进 argv</span>
+$G mount --view team -m /mnt/team \
+   --data-servers 10.0.0.5:50100 --meta-server 10.0.0.5:50110
+<span class="cmt"># GROVEFS_API_KEY 已导出即生效，无需额外参数；也可显式 --api-key '<id>:<secret>'</span>
+
+<span class="cmt"># node3（只读 key）：写被服务端强制拒</span>
+mkdir /mnt/team/should_fail
+<span class="out"># mkdir: cannot create directory ‘/mnt/team/should_fail’: Read-only file system</span>
+
+<span class="cmt"># 拿绑定 team 的 key 去挂 alice：绑定检查处即拒（比存在性检查更早）</span>
+<span class="out"># error: permission denied: this api key is bound to view 'team', not 'alice'</span>
+
+<span class="cmt"># node1：回读审计（每次连接含被拒的都落表）</span>
+$G apikey --meta-dir /data/cluster calls</code></pre>
+<p>systemd 客户端的对应改法见 2.2.5；systemd 挂载单元被撤销 key 的行为：挂载打印拒因后<b>干净自卸载</b>（退出码 0，<code>Restart=on-failure</code> 不会重拉——这是有意的收手不是崩溃）。</p>
+
+<h4 id="s22-kinds">2.2.4 四种视图（服务端集中定义）</h4>
+<p>与 2.1.3 同一套命令，只是寻址换成 <code>--meta-dir /data/cluster</code>（在存储机上执行）；区别在分发面：定义存在<b>服务端</b>，客户机只需 <code>mount --view &lt;名&gt;</code>，不带任何本地规则文件。改定义热生效（≤2s，已挂载连接自动换形）。</p>
+<pre><code><span class="cmt"># node1 上：定义一个只读透镜给外部协作者</span>
+cat > docsonly.rules <<'EOF'
+only /docs
+EOF
+$G view --meta-dir /data/cluster define --name docsonly --base team --rules docsonly.rules
+$G view --meta-dir /data/cluster alias  --name pub --real team
+$G view --meta-dir /data/cluster fork   --name lab --base team
+printf 'raw/logs/2026\tarchive-2026\n' > plan.tsv
+$G view --meta-dir /data/cluster graft --name lab --src team --map plan.tsv --dest archive
+
+<span class="cmt"># node2/node3 上：挂派生名，无需规则文件；M_OPEN 握手带只读标志</span>
+$G mount --view docsonly -m /mnt/lens \
+   --data-servers 10.0.0.5:50100 --meta-server 10.0.0.5:50110
+ls /mnt/lens        <span class="out"># docs            ← 服务端渲染的形状</span>
+
+<span class="cmt"># 改规则热生效：替换 .layout 后，已挂载的派生连接 ≤2s 内换形，免重挂</span>
+printf 'only /docs\nhide /docs/internal\n' | tee /data/cluster/meta/views/docsonly.layout
+<span class="cmt"># （或重新跑一条 view define 同名覆盖）</span>
+
+<span class="cmt"># 分发面差异一览（对照 2.1.3 的本地模式）：</span>
+<span class="cmt"># ① docsonly → 客户机只给名；② pub → 全树可写，真名 team 同时不可直挂（服务端同拒）</span>
+<span class="cmt"># ③ lab → 结构可写/内容 EROFS；删名只影响 fork 自己；④ graft 接枝字节零复制</span></code></pre>
+<p>SQLite 档 <code>view</code> 操作的是服务端本地文件，所以要在 meta-server 所在机器执行；HA 部署下 <code>meta/views/</code> 与 <code>api_keys.db</code>/<code>refs.db</code> 要手工同步到备机（PG 档无此负担，定义在共享库里——见 2.3.5）。</p>
+
+<h4 id="s22-conf">2.2.5 配置文件：客户机挂载瘦身 + 挂载也交给 systemd</h4>
+<pre><code><span class="cmt"># node2/node3：写一次坐标文件，之后挂载只剩「这次挂哪个视图到哪儿」</span>
+cat > ~/.config/grovefs/grovefs.conf <<'EOF'
+GROVEFS_META_SERVER=10.0.0.5:50110
+GROVEFS_DATA_SERVERS=10.0.0.5:50100
+GROVEFS_TOKEN=s3cret            <span class="cmt"># 文件里有口令就 chmod 600</span>
+GROVEFS_API_KEY=aac1f51a…:64位hexsecret
+EOF
+chmod 600 ~/.config/grovefs/grovefs.conf
+
+$G mount --view team -m /mnt/team        <span class="cmt"># 全部坐标从文件补齐</span>
+$G mount --view alice -m /mnt/alice --ro <span class="cmt"># 本机只读叠加：同一坐标，另一个视图</span></code></pre>
+<p>常驻挂载用模板单元（一个视图一个实例，<code>%i</code> = 视图名，挂载点固定 <code>/mnt/%i</code>；<code>--foreground</code> 保持附着，<code>systemctl stop</code> 自动 fusermount 干净卸载）：</p>
+<pre><code><span class="cmt"># /etc/systemd/system/grove-mount@.service</span>
+[Unit]
+Description=GroveFS mount view %i
+After=network-online.target
+Wants=network-online.target
+[Service]
+EnvironmentFile=/etc/grovefs/grovefs.env
+ExecStartPre=-/usr/bin/fusermount -u /mnt/%i
+ExecStart=/usr/local/bin/grovefs mount --view %i --foreground \
+     --data-servers 10.0.0.5:50100 --meta-server 10.0.0.5:50110 \
+     --api-key ${GROVE_API_KEY} -m /mnt/%i
+Restart=on-failure
+RestartSec=2
+[Install]
+WantedBy=multi-user.target</code></pre>
+<pre><code>sudo systemctl daemon-reload
+sudo systemctl start grove-mount@team grove-mount@alice   <span class="cmt"># 一台机挂两个视图</span>
+findmnt -T /mnt/team      <span class="out"># 源显示 grovefs:team，FUSE 类型</span></code></pre>
+<p class="cmt">两个注意：systemd 默认以 root 起挂载，上报 uid=0（可用 <code>--run-as-uid N</code> 指定属主槽位，仅进锁仲裁与审计）；其他用户要访问挂载点加 <code>--o allow_other</code> 并开 <code>/etc/fuse.conf</code> 的 <code>user_allow_other</code>。key 铸好后写进同一份 root-only env（密钥不进 <code>ps</code> 可见的 unit 文本）。</p>
+
+<h4 id="s22-ops">2.2.6 运维与验收</h4>
+<pre><code><span class="cmt"># 跨机实时一致性：node2 写 → node3 立即读（≤2s，失效推送，无需轮询）</span>
+node2: echo x > /mnt/team/t.txt
+node3: cat /mnt/team_ro/t.txt        <span class="out"># x</span>
+
+<span class="cmt"># 分布式锁跨机生效（经 meta-server 的 locks 表集中仲裁）</span>
+node2: flock -x /mnt/team/lk -c 'sleep 30' &amp;
+node3: flock -x /mnt/team/lk -c 'echo got'    <span class="out"># 期望：等 node2 退出后才打印</span>
+
+<span class="cmt"># 字节确实落在中心、不碰客户机盘：node3 上看挂载点背后无本地文件；node1 上看对象桶</span>
+node1: ls /data/cluster/blocks | head    <span class="cmt"># 256 个哈希桶子目录；对象按 key 命名，不是文件名</span>
+
+<span class="cmt"># 用量快数（批量取对象字节汇总；在 node1 上也可用 --meta-dir 形态）</span>
+$G du --view team --meta-server 10.0.0.5:50110 --data-servers 10.0.0.5:50100 --total
+$G du --view team --meta-dir /data/cluster --data-dir /data/cluster --total
+
+<span class="cmt"># 孤儿对象回收：先审计后应用（卸载全部挂载后做；跨视图账本重算可单独跑）</span>
+$G gc --meta-dir /data/cluster --data-dir /data/cluster           <span class="cmt"># 审计，不动字节</span>
+$G gc --meta-dir /data/cluster --data-dir /data/cluster --apply   <span class="cmt"># 确认无异常后才应用</span>
+$G refs --meta-dir /data/cluster rebuild                          <span class="cmt"># 账本可疑时重建（只多留不少算）</span>
+
+<span class="cmt"># 单视图迁移：换机器、换系统（元数据 JSONL + 字节另行拷贝 blocks/）</span>
+$G view --meta-dir /data/cluster export --view alice --out alice.jsonl
+$G view --meta-dir /data/cluster2 import --view alice --in alice.jsonl   <span class="cmt"># 目标机；--as-fork B 可恢复 fork 语义</span>
+
+<span class="cmt"># 数据服务重启对客户机透明：node1 拉起 data-server，客户机 IO 自动重连</span>
+<span class="cmt"># 干净卸载：systemctl stop grove-mount@team（或手工 $G umount -m /mnt/team）</span></code></pre>
+<div class="ok">八步验收全过（服务存活且监听、挂载带 grovefs 标签、跨机实时可见、锁跨机生效、字节在中心、数据服务重启自愈、卸载无残留、未知视图名拒挂且不建树）即认为部署合格。</div>
+<div class="chnav"><span>2.2 SQLite 分布式演示完</span><a href="#s23">继续 2.3：PG 分布式演示 ↓</a></div>
+
+<h3 id="s23">2.3 PostgreSQL 分布式 · 命令演示</h3>
+<p class="lead">场景沿用 1.3：db1（10.0.0.9，PG16，max_connections=200）+ node1（10.0.0.5，存储机）+ node2/node3 客户机。客户机命令与 2.2 一字不差，本节只演示服务端差异与 PG 特有能力。</p>
+
+<h4 id="s23-pg">2.3.1 准备 PG（db1 上一次性）</h4>
+<pre><code>sudo -u postgres psql -c "CREATE ROLE grove LOGIN PASSWORD '换成强口令';"
+sudo -u postgres createdb grovefs
+sudo -u postgres psql -d grovefs -c "GRANT CREATE,CONNECT ON DATABASE grovefs TO grove;"
+<span class="cmt"># 只需 CREATE（建 schema/表）+ CONNECT：不需要 SUPERUSER，不需要预建任何表</span>
+<span class="cmt"># 第一棵树是在首个 view create 时开出的；pg_hba.conf 放行 node1 的网段即可</span></code></pre>
+
+<h4 id="s23-serve">2.3.2 起服务：连接串不落 argv</h4>
+<pre><code><span class="cmt"># node1：连接串只放 root 可读文件（argv 在 ps 里全网可见）</span>
+sudo install -d -m 700 /etc/grovefs
+sudo sh -c 'cat > /etc/grovefs/meta.env' <<'EOF'
+GROVEFS_TOKEN=换成你的32字节随机串
+GROVEFS_META_DIR=/data/cluster
+GROVEFS_META_STORE=postgres://grove:pw@10.0.0.9:5432/grovefs
+EOF
+sudo chmod 600 /etc/grovefs/meta.env</code></pre>
+<pre><code><span class="cmt"># /etc/systemd/system/grovefs-meta.service —— 相比 SQLite 档只改 ExecStart 一行</span>
+[Unit]
+Description=GroveFS meta-server (PostgreSQL backend)
+After=network-online.target
+Wants=network-online.target
+[Service]
+EnvironmentFile=/etc/grovefs/meta.env
+ExecStart=/usr/local/bin/grovefs meta-server --listen 0.0.0.0:50110 \
+          --meta-store ${GROVEFS_META_STORE} --token ${GROVEFS_TOKEN}
+Restart=on-failure
+RestartSec=2
+[Install]
+WantedBy=multi-user.target</code></pre>
+<pre><code><span class="cmt"># data-server 单元同 SQLite 档（字节路径不变）；它要开 key 门时读同一份 PG 控制面</span>
+<span class="cmt"># —— 把 GROVEFS_META_STORE 写进 data 的 env 文件即可（--meta-store 的 env 回退）</span>
+sudo systemctl daemon-reload && sudo systemctl enable --now grovefs-meta grovefs-data
+journalctl -u grovefs-meta -n 20 --no-pager | grep -i 'store\|listen'
+<span class="out"># meta-server listening on 0.0.0.0:50110 (store: postgres://…10.0.0.9:5432/grovefs)</span></code></pre>
+<p class="cmt"><code>GROVEFS_META_STORE</code> 有双重身份：既是 systemd <code>${VAR}</code> 展开的来源，也是 GroveFS 自己的 <code>--meta-store</code> env 回退（<code>view</code>/<code>apikey</code>/<code>mcp</code>/<code>meta-server</code>/<code>data-server</code>/<code>du</code> 未给 flag 时读它）——显式展开与省略参数取到同一份值。PG 下 meta-server 不需要 <code>--meta-dir</code>：权威树与控制面都在库里，服务端本地不落权威数据。</p>
+
+<h4 id="s23-view">2.3.3 建基视图：一视图一个 schema</h4>
+<pre><code><span class="cmt"># node1 上：显式建 schema（挂载不会建；两种后端同一纪律）</span>
+$G view --meta-store postgres://grove:pw@10.0.0.9:5432/grovefs create --view team
+
+<span class="cmt"># 看 PG 里到底建了什么</span>
+sudo -u postgres psql -d grovefs -c '\dn'
+<span class="out">#   grovefs_refs        ← 跨视图引用账本（共享表 grovefs_refs.holders）</span>
+<span class="out">#   grovefs_v_64656d6f  ← 视图 team 的 schema（名字 = grovefs_v_ + 视图名 UTF-8 字节的十六进制）</span>
+<span class="out">#   grovefs_control     ← 控制面（key/视图定义/放置表/审计）</span>
+sudo -u postgres psql -d grovefs -c '\dt grovefs_v_64656d6f.*'
+<span class="out">#   node / ctrl / locks 三张表</span></code></pre>
+<div class="warn">两条硬规则：① 在 PG 后端上跑不带 <code>--meta-store</code> 的 <code>init</code>/<code>view create</code> 只会在本地造一个用不到的 <code>&lt;view&gt;.db</code>——治理命令必须带同一 <code>--meta-store</code>；② 视图名超过 <b>25 字节</b>会被拒（PG 标识符 63 字符上限，hex 编码翻倍；中文约 8 个字）。</div>
+
+<h4 id="s23-auth">2.3.4 授权：同一套 API key，落点在 PG 控制面</h4>
+<pre><code><span class="cmt"># 与 2.2.3 同一套命令，寻址换 --meta-store；key 与审计进 grovefs_control，本地不落 api_keys.db</span>
+$G apikey --meta-store postgres://grove:pw@10.0.0.9:5432/grovefs \
+     create --label node2-rw --for mount --view team
+$G apikey --meta-store postgres://grove:pw@10.0.0.9:5432/grovefs \
+     create --label node3-ro --for mount --view team --ro
+$G apikey --meta-store postgres://grove:pw@10.0.0.9:5432/grovefs list
+$G apikey --meta-store postgres://grove:pw@10.0.0.9:5432/grovefs calls     <span class="cmt"># 审计回读</span>
+
+<span class="cmt"># 服务端开门与 2.2.3 相同（meta/data 两道 --require-api-key；fail-closed：先铸 key 再上 flag）</span>
+<span class="cmt"># 客户端挂载命令与 SQLite 档逐字相同 —— 线协议不变，客户机无感</span></code></pre>
+<p>PG 档的优势：带同一 <code>--meta-store</code> 可从<b>任意可达节点</b>治理（key/定义/审计都在共享库里），无本地文件要同步到备机；治理凭据可用 <code>--for admin --owner</code> 铸账号密钥，配 <code>meta-server --control-listen</code> 从管理机远程治理（不发数据库密码）。</p>
+
+<h4 id="s23-kinds">2.3.5 四种视图：定义进 grovefs_control，其余语义不变</h4>
+<pre><code><span class="cmt"># node1 上：同一套 define/alias/fork/graft，寻址换 --meta-store</span>
+$G view --meta-store postgres://grove:pw@10.0.0.9:5432/grovefs \
+     define --name docsonly --base team --rules docsonly.rules
+$G view --meta-store postgres://grove:pw@10.0.0.9:5432/grovefs alias --name pub --real team
+$G view --meta-store postgres://grove:pw@10.0.0.9:5432/grovefs fork  --name lab --base team
+$G view --meta-store postgres://grove:pw@10.0.0.9:5432/grovefs graft --name lab --src team --map plan.tsv
+
+<span class="cmt"># 验证：定义在库里（本地没有 .layout 文件）</span>
+sudo -u postgres psql -d grovefs -c "SELECT name, kind FROM grovefs_control.view_defs;"
+<span class="out"># docsonly | derived   pub | alias   lab | fork</span>
+
+<span class="cmt"># 客户机：与 2.2.4 逐字相同 —— mount --view docsonly 只读、pub 全树可写、lab 结构可写内容 EROFS</span>
+<span class="cmt"># 改定义同样热生效（PG 看行的 xmin，≤2s 换形）</span></code></pre>
+<p>PG 档与 SQLite 档在视图家族上的两点差异：① 顶层 <code>grovefs import</code>（目录零拷贝登记）<b>拒绝</b>——它只能产出本地 SQLite 树，存量数据改走挂载点灌入（挂上视图后直接 <code>cp/rsync</code>）；② 就地扫本机 <code>blocks/</code> 的离线 <code>gc</code> 同样拒绝，改走 2.3.7 的治理面形态。</p>
+
+<h4 id="s23-scale">2.3.6 多实例扩容与视图搬家（连接数封顶时）</h4>
+<p>每个活跃视图占 PG 档 12 条连接（8 写 + 4 读，<code>--engine-idle-secs 300</code> 默认回收空闲视图的连接，容量按「最近活跃视图数」计）。当活跃集仍要封顶 <code>max_connections</code> 时，扩容答案是<b>多实例注册表 + 视图放置</b>：把不同视图放到不同 PG 实例（一个视图的树永远只落在一个实例上），容量随实例数线性增长。示例：加入 <b>db2</b>（10.0.0.11，同规格 PG，max_connections=200），把热点视图 team1 挪过去。</p>
+<pre><code><span class="cmt"># ① db2 装好库与账号（同 2.3.1）；② node1 上写实例注册表（每行 名字 = postgres://…，# 注释）</span>
+sudo sh -c 'cat > /etc/grovefs/instances.conf' <<'EOF'
+<span class="cmt"># 第一条 = 控制面（放置表/key/定义都落在这里）</span>
+main  = postgres://grove:pw@10.0.0.9:5432/grovefs
+team1 = postgres://grove:pw@10.0.0.11:5433/grovefs
+EOF
+sudo chmod 600 /etc/grovefs/instances.conf
+
+<span class="cmt"># ③ 重启 meta-server：--meta-store 换成 file: 注册表；启动横幅报实例清单</span>
+<span class="out"># meta-server: 2 PG instance(s) [main, team1] — control plane on 'main'</span>
+
+<span class="cmt"># ④ 此后新视图自动向新机器均衡（选放置数最少的实例）；也可显式钉住</span>
+$G view --meta-store file:/etc/grovefs/instances.conf create --view team1 --pg-instance team1
+
+<span class="cmt"># ⑤ 已存在的视图要搬家？view move 四步切换（snapshot → build → flip → retire）</span>
+$G view --meta-store file:/etc/grovefs/instances.conf move --view team1 --pg-instance team1
+<span class="out"># 快照导出（挂载仍在写也不撕裂）→ 目标建副本并按行数自验（不触碰放置）</span>
+<span class="out"># → 改写放置行（唯一原子切换点，失败 DROP 副本回滚）→ 退役源 schema</span>
+<span class="out"># → 挂载客户端无感，字节不动，下次 M_OPEN 即路由到新家</span></code></pre>
+<p>要点与守卫：<code>--keep-source</code> 把源留作回滚点（反向 move 幂等复用副本，只切一次行）；视图挂载中拒绝搬家（先卸载）；alias/derived 拒绝（它们不拥有树）；<b>fork 可以搬但基视图不跟随</b>——搬完的 fork 与基视图分属两实例，后续这对的 <code>graft</code> 会被跨实例拒绝，搬家前想清楚。语义不变量：<code>view list</code> 跨实例合并、<code>refs rebuild</code> 逐实例重算后求和、<code>gc</code> 跨实例并集扫描。给集合加机器不影响已放置视图的落点（放置行说了算）。</p>
+
+<h4 id="s23-ops">2.3.7 运维与巡检（用 psql，不要用 sqlite3）</h4>
+<pre><code><span class="cmt"># 用量快数：du 的 PG 形态（字节来源仍是 data-server）</span>
+$G du --view team --meta-store postgres://grove:pw@10.0.0.9:5432/grovefs \
+     --data-servers 10.0.0.5:50100 --total
+
+<span class="cmt"># 孤儿对象回收（PG 档）：meta-server 开治理口，gc 经治理面跨实例并集扫描</span>
+<span class="cmt"># meta-server 启动参数加: --control-listen 0.0.0.0:50130</span>
+$G gc --control-server 10.0.0.5:50130 --data-servers 10.0.0.5:50100           <span class="cmt"># 审计</span>
+$G gc --control-server 10.0.0.5:50130 --data-servers 10.0.0.5:50100 --apply   <span class="cmt"># 应用</span>
+$G refs --meta-store postgres://grove:pw@10.0.0.9:5432/grovefs rebuild       <span class="cmt"># 账本重算（多实例逐实例求和）</span>
+
+<span class="cmt"># 巡检：schema 计数、连接占用、控制面放置表</span>
+sudo -u postgres psql -d grovefs -c "SELECT count(*) FROM information_schema.schemata WHERE schema_name LIKE 'grovefs_v_%';"
+sudo -u postgres psql -d grovefs -c "SELECT count(*), state FROM pg_stat_activity GROUP BY state;"
+$G view --meta-store file:/etc/grovefs/instances.conf list
+
+<span class="cmt"># 备份与恢复：元数据随 pg_dump 迁移，本地只需另拷 blocks/</span>
+sudo -u postgres pg_dump -Fc grovefs > grovefs-$(date +%F).dump
+sudo -u postgres pg_restore -d grovefs --clean grovefs-2026-11-16.dump
+<span class="cmt"># 多实例部署逐实例各做一份；控制面实例那份同时覆盖放置表与控制面</span>
+<span class="cmt"># 高可用/PITR 交给 PG 自身（流复制）；--meta-store 与自研 HA 参数互斥，启动即 fail-fast</span>
+
+<span class="cmt"># 删基视图：一条命令（销账 + DROP SCHEMA 在同一事务，PG 的 DDL 是事务性的，无中间态）</span>
+$G view --meta-store postgres://grove:pw@10.0.0.9:5432/grovefs rm --name team --base --data-dir /data/cluster</code></pre>
+<div class="ok">验收：第一个挂载建立后 <code>\dn</code> 多出 <code>grovefs_v_&lt;hex&gt;</code>；<code>ls /data/cluster/meta</code> 里<b>没有</b> <code>team.db</code>（权威树在 PG，不在文件里）；客户机读写与 2.2 的验收逐字相同。</div>
+
+<div class="chnav"><span>全页完</span><a href="#p1">回到第一部分 ↑</a></div>
+</section>
+
+<footer>
+<p><b>GroveFS 部署与命令实操演示</b> · 本文所有命令取自仓库实测语义；更完整的语义边界、性能旋钮与诚实标注见主手册 <a href="docs.html">docs.html</a> 与 USAGE.md。三套部署共用同一个二进制，构建方法：<code>cargo build --release</code>（仅 Rust 工具链，无需 libfuse 开发包）。</p>
+</footer>
+</main>
+</div>
+</body>
+</html>
