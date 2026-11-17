@@ -415,6 +415,9 @@ fn serve_auth_keys(
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
+                // One thread per connection: a half-open peer must not pin it
+                // forever — keepalive breaks the blocked read in ~2 min.
+                crate::remote::enable_tcp_keepalive(&s);
                 let backend = backend.clone();
                 let token = token.clone();
                 let fence = fence.clone();

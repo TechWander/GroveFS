@@ -571,6 +571,10 @@ impl RemoteMeta {
                         let _ = s.set_read_timeout(Some(self.connect_timeout));
                         let _ = s.set_write_timeout(Some(self.connect_timeout));
                         let _ = s.set_nodelay(true);
+                        // Long-lived reuse sockets: a vanished meta-server
+                        // must surface as a read error (not hang forever) so
+                        // failover/retry paths can run.
+                        crate::remote::enable_tcp_keepalive(&s);
                         let mut body = Vec::new();
                         proto::put_key(&mut body, &self.view);
                         proto::put_key(&mut body, &self.token);

@@ -205,6 +205,11 @@ impl RemoteBackend {
                     s.set_read_timeout(Some(self.connect_timeout))?;
                     s.set_write_timeout(Some(self.connect_timeout))?;
                     s.set_nodelay(true)?; // LAN: avoid Nagle delaying small request frames
+                    // Pooled sockets live long between ops; a vanished client
+                    // (power cut, link down) must surface as a read error on
+                    // the SERVER side too — the server's accept loop enables
+                    // keepalive, and this mirrors it on the client end.
+                    crate::remote::enable_tcp_keepalive(&s);
                     let mut body = Vec::new();
                     proto::put_key(&mut body, &self.token);
                     proto::put_key(&mut body, &self.api_key);

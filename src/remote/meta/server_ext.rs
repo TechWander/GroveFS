@@ -870,6 +870,13 @@ fn serve_runtime(listener: TcpListener, rt: Arc<MetaRuntime>) {
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
+                // One thread per connection (mount work socket, event
+                // subscriber, HA peer): a half-open peer must not pin the
+                // thread, the mount's `subs` entry and thus the view's engine
+                // (PG: 8 writers + 4 readers) forever — keepalive breaks the
+                // blocked read in ~2 min so the existing cleanup chain
+                // (subscriber removal → idle eviction) can run.
+                crate::remote::enable_tcp_keepalive(&s);
                 let rt = rt.clone();
                 thread::spawn(move || {
                     if let Err(e) = handle_meta_conn(s, rt) {
@@ -902,6 +909,10 @@ fn gov_accept(listener: TcpListener, rt: Arc<MetaRuntime>) {
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
+                // Same rationale as the mount plane: the one-shot request
+                // read has no timeout, so a half-open admin client would pin
+                // a thread; keepalive breaks it in ~2 min.
+                crate::remote::enable_tcp_keepalive(&s);
                 let rt = rt.clone();
                 thread::spawn(move || {
                     if let Err(e) = handle_gov_conn(s, &rt) {
@@ -4007,6 +4018,11 @@ fn try_open_event_stream(
     s.set_read_timeout(None)?; // block waiting for pushed events
     s.set_write_timeout(Some(Duration::from_secs(5)))?;
     s.set_nodelay(true)?;
+    // The blocking event wait has NO read timeout by design; keepalive is what
+    // turns a vanished network (no FIN/RST) into a read error ~2 min later, so
+    // the listener thread exits and its reconnect loop can restore pushes —
+    // without this, a silently dead link pins the mount's invalidations forever.
+    crate::remote::enable_tcp_keepalive(&s);
     let mut body = Vec::new();
     proto::put_key(&mut body, view);
     proto::put_key(&mut body, token);
