@@ -1,11 +1,14 @@
 /*
   GroveFS management console.
 
-  No framework, no fonts, no icons: the gateway's Content-Security-Policy is
-  `'self'` only, and an air-gapped deployment must not render a broken page
-  because a CDN is unreachable. Sizes are rem-based so the dense tables stay
-  readable when zoomed, and colour is used for STATE (kind, ok/failed,
-  enabled/disabled) rather than decoration.
+  No framework, no webfonts, no icon CDN: the gateway's Content-Security-Policy
+  is `'self'` only, and an air-gapped deployment must not render a broken page
+  because a CDN is unreachable. The nav icons are inline `<svg>` DOM in
+  index.html (they inherit the button color via `currentColor`), and the type
+  stack is system-only — with CJK fallbacks so the Chinese UI renders in the
+  platform's own sans instead of a mixed bag. Sizes are rem-based so the dense
+  tables stay readable when zoomed, and colour is used for STATE (kind,
+  ok/failed, enabled/disabled) rather than decoration.
 */
 
 :root {
@@ -21,13 +24,23 @@
   --fg: #1a2733;
   --fg-dim: #5a6b7d;
   --accent: #1663b3;
+  --accent-soft: #e3eefb;
   --ok: #1a7f4f;
   --warn: #a96a08;
   --err: #c93a3a;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --shadow-sm: 0 1px 2px #16222e14, 0 1px 6px #16222e0a;
+  --shadow-md: 0 2px 6px #16222e14, 0 10px 28px #16222e1c;
 }
 
 * { box-sizing: border-box; }
+
+::selection { background: #cfe1f5; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; border-radius: 4px; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: #b9c6d3; border-radius: 6px; border: 2px solid var(--bg); }
+::-webkit-scrollbar-thumb:hover { background: #9fb0c0; }
+::-webkit-scrollbar-track { background: transparent; }
 
 /* The `hidden` attribute's UA style (display:none) loses to any author
    display rule — and #login/.page/#modal-host all set one, which made the
@@ -40,7 +53,9 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--fg);
-  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto,
+        "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  -webkit-font-smoothing: antialiased;
 }
 
 code, .mono, td.mono { font-family: var(--mono); font-size: 12.5px; }
@@ -48,6 +63,8 @@ h1, h2, h3 { margin: 0 0 .4rem; font-weight: 600; }
 h2 { font-size: 15px; }
 a { color: var(--accent); }
 .muted { color: var(--fg-dim); font-weight: 400; font-size: 12.5px; }
+/* Numeric columns and card figures line up digit-for-digit across rows. */
+td, .card .n { font-variant-numeric: tabular-nums; }
 /* `pre-line`, not `pre-wrap`: the server's multi-line refusals are wrapped with
    an indent that belongs to its source, not to the message. Keep the line breaks
    (they separate "why" from "what to do next"), collapse the runs of spaces. */
@@ -68,11 +85,37 @@ a { color: var(--accent); }
   border: 1px solid var(--line);
   border-radius: 10px;
   padding: 1.5rem;
+  position: relative;
+  overflow: hidden;
+  box-shadow: var(--shadow-md);
 }
-.login-card h1 { letter-spacing: .04em; }
+/* The accent bar gives the card a brand anchor without any image asset. */
+.login-card::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 3px;
+  background: linear-gradient(90deg, var(--accent), #4a97dd 60%, transparent);
+}
+.brand-row { display: flex; align-items: center; gap: .5rem; }
+.brand-row .logo { color: var(--accent); flex: none; }
+.login-card h1 { letter-spacing: .04em; margin: 0; }
 #login-form { display: grid; gap: .35rem; }
 #login-form label { margin-top: .6rem; font-size: 12px; color: var(--fg-dim); }
 #login .hint { margin-top: 1.2rem; }
+
+/* Language toggle: a small pill; on the sign-in card it parks top-right. */
+.lang-btn {
+  border-radius: 999px;
+  background: var(--bg3);
+  border: 1px solid var(--line);
+  color: var(--fg-dim);
+  padding: .2rem .7rem;
+  font: inherit;
+  font-size: 12px;
+}
+.lang-btn:hover { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+.lang-login { position: absolute; top: .9rem; right: .9rem; }
 
 /* ---- chrome ---- */
 
@@ -80,32 +123,46 @@ header {
   display: flex;
   align-items: center;
   gap: 1.25rem;
-  padding: .55rem 1rem;
+  padding: .5rem 1.25rem;
   background: var(--bg2);
   border-bottom: 1px solid var(--line);
+  box-shadow: var(--shadow-sm);
   position: sticky;
   top: 0;
   z-index: 5;
 }
-.brand { font-weight: 700; letter-spacing: .05em; }
-nav { display: flex; gap: .25rem; flex: 1; }
+.brand { font-weight: 700; letter-spacing: .05em; display: inline-flex; align-items: center; gap: .45rem; }
+.brand .logo { color: var(--accent); flex: none; }
+nav { display: flex; gap: .3rem; flex: 1; }
 nav button {
   background: none;
   border: 1px solid transparent;
-  border-radius: 6px;
+  border-radius: 999px;
   color: var(--fg-dim);
-  padding: .3rem .7rem;
+  padding: .28rem .85rem;
   font: inherit;
   cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: .4rem;
+  white-space: nowrap;
+  transition: background .12s, color .12s, border-color .12s;
 }
-nav button:hover { color: var(--fg); }
-nav button.on { color: var(--fg); background: var(--bg3); border-color: var(--line); }
+nav button svg { flex: none; opacity: .85; }
+nav button:hover { color: var(--fg); background: var(--bg3); }
+nav button.on {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-color: #bcd4ef;
+  font-weight: 600;
+}
+nav button.on svg { opacity: 1; }
 .who { display: flex; align-items: center; gap: .5rem; }
 
 main { padding: 1rem; max-width: 1500px; }
 .page { display: block; }
 .bar { display: flex; align-items: baseline; gap: .75rem; margin: 1.25rem 0 .5rem; }
-.bar h2 { margin: 0; }
+.bar h2 { margin: 0; padding-left: .55rem; border-left: 3px solid var(--accent); line-height: 1.15; }
 .bar:first-child { margin-top: 0; }
 
 /* ---- controls ---- */
@@ -118,11 +175,16 @@ button {
   color: var(--fg);
   padding: .32rem .7rem;
   cursor: pointer;
+  transition: background .12s, border-color .12s;
 }
 button:hover { border-color: var(--accent); }
 button:disabled { opacity: .45; cursor: default; }
-button.primary { background: #1663b3; border-color: #135596; color: #fff; }
-button.primary:hover { background: #1c72c9; }
+button.primary {
+  background: linear-gradient(180deg, #1c72c9, #1663b3);
+  border-color: #135596;
+  color: #fff;
+}
+button.primary:hover { background: linear-gradient(180deg, #237dd6, #1c72c9); border-color: #114d88; }
 button.danger { color: var(--err); }
 button.danger:hover { background: #fbecec; }
 button.link {
@@ -142,7 +204,11 @@ input, select, textarea {
   min-width: 0;
 }
 textarea { font-family: var(--mono); font-size: 12.5px; width: 100%; min-height: 6.5rem; }
-input:focus, select:focus, textarea:focus { outline: 1px solid var(--accent); }
+input:focus, select:focus, textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px #1663b326;
+}
 label { font-size: 12px; color: var(--fg-dim); }
 
 .panel {
@@ -155,6 +221,7 @@ label { font-size: 12px; color: var(--fg-dim); }
   flex-wrap: wrap;
   gap: .5rem .6rem;
   align-items: flex-end;
+  box-shadow: var(--shadow-sm);
 }
 .panel .field { display: grid; gap: .2rem; }
 .panel h3 { flex-basis: 100%; margin: 0; font-size: 13px; color: var(--fg-dim); font-weight: 500; }
@@ -162,9 +229,10 @@ label { font-size: 12px; color: var(--fg-dim); }
 .badge {
   border: 1px solid var(--line);
   border-radius: 999px;
-  padding: 0 .5rem;
+  padding: .05rem .55rem;
   font-size: 11.5px;
   color: var(--fg-dim);
+  white-space: nowrap;
 }
 .badge.admin { color: var(--warn); border-color: #d9b664; background: #fdf6e8; }
 .badge.off { color: var(--err); border-color: #e2a6a6; background: #fdeeee; }
@@ -176,7 +244,7 @@ label { font-size: 12px; color: var(--fg-dim); }
 .col-narrow, .col-wide { min-width: 0; }
 @media (max-width: 900px) { .split { grid-template-columns: 1fr; } }
 
-.list { list-style: none; margin: 0 0 1rem; padding: 0; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.list { list-style: none; margin: 0 0 1rem; padding: 0; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; box-shadow: var(--shadow-sm); }
 .list li { padding: .3rem .6rem; border-bottom: 1px solid var(--line); cursor: pointer; display: flex; gap: .5rem; align-items: baseline; }
 .list li:last-child { border-bottom: none; }
 .list li:hover { background: var(--bg3); }
@@ -184,20 +252,35 @@ label { font-size: 12px; color: var(--fg-dim); }
 .list li .kind { margin-left: auto; font-size: 11px; color: var(--fg-dim); text-transform: uppercase; letter-spacing: .04em; }
 
 .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr)); gap: .75rem; }
-.card { background: var(--bg2); border: 1px solid var(--line); border-radius: 8px; padding: .7rem .8rem; }
-.card .n { font-size: 22px; font-weight: 600; }
+.card {
+  background: var(--bg2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: .7rem .8rem;
+  box-shadow: var(--shadow-sm);
+  transition: transform .12s, box-shadow .12s;
+}
+.card:hover { transform: translateY(-1px); box-shadow: var(--shadow-md); }
+.card .n { font-size: 23px; font-weight: 650; color: var(--accent); }
 .card .k { font-size: 12px; color: var(--fg-dim); }
 
-.tbl-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; }
+.tbl-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; box-shadow: var(--shadow-sm); background: var(--bg2); }
 table { border-collapse: collapse; width: 100%; font-size: 13px; }
 th, td { text-align: left; padding: .34rem .6rem; border-bottom: 1px solid var(--line); vertical-align: top; }
-th { background: var(--bg3); color: var(--fg-dim); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; white-space: nowrap; }
+th { background: var(--bg3); color: var(--fg-dim); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; white-space: nowrap; border-bottom: 2px solid var(--line); }
+tbody tr:nth-child(even) { background: #fafcfe; }
 tbody tr:last-child td { border-bottom: none; }
 tbody tr:hover { background: #eef3f8; }
+/* Two-line timestamps are noise: keep the audit clock on one line and let the
+   wrap column absorb the width. Action cells were already nowrap. */
 td.actions { white-space: nowrap; text-align: right; }
+td.mono { white-space: nowrap; }
 td.wrap { word-break: break-all; }
+/* The empty state is the only row in its tbody — center it instead of a
+   left-hugging lone sentence. */
+tbody tr:only-child td[colspan] { text-align: center; padding: 1.3rem .6rem; }
 
-.detail { background: var(--bg2); border: 1px solid var(--line); border-radius: 8px; padding: 1rem; }
+.detail { background: var(--bg2); border: 1px solid var(--line); border-radius: 8px; padding: 1rem; box-shadow: var(--shadow-sm); }
 .detail .head { display: flex; align-items: center; gap: .6rem; margin-bottom: .75rem; }
 .detail .head h2 { margin: 0; font-size: 17px; }
 .kv { display: grid; grid-template-columns: max-content 1fr; gap: .15rem .9rem; font-size: 13px; margin-bottom: 1rem; }
@@ -222,7 +305,7 @@ pre {
 
 #toast-host { position: fixed; right: 1rem; bottom: 1rem; display: grid; gap: .4rem; z-index: 20; }
 .toast {
-  background: var(--bg3);
+  background: var(--bg2);
   border: 1px solid var(--line);
   border-left: 3px solid var(--accent);
   border-radius: 6px;
@@ -230,7 +313,7 @@ pre {
   max-width: 34rem;
   white-space: pre-line;
   word-break: break-word;
-  box-shadow: 0 4px 18px #0002;
+  box-shadow: var(--shadow-md);
 }
 .toast.bad { border-left-color: var(--err); }
 .toast.good { border-left-color: var(--ok); }
@@ -238,6 +321,7 @@ pre {
 #modal-host {
   position: fixed; inset: 0;
   background: #0a1520a8;
+  backdrop-filter: blur(2px);
   display: grid; place-items: center;
   z-index: 30;
 }
@@ -249,5 +333,11 @@ pre {
   width: min(34rem, 92vw);
   max-height: 88vh;
   overflow: auto;
+  box-shadow: var(--shadow-md);
+  animation: pop .14s ease-out;
+}
+@keyframes pop { from { transform: scale(.97); opacity: .55; } }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
 }
 .modal .foot { display: flex; gap: .5rem; justify-content: flex-end; margin-top: 1rem; }
