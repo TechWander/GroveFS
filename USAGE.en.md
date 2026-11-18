@@ -32,6 +32,7 @@ One table covers every capability. The left column is **what you want to accompl
 | Share one view across several machines | `data-server` + `meta-server` | §4, §11 |
 | Swap metadata to the PostgreSQL backend | `--meta-store postgres://…` everywhere | §4.1, §6.2, §15.3 |
 | Govern the same metadata from any machine (never hand out the DB password) | `meta-server --control-listen` + `view`/`apikey`/`refs --control-server --api-key` | §3.5.2 |
+| Manage views and keys from a browser, and delegate base views to accounts (create accounts / grant) | `grovefs web` + `web account` / `web grant` | §3.5.3 |
 | Primary/standby HA with real fencing | `meta-server --role/--peer/--sync-repl/--witness` | §5.5, §11.8 |
 | Reconcile a broken ledger / audit who is calling | `refs rebuild` / `apikey calls` | §5.3, §3.5.1 |
 | Slim down long commands (env vars + config file) | `GROVEFS_*` / `~/.config/grovefs/grovefs.conf` | §1.1, §15.15 |
@@ -1271,6 +1272,162 @@ Semantics and boundaries:
 
 e2e in the `ctlplane` suite (startup banner / the first admin key must be minted on the host / remote create·define·alias·list·rm·refs·apikey full set with no local writes on the management machine / a second home still empty (proving the tree is only on the server) / `--for any`·`--for mount` and a junk key refused / remote revoke-instant / two refusal classes for no-key and local-flag mixing / guards still effective after a remote tree delete / the PG tier's same assertions); the remote paths of fork/graft and export/import are covered by the `forksrv` and `xfer` suites respectively (both backends × local/remote).
 
+### 3.5.3 Managing views and keys from a browser, and delegating base views to accounts (`grovefs web`)
+
+§3.5.2 let any machine govern the same metadata, but the door is still a terminal: verbs to remember, a key to carry, refusal reasons to read. The three highest-frequency things — look at the views, hand out a key, give a colleague a patch of ground — are cheaper to click. And "**this** account governs **this** patch, including the forks and aliases derived from it and the keys bound to it" is a claim about ownership that one shared admin key cannot express and the terminal has no shape for.
+
+The console adds exactly that, and it **does not add a second body of governance logic**. `grovefs web` is an HTTP gateway in front of `meta-server --control-listen`: an embedded single-page app (Overview / Views / Keys / Accounts / Audit — `include_str!`'d into the binary at build time, so no CDN, no node_modules, and it opens on an air-gapped host), which turns a browser session into an **account** and every click into one governance op forwarded onward. "Who may touch which tree" is still decided in exactly one place, server-side `gates()`/`authorize()`; the gateway only **subtracts** — the verbs it does not route (`gc.scan`/`gc.apply`/`refs.rebuild`/`view.rm_base`/`fork.graft`) can never reach the server from a browser, even where the server itself would have allowed them. Accounts, grants and password digests live on the **server** (SQLite: `<meta-dir>/meta/web_accounts.db`; PG: tables in the control DB; PBKDF2-HMAC-SHA256, 210,000 rounds), and sign-ins are verified by the process that holds the store — the gateway never sees the password library, which is exactly why it can afford to be only a translation layer.
+
+**Install time: the first administrator can only be placed by the process that holds the store.** If the governance entry point could mint its own administrators, the gate would be decorative — so bootstrap hangs off `meta-server`, not off `web`. Both flags apply only while the accounts table is **empty**; a restart that re-reads the same unit file is idempotent, while a different `--admin-user` refuses to start rather than quietly adding a second administrator. The password comes only from `--admin-password-file`, never `--admin-password` — argv is visible to every process on the machine and lands in the shell history.
+
+```bash
+$ grovefs meta-server --meta-dir .webdoc/srv --listen 127.0.0.1:15698 --control-listen 127.0.0.1:15699 \
+    --admin-user rootops --admin-password-file ./root.pw
+meta-server listening on 127.0.0.1:15698 (base .webdoc/srv, role Primary)
+meta-server: metadata backend sqlite — one db file per view under <base>/meta/
+meta-server: views are created explicitly — M_OPEN refuses a name with no existing tree or definition (`grovefs view create --view <name>`, or `--home <dir> init --view <name>`); no empty tree is ever auto-created
+meta-server: CONTROL plane listening on 127.0.0.1:15699 (admin-scope api keys only; every call is audited as method=control — mint with `grovefs apikey create --for admin --owner <account>` on this host)
+meta-server: web accounts — created the first web account 'rootops' (role admin) from the install-time flags — sign in with it, then delegate base views
+meta-server: web console sign-ins are verified HERE (`grovefs web --control-server 127.0.0.1:15699`); accounts and their base-view delegation live in meta/web_accounts.db
+```
+
+**Start the gateway.** The credential is the same `--for admin` account key from §3.5.2, and `--api-key-file` is the recommended shape (the file itself `0600`, mounted as a secret under systemd):
+
+```bash
+$ grovefs apikey --meta-dir .webdoc/srv create --label web-console --for admin --owner rootops   # shape: see §3.5.1/§3.5.2
+$ grovefs web --control-server 127.0.0.1:15699 --api-key-file ./control.key --listen 127.0.0.1:15687
+grovefs web: management console on http://127.0.0.1:15687/
+  control plane : 127.0.0.1:15699 (backend sqlite)
+  sign-in       : accounts of that server's web store; the first owner comes from its 
+                    --admin-user flag
+  sessions      : 8h idle window, 4 worker thread(s)
+```
+
+Open that address in a browser; for a remote host use an SSH tunnel (`ssh -L 8787:127.0.0.1:15687 store-host`) or a reverse proxy (§11, `docs/deploy.html`).
+
+**Creating accounts and delegating** — an account may exist before it governs anything; `grant add` is what gives it ground, and the object of a grant is a **base view**, not a leaf:
+
+```bash
+$ grovefs view --control-server 127.0.0.1:15699 create --view main
+created BASE view 'main' at .webdoc/srv/meta/main.db (via 127.0.0.1:15699)
+  deletes in a base view free the underlying object once no other view references it;
+  reshape it with `view define` or publish it under a name with `view alias`.
+
+$ grovefs web --control-server 127.0.0.1:15699 --api-key-file ./control.key account create --account bob --password-file ./bob.pw
+web account created: bob
+  role:  user
+  bases: none — it can sign in and govern nothing yet
+  note:  delegate a base view before this account can manage anything
+
+Delegate a base view (a user governs that tree and everything derived from it):
+  grovefs web --control-server 127.0.0.1:15699 grant add --account bob --base VIEW
+
+$ grovefs web --control-server 127.0.0.1:15699 --api-key-file ./control.key grant add --account bob --base main
+bob now governs 'main' and everything derived from it, as granted by rootops.
+That covers its forks, aliases and lenses, and the keys bound to any of those names.
+
+$ grovefs web --control-server 127.0.0.1:15699 --api-key-file ./control.key account list
+account              role   created                last sign-in           disabled               base views governed
+bob                  user   2026-11-17T16:39:25.333958529+00:00 -                      -                      main
+rootops              admin  2026-11-17T16:39:24.081640099+00:00 -                      -                      <all: an admin is not bounded by grants>
+
+$ grovefs web --control-server 127.0.0.1:15699 --api-key-file ./control.key grant list
+account              base view                perm     granted                by
+bob                  main                     manage   2026-11-17T16:39:25.384892614+00:00 rootops
+```
+
+The remaining account verbs: `account passwd` / `account role --role user|admin` / `account disable` (stops at the next call; `account enable` restores it with its grants untouched) / `account rm` (deletes the grants too, **but deliberately leaves its api keys** — removing a person should not silently stop a production mount that is running, and the output reports how many keys are still outstanding) / `grant rm`. Passwords always arrive via `--password-file` or `--password-stdin` (`pass generate … | grovefs web account create --account alice --password-stdin`); the two are mutually exclusive and there is no `--password`.
+
+Refusal reasons, verbatim (exit code 1; the five below are password policy, granting to an account that does not exist, a missing control plane, an invalid key, and plain HTTP on a routable address):
+
+```bash
+$ … account create --account tiny --password-stdin          # feeding "abc"
+error: password too short: use at least 10 characters
+$ … grant add --account ghost --base main
+error: no web account 'ghost' — create it first (`grovefs web account create`)
+$ grovefs web --listen 127.0.0.1:15687
+error: grovefs web needs --control-server HOST:PORT. The console is a gateway in 
+  front of `meta-server --control-listen HOST:PORT`: it holds no accounts, views, keys 
+  or audit of its own, so there is nothing for it to serve without that address.
+  Try: grovefs web --control-server 127.0.0.1:9502 --api-key-file /etc/grovefs/control.key
+$ grovefs web --control-server 127.0.0.1:15699 --api-key 'nope:not-a-key' --listen 127.0.0.1:15687
+error: cannot reach the control plane at 127.0.0.1:15699 with this key: authentication failed: unknown api key id
+The console needs `meta-server --control-listen HOST:PORT` and an `admin`-scope 
+account key (`grovefs apikey create --for admin --owner <account>`), supplied to 
+this process by --api-key / --api-key-file / $GROVEFS_CONTROL_KEY.
+$ grovefs web … --listen 0.0.0.0:15690
+error: refusing to bind 0.0.0.0:15690 — this console speaks plain HTTP, so a routable address puts every sign-in and every governance call on the wire unencrypted. Either bind 127.0.0.1 and terminate TLS in a reverse proxy (and pass --use-x-forwarded-for so sign-ins are throttled per CLIENT rather than per proxy), or pass 
+             --allow-insecure-http if this network is trusted end to end.
+```
+
+**What a signed-in session can do.** The session is one `gfs_sid` cookie, `HttpOnly; SameSite=Strict`; writes additionally carry `X-GroveFS-CSRF` (handed out by the login response), and `Origin` must equal `Host`. Signing in as `bob` returns his own reach:
+
+```json
+{ "ok": true, "account": "bob", "role": "user", "bases": ["main"], "csrf": "…" }
+```
+
+| Page | admin | user (granted `main`) |
+| --- | --- | --- |
+| Overview | backend, role, totals of views / definitions / live keys / live sessions | only its own actor/role/bases — deployment-level numbers are never shown |
+| Views | every view | `physical.list`/`def.list` return only his own tree and what derives from it; may define a lens/alias, create and delete forks, read `view.stats` |
+| Keys | every key, may mint any scope | sees only his own keys and his view's; may mint `--for mount`/`--for mcp`, which **must** bind a view; may set-ro; may revoke his own |
+| Accounts & grants | create accounts, change passwords, promote and demote, disable and delete, add and revoke base-view grants | the form is not rendered at all (he cannot create an account at any moment); the page becomes "your account + change your own password" |
+| Audit | recent calls line by line (`ts/tool/ok/detail`, detail carrying `account=<person>@<ip>`) | sees only his own lines |
+
+What `bob` gets back while working inside his own patch, from a real run (defining a lens, forking his base view, minting a key for a view of his own):
+
+```json
+{ "ok": true, "result": null }                       // def.put  {name:"team", text:"base main\nhide /secret\n"}
+{ "ok": true,                                        // fork.create {base:"main", name:"lab", with_def:true}
+  "result": { "blobs": 0, "definition": "fork main\n", "nodes": 1 } }
+{ "ok": true,                                        // view.stats {view:"main"}
+  "result": { "name": "main", "kind": "base", "base": "main", "tree": true, "forkTree": true,
+              "family": ["lab", "team"], "keys": 1, "sessions": 0, "resident": false,
+              "definition": null, "stamp": null } }
+{ "ok": true, "id": "22e14911182f4d4a8108d648cc4d7f62", "scope": "mount", "owner": "bob" }   // apikey.create
+```
+
+An attempt past his patch comes back with the server's own sentence (not something the gateway invented):
+
+```json
+{ "ok": false, "error": "account 'bob' is not an administrator, and 'view.create' is not per-view governance: a new base view picks a storage home (PG instance / data root), which is a deployment decision — an admin must run it (or grant you the base view it acts on)" }
+{ "ok": false, "error": "account 'bob' is not an administrator, and 'account.list' is not per-view governance: this describes the deployment, not one view — an admin must run it (or grant you the base view it acts on)" }
+{ "ok": false, "error": "account 'bob' may mint `--for mount` or `--for mcp` keys, not `--for admin`: those scopes govern the whole deployment, and only an administrator may hand that out" }
+{ "ok": false, "error": "'gc.scan' is not available from the console: it stays an operator CLI command, where its dry-run report and confirmations are part of calling it" }
+```
+
+Revoking does not wait for a session to expire — the server re-reads the principal per request — so after `grant rm`, bob's **next call** hits the wall, and the audit keeps names on both sides:
+
+```bash
+$ grovefs web … grant rm --account bob --base main
+bob no longer governs 'main'.
+
+# bob's session is still valid, but the next action is refused by the server:
+{ "ok": false, "error": "account 'bob' is not delegated base view 'main' (the name 'main' resolves to it) — an admin grants it with `grant bob main`" }
+```
+
+```text   ← the audit page's data source (`apikey.calls`, tab-separated, newest first)
+2026-11-17T16:39:26.776732901+00:00  grant.remove   true   account=rootops
+2026-11-17T16:39:26.692261124+00:00  view.stats     true   account=bob@127.0.0.1
+2026-11-17T16:39:26.641644723+00:00  apikey.create  true   account=bob@127.0.0.1
+2026-11-17T16:39:26.575385677+00:00  apikey.create  false  account=bob@127.0.0.1 account 'bob' may mint `--for mount` or `--for mcp` keys, not `--for admin`: …
+2026-11-17T16:39:26.541581154+00:00  fork.create    true   account=bob@127.0.0.1
+```
+
+Semantics and boundaries:
+
+- **What is granted is a base view, not a leaf**: if `grant add --base` is given a lens/alias/fork name, the server walks `resolve_base` (≤ 4 hops) up to its base view and **says so**; from then on every fork, rename or extra lens that grows under that base is automatically inside the grant, with no per-name additions — that is the difference between giving someone a patch of ground and giving them a name.
+- **The gateway subtracts capabilities, it never adds them**: the admin key it holds outranks any signed-in account, so the whitelist of verbs a page may press is **hard-coded at 28** (an op not on it answers `… is not available from the console`), and the five destructive/cross-tenant governance verbs plus `login` are not routed at all; `/api/call` matches exactly, so a prefix trick like `apikey.list/../gc.apply` gets nowhere. Those two lists (the gateway's 28 and the server's ACL table) are maintained in two files, so one unit test, `every_routed_op_has_an_access_rule`, checks that every name in the whitelist has a server-side rule, and another, `destructive_ops_are_not_routable`, pins the verbs that are deliberately not routed — drift is caught by `cargo test --lib` rather than by someone clicking a button.
+- **Identity comes from the server, not from the cookie**: the cookie only says "this browser signed in"; every request is re-authorized as its own account, so revoking a grant or `account disable` takes effect on the **next call**, while `account passwd` does not kick out sessions that are already open (that is the gateway's session table; to stop someone immediately, use `disable`).
+- **Anti-enumeration and throttling**: "no such account" and "wrong password" return byte-identical wording and status codes, with timing padded out; the same client IP that fails 5 times within 15 minutes starts receiving 429 (30s baseline, doubling for each further failure), **even if that attempt's password was correct** — the 429 body carries `retryAfter`.
+- **The control store is not a view**: view trees coexist with `refs.db`, `api_keys.db` and `web_accounts.db` under `meta/`, and which files are not view trees is decided by exactly **one** predicate (`meta::is_view_db`) — otherwise a console account library would appear in `view list` as a mountable fake view and drag `refs rebuild`/`gc`/`fork drop` down with it.
+- **Export and import are two dedicated routes** (`/api/export`, `/api/import`), not generic ops: they ship a file body and take session + CSRF the same way. Importing a **new base view** remains admin-only (`view.create` is a deployment decision); a `user` importing a tree they govern uses `as_fork=<their own base view>`.
+- **A routable bind address must be admitted explicitly**: over plain HTTP, `--listen 0.0.0.0` puts every sign-in and every governance call on the wire unencrypted, so the gateway refuses to start by default. Either terminate TLS in a reverse proxy in front (and pass `--use-x-forwarded-for`, otherwise the throttling and the audit will show the proxy's address for everyone), or pass `--allow-insecure-http` to state that the network is trusted end to end. With `--use-x-forwarded-for` on, make sure only that proxy can reach the port — otherwise the client address in the header is whatever the caller chose.
+- **The last lock cannot be destroyed**: demoting or deleting the **only enabled administrator** is refused (`'rootops' is the only enabled administrator — create a second admin and verify you can sign in as it before demoting this one`); create the second admin and verify you can sign in as it before touching the first.
+- **Feature flag**: `web` is a default feature on top of `native`; `cargo build --no-default-features --features remote-only` produces a client-only binary without the gateway or the page (and therefore without tiny_http).
+
+e2e in the `web` suite (145 checks: the four install-time flag combinations and "a refused startup does not open the port" / five classes of refusal before the gateway binds / security headers and no anonymous reach / the two wrong-login replies byte-identical (anti-enumeration) / CSRF, Origin and the whitelist verb by verb / headless account creation and delegation (including `--password-stdin`, password policy, `view list` not containing the three control stores, and `refs rebuild` still succeeding) / `bob`'s positive capabilities and each over-reach refusal / revocation and disable effective on the next call / audit attribution `account=bob@ip` with no bleeding into other people's rows / the export→import tri-state / the last-admin protection tri-state and the second admin unlocking it / the 6th sign-in attempt returning 429 with `retryAfter` / a restart with the same bootstrap flags neither re-seeds nor locks itself, while a different `--admin-user` refuses to start); the server-side storage of accounts and grants on both backends (including PG) is covered by the `webauth`/`meta` unit tests in `cargo test --lib`.
+
 ---
 
 ## 4. Production topology: central storage + multiple client LAN mounts
@@ -1709,18 +1866,18 @@ ps aux | grep grovefs                     # 查看在跑的 server / mount
 
 ## 10. Verification and regression
 
-The full board is **39 stages** in all: `build` → `unit` → **36 suites** → `bench`. **The first 38 stages gate GREEN; `bench` only prints throughput reference numbers and never gates** (for pure functional regression only, use `SKIP_BENCH=1`). `pg`/`pg_parallel`/`evict`/`control`/`forksrv` auto-SKIP their whole stage on hosts with no reachable PostgreSQL, and `xfer`/`gcremote` skip just their PG arm and run the SQLite arm — and `client` skips its whole stage on a host without the sibling `grovefs-client` checkout, its binary, or the `fusermount` helper — none of them lower GREEN.
+The full board is **40 stages** in all: `build` → `unit` → **37 suites** → `bench`. **The first 39 stages gate GREEN; `bench` only prints throughput reference numbers and never gates** (for pure functional regression only, use `SKIP_BENCH=1`). `pg`/`pg_parallel`/`evict`/`control`/`forksrv` auto-SKIP their whole stage on hosts with no reachable PostgreSQL, and `xfer`/`gcremote` skip just their PG arm and run the SQLite arm — and `client` skips its whole stage on a host without the sibling `grovefs-client` checkout, its binary, or the `fusermount` helper — none of them lower GREEN.
 
 ```bash
 export LC_ALL=C LANG=C                                 # 仓库根目录下执行(PKG_CONFIG 不必设:无 crate 查 pkg-config,§1)
-bash .build-bin/run_all.sh                # 全板 39 段(38 门控 + bench)
+bash .build-bin/run_all.sh                # 全板 40 段(39 门控 + bench)
                                           #   build unit
                                           #   posix edge e2e remote errors resilience concurrent
                                           #   metasrv ha striping locks freshness disp_fresh
                                           #   layout fork forksrv viewrm gc gcremote xfer
                                           #   bwlimit migrate import govcheck govtime
-                                          #   grovesci mcp apikey ctlplane mountkey config
-                                          #   pg pg_parallel evict control
+                                          #   grovesci mcp apikey ctlplane web mountkey config
+                                          #   pg pg_parallel evict control client
                                           #   bench(只打吞吐,不门控)
 SKIP_BENCH=1 bash .build-bin/run_all.sh   # 同上,去掉 bench
 bash .build-bin/run_all.sh fork mcp       # 只跑指定套件(build 自动前置)
@@ -1883,6 +2040,37 @@ ss -lntp | grep -E '50100|50110'                        # 两个端口在听
 
 > `meta-server`'s metadata root uses the subcommand parameter `--meta-dir` (taking precedence over the global `--home`; `--home` is the global default root); `data-server`'s data root is `--data-dir`; the two are unrelated, and neither needs the global `--home`.
 
+If you want the web console (§3.5.3), the center node becomes **three** services: the two units above keep running exactly as they do, you only have `meta-server` open one more governance port and place an administrator on **first install**, then add a `grovefs web` that listens on loopback only.
+
+```ini
+# /etc/systemd/system/grove-meta-server.service —— only this ExecStart line changes
+ExecStart=/usr/local/bin/grovefs meta-server --meta-dir /data/cluster --listen 0.0.0.0:50110 --token ${GROVE_TOKEN} --control-listen 127.0.0.1:50111 --admin-user rootops --admin-password-file /etc/grovefs/web-owner.pw
+```
+
+```ini
+# /etc/systemd/system/grove-web.service   —— the console gateway (loopback only; browsers arrive via the reverse proxy or an SSH tunnel)
+[Unit]
+Description=GroveFS management console
+After=grove-meta-server.service
+Requires=grove-meta-server.service
+
+[Service]
+ExecStart=/usr/local/bin/grovefs web --control-server 127.0.0.1:50111 --api-key-file /etc/grovefs/control.key --listen 127.0.0.1:8787
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now grove-meta-server grove-web
+ssh -L 8787:127.0.0.1:8787 10.0.0.5          # then open http://127.0.0.1:8787/ from your own workstation
+```
+
+Both secrets are root-owned 0600: `web-owner.pw` is read once and only while the accounts table is **empty** (editing that file afterwards changes no password — `grovefs web account passwd` is the verb that changes one), and `control.key` is the gateway's governance credential (revoking it takes the whole console dark, while mounts and every other CLI path keep working). Open the governance port to the **intranet** only per §11.6 — or keep it on `127.0.0.1` and run the proxy and the gateway on the same host; the full reverse-proxy + TLS units and nginx config are in `docs/deploy.html`.
+
 ### 11.5 Clients: hand mounting to systemd too (template instance, one per view)
 
 The mount unit carries `--foreground` to keep the process attached (`Type=exec` must watch the service process itself, so it can't be allowed to background-and-exit); a built-in SIGTERM handler means `systemctl stop` automatically does a clean `fusermount -u`, leaving no dead mount.
@@ -1969,7 +2157,7 @@ sudo systemctl restart grove-data-server && cat /mnt/alice/from_a.txt
 sudo systemctl stop grove-mount@alice && findmnt -T /mnt/alice | grep -q grovefs && echo "残留!" || echo "已卸载"
 ```
 
-All passing means the deployment is complete. To run the full regression (38 gated stages) see §10 and §12.7.
+All passing means the deployment is complete. To run the full regression (39 gated stages) see §10 and §12.7.
 
 ### 11.8 HA primary/standby topology (modified from §11.4)
 
@@ -2175,7 +2363,7 @@ HA topology rolling upgrade (writes uninterrupted, except the instant of switcho
 
 ### 12.7 Regression verification after changes
 
-After any upgrade/config change, run the full board (38 gated stages) on a machine with a build environment, or only the planes you care about:
+After any upgrade/config change, run the full board (39 gated stages) on a machine with a build environment, or only the planes you care about:
 
 ```bash
 bash .build-bin/run_all.sh                    # 全板(build 自动前置)
@@ -3372,6 +3560,7 @@ Development reference: `src/` (10 main modules + `remote/` + `backend/`), protoc
 | Govern the same metadata from any machine (using an account key instead of the db password) | `grovefs view --control-server H --api-key K create\|define\|alias\|list\|rm` (with `--meta-store` replaced by `--control-server`, same as above) |
 | Account key (governance port) | `grovefs --home H apikey create --label L --for admin --owner ACCT` (the first key minted on the disk-holding host) / `apikey --control-server H --api-key K list\|create\|revoke\|set-ro\|calls` |
 | Open a remote governance port | `grovefs meta-server --meta-dir D --listen IP:PORT --control-listen IP:PORT` (the second port runs only governance verbs, accepts only admin keys, audits per call) |
+| Web console (accounts + base-view delegation) | Install-time seeding: `grovefs meta-server … --control-listen H:P --admin-user A --admin-password-file F` (applies only while the accounts table is empty); start it: `grovefs web --control-server H:P --api-key-file K [--listen 127.0.0.1:8787]`; headless management: `web account create\|list\|passwd\|role\|disable\|enable\|rm` and `web grant add\|rm\|list` (passwords only via `--password-file`/`--password-stdin`, §3.5.3) |
 | Metadata service (PostgreSQL backend) | `grovefs meta-server --meta-store postgres://user:pw@host:5432/db --listen IP:PORT` (under PG `--meta-dir` is optional — the server writes no authoritative data locally) |
 | Mint an access key | `grovefs apikey --meta-dir D create --label L [--for any\|mcp\|mount\|admin] [--owner ACCT] [--view V] [--ro]` (plaintext printed once; `mount` = opens only mount/data plane, `mcp` = opens only the governance interface, `admin` = opens the governance port and admits the prior two, `--owner` required) |
 | List/revoke/audit keys | `grovefs apikey --meta-dir D list [--view V]` (with `--view`, lists only keys that can open V; a pure alias also matches keys bound to the real name) / `revoke --id ID` (exact id or unique prefix; revoking seals the key's **live mounts**) / `calls --limit N` (includes rejected mount connections) |

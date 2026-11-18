@@ -391,14 +391,17 @@ impl ControlStore for FileControlStore {
         if let Ok(rd) = std::fs::read_dir(self.base.join("meta")) {
             for ent in rd.flatten() {
                 let p = ent.path();
-                if p.extension().and_then(|e| e.to_str()) == Some("db") {
+                let Some(file) = p.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                // `api_keys.db` (the key/audit store), `web_accounts.db` (the web
+                // console's accounts) and `refs.db` (the cross-view holder ledger)
+                // are control-plane stores, not view trees — never surface them as
+                // mountable names. One predicate for every lister, so adding a
+                // fourth store cannot make it look like a view.
+                if crate::meta::is_view_db(file) {
                     if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                        // `api_keys.db` (the key/audit store) and `refs.db` (the
-                        // cross-view holder ledger) are control-plane stores, not
-                        // view trees — never surface them as mountable names.
-                        if stem != "api_keys" && stem != "refs" {
-                            out.push(stem.to_string());
-                        }
+                        out.push(stem.to_string());
                     }
                 }
             }
@@ -602,7 +605,10 @@ impl ControlStore for PgControlStore {
         };
         format!(
             "{} (PostgreSQL grovefs_control{shard_note})",
-            self.pool.uri()
+            // Redacted: this string is echoed by `info`, so it reaches the web
+            // console as well as a terminal, and the pool URI embeds the
+            // database password.
+            crate::pg_store::redact_uri(self.pool.uri())
         )
     }
 
@@ -770,7 +776,12 @@ impl ControlStore for PgControlStore {
         // The spec (not the control URI): `PgEngine::open` routes by view name.
         crate::pg_store::PgEngine::open(&self.spec, view, true)
             .map(|p| -> Arc<dyn MetaProvider> { Arc::new(p) })
-            .map_err(|e| format!("cannot open view '{view}' from {}: {e}", self.pool.uri()))
+            .map_err(|e| {
+                format!(
+                    "cannot open view '{view}' from {}: {e}",
+                    crate::pg_store::redact_uri(self.pool.uri())
+                )
+            })
     }
 
     fn base_tree_missing_note(&self, _view: &str) -> Result<Option<String>, String> {

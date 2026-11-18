@@ -237,6 +237,23 @@ struct MetaRuntime {
     /// entrances with different credential scopes, and enabling one must never
     /// silently enable the other.
     ctl_keys: Option<Arc<crate::apikeys::ApiKeyStore>>,
+    /// The web console's sign-in accounts and their delegation to base views,
+    /// built with the control port (same routing rule as [`Self::ctl_keys`]:
+    /// control-plane state follows the metadata backend). `None` without a
+    /// control port — there is then nothing that can authenticate an actor.
+    /// Every governance call re-reads it, so a revoked grant bites on the NEXT
+    /// call rather than at the next login.
+    web_auth: Option<Arc<crate::webauth::WebAuthStore>>,
+    /// Staged-transfer handle → the principal that minted it. A handle is a
+    /// file name under `<base>/meta/.xfer/`, and staged dumps are per-tenant
+    /// content (one view's whole metadata tree), so a delegated account must
+    /// not be able to pull a chunk out of a dump it did not stage — not even by
+    /// guessing a handle, which is only `pid` + a timestamp. Entries live as long
+    /// as the transfer; [`Self::prune_xfer_owners`] drops the ones whose file is
+    /// gone. A restart loses them, which is already true of the staged files
+    /// themselves (the reply says so), and an unknown handle is then only
+    /// reachable by a super principal.
+    xfer_owner: Mutex<HashMap<String, String>>,
 }
 
 impl MetaRuntime {
@@ -254,6 +271,41 @@ impl MetaRuntime {
         self.views.lock().clear();
         self.bases.lock().clear();
         self.defs.lock().clear();
+    }
+
+    /// Record that `who` minted the staged-transfer `handle`, and forget the
+    /// handles whose staging file is already gone (a client that staged a dump
+    /// and never came back for chunk 2 would otherwise leave a row forever).
+    /// Pruning here rather than on a timer costs one `stat` per abandoned
+    /// transfer, at the moment the map is already being touched.
+    fn claim_xfer(&self, handle: &str, who: &str) {
+        let mut m = self.xfer_owner.lock();
+        if m.len() > 64 {
+            let dir = self.base.join("meta").join(".xfer");
+            m.retain(|h, _| dir.join(h).exists());
+        }
+        m.insert(handle.to_string(), who.to_string());
+    }
+
+    /// Refuse a staged transfer that belongs to a different principal. An admin
+    /// (a control-key operator, or a console admin) may reach any handle: the
+    /// recovery path "an admin finishes a colleague's stuck import" is worth
+    /// more than the isolation between handles, and an admin can read the
+    /// staging file off the disk anyway. A handle with NO recorded owner (a
+    /// transfer started before a server restart) is treated the same way — the
+    /// file exists and only a trusted caller can name it.
+    fn xfer_guard(&self, handle: &str, who: &crate::webauth::Principal) -> Result<(), String> {
+        match self.xfer_owner.lock().get(handle) {
+            Some(owner) if owner.as_str() != who.account.as_str() && !who.is_super() => Err(format!(
+                "transfer handle '{handle}' was staged by another account — a delegated user may \n                     only continue transfers it started; re-run the command under your own sign-in"
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// A finished or aborted transfer releases its ownership row.
+    fn release_xfer(&self, handle: &str) {
+        self.xfer_owner.lock().remove(handle);
     }
 
     /// Physical tree a client-visible view name resolves to. Derived views
@@ -370,6 +422,12 @@ pub struct MetaServer {
     /// Empty/unset keeps the process exactly as before: no governance port, no
     /// admin credentials, nothing new to firewall.
     control_listen: Option<String>,
+    /// The install-time web-console owner (`--admin-user` +
+    /// `--admin-password-file`), held as account + password ONLY for the length
+    /// of `serve()` — it is hashed into the account store and then dropped, and
+    /// never reaches `MetaRuntime`. `None` seeds nothing: an existing store keeps
+    /// exactly the accounts it already has.
+    admin_account: Option<(String, String)>,
 }
 
 /// Default idle-engine eviction window for a builder-constructed `MetaServer`
@@ -400,6 +458,7 @@ impl MetaServer {
             store_unavailable: None,
             engine_idle_ms: DEFAULT_ENGINE_IDLE_MS,
             control_listen: None,
+            admin_account: None,
         }
     }
 
@@ -420,6 +479,7 @@ impl MetaServer {
             store_unavailable: None,
             engine_idle_ms: DEFAULT_ENGINE_IDLE_MS,
             control_listen: None,
+            admin_account: None,
         }
     }
 
@@ -446,6 +506,23 @@ impl MetaServer {
     /// this process byte-for-byte identical to a server without the feature.
     pub fn with_control_listen(mut self, addr: Option<String>) -> Self {
         self.control_listen = addr.filter(|a| !a.trim().is_empty());
+        self
+    }
+
+    /// Set the install-time web-console owner: the account `grovefs web` logs in
+    /// as the first time. Only meaningful together with
+    /// [`MetaServer::with_control_listen`] (that is where the account store is
+    /// opened); `serve()` calls [`crate::webauth::bootstrap_owner`], which
+    /// creates the row when the store is EMPTY, treats a same-named existing
+    /// admin as an idempotent no-op (a systemd restart re-reads the unit file) —
+    /// and REFUSES to mint a second owner into a store that already has one.
+    /// Accounts after that are created by an admin in the console/CLI, so this
+    /// flag is an install-time credential, not a per-boot one.
+    pub fn with_admin_account(mut self, account: Option<String>, password: Option<String>) -> Self {
+        self.admin_account = match (account, password) {
+            (Some(a), Some(p)) => Some((a, p)),
+            _ => None,
+        };
         self
     }
 
@@ -603,17 +680,35 @@ impl MetaServer {
         // does NOT turn on the mount gate. A control port without a key store
         // would be an unauthenticated administrator entrance, which is why
         // there is no "open" mode for it at all.
-        let ctl_keys = match &self.control_listen {
-            None => None,
+        let (ctl_keys, web_auth, admin_note) = match &self.control_listen {
+            None => (None, None, None),
             Some(_) => {
                 let store_uri = match &self.store {
                     StoreKind::Pg(u) => Some(u.as_str()),
                     StoreKind::Sqlite => None,
                 };
-                Some(Arc::new(
+                let keys = Arc::new(
                     crate::apikeys::ApiKeyStore::open_for(&self.base, store_uri)
                         .map_err(io::Error::other)?,
-                ))
+                );
+                let web = Arc::new(
+                    crate::webauth::WebAuthStore::open_for(&self.base, store_uri)
+                        .map_err(io::Error::other)?,
+                );
+                // Install-time owner (`--admin-user` + `--admin-password-file`).
+                // Seeded HERE, by the process that owns the store, because a
+                // governance entrance that could mint its own administrator has
+                // no gate; the rule `bootstrap_owner` applies (and why a restart
+                // must not fail on a flag a unit file keeps re-reading) is stated
+                // there.
+                let note = match &self.admin_account {
+                    Some((account, password)) => Some(
+                        crate::webauth::bootstrap_owner(&web, account, password)
+                            .map_err(io::Error::other)?,
+                    ),
+                    None => None,
+                };
+                (Some(keys), Some(web), note)
             }
         };
         let listener = TcpListener::bind(&self.listen)?;
@@ -704,6 +799,8 @@ impl MetaServer {
             defs: Arc::new(Mutex::new(HashMap::new())),
             engine_idle_ms: self.engine_idle_ms,
             ctl_keys,
+            web_auth,
+            xfer_owner: Mutex::new(HashMap::new()),
         });
         if rt.sync_repl {
             println!("meta-server: synchronous replication ON (RPO=0 for mutating ops, ACK timeout {SYNC_REPL_ACK_TIMEOUT:?})");
@@ -730,6 +827,22 @@ impl MetaServer {
                 "meta-server: CONTROL plane listening on {addr} (admin-scope api keys only; \
                  every call is audited as method=control — mint with `grovefs apikey create \
                  --for admin --owner <account>` on this host)"
+            );
+            // The web console's account store came up with this port, so say
+            // what it holds: an operator must be able to tell "the install flag
+            // seeded the first owner" from "the flag was ignored because one
+            // already exists" without opening a browser.
+            if let Some(note) = &admin_note {
+                println!("meta-server: web accounts — {note}");
+            }
+            println!(
+                "meta-server: web console sign-ins are verified HERE (`grovefs web --control-server {}`); \
+                 accounts and their base-view delegation live in {}",
+                addr,
+                match &self.store {
+                    StoreKind::Pg(_) => "grovefs_control.web_accounts/web_grants",
+                    StoreKind::Sqlite => "meta/web_accounts.db",
+                }
             );
             let crt = rt.clone();
             thread::spawn(move || gov_accept(cl, crt));
@@ -846,23 +959,53 @@ fn serve_on_meta_full(listener: TcpListener, base: PathBuf, token: &str) {
         // exactly the pre-eviction behavior.
         engine_idle_ms: 0,
         ctl_keys: None,
+        web_auth: None,
+        xfer_owner: Mutex::new(HashMap::new()),
     });
     serve_runtime(listener, rt);
 }
 
 fn serve_runtime(listener: TcpListener, rt: Arc<MetaRuntime>) {
-    if rt.engine_idle_ms > 0 {
+    // One ticker carries two jobs: engine eviction (an idle view releases its
+    // WHOLE pool) and pool reaping (a burst above the warm floor is shed back).
+    // The second is what makes a mounted view's idle writers reclaimable at
+    // all — eviction can never reach a mounted view, sessions pin the engine.
+    // Reaping is only worth a thread on a PG backend; SQLite holds no
+    // per-view PG backends, so the pre-eviction "no sweeper" behavior of the
+    // LAN-trusted test server (`engine_idle_ms == 0`) stays exactly as it was.
+    let pg_reap = matches!(rt.store, StoreKind::Pg(_)) && crate::pg_store::pool_idle_ms() > 0;
+    if rt.engine_idle_ms > 0 || pg_reap {
         let sw = rt.clone();
         thread::spawn(move || loop {
-            // Sweep at half the idle window (bounded to 1s–60s) so eviction
-            // lands within ≤1.5× the configured window without a tick storm.
-            let nap = (sw.engine_idle_ms / 2).clamp(1_000, 60_000);
+            // Sweep at half the window each job is configured with, bounded to
+            // 1s–60s, and take the SHORTER of the two: eviction wants to land
+            // within ≤1.5× its idle window, and a reaper that sleeps longer
+            // than the reap TTL would stretch an operator's `--pg-pool-idle-secs
+            // 5` into a minute of held burst connections.
+            let evict = if sw.engine_idle_ms > 0 {
+                (sw.engine_idle_ms / 2).clamp(1_000, 60_000)
+            } else {
+                u64::MAX
+            };
+            let reap = (crate::pg_store::pool_idle_ms() / 2).clamp(1_000, 60_000);
+            let nap = evict.min(reap);
             thread::sleep(std::time::Duration::from_millis(nap));
             let gone = evict_idle(&sw);
             if gone > 0 {
                 println!(
                     "meta-server: evicted {gone} idle engine(s) (>{}s idle, no sessions)",
                     sw.engine_idle_ms / 1000
+                );
+            }
+            let shed = reap_pools(&sw);
+            if shed > 0 {
+                // Per-view windows may differ (a `view pool --idle-secs` override
+                // beats the process value), so the line names the process default
+                // as what it is: the floor of the sweep interval, not the TTL that
+                // necessarily fired.
+                println!(
+                    "meta-server: reaped {shed} idle PG pool connection(s) back to their warm floor (process window {}s, per-view overrides honored)",
+                    crate::pg_store::pool_idle_ms() / 1000
                 );
             }
         });
@@ -939,6 +1082,66 @@ fn gov_reply(s: &mut TcpStream, result: serde_json::Value, err: Option<&str>) ->
     proto::send_response(s, 0, 0, &data)
 }
 
+/// The caller behind one governance connection, decided from the request body.
+///
+/// Two shapes arrive on this port and they must not be confused:
+///
+/// - **an operator** — an admin-scope account key and NO `account` field. That
+///   key already means full governance everywhere in GroveFS (`grovefs view`,
+///   `grovefs apikey`, MCP), so it keeps exactly those rights and is attributed
+///   by key owner;
+/// - **a console user** — the SAME admin key (the gateway holds it; it is the
+///   only credential that can reach this port) plus `account`, the signed-in
+///   web account. That account is re-read from the store on every call and the
+///   ACL below applies to it.
+///
+/// The trust boundary is therefore the admin key, not the `account` field: a
+/// process that can read the key could name anyone, but it can already do
+/// everything the key permits, so nothing is gained. What the field buys is
+/// ATTRIBUTION and per-user LIMITATION — which is the whole point of putting a
+/// console in front of this port: many people, few shared credentials, and each
+/// person's reach bounded by their delegations. `grovefs web` is the only thing
+/// that ever sets it, and it refuses to start without the key.
+fn gov_actor(
+    rt: &Arc<MetaRuntime>,
+    account: &str,
+    authed: &crate::apikeys::AuthedKey,
+) -> Result<crate::webauth::Principal, String> {
+    if account.is_empty() {
+        return Ok(crate::webauth::Principal::operator(
+            authed.owner.as_deref().unwrap_or(&authed.label),
+        ));
+    }
+    let store = rt.web_auth.as_deref().ok_or_else(|| {
+        "this server has no web account store, so it cannot accept an `account` on a control call \
+         (start the meta-server with --control-listen; sign-ins are checked by that process)"
+            .to_string()
+    })?;
+    crate::webauth::Principal::lookup(store, account)
+}
+
+/// Verify a console sign-in HERE, where the password digests live. The gateway
+/// deliberately cannot check a password: it holds no digests, so the answer to
+/// "is this the right password" has to come from the store, and the store is
+/// only open in the process that owns it. Returns the same shape a successful
+/// `login` reply needs, and one identical refusal for "no such account" and
+/// "wrong password".
+fn gov_login(rt: &Arc<MetaRuntime>, a: &serde_json::Value) -> Result<serde_json::Value, String> {
+    use serde_json::json;
+    let store = rt.web_auth.as_deref().ok_or_else(|| {
+        "this server has no web account store — start it with --control-listen to get sign-ins"
+            .to_string()
+    })?;
+    let account = crate::webauth::normalize_account(&req_str(a, "account")?)?;
+    let password = req_str(a, "password")?;
+    let ok = store.login(&account, &password)?;
+    Ok(json!({
+        "account": ok.account,
+        "role": ok.role.as_str(),
+        "bases": ok.bases,
+    }))
+}
+
 fn handle_gov_conn(mut s: TcpStream, rt: &Arc<MetaRuntime>) -> io::Result<()> {
     let _ = s.set_nodelay(true);
     let (op_code, body) = proto::recv_request(&mut s)?;
@@ -965,6 +1168,21 @@ fn handle_gov_conn(mut s: TcpStream, rt: &Arc<MetaRuntime>) -> io::Result<()> {
     let key = req.get("k").and_then(|v| v.as_str()).unwrap_or("");
     let op = req.get("op").and_then(|v| v.as_str()).unwrap_or("");
     let args = req.get("a").cloned().unwrap_or(serde_json::Value::Null);
+    // The web console's per-user attribution: WHO signed in, and from where. Only
+    // the `account` half is checked against the store; `ip` is a label, taken
+    // from the gateway's own view of the socket (it is the gateway that sees the
+    // browser, not this server), and it is recorded verbatim so an audit line
+    // cannot be made to look like someone else's by a crafted value that happens
+    // to parse — it is a string in a detail column, nothing more.
+    let account = req.get("account").and_then(|v| v.as_str()).unwrap_or("");
+    let ip = req.get("ip").and_then(|v| v.as_str()).unwrap_or("");
+    let actor = |owner: &str| {
+        if account.is_empty() {
+            owner.to_string()
+        } else {
+            format!("{account}@{ip}")
+        }
+    };
     let Some(keys) = rt.ctl_keys.as_ref() else {
         return gov_reply(
             &mut s,
@@ -984,14 +1202,59 @@ fn handle_gov_conn(mut s: TcpStream, rt: &Arc<MetaRuntime>) -> io::Result<()> {
             return gov_reply(&mut s, serde_json::Value::Null, Some(&e));
         }
     };
-    match control_dispatch(rt, op, &args) {
+    // Sign-in is the one call made BEFORE there is a principal to authorize, so
+    // it is answered here and never reaches `control_dispatch` — where an
+    // unaccountable caller would have no rule to be judged by.
+    if op == "login" {
+        let out = gov_login(rt, &args);
+        // A failed sign-in is audited against the KEY (there is no verified
+        // account yet) and names the account tried, so `apikey calls` shows the
+        // attempts and not just the successes. It must NOT echo the password.
+        let detail = match &out {
+            Ok(v) => format!(
+                "account={} role={}",
+                actor("-"),
+                v.get("role").and_then(|r| r.as_str()).unwrap_or("?")
+            ),
+            Err(e) => format!(
+                "account={} {e}",
+                if account.is_empty() { "-" } else { account }
+            ),
+        };
+        let _ = keys.log_call(
+            Some(&authed),
+            "control",
+            "login",
+            out.is_ok(),
+            &detail,
+        );
+        return match out {
+            Ok(v) => gov_reply(&mut s, v, None),
+            Err(e) => gov_reply(&mut s, serde_json::Value::Null, Some(&e)),
+        };
+    }
+    let who = match gov_actor(rt, account, &authed) {
+        Ok(w) => w,
+        Err(e) => {
+            let _ = keys.log_call(
+                Some(&authed),
+                "control",
+                op,
+                false,
+                &format!("account={} {e}", actor("-")),
+            );
+            return gov_reply(&mut s, serde_json::Value::Null, Some(&e));
+        }
+    };
+    let owner = authed.owner.as_deref().unwrap_or(&authed.label);
+    match control_dispatch(rt, op, &args, &who) {
         Ok(v) => {
             let _ = keys.log_call(
                 Some(&authed),
                 "control",
                 op,
                 true,
-                &format!("account={}", authed.owner.as_deref().unwrap_or("-")),
+                &format!("account={}", actor(owner)),
             );
             gov_reply(&mut s, v, None)
         }
@@ -1001,7 +1264,7 @@ fn handle_gov_conn(mut s: TcpStream, rt: &Arc<MetaRuntime>) -> io::Result<()> {
                 "control",
                 op,
                 false,
-                &format!("account={} {e}", authed.owner.as_deref().unwrap_or("-")),
+                &format!("account={} {e}", actor(owner)),
             );
             gov_reply(&mut s, serde_json::Value::Null, Some(&e))
         }
@@ -1101,19 +1364,362 @@ fn free_unbooked(rep_refs: &[String], droot: &Path) -> String {
     )
 }
 
+/// What one governance op demands of its caller. Stated as data, in one match,
+/// and evaluated BEFORE the op runs: the console's buttons are a convenience,
+/// this is the gate. An op that is not listed here is REFUSED rather than
+/// defaulted, so adding a verb to `control_dispatch` without saying who may
+/// call it fails loudly instead of silently becoming an open endpoint.
+enum Gate {
+    /// Nothing beyond a valid sign-in: the caller's own identity and state.
+    Self_,
+    /// An administrator only. The reason is quoted to the caller, because the
+    /// console shows it in the refusal — "why can't I click that" should not
+    /// need a Slack message to answer.
+    Super(&'static str),
+    /// Must govern the existing view named by this arg.
+    Base(&'static str),
+    /// Must govern every existing view named by these args.
+    Bases(&'static [&'static str]),
+    /// (Re)defines the view named by `name` from the text in `text`: must govern
+    /// what the name already is (if anything) and what the new text is OVER.
+    Define { name: &'static str, text: &'static str },
+    /// Forks the base in `base` under the name in `name`: must govern the base,
+    /// and the name if it already exists.
+    Create { base: &'static str, name: &'static str },
+    /// Must have staged the transfer handle named by this arg (an admin may
+    /// finish anyone's transfer).
+    Handle(&'static str),
+    /// Must own the api key named by this arg (or be an admin).
+    Key(&'static str),
+    /// Must be an admin, or the account named by the `account` arg.
+    SelfAccount,
+    /// An uploaded dump being installed: the handle must be the caller's, and
+    /// the target is a NEW base view (admin) unless `as_fork` names a base the
+    /// caller governs (then it is that caller's fork). Stated as one gate
+    /// because the two cases share the same args and only an admin may create a
+    /// base view from anywhere.
+    Import,
+}
+
+/// The access rule for one op. Kept adjacent to `control_dispatch`'s match: the
+/// two lists are the same list, and a diff that adds an arm without adding a
+/// line here is the mistake this shape exists to catch.
+fn gates(op: &str) -> Result<Vec<Gate>, String> {
+    let g = match op {
+        "whoami" | "login" => vec![Gate::Self_],
+        // Deployment-wide reads and writes.
+        "info" => vec![Gate::Self_],
+        "store.info" | "account.list" | "account.create" | "account.role" | "account.disable"
+        | "account.delete" | "grant.add" | "grant.remove" | "grant.list" => {
+            vec![Gate::Super("this describes the deployment, not one view")]
+        }
+        "account.passwd" => vec![Gate::SelfAccount],
+        // View definition reads/writes.
+        "def.list" | "physical.list" => vec![Gate::Self_],
+        "def.get" | "stamp" | "physical.has" | "fork.has" | "def.remove" | "fork.drop" => {
+            vec![Gate::Base("name")]
+        }
+        "view.stats" => vec![Gate::Base("view")],
+        "view.export" => vec![Gate::Base("view")],
+        "def.put" => vec![Gate::Define {
+            name: "name",
+            text: "text",
+        }],
+        "fork.create" => vec![Gate::Create {
+            base: "base",
+            name: "name",
+        }],
+        "fork.graft" => vec![Gate::Bases(&["dst", "src"])],
+        // Chunked portable dumps: the name is checked when the handle is minted
+        // (`view.export`, `view.import.commit`), the later chunks are guarded by
+        // handle OWNERSHIP, which is the only thing that still identifies a
+        // caller mid-transfer.
+        "view.export.chunk" | "view.export.done" | "view.import.put" | "view.import.abort" => {
+            vec![Gate::Handle("handle")]
+        }
+        "view.import.begin" => vec![Gate::Self_],
+        "view.import.commit" => vec![Gate::Import],
+        // Placement, refcounts and content-byte GC cross every tenant.
+        "view.create" => vec![Gate::Super(
+            "a new base view picks a storage home (PG instance / data root), which is a deployment decision",
+        )],
+        "view.rm_base" | "refs.rebuild" | "gc.scan" | "gc.apply" => vec![Gate::Super(
+            "it destroys or rewrites state shared by more views than the caller's own",
+        )],
+        // Credentials: an admin sees all; a delegated account may hold keys for
+        // its own views only (enforced in the arms, which is where the scope and
+        // owner of a key are known).
+        "apikey.create" | "apikey.list" | "apikey.calls" => vec![Gate::Self_],
+        "apikey.revoke" | "apikey.set_ro" => vec![Gate::Key("id")],
+        other => {
+            return Err(format!(
+                "control op '{other}' has no access rule (unknown, or added to the dispatcher \n                     without one) — refusing. Known ops: info, whoami, login, def.list/get/put/remove, \n                     stamp, physical.list/has, fork.has/create/drop/graft, view.create/stats/export/import, \n                     view.rm_base, refs.rebuild, gc.scan/apply, apikey.create/list/revoke/set_ro/calls, \n                     account.list/create/passwd/role/disable/delete, grant.list/add/remove"
+            ));
+        }
+    };
+    Ok(g)
+}
+
+/// Is `op` one this plane knows and has RULED on? Exported for
+/// [`crate::web`]'s startup test: the console's whitelist and this table are two
+/// lists of the same ops kept in two files, and a name that drifts between them
+/// is either a dead button or a promise the console cannot keep.
+pub fn control_op_known(op: &str) -> bool {
+    gates(op).is_ok()
+}
+
+/// Refuse unless `who` governs `name`. `allow_new` is for the verbs that CREATE
+/// the name (`def put`, `fork create`): a delegated account may not overwrite a
+/// view that belongs to someone else, but a name that has neither a definition
+/// nor a tree yet belongs to whoever makes it — otherwise the one thing a
+/// delegate must be able to do (build a lens on its own base) would be impossible.
+fn may_govern(
+    rt: &Arc<MetaRuntime>,
+    who: &crate::webauth::Principal,
+    name: &str,
+    allow_new: bool,
+) -> Result<(), String> {
+    if who.is_super() {
+        return Ok(());
+    }
+    if who.manages(rt.control.as_ref(), name).unwrap_or(false) {
+        return Ok(());
+    }
+    if allow_new {
+        // An unresolvable name that does not exist yet is free to claim. One that
+        // resolves to a base the caller does not hold is NOT, and neither is a
+        // broken chain: `manages` already refused it.
+        if !(rt.control.has_def(name)? || rt.control.has_physical(name)?) {
+            return Ok(());
+        }
+    }
+    Err(who.refusal(rt.control.as_ref(), name))
+}
+
+/// Does this principal see this credential row? Its own, or bound to a view it
+/// governs — the second half matters because a key outlives the account that
+/// minted it, and the person who has to clean it up is whoever owns the tree.
+fn key_visible(
+    rt: &Arc<MetaRuntime>,
+    who: &crate::webauth::Principal,
+    k: &crate::apikeys::KeyInfo,
+) -> bool {
+    if who.is_super() {
+        return true;
+    }
+    if k.owner.as_deref() == Some(who.account.as_str()) {
+        return true;
+    }
+    match &k.view {
+        Some(v) => who.manages(rt.control.as_ref(), v).unwrap_or(false),
+        None => false,
+    }
+}
+
+/// The api key row `id`, if it exists at all. Read as a row rather than as an
+/// owner string because the refusal has to name the key, and because "no such
+/// key" and "a key with no owner column value" are different answers.
+fn key_row(rt: &Arc<MetaRuntime>, id: &str) -> Result<Option<crate::apikeys::KeyInfo>, String> {
+    let keys = rt
+        .ctl_keys
+        .as_ref()
+        .ok_or_else(|| "this server has no control key store".to_string())?;
+    Ok(keys.list()?.into_iter().find(|k| k.id == id))
+}
+
+/// Enforce `gates(op)` against `who`. Every refusal names what the caller may
+/// do instead, because the console renders this string to a user who is looking
+/// at a button they just pressed.
+fn authorize(
+    rt: &Arc<MetaRuntime>,
+    who: &crate::webauth::Principal,
+    op: &str,
+    a: &serde_json::Value,
+) -> Result<(), String> {
+    for gate in gates(op)? {
+        match gate {
+            Gate::Self_ => {}
+            Gate::Super(reason) => {
+                if !who.is_super() {
+                    return Err(format!(
+                        "account '{}' is not an administrator, and '{op}' is not per-view governance: {reason} — an admin must run it (or grant you the base view it acts on)",
+                        who.account
+                    ));
+                }
+            }
+            Gate::Base(arg) => may_govern(rt, who, &req_str(a, arg)?, false)?,
+            Gate::Bases(args) => {
+                for arg in args {
+                    may_govern(rt, who, &req_str(a, arg)?, false)?;
+                }
+            }
+            Gate::Define { name, text } => {
+                let name = req_str(a, name)?;
+                let text = req_str(a, text)?;
+                let def = crate::layout::LayoutRules::parse_def(&text)
+                    .map_err(|e| format!("cannot govern '{name}': the new definition is unreadable: {e}"))?;
+                let parent = match def {
+                    crate::layout::ViewDef::Derived(b, _) | crate::layout::ViewDef::Fork(b) => b,
+                    crate::layout::ViewDef::Alias(r) => r,
+                };
+                // Over a base the caller does not hold, a lens is a way to read
+                // someone else's tree; the name itself is checked separately so
+                // an existing view cannot be re-pointed by a non-owner.
+                may_govern(rt, who, &parent, false)?;
+                may_govern(rt, who, &name, true)?;
+            }
+            Gate::Create { base, name } => {
+                may_govern(rt, who, &req_str(a, base)?, false)?;
+                may_govern(rt, who, &req_str(a, name)?, true)?;
+            }
+            Gate::Handle(arg) => rt.xfer_guard(&req_str(a, arg)?, who)?,
+            Gate::Key(arg) => {
+                let id = req_str(a, arg)?;
+                if !who.is_super() {
+                    match key_row(rt, &id)? {
+                        // An id with no row is the op's own "nothing revoked"
+                        // answer; the ACL has nothing to say about it.
+                        None => {}
+                        Some(k) if k.owner.as_deref() == Some(who.account.as_str()) => {}
+                        Some(k) => {
+                            return Err(format!(
+                                "api key '{id}' ('{}') belongs to {}— its owner or an administrator must change it",
+                                k.label,
+                                match &k.owner {
+                                    Some(a) => format!("account '{a}' "),
+                                    None => "no account (a pre-account key) ".to_string(),
+                                }
+                            ));
+                        }
+                    }
+                }
+            }
+            Gate::SelfAccount => {
+                let acc = crate::webauth::normalize_account(&req_str(a, "account")?)?;
+                if !who.is_super() && acc != who.account {
+                    return Err(format!(
+                        "account '{}' may change its own password, not '{acc}' — an admin acts on other accounts",
+                        who.account
+                    ));
+                }
+            }
+            Gate::Import => {
+                rt.xfer_guard(&req_str(a, "handle")?, who)?;
+                let view = req_str(a, "view")?;
+                match a.get("as_fork").and_then(|v| v.as_str()) {
+                    Some(base) => {
+                        may_govern(rt, who, base, false)?;
+                        may_govern(rt, who, &view, true)?;
+                    }
+                    // No `as_fork` means this dump becomes a BASE view, which is
+                    // `view.create` by another door.
+                    None => {
+                        if !who.is_super() {
+                            return Err(format!(
+                                "account '{}' cannot import a new base view '{view}' — an admin must create base views; to import a copy of a view you govern, pass as_fork=<your base>",
+                                who.account
+                            ));
+                        }
+                        may_govern(rt, who, &view, true)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The view names a principal may see. An admin's list is returned untouched —
+/// no `resolve_base` per name — which is the common case and keeps the
+/// deployment-wide listing exactly as cheap as it was before accounts existed.
+fn visible(
+    rt: &Arc<MetaRuntime>,
+    who: &crate::webauth::Principal,
+    names: Vec<String>,
+) -> Vec<String> {
+    if who.is_super() {
+        return names;
+    }
+    names
+        .into_iter()
+        // A name that fails to resolve is hidden rather than reported: to a
+        // delegate it is not theirs either way, and a broken chain elsewhere in
+        // the deployment is not information this listing needs to leak.
+        .filter(|n| who.manages(rt.control.as_ref(), n).unwrap_or(false))
+        .collect()
+}
+
 fn control_dispatch(
     rt: &Arc<MetaRuntime>,
     op: &str,
     a: &serde_json::Value,
+    who: &crate::webauth::Principal,
 ) -> Result<serde_json::Value, String> {
     use serde_json::json;
+    authorize(rt, who, op, a)?;
     match op {
-        "info" => Ok(json!({
-            "backend": rt.control.backend(),
-            "describe": rt.control.describe(),
-            "base": rt.base.display().to_string(),
-        })),
-        "def.list" => Ok(json!(rt.control.list_defs()?)),
+        // What this server IS. An administrator sees the deployment: backend,
+        // its self-description, the local base dir. A delegated account sees
+        // only its own reach — `describe` names storage hosts and `base` names
+        // server paths, and neither is anything a view manager needs to do a
+        // job while holding the keys of one tree.
+        "info" => {
+            if who.is_super() {
+                Ok(json!({
+                    "backend": rt.control.backend(),
+                    "describe": rt.control.describe(),
+                    "base": rt.base.display().to_string(),
+                    "actor": who.account,
+                    "role": who.role.as_str(),
+                }))
+            } else {
+                Ok(json!({
+                    "backend": rt.control.backend(),
+                    "actor": who.account,
+                    "role": who.role.as_str(),
+                    "bases": who.bases,
+                }))
+            }
+        }
+        // The whole deployment seen from the control plane: for the console's
+        // overview page. Deployment-wide numbers are exactly what a delegated
+        // account must not read about someone else's tree, so `Super`.
+        "store.info" => {
+            let live: usize = rt.subs.lock().values().map(|m| m.len()).sum();
+            let engines = rt.cache.lock().len();
+            let views = rt.views.lock().len();
+            let (accounts, keys) = (
+                rt.web_auth
+                    .as_ref()
+                    .and_then(|w| w.list().ok().map(|v| v.len())),
+                rt.ctl_keys
+                    .as_ref()
+                    .and_then(|k| k.list().ok().map(|v| v.iter().filter(|r| r.revoked_at.is_none()).count())),
+            );
+            Ok(json!({
+                "backend": rt.control.backend(),
+                "describe": rt.control.describe(),
+                "base": rt.base.display().to_string(),
+                "role": format!("{:?}", rt.role()),
+                "views": rt.control.list_physical()?.len(),
+                "definitions": rt.control.list_defs()?.len(),
+                "accounts": accounts,
+                "liveKeys": keys,
+                "liveSessions": live,
+                "residentEngines": engines,
+                "residentViews": views,
+            }))
+        }
+        // A delegated caller's list is its own definitions: the same lens/fork
+        // chain `may_govern` judges writes by, so what a user can SEE and what
+        // a user can TOUCH cannot drift apart.
+        "def.list" => {
+            let defs = rt.control.list_defs()?;
+            if who.is_super() {
+                return Ok(json!(defs));
+            }
+            Ok(json!(visible_pairs(rt, who, defs)))
+        }
         "def.get" => {
             let name = req_str(a, "name")?;
             Ok(json!(rt.control.get_def_raw(&name)?))
@@ -1134,7 +1740,10 @@ fn control_dispatch(
             Ok(json!(removed))
         }
         "stamp" => Ok(json!(rt.control.stamp(&req_str(a, "name")?))),
-        "physical.list" => Ok(json!(rt.control.list_physical()?)),
+        "physical.list" => {
+            let v = rt.control.list_physical()?;
+            Ok(json!(visible(rt, who, v)))
+        }
         "physical.has" => Ok(json!(rt.control.has_physical(&req_str(a, "name")?)?)),
         "fork.has" => Ok(json!(rt.control.has_fork_tree(&req_str(a, "name")?)?)),
         // The tree-copy verbs. They are served HERE — by the process that owns
@@ -1148,10 +1757,40 @@ fn control_dispatch(
             let base = req_str(a, "base")?;
             let name = req_str(a, "name")?;
             let seed = a.get("seed").and_then(|v| v.as_bool()).unwrap_or(true);
+            // `with_def`: record `fork <base>` in the same call that builds the
+            // tree. The CLI's `view fork` sequences the two itself (and prints the
+            // definition it wrote), so it does not pass this flag and its behaviour
+            // is untouched; the console does, because a browser can be closed
+            // between two requests and leave a tree whose name resolves to nothing
+            // — the one intermediate state that has no self-service repair.
+            let with_def = a
+                .get("with_def")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let text = format!("fork {base}\n");
+            if with_def && rt.control.has_def(&name)? {
+                return Err(format!(
+                    "view '{name}' already has a definition — this call would overwrite it"
+                ));
+            }
             let st = rt.control.create_fork_tree(&base, &name, seed)?;
+            if with_def {
+                // Tree first, definition second, and the tree goes back if the
+                // definition cannot be written: the reverse order is what strands
+                // a name that resolves to a missing tree.
+                if let Err(e) = rt.control.put_def(&name, &text) {
+                    rt.control.destroy_fork_tree(&name);
+                    rt.evict();
+                    return Err(format!("cannot record the fork definition for '{name}': {e}"));
+                }
+            }
             // A cached engine for `name` could only be a stale tree handle.
             rt.evict();
-            Ok(json!({"nodes": st.nodes, "blobs": st.blobs}))
+            Ok(json!({
+                "nodes": st.nodes,
+                "blobs": st.blobs,
+                "definition": if with_def { serde_json::Value::from(text) } else { serde_json::Value::Null },
+            }))
         }
         "fork.drop" => {
             let name = req_str(a, "name")?;
@@ -1185,7 +1824,7 @@ fn control_dispatch(
         // metadata only — the `data_ref` keys — so no byte of content crosses
         // the wire in either direction (see `view.export` in the reply for the
         // explicit note the CLI prints).
-        "view.export" => view_export_stage(rt, &req_str(a, "view")?),
+        "view.export" => view_export_stage(rt, &req_str(a, "view")?, who),
         "view.export.chunk" => {
             let handle = req_str(a, "handle")?;
             let offset = a.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -1193,7 +1832,7 @@ fn control_dispatch(
             view_export_chunk(rt, &handle, offset, max)
         }
         "view.export.done" => view_xfer_drop(rt, &req_str(a, "handle")?),
-        "view.import.begin" => view_import_begin(rt),
+        "view.import.begin" => view_import_begin(rt, who),
         "view.import.put" => {
             let handle = req_str(a, "handle")?;
             let offset = a.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -1272,10 +1911,57 @@ fn control_dispatch(
                 .ok_or_else(|| "no control key store".to_string())?;
             let label = req_str(a, "label")?;
             let scope = crate::apikeys::Scope::parse(&req_str(a, "scope")?)?;
-            let view = a.get("view").and_then(|v| v.as_str());
+            let view = a
+                .get("view")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
             let ro = a.get("ro").and_then(|v| v.as_bool()).unwrap_or(false);
-            let owner = a.get("owner").and_then(|v| v.as_str());
-            let (id, full) = keys.create_bound(&label, scope, view, ro, owner)?;
+            let mut owner = a
+                .get("owner")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            if !who.is_super() {
+                use crate::apikeys::Scope;
+                // A delegated account mints credentials for a view it governs,
+                // on the two planes a view is actually used from. `admin` is
+                // this port's own scope and `any` admits more than a view
+                // manager may hand out: a key that can govern the deployment
+                // would make the caller's delegation irrelevant, which is the
+                // one thing the ACL exists to prevent.
+                if scope == Scope::Admin || scope == Scope::Any {
+                    return Err(format!(
+                        "account '{}' may mint `--for mount` or `--for mcp` keys, not `--for {}`: \
+                         those scopes govern the whole deployment, and only an administrator may \
+                         hand that out",
+                        who.account,
+                        scope.as_str()
+                    ));
+                }
+                // Unbound (`view: None`) would let the key mount EVERY tree — the
+                // binding is not a nicety here, it is the delegation itself.
+                let v = match &view {
+                    Some(v) => v.clone(),
+                    None => {
+                        return Err(format!(
+                            "account '{}' must name the view a key is bound to (`view=<name>'): \
+                             an unbound key reaches every tree in the deployment",
+                            who.account
+                        ))
+                    }
+                };
+                may_govern(rt, who, &v, false)?;
+                // Attributed to the minter, whatever the caller claimed: the
+                // console's "my keys" list and `apikey revoke`'s ownership test
+                // both read this column, so it cannot be pointed at a colleague.
+                owner = Some(who.account.clone());
+            }
+            let (id, full) = keys.create_bound(
+                &label,
+                scope,
+                view.as_deref(),
+                ro,
+                owner.as_deref(),
+            )?;
             Ok(json!({
                 "id": id,
                 "key": full,
@@ -1292,6 +1978,11 @@ fn control_dispatch(
             let rows: Vec<serde_json::Value> = keys
                 .list()?
                 .into_iter()
+                // An admin's list is every row (unchanged); a delegated
+                // account's is its own keys plus the keys bound to its views,
+                // so it can rotate and revoke what its trees are mounted with
+                // without seeing a stranger's credential.
+                .filter(|k| key_visible(rt, who, k))
                 .map(|k| {
                     json!({
                         "id": k.id,
@@ -1329,9 +2020,33 @@ fn control_dispatch(
                 .as_ref()
                 .ok_or_else(|| "no control key store".to_string())?;
             let limit = a.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+            let mine = who.is_super();
+            // A delegated account's audit window is its own activity. Reading
+            // more rows and filtering here (rather than pushing the predicate
+            // into SQL) keeps one `recent_calls` for both backends; the window
+            // is widened so a tenant with a busy deployment still sees `limit`
+            // of ITS lines instead of a mostly-empty page.
+            let want = if mine { limit } else { limit.saturating_mul(20).min(5000) };
+            let owned: Vec<String> = if mine {
+                Vec::new()
+            } else {
+                keys.list()?
+                    .into_iter()
+                    .filter(|k| key_visible(rt, who, k))
+                    .map(|k| k.id)
+                    .collect()
+            };
+            let tag = format!("account={} ", who.account);
             let rows: Vec<serde_json::Value> = keys
-                .recent_calls(limit)?
+                .recent_calls(want)?
                 .into_iter()
+                .filter(|c| {
+                    mine
+                        || c.key_id.as_deref().is_some_and(|id| owned.iter().any(|k| k == id))
+                        || c.detail.starts_with(&tag)
+                        || c.detail.contains(&format!("account={}@", who.account))
+                })
+                .take(limit)
                 .map(|c| {
                     json!({
                         "ts": c.ts,
@@ -1346,11 +2061,336 @@ fn control_dispatch(
                 .collect();
             Ok(json!(rows))
         }
+        // The console's own plane: sign-in identity, accounts and their base-view
+        // delegation, and the per-view detail page. Every one of these is judged
+        // by `gates` above, exactly like the view verbs.
+        "whoami" | "account.list" | "account.create" | "account.passwd" | "account.role"
+        | "account.disable" | "account.delete" | "grant.list" | "grant.add" | "grant.remove"
+        | "view.stats" => web_dispatch(rt, who, op, a),
         other => Err(format!(
-            "unknown control op '{other}' (known: info, def.list/get/put/remove, stamp, physical.list/has, \
-             fork.has/create/drop/graft, view.create/export/import, view.rm_base, refs.rebuild, \
-             gc.scan/apply, apikey.create/list/revoke/set_ro/calls)"
+            "unknown control op '{other}' (known: info, store.info, whoami, def.list/get/put/remove, stamp, physical.list/has, fork.has/create/drop/graft, view.create/stats/export/import, view.rm_base, refs.rebuild, gc.scan/apply, apikey.create/list/revoke/set_ro/calls, account.list/create/passwd/role/disable/delete, grant.list/add/remove)"
         )),
+    }
+}
+
+/// `list_defs` yields `(name, text)` pairs; the visibility rule is the same as
+/// [`visible`]'s, applied to the name.
+fn visible_pairs(
+    rt: &Arc<MetaRuntime>,
+    who: &crate::webauth::Principal,
+    defs: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    defs.into_iter()
+        .filter(|(n, _)| who.manages(rt.control.as_ref(), n).unwrap_or(false))
+        .collect()
+}
+
+/// The JSON shape of one account row: what the console lists and edits. NEVER
+/// includes the password digest — there is no such field on `AccountInfo`, which
+/// is why a list can be handed to any admin without thinking about it.
+fn acct_json(a: &crate::webauth::AccountInfo) -> serde_json::Value {
+    use serde_json::json;
+    json!({
+        "account": a.account,
+        "role": a.role,
+        "created_at": a.created_at,
+        "disabled_at": a.disabled_at,
+        "last_login_at": a.last_login_at,
+        "bases": a.bases,
+    })
+}
+
+/// The account, delegation and view-detail verbs the web console is built from.
+/// `authorize` has already decided that this caller may run `op`; what is decided
+/// HERE is the shape, and the invariants that are not access rules:
+///
+/// - a password is checked against the policy before it is stretched, and the
+///   digest is never returned or logged;
+/// - an account store's last enabled admin cannot be demoted, disabled or
+///   deleted, because that locks every future sign-in out of the deployment;
+/// - a delegation is always stored against the BASE a name resolves to, so
+///   granting a lens cannot create a grant that never matches.
+fn web_dispatch(
+    rt: &Arc<MetaRuntime>,
+    who: &crate::webauth::Principal,
+    op: &str,
+    a: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    use crate::webauth::{self, Role};
+    use serde_json::json;
+    // Every verb below needs the account store, so it is bound once and its
+    // absence is a refusal of the whole plane rather than of one op: a server
+    // without `--control-listen` has no accounts, and saying that here is what
+    // stops each arm from inventing its own version of the same complaint.
+    let s = rt.web_auth.as_deref().ok_or_else(|| {
+        "this server has no web account store (it needs --control-listen) — accounts and \n         delegations live beside the control plane's api keys".to_string()
+    })?;
+    match op {
+        "whoami" => Ok(json!({
+            "account": who.account,
+            "role": who.role.as_str(),
+            "super": who.is_super(),
+            "bases": who.bases,
+        })),
+        "account.list" => {
+            let rows: Vec<serde_json::Value> = s.list()?.iter().map(acct_json).collect();
+            Ok(json!(rows))
+        }
+        "account.create" => {
+            let account = webauth::normalize_account(&req_str(a, "account")?)?;
+            let password = req_str(a, "password")?;
+            // Named before the policy check and before the store's own UNIQUE
+            // error: the console's form needs to say "that name is taken", and a
+            // raw `UNIQUE constraint failed: web_accounts.account` is the backend
+            // leaking into a person's face. A race still lands on the constraint,
+            // which is the real guard.
+            if let Some(cur) = s.get(&account)? {
+                return Err(if cur.disabled_at.is_some() {
+                    format!("a web account '{account}' already exists and is disabled — enable it (`web enable --account {account}`) rather than creating it again")
+                } else {
+                    format!("a web account '{account}' already exists — change its password with `web passwd --account {account}` if that is what is intended")
+                });
+            }
+            let role = match a.get("role").and_then(|v| v.as_str()) {
+                Some(r) => Role::parse(r)?,
+                // The conservative default: a new account manages nothing until
+                // it is delegated, so creating one cannot accidentally create an
+                // administrator.
+                None => Role::User,
+            };
+            webauth::check_password(&account, &password)?;
+            s.create(&account, &webauth::hash_password(&password), role)?;
+            Ok(json!({
+                "account": account,
+                "role": role.as_str(),
+                "bases": Vec::<String>::new(),
+                "note": if role == Role::Admin {
+                    "this account governs the whole deployment — an admin's grants are not read"
+                } else {
+                    "delegate a base view before this account can manage anything"
+                },
+            }))
+        }
+        "account.passwd" => {
+            let account = webauth::normalize_account(&req_str(a, "account")?)?;
+            let password = req_str(a, "password")?;
+            webauth::check_password(&account, &password)?;
+            if !s.set_password(&account, &webauth::hash_password(&password))? {
+                return Err(format!("no web account '{account}'"));
+            }
+            Ok(json!({"account": account, "passwordChanged": true}))
+        }
+        "account.role" => {
+            let account = webauth::normalize_account(&req_str(a, "account")?)?;
+            let role = Role::parse(&req_str(a, "role")?)?;
+            let cur = s
+                .get(&account)?
+                .ok_or_else(|| format!("no web account '{account}'"))?;
+            // Guarded on the way DOWN only, and against the number that matters:
+            // an ENABLED admin. A deployment whose last admin is disabled is
+            // already locked out and cannot be reached by this call at all.
+            if role != Role::Admin
+                && cur.role == Role::Admin.as_str()
+                && cur.disabled_at.is_none()
+                && s.active_admins()? <= 1
+            {
+                return Err(format!(
+                    "'{account}' is the only enabled administrator — create a second admin and \n                     verify you can sign in as it before demoting this one"
+                ));
+            }
+            if !s.set_role(&account, role)? {
+                return Err(format!("no web account '{account}'"));
+            }
+            Ok(json!({"account": account, "role": role.as_str()}))
+        }
+        "account.disable" => {
+            let account = webauth::normalize_account(&req_str(a, "account")?)?;
+            let disabled = a.get("disabled").and_then(|v| v.as_bool()).unwrap_or(true);
+            let cur = s
+                .get(&account)?
+                .ok_or_else(|| format!("no web account '{account}'"))?;
+            if disabled
+                && cur.role == Role::Admin.as_str()
+                && cur.disabled_at.is_none()
+                && s.active_admins()? <= 1
+            {
+                return Err(format!(
+                    "'{account}' is the only enabled administrator — disabling it locks every \n                     sign-in out of the deployment; enable a second admin first"
+                ));
+            }
+            if !s.set_disabled(&account, disabled)? {
+                return Err(format!("no web account '{account}'"));
+            }
+            Ok(json!({"account": account, "disabled": disabled}))
+        }
+        "account.delete" => {
+            let account = webauth::normalize_account(&req_str(a, "account")?)?;
+            let cur = s
+                .get(&account)?
+                .ok_or_else(|| format!("no web account '{account}'"))?;
+            if cur.role == Role::Admin.as_str() && cur.disabled_at.is_none() && s.active_admins()? <= 1
+            {
+                return Err(format!(
+                    "'{account}' is the only enabled administrator — it cannot be deleted out of \n                     the last lock on the deployment"
+                ));
+            }
+            // Its credentials outlive it on purpose (see `WebAuthStore::delete`),
+            // so the reply has to say what still needs doing rather than let a
+            // clean-looking success hide live mounts attributed to nobody.
+            let keys = rt
+                .ctl_keys
+                .as_ref()
+                .map(|k| {
+                    k.list()
+                        .map(|rows| {
+                            rows.iter()
+                                .filter(|r| {
+                                    r.owner.as_deref() == Some(account.as_str())
+                                        && r.revoked_at.is_none()
+                                })
+                                .count()
+                        })
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+            if !s.delete(&account)? {
+                return Err(format!("no web account '{account}'"));
+            }
+            Ok(json!({
+                "account": account,
+                "deleted": true,
+                "liveKeys": keys,
+                "note": if keys > 0 {
+                    format!("{keys} api key(s) still minted by this account are NOT revoked — revoke them explicitly if they should stop working")
+                } else {
+                    "its grants are gone; it minted no live api keys".to_string()
+                },
+            }))
+        }
+        "grant.list" => {
+            let filter = a.get("account").and_then(|v| v.as_str());
+            let rows: Vec<serde_json::Value> = s
+                .list_grants()?
+                .into_iter()
+                .filter(|g| filter.is_none_or(|f| g.account == f))
+                .map(|g| {
+                    json!({
+                        "account": g.account,
+                        "base_view": g.base_view,
+                        "perm": g.perm,
+                        "granted_at": g.granted_at,
+                        "granted_by": g.granted_by,
+                    })
+                })
+                .collect();
+            Ok(json!(rows))
+        }
+        "grant.add" => {
+            let account = webauth::normalize_account(&req_str(a, "account")?)?;
+            let named = req_str(a, "base")?;
+            if s.get(&account)?.is_none() {
+                return Err(format!(
+                    "no web account '{account}' — create it first (`grovefs web account create`)"
+                ));
+            }
+            // Stored against the BASE the name resolves to. A grant on a lens
+            // would be a row that matches nothing (the ACL resolves outward from
+            // any name to its base), so normalizing here turns a mistake into a
+            // working grant and says what it did.
+            let base = webauth::resolve_base(rt.control.as_ref(), &named)?;
+            s.grant(&account, &base, Some(&who.account))?;
+            Ok(json!({
+                "account": account,
+                "base": base,
+                "asNamed": base == named,
+                "grantedBy": who.account,
+            }))
+        }
+        "grant.remove" => {
+            let account = webauth::normalize_account(&req_str(a, "account")?)?;
+            let named = req_str(a, "base")?;
+            let base = webauth::resolve_base(rt.control.as_ref(), &named)
+                .unwrap_or_else(|_| named.clone());
+            // Removing the delegation an active session relies on takes effect on
+            // that session's NEXT call (the principal is re-read per request), so
+            // there is nothing to expire and nothing to invalidate here.
+            let removed = s.ungrant(&account, &base)? || (base != named && s.ungrant(&account, &named)?);
+            Ok(json!({"account": account, "base": base, "removed": removed}))
+        }
+        // The per-view page. Deliberately built from the CONTROL plane's own
+        // answers (definitions, trees, stamps, keys, live sessions) instead of
+        // walking the tree: a node/blob count would open an engine and read
+        // every row, which on a large PG view is not something a page load may
+        // do. `view export` and the mount's own `du` are the paths that cost
+        // that, and they are explicit.
+        "view.stats" => {
+            let view = req_str(a, "view")?;
+            let def = rt.control.get_def_raw(&view)?;
+            let kind = match &def {
+                Some(text) => {
+                    let parsed = crate::layout::LayoutRules::parse_def(text)
+                        .map_err(|e| format!("bad view definition '{view}': {e}"))?;
+                    match parsed {
+                        crate::layout::ViewDef::Derived(_, _) => "derived",
+                        crate::layout::ViewDef::Fork(_) => "fork",
+                        crate::layout::ViewDef::Alias(_) => "alias",
+                    }
+                }
+                None if rt.control.has_physical(&view)? => "base",
+                None => "none",
+            };
+            let base = webauth::resolve_base(rt.control.as_ref(), &view).ok();
+            // The view's FAMILY: every name that resolves to this same base.
+            // Only computed for a base name (a delegate's own view list is
+            // small, and this is one resolve per name).
+            let mut family: Vec<String> = Vec::new();
+            if base.as_deref() == Some(view.as_str()) {
+                let mut names: Vec<String> = rt.control.list_physical()?;
+                names.extend(rt.control.list_defs()?.into_iter().map(|(n, _)| n));
+                // The two listings OVERLAP by design: a fork has a definition
+                // (`fork <base>`) and a tree of its own, so it appears on both
+                // sides. A family is a set of names — a repeated one would
+                // render as two rows for one view and double the resolve work.
+                names.sort();
+                names.dedup();
+                for n in names {
+                    if n != view
+                        && webauth::resolve_base(rt.control.as_ref(), &n).ok().as_deref()
+                            == Some(view.as_str())
+                    {
+                        family.push(n);
+                    }
+                }
+                family.sort();
+            }
+            let keys = rt
+                .ctl_keys
+                .as_ref()
+                .and_then(|k| {
+                    k.list().ok().map(|rows| {
+                        rows.iter()
+                            .filter(|r| r.view.as_deref() == Some(view.as_str()))
+                            .count()
+                    })
+                });
+            let sessions = rt.subs.lock().get(&view).map(|m| m.len()).unwrap_or(0);
+            let resident = rt.cache.lock().contains_key(base.as_deref().unwrap_or(&view))
+                || rt.views.lock().contains_key(&view);
+            Ok(json!({
+                "name": view,
+                "kind": kind,
+                "base": base,
+                "definition": def,
+                "stamp": rt.control.stamp(&view),
+                "tree": rt.control.has_physical(&view)?,
+                "forkTree": rt.control.has_fork_tree(&view)?,
+                "family": family,
+                "keys": keys,
+                "sessions": sessions,
+                "resident": resident,
+            }))
+        }
+        other => Err(format!("control_dispatch routed an unknown account op '{other}'")),
     }
 }
 
@@ -1440,7 +2480,11 @@ fn refuse_virtual_for_export(view: &str, definition: Option<&str>) -> Result<(),
 /// Render one view's tree into a staging file and hand the client a handle. The
 /// CLI then pulls it in chunks; a failure here leaves no file behind (every
 /// backend's dump writes beside its destination and renames).
-fn view_export_stage(rt: &Arc<MetaRuntime>, view: &str) -> Result<serde_json::Value, String> {
+fn view_export_stage(
+    rt: &Arc<MetaRuntime>,
+    view: &str,
+    who: &crate::webauth::Principal,
+) -> Result<serde_json::Value, String> {
     use serde_json::json;
     if !crate::layout::valid_view_name(view) {
         return Err(format!("invalid view name '{view}'"));
@@ -1452,6 +2496,10 @@ fn view_export_stage(rt: &Arc<MetaRuntime>, view: &str) -> Result<serde_json::Va
     sweep_xfer(&dir);
     let handle = new_xfer_handle('x');
     let path = xfer_path(rt, &handle)?;
+    // Ownership is recorded the moment the handle exists, so the chunk pulls
+    // that follow (each on its own connection, with no session to carry an
+    // identity) are still served only to the principal that staged the dump.
+    rt.claim_xfer(&handle, &who.account);
     let st = match &rt.store {
         StoreKind::Sqlite => crate::meta::export_view(&rt.base, view, &path, true)?,
         StoreKind::Pg(uri) => {
@@ -1533,13 +2581,17 @@ fn view_export_chunk(
 /// Mint a handle for an upload. The file starts empty; every `put` must arrive
 /// at exactly the current length, so a retried or reordered chunk fails loudly
 /// instead of silently corrupting the dump.
-fn view_import_begin(rt: &Arc<MetaRuntime>) -> Result<serde_json::Value, String> {
+fn view_import_begin(
+    rt: &Arc<MetaRuntime>,
+    who: &crate::webauth::Principal,
+) -> Result<serde_json::Value, String> {
     use serde_json::json;
     let dir = xfer_dir(rt);
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     sweep_xfer(&dir);
     let handle = new_xfer_handle('i');
     let path = xfer_path(rt, &handle)?;
+    rt.claim_xfer(&handle, &who.account);
     std::fs::File::create(&path).map_err(|e| format!("cannot create {}: {e}", path.display()))?;
     Ok(json!({"handle": handle}))
 }
@@ -1633,6 +2685,7 @@ fn view_import_commit(
     }
     rt.evict();
     let _ = std::fs::remove_file(&path);
+    rt.release_xfer(&handle);
     Ok(json!({
         "nodes": st.nodes,
         "blobs": st.blobs,
@@ -1666,6 +2719,7 @@ fn drop_imported_tree(rt: &Arc<MetaRuntime>, view: &str) -> String {
 fn view_xfer_drop(rt: &Arc<MetaRuntime>, handle: &str) -> Result<serde_json::Value, String> {
     let path = xfer_path(rt, handle)?;
     let _ = std::fs::remove_file(&path);
+    rt.release_xfer(handle);
     Ok(serde_json::Value::Null)
 }
 
@@ -1711,7 +2765,8 @@ fn view_rm_base(
             let rep = crate::pg_store::PgEngine::remove_view(uri, view)?;
             let bytes = free_unbooked(&rep.unbooked_refs, &droot);
             format!(
-                "removed base view '{view}' from {uri}: {} node(s) gone, {} object(s) no longer held by any view{}; {bytes}",
+                "removed base view '{view}' from {}: {} node(s) gone, {} object(s) no longer held by any view{}; {bytes}",
+                crate::pg_store::redact_uri(uri),
                 rep.entries,
                 rep.unbooked,
                 if rep.still_held > 0 {
@@ -1750,7 +2805,8 @@ fn refs_rebuild(rt: &Arc<MetaRuntime>) -> Result<serde_json::Value, String> {
         StoreKind::Pg(uri) => {
             let rep = crate::pg_store::rebuild_ledger(uri)?;
             Ok(json!(format!(
-                "refs ledger rebuilt in {uri}: {} tree(s), {} content key(s), {} holder unit(s); {} row(s) corrected, {} row(s) deleted",
+                "refs ledger rebuilt in {}: {} tree(s), {} content key(s), {} holder unit(s); {} row(s) corrected, {} row(s) deleted",
+                crate::pg_store::redact_uri(uri),
                 rep.trees, rep.refs, rep.holders, rep.rows_fixed, rep.rows_deleted
             )))
         }
@@ -2030,6 +3086,24 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
+/// Ask every cached engine to shed the burst connections it is holding above
+/// its warm floor, and total up what closed. Handles are cloned out under the
+/// cache lock and called after it is released — reaping talks to PostgreSQL,
+/// and no dispatch path may wait on that behind this lock.
+///
+/// Deliberately NOT gated on idleness: a mounted view whose burst has already
+/// passed is exactly the case eviction cannot serve (sessions pin the engine),
+/// and its idle writers are the ones costing `max_connections` right now.
+fn reap_pools(rt: &MetaRuntime) -> usize {
+    let engines: Vec<Arc<MetaStore>> = rt
+        .cache
+        .lock()
+        .values()
+        .map(|(store, _)| store.clone())
+        .collect();
+    engines.iter().map(|s| s.shrink_pools()).sum()
+}
+
 /// Retire engine cache entries for base views nobody is using: no mounted
 /// session (subscriber) AND no dispatch within `engine_idle_ms`. This is what
 /// lets one meta-server host far more views than the PG backend could keep
@@ -2040,10 +3114,11 @@ fn now_millis() -> u64 {
 /// The sweeper itself is backend-agnostic (it drops cache entries; it does not
 /// know what an engine holds), and that is the right seam, but WHAT it frees
 /// differs per backend and the difference is not cosmetic: under PG a dropped
-/// entry closes 8 writers + 4 readers, which is why the knob is the PG
-/// scalability gate at all. See [`MetaServer::with_engine_idle_secs`]. No branch
-/// is needed here precisely because eviction is "forget the entry, reopen on
-/// next op" for both stores.
+/// entry closes the view's whole pool — warm floor and any burst connections
+/// retained above it — which is why the knob is the PG scalability gate at all.
+/// See [`MetaServer::with_engine_idle_secs`]. No branch is needed here
+/// precisely because eviction is "forget the entry, reopen on next op" for both
+/// stores. Burst shedding without eviction is the job of [`reap_pools`].
 ///
 /// In-flight ops are safe by construction: they hold their own `Arc` clones, so
 /// removing a map entry only releases the CONNECTIONS once the last clone
@@ -2128,7 +3203,16 @@ fn store_for(rt: &MetaRuntime, view: &str) -> io::Result<Arc<MetaStore>> {
                 .map_err(|e| io::Error::other(e.to_string()))?
         }
         StoreKind::Pg(uri) => MetaStore::open_pg(uri, view, false)
-            .map_err(|e| io::Error::other(format!("pg open for view='{view}' uri='{uri}': {e}")))?,
+            .map_err(|e| {
+                // The URI carries the PG password and this error travels back to
+                // the caller (and into the audit `detail` column), so report it
+                // redacted — the account and host are what identify the home,
+                // the secret never is.
+                io::Error::other(format!(
+                    "pg open for view='{view}' uri='{}': {e}",
+                    crate::pg_store::redact_uri(uri)
+                ))
+            })?,
     };
     let engine = Arc::new(store);
     m.insert(
@@ -3091,12 +4175,18 @@ fn install_snapshot(rt: &MetaRuntime, view: &str, snap: &[u8]) -> io::Result<()>
 }
 
 /// Names of the view dbs currently on disk (stem of each `<base>/meta/*.db`).
+/// The control-plane stores are excluded by the same predicate every other
+/// enumerator uses, so the api-key, web-account and ledger files are never
+/// mistaken for view trees here.
 fn list_users(base: &Path) -> Vec<String> {
     let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir(base.join("meta")) {
         for ent in rd.flatten() {
             let p = ent.path();
-            if p.extension().and_then(|e| e.to_str()) == Some("db") {
+            let Some(file) = p.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if crate::meta::is_view_db(file) {
                 if let Some(name) = p.file_stem().and_then(|s| s.to_str()) {
                     out.push(name.to_string());
                 }
@@ -4383,6 +5473,8 @@ mod ha_tests {
             store: StoreKind::Sqlite,
             engine_idle_ms: 0,
             ctl_keys: None,
+            web_auth: None,
+            xfer_owner: Mutex::new(HashMap::new()),
         });
 
         // Witness holds nothing above our epoch: the first proof grants a lease
@@ -4547,6 +5639,8 @@ mod ha_tests {
             store: StoreKind::Sqlite,
             engine_idle_ms: 60_000,
             ctl_keys: None,
+            web_auth: None,
+            xfer_owner: Mutex::new(HashMap::new()),
         };
         let a = store_for(&rt, "v1").unwrap();
         assert!(rt.cache.lock().contains_key("v1"));

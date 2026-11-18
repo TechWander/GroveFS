@@ -264,6 +264,47 @@ pub fn store_uris(spec: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
+/// A URI safe to PUT IN A LOG OR AN API REPLY: the password between `:` and `@`
+/// in the authority is replaced, host/port/database/params stay so an operator
+/// can still tell which instance a message means. A `file:` registry path and a
+/// credential-less URI come back unchanged.
+///
+/// Why this exists as a function rather than as care at each call site: the
+/// control-plane replies (`describe`, a teardown report, a refusal text) are now
+/// consumed by the web console as well as a terminal, so one forgotten `{uri}`
+/// interpolation would ship a database password in JSON to a browser.
+pub fn redact_uri(uri: &str) -> String {
+    let Some(scheme_end) = uri.find("://") else {
+        return uri.to_string();
+    };
+    let rest = &uri[scheme_end + 3..];
+    // The authority ends at the first `/`, `?` or (for `?opts` without a path)
+    // nothing; a `@` after that boundary is part of a parameter value, not a
+    // credential separator.
+    let auth_end = rest
+        .find(['/', '?'])
+        .unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(auth_end);
+    let Some(at) = authority.rfind('@') else {
+        return uri.to_string();
+    };
+    let userinfo = &authority[..at];
+    let masked = match userinfo.find(':') {
+        Some(c) => format!("{}:***", &userinfo[..c]),
+        None => userinfo.to_string(),
+    };
+    // Everything from the last `@` to the end of the authority is the HOST, and
+    // the host is exactly what the caller is printing the line for — naming the
+    // instance a message came from. Redacting it would leave `postgres://u:***@/db`.
+    format!(
+        "{}://{}@{}{}",
+        &uri[..scheme_end],
+        masked,
+        &authority[at + 1..],
+        tail
+    )
+}
+
 /// Where a view's tree lives, as (instance name, URI). Resolution order:
 ///
 /// 0. a single-instance spec routes to itself without any lookup, so the
@@ -717,6 +758,11 @@ const WRITE_STMT_CACHE_CAP: usize = 32;
 struct ReadConn {
     client: Client,
     stmts: HashMap<String, Statement>,
+    /// When this connection went back into the pool (ms since epoch). The idle
+    /// reaper sheds above-floor connections by least-recently-used order, and a
+    /// reaped connection loses its prepared statements with it — which is why
+    /// the floor is never reaped.
+    idle_at: u64,
 }
 
 impl ReadConn {
@@ -724,6 +770,7 @@ impl ReadConn {
         Self {
             client,
             stmts: HashMap::new(),
+            idle_at: now_ms(),
         }
     }
 
@@ -760,6 +807,9 @@ impl ReadConn {
 struct WriteConn {
     client: Client,
     stmts: HashMap<String, Statement>,
+    /// See [`ReadConn::idle_at`] — same least-recently-used reaping, and the
+    /// same reason the writer floor must not be reaped casually.
+    idle_at: u64,
 }
 
 impl WriteConn {
@@ -767,6 +817,7 @@ impl WriteConn {
         Self {
             client,
             stmts: HashMap::new(),
+            idle_at: now_ms(),
         }
     }
 }
@@ -963,6 +1014,21 @@ pub struct PgEngine {
     /// engine: `(parent, checkpoint offset)` -> the name of the row before it.
     /// Cleared by any name mutation; a miss falls back to `LIMIT/OFFSET`.
     cursors: parking_lot::Mutex<HashMap<(i64, usize), String>>,
+    /// Writer/reader lane bounds in force for THIS view: seeded from the
+    /// process-wide profile at open, then possibly replaced by the view's own
+    /// `ctrl` rows in [`Self::apply_pool_overrides`] (see
+    /// [`PgEngine::ensure_schema`]). Atomics because the pool checkout paths
+    /// read them and the override/sweeper paths write them.
+    ///
+    /// The warm value is what `open()` pre-fills and what the idle reaper
+    /// never goes below; the max is what `requeue_*` will retain. Equal values
+    /// reproduce the pre-split behavior exactly.
+    w_warm: std::sync::atomic::AtomicUsize,
+    w_max: std::sync::atomic::AtomicUsize,
+    r_warm: std::sync::atomic::AtomicUsize,
+    r_max: std::sync::atomic::AtomicUsize,
+    /// Idle window for THIS view's reaper (ms); `0` never reaps.
+    pool_idle_ms: std::sync::atomic::AtomicU64,
 }
 
 /// What a whole-base-view teardown found and did (see [`PgEngine::remove_view`]).
@@ -1002,51 +1068,419 @@ const READDIR_CURSOR_CAP: usize = 65_536;
 /// which rarely lands on our own page boundary (see the SQLite engine).
 const READDIR_CURSOR_STRIDE: usize = 32;
 
-/// Default number of pooled writer connections per PG view engine. Bounded by
-/// `max_connections` on the server (default 100); a small per-view pool keeps
-/// total backend pressure predictable when the meta-server hosts many views.
+/// Default WARM floor of the writer lane: connections pre-filled at engine open
+/// and never reaped. Bounded by `max_connections` on the server (default 100);
+/// a small per-view pool keeps total backend pressure predictable when the
+/// meta-server hosts many views.
 const PG_WRITE_POOL_SIZE: usize = 8;
 
-/// Default number of pooled read connections opened per PG view engine, matching
-/// the SQLite engine's [`crate::meta::READ_POOL_SIZE`].
+/// Default WARM floor of the reader lane, matching the SQLite engine's
+/// [`crate::meta::READ_POOL_SIZE`].
 const PG_READ_POOL_SIZE: usize = 4;
 
-/// Runtime knobs for the two per-view pools: `GROVEFS_PG_WRITE_POOL` and
-/// `GROVEFS_PG_READ_POOL` (`0..=64` each). The pool size is what the capacity
-/// formula (active views x pool + burst <= `max_connections`) is planned
-/// against, so an operator who tuned `max_connections` upward can widen the
-/// pool without rebuilding; `0` means "no warm pool" (every checkout connects
-/// fresh), which is legal but pays connect latency per op. Internal tuning
-/// knobs (like `GROVEFS_SQLITE_READ_POOL`), cached on first read; the CLI
-/// surface is unchanged.
-fn pg_write_pool_size() -> usize {
-    static SLOT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
-    let cur = SLOT.load(std::sync::atomic::Ordering::Relaxed);
+/// Default idle window before a burst connection ABOVE the warm floor is
+/// reaped. Inert until an operator raises a retain ceiling above its floor
+/// (`GROVEFS_PG_*_POOL_MAX`), because a lane with `max == warm` can never hold
+/// an above-floor connection to reap. 60s sits in the 30–60s band picked to
+/// keep a reaped writer from immediately paying dial + `tune_writer` PRAGMA +
+/// prepared re-parse again — measured 577us vs 316us per write tx.
+const PG_POOL_IDLE_SECS: u64 = 60;
+
+/// Upper bound on any lane size, floor or ceiling (as the single knobs had).
+const POOL_LANE_CAP: usize = 64;
+
+/// One pool lane's bounds: a WARM floor pre-filled at engine open and always
+/// kept, plus a retain MAX that burst-dialed connections may occupy.
+///
+/// `warm == max` is the historical single-knob shape: `open()` pre-filled
+/// `warm` connections, `checkout_*` dialled beyond that on demand, and
+/// `requeue_*` DROPPED anything above `warm` on return. Steady-state cost was
+/// therefore `warm` no matter what real concurrency looked like — an idle view
+/// still held 8 writers — while a create burst paid connect + PRAGMA + re-parse
+/// per extra op. With `max > warm` the burst is RETAINED (up to `max`) and the
+/// idle reaper ([`PgEngine::shrink_pools`], driven by the server's engine
+/// sweeper) sheds it back to `warm`. That is what makes the connection floor
+/// track actual metadata concurrency while a create-heavy spell keeps its
+/// writers warm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LaneBounds {
+    pub warm: usize,
+    pub max: usize,
+}
+
+impl LaneBounds {
+    /// Normalise an operator-supplied pair: clamp both to [`POOL_LANE_CAP`],
+    /// enforce `max >= warm` (a ceiling under the floor is meaningless — the
+    /// floor is always retained), and read `max == 0` as "no ceiling
+    /// configured", i.e. ceiling = floor.
+    fn resolve(warm: usize, max: usize) -> Self {
+        let warm = warm.min(POOL_LANE_CAP);
+        let max = max.min(POOL_LANE_CAP);
+        Self {
+            warm,
+            max: if max == 0 || max < warm { warm } else { max },
+        }
+    }
+}
+
+/// Process-wide pool bounds: CLI flag, else env, else default. Each lane sits
+/// in its own atomic so a pool checkout never takes a lock; `usize::MAX` means
+/// "unresolved", resolved from env on first read exactly as the single knobs
+/// did before this split.
+struct PoolProfile {
+    write: LaneBounds,
+    read: LaneBounds,
+    idle_ms: u64,
+}
+
+static P_WARM_W: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+static P_MAX_W: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+static P_WARM_R: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+static P_MAX_R: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+static P_IDLE_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Read one resolved atomic, resolving it from `env` (capped) on first use.
+fn slot_val(slot: &std::sync::atomic::AtomicUsize, env: &str, def: usize) -> usize {
+    let cur = slot.load(std::sync::atomic::Ordering::Relaxed);
     if cur != usize::MAX {
         return cur;
     }
-    let v = std::env::var("GROVEFS_PG_WRITE_POOL")
+    let v = std::env::var(env)
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .map(|n| n.min(64))
-        .unwrap_or(PG_WRITE_POOL_SIZE);
-    SLOT.store(v, std::sync::atomic::Ordering::Relaxed);
+        .map(|n| n.min(POOL_LANE_CAP))
+        .unwrap_or(def);
+    slot.store(v, std::sync::atomic::Ordering::Relaxed);
     v
 }
 
-fn pg_read_pool_size() -> usize {
-    static SLOT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
-    let cur = SLOT.load(std::sync::atomic::Ordering::Relaxed);
-    if cur != usize::MAX {
+/// Read one resolved SECONDS atomic, resolving it from `env` on first use. The
+/// unit is deliberately part of the name: every knob spelled `*_SECS` (CLI flag
+/// and env var alike) is stored here as seconds and converted at the use site,
+/// so a value can never be scaled twice on its way to a duration.
+fn slot_secs(slot: &std::sync::atomic::AtomicU64, env: &str, def: u64) -> u64 {
+    let cur = slot.load(std::sync::atomic::Ordering::Relaxed);
+    if cur != u64::MAX {
         return cur;
     }
-    let v = std::env::var("GROVEFS_PG_READ_POOL")
+    let v = std::env::var(env)
         .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .map(|n| n.min(64))
-        .unwrap_or(PG_READ_POOL_SIZE);
-    SLOT.store(v, std::sync::atomic::Ordering::Relaxed);
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(def);
+    slot.store(v, std::sync::atomic::Ordering::Relaxed);
     v
+}
+
+/// The process-wide bounds every engine inherits at open; a view may then
+/// override them in its own `ctrl` table (see [`PgEngine::apply_pool_overrides`]).
+fn pool_profile() -> PoolProfile {
+    let write = LaneBounds::resolve(
+        slot_val(&P_WARM_W, "GROVEFS_PG_WRITE_POOL", PG_WRITE_POOL_SIZE),
+        slot_val(&P_MAX_W, "GROVEFS_PG_WRITE_POOL_MAX", 0),
+    );
+    let read = LaneBounds::resolve(
+        slot_val(&P_WARM_R, "GROVEFS_PG_READ_POOL", PG_READ_POOL_SIZE),
+        slot_val(&P_MAX_R, "GROVEFS_PG_READ_POOL_MAX", 0),
+    );
+    let idle_secs = slot_secs(&P_IDLE_SECS, "GROVEFS_PG_POOL_IDLE_SECS", PG_POOL_IDLE_SECS);
+    PoolProfile {
+        write,
+        read,
+        idle_ms: idle_secs.saturating_mul(1000),
+    }
+}
+
+/// Install process-wide pool bounds from the CLI (`meta-server --pg-write-pool`
+/// and friends) so operators need no env vars: a flag wins over env, `None`
+/// leaves that lane to env/default. `--pg-*-pool-max 0` means "same as the
+/// floor", which is the historical shape.
+///
+/// Engines already open keep the bounds they were created with — their pooled
+/// connections hold session-scoped prepared statements and mounted sessions pin
+/// the engine — so this must run at startup, before the first view is served.
+/// That is the same contract the env knobs already had, where the value was
+/// cached on first read.
+pub fn set_pool_profile(
+    write_warm: Option<usize>,
+    write_max: Option<usize>,
+    read_warm: Option<usize>,
+    read_max: Option<usize>,
+    idle_secs: Option<u64>,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let apply = |slot: &std::sync::atomic::AtomicUsize,
+                 v: Option<usize>,
+                 env: &str,
+                 def: usize| {
+        match v {
+            Some(v) => slot.store(v.min(POOL_LANE_CAP), Relaxed),
+            // Force env resolution now so no later engine open can observe the
+            // unresolved sentinel while an operator inspects the settings.
+            None => {
+                slot_val(slot, env, def);
+            }
+        }
+    };
+    apply(&P_WARM_W, write_warm, "GROVEFS_PG_WRITE_POOL", PG_WRITE_POOL_SIZE);
+    apply(&P_MAX_W, write_max, "GROVEFS_PG_WRITE_POOL_MAX", 0);
+    apply(&P_WARM_R, read_warm, "GROVEFS_PG_READ_POOL", PG_READ_POOL_SIZE);
+    apply(&P_MAX_R, read_max, "GROVEFS_PG_READ_POOL_MAX", 0);
+    match idle_secs {
+        Some(s) => P_IDLE_SECS.store(s, Relaxed),
+        None => {
+            slot_secs(&P_IDLE_SECS, "GROVEFS_PG_POOL_IDLE_SECS", PG_POOL_IDLE_SECS);
+        }
+    }
+}
+
+/// The idle window after which an above-floor connection is reaped, in ms (the
+/// knob is seconds, every consumer is a duration). Each engine keeps its own
+/// copy; this module-level read is what tells the server's sweeper whether it
+/// has any reaping to do at all, and how often to wake.
+pub fn pool_idle_ms() -> u64 {
+    slot_secs(&P_IDLE_SECS, "GROVEFS_PG_POOL_IDLE_SECS", PG_POOL_IDLE_SECS).saturating_mul(1000)
+}
+
+/// Current process-wide bounds, for the startup banner and `view pool`.
+pub fn pool_profile_now() -> (LaneBounds, LaneBounds, u64) {
+    let p = pool_profile();
+    (p.write, p.read, p.idle_ms)
+}
+
+/// Milliseconds since the epoch. `now()` is seconds and the reap window is
+/// deliberately finer than a second, so pools get their own clock.
+fn now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The per-view override keys, held in the view's OWN `ctrl` table: the setting
+/// then travels with the tree (a `view move` snapshot exports the schema, this
+/// included) and costs the single-instance zero-query resolve path nothing.
+pub const POOL_CTRL_KEYS: [&str; 5] = [
+    "pg_write_warm",
+    "pg_write_max",
+    "pg_read_warm",
+    "pg_read_max",
+    "pg_pool_idle_secs",
+];
+
+/// A view's declared pool settings: `None` on a lane means it inherits the
+/// process-wide bounds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PgPoolSettings {
+    pub write_warm: Option<usize>,
+    pub write_max: Option<usize>,
+    pub read_warm: Option<usize>,
+    pub read_max: Option<usize>,
+    pub idle_secs: Option<u64>,
+}
+
+/// Shed the least-recently-used tail of a pool lane down to `warm` once a
+/// connection has sat idle for `ttl` ms, and report how many dropped.
+///
+/// Checkout is LIFO (`Vec::pop` takes the freshest return), so the entries that
+/// have been idle longest sit at the FRONT — walking from the front is both the
+/// cheapest least-recently-used order and the hysteresis that keeps a bursty
+/// view from being shed mid-burst: the walk stops at the first connection still
+/// inside the window rather than skipping ahead to an older one behind it.
+/// Lane size is capped at [`POOL_LANE_CAP`], so the `remove(0)` shift is free
+/// in any practical sense.
+fn reap_lane<T>(
+    p: &mut Vec<T>,
+    warm: usize,
+    ttl: u64,
+    now: u64,
+    stamp: impl Fn(&T) -> u64,
+) -> usize {
+    let mut gone = 0;
+    while p.len() > warm {
+        match p.first() {
+            Some(c) if now.saturating_sub(stamp(c)) >= ttl => {
+                p.remove(0);
+                gone += 1;
+            }
+            _ => break,
+        }
+    }
+    gone
+}
+
+/// Parse one `FLOOR[:MAX]` lane spec (`2:8`, or bare `2` for the historical
+/// floor==ceiling shape). Shared by the CLI and the governance handler so both
+/// speak one syntax.
+pub fn parse_lane_spec(text: &str) -> Result<(usize, Option<usize>), String> {
+    let (a, b) = match text.split_once(':') {
+        Some((a, b)) => (a, Some(b)),
+        None => (text, None),
+    };
+    let warm = a
+        .parse::<usize>()
+        .map_err(|_| format!("bad pool floor '{a}' (want a non-negative integer)"))?;
+    let max = match b {
+        Some(b) => Some(
+            b.parse::<usize>()
+                .map_err(|_| format!("bad pool ceiling '{b}' (want a non-negative integer)"))?,
+        ),
+        None => None,
+    };
+    if warm > POOL_LANE_CAP || max.is_some_and(|m| m > POOL_LANE_CAP) {
+        return Err(format!("pool sizes are capped at {POOL_LANE_CAP}"));
+    }
+    if let Some(m) = max {
+        if m < warm {
+            return Err(format!(
+                "ceiling {m} is below floor {warm} — the floor is always retained, raise the ceiling or drop it"
+            ));
+        }
+    }
+    Ok((warm, max))
+}
+
+/// Read a view's declared pool bounds straight from its own `ctrl` table — the
+/// same rows an engine adopts at open ([`PgEngine::apply_pool_overrides`]).
+/// All-`None` means the view inherits the process-wide bounds.
+pub fn view_pool_get(spec: &str, view: &str) -> Result<PgPoolSettings, String> {
+    let (_home, uri) = resolve_view_home(spec, view)?;
+    let schema = schema_for(view)
+        .ok_or_else(|| format!("view name '{view}' incompatible with PG schema naming"))?;
+    let mut c = Client::connect(&uri, NoTls).map_err(|e| format!("postgres connect: {e}"))?;
+    read_pool_rows(&mut c, &schema)
+}
+
+/// Declare a view's pool bounds (`grovefs view pool`), or remove them all with
+/// `inherit` so the view follows the process-wide settings again. Validation
+/// runs against the RESULTING pair — a lone `--read 4:16` onto a view that
+/// already declares `read_warm=32` is refused rather than silently
+/// re-normalised, because a ceiling below the floor is an operator asking for
+/// something the pool cannot do.
+///
+/// Takes effect on the view's NEXT engine open (mounted sessions pin the
+/// engine, and its connections hold session-scoped prepared statements); a
+/// raised floor is topped up at that open, a lowered one drains through the
+/// idle reaper.
+pub fn view_pool_set(
+    spec: &str,
+    view: &str,
+    want: PgPoolSettings,
+    inherit: bool,
+) -> Result<PgPoolSettings, String> {
+    let (home, uri) = resolve_view_home(spec, view)?;
+    let schema = schema_for(view)
+        .ok_or_else(|| format!("view name '{view}' incompatible with PG schema naming"))?;
+    let mut c = Client::connect(&uri, NoTls).map_err(|e| format!("postgres connect: {e}"))?;
+    let mut cur = read_pool_rows(&mut c, &schema)?;
+    if inherit {
+        c.execute(
+            &format!(
+                "DELETE FROM {}.ctrl WHERE k = ANY($1)",
+                quoted_schema(&schema)
+            ),
+            &[&POOL_CTRL_KEYS.iter().map(|k| k.to_string()).collect::<Vec<_>>()],
+        )
+        .map_err(|e| format!("postgres pool inherit: {e}"))?;
+        return Ok(PgPoolSettings::default());
+    }
+    // Merge, then validate the resulting lanes.
+    cur.write_warm = want.write_warm.or(cur.write_warm);
+    cur.write_max = want.write_max.or(cur.write_max);
+    cur.read_warm = want.read_warm.or(cur.read_warm);
+    cur.read_max = want.read_max.or(cur.read_max);
+    cur.idle_secs = want.idle_secs.or(cur.idle_secs);
+    for (lane, warm, max) in [
+        ("write", cur.write_warm, cur.write_max),
+        ("read", cur.read_warm, cur.read_max),
+    ] {
+        if let (Some(w), Some(m)) = (warm, max) {
+            if m < w {
+                return Err(format!(
+                    "{lane} ceiling {m} is below {lane} floor {w} — the floor is always retained; raise the ceiling, lower the floor, or set the lane with FLOOR:MAX in one go"
+                ));
+            }
+        }
+    }
+    let ctrl = format!("{}.ctrl", quoted_schema(&schema));
+    let mut written = 0usize;
+    for (k, v) in [
+        ("pg_write_warm", cur.write_warm.map(|v| v as i64)),
+        ("pg_write_max", cur.write_max.map(|v| v as i64)),
+        ("pg_read_warm", cur.read_warm.map(|v| v as i64)),
+        ("pg_read_max", cur.read_max.map(|v| v as i64)),
+        ("pg_pool_idle_secs", cur.idle_secs.map(|v| v as i64)),
+    ] {
+        let Some(v) = v else { continue };
+        c.execute(
+            &format!("INSERT INTO {ctrl} (k,v) VALUES ($1,$2) ON CONFLICT(k) DO UPDATE SET v=EXCLUDED.v"),
+            &[&k.to_string(), &v],
+        )
+        .map_err(|e| format!("postgres pool set {k}: {e}"))?;
+        written += 1;
+    }
+    if written == 0 {
+        return Err(format!(
+            "nothing to record for view '{view}' — pass --write FLOOR[:MAX], --read FLOOR[:MAX], --idle-secs N, or --inherit"
+        ));
+    }
+    // The placement the view already has is untouched; only the bounds moved.
+    read_pool_rows(&mut c, &schema).map(|s| {
+        let _ = home;
+        s
+    })
+}
+
+/// The declared rows of one view's `ctrl` table, as settings. Refuses plainly
+/// when the view has no tree here — a tuning command must never CREATE one as
+/// a side effect (that would let a typo'd view name mint a schema).
+fn read_pool_rows(c: &mut Client, schema: &str) -> Result<PgPoolSettings, String> {
+    let tables: bool = c
+        .query(
+            "SELECT 1 FROM information_schema.tables WHERE table_schema = $1 AND table_name = 'ctrl'",
+            &[&schema],
+        )
+        .map_err(|e| format!("postgres {e}"))?
+        .into_iter()
+        .next()
+        .is_some();
+    if !tables {
+        return Err(format!(
+            "schema '{schema}' has no `ctrl` table — no metadata tree for this view in this store (`view list` shows what exists); `view pool` configures an existing view and never creates one"
+        ));
+    }
+    let keys: Vec<String> = POOL_CTRL_KEYS.iter().map(|k| k.to_string()).collect();
+    let rows = c
+        .query(
+            &format!(
+                "SELECT k, v FROM {}.ctrl WHERE k = ANY($1)",
+                quoted_schema(schema)
+            ),
+            &[&keys],
+        )
+        .map_err(|e| format!("postgres pool get: {e}"))?;
+    let mut s = PgPoolSettings::default();
+    for r in &rows {
+        let k: String = r.get(0);
+        let v = r.get::<_, i64>(1).max(0) as usize;
+        match k.as_str() {
+            "pg_write_warm" => s.write_warm = Some(v),
+            "pg_write_max" => s.write_max = Some(v),
+            "pg_read_warm" => s.read_warm = Some(v),
+            "pg_read_max" => s.read_max = Some(v),
+            "pg_pool_idle_secs" => s.idle_secs = Some(v as u64),
+            _ => {}
+        }
+    }
+    Ok(s)
+}
+
+/// Quote a schema name for use in SQL. Schema names from [`schema_for`] are
+/// `[0-9a-f]`-only and need no quoting, but the `ctrl` lookups above are read
+/// by operators from a REPL-like CLI path, and quoting keeps the text
+/// uniformly safe rather than relying on the caller's input shape.
+fn quoted_schema(schema: &str) -> String {
+    format!("\"{schema}\"")
 }
 
 /// Upper bound on SSI retries per write op. Chosen so that a hot rename
@@ -1128,40 +1562,52 @@ impl PgEngine {
                 "view name '{view}' incompatible with PG schema naming (empty, or longer than 25 bytes)"
             ))
         })?;
-        // Pre-fill the writer pool: every entry carries the session-level
-        // SERIALIZABLE pragma so any `Client::transaction()` inherits SSI.
-        // A failed extra connection just shrinks the pool (writes fall back to
-        // a fresh connect in `checkout_writer`), never fails open().
-        let mut write_pool = Vec::new();
-        for _ in 0..pg_write_pool_size() {
-            if let Ok(mut wc) = Client::connect(&conn_uri, NoTls) {
-                if tune_writer(&mut wc) {
-                    write_pool.push(WriteConn::new(wc));
+        let prof = pool_profile();
+        // One tuned writer before anything else. The schema DDL needs a session
+        // anyway, and reading the view's own bounds from it BEFORE the prefill
+        // is what lets a view sit at a floor BELOW the process default without
+        // first dialing the process default and then reaping it — with a
+        // 10k-view server that difference is the whole feature. A failure here
+        // is not fatal: `ensure_schema` below reconnects through the normal
+        // checkout path, so a real outage still surfaces as the mapped
+        // io_error the caller expects.
+        let boot = match Client::connect(&conn_uri, NoTls) {
+            Ok(mut c) => {
+                // A writer session that cannot be armed with the SERIALIZABLE
+                // pragma must not enter the pool, so it is dropped here.
+                if tune_writer(&mut c) {
+                    Some(WriteConn::new(c))
+                } else {
+                    None
                 }
             }
-        }
-        // Pre-fill the read pool so the first big-directory scan doesn't pay
-        // connect latency per page. Reads stay at READ COMMITTED (the PG
-        // default) — cheaper and no SSI predicate-lock overhead.
-        let mut read_pool = Vec::new();
-        for _ in 0..pg_read_pool_size() {
-            if let Ok(rc) = Client::connect(&conn_uri, NoTls) {
-                read_pool.push(ReadConn::new(rc));
-            }
-        }
+            Err(_) => None,
+        };
         let this = Self {
             view: view.to_string(),
             schema,
             conn_uri,
-            write_pool: parking_lot::Mutex::new(write_pool),
-            read_pool: parking_lot::Mutex::new(read_pool),
+            write_pool: parking_lot::Mutex::new(boot.into_iter().collect()),
+            read_pool: parking_lot::Mutex::new(Vec::new()),
             cursors: parking_lot::Mutex::new(HashMap::new()),
+            w_warm: std::sync::atomic::AtomicUsize::new(prof.write.warm),
+            w_max: std::sync::atomic::AtomicUsize::new(prof.write.max),
+            r_warm: std::sync::atomic::AtomicUsize::new(prof.read.warm),
+            r_max: std::sync::atomic::AtomicUsize::new(prof.read.max),
+            pool_idle_ms: std::sync::atomic::AtomicU64::new(prof.idle_ms),
         };
-        // Ensure the schema exists through the normal writer checkout: if
-        // every pool connect above failed, `checkout_writer` opens a fresh
-        // one; a real outage then surfaces as the mapped io_error the caller
-        // already expects.
+        // Ensure the schema exists through the normal writer checkout: if the
+        // boot connect above failed, `checkout_writer` opens a fresh one.
         this.ensure_schema()?;
+        // The view may declare its own bounds (see `grovefs view pool`); these
+        // are read field by field over the profile, and only THEN are the pools
+        // filled — to the WARM floor, never to the ceiling, which demand reaches
+        // one checkout at a time. A stored floor above what the pool holds is
+        // topped up here; connections that must go instead drain through the
+        // idle reaper, because yanking one out from under live traffic to honor
+        // a tuning hint is never worth it.
+        this.apply_pool_overrides();
+        this.top_up_pools();
         Ok(this)
     }
 
@@ -1234,14 +1680,18 @@ impl PgEngine {
         }
     }
 
-    /// Return a writer connection to the pool (bounded); drop it if the
-    /// server closed the socket so a stale handle never gets handed out again.
-    fn requeue_writer(&self, c: WriteConn) {
+    /// Return a writer connection to the pool, retaining it up to the lane's
+    /// ceiling (above that it is dropped, as before); drop it if the server
+    /// closed the socket so a stale handle never gets handed out again. Stamps
+    /// the idle clock the reaper reads.
+    fn requeue_writer(&self, mut c: WriteConn) {
         if c.is_closed() {
             return;
         }
+        c.idle_at = now_ms();
+        let cap = self.w_max.load(std::sync::atomic::Ordering::Relaxed);
         let mut p = self.write_pool.lock();
-        if p.len() < pg_write_pool_size() {
+        if p.len() < cap {
             p.push(c);
         }
     }
@@ -1270,14 +1720,17 @@ impl PgEngine {
         }
     }
 
-    /// Return a used read connection to the pool (bounded); drop it if the
-    /// server closed it so a stale socket never gets handed out again.
-    fn requeue_read(&self, c: ReadConn) {
+    /// Return a used read connection to the pool, retaining it up to the lane's
+    /// ceiling (above that it is dropped, as before); drop it if the server
+    /// closed it so a stale socket never gets handed out again.
+    fn requeue_read(&self, mut c: ReadConn) {
         if c.client.is_closed() {
             return;
         }
+        c.idle_at = now_ms();
+        let cap = self.r_max.load(std::sync::atomic::Ordering::Relaxed);
         let mut p = self.read_pool.lock();
-        if p.len() < pg_read_pool_size() {
+        if p.len() < cap {
             p.push(c);
         }
     }
@@ -1394,6 +1847,153 @@ impl PgEngine {
         Ok(())
     }
 
+    /// Adopt the pool bounds this view declared in its own `ctrl` table (see
+    /// `grovefs view pool`), field by field over the process-wide profile: a
+    /// view that only sets `pg_write_max` keeps the process floor and only
+    /// widens its ceiling.
+    ///
+    /// Fail-safe by construction — an unreadable `ctrl` (a view whose schema
+    /// predates the table, a blip, a permission gap) simply leaves the
+    /// inherited bounds in place, because refusing to open a mounted view over
+    /// a tuning row would be a worse trade than one unapplied hint. This only
+    /// moves the numbers; [`Self::top_up_pools`] (which `open()` always runs
+    /// afterwards, so a lowered floor costs nothing) is what dials connections,
+    /// and connections already in hand are never taken back here — live traffic
+    /// owns them until the idle reaper sheds them.
+    fn apply_pool_overrides(&self) {
+        let ctrl = self.t("ctrl");
+        let keys: Vec<String> = POOL_CTRL_KEYS.iter().map(|k| k.to_string()).collect();
+        let rows = match self.checkout_writer() {
+            Ok(mut c) => {
+                let r = c.query(
+                    &format!("SELECT k, v FROM {ctrl} WHERE k = ANY($1)"),
+                    &[&keys],
+                );
+                self.requeue_writer(c);
+                r
+            }
+            Err(_) => return,
+        };
+        let rows = match rows {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        let mut got: HashMap<String, i64> = HashMap::new();
+        for r in &rows {
+            got.insert(r.get::<_, String>(0), r.get::<_, i64>(1));
+        }
+        if got.is_empty() {
+            return;
+        }
+        use std::sync::atomic::Ordering::Relaxed;
+        let pick = |k: &str, cur: usize| -> usize {
+            got.get(k)
+                .map(|v| (*v).clamp(0, POOL_LANE_CAP as i64) as usize)
+                .unwrap_or(cur)
+        };
+        let w = LaneBounds::resolve(
+            pick("pg_write_warm", self.w_warm.load(Relaxed)),
+            pick("pg_write_max", self.w_max.load(Relaxed)),
+        );
+        let r = LaneBounds::resolve(
+            pick("pg_read_warm", self.r_warm.load(Relaxed)),
+            pick("pg_read_max", self.r_max.load(Relaxed)),
+        );
+        let idle = got
+            .get("pg_pool_idle_secs")
+            .map(|v| (*v).max(0) as u64 * 1000)
+            .unwrap_or_else(|| self.pool_idle_ms.load(Relaxed));
+        self.w_warm.store(w.warm, Relaxed);
+        self.w_max.store(w.max, Relaxed);
+        self.r_warm.store(r.warm, Relaxed);
+        self.r_max.store(r.max, Relaxed);
+        self.pool_idle_ms.store(idle, Relaxed);
+    }
+
+    /// Dial both lanes up to their WARM floor. Runs once at engine open, after
+    /// [`Self::apply_pool_overrides`] so the view's own floor is what gets
+    /// dialed. Deliberately does NOT pre-dial the ceiling — the whole point of
+    /// the split is that a ceiling is reached by demand, one `checkout_*` at a
+    /// time. Readers stay at READ COMMITTED (the PG default), cheaper and with
+    /// no SSI predicate-lock overhead, so they need no arming step. Never blocks
+    /// on a failure: a short pool is the pre-existing degraded shape,
+    /// `checkout_writer` fills the gap per op.
+    fn top_up_pools(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let want_w = self.w_warm.load(Relaxed);
+        {
+            let mut p = self.write_pool.lock();
+            while p.len() < want_w {
+                match Client::connect(&self.conn_uri, NoTls) {
+                    Ok(mut c) => {
+                        if !tune_writer(&mut c) {
+                            break;
+                        }
+                        p.push(WriteConn::new(c));
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        let want_r = self.r_warm.load(Relaxed);
+        let mut p = self.read_pool.lock();
+        while p.len() < want_r {
+            match Client::connect(&self.conn_uri, NoTls) {
+                Ok(c) => p.push(ReadConn::new(c)),
+                _ => break,
+            }
+        }
+    }
+
+    /// Shed pool connections held above the WARM floor that have been idle for
+    /// at least this view's window, and report how many closed. The server's
+    /// engine sweeper calls this on EVERY cached engine — engine eviction alone
+    /// would never reach a mounted view's pool, which is exactly the case that
+    /// matters, since a burst that has passed leaves an idle writer behind for
+    /// the whole mount.
+    ///
+    /// The floor is untouched: those connections carry the session-scoped
+    /// prepared statements that make a write tx 316us instead of 577us, so
+    /// reaping them would trade a backend slot for latency on every later op.
+    pub fn shrink_pools(&self) -> usize {
+        let ttl = self.pool_idle_ms.load(std::sync::atomic::Ordering::Relaxed);
+        if ttl == 0 {
+            return 0;
+        }
+        let now = now_ms();
+        let mut gone = 0;
+        {
+            let mut p = self.write_pool.lock();
+            gone += reap_lane(&mut p, self.warm_of(&self.w_warm), ttl, now, |c| c.idle_at);
+        }
+        let mut p = self.read_pool.lock();
+        gone += reap_lane(&mut p, self.warm_of(&self.r_warm), ttl, now, |c| c.idle_at);
+        gone
+    }
+
+    fn warm_of(&self, slot: &std::sync::atomic::AtomicUsize) -> usize {
+        slot.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The pool bounds currently in force for this view, resolved (live
+    /// occupancy first, then floor/ceiling) — used by diagnostics.
+    pub fn pool_bounds_now(&self) -> (LaneBounds, LaneBounds, u64, usize, usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            LaneBounds {
+                warm: self.w_warm.load(Relaxed),
+                max: self.w_max.load(Relaxed),
+            },
+            LaneBounds {
+                warm: self.r_warm.load(Relaxed),
+                max: self.r_max.load(Relaxed),
+            },
+            self.pool_idle_ms.load(Relaxed),
+            self.write_pool.lock().len(),
+            self.read_pool.lock().len(),
+        )
+    }
+
     /// Classify a `postgres::Error` as an SSI retry trigger. Only the two
     /// server signalled codes are retried transparently: 40001
     /// `serialization_failure` (SSI abort) and 40P01 `deadlock_detected`
@@ -1440,7 +2040,12 @@ impl PgEngine {
                 // Split the pooled connection so the transaction holds `client`
                 // while the body keeps the statement cache: they are disjoint
                 // fields and `WriteTx` re-joins them for the duration of one op.
-                let WriteConn { client, stmts } = &mut wc;
+                // The idle clock stays with the connection struct (`idle_at: _`).
+                let WriteConn {
+                    client,
+                    stmts,
+                    idle_at: _,
+                } = &mut wc;
                 let mut tx = client.transaction().map_err(|e| {
                     if Self::is_serialization_failure(&e) {
                         WriteErr::Serialization
@@ -4546,6 +5151,149 @@ mod shard_tests {
         assert_eq!(
             (dir.id, dir.parent_id, dir.mode, dir.uid, dir.gid, dir.mtime),
             (7, 3, 0o640, 12, 34, 99)
+        );
+    }
+}
+
+/// The pool bounds arithmetic, kept honest without a server: what the knobs
+/// normalise to, what the CLI accepts, and which connections the idle reaper
+/// is allowed to close. The dialling itself (open/checkout/reap against a real
+/// backend) is the `view pool` section of `.build-bin/test_pg.sh`.
+#[cfg(test)]
+mod pool_tests {
+    use super::{
+        parse_lane_spec, redact_uri, quoted_schema, reap_lane, LaneBounds, POOL_LANE_CAP,
+        PG_POOL_IDLE_SECS, PG_READ_POOL_SIZE, PG_WRITE_POOL_SIZE,
+    };
+
+    /// The defaults every measurement in USAGE/docs was taken against must not
+    /// have moved: a floor of 8 writers + 4 readers, a 60s window, and — the
+    /// point of the split — a ceiling that defaults to the floor, so an
+    /// untouched deployment can never hold an above-floor connection and the
+    /// reaper has nothing to do.
+    #[test]
+    fn defaults_reproduce_the_single_knob_shape() {
+        assert_eq!((PG_WRITE_POOL_SIZE, PG_READ_POOL_SIZE), (8, 4));
+        assert_eq!(PG_POOL_IDLE_SECS, 60);
+        let w = LaneBounds::resolve(PG_WRITE_POOL_SIZE, 0);
+        let r = LaneBounds::resolve(PG_READ_POOL_SIZE, 0);
+        assert_eq!((w.warm, w.max), (8, 8));
+        assert_eq!((r.warm, r.max), (4, 4));
+    }
+
+    #[test]
+    fn resolve_reads_no_ceiling_and_a_short_ceiling_as_the_floor() {
+        // `0` is how the unset case arrives (the env/flag default), and a
+        // ceiling under the floor is unrepresentable — the floor is retained by
+        // definition, so the pair can only mean "no burst allowed".
+        assert_eq!(LaneBounds::resolve(2, 0), LaneBounds { warm: 2, max: 2 });
+        assert_eq!(LaneBounds::resolve(4, 2), LaneBounds { warm: 4, max: 4 });
+        assert_eq!(LaneBounds::resolve(2, 8), LaneBounds { warm: 2, max: 8 });
+        assert_eq!(LaneBounds::resolve(0, 4), LaneBounds { warm: 0, max: 4 });
+        // Clamping keeps both sides under the cap AND keeps max >= warm.
+        let b = LaneBounds::resolve(POOL_LANE_CAP + 100, POOL_LANE_CAP + 200);
+        assert_eq!((b.warm, b.max), (POOL_LANE_CAP, POOL_LANE_CAP));
+    }
+
+    #[test]
+    fn parse_lane_spec_accepts_both_spellings() {
+        assert_eq!(parse_lane_spec("2").unwrap(), (2, None));
+        assert_eq!(parse_lane_spec("2:8").unwrap(), (2, Some(8)));
+        assert_eq!(parse_lane_spec("2:2").unwrap(), (2, Some(2)));
+        assert_eq!(parse_lane_spec("0").unwrap(), (0, None));
+        assert_eq!(parse_lane_spec("64").unwrap(), (64, None));
+    }
+
+    #[test]
+    fn parse_lane_spec_refuses_what_the_pool_cannot_do() {
+        let e = parse_lane_spec("8:2").unwrap_err();
+        assert!(e.contains("below floor"), "{e}");
+        assert!(parse_lane_spec("70").is_err());
+        assert!(parse_lane_spec("2:70").is_err());
+        assert!(parse_lane_spec("x").is_err());
+        assert!(parse_lane_spec("2:x").is_err());
+        // An empty side is a typo, not a request to inherit: the CLI has no
+        // way to express "ceiling only" through this parser.
+        assert!(parse_lane_spec(":8").is_err());
+        assert!(parse_lane_spec("2:").is_err());
+        assert!(parse_lane_spec("-1").is_err());
+    }
+
+    /// A lane is a `Vec` whose FRESHEST entry is at the back (`checkout_*` pops
+    /// the tail), so reaping walks from the front and stops at the first entry
+    /// still inside the window. Both halves matter: the floor is never touched,
+    /// and a bursty view is not shed from the middle of its own pool.
+    #[test]
+    fn reap_lane_sheds_idle_entries_down_to_but_not_below_the_floor() {
+        let stamp = |t: &u64| *t;
+        let mut lane: Vec<u64> = vec![100, 200, 300, 400];
+        // now=400, ttl=50: the two oldest are past the window, the two newest
+        // are inside it.
+        assert_eq!(reap_lane(&mut lane, 2, 50, 400, stamp), 2);
+        assert_eq!(lane, vec![300, 400]);
+        // Nothing above the floor left, however idle.
+        assert_eq!(reap_lane(&mut lane, 2, 50, 100_000, stamp), 0);
+        assert_eq!(lane, vec![300, 400]);
+        // Floor 0 means "shed the whole lane once idle" — the knob an
+        // aggressively-packed server can set; the walk still stops on the
+        // first in-window entry.
+        assert_eq!(reap_lane(&mut lane, 0, 50, 400, stamp), 1);
+        assert_eq!(lane, vec![400]);
+    }
+
+    #[test]
+    fn reap_lane_does_not_skip_ahead_past_a_fresh_entry() {
+        // The walk is strictly front-to-back and stops dead: a lane whose head
+        // is still inside the window is left alone even when older entries sit
+        // behind it. Reaping by age instead would need a sort per sweep for no
+        // benefit — with LIFO checkout the front IS the least-recently-used end
+        // in every case that matters, and the slack is the hysteresis.
+        let mut lane: Vec<u64> = vec![200, 900, 100];
+        assert_eq!(reap_lane(&mut lane, 0, 150, 1000, |t| *t), 1);
+        assert_eq!(lane, vec![900, 100]);
+        // The tail entry (stamp 100) is the OLDEST in the lane and still
+        // stays: one fresh connection ahead of it is enough to say "this view
+        // is mid-burst", which is exactly the hysteresis a too-eager TTL
+        // would cost in dial + PRAGMA + re-parse on the next op.
+        assert_eq!(reap_lane(&mut lane, 2, 150, 5_000, |t| *t), 0);
+    }
+
+    #[test]
+    fn quoted_schema_wraps_for_the_sql_interpolation() {
+        // `schema_for` output is [0-9a-f]-only, but the ctrl lookups interpolate
+        // it, so the quoting rule is worth pinning.
+        assert_eq!(quoted_schema("9f86d081884c7d65"), "\"9f86d081884c7d65\"");
+    }
+
+    #[test]
+    fn redact_uri_masks_only_the_password() {
+        assert_eq!(
+            redact_uri("postgres://grove:s3cr3t@10.0.0.9:5433/grovefs"),
+            "postgres://grove:***@10.0.0.9:5433/grovefs"
+        );
+        assert_eq!(
+            redact_uri("postgresql://u:p@h/db?connect_timeout=3"),
+            "postgresql://u:***@h/db?connect_timeout=3"
+        );
+        // A password that itself contains '@': the LAST separator is the real
+        // one (RFC 3986), so everything before it is userinfo.
+        assert_eq!(
+            redact_uri("postgres://u:p@ss@h/db"),
+            "postgres://u:***@h/db"
+        );
+        // Nothing to mask stays byte-identical: a `file:` registry path is not
+        // a secret, and host/port/dbname must survive so the line still names
+        // the instance it came from.
+        assert_eq!(
+            redact_uri("file:/data/fdb/instances.conf"),
+            "file:/data/fdb/instances.conf"
+        );
+        assert_eq!(redact_uri("postgres://h/db"), "postgres://h/db");
+        assert_eq!(redact_uri("postgres://u@h/db"), "postgres://u@h/db");
+        // A '@' inside a query parameter is not a credential separator.
+        assert_eq!(
+            redact_uri("postgres://h/db?options=-c%20a@b"),
+            "postgres://h/db?options=-c%20a@b"
         );
     }
 }

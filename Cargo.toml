@@ -23,7 +23,7 @@ path = "src/lib.rs"
 # Full build: fuse-bridge + on-disk metadata engine (rusqlite) + PostgreSQL
 # backend + the cluster servers/control plane. On by default for the Linux
 # `grovefs` binary.
-default = ["native"]
+default = ["native", "web"]
 # The kernel FUSE bridge and real POSIX shims only: `fuser` (kernel bridge),
 # `libc` (real errno/ids/signals), plus the `fs_impl` mount path and `bwlimit`
 # shaper they need. NO on-disk engine and NO server/control plane. This is what
@@ -38,6 +38,12 @@ native = ["fuse-bridge", "dep:rusqlite", "dep:postgres"]
 # no fuser/libc, no engine. Combine with `--no-default-features` (the Windows
 # WinFsp client's build).
 remote-only = []
+# The WEB CONSOLE (`grovefs web`): a static SPA plus the HTTP gateway in front of
+# `meta-server --control-listen`. Needs `native` because the account store
+# (`web_accounts`) and the governance ops it calls live in the server-side
+# stack. Deliberately NOT part of `native`: a client build gains nothing from
+# linking an HTTP server, and `remote-only`/WinFsp must stay free of it.
+web = ["native", "dep:tiny_http"]
 
 [dependencies]
 # FUSE in userspace. 0.18: high-level Filesystem trait is &self + Send/Sync and
@@ -78,6 +84,12 @@ postgres = { version = "0.19", default-features = false, optional = true }
 hdrhistogram = "7"
 serde_json = "1.0.154"
 sha2 = "0.11.1"
+# The web console's HTTP/1.1 server (`grovefs web`, feature `web`). Chosen over
+# an async framework because the gateway's whole job is a request/response shim
+# in front of an existing TCP control plane: one blocking thread per request, no
+# tokio runtime, no async refactor of anything below it, and it inherits the
+# workspace's "a client build must not pay for the server's graph" rule.
+tiny_http = { version = "0.12", optional = true }
 
 [dev-dependencies]
 # Temp dirs for integration tests (metadata DB, remote data-server backing store)

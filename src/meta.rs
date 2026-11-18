@@ -197,6 +197,28 @@ pub const REFS_DB: &str = "refs.db";
 /// The schema name every engine connection ATTACHes the ledger under.
 pub const REFS_SCHEMA: &str = "refs";
 
+/// The stems of the `meta/*.db` files that are CONTROL-PLANE stores rather than
+/// view trees: the api-key/audit store, the web console's account/grant store,
+/// and the holder ledger itself.
+///
+/// Every enumerator that walks `meta/` looking for views has to skip these, and
+/// it must ask THIS question rather than keep its own pair of names: five call
+/// sites each carried a hand-written `!= "api_keys" && != "refs"`, and adding a
+/// third store to that directory would otherwise have made `web_accounts` look
+/// like a mountable view to `view list`, to `gc`, to `refs rebuild` and to the
+/// server's own epoch scan — with `gc`/`refs` then failing on its missing `node`
+/// table. A new store is now invisible to the view listing by construction.
+pub const CONTROL_DB_STEMS: &[&str] = &["api_keys", "refs", "web_accounts"];
+
+/// Is `name` (a `meta/` directory entry) a view tree's database? Anything that
+/// is not a `.db`, or is one of [`CONTROL_DB_STEMS`], is not.
+pub fn is_view_db(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".db") else {
+        return false;
+    };
+    !stem.is_empty() && !CONTROL_DB_STEMS.contains(&stem)
+}
+
 /// One `CREATE` request in a batch (see [`MetaProvider::create_nodes_batch`]).
 ///
 /// Borrowed, because the caller keeps the owned names in its queue and only
@@ -501,3 +523,32 @@ impl std::error::Error for MetaError {}
 mod engine;
 #[cfg(feature = "native")]
 pub use engine::*;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_stores_are_never_view_trees() {
+        // The files that share `meta/` with the view trees must never be listed
+        // as views. Five enumerators used to keep their own two-name exception
+        // list, so a third store added there would have shown up in `view list`
+        // and been opened as a tree by `gc` and `refs rebuild` alike.
+        assert!(!is_view_db("refs.db"));
+        assert!(!is_view_db("api_keys.db"));
+        assert!(!is_view_db("web_accounts.db"));
+        assert!(is_view_db("team.db"));
+        assert!(is_view_db("a-b_c1.db"));
+        // The ledger's own name has to stay in the exception list, whatever it is
+        // spelled as over in `REFS_DB`.
+        assert!(CONTROL_DB_STEMS.contains(&REFS_DB.strip_suffix(".db").unwrap()));
+        // Not a db, a directory, a definition, a sidecar, an import scratch file,
+        // or an empty stem: none of them is a tree.
+        for n in [
+            "views", "team.layout", "team.db-wal", "team.db-shm", ".team.import-4-5", "db", ".db",
+            "team.DB",
+        ] {
+            assert!(!is_view_db(n), "'{n}' must not look like a view tree");
+        }
+    }
+}

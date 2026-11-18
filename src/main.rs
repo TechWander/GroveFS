@@ -505,6 +505,38 @@ enum Cmd {
         /// the view-count ceiling stops being `max_connections / 12`.
         #[arg(long = "engine-idle-secs", value_name = "SECS", default_value_t = 300)]
         engine_idle_secs: u64,
+        /// WARM floor of each PG view's writer pool: connections pre-filled at
+        /// engine open and NEVER reaped (they carry the session's prepared
+        /// statements). Default 8, exactly the historical `GROVEFS_PG_WRITE_POOL`
+        /// value, so setting nothing changes nothing. Lower it (with
+        /// `--pg-write-pool-max` raised) to make the per-view connection floor
+        /// track real metadata concurrency instead of the configured ceiling.
+        /// `GROVEFS_PG_WRITE_POOL` fills the same slot when this flag is absent.
+        #[arg(long = "pg-write-pool", value_name = "N")]
+        pg_write_pool: Option<usize>,
+        /// RETAIN CEILING of each PG view's writer pool: burst connections a
+        /// `checkout` dialled are kept up to this many, then shed back to the
+        /// warm floor after `--pg-pool-idle-secs` idle. Default (unset or `0`)
+        /// is the floor, i.e. the pre-split behavior where anything above the
+        /// floor was dropped on return. `GROVEFS_PG_WRITE_POOL_MAX` fills the
+        /// same slot.
+        #[arg(long = "pg-write-pool-max", value_name = "N")]
+        pg_write_pool_max: Option<usize>,
+        /// WARM floor of each PG view's reader lane (default 4; env
+        /// `GROVEFS_PG_READ_POOL`).
+        #[arg(long = "pg-read-pool", value_name = "N")]
+        pg_read_pool: Option<usize>,
+        /// RETAIN CEILING of each PG view's reader lane (default: the floor;
+        /// env `GROVEFS_PG_READ_POOL_MAX`).
+        #[arg(long = "pg-read-pool-max", value_name = "N")]
+        pg_read_pool_max: Option<usize>,
+        /// Idle window after which a PG pool connection held ABOVE its warm
+        /// floor is closed (default 60, `0` never reaps). Sized to keep a
+        /// bursty view from paying connect + SERIALIZABLE pragma + prepared
+        /// re-parse again on every write (measured 577us vs 316us per write
+        /// transaction). `GROVEFS_PG_POOL_IDLE_SECS` fills the same slot.
+        #[arg(long = "pg-pool-idle-secs", value_name = "SECS")]
+        pg_pool_idle_secs: Option<u64>,
         /// Expose the REMOTE CONTROL PLANE on a second listener
         /// (`--control-listen HOST:PORT`): `grovefs view` / `grovefs apikey` /
         /// `grovefs refs` calls arrive as framed requests and are executed HERE,
@@ -521,6 +553,25 @@ enum Cmd {
         /// Unset (default) keeps this process exactly as it was.
         #[arg(long = "control-listen", value_name = "HOST:PORT")]
         control_listen: Option<String>,
+        /// Seed the web console's FIRST owner at install time
+        /// (`grovefs web --control-server` signs in against the accounts this
+        /// process creates). Applied ONLY when the account store is empty:
+        /// a governance entrance that can mint its own administrator has no
+        /// gate. Re-named on a later start with the same account is ignored (a
+        /// systemd unit re-reads its flags on every restart, and that must not
+        /// be an outage); a DIFFERENT account into a non-empty store is refused.
+        /// After the first sign-in, accounts come from the console or
+        /// `grovefs web account create`, never from a start-up flag.
+        #[arg(long = "admin-user", value_name = "ACCOUNT")]
+        admin_user: Option<String>,
+        /// File holding `--admin-user`'s password (its first line, trailing
+        /// newline stripped). A PATH and not the password itself because argv is
+        /// readable by every local process (`ps`, the journal, a shell history)
+        /// — and because this value, unlike every other credential here, is
+        /// stretched into `web_accounts` and then never needed again. `0600` by
+        /// the owner root is the expectation; nothing here can enforce it.
+        #[arg(long = "admin-password-file", value_name = "PATH")]
+        admin_password_file: Option<PathBuf>,
     },
     /// Unmount a mountpoint
     Umount {
@@ -696,6 +747,75 @@ NOTES
         control_key: Option<String>,
         #[command(subcommand)]
         action: ApikeyAction,
+    },
+    /// Serve the MANAGEMENT CONSOLE, and administer its sign-in accounts.
+    ///
+    /// With no subcommand this is a small HTTP gateway in front of `meta-server
+    /// --control-listen`: it serves the embedded single-page app (overview, views,
+    /// keys, accounts and grants, audit), turns a browser session into an ACCOUNT,
+    /// and forwards each click to the control plane — where the rule that decides
+    /// what that account may touch lives beside the data. It holds ONE
+    /// `admin`-scope key and no store credential, adds no governance rule of its
+    /// own, and only ever REMOVES capability: the verbs it refuses to route
+    /// (`gc`, `refs rebuild`, `view rm-base`, `fork graft`) stay CLI-only, where
+    /// their dry-run reports and typed confirmations are part of calling them.
+    ///
+    /// Sign in as the account seeded at install time (`meta-server --admin-user
+    /// <name> --admin-password-file <path>`, applied only while the account store
+    /// is empty), then create the rest here or in the page. Loopback is the
+    /// default bind and this server speaks plain HTTP: a routable `--listen` needs
+    /// `--allow-insecure-http`, or TLS on a reverse proxy in front of it (with
+    /// `--use-x-forwarded-for`, so sign-ins are throttled per client rather than
+    /// per proxy).
+    #[cfg(feature = "web")]
+    Web {
+        /// The governance entrance to put the console in front of: the
+        /// `meta-server --control-listen HOST:PORT` that owns the accounts, the
+        /// views and the audit log. Required — this process stores nothing.
+        #[arg(long = "control-server", value_name = "HOST:PORT", global = true)]
+        control_server: Option<String>,
+        /// The `admin`-scope account key for --control-server
+        /// (`GROVEFS_CONTROL_KEY` / `GROVEFS_API_KEY` fill a missing value). This
+        /// is the deployment's governance credential: it must stay on this host,
+        /// which is what `--api-key-file` (a `0600` secret file a unit reads) and
+        /// the loopback default are for.
+        #[arg(long = "api-key", value_name = "ID:SECRET", global = true)]
+        control_key: Option<String>,
+        /// File holding that key (its first line) instead of `--api-key`, for a
+        /// systemd unit or a mounted secret — argv is visible to every local
+        /// process and lands in the shell history. Beats `GROVEFS_CONTROL_KEY`.
+        #[arg(long = "api-key-file", value_name = "PATH", global = true)]
+        control_key_file: Option<PathBuf>,
+        /// Address to serve the console on. `127.0.0.1` by default; a browser on
+        /// another host reaches it through a reverse proxy or an SSH tunnel
+        /// (`ssh -L 8787:127.0.0.1:8787 <host>`).
+        #[arg(long = "listen", value_name = "HOST:PORT", default_value = grovefs::web::DEFAULT_LISTEN)]
+        listen: String,
+        /// Idle window of a signed-in session (`30m`, `8h`, `2d`). The console
+        /// mints keys and changes roles, so an unattended browser gets a shorter
+        /// leash than an unattended shell. A revoked grant or a disabled account
+        /// takes effect sooner than this: on that session's NEXT call, because the
+        /// server re-reads the principal per request.
+        #[arg(long = "session-ttl", value_name = "AGE", default_value = "8h")]
+        session_ttl: String,
+        /// Worker threads, i.e. how many console requests may be in flight. One
+        /// governance call blocks its thread, so this caps concurrency and waiting
+        /// browsers at once; further requests queue in the listener.
+        #[arg(long, default_value_t = 4)]
+        workers: usize,
+        /// Bind a NON-LOOPBACK address over plain HTTP anyway: every sign-in and
+        /// every governance call then crosses the wire unencrypted. Only correct
+        /// when the network itself is trusted end to end.
+        #[arg(long)]
+        allow_insecure_http: bool,
+        /// Take the client address from `X-Forwarded-For` instead of the socket.
+        /// Correct ONLY behind a proxy that sets and sanitizes that header: an
+        /// untrusted value would turn the sign-in throttle and the audit's `ip`
+        /// into something the caller chooses.
+        #[arg(long)]
+        use_x_forwarded_for: bool,
+        #[command(subcommand)]
+        action: Option<WebAction>,
     },
     /// Inspect and repair the cross-view blob reference ledger (the shared
     /// `meta/refs.db` that decides when a physical object may actually be
@@ -1169,6 +1289,40 @@ enum ViewAction {
         #[arg(long)]
         keep_source: bool,
     },
+    /// Show or set a view's PostgreSQL connection-pool bounds — the WARM floor
+    /// (connections held for the whole engine lifetime) and the RETAIN CEILING
+    /// (burst connections kept before the idle reaper sheds them), per lane.
+    /// With no flags it shows what the view declares and what the process
+    /// defaults to; `--write FLOOR[:MAX]` / `--read FLOOR[:MAX]` / `--idle-secs
+    /// N` record overrides in the view's OWN metadata tree (so a `view move`
+    /// carries them along), and `--inherit` removes them again.
+    ///
+    /// This is how a fork-heavy fleet stops paying 12 connections per tree:
+    /// a branch that is read and structure-written but never content-written
+    /// (content writes are EROFS on a fork) needs a writer floor of 1–2, not 8,
+    /// and still gets 8 during an import burst. Bounds take effect on the
+    /// view's NEXT engine open — mounted sessions pin the engine and its
+    /// connections hold session-scoped prepared statements, so nothing is
+    /// yanked out from under a live mount.
+    Pool {
+        #[arg(long)]
+        view: String,
+        /// Writer lane as `FLOOR[:MAX]` (e.g. `2:8`); bare `N` keeps the
+        /// historical floor==ceiling shape.
+        #[arg(long, value_name = "FLOOR[:MAX]")]
+        write: Option<String>,
+        /// Reader lane as `FLOOR[:MAX]`.
+        #[arg(long, value_name = "FLOOR[:MAX]")]
+        read: Option<String>,
+        /// Per-view idle window (seconds) before a burst connection above the
+        /// floor is reaped; `0` never reaps.
+        #[arg(long = "idle-secs", value_name = "SECS")]
+        idle_secs: Option<u64>,
+        /// Drop this view's overrides and follow the meta-server's process-wide
+        /// bounds again.
+        #[arg(long)]
+        inherit: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1251,6 +1405,128 @@ enum ApikeyAction {
     Calls {
         #[arg(long, default_value_t = 20)]
         limit: usize,
+    },
+}
+
+/// The headless half of the web console: the same account and delegation verbs
+/// the page offers, for the cases a browser is wrong for (an install script, an
+/// operator over SSH, `--json` for a tool). They run as the OPERATOR — the admin
+/// key with no account attached — which is the plane's oldest and widest
+/// credential, so these commands are how a deployment's first accounts get made
+/// before anyone can sign in.
+///
+/// There is deliberately no `--meta-dir`/`--meta-store` form of them: the
+/// meta-server owns its account store, and rules like "the last enabled admin
+/// cannot be demoted" and the password policy live in front of that store. A CLI
+/// that opened the table directly would be a second implementation of them, and
+/// the one nobody audits.
+#[cfg(feature = "web")]
+#[derive(Subcommand)]
+enum WebAction {
+    /// Manage sign-in accounts (`--control-server` + an admin key required).
+    #[command(subcommand)]
+    Account(WebAccountAction),
+    /// Manage which BASE views an account governs — its delegations. An account
+    /// with no grant manages nothing: `admin` is the role that ignores grants, so
+    /// `create` alone never widens anyone's reach.
+    #[command(subcommand)]
+    Grant(WebGrantAction),
+}
+
+#[cfg(feature = "web")]
+#[derive(Subcommand)]
+enum WebAccountAction {
+    /// Create an account named `--account` with the password in
+    /// `--password-file` (or on stdin with `--password-stdin`) and role
+    /// `--role user|admin`. A password never goes on a command line: argv is
+    /// visible to every local process and lands in the shell history. The
+    /// minimum length and the "not the account name" rule are the server's
+    /// (`webauth::check_password`) and are reported verbatim.
+    Create {
+        #[arg(long, value_name = "ACCOUNT")]
+        account: String,
+        #[arg(long = "password-file", value_name = "PATH")]
+        password_file: Option<PathBuf>,
+        /// Read the password from stdin — `pass generate … | grovefs web account
+        /// create --account alice --password-stdin`, so the secret appears in no
+        /// argument list and no file.
+        #[arg(long, conflicts_with = "password_file")]
+        password_stdin: bool,
+        /// `user` (default): governs only the base views it is granted. `admin`:
+        /// governs the deployment, grants included.
+        #[arg(long, default_value = "user")]
+        role: String,
+    },
+    /// List accounts (name, role, created/last sign-in, disabled, granted base
+    /// views) — never a password digest.
+    List,
+    /// Set a new password for `--account` from `--password-file` /
+    /// `--password-stdin`. An active browser session is NOT ended by this (it is
+    /// the gateway's cookie table); `disable` is the verb that stops someone now.
+    Passwd {
+        #[arg(long, value_name = "ACCOUNT")]
+        account: String,
+        #[arg(long = "password-file", value_name = "PATH")]
+        password_file: Option<PathBuf>,
+        #[arg(long, conflicts_with = "password_file")]
+        password_stdin: bool,
+    },
+    /// Change an account's role. Demoting the LAST enabled admin is refused —
+    /// that is the lock-out this guard exists for; create and verify a second
+    /// admin first.
+    Role {
+        #[arg(long, value_name = "ACCOUNT")]
+        account: String,
+        #[arg(long, value_name = "user|admin")]
+        role: String,
+    },
+    /// Let `--account` sign in again (undo `disable`). Grants are untouched by
+    /// either verb, so re-enabling returns exactly the reach it had.
+    Enable {
+        #[arg(long, value_name = "ACCOUNT")]
+        account: String,
+    },
+    /// Stop `--account` signing in. Takes effect on that user's NEXT call, not at
+    /// the end of a page's session, because the server re-reads the principal per
+    /// request. Its api keys are NOT revoked (a disable is reversible; killing a
+    /// running mount is not) — `grovefs apikey revoke` is that verb.
+    Disable {
+        #[arg(long, value_name = "ACCOUNT")]
+        account: String,
+    },
+    /// Delete `--account` and its delegations. Its api keys stay alive and
+    /// unattributed on purpose, so a delete cannot silently stop a production
+    /// mount; the reply counts them so the next command is obvious.
+    Rm {
+        #[arg(long, value_name = "ACCOUNT")]
+        account: String,
+    },
+}
+
+#[cfg(feature = "web")]
+#[derive(Subcommand)]
+enum WebGrantAction {
+    /// Give `--account` management of base view `--base` — and of everything
+    /// derived from it (lenses, aliases and forks resolve outward to their base),
+    /// which is why this names a BASE and not a leaf. A `--base` that is a lens or
+    /// a fork is stored against the base it resolves to and says so.
+    Add {
+        #[arg(long, value_name = "ACCOUNT")]
+        account: String,
+        #[arg(long, value_name = "VIEW")]
+        base: String,
+    },
+    /// Withdraw one delegation. Effective on that account's next call.
+    Rm {
+        #[arg(long, value_name = "ACCOUNT")]
+        account: String,
+        #[arg(long, value_name = "VIEW")]
+        base: String,
+    },
+    /// List delegations (`--account` to narrow to one person).
+    List {
+        #[arg(long, value_name = "ACCOUNT")]
+        account: Option<String>,
     },
 }
 
@@ -1489,6 +1765,286 @@ fn refuse_local_with_remote(
              a different store. Drop the local flags — the account key alone decides what is governed."
         )
         .into());
+    }
+    Ok(())
+}
+
+/// The first line of a secret file, stripped of its newline. Every credential
+/// this CLI can take from a FILE instead of from argv goes through here: a key on
+/// a command line is visible to every local process (`ps`, the journal, a shell
+/// history), which is a strictly worse exposure than the `0600` file a unit
+/// already reads.
+#[cfg(feature = "web")]
+fn read_secret_file(path: &PathBuf, what: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("cannot read {what} {}: {e}", path.display()))?;
+    secret_line(&text, what)
+}
+
+/// One secret out of the first line of what was read. Empty is refused HERE on
+/// purpose: an empty password would come back as the server's policy refusal
+/// ("at least 10 characters"), which hides the actual mistake — that nothing was
+/// piped in.
+#[cfg(feature = "web")]
+fn secret_line(text: &str, what: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let line = text.lines().next().unwrap_or("").to_string();
+    if line.is_empty() {
+        return Err(format!("{what} has no secret in its first line").into());
+    }
+    Ok(line)
+}
+
+/// A password for `web account create|passwd`: from a file or from stdin, never
+/// from argv and never invented here — a placeholder generated by the CLI is the
+/// same leak with extra steps.
+#[cfg(feature = "web")]
+fn read_password(
+    file: Option<&PathBuf>,
+    stdin: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let text = match (file, stdin) {
+        (Some(p), false) => std::fs::read_to_string(p)
+            .map_err(|e| format!("cannot read --password-file {}: {e}", p.display()))?,
+        (None, true) => {
+            use std::io::Read;
+            let mut s = String::new();
+            let n = std::io::stdin()
+                .read_to_string(&mut s)
+                .map_err(|e| format!("cannot read the password from stdin: {e}"))?;
+            if n == 0 {
+                return Err("--password-stdin received nothing: pipe the secret in (a password \n                        manager, a file) rather than running this from a terminal.".into());
+            }
+            s
+        }
+        (Some(_), true) => {
+            return Err("--password-file and --password-stdin name two sources for one password.".into())
+        }
+        (None, false) => {
+            return Err(
+                "a password comes from --password-file PATH or --password-stdin: on a command line \n             it is visible to every local process and lands in the shell history. The length and \n             composition rules are the server's and are reported verbatim."
+                    .into(),
+            )
+        }
+    };
+    secret_line(&text, "the password")
+}
+
+/// One string/number/bool field of a control reply as a table cell (`-` when the
+/// server omitted it or sent null, so an optional column cannot panic the CLI).
+#[cfg(feature = "web")]
+fn jfield(v: &serde_json::Value, f: &str) -> String {
+    match v.get(f) {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Bool(b)) => b.to_string(),
+        Some(serde_json::Value::Number(n)) => n.to_string(),
+        _ => "-".to_string(),
+    }
+}
+
+/// A string-array field of a control reply, joined for one cell.
+#[cfg(feature = "web")]
+fn jlist(v: &serde_json::Value, f: &str) -> String {
+    v.get(f)
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default()
+}
+
+/// A reply that is a list of rows.
+#[cfg(feature = "web")]
+fn jrows(v: &serde_json::Value) -> Vec<serde_json::Value> {
+    v.as_array().cloned().unwrap_or_default()
+}
+
+/// Run one `grovefs web account|grant` verb over the control plane and print the
+/// reply. Each is ONE call, and every rule behind it stays the server's — the
+/// password policy, the last-enabled-admin guard, the base a grant on a lens
+/// resolves to. Formatting is the only thing this function owns, which is the
+/// same argument the web gateway makes about the ACL: a second implementation of
+/// a governance rule is the one nobody audits.
+#[cfg(feature = "web")]
+fn web_govern(
+    c: &grovefs::control_remote::ControlClient,
+    action: WebAction,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use serde_json::json;
+    let call = |op: &str, a: serde_json::Value| -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        c.call(op, a)
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })
+    };
+    // The address echoed into every "do this next" line, so a copy-paste of the
+    // hint is a working command rather than one the operator has to complete.
+    let at = c.addr();
+    match action {
+        WebAction::Account(WebAccountAction::Create {
+            account,
+            password_file,
+            password_stdin,
+            role,
+        }) => {
+            let password = read_password(password_file.as_ref(), password_stdin)?;
+            let r = call(
+                "account.create",
+                json!({"account": account, "password": password, "role": role}),
+            )?;
+            let made = jfield(&r, "account");
+            println!("web account created: {made}");
+            println!("  role:  {}", jfield(&r, "role"));
+            let bases = jlist(&r, "bases");
+            println!(
+                "  bases: {}",
+                if bases.is_empty() {
+                    "none — it can sign in and govern nothing yet"
+                } else {
+                    &bases
+                }
+            );
+            if let Some(note) = r.get("note").and_then(|v| v.as_str()) {
+                println!("  note:  {note}");
+            }
+            println!();
+            println!("Delegate a base view (a user governs that tree and everything derived from it):");
+            println!("  grovefs web --control-server {at} grant add --account {made} --base VIEW");
+        }
+        WebAction::Account(WebAccountAction::List) => {
+            let rows = jrows(&call("account.list", json!({}))?);
+            if rows.is_empty() {
+                println!(
+                    "no web accounts in the control plane at {at}. The first one is seeded at install\ntime while the store is empty (`meta-server --admin-user alice --admin-password-file PATH`);\nafter that they come from the console's Accounts page or from `grovefs web account create`."
+                );
+                return Ok(());
+            }
+            println!(
+                "{:<20} {:<6} {:<22} {:<22} {:<22} {}",
+                "account", "role", "created", "last sign-in", "disabled", "base views governed"
+            );
+            for r in &rows {
+                let mut bases = jlist(r, "bases");
+                if bases.is_empty() {
+                    bases = if jfield(r, "role") == "admin" {
+                        "<all: an admin is not bounded by grants>".to_string()
+                    } else {
+                        "-".to_string()
+                    };
+                }
+                println!(
+                    "{:<20} {:<6} {:<22} {:<22} {:<22} {}",
+                    jfield(r, "account"),
+                    jfield(r, "role"),
+                    jfield(r, "created_at"),
+                    jfield(r, "last_login_at"),
+                    jfield(r, "disabled_at"),
+                    bases
+                );
+            }
+        }
+        WebAction::Account(WebAccountAction::Passwd {
+            account,
+            password_file,
+            password_stdin,
+        }) => {
+            let password = read_password(password_file.as_ref(), password_stdin)?;
+            let r = call(
+                "account.passwd",
+                json!({"account": account, "password": password}),
+            )?;
+            println!("password changed for {}.", jfield(&r, "account"));
+            println!("A browser session already signed in keeps its session until it goes idle (the\ngateway's own table, not a credential); `account disable` is the verb that stops a person\non their next call.");
+        }
+        WebAction::Account(WebAccountAction::Role { account, role }) => {
+            let r = call("account.role", json!({"account": account, "role": role}))?;
+            println!("{} is now role {}", jfield(&r, "account"), jfield(&r, "role"));
+            if jfield(&r, "role") == "admin" {
+                println!("An admin governs the whole deployment: every view, every key, every account. Its\nown grants are not read, so delegate a `user` (`grant add`) rather than raising a role\nto solve a missing grant.");
+            }
+        }
+        WebAction::Account(WebAccountAction::Enable { account }) => {
+            let r = call(
+                "account.disable",
+                json!({"account": account, "disabled": false}),
+            )?;
+            println!("{} can sign in again.", jfield(&r, "account"));
+        }
+        WebAction::Account(WebAccountAction::Disable { account }) => {
+            let r = call(
+                "account.disable",
+                json!({"account": account, "disabled": true}),
+            )?;
+            println!("{} cannot sign in.", jfield(&r, "account"));
+            println!("Effective on that user's NEXT call (the server re-reads the principal per request); its\ndelegations are untouched, so `account enable` returns exactly this reach. Its API keys are\nNOT revoked — a disable is reversible and stopping a live mount is not, so revoking one\nis a separate, deliberate verb: `grovefs apikey --control-server {at} revoke --id <ID>`.");
+        }
+        WebAction::Account(WebAccountAction::Rm { account }) => {
+            let r = call("account.delete", json!({"account": account}))?;
+            println!("web account {} deleted.", jfield(&r, "account"));
+            println!("  {}", jfield(&r, "note"));
+        }
+        WebAction::Grant(WebGrantAction::Add { account, base }) => {
+            let r = call("grant.add", json!({"account": account, "base": base}))?;
+            let got = jfield(&r, "base");
+            if r.get("asNamed").and_then(|v| v.as_bool()) == Some(false) {
+                println!("'{base}' resolves to base view '{got}' — the delegation is stored on that (a grant\non a lens would be a row the ACL can never match).");
+            }
+            println!(
+                "{} now governs '{got}' and everything derived from it, as granted by {}.",
+                jfield(&r, "account"),
+                jfield(&r, "grantedBy")
+            );
+            println!("That covers its forks, aliases and lenses, and the keys bound to any of those names.");
+        }
+        WebAction::Grant(WebGrantAction::Rm { account, base }) => {
+            let r = call("grant.remove", json!({"account": account, "base": base}))?;
+            println!(
+                "{}",
+                if r.get("removed").and_then(|v| v.as_bool()) == Some(true) {
+                    format!("{} no longer governs '{}'.", jfield(&r, "account"), jfield(&r, "base"))
+                } else {
+                    format!(
+                        "there was no such delegation: {} did not govern '{}'.",
+                        jfield(&r, "account"),
+                        jfield(&r, "base")
+                    )
+                }
+            );
+        }
+        WebAction::Grant(WebGrantAction::List { account }) => {
+            let arg = match &account {
+                Some(a) => json!({"account": a}),
+                None => json!({}),
+            };
+            let rows = jrows(&call("grant.list", arg)?);
+            if rows.is_empty() {
+                println!(
+                    "no delegations{}
+
+An account with role `user` governs nothing until it is granted a base view:
+  grovefs web --control-server {at} grant add --account alice --base mybase",
+                    match &account {
+                        Some(a) => format!(" for '{a}'"),
+                        None => String::new(),
+                    }
+                );
+                return Ok(());
+            }
+            println!(
+                "{:<20} {:<24} {:<8} {:<22} {}",
+                "account", "base view", "perm", "granted", "by"
+            );
+            for r in &rows {
+                println!(
+                    "{:<20} {:<24} {:<8} {:<22} {}",
+                    jfield(r, "account"),
+                    jfield(r, "base_view"),
+                    jfield(r, "perm"),
+                    jfield(r, "granted_at"),
+                    jfield(r, "granted_by")
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -2293,7 +2849,14 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             witness,
             store,
             engine_idle_secs,
+            pg_write_pool,
+            pg_write_pool_max,
+            pg_read_pool,
+            pg_read_pool_max,
+            pg_pool_idle_secs,
             control_listen,
+            admin_user,
+            admin_password_file,
         } => {
             let role = if role.eq_ignore_ascii_case("standby") {
                 grovefs::remote::meta::Role::Standby
@@ -2333,9 +2896,70 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                 srv = srv.with_sync_repl(true);
             }
             srv = srv.with_witness(witness);
+            // PG connection-pool bounds: flags over env over defaults, applied
+            // BEFORE the first engine opens (engines open lazily per view on
+            // M_OPEN, so this is the last safe point). Calling it under a
+            // SQLite store is inert — no PG engine is ever constructed — so no
+            // branch guards the set; only the banner is store-aware.
+            grovefs::pg_store::set_pool_profile(
+                pg_write_pool,
+                pg_write_pool_max,
+                pg_read_pool,
+                pg_read_pool_max,
+                pg_pool_idle_secs,
+            );
+            let store_is_pg = store
+                .as_deref()
+                .is_some_and(grovefs::pg_store::is_pg_store);
             srv = srv.with_store(store);
+            if store_is_pg {
+                let (w, r, idle) = grovefs::pg_store::pool_profile_now();
+                println!(
+                    "meta-server: PG pool bounds per view = write {} warm/{} max, read {} warm/{} max, burst above the floor reaped after {}s idle (a view may override with `grovefs view pool`); plan max_connections as active trees x (floor + retained burst)",
+                    w.warm, w.max, r.warm, r.max, idle / 1000
+                );
+            }
             srv = srv.with_engine_idle_secs(engine_idle_secs);
+            // The install-time web owner, if the flags ask for one. Read here and
+            // handed to `serve()` as (account, password) — the digest is written
+            // by the process that owns the account store, and this value is then
+            // dropped rather than kept in the runtime.
+            let admin = match (&admin_user, &admin_password_file) {
+                (None, None) => None,
+                (Some(_), None) => {
+                    return Err("--admin-user needs --admin-password-file PATH: a password has no \n                        place on a command line (argv is visible to every local process and \n                        lands in the shell history)".into())
+                }
+                (None, Some(_)) => {
+                    return Err("--admin-password-file needs --admin-user: an owner without a name \n                        cannot be created".into())
+                }
+                (Some(account), Some(path)) => {
+                    if control_listen.is_none() {
+                        return Err(format!(
+                            "--admin-user needs --control-listen HOST:PORT: the web accounts live \n                             beside the control plane, and without that port nothing can verify a sign-in"
+                        )
+                        .into())
+                    }
+                    let text = std::fs::read_to_string(path)
+                        .map_err(|e| format!("cannot read --admin-password-file {}: {e}", path.display()))?;
+                    let password = text.lines().next().unwrap_or("").to_string();
+                    if password.is_empty() {
+                        return Err(format!(
+                            "--admin-password-file {} is empty (its first line is the password)",
+                            path.display()
+                        )
+                        .into())
+                    }
+                    // Never print the secret, and never let it survive past this
+                    // statement's scope in a variable the banner could echo.
+                    drop(text);
+                    Some((account.clone(), password))
+                }
+            };
             srv = srv.with_control_listen(control_listen);
+            srv = srv.with_admin_account(
+                admin.as_ref().map(|(a, _)| a.clone()),
+                admin.map(|(_, p)| p),
+            );
             srv.serve()?;
         }
         Cmd::Umount { mountpoint } => {
@@ -3016,6 +3640,79 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         "  metadata only: content bytes stay in the data domain — keep mounts pointed at the same --data-servers (server-side gc unions all instances' ledgers, so nothing is reclaimed out from under this view)"
                     );
                 }
+                ViewAction::Pool {
+                    view,
+                    write,
+                    read,
+                    idle_secs,
+                    inherit,
+                } => {
+                    // A view's pool bounds live in its OWN metadata tree (the
+                    // `ctrl` rows an engine adopts at open), so — exactly like
+                    // `view move` — this talks to the store directly and runs on
+                    // the storage host with --meta-store.
+                    if !grovefs::layout::valid_view_name(&view) {
+                        return Err(format!("invalid view name '{view}'").into());
+                    }
+                    if remote_ctl.is_some() {
+                        return Err("view pool writes into the view's own metadata tree — run it on the storage host with --meta-store (drop --control-server)".into());
+                    }
+                    if !store_is_pg {
+                        return Err("view pool sets PostgreSQL connection-pool bounds; this store is SQLite, whose engine holds one write handle plus a --threads-sized read pool — there is no per-view PG pool to bound".into());
+                    }
+                    let spec = store.as_deref().expect("store_is_pg implies a store spec");
+                    let mut want = grovefs::pg_store::PgPoolSettings::default();
+                    if let Some(text) = &write {
+                        let (warm, max) = grovefs::pg_store::parse_lane_spec(text)?;
+                        want.write_warm = Some(warm);
+                        want.write_max = max;
+                    }
+                    if let Some(text) = &read {
+                        let (warm, max) = grovefs::pg_store::parse_lane_spec(text)?;
+                        want.read_warm = Some(warm);
+                        want.read_max = max;
+                    }
+                    want.idle_secs = idle_secs;
+                    let bare_show = !inherit
+                        && want.write_warm.is_none()
+                        && want.read_warm.is_none()
+                        && want.idle_secs.is_none();
+                    let declared = if bare_show {
+                        grovefs::pg_store::view_pool_get(spec, &view)?
+                    } else {
+                        grovefs::pg_store::view_pool_set(spec, &view, want, inherit)?
+                    };
+                    let lane = |warm: Option<usize>, max: Option<usize>| match (warm, max) {
+                        (Some(w), Some(m)) if m != w => format!("{w}:{m}"),
+                        // A floor with no ceiling: the burst stays whatever the
+                        // serving process allows, only the floor is declared here.
+                        (Some(w), None) => format!("{w}:(process ceiling)"),
+                        (Some(w), Some(_)) => w.to_string(),
+                        // A ceiling with no floor: the floor still comes from
+                        // the serving process, only the burst is declared here.
+                        (None, Some(m)) => format!("(process floor):{m}"),
+                        (None, None) => "(process default)".to_string(),
+                    };
+                    println!(
+                        "view '{}' pool bounds: write {}  read {}  reap-after {}",
+                        view,
+                        lane(declared.write_warm, declared.write_max),
+                        lane(declared.read_warm, declared.read_max),
+                        match declared.idle_secs {
+                            Some(s) => format!("{s}s"),
+                            None => "(process default)".to_string(),
+                        }
+                    );
+                    if declared == grovefs::pg_store::PgPoolSettings::default() {
+                        println!(
+                            "  nothing declared — the view follows the serving meta-server's process bounds; that process prints them at startup (`--pg-write-pool` and friends), and this CLI cannot see another machine's settings"
+                        );
+                    } else {
+                        println!(
+                            "  takes effect on the view's NEXT engine open: unmount it, or wait out --engine-idle-secs — a live mount keeps the pool it already holds (its connections carry session-scoped prepared statements)"
+                        );
+                    }
+                }
             }
         }
         Cmd::Mcp {
@@ -3355,6 +4052,62 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+            }
+        }
+        #[cfg(feature = "web")]
+        Cmd::Web {
+            control_server,
+            control_key,
+            control_key_file,
+            listen,
+            session_ttl,
+            workers,
+            allow_insecure_http,
+            use_x_forwarded_for,
+            action,
+        } => {
+            // ONE credential, three sources, one precedence: `--api-key` >
+            // `--api-key-file` > `GROVEFS_CONTROL_KEY` > `GROVEFS_API_KEY`.
+            let explicit = match (control_key, control_key_file) {
+                (Some(k), _) => Some(k),
+                (None, Some(p)) => Some(read_secret_file(&p, "--api-key-file")?),
+                (None, None) => None,
+            };
+            let addr = control_server.ok_or_else(|| -> Box<dyn std::error::Error> {
+                "grovefs web needs --control-server HOST:PORT. The console is a gateway in \n  front of `meta-server --control-listen HOST:PORT`: it holds no accounts, views, keys \n  or audit of its own, so there is nothing for it to serve without that address.\n  Try: grovefs web --control-server 127.0.0.1:9502 --api-key-file /etc/grovefs/control.key"
+                    .into()
+            })?;
+            let key = resolve_control_key(explicit).ok_or_else(
+                || -> Box<dyn std::error::Error> {
+                    format!(
+                        "--control-server {addr} needs the console's admin credential: --api-key \n  '<id>:<secret>', --api-key-file PATH (first line), or GROVEFS_CONTROL_KEY. It must be an\n  `admin`-scope key — mint one on the server host with `grovefs apikey --meta-dir \n  <server-meta-dir> create --for admin --owner <account>` (the first one cannot come \n  from the governance API, or that API would install its own administrators)."
+                    )
+                    .into()
+                },
+            )?;
+            let client = grovefs::control_remote::ControlClient::new(&addr, &key);
+            match action {
+                // The gateway: foreground, one accept loop, no daemonizing — the
+                // same contract as every other server subcommand here, so a unit
+                // file's `ExecStart` works for all of them.
+                None => {
+                    let ttl = grovefs::gc::parse_age(&session_ttl)
+                        .map_err(|e| -> Box<dyn std::error::Error> {
+                            format!("--session-ttl '{session_ttl}': {e}").into()
+                        })?;
+                    if ttl.is_zero() {
+                        return Err("--session-ttl cannot be 0: every request would sign itself out \n                        before it answered.".into());
+                    }
+                    grovefs::web::serve(grovefs::web::Config {
+                        listen,
+                        control: client,
+                        session_ttl: ttl,
+                        xff: use_x_forwarded_for,
+                        workers: workers.max(1),
+                        allow_insecure_http,
+                    })?;
+                }
+                Some(a) => web_govern(&client, a)?,
             }
         }
         Cmd::Refs {

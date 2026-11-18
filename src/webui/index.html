@@ -1,0 +1,80 @@
+<!doctype html>
+<!--
+  The GroveFS management console, embedded in the `grovefs web` binary.
+
+  Zero build, zero external assets: this file plus app.css and app.js are the
+  whole UI, so the page a browser gets is provably the page the binary was
+  compiled from (there is no --assets path that could disagree with it, and no
+  CDN for an air-gapped deployment to be missing). The Content-Security-Policy
+  the gateway sends allows 'self' only, which this file respects: no inline
+  script, no inline style attribute, no remote font.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GroveFS console</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+
+<div id="toast-host" aria-live="polite"></div>
+
+<!-- Sign-in. Shown until /api/session says there is a session. -->
+<section id="login" hidden>
+  <div class="login-card">
+    <h1>GroveFS</h1>
+    <p class="sub">Governance console</p>
+    <form id="login-form" autocomplete="on">
+      <label for="login-account">Account</label>
+      <input id="login-account" name="username" autocomplete="username" spellcheck="false" required>
+      <label for="login-password">Password</label>
+      <input id="login-password" name="password" type="password" autocomplete="current-password" required>
+      <button id="login-btn" type="submit" class="primary">Sign in</button>
+      <p id="login-error" class="err" role="alert"></p>
+    </form>
+    <p class="hint">
+      Accounts live in the meta-server's control plane. The first owner is created at
+      install time with <code>meta-server --admin-user</code>; more come from
+      <em>Accounts</em> here or <code>grovefs web account create</code>.
+    </p>
+  </div>
+</section>
+
+<!-- The app. -->
+<div id="app" hidden>
+  <header>
+    <span class="brand">GroveFS</span>
+    <nav id="nav">
+      <button type="button" data-page="overview" class="on">Overview</button>
+      <button type="button" data-page="views">Views</button>
+      <button type="button" data-page="keys">Keys</button>
+      <button type="button" data-page="accounts">Accounts</button>
+      <button type="button" data-page="audit">Audit</button>
+    </nav>
+    <div class="who">
+      <span id="who-account"></span>
+      <span id="who-role" class="badge"></span>
+      <button type="button" id="logout" class="link">Sign out</button>
+    </div>
+  </header>
+
+  <!--
+    The five sections are empty on purpose: app.js builds and replaces their
+    contents, so there is exactly one place where a table's columns are declared
+    and no static markup that a page's state could disagree with.
+  -->
+  <main>
+    <section id="page-overview" class="page" hidden></section>
+    <section id="page-views" class="page" hidden></section>
+    <section id="page-keys" class="page" hidden></section>
+    <section id="page-accounts" class="page" hidden></section>
+    <section id="page-audit" class="page" hidden></section>
+  </main>
+</div>
+
+<div id="modal-host" hidden></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

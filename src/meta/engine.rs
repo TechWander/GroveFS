@@ -1294,9 +1294,10 @@ pub fn rebuild_ledger(base: &Path) -> rusqlite::Result<usize> {
                 .and_then(|n| n.to_str())
                 .unwrap_or_default()
                 .to_string();
-            // Control-plane dbs never carry node rows; skip them and the ledger
-            // itself (a stray match would just count zero refs anyway).
-            if name.ends_with(".db") && name != REFS_DB && name != "api_keys.db" {
+            // Control-plane stores (keys, web accounts, the ledger itself) carry
+            // no node rows and have no `node` table at all: one shared predicate
+            // instead of a list of names this function would have to keep current.
+            if crate::meta::is_view_db(&name) {
                 views.push(p);
             }
         }
@@ -3113,6 +3114,17 @@ impl MetaStore {
                 .backup_to_bytes()
                 .map_err(|err| std::io::Error::other(err.to_string())),
             MetaStore::Pg(p) => p.backup_to_bytes(),
+        }
+    }
+
+    /// Shed this store's burst connections back to their warm floor and report
+    /// how many closed. SQLite has no PG backends to release, so it reports
+    /// zero; the meta-server's sweeper calls this on every cached engine
+    /// because engine eviction alone never reaches a mounted view's pool.
+    pub fn shrink_pools(&self) -> usize {
+        match self {
+            MetaStore::Sqlite(_) => 0,
+            MetaStore::Pg(p) => p.shrink_pools(),
         }
     }
 }

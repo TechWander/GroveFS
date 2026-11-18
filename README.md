@@ -34,10 +34,11 @@
 - **Token 双面鉴权**（集群共享口令）、**可撤销的 per-caller API key 门**（`meta-server`/`data-server --require-api-key` + `mount --api-key`，key 可 `--view` 绑定单一视图、`--ro` 服务端强制只读）、**只读挂载**（`--ro`）、多线程 `fuser 0.18`（`clone_fd` 并发派发）、**分块并行 IO** 与 **跨 server 条带**。
 - **显式视图名（唯一规则）**：视图只能由 `init --view` / `view create` / `view import` / `import --view` 显式建出来（SQLite `meta/<view>.db`，PG `grovefs_v_<hex>` schema）；`M_OPEN` 与本地挂载一律先探测存在性，未知名字**直接拒绝**并给出可读原因（客户端直接打印，服务端日志同一句），**不落盘**，开 `--require-api-key` 时还进 `apikey calls` 审计。派生/别名/fork 等治理定义照常可挂；拼错名字不会长出一棵空树（USAGE §4）。
 - **智能体 MCP 接口（`grovefs mcp`）**：把上述视图治理（派生视图/纯别名/fork 的 `define/alias/fork/graft/list/rm`）以 MCP（Model Context Protocol）暴露给 AI 智能体：规则以**内联文本**经 `tools/call` 提交，智能体无需碰任何文件即可自动定制数据列表的形状（含 `list_view_tree` 只读探查真实目录清单 / 不落盘预览未发布规则的形状、`get_view` 读回单个定义、`validate_definition` 发布前把整副定义走完整套治理守卫而不写盘）；同一套治理再以 2025-06-18 协议的其余常用方法面二次暴露——资源（`resources/list`/`resources/templates/list`/`resources/read`，把视图作为可附着上下文）、提示（`prompts/list`/`prompts/get`，参数化治理剧本）、补全（`completion/complete`，用真实视图名前缀补全）、日志（`logging/setLevel` → 服务端 `notifications/message`），且复用完全相同的渲染器（故资源/提示/补全与工具结果逐字节一致）；与 CLI 共用同一套校验与错误文案（一个契约、两个入口），控制面 only——不挂载、不触数据；`grovefs mcp --require-api-key` 可选地为接口上 API key 门，同一份 `grovefs apikey` 注册表也可经 `meta-server`/`data-server --require-api-key` 门住挂载与数据入口（key 带 scope：`--for mcp|mount|any|admin`；`admin` scope 经 `meta-server --control-listen` 顶替数据库密码，让任意机器用账号密钥治理同一份元数据，见 USAGE §3.5.2），并记录每次调用/连接的审计日志；撤销可逐调用方生效并封停**已建立**的挂载（详见 USAGE §3.5.1/§6）。详见「智能体定制数据列表」一节与 `USAGE.md` §3.5。
+- **网页管理台（`grovefs web`）**：远程治理面（`meta-server --control-listen`，上一条）之上的一个**独立子命令** HTTP 网关：内嵌单页应用（概览 / 视图 / 密钥 / 账号与授权 / 审计五页，构建期 `include_str!` 进二进制——没有 CDN、没有 node_modules、离线主机也打得开），把浏览器会话变成一个**账号**、把点击转成一次治理 op 转发。账号可创建、可被划**基视图**：`web grant add --account bob --base main` 之后，bob 对这棵基树就是完整管理权——它的 `fork`/`alias`/`lens` 定义与派生树、以及绑在这些名字上的密钥，全部自动落在授权范围内（一个 `lens`/`alias`/`fork` 名在服务端沿定义链 ≤4 跳归一到它的基视图），不必逐名追加。**“谁能碰哪棵树”的判定仍然只在服务端一处**：网关只做翻译与**减法**（写死的路由白名单，`gc.scan`/`gc.apply`/`refs.rebuild`/`view.rm_base`/`fork.graft` 不过路由），账号、授权与口令摘要（PBKDF2-HMAC-SHA256 21 万轮）都存在**服务端**（SQLite 档 `<meta-dir>/meta/web_accounts.db`，PG 档是控制库里的表），登录校验由持有存储的进程做——网关拿不到密码库。第一任管理员只能由 `meta-server --admin-user/--admin-password-file` 在账号表**为空**时放入（治理入口若能自铸管理员，这道门就白设了）。详见「网页管理台」一节与 `USAGE.md` §3.5.3。
 - **元数据读并行 + 目录列举分页 + `FUSE_READDIRPLUS`**：每个视图的 `MetaEngine` 在单条写连接之外再开一池暖读连接（**本地挂载默认 = `--threads`（默认 4），库内嵌/`meta-server` 默认 1**，env `GROVEFS_SQLITE_READ_POOL` 覆盖、0–16），`lookup`/`getattr`/`readdir` 及 nlink 解析都走这条只读池，元数据**读**不必排队等写锁（SQLite 的**写仍串行在同一权威连接上**，单写者语义不动；PG 后端写另走 SERIALIZABLE 写池并行，见下文 PG 诚实边界）；服务端 `MetaEngine` 同样吃这条池，故 `meta-server` 的并发 RPC 处理器互不等待。目录列举走 `readdir_page(parent, offset, limit)`，SQLite 引擎把它下推成 SQL `LIMIT/OFFSET`，FUSE 回调按几何块（READDIRPLUS 32→1024、普通 READDIR 128→1024）流式填回复缓冲，一个内核请求付 `O(缓冲)` 而非 `O(整棵目录)`；并默认协商 `FUSE_DO_READDIRPLUS`（内核 ≥4.6），目录项连同属性一次带回，`ls -l` 不必逐条 `LOOKUP`+`GETATTR`。同一份 5001 条目录、同一挂载点、逐个新挂载（内核 dentry 缓存为空）实测 `ls -l`：**2.56s**（`--no-readdirplus` 只留分页为 5.22s，两份输出逐字节相同）。分页与 PLUS 只在「能自己分页的存储引擎」上启用——本地 `--home` 的 SQLite（走这条暖读连接）与 PG 后端（4 连接只读池，每条连接缓存自己的 prepared statement），两边同样下推 `LIMIT/OFFSET`，以及对接 SQLite/PG `meta-server` 的**远端挂载**：`M_READDIRP` 帧把 `offset/limit` 下推到服务端，客户端每个内核缓冲只取一页并协商 PLUS。同一 5001 条目录经 `meta-server`+`data-server` 实测 `ls -l`：**2.29s**（`--no-readdirplus` 只留分页为 4.22s，两份输出排序后逐字节相同）。唯有派生/透镜视图（`LayoutMeta`）仍走 trait 默认实现（每内核缓冲一次全量列表、不协商 PLUS），详见「诚实边界」。`--no-readdirplus` 保留作 A/B 排障开关。
 - **分阶段延迟遥测（`--stats`，opt-in、默认关闭零成本）**：给一次读/写/元数据 op 内部各阶段（端到端 `op_total`、key 解析、后端 IO、分片扇出、元数据 DB、远程 RPC）打时间戳，用 hdrhistogram 汇成 p50/p90/p99/max 离线定位瓶颈。**默认关闭时每个埋点仅一次 relaxed 原子读即短路**（连 `Instant::now()` 都不调用），读写热路径不受影响；仅显式开启才采样，直方图按 worker 线程分片不串行化到全局锁。开关 `--stats` / `--stats-file <路径>`（周期覆盖写）/ `--stats-interval <秒>` / `GROVEFS_STATS=1`；退出时经 `stderr` 打印报告，只读控制节点 `<mnt>/.grove-stats` 仅在开启时出现（保留 inode、不落盘，治理不变量不受影响）。是排障工具而非吞吐测量，详见 `USAGE.md` §8.1。
 - **挂载级内容带宽整形（`--bw-read` / `--bw-write`）**：给一次挂载的内容读、写各上一道**客户端 GCRA 令牌槽**（按字节铺开互不重叠的时间槽，长跑速率精确等于上限），按实际交付字节计费——读在回复前、写在落盘后，超额的 op 只睡到自己的时间槽，慢的是速度而不是丢数据；写侧延迟天然形成背压。`0`/缺省 = 不限，热路径零成本（一次 `rate == 0` 分支）；`--stats` 的 `bytes read`/`bytes written` 计数可直接核对实际吞吐。**诚实边界**：这是自限速而非隔离——绕过 FUSE 的原始协议客户端、或同一视图的多个挂载各自拿满额度；服务端也无法把内容寻址的字节归到某棵视图上。回归 `bwlimit` 套件钉住速率下限、env 回退、`0`=不限与非法速率拒绝。
-- **完整回归**：`run_all.sh` **全板 39 段（38 门控 + bench）GREEN**（`layout` 显示透镜与服务端派生视图 e2e、`fork` 独立元数据树 fork 视图 e2e、`viewrm` 删整个基视图与零持有字节回收 e2e（四重守卫/最后命名者死才释放/分家根 `--data-dir`）、`gc` 离线孤儿对象审计与回收 e2e（账本持有不删/grace 年龄门/本库活挂载拒 apply 而他库同名视图不拦/零交集数据根防呆）、`bwlimit` 每挂载内容读/写带宽整形 e2e（GCRA 令牌槽 24MiB@8MiB/s 读写下限断言/超额睡眠不丢字节/env `GROVEFS_BW_READ` 回退/`0`=不限/非法速率拒绝/只读挂载下 `--bw-write` 空转）、`migrate` 视图元数据导出/导入与跨机器迁移 e2e、`import` 零拷贝导入 e2e、`mcp` 智能体治理接口 e2e、`apikey` MCP 接口 API key 认证与调用审计 e2e、`mountkey` 可撤销挂载凭据（scope 分区/拒因入协议/撤销封停活挂载/视图绑定与只读 key/`set-ro` 就地翻转写裁决热生效）e2e、`config` 配置文件与 env 回退 e2e、`pg` PostgreSQL 后端 e2e、`ctlplane` 远程治理面 e2e（`meta-server --control-listen` + 账号密钥跨机治理：首把 admin key 必须在持盘主机铸造/远程视图与密钥全套且管理机无落盘/`any`·`mount` 与垃圾 key 被拒/远程撤销即失效/本地 flag 混用拒绝/远程删树后守卫仍生效）、`forksrv` 两档后端远程 fork/graft e2e（整树复制零字节/独立树结构与 EROFS/`--empty`+`graft` 策展/账本精确归零）、`xfer` 两档后端远程 export/import e2e（dump 落在操作员磁盘、按行对齐分片、60B 与 4MiB 窗口同结果、`--as-fork`/`--replace`/守卫、往返逐行精确、账本无泄漏）、`gcremote` 远程 gc e2e（服务端读自己的树、字节向 data-server 枚举）、`control` 控制面统一 e2e（视图定义/key 随 `--meta-store` 进 `grovefs_control`、本地不落控制面文件、PG meta-server 从 PG 解派生挂载/热换形/key 门控）、`client` 平台客户端 e2e（预编译 `grovefs-mac` 挂本内核的 meta-server+data-server：SQLite/PG 两档各跑一次挂载读写、未知视图拒挂、token 门拒挂与带 token 放行、字节只落 data-server 而非客户端主机）；`pg`、`control` 会在无 PG 主机上自动 SKIP，`client` 在没有同级 `grovefs-client` 检出或没有 `fusermount` 助手的机器上整段 SKIP）。两档能力是否**对齐**由 `bash .bneck/engine_matrix.sh` 单独回答：同一串治理命令在 SQLite/PG 上各跑一遍，**20 项能力**（含 `fork`/`graft`、`export`/`import --as-fork`、远程 `gc`、`du` 及其 no-tree 守卫、`apikey`/审计）并排成一张表，OK/REFUSED（设计边界，引拒绝原文）/ERROR（缺口）；最近一次 20 行零 ERROR、`TEARDOWN CLEAN`，见 USAGE §10.1。
+- **完整回归**：`run_all.sh` **全板 40 段（39 门控 + bench）GREEN**（`layout` 显示透镜与服务端派生视图 e2e、`fork` 独立元数据树 fork 视图 e2e、`viewrm` 删整个基视图与零持有字节回收 e2e（四重守卫/最后命名者死才释放/分家根 `--data-dir`）、`gc` 离线孤儿对象审计与回收 e2e（账本持有不删/grace 年龄门/本库活挂载拒 apply 而他库同名视图不拦/零交集数据根防呆）、`bwlimit` 每挂载内容读/写带宽整形 e2e（GCRA 令牌槽 24MiB@8MiB/s 读写下限断言/超额睡眠不丢字节/env `GROVEFS_BW_READ` 回退/`0`=不限/非法速率拒绝/只读挂载下 `--bw-write` 空转）、`migrate` 视图元数据导出/导入与跨机器迁移 e2e、`import` 零拷贝导入 e2e、`mcp` 智能体治理接口 e2e、`apikey` MCP 接口 API key 认证与调用审计 e2e、`mountkey` 可撤销挂载凭据（scope 分区/拒因入协议/撤销封停活挂载/视图绑定与只读 key/`set-ro` 就地翻转写裁决热生效）e2e、`config` 配置文件与 env 回退 e2e、`pg` PostgreSQL 后端 e2e、`ctlplane` 远程治理面 e2e（`meta-server --control-listen` + 账号密钥跨机治理：首把 admin key 必须在持盘主机铸造/远程视图与密钥全套且管理机无落盘/`any`·`mount` 与垃圾 key 被拒/远程撤销即失效/本地 flag 混用拒绝/远程删树后守卫仍生效）、`web` 网页管理台 e2e（安装期 `--admin-user`+`--admin-password-file` 只在空表播种第一任管理员·同 flag 重启幂等·换名重启拒启动/网关启动前四道拒绝/CSRF·Origin·op 白名单与五个仍留在 CLI 的动词/被授权账号**走页面路径**管得住自己的基视图与 family、只给自己的视图铸 key、越界被服务端原句拒/撤权下一个调用即失效/审计以 `account@ip` 到人/登录限速按客户端 IP 且第 6 次即使口令对也 429）、`forksrv` 两档后端远程 fork/graft e2e（整树复制零字节/独立树结构与 EROFS/`--empty`+`graft` 策展/账本精确归零）、`xfer` 两档后端远程 export/import e2e（dump 落在操作员磁盘、按行对齐分片、60B 与 4MiB 窗口同结果、`--as-fork`/`--replace`/守卫、往返逐行精确、账本无泄漏）、`gcremote` 远程 gc e2e（服务端读自己的树、字节向 data-server 枚举）、`control` 控制面统一 e2e（视图定义/key 随 `--meta-store` 进 `grovefs_control`、本地不落控制面文件、PG meta-server 从 PG 解派生挂载/热换形/key 门控）、`client` 平台客户端 e2e（预编译 `grovefs-mac` 挂本内核的 meta-server+data-server：SQLite/PG 两档各跑一次挂载读写、未知视图拒挂、token 门拒挂与带 token 放行、字节只落 data-server 而非客户端主机）；`pg`、`control` 会在无 PG 主机上自动 SKIP，`client` 在没有同级 `grovefs-client` 检出或没有 `fusermount` 助手的机器上整段 SKIP）。两档能力是否**对齐**由 `bash .bneck/engine_matrix.sh` 单独回答：同一串治理命令在 SQLite/PG 上各跑一遍，**20 项能力**（含 `fork`/`graft`、`export`/`import --as-fork`、远程 `gc`、`du` 及其 no-tree 守卫、`apikey`/审计）并排成一张表，OK/REFUSED（设计边界，引拒绝原文）/ERROR（缺口）；最近一次 20 行零 ERROR、`TEARDOWN CLEAN`，见 USAGE §10.1。
 
 ## 架构与原理
 
@@ -131,7 +132,7 @@ M_OPEN / OP_OPEN（TCP 帧握手）按序过门：
 
 诚实边界：显示治理（派生/别名/fork）**不是安全边界**——它只改呈现的名字树，可见即可读、可读即可写回（fork 除外）；真正的门是 token 与可撤销 key。key 只存 SHA-256 摘要、明文打印一次；控制面（key/审计/视图定义）**跟随元数据后端**——SQLite 部署落 `api_keys.db` + `views/*.layout`，PG 部署全部进 `grovefs_control` schema，同一份状态两种形态、绝不双写。
 
-> 详节：README「共享视图与权限模型」「给入口上把锁：API key 认证…」、USAGE §6（含 §6.1 视图绑定/只读 key 实测）、§3.5.1（十步 key 演练）。
+> 详节：README「共享视图与权限模型」「给入口上把锁：API key 认证…」「网页管理台…」、USAGE §6（含 §6.1 视图绑定/只读 key 实测）、§3.5.1（十步 key 演练）、§3.5.3（账号 + 基视图授权）。
 
 ## 多机共享与存储选型（原理与常见疑问）
 
@@ -175,7 +176,7 @@ mount --view alice   ─TCP→   meta-server   ─postgres://→  PostgreSQL 服
 **Q：那什么时候才值得上 PG？**
 当你想把权威树的**持久化 / 高可用 / 备份 / 集中运维**交给一个成熟数据库时:PG 自带流复制 / logical replication / PITR、`pg_basebackup`、监控与 DBA 工具链,海量元数据(百万级节点)也可借 PG 的索引/VACUUM 调优。注意**自研 HA(快照复制)与 PG 互斥**(见「共享视图与权限模型」),上了 PG 就用 PG 自己的复制、不再用 GroveFS 的文件级快照。选型是**二选一**而非叠加：后端在 `meta-server` 启动时经 `--meta-store` 定死，同一棵权威树不会同时落 SQLite 又落 PG；中途换库用 `view export/import`（两档后端通用，含 `--control-server` 远程分片上下行）或 `pg_dump` 单向搬移，不支持双写。
 
-> **诚实边界**：写模型在 SQLite 与 PostgreSQL 下**不同**——默认 SQLite 后端 `meta-server` 对同一 view 仍是**单写者**（一条权威连接 `conn` + 互斥，写串行）；换 `--meta-store postgres://…` 后写路径放宽为**有界 SERIALIZABLE 写连接池**（`PG_WRITE_POOL_SIZE = 8`，HopsFS 路线，事务基座交给 PostgreSQL 自带 SSI）——不相交 `(parent_id, name)` 行上的并发写真正并行提交，读写重叠的一例由 SSI 中止（`SQLSTATE 40001/40P01`）并**透明重试**（200µs–25ms 退避、≤12 次、绝不外泄给 POSIX 调用方），由 `pg_ssi`（Rust 5 项）与 `pg_parallel`（bash 三挂载并发）套件证明、无 PG 主机自动 SKIP。这把“单一权威写者”放宽为“单一权威调度（serially equivalent）”，治理不变量 I1–I4 在任意 SSI 接受的调度下逐条不变。元数据**读**并行则覆盖两个引擎——SQLite `MetaEngine` 与 PG `PgEngine`：前者持 1 条暖读连接（`GROVEFS_SQLITE_READ_POOL` 可调）、后者持 4 条只读连接且各自缓存 prepared statement；写侧同样缓存（每写连接 ≤32 条，单连接一次事务 577–670µs → 316–330µs，台架写吞吐 N=1/4/8 3,048–3,118 / 4,784–5,202 / 4,518–4,680 ops/s），目录列举各下推 SQL `LIMIT/OFFSET`。**仍未做的是跨节点多权威**（把权威分区、Spanner 式外部一致性）——PG 写并行只在单集群内；单权威下的**多 PG 实例分片**只有原型（`--meta-store a,b`，每个视图按名字哈希落到恰好一个实例，控制面钉在第一个，每个分片必须配自己的 data-server，`refs rebuild` 按实例运行），取证 `.build-bin/probe_pg_shard.sh`。默认场景请继续用零依赖的 SQLite；PG 的增量价值是**写并行 + 持久化/复制/运维成熟度**。
+> **诚实边界**：写模型在 SQLite 与 PostgreSQL 下**不同**——默认 SQLite 后端 `meta-server` 对同一 view 仍是**单写者**（一条权威连接 `conn` + 互斥，写串行）；换 `--meta-store postgres://…` 后写路径放宽为**有界 SERIALIZABLE 写连接池**（`PG_WRITE_POOL_SIZE = 8`，HopsFS 路线，事务基座交给 PostgreSQL 自带 SSI；这 8 写 + 对等 4 读现在是**暖地板**，突发保留上限由 `--pg-*-pool-max` 定、静默过 `--pg-pool-idle-secs` 自动收回，单视图可用 `grovefs view pool` 覆盖，USAGE §6.2）——不相交 `(parent_id, name)` 行上的并发写真正并行提交，读写重叠的一例由 SSI 中止（`SQLSTATE 40001/40P01`）并**透明重试**（200µs–25ms 退避、≤12 次、绝不外泄给 POSIX 调用方），由 `pg_ssi`（Rust 5 项）与 `pg_parallel`（bash 三挂载并发）套件证明、无 PG 主机自动 SKIP。这把“单一权威写者”放宽为“单一权威调度（serially equivalent）”，治理不变量 I1–I4 在任意 SSI 接受的调度下逐条不变。元数据**读**并行则覆盖两个引擎——SQLite `MetaEngine` 与 PG `PgEngine`：前者持 1 条暖读连接（`GROVEFS_SQLITE_READ_POOL` 可调）、后者持 4 条只读连接且各自缓存 prepared statement；写侧同样缓存（每写连接 ≤32 条，单连接一次事务 577–670µs → 316–330µs，台架写吞吐 N=1/4/8 3,048–3,118 / 4,784–5,202 / 4,518–4,680 ops/s），目录列举各下推 SQL `LIMIT/OFFSET`。**仍未做的是跨节点多权威**（把权威分区、Spanner 式外部一致性）——PG 写并行只在单集群内；单权威下的**多 PG 实例分片**只有原型（`--meta-store a,b`，每个视图按名字哈希落到恰好一个实例，控制面钉在第一个，每个分片必须配自己的 data-server，`refs rebuild` 按实例运行），取证 `.build-bin/probe_pg_shard.sh`。默认场景请继续用零依赖的 SQLite；PG 的增量价值是**写并行 + 持久化/复制/运维成熟度**。
 
 ## 构建
 
@@ -297,7 +298,7 @@ $Y apikey --meta-dir /data/cluster set-ro --id <ID> --rw                        
 
   为什么没做 Redis：Redis 的 K/V+TTL 模型与视图树（rename/unlink/hardlink/refcount GC 需事务、锁需要行级仲裁）不同构——把 relational 语义硬塞到 Redis 里等于在应用层重做一个 PG，收益为负。**GroveFS 只加 PG，不加 Redis**。
 
-  > **两档怎么选**（而不是“功能有没有”）：SQLite / PG 的硬指标（写吞吐 **767–1,109 ops/s** vs **~4.6k–5.2k ops/s**，差 4–6 倍，差距来自单写者模型本身；可用性形态：SQLite 原生主备 HA vs PG 交给流复制/PITR；视图规模：一视图一文件一引擎 vs 一视图一个连接池 + 空闲驱逐；独占命令只剩三处「只能 SQLite」——原生 HA、目录零拷贝纳管、就地 `gc`）见 USAGE §4.1.1，同一件事在两档的命令写法见 docs.html §22.1 大表。
+  > **两档怎么选**（而不是“功能有没有”）：SQLite / PG 的硬指标（写吞吐 **767–1,109 ops/s** vs **~4.6k–5.2k ops/s**，差 4–6 倍，差距来自单写者模型本身；可用性形态：SQLite 原生主备 HA vs PG 交给流复制/PITR；视图规模：一视图一文件一引擎 vs 一视图一个连接池 + 空闲驱逐 + 地板/上限分离；独占命令只剩三处「只能 SQLite」——原生 HA、目录零拷贝纳管、就地 `gc`）见 USAGE §4.1.1，同一件事在两档的命令写法见 docs.html §22.1 大表。
 
 ## 显示定制：同一份数据、每个客户端不同形状（`--layout`）
 
@@ -576,6 +577,46 @@ $ grovefs apikey --meta-dir <home> list                            # id/label/sc
 
 无法自定义握手的 MCP 客户端，可由运维方导出 `GROVEFS_MCP_API_KEY='<id>:<secret>'` **预鉴权整个服务进程**（挂载侧对应的是 `GROVEFS_API_KEY`）。诚实边界：这把 key 认证的是**入口的调用方**——它让某个调用方能（或不能）发治理写命令、能（或不能）开某棵视图树，并把每次准入归咎到具体 key，但不改变治理语义本身；视图绑定/只读（`--view`/`--ro`）维度由服务端强制，且只读↔读写可 `set-ro` 原地翻转、在同一 ≤1s 复验 tick 热生效（免重铸免重连）；活连接复证是 **op 驱动**的（有流量才查），故封停边界是“撤销后的首个服务端往返”——完全由内核缓存回答的读不需要往返，因此不会被打断（下一次往返即封）；`--token` 与 `--require-api-key` 可同时存在，两道都得过。不开 `--require-api-key` 时，服务行为与不设门完全一致（只是照样落审计）。e2e 见 `apikey` 套件（33 条断言：铸造/列表/哈希不落盘/无 key 拒·错 secret 拒·对 key 放行/调用归属/撤销即失效且行保留/短 id 前缀撤销/env 预鉴权/`list --view` 过滤/默认不设门回归）与 `mountkey` 套件（76 条断言：scope 铸造与 typo 拒绝/六类拒因入协议/准入与 env 回退（argv 不泄密）/连接审计到具体 key 与视图/scope 双向隔离/撤销封停活挂载且无脏 endpoint/其他 key 不受波及/token 与 key 双门 AND/数据面独立门/故障转移携带凭据/不设门默认路径无回归/视图绑定 key 跨视图拒挂与审计归属/只读 key 服务端强制写拒/`set-ro` 在同一活挂载 rw→ro 拒写·ro→rw 放行·免重连）。
 
+## 网页管理台：浏览器里管视图与密钥、给账号划基视图（`grovefs web`）
+
+远程治理面让任意一台机器都能治理同一份元数据，但入口仍是终端：动词要记、key 要带、拒因要读。高频的三件事——看视图、发密钥、给同事划一块地方——在浏览器里点更省事；而“**这个账号管这块地方，包括它派生出的 fork、别名和这块地方的密钥**”这种归属，一把共享的 admin key 说不清。`grovefs web` 就是治理口前面的一个 HTTP 网关（**独立子命令**，HTTP 不进 `meta-server`），它**不新增一套治理逻辑**：
+
+```bash
+# 安装期：第一任管理员只能由持有存储的进程放（仅当账号表为空；口令只有 file/stdin，没有 --admin-password）
+$ grovefs meta-server --meta-dir .webdoc/srv --listen 127.0.0.1:15698 --control-listen 127.0.0.1:15699 \
+    --admin-user rootops --admin-password-file ./root.pw
+meta-server: web accounts — created the first web account 'rootops' (role admin) from the install-time flags — sign in with it, then delegate base views
+meta-server: web console sign-ins are verified HERE (`grovefs web --control-server 127.0.0.1:15699`); accounts and their base-view delegation live in meta/web_accounts.db
+
+# 网关自己不存任何东西：它需要治理口地址 + 一把 --for admin 的账号密钥
+$ grovefs web --control-server 127.0.0.1:15699 --api-key-file ./control.key --listen 127.0.0.1:15687
+grovefs web: management console on http://127.0.0.1:15687/
+  control plane : 127.0.0.1:15699 (backend sqlite)
+  sign-in       : accounts of that server's web store; the first owner comes from its
+                    --admin-user flag
+  sessions      : 8h idle window, 4 worker thread(s)
+
+# 建号、划地方（这三条在页面 Accounts 页里点也一样，headless 与浏览器走同一套 op）
+$ grovefs web --control-server 127.0.0.1:15699 --api-key-file ./control.key account create --account bob --password-file ./bob.pw
+web account created: bob
+  role:  user
+  bases: none — it can sign in and govern nothing yet
+  note:  delegate a base view before this account can manage anything
+
+$ grovefs web --control-server 127.0.0.1:15699 --api-key-file ./control.key grant add --account bob --base main
+bob now governs 'main' and everything derived from it, as granted by rootops.
+That covers its forks, aliases and lenses, and the keys bound to any of those names.
+```
+
+授权的对象是**基视图**而不是叶子：此后这棵基树下新长出的 fork、改的别名、加的透镜全部自动在授权范围内，绑在这些名字上的密钥也归它管——这正是“给一块地方”与“给一个名字”的区别。`bob` 登录后拿到的是自己的 reach（`{ "account": "bob", "role": "user", "bases": ["main"] }`），能列自己的视图、建 lens/alias、`fork` 基视图、看 `view.stats`（它的 `family` 含自己的 fork）、只给自己的视图铸 `--for mount`/`--for mcp` 密钥并可 `set-ro`/撤销；超出自己那块的尝试，回的是**服务端的原句**而不是网关编的：
+
+```json
+{ "ok": false, "error": "account 'bob' is not an administrator, and 'view.create' is not per-view governance: a new base view picks a storage home (PG instance / data root), which is a deployment decision — an admin must run it (or grant you the base view it acts on)" }
+{ "ok": false, "error": "'gc.scan' is not available from the console: it stays an operator CLI command, where its dry-run report and confirmations are part of calling it" }
+```
+
+诚实边界：网关手里持着一把 `admin` scope 的 key，能读到它配置的人已经治理得了整个部署——所以它默认只听 `127.0.0.1`（要绑可路由地址得显式 `--allow-insecure-http`，否则它在绑端口之前就拒绝启动并给出反代配方），**登录不产生能力，只限制并归属能力**：一个会话只能以一个账号的身份行动，而每一次调用都以 `account@ip` 落审计。会话是 `gfs_sid`（`HttpOnly; SameSite=Strict`）+ 写操作要带 `X-GroveFS-CSRF` 且 `Origin` 主机部分必须等于 `Host`；同一客户端 IP 在 15 分钟内错满 5 次就 429（基础 30s、每多错一次翻倍，**即使那次口令是对的**），“无此账号”与“口令错”回复逐字节相同。路由白名单写死 28 个 op，`gc.scan`/`gc.apply`/`refs.rebuild`/`view.rm_base`/`fork.graft` 不过路由。`grant rm` 不必等会话过期——服务端每请求重读主体，撤权后**下一个调用**就撞墙。`account rm` 连授权一起删，但**它的 api key 故意留着**（删号不该顺手停掉一个在跑的生产挂载，回显会报有几把待处理）。e2e 见 `web` 套件（145 条断言）；命令、五页能力表、全部拒因原文与 systemd/反代配方见 `USAGE.md` §3.5.3 与 §11.4、`docs/deploy.html` §2.4。
+
 ## 存量数据导入：零拷贝直通（`grovefs import`）
 
 服务端目录里已经有一批数据、想让客户端按视图获取时，不必先「灌」一遍：`grovefs import` 把**已存在的本地目录树**登记进视图，字节原地不动——
@@ -712,7 +753,7 @@ $Y apikey --meta-dir /data/cluster revoke --id <id>                          # �
 | 分块并行 IO | 客户端读 ≥1MiB 按 1MiB 切片并发；写 ≥4MiB 分片并发 |
 | 大文件条带 | 文件 ≥16MiB 才分块；`data_ref` = `s<N>:<stripe>:<uuid>`，chunk i 落 `servers[i%N]`；无前缀 = 单对象（未启用条带的存储形态） |
 | touch 去抖 | 元数据 mtime 只有 epoch **秒**精度，所以 `write()` 只在「当前秒 ≠ 该 inode 记着的秒」时才写一次 `mtime/ctime`；新建文件把创建那一秒直接记入（同 秒首次写不再 touch），流式写 1000 次/10ms 只 touch ~10 次。close 时内核回填的 `SETATTR` 也享同一条口径：回填的 mtime 落在已存的同一秒就不落库，回填的 size 与对象当前长度相同就不 ftruncate——一个「建→写→关」的小文件因此只付一次 create 事务 |
-| 元数据读连接池 | 每视图 SQLite 引擎一池暖读连接（本地挂载默认 = `--threads`，库内嵌/meta-server 默认 1；env `GROVEFS_SQLITE_READ_POOL` 覆盖、0–16）服务 `lookup`/`getattr`/`readdir`， 读不必排写锁，池空时按需开、用完归还；PG 引擎另持对等的只读池（`PG_READ_POOL_SIZE` = 4，env `GROVEFS_PG_READ_POOL`），每条读连接缓存自己的 prepared statement（≤16 条，实测 `stat` 0.820ms → 0.528ms/op）。写仍各走单一权威连接（SQLite `conn`  串行 / PG 8 连接 SERIALIZABLE 写池，env `GROVEFS_PG_WRITE_POOL`） |
+| 元数据读连接池 | 每视图 SQLite 引擎一池暖读连接（本地挂载默认 = `--threads`，库内嵌/meta-server 默认 1；env `GROVEFS_SQLITE_READ_POOL` 覆盖、0–16）服务 `lookup`/`getattr`/`readdir`， 读不必排写锁，池空时按需开、用完归还；PG 引擎另持对等的只读连接暖**地板**（`PG_READ_POOL_SIZE` = 4，env `GROVEFS_PG_READ_POOL`；`GROVEFS_PG_READ_POOL_MAX` 只定突发保留上限，默认 = 地板，§6.2），每条读连接缓存自己的 prepared statement（≤16 条，实测 `stat` 0.820ms → 0.528ms/op）。写仍各走单一权威连接（SQLite `conn`  串行 / PG 8 连接 SERIALIZABLE 写**地板**，env `GROVEFS_PG_WRITE_POOL`，突发保留上限 `GROVEFS_PG_WRITE_POOL_MAX`） |
 | 写语句缓存（SQLite） | 引擎把 `create` 的「本视图是否已有该 key」`COUNT`/`INSERT`/`ino` 回填、`unlink` 的查行/删行/引用计数、账本 `holders` 的增减都缓存到连接上（`prepare_cached`），同一段 SQL 不再每行现场解析；PG 侧对等机制见上一条。引擎级微基准（同一事务、同一批语句，N=1200）：单条 create **83µs/行**、组 3 **38µs/行**、组 8 **25µs/行**。删除侧走同一条路：单线程 `rm` 小文件 **3.1–3.3k 文件/s**（`meta.unlink` p50 140µs），并行侧再叠一层组提交（见下一条） |
 | 删除组提交 | `unlink`/`rmdir` 与 `create` 同构地入队：抢到 leader 的 worker 用一次 `BEGIN IMMEDIATE` 删整队（`MetaProvider::unlink_nodes_batch`，SQLite 引擎实现；单个删除自成 leader、批长 1，单线程不付额外延迟）。批内「名字不存在」「目录非空」只废那一条，不连带兄弟项；字节回收（`backend.remove`）仍留在各自 worker 上做，所以只有提交被合并。同一挂载点、每线程一个父目录：3200 个文件的并行删只提交 **1.1–1.8k 次事务**（平均批 1.8–2.8），T=8 **6.2–8.6k** 文件/s、T=16 **11.8–12.2k** 文件/s，单线程不变（批恒为 1）。引擎级微基准（同一事务删 N 行，N=2400）：批 1/2/4/8/16 是 **53.9 / 30.0 / 18.7 / 13.2 / 10.8 µs/行** |
 | PG 写语句缓存 | 每个 PG 写连接缓存 ≤32 条 prepared statement（`WRITE_STMT_CACHE_CAP`：`INSERT`/按名 `lookup`/`DELETE`/`rename`/`setattr`/锁 op/三条账本语句）；`postgres` 0.19 无 `prepare_cached`，故自建 per-connection 语句表，事务体内 SQL 零改动即命中，失效（`0A000`）时驱逐并回落 unnamed。单连接一次事务 577–670µs → 316–330µs；台架写吞吐 N=1/4/8 3,048–3,118 / 4,784–5,202 / 4,518–4,680 ops/s |
@@ -845,6 +886,8 @@ SKIP_BENCH=1 bash .build-bin/run_all.sh   # 跳过吞吐基准（纯功能回归
 | 智能体接口（MCP） | `grovefs mcp --meta-dir D [--meta-store postgres://…]`（stdio JSON-RPC：治理 `list_views` / `define_derived_view` / `alias_view` / `fork_view` / `graft_view` / `remove_view` / `preview_rules` / `validate_definition`，只读探查 `list_view_tree` / `get_view`；规则内联文本， 与 `grovefs view` 同校验同文案；同一治理另经 `resources/*`/`prompts/*`/`completion/complete`/`logging/setLevel` 常用方法面暴露） |
 | API key 与调用审计 | `grovefs apikey --meta-dir D create --label L [--for any\|mcp\|mount\|admin] [--owner ACCT]` / `list` / `revoke --id X` / `set-ro --id X [--rw|--ro]`（活跃 key 只读↔读写原地翻转，活挂载 ≤1s 热生效免重连） / `calls [--limit N]`（key 只存 SHA-256、明文打印一次、`list` 带 scope 列；配合 `grovefs mcp --meta-dir D --require-api-key` 门住读写治理状态的方法，或 `meta-server`/`data-server --require-api-key` 门住挂载入口（客户端 `mount --api-key`/env `GROVEFS_API_KEY`）；每次调用与每次挂载连接都落审计（SQLite：`meta/api_keys.db`；PG：`grovefs_control.mcp_calls`），撤销封停活挂载；`GROVEFS_MCP_API_KEY` 可预鉴权整个服务） |
 | 导入存量目录 | `grovefs import --view V --source DIR [--prefix P] [--data-dir R] [--dry-run]`（同盘硬链接零拷贝，重跑增量） |
+| 起网页管理台 | `grovefs web --control-server H:P --api-key-file F [--listen 127.0.0.1:PORT] [--session-ttl N] [--allow-insecure-http|--use-x-forwarded-for]`（治理口前面的 HTTP 网关：概览/视图/密钥/账号与授权/审计五页；本身不存任何状态） |
+| 建号与基视图授权 | `grovefs web … account create --account A --password-file P\|--password-stdin [--role admin]` / `account passwd\|role\|disable\|enable\|rm` / `grant add\|rm --account A --base V` / `grant list`（授权给的是**基视图**，其 fork/别名/透镜与其上的 key 自动继承；安装期第一任管理员由 `meta-server --admin-user --admin-password-file` 在空表上播种） |
 | 卸载 | `grovefs umount -m MP` |
 | 数据服务 | `grovefs data-server --listen IP:PORT --data-dir DIR [--token T] [--require-api-key [--meta-dir D]]` |
 | 元数据服务（默认 SQLite） | `grovefs meta-server --meta-dir D --listen IP:PORT [--token T] [--require-api-key] [--role primary\|standby --peer ADDR [--sync-repl] [--witness DATA_ADDR]]` |

@@ -215,7 +215,7 @@ pub fn physical_views(meta_root: &Path) -> Result<Vec<String>, String> {
         let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if !name.ends_with(".db") || name == "refs.db" || name == "api_keys.db" {
+        if !crate::meta::is_view_db(name) {
             continue;
         }
         if !p.is_file() {
@@ -272,7 +272,7 @@ fn collect_refs(meta_root: &Path) -> Result<Refs, String> {
         let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if !name.ends_with(".db") || name == "refs.db" || name == "api_keys.db" {
+        if !crate::meta::is_view_db(name) {
             continue;
         }
         if !p.is_file() {

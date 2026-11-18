@@ -59,6 +59,11 @@ use crate::remote::proto;
 pub struct ControlClient {
     addr: String,
     key: String,
+    /// The web console's per-call attribution: `(account, ip)` of whoever is
+    /// behind this client, `None` for an operator running a command themselves.
+    /// It travels in the request body and is the ONLY thing the server's ACL
+    /// can judge a delegated user by — see [`ControlClient::with_actor`].
+    actor: Option<(String, String)>,
 }
 
 impl ControlClient {
@@ -66,7 +71,27 @@ impl ControlClient {
         Self {
             addr: addr.to_string(),
             key: key.to_string(),
+            actor: None,
         }
+    }
+
+    /// Speak for a signed-in console account: every call this client makes
+    /// carries `account` + `ip`, so the server (a) authorizes it against that
+    /// account's delegations instead of the key's full rights, and (b) writes
+    /// the audit row as that person rather than as "whoever holds the key".
+    ///
+    /// The credential stays the admin key, and that is the honest shape of it:
+    /// the console is one trusted process holding the deployment's governance
+    /// credential, and what this field adds is per-user LIMITATION and
+    /// ATTRIBUTION, not a second authentication factor. Anyone who can read the
+    /// key can name any account — and can already do everything the key allows,
+    /// which is why the key must not leave the gateway's host.
+    ///
+    /// Cloned, not mutated in place: the gateway derives one client per request
+    /// from a shared template, so a session's identity cannot leak into another.
+    pub fn with_actor(mut self, account: &str, ip: &str) -> Self {
+        self.actor = Some((account.to_string(), ip.to_string()));
+        self
     }
 
     pub fn addr(&self) -> &str {
@@ -78,12 +103,17 @@ impl ControlClient {
     /// server's own refusal text (unknown/revoked key, wrong scope, a governance
     /// refusal), never a bare status code — the point of the envelope.
     pub fn call(&self, op: &str, args: Value) -> Result<Value, String> {
-        let body = serde_json::to_vec(&json!({
+        let mut req = json!({
             "k": self.key,
             "op": op,
             "a": args,
-        }))
-        .map_err(|e| format!("cannot encode control request: {e}"))?;
+        });
+        if let Some((account, ip)) = &self.actor {
+            req["account"] = json!(account);
+            req["ip"] = json!(ip);
+        }
+        let body = serde_json::to_vec(&req)
+            .map_err(|e| format!("cannot encode control request: {e}"))?;
         let mut sock = TcpStream::connect(&self.addr).map_err(|e| {
             format!(
                 "cannot reach the control plane at {}: {e} — is `meta-server --control-listen {}` running?",
