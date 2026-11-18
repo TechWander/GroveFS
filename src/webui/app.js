@@ -27,6 +27,7 @@ const ST = {
   views: [],        // [{name, kind, base}] merged from physical.list + def.list
   sel: null,        // selected view name
   auditLimit: 50,   // kept across reloads, so "refresh" does not shrink the window
+  vFilter: { q: '', kind: 'all' }, // client-side view list filter, reset per boot
 };
 
 /* ----------------------------------------------------------------- i18n --- */
@@ -291,6 +292,25 @@ const I18N_ZH = {
   'view created': '视图已创建',
   'New api key': '新的 API 密钥',
   'account': '账号',
+  /* page heads */
+  'Deployment snapshot, your reach and the latest governance activity.': '部署概要、你的权限范围与最近的治理动态。',
+  'Base views, forks, aliases and lenses — select one to inspect.': '基视图、fork、别名与透镜 — 选择一个进行查看。',
+  'Mint, rotate and revoke the keys clients mount and agents call with.': '铸造、轮换与吊销客户端挂载及智能体调用所用的密钥。',
+  'Who governs what — accounts, roles and base-view delegations.': '谁治理什么 — 账号、角色与基视图委派。',
+  'Every call the control plane answered — failures included.': '控制面应答的每一次调用 — 含失败记录。',
+  /* filtering */
+  'filter by name…': '按名称过滤…',
+  'filter by label, id, owner or view…': '按标签、ID、属主或视图过滤…',
+  'filter by key, op or detail…': '按密钥、操作或详情过滤…',
+  'failures only': '仅看失败',
+  'all': '全部',
+  'forks': 'fork',
+  'aliases': '别名',
+  'lenses': '透镜',
+  'no views match the filter': '没有符合过滤条件的视图',
+  'no keys match the filter': '没有符合过滤条件的密钥',
+  'no calls match the filter': '没有符合过滤条件的调用',
+  'View list': '视图列表',
 };
 
 const t = (k, vars) => {
@@ -411,6 +431,33 @@ function tableNode(cols, rows, emptyText) {
 const field = (label, ...nodes) => el('div', { class: 'field' }, el('label', null, label), ...nodes);
 const hint = (txt) => el('span', { class: 'muted' }, txt);
 const bar = (...nodes) => el('div', { class: 'bar' }, ...nodes);
+/** Page head: one big title + one-line description per page, actions right.
+    The .bar sections below it stay the small in-page headings. */
+const pageHead = (title, desc, ...actions) => el('div', { class: 'page-head' },
+  el('div', { class: 'ph-t' }, el('h2', null, title), desc ? el('p', { class: 'muted' }, desc) : null),
+  actions.length ? el('div', { class: 'ph-a' }, ...actions) : null);
+/** The view picker's client-side filter: a name box plus kind chips. Both are
+    re-applied on every keystroke by renderViewList; ST.vFilter keeps them
+    sticky while the user walks the detail pane. */
+function viewFilterBar() {
+  const q = el('input', {
+    type: 'search', placeholder: t('filter by name…'),
+    oninput: () => { ST.vFilter.q = q.value; renderViewList(); },
+  });
+  // Chip labels reuse real dictionary keys ('base views' is the overview card
+  // label too); the KEY of a chip is the kind value it filters by.
+  const KIND_CHIP = { all: 'all', base: 'base views', fork: 'forks', alias: 'aliases', derived: 'lenses' };
+  const chips = el('div', { class: 'chips' }, ...Object.keys(KIND_CHIP).map((k) =>
+    el('button', {
+      type: 'button', class: 'chip' + (ST.vFilter.kind === k ? ' on' : ''),
+      onclick: (ev) => {
+        ST.vFilter.kind = k;
+        for (const c of ev.currentTarget.parentElement.children) c.classList.toggle('on', c === ev.currentTarget);
+        renderViewList();
+      },
+    }, t(KIND_CHIP[k]))));
+  return el('div', { class: 'filterbox' }, q, chips);
+}
 const when = (cond, ...nodes) => (cond ? nodes : null);
 
 /** Run an async action from a button: disabled while in flight, and a refusal
@@ -596,6 +643,7 @@ const defBase = (text) => defFirst(text, 'alias') || defFirst(text, 'fork') || d
 /* -------------------------------------------------------------- overview --- */
 
 async function pageOverview(root) {
+  root.appendChild(pageHead(t('Overview'), t('Deployment snapshot, your reach and the latest governance activity.')));
   const info = await api('info', {});
   const cards = el('div', { class: 'cards' });
   const card = (k, v, sub) => cards.appendChild(el('div', { class: 'card' },
@@ -643,7 +691,7 @@ async function pageOverview(root) {
   root.appendChild(calls.ok ? auditTable(calls.r) : el('p', { class: 'err' }, calls.error));
 }
 
-function auditTable(rows) {
+function auditTable(rows, emptyText) {
   return tableNode([
     { t: t('when'), k: 'ts', class: 'mono' },
     { t: t('key'), render: (r) => r.key_label || r.key_id || null, class: 'mono' },
@@ -651,16 +699,18 @@ function auditTable(rows) {
     { t: t('op'), k: 'tool', class: 'mono' },
     { t: t('result'), render: (r) => el('span', { class: r.ok ? 'ok-text' : 'err' }, r.ok ? t('ok') : t('failed')) },
     { t: t('detail'), k: 'detail', class: 'wrap' },
-  ], rows, t('no governance calls yet'));
+  ], rows, emptyText || t('no governance calls yet'));
 }
 
 /* ------------------------------------------------------------------ views --- */
 
 async function pageViews(root) {
   await loadViews(true);
+  root.appendChild(pageHead(t('Views'), t('Base views, forks, aliases and lenses — select one to inspect.')));
   root.appendChild(el('div', { class: 'split' },
     el('div', { class: 'col-narrow' },
-      bar(el('h2', null, t('Views')), action(t('refresh'), reload, { class: 'link' })),
+      bar(el('h2', null, t('View list')), action(t('refresh'), reload, { class: 'link' })),
+      viewFilterBar(),
       el('ul', { id: 'view-list', class: 'list' }),
       el('div', { id: 'view-new', class: 'panel' })),
     el('div', { class: 'col-wide', id: 'view-detail' })));
@@ -676,7 +726,15 @@ async function renderViewList() {
     ul.appendChild(el('li', { class: 'muted' }, t('no views you can see')));
     return;
   }
-  for (const v of ST.views) {
+  const q = (ST.vFilter.q || '').trim().toLowerCase();
+  const rows = ST.views.filter((v) =>
+    (ST.vFilter.kind === 'all' || v.kind === ST.vFilter.kind)
+    && (!q || v.name.toLowerCase().includes(q)));
+  if (!rows.length) {
+    ul.appendChild(el('li', { class: 'muted' }, t('no views match the filter')));
+    return;
+  }
+  for (const v of rows) {
     ul.appendChild(el('li', {
       class: ST.sel === v.name ? 'sel' : '',
       onclick: () => { ST.sel = v.name; renderViewList().then(() => renderDetail(v.name)); },
@@ -936,7 +994,7 @@ async function renderDefEdit(box, s) {
 
 async function pageKeys(root) {
   await loadViews();
-  root.appendChild(bar(el('h2', null, t('API keys')), action(t('refresh'), reload, { class: 'link' })));
+  root.appendChild(pageHead(t('API keys'), t('Mint, rotate and revoke the keys clients mount and agents call with.'), action(t('refresh'), reload, { class: 'link' })));
 
   const labelI = el('input', { placeholder: 'etl job', size: 16 });
   const scopeS = el('select', null, ...(isSuper()
@@ -974,7 +1032,9 @@ async function pageKeys(root) {
   root.appendChild(panel);
 
   const rows = await api('apikey.list', {});
-  root.appendChild(tableNode([
+  // Client-side filter over the whole visible table; the column set lives in
+  // renderKeysTable so the filter re-renders ONLY the table node.
+  const keyCols = [
     { t: t('label'), k: 'label' },
     { t: t('id'), k: 'id', class: 'mono' },
     { t: t('owner'), render: (r) => r.owner || null },
@@ -987,9 +1047,24 @@ async function pageKeys(root) {
     {
       t: '', class: 'actions', render: (r) => (r.revoked_at ? null : el('div', { class: 'row' }, roBtn(r), revokeBtn(r))),
     },
-  ], rows, t('no keys you can see')));
+  ];
+  const keyHost = el('div');
+  root.appendChild(el('div', { class: 'filterbox' }, el('input', {
+    type: 'search', placeholder: t('filter by label, id, owner or view…'),
+    oninput: (ev) => renderKeysTable(ev.target.value),
+  })));
+  root.appendChild(keyHost);
   root.appendChild(el('p', { class: 'muted' },
     t('A key’s secret is shown once, at creation. Revoke is the only way back, and it takes effect on the key’s NEXT call — a live mount keeps its open trees until then.')));
+  renderKeysTable('');
+
+  function renderKeysTable(qRaw) {
+    clear(keyHost);
+    const q = (qRaw || '').trim().toLowerCase();
+    const hit = !q ? rows
+      : rows.filter((r) => [r.label, r.id, r.owner, r.view].some((x) => x && String(x).toLowerCase().includes(q)));
+    keyHost.appendChild(tableNode(keyCols, hit, q ? t('no keys match the filter') : t('no keys you can see')));
+  }
 }
 
 function roBtn(r) {
@@ -1016,7 +1091,7 @@ function revokeBtn(r) {
 async function pageAccounts(root) {
   await loadViews();
   const bases = ST.views.filter((v) => v.kind === 'base').map((v) => v.name);
-  root.appendChild(bar(el('h2', null, t('Accounts')),
+  root.appendChild(pageHead(t('Accounts'), t('Who governs what — accounts, roles and base-view delegations.'),
     when(!isSuper(), el('span', { class: 'badge off' }, t('administrators act here'))),
     action(t('refresh'), reload, { class: 'link' })));
 
@@ -1174,14 +1249,37 @@ function roleDialog(r) {
 /* ----------------------------------------------------------------- audit --- */
 
 async function pageAudit(root) {
+  root.appendChild(pageHead(t('Audit'), t('Every call the control plane answered — failures included.')));
   const limitS = el('select', { onchange: () => { ST.auditLimit = Number(limitS.value); go('audit'); } },
     el('option', { value: '50' }, '50'), el('option', { value: '200' }, '200'), el('option', { value: '1000' }, '1000'));
   limitS.value = String(ST.auditLimit || 50);
   root.appendChild(bar(el('h2', null, t('Recent governance calls')), limitS, action(t('refresh'), reload, { class: 'link' })));
-  root.appendChild(auditTable(await api('apikey.calls', { limit: Number(limitS.value) })));
+  // Client-side filter: free text over key/op/detail plus a failures-only
+  // switch — querying the audit log is, in practice, looking for failures.
+  const rows = await api('apikey.calls', { limit: Number(limitS.value) });
+  const qI = el('input', {
+    type: 'search', placeholder: t('filter by key, op or detail…'),
+    oninput: () => renderAuditTable(),
+  });
+  const onlyBad = el('input', { type: 'checkbox', onchange: () => renderAuditTable() });
+  const auditHost = el('div');
+  root.appendChild(el('div', { class: 'filterbox' }, qI,
+    el('label', { class: 'chk' }, onlyBad, t('failures only'))));
+  root.appendChild(auditHost);
   root.appendChild(el('p', { class: 'muted' }, isSuper()
     ? t('Every call the control plane answered, by any key or account. Failures are here too — a wrong credential included.')
     : t('Only your own activity and your views’ keys; the full log is an administrator’s view.')));
+  renderAuditTable();
+
+  function renderAuditTable() {
+    clear(auditHost);
+    const q = (qI.value || '').trim().toLowerCase();
+    let hit = rows || [];
+    if (q) hit = hit.filter((r) => [r.key_label, r.key_id, r.method, r.tool, r.detail]
+      .some((x) => x && String(x).toLowerCase().includes(q)));
+    if (onlyBad.checked) hit = hit.filter((r) => !r.ok);
+    auditHost.appendChild(auditTable(hit, q || onlyBad.checked ? t('no calls match the filter') : t('no governance calls yet')));
+  }
 }
 
 /* ---------------------------------------------------------------- start --- */
