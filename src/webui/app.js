@@ -53,8 +53,6 @@ const I18N_ZH = {
   'Account': '账号',
   'Password': '口令',
   'password': '口令',
-  "Accounts live in the meta-server's control plane. The first owner is created at install time with <code>meta-server --admin-user</code>; more come from the <em>Accounts</em> page or <code>grovefs web account create</code>.":
-    '账号存于 meta-server 的控制面。首任管理员在安装时由 <code>meta-server --admin-user</code> 创建；后续账号经「账号」页或 <code>grovefs web account create</code> 添加。',
   'Overview': '总览',
   'Views': '视图',
   'Keys': '密钥',
@@ -449,7 +447,7 @@ function viewFilterBar() {
   const KIND_CHIP = { all: 'all', base: 'base views', fork: 'forks', alias: 'aliases', derived: 'lenses' };
   const chips = el('div', { class: 'chips' }, ...Object.keys(KIND_CHIP).map((k) =>
     el('button', {
-      type: 'button', class: 'chip' + (ST.vFilter.kind === k ? ' on' : ''),
+      type: 'button', 'data-kind': k, class: 'chip' + (ST.vFilter.kind === k ? ' on' : ''),
       onclick: (ev) => {
         ST.vFilter.kind = k;
         for (const c of ev.currentTarget.parentElement.children) c.classList.toggle('on', c === ev.currentTarget);
@@ -736,7 +734,7 @@ async function renderViewList() {
   }
   for (const v of rows) {
     ul.appendChild(el('li', {
-      class: ST.sel === v.name ? 'sel' : '',
+      class: (ST.sel === v.name ? 'sel ' : '') + 'k-' + v.kind,
       onclick: () => { ST.sel = v.name; renderViewList().then(() => renderDetail(v.name)); },
     }, el('span', { class: 'mono' }, v.name), el('span', { class: 'kind' }, v.kind)));
   }
@@ -755,7 +753,7 @@ async function renderDetail(name) {
   const box = el('div', { class: 'detail' });
   box.appendChild(el('div', { class: 'head' },
     el('h2', { class: 'mono' }, s.name),
-    el('span', { class: 'badge' }, s.kind),
+    el('span', { class: 'badge k-' + s.kind }, s.kind),
     when(s.sessions > 0, el('span', { class: 'badge on-state' }, t('${n} mount session(s)', { n: s.sessions })))));
 
   box.appendChild(el('dl', { class: 'kv' },

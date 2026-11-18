@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- GroveFS mark: three data blocks growing into a tree. -->
+  <defs>
+    <linearGradient id="lg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#237dd6"/>
+      <stop offset="1" stop-color="#1663b3"/>
+    </linearGradient>
+  </defs>
+  <rect width="32" height="32" rx="8" fill="url(#lg)"/>
+  <g fill="#fff">
+    <rect x="11.5" y="4" width="9" height="8" rx="2"/>
+    <rect x="6.5" y="14" width="9" height="8" rx="2"/>
+    <rect x="16.5" y="14" width="9" height="8" rx="2"/>
+    <rect x="14" y="24" width="4" height="5" rx="1.5"/>
+  </g>
+</svg>

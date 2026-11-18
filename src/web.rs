@@ -56,6 +56,7 @@ use crate::control_remote::ControlClient;
 const INDEX_HTML: &str = include_str!("webui/index.html");
 const APP_CSS: &str = include_str!("webui/app.css");
 const APP_JS: &str = include_str!("webui/app.js");
+const FAVICON_SVG: &str = include_str!("webui/favicon.svg");
 
 /// What the console listens on unless told otherwise. Loopback on a
 /// non-privileged port: the operator points a browser at the host the gateway
@@ -416,8 +417,13 @@ impl Gateway {
                 "application/javascript; charset=utf-8",
                 APP_JS.as_bytes().to_vec(),
             ),
-            // No icon in the bundle; a 404 from the server would be noise in the
-            // browser console on every load.
+            (Method::Get, "/favicon.svg") => Reply::body(
+                200,
+                "image/svg+xml",
+                FAVICON_SVG.as_bytes().to_vec(),
+            ),
+            // Browsers request /favicon.ico by default even when a `link rel=icon`
+            // points at the SVG; a 204 keeps that miss out of the console.
             (Method::Get, "/favicon.ico") => Reply::body(204, "text/plain; charset=utf-8", Vec::new()),
             (Method::Post, "/api/login") => self.login(&mut rq, &ip),
             (Method::Post, "/api/logout") => self.logout(&mut rq),

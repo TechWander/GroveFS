@@ -25,6 +25,13 @@
   --fg-dim: #5a6b7d;
   --accent: #1663b3;
   --accent-soft: #e3eefb;
+  /* One hue per view kind: base/fork/alias/lens each get a colour that the
+     list stripe, the chip dot and the detail badge all repeat, so "what kind
+     of thing am I looking at" is answerable pre-attentively. */
+  --k-base: #1663b3;
+  --k-fork: #6f4fb8;
+  --k-alias: #0c7f76;
+  --k-lens: #b05e12;
   --ok: #1a7f4f;
   --warn: #a96a08;
   --err: #c93a3a;
@@ -97,12 +104,11 @@ td, .card .n { font-variant-numeric: tabular-nums; }
   height: 3px;
   background: linear-gradient(90deg, var(--accent), #4a97dd 60%, transparent);
 }
-.brand-row { display: flex; align-items: center; gap: .5rem; }
-.brand-row .logo { color: var(--accent); flex: none; }
+.brand-row { display: flex; align-items: center; gap: .65rem; }
+.brand-row .logo { flex: none; border-radius: 10px; box-shadow: var(--shadow-sm); }
 .login-card h1 { letter-spacing: .04em; margin: 0; }
 #login-form { display: grid; gap: .35rem; }
 #login-form label { margin-top: .6rem; font-size: 12px; color: var(--fg-dim); }
-#login .hint { margin-top: 1.2rem; }
 
 /* Language toggle: a small pill; on the sign-in card it parks top-right. */
 .lang-btn {
@@ -132,7 +138,7 @@ header {
   z-index: 5;
 }
 .brand { font-weight: 700; letter-spacing: .05em; display: inline-flex; align-items: center; gap: .45rem; }
-.brand .logo { color: var(--accent); flex: none; }
+.brand .logo { flex: none; border-radius: 6px; }
 nav { display: flex; gap: .3rem; flex: 1; }
 nav button {
   background: none;
@@ -185,7 +191,17 @@ main { padding: 1.25rem 1.5rem 2rem; max-width: 1500px; margin: 0 auto; }
   padding: .1rem .6rem;
   cursor: pointer;
   transition: background .12s, color .12s, border-color .12s;
+  display: inline-flex;
+  align-items: center;
+  gap: .35rem;
 }
+/* The chip's dot repeats its kind's hue; "all" gets all of them. */
+.chip::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--line); flex: none; }
+.chip[data-kind="base"]::before { background: var(--k-base); }
+.chip[data-kind="fork"]::before { background: var(--k-fork); }
+.chip[data-kind="alias"]::before { background: var(--k-alias); }
+.chip[data-kind="derived"]::before { background: var(--k-lens); }
+.chip[data-kind="all"]::before { background: linear-gradient(90deg, var(--k-base), var(--k-fork), var(--k-lens)); }
 .chip:hover { border-color: var(--accent); color: var(--accent); }
 .chip.on { background: var(--accent-soft); border-color: #bcd4ef; color: var(--accent); font-weight: 600; }
 
@@ -252,7 +268,19 @@ label { font-size: 12px; color: var(--fg-dim); }
   box-shadow: var(--shadow-sm);
 }
 .panel .field { display: grid; gap: .2rem; }
-.panel h3 { flex-basis: 100%; margin: 0; font-size: 13px; color: var(--fg-dim); font-weight: 500; }
+.panel h3 {
+  flex-basis: 100%;
+  margin: -.75rem -.75rem 0;
+  padding: .45rem .75rem;
+  font-size: 12px;
+  color: var(--fg-dim);
+  font-weight: 600;
+  background: var(--bg3);
+  border-bottom: 1px solid var(--line);
+  border-radius: 7px 7px 0 0;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
 
 .badge {
   border: 1px solid var(--line);
@@ -265,6 +293,12 @@ label { font-size: 12px; color: var(--fg-dim); }
 .badge.admin { color: var(--warn); border-color: #d9b664; background: #fdf6e8; }
 .badge.off { color: var(--err); border-color: #e2a6a6; background: #fdeeee; }
 .badge.on-state { color: var(--ok); border-color: #9fcbb2; background: #ebf7f0; }
+/* Kind badges repeat the view-kind hue (same family as the list stripe and
+   the chip dot). */
+.badge.k-base { color: var(--k-base); border-color: #bcd4ef; background: var(--accent-soft); }
+.badge.k-fork { color: var(--k-fork); border-color: #cdb8ea; background: #efeaf8; }
+.badge.k-alias { color: var(--k-alias); border-color: #b3dcd8; background: #e1f2f0; }
+.badge.k-derived { color: var(--k-lens); border-color: #e4c9a0; background: #faeedd; }
 
 /* ---- layout bits ---- */
 
@@ -278,6 +312,16 @@ label { font-size: 12px; color: var(--fg-dim); }
 .list li:hover { background: var(--bg3); }
 .list li.sel { background: #dbe9f7; }
 .list li .kind { margin-left: auto; font-size: 11px; color: var(--fg-dim); text-transform: uppercase; letter-spacing: .04em; }
+/* A stripe in the view's kind hue, inset so the selection background keeps
+   working underneath it. */
+.list li.k-base { box-shadow: inset 3px 0 0 var(--k-base); }
+.list li.k-fork { box-shadow: inset 3px 0 0 var(--k-fork); }
+.list li.k-alias { box-shadow: inset 3px 0 0 var(--k-alias); }
+.list li.k-derived { box-shadow: inset 3px 0 0 var(--k-lens); }
+.list li.k-base .kind { color: var(--k-base); }
+.list li.k-fork .kind { color: var(--k-fork); }
+.list li.k-alias .kind { color: var(--k-alias); }
+.list li.k-derived .kind { color: var(--k-lens); }
 
 .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr)); gap: .75rem; }
 .card {
@@ -287,8 +331,13 @@ label { font-size: 12px; color: var(--fg-dim); }
   padding: .7rem .8rem;
   box-shadow: var(--shadow-sm);
   transition: transform .12s, box-shadow .12s;
+  position: relative;
+  overflow: hidden;
 }
+/* A short accent cap separates the card from the page ground at a glance. */
+.card::before { content: ""; position: absolute; inset: 0 0 auto 0; height: 3px; background: var(--accent); opacity: .5; }
 .card:hover { transform: translateY(-1px); box-shadow: var(--shadow-md); }
+.card:hover::before { opacity: .85; }
 .card .n { font-size: 23px; font-weight: 650; color: var(--accent); }
 .card .k { font-size: 12px; color: var(--fg-dim); }
 
@@ -309,7 +358,7 @@ td.wrap { word-break: break-all; }
 tbody tr:only-child td[colspan] { text-align: center; padding: 1.3rem .6rem; }
 
 .detail { background: var(--bg2); border: 1px solid var(--line); border-radius: 8px; padding: 1rem; box-shadow: var(--shadow-sm); }
-.detail .head { display: flex; align-items: center; gap: .6rem; margin-bottom: .75rem; }
+.detail .head { display: flex; align-items: center; gap: .6rem; margin-bottom: .75rem; padding-bottom: .6rem; border-bottom: 1px solid var(--line); }
 .detail .head h2 { margin: 0; font-size: 17px; }
 .kv { display: grid; grid-template-columns: max-content 1fr; gap: .15rem .9rem; font-size: 13px; margin-bottom: 1rem; }
 .kv dt { color: var(--fg-dim); }
