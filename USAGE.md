@@ -23,7 +23,7 @@
 | 删一个定义 / 删整棵基视图并回收字节 | `view rm --name F` / `view rm --name F --base` | §3.4.3、§5.3 |
 | 排查/回收孤儿对象(离线) | `gc --meta-dir D [--data-dir R] [--apply]` | §12.6 |
 | 让智能体自己定制数据列表 | `grovefs mcp`(stdio JSON-RPC) | §3.5 |
-| 给接口和挂载点加锁、逐调用方撤销 | `apikey create/list/rotate/revoke/set-ro/calls` | §3.5.1、§6 |
+| 给接口和挂载点加锁、逐调用方撤销 | `apikey create/list/rotate/revoke/set-ro/calls/update` | §3.5.1、§6 |
 | 只读挂载 / 零缓存强一致 | `mount --ro` / `--no-cache` | §7 |
 | 性能观测与限速(分阶段延迟 / 带宽 / 缓存 TTL) | `mount --stats*` / `--bw-read|--bw-write` / `--cache-ttl` | §8 |
 | 多台机器共享同一棵视图 | `data-server` + `meta-server` | §4、§11 |
@@ -387,7 +387,7 @@ fork team
 | `blocks/<2hex>/<key>` | 文件真实字节;所有视图只存 key | 写入/导入时生成;回收时删除 |
 | `meta/api_keys.db` | 可选控制面:key 摘要与调用审计 | `apikey` 命令 / `mcp --require-api-key` |
 
-`node` 表一行包含:`id`、`ino`、`parent_id`、`name`、`is_dir`、`data_ref`(指向 blocks 的 key)、`link_target`、`mode/uid/gid`、`mtime/atime/ctime`,并对 `(parent_id, name)` 唯一。`ctrl` 是 `(k, v)` 键值表,今天只放 HA 的 `epoch`(**不是 inode 计数器**——新 inode 不走游标分配,= 自己那行的 `id`);`locks` 是 POSIX/BSD 锁租约。`refs.db` 只有一张 `holders(data_ref TEXT PRIMARY KEY, holders INTEGER)`,记每个对象被多少个视图持有。`api_keys.db`(可选)含 `api_keys` 与 `mcp_calls` 两张表(凭据摘要/审计)。**视图之间的差别不在表结构,而在“这个名字有没有自己的 `.db`”**。
+`node` 表一行包含:`id`、`ino`、`parent_id`、`name`、`is_dir`、`data_ref`(指向 blocks 的 key)、`link_target`、`mode/uid/gid`、`mtime/atime/ctime`,并对 `(parent_id, name)` 唯一。`ctrl` 是 `(k, v)` 键值表,今天只放 HA 的 `epoch`(**不是 inode 计数器**——新 inode 不走游标分配,= 自己那行的 `id`);`locks` 是 POSIX/BSD 锁租约。`refs.db` 只有一张 `holders(data_ref TEXT PRIMARY KEY, holders INTEGER)`,记每个对象被多少个视图持有。`api_keys.db`(可选)含 `api_keys` 与 `mcp_calls` 两张表:前者是 `id, label, secret_hash, created_at, last_used_at, revoked_at, scope, view, ro, owner, note, expires_at, created_by, secret_hint`——摘要之外另存三笔台账(备注/有效期/铸造者)与一段头尾指纹,库里既无明文也无密文;后者是调用审计。PG 档列名相同(`view_name`/`ro BOOLEAN`,另多一个 `seq` 身份列)。旧库就地升级:`apikey` 打开注册表时按需 `ALTER TABLE … ADD COLUMN`,不重写任何一行。**视图之间的差别不在表结构,而在“这个名字有没有自己的 `.db`”**。
 
 **PG 后端(`--meta-store postgres://…`)的对应关系**
 
@@ -1047,99 +1047,148 @@ docs  photos
 
 ### 3.5.1 给接口和挂载点上把锁:API key 认证、scope 分区与调用审计(`grovefs apikey`)
 
-同一个服务端常常要面对**多个不同调用方**——智能体运行时把一个 `grovefs mcp` 服务 front 出去,多台客户机经 LAN 挂同一个 `meta-server`——此时需要可撤销的凭据与归属审计。`grovefs apikey` 铸造 API key(**只存 SHA-256 摘要**,明文仅在 `create` 时打印一次,故 `api_keys.db` 泄露也换不出可用凭据),并给每个 key 打 **scope**(`--for admin` 是顶替数据库密码的治理端口凭据,见 §3.5.2)与 **owner**(`--owner <账号>`,`--for admin` 必填):`--for mcp`(只开治理接口)、`--for mount`(只开 `--require-api-key` 的 meta/data 服务端)、`--for admin`(只开治理端口 `meta-server --control-listen`,同时放行 mount+mcp)、`--for any`(**默认**,仅 mount+mcp——`any` 不会升格为 `admin`,scope 概念之前铸造的所有旧 key 都是这一档,故老部署一律无需改动)。两处入口共用同一份注册表(`<meta-dir>/meta/api_keys.db`),靠 scope 隔离:挂载凭据重放不到治理 API,智能体 key 也开不了数据面。挂载 key 还可带**两个访问控制维度**:`--view V` 把凭据**绑定到单一物理视图** V——用它 `M_OPEN` 别的视图在握手处即被 `E_AUTH` 拒(省略 `--view` 的是系统级 key,可开任意视图);`--ro` 标为**只读**——服务端在 meta 面对其逐写意图 op 拒 `E_NOTPERM`、data 面内容写拒 `EROFS`,并在 `M_OPEN` 回包提示客户端只读挂载(「只读」由服务端强制,不靠客户端自觉 `-o ro`);只读/读写**可原地切换**——`apikey set-ro --id <ID> --rw` 把只读 key 切回读写、不带 `--rw`(或带 `--ro`)切回只读,活挂载在下一次秒级复验 tick 就按新值放行/拒绝,无需重铸、无需重连(唯一例外:握手时已落内核只读的挂载要解除 OS 层caps仍需重挂,详见 3.5.1 的 set-ro 段;且切换只对经服务端的挂载成立,本机 `--home` 挂载无服务端凭据门、不受影响)。**治理面门**:`grovefs mcp --require-api-key` 据此对所有**读写治理状态的方法**设门——`tools/list`、`tools/call`、`resources/list`、`resources/templates/list`、`resources/read`、`completion/complete`(`initialize` / `ping` / `prompts/*` / `logging/*` 始终开放,好让客户端完成握手、取静态剧本、并控制服务端详谈程度)。**挂载面门**:`meta-server --require-api-key` 卡 `M_OPEN`、`data-server --require-api-key` 卡 `OP_OPEN`,客户端以 `mount --api-key <ID:SECRET>` 呈现(不便写命令行时可导出 `GROVEFS_API_KEY='<ID:SECRET>'`,密钥随即不落 argv);**开启顺序很重要**: 服务端**不写** `--require-api-key` 就完全**不校验** key(客户端带一个瞎编的 key 也照挂,实测 `MOUNTED`);写了则是 **fail-closed**——`api_keys.db` 里没有可用 key 时**所有人(包括你)都进不来**,所以先把 key 铸好、再带 flag 重启;**审计面**:每一次 `tools/call`、`resources/read`,以及每一次挂载连接(含被拒的)都追加进同一张审计表(时间、key、平面 method、工具 tool、成败、详情),`grovefs apikey calls` 回读。撤销只把行标记为 revoked(历史调用仍保留归属),撤销后的 key 立即鉴不上,**且已建立的挂载也会被封停**(见下)。存储是一处独立的本地 SQLite(`<meta-dir>/meta/api_keys.db`):控制面状态。新铸造的 key 为短格式 `<16位hex id>:<32位hex secret>`(共 49 字符;secret 为 122 位随机,离线爆破与在线重放都仍不可行),格式之前铸造的长 key 照常验证——校验只比摘要、不看长度,零迁移;`apikey rotate` 在 secret 丢失后为**同一 id** 重新铸一把新 secret(标签/范围/视图绑定/审计历史全保留,新明文同样只展示一次)。下列回显取自真实运行:
+同一个服务端常常要面对**多个不同调用方**——智能体运行时把一个 `grovefs mcp` 服务 front 出去,多台客户机经 LAN 挂同一个 `meta-server`——此时需要可撤销的凭据与归属审计。`grovefs apikey` 铸造 API key(**只存 SHA-256 摘要**,明文仅在 `create` 时打印一次,故 `api_keys.db` 泄露也换不出可用凭据),并给每个 key 打 **scope**(`--for admin` 是顶替数据库密码的治理端口凭据,见 §3.5.2)与 **owner**(`--owner <账号>`,`--for admin` 必填):`--for mcp`(只开治理接口)、`--for mount`(只开 `--require-api-key` 的 meta/data 服务端)、`--for admin`(只开治理端口 `meta-server --control-listen`,同时放行 mount+mcp)、`--for any`(**默认**,仅 mount+mcp——`any` 不会升格为 `admin`,scope 概念之前铸造的所有旧 key 都是这一档,故老部署一律无需改动)。两处入口共用同一份注册表(`<meta-dir>/meta/api_keys.db`),靠 scope 隔离:挂载凭据重放不到治理 API,智能体 key 也开不了数据面。挂载 key 还可带**两个访问控制维度**:`--view V` 把凭据**绑定到单一物理视图** V——用它 `M_OPEN` 别的视图在握手处即被 `E_AUTH` 拒(省略 `--view` 的是系统级 key,可开任意视图);`--ro` 标为**只读**——服务端在 meta 面对其逐写意图 op 拒 `E_NOTPERM`、data 面内容写拒 `EROFS`,并在 `M_OPEN` 回包提示客户端只读挂载(「只读」由服务端强制,不靠客户端自觉 `-o ro`);只读/读写**可原地切换**——`apikey set-ro --id <ID> --rw` 把只读 key 切回读写、不带 `--rw`(或带 `--ro`)切回只读,活挂载在下一次秒级复验 tick 就按新值放行/拒绝,无需重铸、无需重连(唯一例外:握手时已落内核只读的挂载要解除 OS 层caps仍需重挂,详见 3.5.1 的 set-ro 段;且切换只对经服务端的挂载成立,本机 `--home` 挂载无服务端凭据门、不受影响)。**治理面门**:`grovefs mcp --require-api-key` 据此对所有**读写治理状态的方法**设门——`tools/list`、`tools/call`、`resources/list`、`resources/templates/list`、`resources/read`、`completion/complete`(`initialize` / `ping` / `prompts/*` / `logging/*` 始终开放,好让客户端完成握手、取静态剧本、并控制服务端详谈程度)。**挂载面门**:`meta-server --require-api-key` 卡 `M_OPEN`、`data-server --require-api-key` 卡 `OP_OPEN`,客户端以 `mount --api-key <ID:SECRET>` 呈现(不便写命令行时可导出 `GROVEFS_API_KEY='<ID:SECRET>'`,密钥随即不落 argv);**开启顺序很重要**: 服务端**不写** `--require-api-key` 就完全**不校验** key(客户端带一个瞎编的 key 也照挂,实测 `MOUNTED`);写了则是 **fail-closed**——`api_keys.db` 里没有可用 key 时**所有人(包括你)都进不来**,所以先把 key 铸好、再带 flag 重启;**审计面**:每一次 `tools/call`、`resources/read`,以及每一次挂载连接(含被拒的)都追加进同一张审计表(时间、key、平面 method、工具 tool、成败、详情),`grovefs apikey calls` 回读。撤销只把行标记为 revoked(历史调用仍保留归属),撤销后的 key 立即鉴不上,**且已建立的挂载也会被封停**(见下)。存储是一处独立的本地 SQLite(`<meta-dir>/meta/api_keys.db`):控制面状态。新铸造的 key 为短格式 `<16位hex id>:<32位hex secret>`(共 49 字符;secret 为 122 位随机,离线爆破与在线重放都仍不可行),格式之前铸造的长 key 照常验证——校验只比摘要、不看长度,零迁移;`apikey rotate` 在 secret 丢失后为**同一 id** 重新铸一把新 secret(标签/范围/视图绑定/审计历史全保留,新明文同样只展示一次)。**每把 key 另有三笔台账随它入库**:`--note TEXT` 的备注、`--ttl DUR` 由服务端换算出的绝对 `expires_at`(时长单位只认 `s`/`m`/`h`/`d`,拼错直接拒,不会静默铸出一把永不过期的 key)、`created_by` 记下铸造它的账号,外加一列 `secret_hint`——头 4 + `…` + 尾 4 的指纹,不可逆推。`list` 的 key 列显示的就是这段入库指纹,所以「在列表里看到 key」与「拿到可用凭据」仍是两件事(要重新拿到明文只有 `rotate`)。下列回显取自真实运行:
 
 ```
 # 1) 铸造一个 key(明文只打印一次;scope 默认 any)
 $ grovefs apikey --meta-dir $HOME_DIR create --label claude-desktop
 apikey created — shown ONCE (only its SHA-256 is stored; save it now):
-  id:    06fc0287c1464bd1
+  id:    01fcf6bb65a742c4
+  owner: <none>
   label: claude-desktop
   scope: any
-  key:   06fc0287c1464bd1:7ddadff0451c46889d8e0a2c77b13490
+  view:  <any>
+  rw:    rw (read-write)
+  expires: never (set one with --ttl, or `apikey update --ttl`)
+  key:   01fcf6bb65a742c4:49d5f536592d49c090ddb10624f05c7e
 
 Present it to a `--require-api-key` server as
-  grovefs mount --meta-server ... --data-servers ... --api-key '06fc0287c1464bd1:7ddadff0451c46889d8e0a2c77b13490' -m /mnt/x
-(or export GROVEFS_API_KEY='...' so it stays out of the command line).
+  grovefs mount --meta-server ... --data-servers ... --api-key '01fcf6bb65a742c4:49d5f536592d49c090ddb10624f05c7e' -m /mnt/x
+(or export GROVEFS_API_KEY='01fcf6bb65a742c4:49d5f536592d49c090ddb10624f05c7e' so it stays out of the command line).
 Scope it to one entrance with `--for mount` / `--for mcp` to keep a mount
-credential out of the governance API (and vice versa).
-Revoke later with: grovefs apikey --meta-dir $HOME_DIR revoke --id 06fc0287c1464bd1
+credential out of the governance API (and vice versa); `--for admin` is the
+governance credential and is never implied by `any`.
+Revoke later with: grovefs apikey --meta-dir $HOME_DIR revoke --id 01fcf6bb65a742c4
+
+# 1b) 备注与有效期一起入账:三笔台账(备注/有效期/铸造者)都随 key 落库,期限由服务端算
+$ grovefs apikey --meta-dir $HOME_DIR create --label nightly --for mount --note "staging box, hand over end of March" --ttl 30d
+apikey created — shown ONCE (only its SHA-256 is stored; save it now):
+  id:    be55fdb6147a4f79
+  owner: <none>
+  label: nightly
+  scope: mount
+  view:  <any>
+  rw:    rw (read-write)
+  note:  staging box, hand over end of March
+  expires: 2026-12-18T15:10:06.069199511+00:00
+  key:   be55fdb6147a4f79:0d4fb3aff1584c74b10630148e42eb4e
 
 # 2) 铸造一个只能挂载的 key;scope 写错直接拒绝(打错一个词不会静默放宽权限)
 $ grovefs apikey --meta-dir $HOME_DIR create --label laptop-alice --for mount
-  id:    aac1f51a0d5641dd   scope: mount   key: aac1f51a...:a5d5450a...
+apikey created — shown ONCE (only its SHA-256 is stored; save it now):
+  id:    18c4bb4091764ad6
+  owner: <none>
+  label: laptop-alice
+  scope: mount
+  view:  <any>
+  rw:    rw (read-write)
+  expires: never (set one with --ttl, or `apikey update --ttl`)
+  key:   18c4bb4091764ad6:3d6997d607be4cf7ba0024a85afedbe6
 $ grovefs apikey --meta-dir $HOME_DIR create --label x --for both
 error: unknown api key scope 'both' (expected any|mcp|mount|admin)      # exit=1
 
 # 2b) 视图绑定 + 只读的 key(访问控制维度)
 $ grovefs apikey --meta-dir $HOME_DIR create --label reader --for mount --view alice --ro
 apikey created — shown ONCE (only its SHA-256 is stored; save it now):
-  id:    7c0e...
-  label: reader
-  scope: mount
-  view:  alice
-  rw:    ro (read-only)
-  key:   7c0e...:…(32 hex secret)     # 只能挂 view alice,写一律被服务端拒
-$ grovefs mount --view bob -m /mnt/b --meta-server ... --data-servers ... --api-key "$READER_KEY"   # 挂别的视图
-error: permission denied: this api key is bound to view 'alice', not 'bob'    # M_OPEN 处 E_AUTH
-$ mkdir /mnt/a/should_fail                                                          # alice 的只读 key
-bash: /mnt/a/should_fail: 只读文件系统                                               # 据握手标志落内核只读;服务端另逐写拒 E_NOTPERM/EROFS
-
-# 2c) 原地切换只读/读写(热生效,不重铸不重连)
-$ grovefs apikey --meta-dir $HOME_DIR set-ro --id 7c0e --rw
-apikey: id='7c0e…' (label 'reader') is now rw (read-write)
-  a LIVE mount presenting this key picks up the new verdict on its next op (within the 1s re-check window) — no reconnect;
-  only a mount the handshake placed kernel read-only needs a remount to lift the OS-level cap.
-$ grovefs apikey --meta-dir $HOME_DIR set-ro --id 7c0e            # 切回只读(默认方向)
-apikey: id='7c0e…' (label 'reader') is now ro (read-only)
-# 前缀歧义/已撤销/未知 id 与 revoke 同样处理:歧义前缀报错、revoked 行不回活、未知 id 报错(exit=1)。
-
-# 2d) secret 丢了不换身份:rotate 为同一 id 重铸 secret(绑定/归属/审计全保留,新明文再展示一次)
-$ grovefs apikey --meta-dir $HOME_DIR rotate --id 7c0e
-apikey rotated — NEW key shown ONCE (only its SHA-256 is stored; save it now):
-  id:    7c0e...
+  id:    a026316b216946dc
   owner: <none>
   label: reader
   scope: mount
   view:  alice
-  key:   7c0e...:<新的 32 位 hex secret>
+  rw:    ro (read-only)
+  expires: never (set one with --ttl, or `apikey update --ttl`)
+  key:   a026316b216946dc:4611085b2d714a519af0a762acad76c6
+$ grovefs mount --view bob -m /mnt/b --meta-server ... --data-servers ... --api-key "$READER_KEY"   # 拿它去挂别的视图
+error: permission denied: this api key is bound to view 'alice', not 'bob'    # M_OPEN 处 E_AUTH
+$ mkdir /mnt/a/should_fail                                                          # alice 的只读 key 挂载
+mkdir: 无法创建目录 “/mnt/a/should_fail”: 只读文件系统                        # 据握手标志落内核只读;服务端另逐写拒 E_NOTPERM/EROFS
+
+# 2c) 原地切换只读/读写(热生效,不重铸不重连)
+$ grovefs apikey --meta-dir $HOME_DIR set-ro --id a026 --rw
+apikey: id='a026316b216946dc' (label 'reader') is now rw (read-write)
+  a LIVE mount presenting this key resumes admitting writes on its next re-check window (≤1s) — no reconnect, no remount.
+$ grovefs apikey --meta-dir $HOME_DIR set-ro --id a026            # 切回只读(默认方向)
+apikey: id='a026316b216946dc' (label 'reader') is now ro (read-only)
+  a LIVE mount presenting this key starts refusing writes on its next re-check window (≤1s) — no reconnect, no remount; its reads keep flowing.
+# 前缀歧义/已撤销/未知 id 与 revoke 同样处理:歧义前缀报错、revoked 行不回活、未知 id 报错(exit=1)。
+
+# 2d) secret 丢了不换身份:rotate 为同一 id 重铸 secret(绑定/归属/审计/台账全保留,新明文再展示一次)
+$ grovefs apikey --meta-dir $HOME_DIR rotate --id a026
+apikey rotated — NEW key shown ONCE (only its SHA-256 is stored; save it now):
+  id:    a026316b216946dc
+  owner: <none>
+  label: reader
+  scope: mount
+  view:  alice
+  key:   a026316b216946dc:942266559f824286b450b4e8a67ad04c
 
   the id and every binding are unchanged — only the secret was replaced;
   the OLD secret fails its next handshake, and a live mount established on it
   stays open until it reconnects — `apikey revoke` is the kill-now verb.
-# 已撤销的 id 拒绝 rotate(revoke 是终态,轮换不复活);要立刻封杀用 revoke。
+# 已撤销的 id 拒绝 rotate(revoke 是终态,轮换不复活);要立刻封杀用 revoke。列表里的指纹同步换成新 secret 的头尾。
 
-# 3) 列表带 scope/view/rw 列,绝不落密文;哈希也不落盘(库内只有摘要)
+# 3) 列表:直接显示 key 指纹(头4…尾4,库里存的那一段,读取时不反推),绝不落明文;台账随行带出
 $ grovefs apikey --meta-dir $HOME_DIR list
-#   id               label            scope   view          rw   created                   last_used                 revoked
-1   296ef5839f514607   agent            mcp     -             rw   2026-10-27T06:57:59...      -                         -
-2   aac1f51a0d5641dd   laptop-alice     mount   -             rw   2026-10-27T06:57:59...      2026-10-27T06:58:02...    -
-3   06fc0287c1464bd1   claude-desktop   any     <any>         rw   2026-10-27T06:57:59...      -                         -
+#   id                 key          owner            label            scope   view         rw   created                   last_used                 expires / revoked / note
+1   9622e52b060e41d8   772a…636e    -                agent            mcp     <any>        rw   2026-11-18T15:10:06.161151695+00:00 -                         never
+2   b381a1693c9b4165   1c5f…1d10    -                lab-agent        any     lab          rw   2026-11-18T15:10:06.124367225+00:00 -                         never
+3   be55fdb6147a4f79   0d4f…eb4e    -                nightly          mount   <any>        rw   2026-11-18T15:10:06.069303270+00:00 -                         expires 2026-12-18T15:10:06.069199511+00:00 | note: staging box, hand over end of March
+4   a026316b216946dc   9422…d04c    -                reader           mount   alice        ro   2026-11-18T15:10:06.032809367+00:00 2026-11-18T15:10:11.311280050+00:00 never
+5   18c4bb4091764ad6   3d69…dbe6    -                laptop-alice     mount   <any>        rw   2026-11-18T15:10:05.984742303+00:00 2026-11-18T15:10:11.259186132+00:00 never
+6   01fcf6bb65a742c4   49d5…5c7e    -                claude-desktop   any     <any>        rw   2026-11-18T15:10:05.965729039+00:00 -                         never
 
 # 3b) 按视图过滤:只列能开 lab 的 key(纯别名也匹配绑定到真实名的 key),并提示系统级 key 数
 $ grovefs apikey --meta-dir $HOME_DIR list --view lab
-#   id               label            scope   view         rw   created                   last_used                 revoked
-1   0cfaffd5fe2e4486   lab-agent        any     lab          rw   2026-10-27T15:31:33...      -                         -
-1 bound key(s) for view 'lab' of 2 total
+#   id                 key          owner            label            scope   view         rw   created                   last_used                 expires / revoked / note
+1   b381a1693c9b4165   1c5f…1d10    -                lab-agent        any     lab          rw   2026-11-18T15:10:06.124367225+00:00 -                         never
+1 bound key(s) for view 'lab' of 6 total
+  note: 4 unbound key(s) admit every view too — plain `apikey list` shows them
 
-# 3c) 凭据多了直接检索:`--label/--owner` 大小写不敏感子串,`--scope` 精确到一档入口
+# 3c) 凭据多了直接检索:`--label/--owner/--note` 大小写不敏感子串,`--scope` 精确到一档入口
 $ grovefs apikey --meta-dir $HOME_DIR list --label alice --scope mount
-#   id               label            scope   view         rw   created                   last_used                 revoked
-1   aac1f51a0d5641dd   laptop-alice     mount   -            rw   2026-10-27T06:57:59...      2026-10-27T06:58:02...    -
+#   id                 key          owner            label            scope   view         rw   created                   last_used                 expires / revoked / note
+1   18c4bb4091764ad6   3d69…dbe6    -                laptop-alice     mount   <any>        rw   2026-11-18T15:10:05.984742303+00:00 2026-11-18T15:10:11.259186132+00:00 never
+$ grovefs apikey --meta-dir $HOME_DIR list --note staging
+#   id                 key          owner            label            scope   view         rw   created                   last_used                 expires / revoked / note
+1   be55fdb6147a4f79   0d4f…eb4e    -                nightly          mount   <any>        rw   2026-11-18T15:10:06.069303270+00:00 -                         expires 2026-12-18T15:10:06.069199511+00:00 | note: staging box, hand over end of March
+
+# 3d) 台账就地可改:`update` 只动备注与期限两笔,其余(身份/绑定/审计)一概不碰
+$ grovefs apikey --meta-dir $HOME_DIR update --id be55 --note "handed to ops" --ttl never
+apikey updated: id='be55fdb6147a4f79' (label 'nightly')
+  note:    handed to ops
+  expires: never
+$ grovefs apikey --meta-dir $HOME_DIR update --id be55 --ttl "3 weeks"     # 时长只认 s/m/h/d 四个单位
+error: bad ttl '3 weeks': expected a count and a unit, like 45m, 24h or 7d   # exit=1
+$ grovefs apikey --meta-dir $HOME_DIR update --id be55                      # 两个 flag 都不给:拒,而不是空转一次
+error: nothing to update: pass --note TEXT and/or --ttl DUR (`--ttl never` removes a deadline)   # exit=1
+# 期限由服务端判:过了 expires 的 key 在 list 里标 EXPIRED(行仍列出)、每一次鉴权都被拒;
+# 给它一个新的 --ttl 就是唯一恢复路径(同一把 key 重新鉴上);revoked 行拒改——吊销是终态。
 
 # 4) 服务端开门时自报门槛;不开门的默认路径行为与从前逐字节一致
-$ grovefs meta-server --meta-dir $HOME_DIR --listen 0.0.0.0:50110 --require-api-key
-meta-server listening on 0.0.0.0:50110 (base $HOME_DIR, role Primary)
+$ grovefs meta-server --meta-dir $HOME_DIR --listen 127.0.0.1:15310 --require-api-key
+meta-server listening on 127.0.0.1:15310 (base $HOME_DIR, role Primary)
+meta-server: metadata backend sqlite — one db file per view under <base>/meta/
 meta-server: api-key auth REQUIRED (present `mount --api-key`, minted by `grovefs apikey create --for mount|any`); a revoke closes live mounts on their next op
-$ grovefs data-server --listen 0.0.0.0:50100 --data-dir /data/cluster --require-api-key --meta-dir $HOME_DIR
+meta-server: views are created explicitly — M_OPEN refuses a name with no existing tree or definition (`grovefs view create --view <name>`, or `--home <dir> init --view <name>`); no empty tree is ever auto-created
+$ grovefs data-server --listen 127.0.0.1:15311 --data-dir /data/cluster --require-api-key --meta-dir $HOME_DIR
 data-server: api-key auth REQUIRED (present `mount --api-key`, minted by `grovefs apikey create --for mount|any`); a revoke closes live connections on the next op
 
 # 5) 客户端拿各种坏凭据去挂:拒因逐字节的原文回到本地 stderr(退出码 1,不留脏挂载)
 $ grovefs mount --view alice -m /mnt/a --meta-server ... --data-servers ...                      # 不带 key
 error: no api key presented: this server requires one (pass `mount --api-key ID:SECRET` or export GROVEFS_API_KEY; mint with `grovefs apikey create --for mount`)
-$ grovefs mount --view alice -m /mnt/a --meta-server ... --data-servers ... --api-key "aac1f51a...:deadbeef"
+$ grovefs mount --view alice -m /mnt/a --meta-server ... --data-servers ... --api-key "18c4bb40...:deadbeef"
 error: authentication failed: invalid api key secret
-$ grovefs mount --view alice -m /mnt/a --meta-server ... --data-servers ... --api-key "00000000...:whatever"
+$ grovefs mount --view alice -m /mnt/a --meta-server ... --data-servers ... --api-key "0000000000000000:whatever"
 error: authentication failed: unknown api key id
 $ grovefs mount --view alice -m /mnt/a --meta-server ... --data-servers ... --api-key "no-colon-here"
 error: malformed api key (expected '<id>:<secret>')
@@ -1148,31 +1197,37 @@ error: authentication failed: this api key is scoped to 'mcp', not 'mount'
 #   反方向同样被拒:把 mount key 塞进 MCP initialize 的 apiKey,tools/list 回 -32001,
 #   且这条跨入口尝试同样被审计成 scope 拒因。
 
-# 6) 挂载连接与治理调用同表审计(method 分平面、tool 分握手)
-$ grovefs apikey --meta-dir $HOME_DIR calls --limit 6
-last 6 call(s), newest first:
+# 6) 挂载连接与治理调用同表审计(method 分平面、tool 分握手;被拒的也入账)
+$ grovefs apikey --meta-dir $HOME_DIR calls --limit 8
+last 8 call(s), newest first:
 ts                        key_id                             method       tool                   ok   detail
-2026-10-27T06:58:02.176356991+00:00 aac1f51a0d5641dd                   meta         M_OPEN                 yes  view='alice' uid=1005
-2026-10-27T06:58:00.180250185+00:00 aac1f51a0d5641dd                   data         OP_OPEN                yes
-2026-10-27T06:58:00.169508131+00:00 -                                  meta         M_OPEN                 no   view='alice': authentication failed: this api key is scoped to 'mcp', not 'mount'
-2026-10-27T06:58:00.164775080+00:00 -                                  meta         M_OPEN                 no   view='alice': authentication failed: invalid api key secret
+2026-11-18T15:10:11.569517381+00:00 -                                  meta         M_OPEN                 no   view='alice': authentication failed: this api key is scoped to 'mcp', not 'mount'
+2026-11-18T15:10:11.535856955+00:00 -                                  meta         M_OPEN                 no   view='alice': malformed api key (expected '<id>:<secret>')
+2026-11-18T15:10:11.502511379+00:00 -                                  meta         M_OPEN                 no   view='alice': authentication failed: unknown api key id
+2026-11-18T15:10:11.485540205+00:00 -                                  meta         M_OPEN                 no   view='alice': authentication failed: invalid api key secret
+2026-11-18T15:10:11.462438861+00:00 -                                  meta         M_OPEN                 no   view='alice': no api key presented: this server requires one (pass `mount --api-key ID:SECRET` or export GROVEFS_API_KEY; mint with `grovefs apikey create --for mount`)
+2026-11-18T15:10:11.344410213+00:00 a026316b216946dc                   meta         M_OPEN                 no   view='bob': key bound to view 'alice'
+2026-11-18T15:10:11.335343137+00:00 a026316b216946dc                   meta         M_OPEN                 yes  view='bob' uid=1005
+2026-11-18T15:10:11.276881451+00:00 18c4bb4091764ad6                   data         OP_OPEN                yes
 
 # 7) 撤销一行输出说清两面契约;历史调用仍保留归属
-$ grovefs apikey --meta-dir $HOME_DIR revoke --id aac1f51a0d5641dd
-apikey: revoked id='aac1f51a0d5641dd' (label 'laptop-alice'); it can no longer authenticate, past calls keep attribution
+$ grovefs apikey --meta-dir $HOME_DIR revoke --id 18c4bb4091764ad6
+apikey: revoked id='18c4bb4091764ad6' (label 'laptop-alice'); it can no longer authenticate, past calls keep attribution
   a LIVE mount presenting this key is refused on its next op (within the 1s re-check window) and unmounts itself;
   a `grovefs mcp` session in flight keeps its identity until it reconnects.
 
 # 8) 封停活挂载:实测撤销后一次写的遭遇(无需运维介入)
 $ printf 'late' > /mnt/a/new.txt
-bash: /mnt/a/new.txt: 权限不够        # EACCES,来自服务端的拒因
-$ cat /mnt/a/grovefs-mount.log        # 挂载自己把原因打出来并卸载
-using remote metadata service at 10.0.0.5:50110
-using remote data service at 10.0.0.5:50100
+bash: /mnt/a/new.txt: 输入/输出错误        # EIO:后台复验 tick 先落地,daemon 正在自卸载
+$ cat /tmp/grovefs-mount--mnt-a.log        # 分离挂载的日志默认落 $TMPDIR,按挂载点命名(`--log-file` 可指定)
+using remote metadata service at 127.0.0.1:15310
+using remote data service at 127.0.0.1:15311
 grovefs: access refused by the server (authentication failed: this api key has been revoked) — unmounting this view
 received termination signal, unmounting cleanly...
-unmounted view 'alice' at /mnt/a
 $ ls /mnt/a                            # 干净的空目录——不是 "Transport endpoint is not connected"
+.  ..
+#   errno 取决于写与自卸载谁先到:那趟写正是复验的载体时拿到服务端的拒因、报 权限不够(EACCES),
+#   复验先落地则报 输入/输出错误(EIO);两者都不是假成功(套件钉的是 rc≠0)。
 #   同期另一个 key 的挂载照旧读写(逐调用方撤销,不像轮换一份共享 token 那样断全部人);
 #   拿被撤销的 key 重挂则 fail-closed:"authentication failed: this api key has been revoked"。
 
@@ -1186,7 +1241,7 @@ $ grovefs mcp --meta-dir $HOME_DIR --require-api-key      # 客户端 initialize
 defined derived view 'release' over base 'team': 1 hide, 0 only, 0 reloc rule(s)
 ```
 
-六个子命令:`create --label L [--for any|mcp|mount|admin] [--owner ACCOUNT] [--view V] [--ro]`(铸造并一次性打印 `<id>:<secret>`,短格式 49 字符;`--view`/`--ro` 只对 mount/any scope 有意义,`--owner` 对 admin 必填)、`list [--view V] [--label S] [--owner S] [--scope P]`(id/owner/label/scope/view/rw/created/last_used/revoked,无密文;带 `--view` 时只列能开该视图的 key,纯别名也匹配绑定到真实名的 key;`--label`/`--owner` 大小写不敏感子串,`--scope` 精确到一档入口)、`revoke --id ID`(支持精确 id 或唯一前缀)、`rotate --id ID`(精确 id 或唯一前缀;为活跃 key 的同一 id 重铸 secret 并一次性打印新 key,旧 secret 下一次握手失效,已建立会话到重连前不受影响,revoked id 拒旋——轮换替换凭据,revoke 封杀凭据)、`set-ro --id ID [--rw|--ro]`(原地翻转活跃 key 的只读标志:默认与 `--ro` 置只读、`--rw` 恢复读写;只动写权限不改存活/鉴权,经服务端建立的已建立挂载 ≤1s 热生效免重连——本机 `--home` 挂载无服务端凭据门,不受切换影响;revoked id 拒翻)、`calls --limit N`(默认 20,倒序回读审计)。无法自定义握手的 MCP 客户端,可由运维方导出 `GROVEFS_MCP_API_KEY='<id>:<secret>'` **预鉴权整个服务进程**(`grovefs mcp` 启动即以该 key 建立身份,客户端 initialize 无须再带);挂载侧对应的环境变量是 `GROVEFS_API_KEY`(不传 `--api-key` 时生效,让密钥不进命令行)。`data-server` 的 key 库路径由 `--meta-dir <元数据根>` 指定,**默认取本节点首个 `--data-dir`**——同机部署无需额外参数,数据盘与元数据根分开部署时必须指对(指到一个没铸造过 key 的目录时 fail-closed,一个也不放)。诚实边界:这把 key 认证的是**入口的调用方**——它让某个调用方能(或不能)发治理写命令、能(或不能)开某棵视图树,并把每次准入归咎到具体 key,但不改变治理语义本身;视图绑定/只读维度由服务端强制;活连接复证是 **op 驱动**的(有流量才查),故撤销的封停边界是“该挂载撤销后的首个服务端往返”——一次完全由内核缓存回答的读不需要往返,因此不会被打断(下一次往返即封);`--token` 与 `--require-api-key` 可同时存在,两者都得过。不开 `--require-api-key` 时,服务行为与不设门完全一致(只是照样落审计)。e2e 见 `apikey` 套件(41 条断言:铸造/列表/哈希不落盘/无 key 拒·错 secret 拒·对 key 放行/调用归属/撤销即失效且行保留/短 id 前缀撤销/env 预鉴权/`list --view` 过滤/默认不设门回归/`set-ro` 原地 ro↔rw 翻转·翻转后仍鉴权/短格式 16+32 hex/`rotate` 前缀轮换保 id·旧 secret 拒·新 secret 鉴·盘上仍只有摘要·revoked 拒旋/`list --label·--scope` 过滤)与 `mountkey` 套件(76 条断言:scope 铸造与 typo 拒绝/六类拒因入协议/准入与 env 回退(argv 不泄密)/连接审计到具体 key 与视图/scope 双向隔离/撤销封停活挂载且无脏 endpoint/其他 key 不受波及/token 与 key 双门 AND/数据面独立门/故障转移携带凭据/不设门默认路径无回归/视图绑定 key 跨视图拒挂与审计归属/只读 key 服务端强制写拒/`set-ro` 在同一活挂载 rw→ro 拒写·ro→rw 放行·免重连)。
+七个子命令:`create --label L [--for any|mcp|mount|admin] [--owner ACCOUNT] [--view V] [--ro] [--note TEXT] [--ttl DUR]`(铸造并一次性打印 `<id>:<secret>`,短格式 49 字符;`--view`/`--ro` 只对 mount/any scope 有意义,`--owner` 对 admin 必填;`--note` 是随行入库的备注,`--ttl` 由服务端换算成绝对的 `expires_at`(时长单位只认 `s`/`m`/`h`/`d`,拼错直接拒))、`list [--view V] [--label S] [--owner S] [--scope P] [--note S]`(列序 id/key/owner/label/scope/view/rw/created/last_used,最后一列合写 `expires / revoked / note`,过了期限的行标 `EXPIRED`——行仍列出、鉴权已被服务端拒;key 列显示的是入库的头4…尾4 指纹,既无明文也无密文;带 `--view` 时只列能开该视图的 key,纯别名也匹配绑定到真实名的 key,并附一句还有几把系统级 key 不受绑定限制;`--label`/`--owner`/`--note` 大小写不敏感子串,`--scope` 精确到一档入口)、`revoke --id ID`(支持精确 id 或唯一前缀)、`rotate --id ID`(精确 id 或唯一前缀;为活跃 key 的同一 id 重铸 secret 并一次性打印新 key,旧 secret 下一次握手失效,已建立会话到重连前不受影响,revoked id 拒旋——轮换替换凭据,revoke 封杀凭据;列表里的 key 指纹随之换成新 secret 的头尾)、`set-ro --id ID [--rw|--ro]`(原地翻转活跃 key 的只读标志:默认与 `--ro` 置只读、`--rw` 恢复读写;只动写权限不改存活/鉴权,经服务端建立的已建立挂载 ≤1s 热生效免重连——本机 `--home` 挂载无服务端凭据门,不受切换影响;revoked id 拒翻)、`update --id ID [--note TEXT] [--ttl DUR]`(只改备注与期限这两笔台账,身份/绑定/审计一概不碰:`--note ""` 清空备注、`--ttl never` 撤掉期限;两个 flag 都不给直接被拒,而不是空转一次;**它也是过期 key 的唯一恢复路径**——给一把 `EXPIRED` 的 key 一个新的 `--ttl`,同一把 key 就重新鉴上;revoked id 拒改,吊销是终态)、`calls --limit N`(默认 20,倒序回读审计)。无法自定义握手的 MCP 客户端,可由运维方导出 `GROVEFS_MCP_API_KEY='<id>:<secret>'` **预鉴权整个服务进程**(`grovefs mcp` 启动即以该 key 建立身份,客户端 initialize 无须再带);挂载侧对应的环境变量是 `GROVEFS_API_KEY`(不传 `--api-key` 时生效,让密钥不进命令行)。`data-server` 的 key 库路径由 `--meta-dir <元数据根>` 指定,**默认取本节点首个 `--data-dir`**——同机部署无需额外参数,数据盘与元数据根分开部署时必须指对(指到一个没铸造过 key 的目录时 fail-closed,一个也不放)。诚实边界:这把 key 认证的是**入口的调用方**——它让某个调用方能(或不能)发治理写命令、能(或不能)开某棵视图树,并把每次准入归咎到具体 key,但不改变治理语义本身;视图绑定/只读维度由服务端强制;活连接复证是 **op 驱动**的(有流量才查),故撤销的封停边界是“该挂载撤销后的首个服务端往返”——一次完全由内核缓存回答的读不需要往返,因此不会被打断(下一次往返即封);`--token` 与 `--require-api-key` 可同时存在,两者都得过。不开 `--require-api-key` 时,服务行为与不设门完全一致(只是照样落审计)。e2e 见 `apikey` 套件(56 条断言:铸造/列表/哈希不落盘/无 key 拒·错 secret 拒·对 key 放行/调用归属/撤销即失效且行保留/短 id 前缀撤销/env 预鉴权/`list --view` 过滤/默认不设门回归/`set-ro` 原地 ro↔rw 翻转·翻转后仍鉴权/短格式 16+32 hex/`rotate` 前缀轮换保 id·旧 secret 拒·新 secret 鉴·盘上仍只有摘要·revoked 拒旋/`list --label·--scope·--note` 过滤/`create --note·--ttl` 回显备注与服务端算出的期限·`list` 随行带出两者·key 列是入库的头尾指纹而明文不落盘·指纹本身入库(读取时不反推)·`update` 清空备注与 `--ttl never` 撤期限·两个 flag 都不给即拒·过期行标 `EXPIRED` 且任何门都拒·新 `--ttl` 让同一把 key 重新鉴上·`update` 拒 revoked id)与 `mountkey` 套件(76 条断言:scope 铸造与 typo 拒绝/六类拒因入协议/准入与 env 回退(argv 不泄密)/连接审计到具体 key 与视图/scope 双向隔离/撤销封停活挂载且无脏 endpoint/其他 key 不受波及/token 与 key 双门 AND/数据面独立门/故障转移携带凭据/不设门默认路径无回归/视图绑定 key 跨视图拒挂与审计归属/只读 key 服务端强制写拒/`set-ro` 在同一活挂载 rw→ro 拒写·ro→rw 放行·免重连)。
 
 ### 3.5.2 任意机器管同一份元数据:远程治理面(`--control-listen` / `--control-server`)
 
@@ -1276,7 +1331,7 @@ error: --control-server 10.0.0.5:50111 audits bytes on the DATA SERVERS, so --da
 | `view create`(含 `--manifest` 文本) / `define` / `alias` / `list` / `rm`(删定义、`--base` 删整棵树) | `mount` / `umount`(挂载点在本机) |
 | `view fork`(整树复制，含 `--empty`) / `graft`(挑选子集 + 改名/`--dest`) | `gc --data-dir R`(就地扫本机 `blocks/` 的 SQLite 专用形态) |
 | `view export` / `import`(分片上下行；本机只有 `--out` 与输入文件) | `du --meta-dir`(本机树文件) |
-| `apikey create` / `list` / `rotate` / `revoke` / `set-ro` / `calls` | |
+| `apikey create` / `list` / `rotate` / `revoke` / `set-ro` / `calls` / `update` | |
 | `refs rebuild` | |
 | `gc --data-servers … [--apply]`(服务端读自己的树，字节向 data-server 枚举) | |
 
@@ -1299,7 +1354,7 @@ e2e 见 `ctlplane` 套件(启动横幅/首个 admin key 必须在主机铸造/�
 
 §3.5.2 让任意一台机器都能治理同一份元数据,但入口仍是终端:动词要记、key 要带、拒因要读。高频的三件事——看视图、发密钥、给同事划一块地方——在浏览器里点更省事;而"这个账号管这一块,包括它派生出的 fork、别名和这块地方的密钥"这种**归属**,一把共享的 admin key 说不清,终端里也没有对应的形状。
 
-管理台补的就是这块,而它**不新增一套治理逻辑**。`grovefs web` 是 `meta-server --control-listen` 前面的一个 HTTP 网关:内嵌单页应用(概览/视图/密钥/账号与授权/审计五页,构建期 `include_str!` 进二进制——没有 CDN、没有 node_modules、离线主机也打得开),把浏览器会话变成一个**账号**,把每次点击转成一个治理 op 转发过去。"谁能碰哪棵树"的判定仍然只在服务端 `gates()`/`authorize()` 一处;网关只做**减法**,它不路由的动词(`gc.scan`/`gc.apply`/`refs.rebuild`/`view.rm_base`/`fork.graft`)在浏览器里永远到不了,哪怕服务端本来会允许。账号、授权、口令摘要都存在**服务端**(SQLite 档 `<meta-dir>/meta/web_accounts.db`,PG 档是控制库里的表;PBKDF2-HMAC-SHA256 21 万轮),登录校验由持有存储的进程做——网关拿不到密码库,这正是它敢只做翻译层的原因。
+管理台补的就是这块,而它**不新增一套治理逻辑**。`grovefs web` 是 `meta-server --control-listen` 前面的一个 HTTP 网关:内嵌单页应用(总览/视图/密钥/账号与授权/审计五页,构建期 `include_str!` 进二进制——没有 CDN、没有 node_modules、离线主机也打得开),把浏览器会话变成一个**账号**,把每次点击转成一个治理 op 转发过去。"谁能碰哪棵树"的判定仍然只在服务端 `gates()`/`authorize()` 一处;网关只做**减法**,它不路由的动词(`gc.scan`/`gc.apply`/`refs.rebuild`/`view.rm_base`/`fork.graft`)在浏览器里永远到不了,哪怕服务端本来会允许。账号、授权、口令摘要都存在**服务端**(SQLite 档 `<meta-dir>/meta/web_accounts.db`,PG 档是控制库里的表;PBKDF2-HMAC-SHA256 21 万轮),登录校验由持有存储的进程做——网关拿不到密码库,这正是它敢只做翻译层的原因。
 
 **安装期:第一个管理员只能由持有存储的进程放。** 治理入口若能自己铸管理员,这道门就白设了,所以 bootstrap 挂在 `meta-server` 上而不是 `web` 上:两面 flag 只在账号表**为空**时生效,unit 文件反复读同一个 flag 的重启是幂等的,而换一个 `--admin-user` 会拒绝启动而不是悄悄多塞一个管理员。口令只有 `--admin-password-file`,没有 `--admin-password`——argv 对本机所有进程可见,还会落进 shell history。
 
@@ -1391,11 +1446,13 @@ error: refusing to bind 0.0.0.0:15690 — this console speaks plain HTTP, so a r
 
 | 页 | admin | user(被授了 `main`) |
 | --- | --- | --- |
-| 概览 | 后端、角色、视图/定义/在线密钥/在线会话总数 | 只见自己的 actor/role/bases,部署级数字一律不给 |
-| 视图 | 全部视图 | `physical.list`/`def.list` 只回自己那棵及它的派生;可建 lens/alias、建/删 fork、看 `view.stats` |
-| 密钥 | 全部 key,可铸任意 scope | 只见自己的与该视图的;可铸 `--for mount`/`--for mcp` 且**必须绑视图**,可 set-ro、可轮换 secret(rotate,id 与绑定不动)、可撤销自己的 |
-| 账号与授权 | 建号、改口令、升降角色、停用/删除、加/撤基视图授权 | 表单直接不渲染(它任何时刻都建不了号),页面改成"你的账号 + 改自己的口令" |
-| 审计 | 最近调用逐行(`ts/tool/ok/detail`,detail 带 `account=<人>@<ip>`) | 只看得到自己那些行 |
+| 总览 | 八个部署数(后端、当前身份、基视图、定义、账号、在线密钥、挂载会话、打开的树)按**每行 4 个、共两行**网格排列,过期密钥非零时该卡转琥珀色;下方「本部署」事实表给出后端+describe 行、元数据根、服务端角色、命名空间(基视图/定义拆开)、凭据(live/expired 拆开)、账号数、活动量 | 只见自己的 actor/role/bases 与自己治理的基视图数,部署级数字一律不给 |
+| 视图 | 全部视图 | `physical.list`/`def.list` 只回自己那棵及它的派生;可建 lens/alias、建/删 fork、看 `view.stats`;选中一棵基视图时,右侧除现有信息外还给出**谱系面板**——它的别名/透镜/fork 与逐层向下的子名字 |
+| 密钥 | 全部 key,可铸任意 scope。列含 **key 指纹(头4…尾4)/owner/备注/有效期/铸造者**,可按状态片(all/live/expiring/expired/revoked)、scope、视图与关键字四个维度过滤;每行可开**详情抽屉**,把每个动作的后果写明(轮换只换 secret、吊销是终态、改备注与期限走 `apikey.update`);备注与期限就地可改 | 只见自己的与该视图的;可铸 `--for mount`/`--for mcp` 且**必须绑视图**,可 set-ro、可轮换 secret(rotate,id 与绑定不动)、可改自己 key 的备注与期限、可撤销自己的 |
+| 账号与授权 | 建号、改口令、升降角色、停用/删除、加/撤基视图授权;顶部搜索框 + 角色/状态过滤,每行带"N 把 key · M 把 live"计数片(点它跳到密钥页并按该账号过滤) | 表单直接不渲染(它任何时刻都建不了号),页面改成"你的账号 + 改自己的口令" |
+| 审计 | 最近调用逐行(`ts/tool/ok/detail`,detail 带 `account=<人>@<ip>`),可按**时间窗、平面、事件类型、成败、关键字**五个维度检索 | 只看得到自己那些行 |
+
+五页共用**一套设计系统**(同一字号阶梯与间距令牌、卡片化的面板与表格、抽屉与可折叠详情行),而不各写各的样式;表格由一份列描述生成(`tableNode(cols, rows, …)`),后续要显示更多字段只需加一列描述,不动渲染器;界面文案全部过词典,中/英一键切换。密钥页把「列表直接显示 key」落实为**显示入库的指纹**:明文只在铸造/轮换的回包里出现一次,需要重新拿到明文的手段是 `rotate`(同一 id 重铸),这条取舍在页面上写给用户看,而不是让他自己猜。
 
 `bob` 在自己那棵上干活的真实回显(定义 lens、fork 基视图、给自己的视图铸密钥):
 
@@ -1440,7 +1497,7 @@ bob no longer governs 'main'.
 语义与边界:
 
 - **授权的是基视图,不是叶子**:`grant add --base` 若给的是一个 lens/alias/fork 名,服务端会沿 `resolve_base`(≤ 4 跳)归到它的基视图并**明说**;此后该基树下新长出的 fork、改名、加 lens 都自动在授权范围内,不必逐名追加——这正是"给一块地方"和"给一个名字"的区别。
-- **网关只删能力,不增能力**:它手里那把 admin key 的权力大于任何登录账号,因此页面能点到的动词白名单是**写死的 29 个**(未列出的 op 回 `… is not available from the console`),破坏性/跨租户的五个治理动词与 `login` 根本不过路由;`/api/call` 是精确匹配,`apikey.list/../gc.apply` 这种前缀戏法满不了它。这两份清单(网关的 29 个白名单、服务端的 ACL 表)养在两个文件里,所以有一条单测 `every_routed_op_has_an_access_rule` 逐个核对白名单在服务端有规则,另一条 `destructive_ops_are_not_routable` 钉住那几个故意不路由的动词——漂移在 `cargo test --lib` 就被抓住,而不是等到有人点按钮。
+- **网关只删能力,不增能力**:它手里那把 admin key 的权力大于任何登录账号,因此页面能点到的动词白名单是**写死的 30 个**(未列出的 op 回 `… is not available from the console`),破坏性/跨租户的五个治理动词与 `login` 根本不过路由;`/api/call` 是精确匹配,`apikey.list/../gc.apply` 这种前缀戏法满不了它。这两份清单(网关的 30 个白名单、服务端的 ACL 表)养在两个文件里,所以有一条单测 `every_routed_op_has_an_access_rule` 逐个核对白名单在服务端有规则,另一条 `destructive_ops_are_not_routable` 钉住那几个故意不路由的动词——漂移在 `cargo test --lib` 就被抓住,而不是等到有人点按钮。
 - **身份来自服务端,不来自 cookie**:cookie 只表明"这个浏览器已登录",每个请求仍以对应账号重新鉴权;所以撤销授权、`account disable` 都生效于**下一次调用**,而 `account passwd` 不会踢掉已开的会话(那是网关的会话表;要立刻停人是 `disable`)。
 - **防枚举与限速**:"无此账号"与"口令错"回一模一样的文案、一样的状态码,并做了耗时补齐;同一客户端 IP 在 15 分钟内错满 5 次就开始 429(基础 30s,每多错一次翻倍),**即使那次口令是对的**——429 体里带 `retryAfter`。
 - **控制存储不是视图**:`meta/` 目录下视图树与 `refs.db`、`api_keys.db`、`web_accounts.db` 并存,哪些不是视图树只有**一份**判据(`meta::is_view_db`),否则一个管理台账号库就会出现在 `view list` 里变成可挂载的假视图,并把 `refs rebuild`/`gc`/`fork drop` 一路带倒。
@@ -1449,7 +1506,7 @@ bob no longer governs 'main'.
 - **最后一把锁不会被打掉**:降级或删除**唯一在职的 admin** 会被拒(`'rootops' is the only enabled administrator — create a second admin and verify you can sign in as it before demoting this one`);建第二个 admin 并验证登录之后才能动第一个。
 - **feature 开关**:`web` 是 `native` 之上的默认 feature,`cargo build --no-default-features --features remote-only` 的纯客户端二进制不含网关与页面(因此也不带 tiny_http 依赖)。
 
-e2e 见 `web` 套件(152 条:安装期 bootstrap 四种 flag 组合与"被拒的启动不开端口"/网关启动前五类拒绝/安全头与匿名不可达/两条错登录回复逐字节相同(防枚举)/CSRF·Origin·白名单逐动词/headless 建号与授权(含 `--password-stdin`、口令策略、`view list` 不含三个控制库、`refs rebuild` 必须成功)/`bob` 的正向能力与越权拒因逐条/经页面路由 `apikey.rotate` 轮换自己 key 的 secret(id 不变、新明文只出现在回包里、库中两个明文都搜不到)与别人的 key 拒旋/撤权与 disable 的下一次调用即失效/审计归属 `account=bob@ip` 且不串看别人的行/export→import 三态/最后一把 admin 三态保护与第二 admin 解锁/第 6 次登录 429 与 `retryAfter`/重启 bootstrap 幂等与换名拒绝);账号与授权的服务端存储两档(含 PG)由 `cargo test --lib` 的 `webauth`/`meta` 单测覆盖。
+e2e 见 `web` 套件(173 条:安装期 bootstrap 四种 flag 组合与"被拒的启动不开端口"/网关启动前五类拒绝/安全头与匿名不可达/两条错登录回复逐字节相同(防枚举)/CSRF·Origin·白名单逐动词/headless 建号与授权(含 `--password-stdin`、口令策略、`view list` 不含三个控制库、`refs rebuild` 必须成功)/`bob` 的正向能力与越权拒因逐条/经页面路由 `apikey.rotate` 轮换自己 key 的 secret(id 不变、新明文只出现在回包里、库中两个明文都搜不到)与别人的 key 拒旋/路由白名单**计数断言**(页面恰好路由 30 个治理 op、`apikey.update` 在内——服务端 ACL 新增了 op而控制台漏接会在这里红,而不是变成浏览器里一个坏按钮)/密钥页的台账:备注与**服务端算出的**期限随回包给出、铸造者入库,列表只给头尾指纹且服务端存的指纹等于创建时那次明文打印的头4尾4(任何列表都不含明文)/过期由服务端判定并随行返回、新的 ttl 是恢复路径、拼错的 ttl 被拒、跨账号改台账被拒、`update` 拒绝 revoked 行/撤权与 disable 的下一次调用即失效/审计归属 `account=bob@ip` 且不串看别人的行/export→import 三态/最后一把 admin 三态保护与第二 admin 解锁/第 6 次登录 429 与 `retryAfter`/重启 bootstrap 幂等与换名拒绝);账号与授权的服务端存储两档(含 PG)由 `cargo test --lib` 的 `webauth`/`meta` 单测覆盖。
 
 ## 4. 生产拓扑:中心存储 + 多客户机 LAN 挂载
 
@@ -3649,7 +3706,7 @@ grovefs gc --control-server 192.168.1.10:50112 --api-key <id:secret> --data-serv
 | 卸载 | `grovefs umount -m MP` |
 | 数据服务 | `grovefs data-server --listen IP:PORT --data-dir DIR [--token T] [--require-api-key [--meta-dir D]]` |
 | 任意机器治理同一份元数据(用账号密钥代替数据库密码) | `grovefs view --control-server H --api-key K create\|define\|alias\|list\|rm`(`--meta-store` 换成 `--control-server` 同上) |
-| 账号密钥(治理口) | `grovefs --home H apikey create --label L --for admin --owner ACCT`(首把在持盘主机铸造) / `apikey --control-server H --api-key K list\|create\|revoke\|rotate\|set-ro\|calls` |
+| 账号密钥(治理口) | `grovefs --home H apikey create --label L --for admin --owner ACCT`(首把在持盘主机铸造) / `apikey --control-server H --api-key K list\|create\|revoke\|rotate\|set-ro\|calls\|update` |
 | 开远程治理口 | `grovefs meta-server --meta-dir D --listen IP:PORT --control-listen IP:PORT`(第二个端口只跑治理动词、只认 admin key、逐调用审计) |
 | 网页管理台(账号 + 基视图授权) | 安装期播种:`grovefs meta-server … --control-listen H:P --admin-user A --admin-password-file F`(仅账号表为空时生效) ;起服务:`grovefs web --control-server H:P --api-key-file K [--listen 127.0.0.1:8787]` ;headless 管理:`web account create\|list\|passwd\|role\|disable\|enable\|rm` 与 `web grant add\|rm\|list`(口令只走 `--password-file`/`--password-stdin`,§3.5.3) |
 | 元数据服务（PostgreSQL 后端） | `grovefs meta-server --meta-store postgres://user:pw@host:5432/db --listen IP:PORT`（PG 下 `--meta-dir` 可省，服务端本地不落权威数据） |

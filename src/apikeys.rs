@@ -188,6 +188,22 @@ pub struct KeyInfo {
     pub created_at: String,
     pub last_used_at: Option<String>,
     pub revoked_at: Option<String>,
+    /// Free-text remark the operator attaches to a key (`apikey update
+    /// --note`) — the field that makes a 200-row registry greppable.
+    pub note: Option<String>,
+    /// RFC 3339 deadline, `None` = never expires.
+    pub expires_at: Option<String>,
+    /// The SERVER's verdict on `expires_at` (the same comparison the auth path
+    /// makes), so no client re-implements it and `list` cannot disagree with
+    /// what actually authenticates.
+    pub expired: bool,
+    /// Account that MINTED the key — deliberately distinct from `owner`, who
+    /// the key belongs to. An admin minting for a colleague is the common case.
+    pub created_by: Option<String>,
+    /// Masked fingerprint of the secret (`a1b2…c3d4`): enough to recognise one
+    /// credential in a list, far too little to be a credential. See
+    /// [`secret_hint`] for what is actually revealed.
+    pub secret_hint: Option<String>,
 }
 
 /// One recorded MCP tool invocation.
@@ -227,6 +243,74 @@ fn gen_secret() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }
 
+/// The masked fingerprint stored beside the digest: FOUR hex chars from the
+/// front of the secret and four from the back, joined by an ellipsis
+/// (`a1b2…c3d4`). This is what the console's key list displays, so an operator
+/// can recognise a credential without the store holding anything reversible.
+/// What it gives away is 32 of the secret's 122 random bits — an attacker who
+/// already stole the database still faces 2^90 work per key, which is the same
+/// answer as facing 2^122: none. Revealing a CONTIGUOUS run would be worse
+/// (a prefix is what typo-brute-forcing and grep-adjacency exploit), hence the
+/// two short halves.
+fn secret_hint(secret: &str) -> String {
+    let chars: Vec<char> = secret.chars().collect();
+    if chars.len() < 12 {
+        return String::new();
+    }
+    let head: String = chars[..4].iter().collect();
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("{head}\u{2026}{tail}")
+}
+
+/// How long a remark may be. A registry field, not a document: past this the
+/// column stops being scannable and starts being a place to hide payloads, so
+/// the store refuses it at the door instead of truncating silently.
+pub const NOTE_MAX: usize = 500;
+
+fn check_note(note: Option<&str>) -> Result<(), String> {
+    match note {
+        Some(t) if t.chars().count() > NOTE_MAX => Err(format!(
+            "that note is {} characters — the limit is {NOTE_MAX}, which is already more than a remark needs",
+            t.chars().count()
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Turn a TTL spelling (`30m`, `24h`, `7d`, `365d`, `never`, or empty) into the
+/// instant it expires at, written in the store's own clock as the same RFC 3339
+/// shape [`now_iso`] stamps everywhere else — an operator reading a row sees
+/// local wall time, while [`expiry_passed`] compares the parsed instants, so the
+/// display format costs nothing in correctness. `None` means "never expires"
+/// and is stored as NULL.
+pub fn expires_from_ttl(ttl: &str) -> Result<Option<String>, String> {
+    let t = ttl.trim().to_lowercase();
+    if t.is_empty() || t == "never" || t == "none" || t == "0" {
+        return Ok(None);
+    }
+    let (digits, unit) = t.split_at(t.len() - 1);
+    let n: i64 = digits
+        .parse()
+        .map_err(|_| format!("bad ttl '{ttl}': expected a count and a unit, like 45m, 24h or 7d"))?;
+    if n <= 0 {
+        return Err(format!("bad ttl '{ttl}': the count must be positive (or `never`)"));
+    }
+    let secs = match unit {
+        "s" => n,
+        "m" => n * 60,
+        "h" => n * 3600,
+        "d" => n * 86400,
+        other => {
+            return Err(format!(
+                "bad ttl '{ttl}': unit '{other}' is unknown — use s(econds), m(inutes), h(ours) or d(ays), or `never`"
+            ))
+        }
+    };
+    let when = chrono::Local::now()
+        + chrono::Duration::try_seconds(secs).ok_or_else(|| format!("ttl '{ttl}' overflows"))?;
+    Ok(Some(when.to_rfc3339()))
+}
+
 /// One row reader shared by both backends' map closures (column access lives
 /// in the per-backend `query`, this normalizes the error plumbing).
 fn cell<T>(row: &rusqlite::Row, i: usize) -> Result<Option<T>, rusqlite::Error>
@@ -255,7 +339,11 @@ const KEYS_DDL_SQLITE: &str = "CREATE TABLE IF NOT EXISTS api_keys (
                  scope       TEXT NOT NULL DEFAULT 'any',
                  view        TEXT,
                  ro          INTEGER NOT NULL DEFAULT 0,
-                 owner       TEXT
+                 owner       TEXT,
+                 note        TEXT,
+                 expires_at  TEXT,
+                 created_by  TEXT,
+                 secret_hint TEXT
              );";
 const CALLS_DDL_SQLITE: &str = "CREATE TABLE IF NOT EXISTS mcp_calls (
                  ts        TEXT NOT NULL,
@@ -278,15 +366,45 @@ const KEYS_DDL_PG: &str = "CREATE TABLE IF NOT EXISTS grovefs_control.api_keys (
     scope        TEXT NOT NULL DEFAULT 'any',
     view_name    TEXT,
     ro           BOOLEAN NOT NULL DEFAULT false,
-    owner        TEXT
+    owner        TEXT,
+    note         TEXT,
+    expires_at   TEXT,
+    created_by   TEXT,
+    secret_hint  TEXT
 )";
-/// Idempotent column addition for stores minted before accounts existed. NOT a
-/// table upgrade (nothing is rewritten, no row is touched): it only makes the
-/// `owner` column visible so the single SELECT/INSERT spelling above works
-/// against an old file/schema.
-const OWNER_MIGRATE_SQLITE: &str = "ALTER TABLE api_keys ADD COLUMN owner TEXT";
-const OWNER_MIGRATE_PG: &str =
-    "ALTER TABLE grovefs_control.api_keys ADD COLUMN IF NOT EXISTS owner TEXT";
+/// Column additions for stores minted before those columns existed. NOT a table
+/// upgrade (nothing is rewritten, no row is touched): they only make the extra
+/// columns visible, so the single SELECT/INSERT spelling works against an old
+/// file or schema. `(column, SQLite ALTER, PG ALTER)` in application order; the
+/// SQLite arm needs the `table_info` probe because SQLite has no
+/// `ADD COLUMN IF NOT EXISTS`, while PG's is idempotent on its own.
+const KEY_MIGRATIONS: &[(&str, &str, &str)] = &[
+    (
+        "owner",
+        "ALTER TABLE api_keys ADD COLUMN owner TEXT",
+        "ALTER TABLE grovefs_control.api_keys ADD COLUMN IF NOT EXISTS owner TEXT",
+    ),
+    (
+        "note",
+        "ALTER TABLE api_keys ADD COLUMN note TEXT",
+        "ALTER TABLE grovefs_control.api_keys ADD COLUMN IF NOT EXISTS note TEXT",
+    ),
+    (
+        "expires_at",
+        "ALTER TABLE api_keys ADD COLUMN expires_at TEXT",
+        "ALTER TABLE grovefs_control.api_keys ADD COLUMN IF NOT EXISTS expires_at TEXT",
+    ),
+    (
+        "created_by",
+        "ALTER TABLE api_keys ADD COLUMN created_by TEXT",
+        "ALTER TABLE grovefs_control.api_keys ADD COLUMN IF NOT EXISTS created_by TEXT",
+    ),
+    (
+        "secret_hint",
+        "ALTER TABLE api_keys ADD COLUMN secret_hint TEXT",
+        "ALTER TABLE grovefs_control.api_keys ADD COLUMN IF NOT EXISTS secret_hint TEXT",
+    ),
+];
 const CALLS_DDL_PG: &str = "CREATE TABLE IF NOT EXISTS grovefs_control.mcp_calls (
     seq       BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     ts        TEXT NOT NULL,
@@ -316,6 +434,31 @@ struct StoredKey {
     view: Option<String>,
     ro: bool,
     owner: Option<String>,
+    expires_at: Option<String>,
+}
+
+/// Milliseconds since the epoch, for the deadline comparison. Instant-based on
+/// purpose: `expires_at` is written as a LOCAL RFC 3339 string (so an operator
+/// reading the row sees their own wall clock), and comparing those strings
+/// lexically would be wrong for two rows minted on either side of a DST shift.
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+/// Has this row's deadline passed on the store's clock? One place decides it,
+/// so the handshake ([`ApiKeyStore::authenticate_for`]), the live-session
+/// re-check ([`ApiKeyStore::live_state`]) and what `list` reports cannot
+/// disagree about which keys still work. A NULL `expires_at` never expires; a
+/// deadline that will NOT parse counts as EXPIRED, since failing open would make
+/// a corrupted `expires_at` a way to hand a credential immortality.
+fn expiry_passed(expires_at: Option<&str>, now_ms: i64) -> bool {
+    let Some(raw) = expires_at else {
+        return false;
+    };
+    match chrono::DateTime::parse_from_rfc3339(raw) {
+        Ok(when) => when.timestamp_millis() <= now_ms,
+        Err(_) => true,
+    }
 }
 
 /// One row reader for both backends: fetch column `i` as `Option<String>`.
@@ -339,21 +482,24 @@ impl ApiKeyStore {
              {CALLS_DDL_SQLITE}"
         ))
         .map_err(|e| e.to_string())?;
-        // Pre-account stores (`meta/api_keys.db` from an older build) lack the
-        // `owner` column. Add it in place; the only other in-place change this
-        // module ever made is nothing — everything else is part of the DDL.
-        let has_owner = conn
+        // A store from before the bookkeeping columns (`owner`, `note`,
+        // `expires_at`, `created_by`, `secret_hint`) lacks them; add each in
+        // place, once. Fresh stores get them from the DDL above, so this loop
+        // is a no-op there.
+        let mut names = conn
             .prepare("PRAGMA table_info(api_keys)")
             .and_then(|mut s| {
                 let names = s
                     .query_map([], |r| r.get::<_, String>(1))?
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(names.iter().any(|n| n == "owner"))
+                Ok(names)
             })
             .map_err(|e| e.to_string())?;
-        if !has_owner {
-            conn.execute(OWNER_MIGRATE_SQLITE, [])
-                .map_err(|e| e.to_string())?;
+        for (column, sqlite, _) in KEY_MIGRATIONS {
+            if !names.iter().any(|n| n == column) {
+                conn.execute(sqlite, []).map_err(|e| e.to_string())?;
+                names.push((*column).to_string());
+            }
         }
         Ok(Self {
             backend: Backend::Sqlite(parking_lot::Mutex::new(conn)),
@@ -367,7 +513,11 @@ impl ApiKeyStore {
     /// same URI authenticates against the same rows, and a revoke reaches all
     /// of them within the re-check window.
     pub fn open_pg(uri: &str) -> Result<Self, String> {
-        let pool = PgPool::open(uri, &[KEYS_DDL_PG, OWNER_MIGRATE_PG, CALLS_DDL_PG])?;
+        // PG's ALTERs are idempotent, so the DDL and the migrations go in one
+        // ordered batch (see [`PgPool::open`]).
+        let mut ddl: Vec<&str> = vec![KEYS_DDL_PG, CALLS_DDL_PG];
+        ddl.extend(KEY_MIGRATIONS.iter().map(|(_, _, pg)| *pg));
+        let pool = PgPool::open(uri, &ddl)?;
         Ok(Self {
             backend: Backend::Pg(pool),
         })
@@ -396,7 +546,7 @@ impl ApiKeyStore {
     /// [`Self::live_state`], so they cannot drift per backend.
     fn fetch_key(&self, id: &str) -> Result<Option<StoredKey>, String> {
         let mut rows = self.query2(
-            "SELECT label, secret_hash, scope, revoked_at, view, ro, owner FROM api_keys WHERE id = ?1",
+            "SELECT label, secret_hash, scope, revoked_at, view, ro, owner, expires_at FROM api_keys WHERE id = ?1",
             params![id],
             |r| {
                 Ok((
@@ -407,9 +557,10 @@ impl ApiKeyStore {
                     cell::<String>(r, 4)?,
                     r.get::<_, i64>(5)?,
                     cell::<String>(r, 6)?,
+                    cell::<String>(r, 7)?,
                 ))
             },
-            "SELECT label, secret_hash, scope, revoked_at, view_name, ro, owner FROM grovefs_control.api_keys WHERE id = $1",
+            "SELECT label, secret_hash, scope, revoked_at, view_name, ro, owner, expires_at FROM grovefs_control.api_keys WHERE id = $1",
             &[&id],
             |r| {
                 (
@@ -420,11 +571,12 @@ impl ApiKeyStore {
                     cell_str(r, 4),
                     r.get::<_, bool>(5) as i64,
                     cell_str(r, 6),
+                    cell_str(r, 7),
                 )
             },
         )?;
         Ok(rows.pop().map(
-            |(label, secret_hash, scope, revoked_at, view, ro, owner)| StoredKey {
+            |(label, secret_hash, scope, revoked_at, view, ro, owner, expires_at)| StoredKey {
                 label,
                 secret_hash,
                 scope,
@@ -432,6 +584,7 @@ impl ApiKeyStore {
                 view,
                 ro: ro != 0,
                 owner,
+                expires_at,
             },
         ))
     }
@@ -520,7 +673,8 @@ impl ApiKeyStore {
     /// hold several keys). Returns `(id, full_plaintext_key)`; the plaintext
     /// (`"<id>:<secret>"`) is produced here and NEVER stored — only its SHA-256
     /// goes to disk. The caller must show it once and tell the operator to save
-    /// it.
+    /// it. Keys minted without the bookkeeping fields have no note, no deadline
+    /// and no recorded minter — see [`Self::create_extended`] for those.
     pub fn create_bound(
         &self,
         label: &str,
@@ -529,20 +683,57 @@ impl ApiKeyStore {
         ro: bool,
         owner: Option<&str>,
     ) -> Result<(String, String), String> {
+        // One minting path only: the extra fields are simply absent, which is
+        // exactly how a key minted before `--ttl`/`--note` existed looked.
+        self.create_extended(label, scope, view, ro, owner, None, None, None)
+    }
+
+    /// Mint a new key with the full bookkeeping set (see [`Self::create_bound`]
+    /// for the identity fields, plus): `note` (free-text remark), `expires_at`
+    /// (an [`expires_from_ttl`] instant, `None` = never) and `created_by` — the
+    /// ACCOUNT that minted it, which is NOT the same as `owner` (an admin
+    /// minting for a colleague). The plaintext secret still never reaches the
+    /// store: only its digest and the masked [`secret_hint`] do.
+    pub fn create_extended(
+        &self,
+        label: &str,
+        scope: Scope,
+        view: Option<&str>,
+        ro: bool,
+        owner: Option<&str>,
+        note: Option<&str>,
+        expires_at: Option<&str>,
+        created_by: Option<&str>,
+    ) -> Result<(String, String), String> {
+        check_note(note)?;
         // The id is a lookup index, not a secret (auth rests on the digest
         // comparison), so 64 random bits — with the PRIMARY KEY as the
         // collision net — keeps it unguessable and short enough to paste.
         let id = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
         let secret = gen_secret();
         let hash = sha256_hex(&secret);
+        let hint = secret_hint(&secret);
         let full_key = format!("{id}:{secret}");
         let ts = now_iso();
         let sc = scope.as_str();
         self.exec2(
-            "INSERT INTO api_keys (id, label, secret_hash, created_at, scope, view, ro, owner) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![id, label, hash, ts, sc, view, ro as i64, owner],
-            "INSERT INTO grovefs_control.api_keys (id, label, secret_hash, created_at, scope, view_name, ro, owner) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-            &[&id, &label, &hash, &ts, &sc, &view, &ro, &owner],
+            "INSERT INTO api_keys (id, label, secret_hash, created_at, scope, view, ro, owner, note, expires_at, created_by, secret_hint) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![id, label, hash, ts, sc, view, ro as i64, owner, note, expires_at, created_by, hint],
+            "INSERT INTO grovefs_control.api_keys (id, label, secret_hash, created_at, scope, view_name, ro, owner, note, expires_at, created_by, secret_hint) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+            &[
+                &id,
+                &label,
+                &hash,
+                &ts,
+                &sc,
+                &view,
+                &ro,
+                &owner,
+                &note,
+                &expires_at,
+                &created_by,
+                &hint,
+            ],
         )?;
         Ok((id, full_key))
     }
@@ -587,6 +778,15 @@ impl ApiKeyStore {
             .ok_or_else(|| "authentication failed: unknown api key id".to_string())?;
         if k.revoked_at.is_some() {
             return Err("authentication failed: this api key has been revoked".to_string());
+        }
+        // Checked before the digest, exactly like `revoked_at`: the deadline is
+        // a property of the row the caller already proved to own, and naming it
+        // is the difference between "rotate your credential" and a mystery.
+        if expiry_passed(k.expires_at.as_deref(), now_ms()) {
+            return Err(format!(
+                "authentication failed: this api key expired at {} (extend it with `grovefs apikey update --id {id} --ttl <dur>`, or mint a fresh one)",
+                k.expires_at.as_deref().unwrap_or("?")
+            ));
         }
         if sha256_hex(secret) != k.secret_hash {
             return Err("authentication failed: invalid api key secret".to_string());
@@ -634,17 +834,64 @@ impl ApiKeyStore {
     /// never probed (an idle socket grants no access by itself). Reads answered
     /// purely from a client's kernel cache likewise land before the next
     /// round-trip — the bound is "first server round-trip after the window",
-    /// not wall-clock. Unknown id, revoked row or a scope that no longer fits
-    /// the entrance all report `None`.
+    /// not wall-clock. Unknown id, revoked row, a row whose deadline has passed
+    /// or a scope that no longer fits the entrance all report `None` — so an
+    /// `--ttl` cuts a live mount off on this same path, not only at the next
+    /// handshake.
     pub fn live_state(&self, id: &str, want: Scope) -> Option<LiveState> {
         let k = self.fetch_key(id).ok()??;
-        if k.revoked_at.is_some() || !Scope::parse(&k.scope).unwrap_or(Scope::Any).admits(want) {
+        if k.revoked_at.is_some()
+            || expiry_passed(k.expires_at.as_deref(), now_ms())
+            || !Scope::parse(&k.scope).unwrap_or(Scope::Any).admits(want)
+        {
             return None;
         }
         Some(LiveState {
             live: true,
             ro: k.ro,
         })
+    }
+
+    /// Why an id that WAS accepted at handshake is now refused by the
+    /// re-check tick, in the same words [`Self::authenticate_for`] uses for a
+    /// fresh attempt. The two mount servers used to answer every mid-session
+    /// cut with "has been revoked", which sent operators off to re-mint a
+    /// credential that only needed `apikey update --ttl` — an expired row and a
+    /// revoked row are different repairs, and the sentence a live mount prints
+    /// on stderr is often the only one they see.
+    ///
+    /// Reads the row a second time, right after [`Self::live_state`] said
+    /// `None`: one extra primary-key lookup on a path that only runs when a
+    /// session is already being closed, never on the per-op hot path. The two
+    /// reads are not one transaction, so a `--ttl` pushed forward between them
+    /// can make the row look live again; that case says so plainly instead of
+    /// claiming a cause that no longer holds.
+    pub fn dead_reason(&self, id: &str, want: Scope) -> String {
+        let k = match self.fetch_key(id) {
+            Ok(Some(k)) => k,
+            // Revoked rows are never deleted, so an absent id means the store
+            // itself changed under the session (a fresh file, a wiped table).
+            _ => return "authentication failed: unknown api key id".to_string(),
+        };
+        if k.revoked_at.is_some() {
+            return "authentication failed: this api key has been revoked".to_string();
+        }
+        if expiry_passed(k.expires_at.as_deref(), now_ms()) {
+            return format!(
+                "authentication failed: this api key expired at {} (extend it with `grovefs apikey update --id {id} --ttl <dur>`, or mint a fresh one)",
+                k.expires_at.as_deref().unwrap_or("?")
+            );
+        }
+        let scope = Scope::parse(&k.scope).unwrap_or(Scope::Any);
+        if !scope.admits(want) {
+            return format!(
+                "authentication failed: this api key is scoped to '{}', not '{}'",
+                scope.as_str(),
+                want.as_str()
+            );
+        }
+        "authentication failed: this api key was refused by the live-credential re-check"
+            .to_string()
     }
 
     /// Flip the read-only flag of an ACTIVE key in place (`apikey set-ro`).
@@ -673,10 +920,12 @@ impl ApiKeyStore {
         Ok(n > 0)
     }
 
-    /// Every key, newest first (secrets never leave the store).
+    /// Every key, newest first. No secret material is in the row set: what
+    /// `list` can show about a secret is the masked [`secret_hint`] fingerprint.
     pub fn list(&self) -> Result<Vec<KeyInfo>, String> {
         let rows = self.query2(
-            "SELECT id, label, scope, view, ro, created_at, last_used_at, revoked_at, owner
+            "SELECT id, label, scope, view, ro, created_at, last_used_at, revoked_at, owner,
+                    note, expires_at, created_by, secret_hint
              FROM api_keys ORDER BY created_at DESC",
             &[],
             |r| {
@@ -690,9 +939,15 @@ impl ApiKeyStore {
                     created_at: r.get(5)?,
                     last_used_at: cell(r, 6)?,
                     revoked_at: cell(r, 7)?,
+                    note: cell(r, 9)?,
+                    expires_at: cell(r, 10)?,
+                    created_by: cell(r, 11)?,
+                    secret_hint: cell(r, 12)?,
+                    expired: false,
                 })
             },
-            "SELECT id, label, scope, view_name, ro, created_at, last_used_at, revoked_at, owner
+            "SELECT id, label, scope, view_name, ro, created_at, last_used_at, revoked_at, owner,
+                    note, expires_at, created_by, secret_hint
              FROM grovefs_control.api_keys ORDER BY created_at DESC, seq DESC",
             &[],
             |r| KeyInfo {
@@ -705,15 +960,31 @@ impl ApiKeyStore {
                 created_at: r.get(5),
                 last_used_at: cell_str(r, 6),
                 revoked_at: cell_str(r, 7),
+                note: cell_str(r, 9),
+                expires_at: cell_str(r, 10),
+                created_by: cell_str(r, 11),
+                secret_hint: cell_str(r, 12),
+                expired: false,
             },
         )?;
-        Ok(rows)
+        // `expired` is the SERVER's verdict, stamped from one clock reading for
+        // the whole pass, so what a list claims and what the handshake enforces
+        // cannot drift — and no client has to compare timestamp strings written
+        // in another machine's timezone.
+        let now = now_ms();
+        Ok(rows
+            .into_iter()
+            .map(|mut k| {
+                k.expired = expiry_passed(k.expires_at.as_deref(), now);
+                k
+            })
+            .collect())
     }
 
     /// Rotate the secret of an ACTIVE key in place (`apikey rotate`): mint a
-    /// new secret, store only its digest, return the new plaintext
-    /// `"<id>:<secret>"` for one-time display — same contract as
-    /// [`Self::create_bound`]. Everything else (id, label, scope, view
+    /// new secret, store only its digest and the new masked fingerprint, return
+    /// the new plaintext `"<id>:<secret>"` for one-time display — same contract
+    /// as [`Self::create_bound`]. Everything else (id, label, scope, view
     /// binding, ro, owner, `created_at`) survives untouched, so audit rows and
     /// view bindings keep their attribution. Returns `None` if no ACTIVE row
     /// matched `id` — a revoked key stays dead, the same rule [`Self::set_ro`]
@@ -724,22 +995,98 @@ impl ApiKeyStore {
     pub fn rotate(&self, id: &str) -> Result<Option<String>, String> {
         let secret = gen_secret();
         let hash = sha256_hex(&secret);
+        // The fingerprint follows the secret in the same statement: a list that
+        // still showed the retired key's hint would point at a credential that
+        // no longer exists.
+        let hint = secret_hint(&secret);
         let full_key = format!("{id}:{secret}");
         let n = match &self.backend {
             Backend::Sqlite(m) => m
                 .lock()
                 .execute(
-                    "UPDATE api_keys SET secret_hash = ?1 WHERE id = ?2 AND revoked_at IS NULL",
-                    params![hash, id],
+                    "UPDATE api_keys SET secret_hash = ?1, secret_hint = ?2 WHERE id = ?3 AND revoked_at IS NULL",
+                    params![hash, hint, id],
                 )
                 .map_err(|e| e.to_string())?,
             Backend::Pg(pool) => pool
                 .execute(
-                    "UPDATE grovefs_control.api_keys SET secret_hash = $1 WHERE id = $2 AND revoked_at IS NULL",
-                    &[&hash, &id],
+                    "UPDATE grovefs_control.api_keys SET secret_hash = $1, secret_hint = $2 WHERE id = $3 AND revoked_at IS NULL",
+                    &[&hash, &hint, &id],
                 )? as usize,
         };
         Ok(if n > 0 { Some(full_key) } else { None })
+    }
+
+    /// Edit the bookkeeping fields of an ACTIVE key in place (`apikey update`):
+    /// the remark and/or the deadline. `note` is written verbatim when given (an
+    /// empty string clears it); `expires_at` distinguishes three cases —
+    /// `None` leave alone, `Some(None)` remove the deadline ("never"),
+    /// `Some(Some(instant))` set it (from [`expires_from_ttl`]). Returns false
+    /// when no ACTIVE row matched: a REVOKED key is not editable, because
+    /// editing a credential that can never authenticate again would make `list`
+    /// advertise a live deadline on a dead key. Revoking is terminal by design
+    /// (see [`Self::set_ro`] for the same rule).
+    pub fn update_fields(
+        &self,
+        id: &str,
+        note: Option<&str>,
+        expires_at: Option<Option<&str>>,
+    ) -> Result<bool, String> {
+        check_note(note)?;
+        let mut sets: Vec<&str> = Vec::new();
+        if note.is_some() {
+            sets.push("note");
+        }
+        if expires_at.is_some() {
+            sets.push("expires_at");
+        }
+        if sets.is_empty() {
+            return Err("nothing to update: pass --note and/or --ttl".to_string());
+        }
+        // Built from the same column list for both dialects, so the two
+        // parameter vectors stay aligned by position (`exec2`'s contract) and a
+        // new field costs one `push`, not two hand-written statements.
+        let mut sql_s = String::from("UPDATE api_keys SET ");
+        let mut sql_p = String::from("UPDATE grovefs_control.api_keys SET ");
+        for (i, column) in sets.iter().enumerate() {
+            if i > 0 {
+                sql_s.push_str(", ");
+                sql_p.push_str(", ");
+            }
+            let n = i + 1;
+            sql_s.push_str(&format!("{column} = ?{n}"));
+            sql_p.push_str(&format!("{column} = ${n}"));
+        }
+        // Bound at function scope: the parameter vectors hold references into
+        // these, so they must outlive the statement, not an `if` arm.
+        // An empty remark is stored as NULL — the shape `create_extended` writes
+        // for a key without one — so a reader never has to tell "no note" apart
+        // from "a note of zero length".
+        let note_text: Option<&str> = note.map(str::trim).filter(|t| !t.is_empty());
+        let deadline: Option<&str> = expires_at.unwrap_or(None);
+        let mut ps: Vec<&dyn rusqlite::ToSql> = Vec::new();
+        let mut pp: Vec<&(dyn postgres::types::ToSql + Sync)> = Vec::new();
+        if note.is_some() {
+            ps.push(&note_text);
+            pp.push(&note_text);
+        }
+        if expires_at.is_some() {
+            ps.push(&deadline);
+            pp.push(&deadline);
+        }
+        let n = sets.len() + 1;
+        sql_s.push_str(&format!(" WHERE id = ?{n} AND revoked_at IS NULL"));
+        sql_p.push_str(&format!(" WHERE id = ${n} AND revoked_at IS NULL"));
+        ps.push(&id);
+        pp.push(&id);
+        let rows = match &self.backend {
+            Backend::Sqlite(m) => m
+                .lock()
+                .execute(&sql_s, ps.as_slice())
+                .map_err(|e| e.to_string())?,
+            Backend::Pg(pool) => pool.execute(&sql_p, pp.as_slice())? as usize,
+        };
+        Ok(rows > 0)
     }
 
     /// Revoke a key by id (idempotent: returns false if no ACTIVE row matched,
@@ -1181,5 +1528,283 @@ mod tests {
         assert!(recent[0].key_id.is_none());
         assert_eq!(recent[1].tool, "define_derived_view");
         assert_eq!(recent[1].key_label.as_deref(), Some("worker"));
+    }
+
+    /// A store plus the DB FILE it wrote to, for the tests that check what is
+    /// actually on disk: the column lists are the store's own description of
+    /// itself, the bytes are the evidence.
+    fn store_on_disk() -> (ApiKeyStore, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().to_path_buf();
+        std::mem::forget(dir);
+        (ApiKeyStore::open(&p).unwrap(), p.join("meta").join("api_keys.db"))
+    }
+
+    /// An RFC 3339 stamp `secs` from now on the store's own clock — what
+    /// [`expires_from_ttl`] writes for a TTL of that length (negative for a
+    /// deadline already passed, which no TTL can produce but a waiting operator
+    /// certainly will).
+    fn deadline_from_now(secs: i64) -> String {
+        let d = chrono::Duration::try_seconds(secs).unwrap();
+        (chrono::Local::now() + d).to_rfc3339()
+    }
+
+    /// What the store keeps about a secret: a 9-character mask, and nothing that
+    /// assembles into a credential. The plaintext is searched for in the raw
+    /// file bytes (and the WAL, where a fresh write actually lands) — the one
+    /// assertion that means "recoverable" rather than "not selected by `list`".
+    #[test]
+    fn the_store_holds_a_mask_never_a_secret() {
+        let (s, path) = store_on_disk();
+        let (id, key) = s
+            .create_extended(
+                "laptop",
+                Scope::Any,
+                None,
+                false,
+                Some("alice"),
+                Some("back on the 3rd"),
+                None,
+                Some("admin"),
+            )
+            .unwrap();
+        let secret = key.split_once(':').unwrap().1;
+        let mut bytes = std::fs::read(&path).unwrap();
+        // WAL keeps a recent write out of the main file; check both, so this
+        // cannot pass just because the row had not been checkpointed yet.
+        if let Ok(wal) = std::fs::read(path.with_extension("db-wal")) {
+            bytes.extend_from_slice(&wal);
+        }
+        let hay = String::from_utf8_lossy(&bytes);
+        assert!(!hay.contains(secret), "the plaintext secret reached the file");
+        assert!(!hay.contains(&key), "nor the assembled key");
+        assert!(
+            hay.contains(&sha256_hex(secret)),
+            "the digest is what is stored — the test would be vacuous without this"
+        );
+        let row = s.list().unwrap().into_iter().find(|k| k.id == id).unwrap();
+        let hint = row.secret_hint.clone().unwrap();
+        assert_eq!(hint.chars().count(), 9, "4 hex, an ellipsis, 4 hex: {hint}");
+        let head: String = hint.chars().take(4).collect();
+        let tail: String = hint.chars().skip(5).collect();
+        assert!(secret.starts_with(&head) && secret.ends_with(&tail));
+        // The middle stays hidden: 96 hex digits' worth of it, which is why the
+        // mask is safe to print in a list.
+        assert!(!hint.contains(&secret[4..secret.len() - 4]));
+        assert!(!row.expired, "no deadline set is not a deadline passed");
+        assert_eq!(row.note.as_deref(), Some("back on the 3rd"));
+        assert_eq!(row.created_by.as_deref(), Some("admin"));
+        assert_eq!(
+            row.owner.as_deref(),
+            Some("alice"),
+            "whose key it is and who minted it are different columns"
+        );
+    }
+
+    /// A key with a deadline is refused AFTER it and the refusal says so —
+    /// "expired" and "revoked" need different repairs, and an operator who gets
+    /// the wrong one of those words wastes the afternoon.
+    #[test]
+    fn an_expired_key_is_refused_and_says_so() {
+        let s = store();
+        let (id, key) = s
+            .create_extended(
+                "temp",
+                Scope::Any,
+                None,
+                false,
+                None,
+                None,
+                Some(&deadline_from_now(3600)),
+                Some("admin"),
+            )
+            .unwrap();
+        assert!(s.authenticate(&key).is_ok(), "a FUTURE deadline changes nothing");
+        let listed = s.list().unwrap();
+        assert!(!listed[0].expired);
+        assert!(listed[0].expires_at.is_some());
+        // Move the deadline into the past the only way there is from here.
+        s.update_fields(&id, None, Some(Some(&deadline_from_now(-60))))
+            .unwrap();
+        let err = s.authenticate(&key).unwrap_err();
+        assert!(err.contains("expired"), "{err}");
+        assert!(
+            err.contains("--ttl"),
+            "the refusal should name the repair: {err}"
+        );
+        assert!(
+            s.list().unwrap()[0].expired,
+            "`list`'s verdict and the handshake's must agree"
+        );
+    }
+
+    /// The deadline is not only a handshake rule: a mount that authenticated
+    /// while the key was valid loses its ESTABLISHED session on the re-check
+    /// path, on the same ≤1s latency `revoke` advertises. `--ttl never` puts it
+    /// back — an expired key is deferred, not dead (a revoked one is not).
+    #[test]
+    fn expiry_cuts_a_live_session_off() {
+        let s = store();
+        let (id, key) = s.create_for("mounter", Scope::Mount).unwrap();
+        s.authenticate_mount(&key).unwrap();
+        assert!(s.is_live(&id, Scope::Mount));
+        s.update_fields(&id, None, Some(Some(&deadline_from_now(-1))))
+            .unwrap();
+        assert!(!s.is_live(&id, Scope::Mount));
+        assert!(s.live_state(&id, Scope::Mount).is_none());
+        s.update_fields(&id, None, Some(None)).unwrap();
+        assert!(s.is_live(&id, Scope::Mount));
+        assert!(s.authenticate_mount(&key).is_ok());
+    }
+
+    /// The sentence a mount prints when the re-check cuts it off must name the
+    /// cause, because the two repairs are opposites: an expired key is extended
+    /// with `apikey update --ttl`, a revoked one is gone and needs re-minting.
+    /// Both used to print "has been revoked".
+    #[test]
+    fn the_mid_session_cut_names_the_real_reason() {
+        let s = store();
+        // Expired: the deadline and the repair both belong in the refusal.
+        let (eid, _) = s.create_for("mounter", Scope::Mount).unwrap();
+        s.update_fields(&eid, None, Some(Some(&deadline_from_now(-1))))
+            .unwrap();
+        assert!(s.live_state(&eid, Scope::Mount).is_none());
+        let why = s.dead_reason(&eid, Scope::Mount);
+        assert!(why.contains("expired at"), "{why}");
+        assert!(
+            why.contains("--ttl") && !why.contains("revoked"),
+            "an expired key is extended, not re-minted: {why}"
+        );
+        // Revoked: the opposite wording, and no expiry invented for it.
+        let (rid, _) = s.create_for("mounter", Scope::Mount).unwrap();
+        s.revoke(&rid).unwrap();
+        let why = s.dead_reason(&rid, Scope::Mount);
+        assert!(why.contains("revoked"), "{why}");
+        assert!(!why.contains("expired"), "{why}");
+        // Re-scoped away from this entrance.
+        let (mid, _) = s.create_for("mcp only", Scope::Mcp).unwrap();
+        let why = s.dead_reason(&mid, Scope::Mount);
+        assert!(why.contains("'mcp'") && why.contains("'mount'"), "{why}");
+        // A row the re-check never found at all.
+        assert_eq!(
+            s.dead_reason("ffffffffffffffff", Scope::Mount),
+            "authentication failed: unknown api key id"
+        );
+        // Still live (the two reads raced an `--ttl` pushed forward): do not
+        // claim a cause the row does not have.
+        let (lid, _) = s.create_for("mounter", Scope::Mount).unwrap();
+        assert!(s
+            .dead_reason(&lid, Scope::Mount)
+            .contains("live-credential re-check"));
+    }
+
+    /// A typo in a TTL must not read as "no deadline": the whole point of the
+    /// column is that a key can be given a finite life, so an unparseable
+    /// spelling is an error at the door.
+    #[test]
+    fn ttl_spelling_is_validated_at_the_door() {
+        // The empty string is the one blank allowed, and it means "no deadline"
+        // (it is what an unset form field arrives as).
+        assert!(expires_from_ttl("").unwrap().is_none());
+        for never in ["never", "NEVER", " none ", "0"] {
+            assert!(
+                expires_from_ttl(never).unwrap().is_none(),
+                "'{never}' means never"
+            );
+        }
+        for dur in ["45m", "24h", "7d", "365d", "30s"] {
+            assert!(expires_from_ttl(dur).unwrap().is_some(), "'{dur}' is a deadline");
+        }
+        for bad in ["7", "7x", "1w", "-3d", "0d", "d", "h", "1.5d", "some"] {
+            assert!(
+                expires_from_ttl(bad).is_err(),
+                "'{bad}' must not silently mean 'never'"
+            );
+        }
+    }
+
+    /// `apikey update` edits the bookkeeping and NOTHING else: it refuses an
+    /// empty call and an over-long remark instead of pretending, leaves the
+    /// fields it was not given alone, stores a blank remark as NULL (no "blank
+    /// but present" state for a reader to distinguish), and will not touch a
+    /// revoked row.
+    #[test]
+    fn update_edits_the_bookkeeping_columns_only() {
+        let s = store();
+        let (id, key) = s
+            .create_bound("keep", Scope::Mcp, Some("team1"), true, Some("alice"))
+            .unwrap();
+        let row = || {
+            s.list()
+                .unwrap()
+                .into_iter()
+                .find(|k| k.id == id)
+                .unwrap()
+        };
+        assert!(
+            s.update_fields(&id, None, None).is_err(),
+            "an update that changes nothing should say so"
+        );
+        assert!(s.update_fields(&id, Some("hand over on the 3rd"), None).unwrap());
+        assert_eq!(row().note.as_deref(), Some("hand over on the 3rd"));
+        assert_eq!(row().scope, "mcp");
+        assert_eq!(row().view.as_deref(), Some("team1"));
+        assert!(row().ro);
+        assert_eq!(row().owner.as_deref(), Some("alice"));
+        assert!(
+            s.authenticate(&key).is_ok(),
+            "a remark is metadata, not a new credential"
+        );
+        // Setting one field leaves the other alone.
+        s.update_fields(&id, None, Some(Some(&deadline_from_now(86400))))
+            .unwrap();
+        assert_eq!(row().note.as_deref(), Some("hand over on the 3rd"));
+        assert!(!row().expired);
+        // A blank remark is no remark.
+        s.update_fields(&id, Some("   "), None).unwrap();
+        assert_eq!(row().note, None);
+        // Over-long is refused, not silently truncated — and a refused update
+        // must not have written half a row.
+        let long = "x".repeat(NOTE_MAX + 1);
+        assert!(s.update_fields(&id, Some(&long), None).is_err());
+        assert!(row().expires_at.is_some(), "the earlier deadline survived a refused note");
+        // Revoke is final.
+        s.revoke(&id).unwrap();
+        assert!(!s.update_fields(&id, Some("x"), None).unwrap());
+        assert!(!s.update_fields("nosuchid", Some("x"), None).unwrap());
+    }
+
+    /// A store written before the bookkeeping columns existed: opening it ADDS
+    /// them in place and reads the old rows as unknown (`None`), rather than
+    /// failing or inventing a value. This is the zero-migration promise the PG
+    /// path shares with the file path, asserted on the file the operator has.
+    #[test]
+    fn a_pre_bookkeeping_store_is_upgraded_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meta").join("api_keys.db");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        {
+            let c = rusqlite::Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE api_keys (id TEXT PRIMARY KEY, label TEXT NOT NULL,
+                        secret_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+                        last_used_at TEXT, revoked_at TEXT,
+                        scope TEXT NOT NULL DEFAULT 'any', view TEXT,
+                        ro INTEGER NOT NULL DEFAULT 0);
+                 INSERT INTO api_keys (id, label, secret_hash, created_at, scope)
+                        VALUES ('legacyid', 'old', 'hash', '2026-01-01T00:00:00+08:00', 'any');",
+            )
+            .unwrap();
+        }
+        let s = ApiKeyStore::open(dir.path()).unwrap();
+        let row = &s.list().unwrap()[0];
+        assert_eq!(row.id, "legacyid");
+        assert_eq!(row.owner, None);
+        assert_eq!(row.note, None);
+        assert_eq!(row.expires_at, None);
+        assert_eq!(row.secret_hint, None);
+        assert!(!row.expired, "a row with no deadline is not an expired one");
+        // Opening it a second time is a no-op, not a duplicate-column failure.
+        assert!(ApiKeyStore::open(dir.path()).is_ok());
     }
 }

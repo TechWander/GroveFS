@@ -6,9 +6,20 @@
   because a CDN is unreachable. The nav icons are inline `<svg>` DOM in
   index.html (they inherit the button color via `currentColor`), and the type
   stack is system-only — with CJK fallbacks so the Chinese UI renders in the
-  platform's own sans instead of a mixed bag. Sizes are rem-based so the dense
-  tables stay readable when zoomed, and colour is used for STATE (kind,
-  ok/failed, enabled/disabled) rather than decoration.
+  platform's own sans instead of a mixed bag.
+
+  Design system, in one paragraph: every font size and radius is a token below
+  (`--fs-*`, `--sp-*`), stated in `rem` against the USER's own default rather
+  than a fixed root size, so browser font settings and OS scaling still move
+  this page — the hierarchy moves with them. One scale runs through all five
+  pages: body copy at `--fs-body`, table and control copy one step down, labels
+  and metadata two steps down, the page title three up. Colour is reserved for
+  STATE (view kind, live/expired/revoked, ok/failed) and never used for
+  decoration; structure comes from the card, the 1px rule and the shadow pair.
+  Anything a later release needs to display has a shape here already — the
+  collapsible `.help`, the side `.drawer`, the `.tree` lineage list, the `.gloss`
+  term table — so new information lands in a styled container instead of a new
+  ad-hoc one.
 */
 
 :root {
@@ -21,6 +32,7 @@
   --bg2: #ffffff;
   --bg3: #e8edf3;
   --line: #cdd8e3;
+  --line-soft: #e2e9f0;
   --fg: #1a2733;
   --fg-dim: #5a6b7d;
   --accent: #1663b3;
@@ -38,6 +50,26 @@
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   --shadow-sm: 0 1px 2px #16222e14, 0 1px 6px #16222e0a;
   --shadow-md: 0 2px 6px #16222e14, 0 10px 28px #16222e1c;
+  --shadow-lg: -14px 0 40px #16222e2e;
+  /* Type scale — five steps, one ratio. `body` is the reading size; `table`
+     and `control` share the step below it so a grid of rows and a row of
+     buttons visually agree; `label` is for field names, column heads and
+     chips; `micro` is only for uppercase eyebrow captions. */
+  --fs-page: 1.625rem;
+  --fs-h3: 1.0625rem;
+  --fs-body: 1rem;
+  --fs-table: .9375rem;
+  --fs-label: .8125rem;
+  --fs-micro: .75rem;
+  /* Spacing rhythm: one ladder so two panels on the same page never sit at
+     different distances from each other. */
+  --sp-1: .35rem;
+  --sp-2: .7rem;
+  --sp-3: 1.1rem;
+  --sp-4: 1.75rem;
+  --r-1: 6px;
+  --r-2: 10px;
+  --r-3: 14px;
 }
 
 * { box-sizing: border-box; }
@@ -60,16 +92,16 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--fg);
-  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto,
+  font: var(--fs-body)/1.55 system-ui, -apple-system, "Segoe UI", Roboto,
         "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
   -webkit-font-smoothing: antialiased;
 }
 
-code, .mono, td.mono { font-family: var(--mono); font-size: 12.5px; }
+code, .mono, td.mono { font-family: var(--mono); font-size: var(--fs-table); }
 h1, h2, h3 { margin: 0 0 .4rem; font-weight: 600; }
-h2 { font-size: 15px; }
+h2 { font-size: var(--fs-h3); }
 a { color: var(--accent); }
-.muted { color: var(--fg-dim); font-weight: 400; font-size: 12.5px; }
+.muted { color: var(--fg-dim); font-weight: 400; font-size: var(--fs-label); }
 /* Numeric columns and card figures line up digit-for-digit across rows. */
 td, .card .n { font-variant-numeric: tabular-nums; }
 /* `pre-line`, not `pre-wrap`: the server's multi-line refusals are wrapped with
@@ -108,7 +140,7 @@ td, .card .n { font-variant-numeric: tabular-nums; }
 .brand-row .logo { flex: none; border-radius: 10px; box-shadow: var(--shadow-sm); }
 .login-card h1 { letter-spacing: .04em; margin: 0; }
 #login-form { display: grid; gap: .35rem; }
-#login-form label { margin-top: .6rem; font-size: 12px; color: var(--fg-dim); }
+#login-form label { margin-top: .6rem; }
 
 /* Language toggle: a small pill; on the sign-in card it parks top-right. */
 .lang-btn {
@@ -116,9 +148,9 @@ td, .card .n { font-variant-numeric: tabular-nums; }
   background: var(--bg3);
   border: 1px solid var(--line);
   color: var(--fg-dim);
-  padding: .2rem .7rem;
+  padding: .25rem .8rem;
   font: inherit;
-  font-size: 12px;
+  font-size: var(--fs-label);
 }
 .lang-btn:hover { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
 .lang-login { position: absolute; top: .9rem; right: .9rem; }
@@ -131,7 +163,7 @@ header {
   display: flex;
   align-items: center;
   gap: 1.25rem;
-  padding: .5rem 1.25rem;
+  padding: .6rem 1.5rem;
   background: #ffffffd9;
   backdrop-filter: blur(8px);
   border-bottom: 1px solid var(--line);
@@ -140,16 +172,17 @@ header {
   top: 0;
   z-index: 5;
 }
-.brand { font-weight: 700; letter-spacing: .05em; display: inline-flex; align-items: center; gap: .45rem; }
+.brand { font-weight: 700; letter-spacing: .05em; display: inline-flex; align-items: center; gap: .45rem; font-size: 1.0625rem; }
 .brand .logo { flex: none; border-radius: 6px; }
-nav { display: flex; gap: .3rem; flex: 1; }
+nav { display: flex; gap: .35rem; flex: 1; }
 nav button {
   background: none;
   border: 1px solid transparent;
   border-radius: 999px;
   color: var(--fg-dim);
-  padding: .28rem .85rem;
+  padding: .35rem .95rem;
   font: inherit;
+  font-size: var(--fs-table);
   cursor: pointer;
   display: inline-flex;
   align-items: center;
@@ -168,59 +201,81 @@ nav button.on {
 nav button.on svg { opacity: 1; }
 .who { display: flex; align-items: center; gap: .5rem; }
 
-main { padding: 1.25rem 1.5rem 2rem; max-width: 1500px; margin: 0 auto; }
+main { padding: var(--sp-4) 2rem 3rem; max-width: 1680px; margin: 0 auto; }
 .page { display: block; }
 
 /* ---- page head: the one big title per page, description and actions with it.
     The .bar rows below stay small section headings, so the hierarchy reads:
     page → section → panel, without ever two titles of the same weight. ---- */
-.page-head { display: flex; align-items: flex-end; gap: 1rem; margin: .1rem 0 1.15rem; }
+.page-head { display: flex; align-items: flex-end; gap: 1rem; margin: .1rem 0 1.5rem; }
 .page-head .ph-t { min-width: 0; flex: 1; }
-.page-head h2 { margin: 0; font-size: 22px; letter-spacing: .01em; font-weight: 650; }
-.page-head .ph-t .muted { margin: .2rem 0 0; }
+.page-head h2 { margin: 0; font-size: var(--fs-page); letter-spacing: -.01em; font-weight: 650; line-height: 1.2; }
+.page-head .ph-t .muted { margin: .35rem 0 0; font-size: var(--fs-table); }
 .page-head .ph-a { display: flex; gap: .5rem; align-items: center; white-space: nowrap; padding-bottom: .15rem; }
 
-/* ---- filter row: a search box plus chips; client-side, applied on keystroke ---- */
-.filterbox { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; margin-bottom: .55rem; }
-.filterbox input[type="search"] { flex: 1 1 9rem; max-width: 22rem; padding: .25rem .55rem; }
-.filterbox .chk { display: inline-flex; gap: .3rem; align-items: center; font-size: 12.5px; color: var(--fg-dim); cursor: pointer; }
-.chips { display: flex; gap: .3rem; flex-wrap: wrap; }
+/* ---- filter row: a search box plus chips; client-side, applied on keystroke.
+   Every list page opens with one of these, so "find the row" is the same
+   gesture on keys, accounts, views and audit. ---- */
+.filterbar {
+  background: var(--bg2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-2);
+  box-shadow: var(--shadow-sm);
+  padding: var(--sp-2) var(--sp-3);
+  margin-bottom: var(--sp-3);
+}
+.filterbox { display: flex; flex-wrap: wrap; gap: var(--sp-2); align-items: center; }
+.filterbox + .filterbox { margin-top: var(--sp-2); }
+.filterbox input[type="search"], .filterbox input[type="text"] { flex: 1 1 12rem; max-width: 26rem; padding: .4rem .7rem; }
+.filterbox .fld { display: grid; gap: .2rem; }
+.filterbox .fld > label { padding-left: .1rem; }
+.filterbox select { padding: .35rem .5rem; min-width: 8.5rem; }
+.filterbox .chk { display: inline-flex; gap: .35rem; align-items: center; color: var(--fg-dim); cursor: pointer; }
+.filterbox .count { color: var(--fg-dim); font-size: var(--fs-label); margin-left: auto; white-space: nowrap; }
+.chips { display: flex; gap: .35rem; flex-wrap: wrap; }
 .chip {
   border-radius: 999px;
   border: 1px solid var(--line);
   background: var(--bg2);
   color: var(--fg-dim);
-  font-size: 12px;
-  padding: .1rem .6rem;
+  font-size: var(--fs-label);
+  padding: .18rem .7rem;
   cursor: pointer;
   transition: background .12s, color .12s, border-color .12s;
   display: inline-flex;
   align-items: center;
   gap: .35rem;
 }
-/* The chip's dot repeats its kind's hue; "all" gets all of them. */
+/* The chip's dot repeats its kind's hue; "all" gets all of them. A chip that
+   is a FILTER rather than a kind (status, verdict, time window) opts out with
+   `.dotless` — the dot means "this is a colour family" and nothing else. */
 .chip::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--line); flex: none; }
+.chip.dotless::before { content: none; }
 .chip[data-kind="base"]::before { background: var(--k-base); }
 .chip[data-kind="fork"]::before { background: var(--k-fork); }
 .chip[data-kind="alias"]::before { background: var(--k-alias); }
 .chip[data-kind="derived"]::before { background: var(--k-lens); }
 .chip[data-kind="all"]::before { background: linear-gradient(90deg, var(--k-base), var(--k-fork), var(--k-lens)); }
 .chip:hover { border-color: var(--accent); color: var(--accent); }
+/* A chip's count is part of the label, not a second sentence. */
+.chip .c-sub { opacity: .7; font-variant-numeric: tabular-nums; }
 .chip.on { background: var(--accent-soft); border-color: #bcd4ef; color: var(--accent); font-weight: 600; }
 
-.bar { display: flex; align-items: baseline; gap: .75rem; margin: 1.25rem 0 .5rem; }
-.bar h2 { margin: 0; padding-left: .55rem; border-left: 3px solid var(--accent); line-height: 1.15; }
+.bar { display: flex; align-items: baseline; gap: .75rem; margin: var(--sp-4) 0 var(--sp-2); }
+.bar h2 { margin: 0; padding-left: .6rem; border-left: 3px solid var(--accent); line-height: 1.15; font-size: var(--fs-h3); }
 .bar:first-child { margin-top: 0; }
+.bar .muted { font-size: var(--fs-label); }
 
 /* ---- controls ---- */
 
 button {
   font: inherit;
-  border-radius: 6px;
+  font-size: var(--fs-table);
+  border-radius: var(--r-1);
   border: 1px solid var(--line);
   background: var(--bg3);
   color: var(--fg);
-  padding: .32rem .7rem;
+  padding: .4rem .85rem;
   cursor: pointer;
   transition: background .12s, border-color .12s;
 }
@@ -239,52 +294,102 @@ button.link {
   background: none;
   border: none;
   color: var(--accent);
-  padding: 0 .1rem;
+  padding: 0 .15rem;
   text-decoration: underline;
 }
+/* A row's secondary verbs: no border, no background, so a table of eight
+   actions reads as text and the primary verb on a card still stands out. */
+button.mini {
+  background: none;
+  border: none;
+  color: var(--accent);
+  padding: .1rem .3rem;
+  font-size: var(--fs-label);
+}
+button.mini:hover { text-decoration: underline; }
+button.mini.danger { color: var(--err); }
 input, select, textarea {
   font: inherit;
+  font-size: var(--fs-table);
   background: var(--bg);
   color: var(--fg);
   border: 1px solid var(--line);
-  border-radius: 6px;
-  padding: .3rem .45rem;
+  border-radius: var(--r-1);
+  padding: .4rem .6rem;
   min-width: 0;
 }
-textarea { font-family: var(--mono); font-size: 12.5px; width: 100%; min-height: 6.5rem; }
+textarea { font-family: var(--mono); font-size: var(--fs-table); width: 100%; min-height: 7rem; }
+/* Prose in a textarea (a key's note) is not code: the mono face is for
+   values you compare character by character. */
+textarea.plain { font-family: inherit; min-height: 3.2rem; }
 input:focus, select:focus, textarea:focus {
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 3px #1663b326;
 }
-label { font-size: 12px; color: var(--fg-dim); }
+label { font-size: var(--fs-label); color: var(--fg-dim); }
+/* The UA default box is ~13px, which reads as a speck beside the 0.85rem
+   controls it shares a row with, and the `padding` above must not turn it into
+   a fat rectangle. Sized to the text line, tinted with the theme accent. */
+input[type=checkbox], input[type=radio] {
+  width: 1rem;
+  height: 1rem;
+  padding: 0;
+  accent-color: var(--accent);
+  vertical-align: -.125em;
+}
 
 .panel {
   background: var(--bg2);
   border: 1px solid var(--line);
-  border-radius: 10px;
-  padding: .75rem;
-  margin-bottom: 1rem;
-  display: flex;
-  flex-wrap: wrap;
-  gap: .5rem .6rem;
-  align-items: flex-end;
+  border-radius: var(--r-2);
+  padding: var(--sp-3);
+  margin-bottom: var(--sp-3);
+  /* Fields ride a grid, so every label sits on the SAME line. The old flex row
+     with `align-items: flex-end` made a field that carries a hint line push its
+     neighbours up or down, and the mint-key form read as three rows of
+     accident. `auto-fit` still lets the row reflow on a narrow window. */
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+  gap: var(--sp-2) var(--sp-3);
+  align-items: start;
   box-shadow: var(--shadow-sm);
 }
-.panel .field { display: grid; gap: .2rem; }
+.panel .field { display: grid; gap: .2rem; min-width: 0; }
+/* One control per cell, one width per column: `size="24"` next to `size="16"`
+   is what made the form look hand-stacked. */
+.panel .field input:not([type=checkbox]),
+.panel .field select { width: 100%; max-width: 24rem; }
+/* A bare checkbox sits in the same grid row as the fields around it, and the
+   field cells spend their first 1.3rem on the label line — so both the submit
+   button and a loose `label` need that offset to land on the control row. */
+.panel > button,
+.panel > label { justify-self: start; margin-top: 1.3rem; }
+/* The checkbox then needs the control's own height, or its 16px box rides the
+   TOP of a 36px select: measured 9px above the select's centre line. Giving the
+   label a control-sized box and centring inside it puts the box on the same
+   centre line as the fields it is read against. */
+.panel > label {
+  display: flex;
+  align-items: center;
+  min-height: 2.2rem;
+  gap: .35rem;
+}
 .panel h3 {
-  flex-basis: 100%;
-  margin: -.75rem -.75rem 0;
-  padding: .45rem .75rem;
-  font-size: 12px;
+  grid-column: 1 / -1;
+  margin: calc(-1 * var(--sp-3)) calc(-1 * var(--sp-3)) var(--sp-2);
+  padding: .55rem var(--sp-3);
+  font-size: var(--fs-label);
   color: var(--fg-dim);
   font-weight: 600;
   background: var(--bg3);
   border-bottom: 1px solid var(--line);
-  border-radius: 7px 7px 0 0;
+  border-radius: var(--r-2) var(--r-2) 0 0;
   text-transform: uppercase;
-  letter-spacing: .04em;
+  letter-spacing: .05em;
 }
+/* A panel that explains rather than acts: no shadow play, no field row. */
+.panel.note { display: block; color: var(--fg-dim); font-size: var(--fs-table); }
 
 /* The one-time secret: the highest-value moment of the keys page — give it a
    soft accent card of its own, with the copy action beside the value. */
@@ -303,14 +408,23 @@ label { font-size: 12px; color: var(--fg-dim); }
 .badge {
   border: 1px solid var(--line);
   border-radius: 999px;
-  padding: .05rem .55rem;
-  font-size: 11.5px;
+  padding: .1rem .6rem;
+  font-size: var(--fs-label);
   color: var(--fg-dim);
   white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: .3rem;
 }
 .badge.admin { color: var(--warn); border-color: #d9b664; background: #fdf6e8; }
 .badge.off { color: var(--err); border-color: #e2a6a6; background: #fdeeee; }
 .badge.on-state { color: var(--ok); border-color: #9fcbb2; background: #ebf7f0; }
+/* State vocabulary for anything with a lifecycle (a live / expiring / dead key,
+   an ok / failed audit row, an enabled / disabled account). Named by MEANING so
+   a new page reuses these three instead of inventing a fourth palette. */
+.badge.good { color: var(--ok); border-color: #9fcbb2; background: #ebf7f0; }
+.badge.warn { color: var(--warn); border-color: #d9b664; background: #fdf6e8; }
+.badge.bad { color: var(--err); border-color: #e2a6a6; background: #fdeeee; }
 /* Kind badges repeat the view-kind hue (same family as the list stripe and
    the chip dot). */
 .badge.k-base { color: var(--k-base); border-color: #bcd4ef; background: var(--accent-soft); }
@@ -320,16 +434,16 @@ label { font-size: 12px; color: var(--fg-dim); }
 
 /* ---- layout bits ---- */
 
-.split { display: grid; grid-template-columns: 22rem 1fr; gap: 1rem; align-items: start; }
+.split { display: grid; grid-template-columns: 23rem 1fr; gap: var(--sp-3); align-items: start; }
 .col-narrow, .col-wide { min-width: 0; }
-@media (max-width: 900px) { .split { grid-template-columns: 1fr; } }
+@media (max-width: 1000px) { .split { grid-template-columns: 1fr; } }
 
-.list { list-style: none; margin: 0 0 1rem; padding: 0; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; box-shadow: var(--shadow-sm); background: var(--bg2); }
-.list li { padding: .3rem .6rem; border-bottom: 1px solid var(--line); cursor: pointer; display: flex; gap: .5rem; align-items: baseline; }
+.list { list-style: none; margin: 0 0 var(--sp-3); padding: 0; border: 1px solid var(--line); border-radius: var(--r-2); overflow: hidden; box-shadow: var(--shadow-sm); background: var(--bg2); }
+.list li { padding: .5rem .8rem; border-bottom: 1px solid var(--line-soft); cursor: pointer; display: flex; gap: .5rem; align-items: baseline; }
 .list li:last-child { border-bottom: none; }
 .list li:hover { background: var(--bg3); }
 .list li.sel { background: #dbe9f7; }
-.list li .kind { margin-left: auto; font-size: 11px; color: var(--fg-dim); text-transform: uppercase; letter-spacing: .04em; }
+.list li .kind { margin-left: auto; font-size: var(--fs-micro); color: var(--fg-dim); text-transform: uppercase; letter-spacing: .04em; }
 /* A stripe in the view's kind hue, inset so the selection background keeps
    working underneath it. */
 .list li.k-base { box-shadow: inset 3px 0 0 var(--k-base); }
@@ -341,23 +455,44 @@ label { font-size: 12px; color: var(--fg-dim); }
 .list li.k-alias .kind { color: var(--k-alias); }
 .list li.k-derived .kind { color: var(--k-lens); }
 
-.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr)); gap: .75rem; }
+/* The overview's headline grid: FOUR per row, two rows deep, by design — the
+   eight deployment numbers an operator scans in one eye-run. `auto-fill` was
+   the old behaviour and it made the count per row depend on the window width,
+   which reads as a bug on a projector. Fewer columns only on a narrower
+   screen, where four genuinely do not fit: the step down waits until a card
+   would be narrower than its own caption (880px), not at the first laptop. */
+.cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--sp-3); }
+@media (max-width: 880px) { .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 520px) { .cards { grid-template-columns: 1fr; } }
 .card {
   background: var(--bg2);
   border: 1px solid var(--line);
-  border-radius: 10px;
-  padding: .8rem .9rem;
+  border-radius: var(--r-2);
+  padding: var(--sp-3);
   box-shadow: var(--shadow-sm);
   transition: transform .12s, box-shadow .12s;
   position: relative;
   overflow: hidden;
+  display: grid;
+  gap: .15rem;
+  align-content: start;
+  min-height: 6.2rem;
 }
 /* A short accent cap separates the card from the page ground at a glance. */
 .card::before { content: ""; position: absolute; inset: 0 0 auto 0; height: 3px; background: var(--accent); opacity: .5; }
 .card:hover { transform: translateY(-1px); box-shadow: var(--shadow-md); }
 .card:hover::before { opacity: .85; }
-.card .n { font-size: 28px; font-weight: 650; color: var(--accent); }
-.card .k { font-size: 12px; color: var(--fg-dim); }
+.card .k { font-size: var(--fs-label); color: var(--fg-dim); text-transform: uppercase; letter-spacing: .05em; }
+.card .n { font-size: 2.125rem; font-weight: 650; color: var(--accent); line-height: 1.15; }
+/* The line under the figure: "of what", "vs last week", a unit — whatever the
+   next release needs the card to say has a styled home already. */
+.card .s { font-size: var(--fs-label); color: var(--fg-dim); }
+.card.warn::before { background: var(--warn); }
+.card.warn .n { color: var(--warn); }
+.card.ok::before { background: var(--ok); }
+.card.ok .n { color: var(--ok); }
+.card.mute::before { background: var(--fg-dim); }
+.card.mute .n { color: var(--fg-dim); }
 /* Cards that are also links: an arrow fades in at the corner, so the
    affordance is visible before the first click. */
 .card.link-card { cursor: pointer; }
@@ -374,47 +509,58 @@ label { font-size: 12px; color: var(--fg-dim); }
 }
 .card.link-card:hover::after, .card.link-card:focus-visible::after { opacity: .9; transform: none; }
 
-.tbl-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow-sm); background: var(--bg2); }
-table { border-collapse: collapse; width: 100%; font-size: 13px; }
-th, td { text-align: left; padding: .34rem .6rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+.tbl-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--r-2); box-shadow: var(--shadow-sm); background: var(--bg2); }
+table { border-collapse: collapse; width: 100%; font-size: var(--fs-table); }
+th, td { text-align: left; padding: .5rem .8rem; border-bottom: 1px solid var(--line-soft); vertical-align: top; }
 /* Headings ride on the card ground with a heavier rule below — lighter than
    a filled band, still unmistakably a header row. */
-th { color: var(--fg-dim); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; white-space: nowrap; border-bottom: 2px solid var(--line); }
+th { color: var(--fg-dim); font-weight: 600; font-size: var(--fs-label); text-transform: uppercase; letter-spacing: .04em; white-space: nowrap; border-bottom: 2px solid var(--line); background: var(--bg2); }
 tbody tr:nth-child(even) { background: #fafcfe; }
 tbody tr:last-child td { border-bottom: none; }
 tbody tr:hover { background: #eef3f8; }
+/* A row the operator is looking at (open in the drawer). */
+tbody tr.cur, tbody tr.cur:hover { background: #dbe9f7; }
 /* Two-line timestamps are noise: keep the audit clock on one line and let the
    wrap column absorb the width. Action cells were already nowrap. */
 td.actions { white-space: nowrap; text-align: right; }
 td.mono { white-space: nowrap; }
-td.wrap { word-break: break-all; }
-/* The empty state is the only row in its tbody — center it instead of a
-   left-hugging lone sentence. */
-tbody tr:only-child td[colspan] { text-align: center; padding: 1.3rem .6rem; }
+/* The prose columns (a key's remark, an audit detail). `break-all` let the
+   table crush them to ONE CHARACTER PER LINE — CJK may break between any two
+   glyphs, so "dp1 活挂载切断" came out as a vertical strip. A floor on the
+   width plus break-word keeps a readable column and still breaks a genuinely
+   long token (account=rootops@192.168.122.1) only when it has to. */
+td.wrap, th.wrap { min-width: 11rem; word-break: normal; overflow-wrap: break-word; }
+td.nowrap { white-space: nowrap; }
+td.num { text-align: right; }
+tbody tr:only-child td[colspan] { text-align: center; padding: 1.6rem .8rem; }
 /* The empty state: a stroke inbox above the sentence, centered and dim. */
 td.empty { text-align: center; padding: 1.9rem .6rem !important; color: var(--fg-dim); }
 td.empty svg { display: block; margin: 0 auto .5rem; opacity: .45; }
 
-.detail { background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; padding: 1rem; box-shadow: var(--shadow-sm); }
-.detail .head { display: flex; align-items: center; gap: .6rem; margin-bottom: .75rem; padding-bottom: .6rem; border-bottom: 1px solid var(--line); }
-.detail .head h2 { margin: 0; font-size: 17px; }
-.kv { display: grid; grid-template-columns: max-content 1fr; gap: .15rem .9rem; font-size: 13px; margin-bottom: 1rem; }
+.detail { background: var(--bg2); border: 1px solid var(--line); border-radius: var(--r-2); padding: var(--sp-3) var(--sp-4); box-shadow: var(--shadow-sm); }
+.detail .head { display: flex; align-items: center; gap: .6rem; margin-bottom: var(--sp-3); padding-bottom: var(--sp-2); border-bottom: 1px solid var(--line); }
+.detail .head h2 { margin: 0; font-size: 1.1875rem; }
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: .3rem 1.1rem; font-size: var(--fs-table); margin-bottom: var(--sp-3); }
 .kv dt { color: var(--fg-dim); }
 .kv dd { margin: 0; word-break: break-word; }
-.row { display: flex; gap: .5rem; flex-wrap: wrap; align-items: flex-end; margin-bottom: .6rem; }
+.row { display: flex; gap: .5rem; flex-wrap: wrap; align-items: flex-end; margin-bottom: .7rem; }
 pre {
   background: var(--bg);
   border: 1px solid var(--line);
-  border-radius: 6px;
-  padding: .5rem .6rem;
+  border-radius: var(--r-1);
+  padding: .55rem .7rem;
   overflow-x: auto;
   font-family: var(--mono);
-  font-size: 12.5px;
-  margin: .3rem 0 .8rem;
+  font-size: var(--fs-table);
+  margin: .3rem 0 .9rem;
   white-space: pre-wrap;
   word-break: break-all;
 }
-.secret { color: var(--warn); font-family: var(--mono); font-size: 13px; word-break: break-all; }
+.secret { color: var(--warn); font-family: var(--mono); font-size: var(--fs-table); word-break: break-all; }
+/* A server refusal is PROSE with line breaks that mean something ("why" above
+   "what to do next"), so it keeps its breaks and its reading font — but not
+   the mono face meant for values compared character by character. */
+pre.plain { font-family: inherit; white-space: pre-line; word-break: break-word; }
 
 /* ---- messages ---- */
 
@@ -456,3 +602,160 @@ pre {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
 .modal .foot { display: flex; gap: .5rem; justify-content: flex-end; margin-top: 1rem; }
+
+/* ---- detail drawer ----
+   A row's full record, without leaving the list: the table keeps its scroll
+   position and filters while the drawer holds the long fields (a key's
+   timestamps, an account's delegations, an audit row's whole `detail` text).
+   It is a SECOND pane, not a dialog: nothing is confirmed here, so no modal
+   focus trap, and `Esc` closes it. ---- */
+.drawer-back { position: fixed; inset: 0; background: #0a152059; backdrop-filter: blur(1px); z-index: 24; }
+.drawer {
+  position: fixed;
+  top: 0; right: 0; bottom: 0;
+  width: min(34rem, 94vw);
+  background: var(--bg2);
+  border-left: 1px solid var(--line);
+  box-shadow: var(--shadow-lg);
+  z-index: 25;
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  animation: slide .16s ease-out;
+}
+@keyframes slide { from { transform: translateX(1.2rem); opacity: .5; } }
+.drawer .dh {
+  display: flex; align-items: center; gap: .6rem;
+  padding: var(--sp-3) var(--sp-4);
+  border-bottom: 1px solid var(--line);
+  background: var(--bg3);
+}
+.drawer .dh h2 { margin: 0; font-size: 1.125rem; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.drawer .dh .x { margin-left: auto; flex: none; }
+.drawer .db { overflow: auto; padding: var(--sp-3) var(--sp-4) var(--sp-4); }
+.drawer .db .kv { margin-bottom: var(--sp-3); }
+.drawer .df {
+  display: flex; gap: .5rem; justify-content: flex-end; align-items: center;
+  padding: var(--sp-2) var(--sp-4);
+  border-top: 1px solid var(--line);
+  background: var(--bg3);
+}
+.drawer .df .left { margin-right: auto; color: var(--fg-dim); font-size: var(--fs-label); }
+.drawer section { margin-bottom: var(--sp-3); }
+.drawer section > h3, .det-h {
+  font-size: var(--fs-label); color: var(--fg-dim); font-weight: 600;
+  text-transform: uppercase; letter-spacing: .05em; margin: 0 0 .4rem;
+}
+
+/* ---- "what does this button do": the explainer ----
+   Requirement the first version of this console failed: a page of verbs with no
+   gloss is a page a user guesses at. `.help` is COLLAPSED by default (an
+   operator who knows the page never pays for it in scroll distance) and holds a
+   `.gloss` table, so the explanation is in the DOM — searchable, translatable —
+   rather than a title attribute nobody hovers. ---- */
+details.help {
+  background: var(--bg2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-2);
+  box-shadow: var(--shadow-sm);
+  margin-bottom: var(--sp-3);
+}
+details.help > summary {
+  cursor: pointer;
+  padding: .55rem var(--sp-3);
+  font-weight: 600;
+  font-size: var(--fs-table);
+  color: var(--fg-dim);
+  display: flex;
+  align-items: center;
+  gap: .45rem;
+  list-style: none;
+}
+details.help > summary::-webkit-details-marker { display: none; }
+details.help > summary::before { content: "\25B8"; font-size: .8em; transition: transform .12s; }
+details.help[open] > summary { border-bottom: 1px solid var(--line-soft); color: var(--fg); }
+details.help[open] > summary::before { transform: rotate(90deg); }
+details.help > .body { padding: var(--sp-2) var(--sp-3) var(--sp-3); }
+.gloss { display: grid; grid-template-columns: max-content 1fr; gap: .35rem 1.1rem; margin: 0; }
+.gloss dt { font-weight: 600; color: var(--accent); white-space: nowrap; }
+.gloss dd { margin: 0; color: var(--fg-dim); }
+.gloss dd code { color: var(--fg); }
+
+/* ---- credential mask ----
+   The key column shows the stored fingerprint: the head and tail hex in the
+   foreground, the elision dimmed, on a ground that says "this is a code, and it
+   is deliberately incomplete". ---- */
+.mask {
+  font-family: var(--mono);
+  background: var(--bg3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-1);
+  padding: .05rem .35rem;
+  white-space: nowrap;
+}
+.mask i { color: var(--fg-dim); font-style: normal; padding: 0 .05rem; }
+
+/* ---- view lineage ----
+   Every view is derived from something: a fork from a base, a derived view from
+   a base or another derived view, an alias from a real name. The tree draws that
+   one edge per node, so "what breaks if I move this base" is a shape on screen
+   rather than a mental model. ---- */
+.tree { list-style: none; margin: 0; padding: 0; }
+.tree ul { list-style: none; margin: 0; padding-left: 1.1rem; }
+.tree li { position: relative; padding: .25rem 0 .25rem .8rem; }
+.tree li::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; border-left: 1px solid var(--line); }
+.tree li::after { content: ""; position: absolute; left: 0; top: .85rem; width: .7rem; border-top: 1px solid var(--line); }
+.tree li:last-child::before { height: .85rem; bottom: auto; }
+.tree .t-name { font-weight: 600; }
+.tree li.clickable .t-name { cursor: pointer; }
+.tree li.clickable:hover .t-name { text-decoration: underline; }
+.tree .t-meta { color: var(--fg-dim); font-size: var(--fs-label); margin-left: .35rem; }
+.tree li.k-base .t-name { color: var(--k-base); }
+.tree li.k-fork .t-name { color: var(--k-fork); }
+.tree li.k-alias .t-name { color: var(--k-alias); }
+.tree li.k-derived .t-name { color: var(--k-lens); }
+.tree .t-cur { background: var(--accent-soft); border-radius: var(--r-1); padding: .05rem .3rem; }
+
+/* ---- people ---- */
+.avatar {
+  width: 2rem; height: 2rem; flex: none;
+  border-radius: 50%;
+  display: inline-grid; place-items: center;
+  background: var(--accent-soft); color: var(--accent);
+  border: 1px solid #bcd4ef;
+  font-weight: 700; font-size: var(--fs-label);
+  text-transform: uppercase;
+}
+.avatar.off { background: var(--bg3); color: var(--fg-dim); border-color: var(--line); }
+.who-cell { display: flex; align-items: center; gap: .6rem; }
+.who-cell .nm { font-weight: 600; }
+.who-cell .sub2 { color: var(--fg-dim); font-size: var(--fs-label); }
+
+/* A count that is also a filter ("3 keys", "12 events"): pill-shaped, quiet,
+   clickable — the pattern the keys and accounts pages share. */
+.count-pill {
+  border: 1px solid var(--line); border-radius: 999px; background: var(--bg2);
+  color: var(--fg-dim); font-size: var(--fs-label); padding: .05rem .5rem;
+  white-space: nowrap;
+}
+.count-pill.on { color: var(--accent); border-color: #bcd4ef; background: var(--accent-soft); font-weight: 600; }
+
+/* A two-up grid of read-only blocks (the overview's deployment panel, a drawer's
+   "where does it live" section). Same card language, no fixed column count: the
+   content is text, so let it wrap at a readable measure. */
+.grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr)); gap: var(--sp-2) var(--sp-4); }
+.stat-line { display: flex; align-items: baseline; gap: .5rem; border-bottom: 1px dashed var(--line-soft); padding: .4rem 0; }
+.stat-line:last-child { border-bottom: none; }
+.stat-line .lbl { color: var(--fg-dim); font-size: var(--fs-label); text-transform: uppercase; letter-spacing: .04em; flex: none; min-width: 7.5rem; }
+.stat-line .val { min-width: 0; word-break: break-word; }
+.stat-line .val b { font-weight: 600; }
+
+/* ---- table cells that hold more than one fact ----
+   A row can carry a second line (a note under a label, an expiry under a
+   state) without a new column: the table stays scannable and the extra fact is
+   still in the DOM. `.cell-badges` is the same idea horizontally. */
+.cell2 { display: grid; gap: .12rem; }
+.cell2 .c-sub { color: var(--fg-dim); font-size: var(--fs-label); }
+.cell-badges { display: flex; gap: .3rem; align-items: center; flex-wrap: wrap; }
+/* A row the drawer is open on is clickable, and must LOOK clickable. */
+tbody tr.click { cursor: pointer; }
+

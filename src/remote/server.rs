@@ -495,12 +495,13 @@ fn handle_conn(
     // Live-credential re-check: one store lookup per connection per
     // `KEY_RECHECK` window (a control-plane query, off the per-byte hot path),
     // so `grovefs apikey revoke` closes an ESTABLISHED data connection instead
-    // of only refusing the next mount. The same tick refreshes the key's
-    // CURRENT `ro` flag, so `apikey set-ro` hot-swaps content-write verdicts
-    // without a reconnect. Only checked when traffic arrives: an
-    // idle socket holds no access. The next client op sees the refusal and,
-    // because its credential was accepted at setup, tears its mount down
-    // cleanly (see [`super::signal_auth_loss`]).
+    // of only refusing the next mount — and so does an elapsed `--ttl`, since
+    // [`crate::apikeys::ApiKeyStore::live_state`] reports both as not live. The
+    // same tick refreshes the key's CURRENT `ro` flag, so `apikey set-ro`
+    // hot-swaps content-write verdicts without a reconnect. Only checked when
+    // traffic arrives: an idle socket holds no access. The next client op sees
+    // the refusal and, because its credential was accepted at setup, tears its
+    // mount down cleanly (see [`super::signal_auth_loss`]).
     let mut next_check = std::time::Instant::now() + crate::apikeys::KEY_RECHECK;
     // A read-only key (`apikey create --ro`) may not write content either. The
     // meta plane already gated the tree by view binding; here the object keys
@@ -526,8 +527,12 @@ fn handle_conn(
             if std::time::Instant::now() >= next_check {
                 match store.live_state(&a.id, crate::apikeys::Scope::Mount) {
                     None => {
-                        let why = "authentication failed: this api key has been revoked";
-                        let _ = store.log_call(Some(a), "data", "OP_OPEN", false, why);
+                        // Name the REAL cause (expired / revoked / re-scoped) rather
+                        // than the old blanket "revoked": this sentence is what the
+                        // mount prints on stderr and what `apikey calls` stores, and
+                        // an expired key is extended, not re-minted.
+                        let why = store.dead_reason(&a.id, crate::apikeys::Scope::Mount);
+                        let _ = store.log_call(Some(a), "data", "OP_OPEN", false, &why);
                         let _ = proto::send_response(&mut writer, EACCES, 0, why.as_bytes());
                         return Ok(());
                     }

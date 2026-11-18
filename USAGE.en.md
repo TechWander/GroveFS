@@ -26,7 +26,7 @@ One table covers every capability. The left column is **what you want to accompl
 | Delete one definition / delete a whole base view and reclaim bytes | `view rm --name F` / `view rm --name F --base` | §3.4.3, §5.3 |
 | Audit / reclaim orphan objects (offline) | `gc --meta-dir D [--data-dir R] [--apply]` | §12.6 |
 | Let an agent customize data listings itself | `grovefs mcp` (stdio JSON-RPC) | §3.5 |
-| Lock the interface and mount points, revoke per-caller | `apikey create/list/rotate/revoke/set-ro/calls` | §3.5.1, §6 |
+| Lock the interface and mount points, revoke per-caller | `apikey create/list/rotate/revoke/set-ro/calls/update` | §3.5.1, §6 |
 | Read-only mount / zero-cache strong consistency | `mount --ro` / `--no-cache` | §7 |
 | Performance observation and rate limiting (per-stage latency / bandwidth / cache TTL) | `mount --stats*` / `--bw-read|--bw-write` / `--cache-ttl` | §8 |
 | Share one view across several machines | `data-server` + `meta-server` | §4, §11 |
@@ -385,7 +385,7 @@ fork team
 | `blocks/<2hex>/<key>` | the file's real bytes; all views store only the key | produced on write/import; deleted on reclaim |
 | `meta/api_keys.db` | optional control plane: key digests and call audit | the `apikey` command / `mcp --require-api-key` |
 
-A row of the `node` table contains: `id`, `ino`, `parent_id`, `name`, `is_dir`, `data_ref` (the key pointing into blocks), `link_target`, `mode/uid/gid`, `mtime/atime/ctime`, with a uniqueness constraint on `(parent_id, name)`. `ctrl` is a `(k, v)` key-value table holding today only the HA `epoch` (**not an inode counter** — new inodes aren't allocated from a cursor, they equal their own row's `id`); `locks` are POSIX/BSD lock leases. `refs.db` has a single `holders(data_ref TEXT PRIMARY KEY, holders INTEGER)` table recording how many views hold each object. `api_keys.db` (optional) has two tables `api_keys` and `mcp_calls` (credential digests / audit). **The difference between views is not the table structure, but "whether this name has its own `.db`"**.
+A row of the `node` table contains: `id`, `ino`, `parent_id`, `name`, `is_dir`, `data_ref` (the key pointing into blocks), `link_target`, `mode/uid/gid`, `mtime/atime/ctime`, with a uniqueness constraint on `(parent_id, name)`. `ctrl` is a `(k, v)` key-value table holding today only the HA `epoch` (**not an inode counter** — new inodes aren't allocated from a cursor, they equal their own row's `id`); `locks` are POSIX/BSD lock leases. `refs.db` has a single `holders(data_ref TEXT PRIMARY KEY, holders INTEGER)` table recording how many views hold each object. `api_keys.db` (optional) has two tables `api_keys` and `mcp_calls`: the former carries `id, label, secret_hash, created_at, last_used_at, revoked_at, scope, view, ro, owner, note, expires_at, created_by, secret_hint` — beyond the digest, three bookkeeping fields (remark / deadline / minter) and one head+tail fingerprint, with neither plaintext nor ciphertext anywhere in the store — the latter is the call audit. The PG tier uses the same column names (`view_name`/`ro BOOLEAN`, plus an extra `seq` identity column). Old stores upgrade in place: opening the registry adds the missing columns with `ALTER TABLE … ADD COLUMN` and rewrites no row. **The difference between views is not the table structure, but "whether this name has its own `.db`"**.
 
 **The PG backend's (`--meta-store postgres://…`) correspondence**
 
@@ -1045,99 +1045,148 @@ Ten tools and their parameters: eight governance ones — `list_views` (optional
 
 ### 3.5.1 Locking the interface and the mountpoints: API-key authentication, scope partitioning and call audit (`grovefs apikey`)
 
-One server often faces **multiple different callers** — an agent runtime fronting one `grovefs mcp` service out, several client machines mounting the same `meta-server` over LAN — when you need revocable credentials and attribution audit. `grovefs apikey` mints API keys (**storing only the SHA-256 digest**, the plaintext printed once at `create`, so even a leaked `api_keys.db` can't be turned into a usable credential), and tags each key with a **scope** (`--for admin` is the credential for the governance port that stands in for the DB password, see §3.5.2) and an **owner** (`--owner <account>`, required for `--for admin`): `--for mcp` (opens only the governance interface), `--for mount` (opens only a `--require-api-key` meta/data server), `--for admin` (opens only the governance port `meta-server --control-listen`, and also admits mount+mcp), `--for any` (**default**, mount+mcp only — `any` never upgrades to `admin`; every key minted before the scope concept was this tier, so old deployments need no change). The two entrances share one registry (`<meta-dir>/meta/api_keys.db`), isolated by scope: a mount credential can't be replayed to the governance API, and an agent key can't open the data plane either. A mount key may also carry **two access-control dimensions**: `--view V` **binds the credential to a single physical view** V — using it to `M_OPEN` another view is refused with `E_AUTH` at the handshake (one without `--view` is a system-level key, able to open any view); `--ro` marks it **read-only** — the server refuses write-intent ops per-op with `E_NOTPERM` on the meta plane and content writes with `EROFS` on the data plane, and hints the client a read-only mount in the `M_OPEN` reply ("read-only" is enforced server-side, not relying on the client's `-o ro` self-discipline); read-only/read-write **can be flipped in place** — `apikey set-ro --id <ID> --rw` flips a read-only key back to read-write, without `--rw` (or with `--ro`) back to read-only, a live mount adopts the new verdict on its next second-level revalidation tick, no remint, no reconnect (the one exception: a mount whose read-only already landed in the kernel at handshake still needs a remount to lift the OS-level cap, see set-ro's paragraph in 3.5.1; and the switch holds only for server-routed mounts, a local `--home` mount has no server credential gate and is unaffected). **Governance-plane gate**: `grovefs mcp --require-api-key` gates all **state-reading/writing methods** accordingly — `tools/list`, `tools/call`, `resources/list`, `resources/templates/list`, `resources/read`, `completion/complete` (`initialize` / `ping` / `prompts/*` / `logging/*` are always open so a client can complete the handshake, fetch static playbooks, and control how verbose the server is). **Mount-plane gate**: `meta-server --require-api-key` gates `M_OPEN`, `data-server --require-api-key` gates `OP_OPEN`, the client presents via `mount --api-key <ID:SECRET>` (if you'd rather not put it on the command line, export `GROVEFS_API_KEY='<ID:SECRET>'`, the secret then stays out of argv); **the enabling order matters**: a server **without** `--require-api-key` does **no** key verification at all (a client presenting a made-up key still mounts, verified `MOUNTED`); with it, it is **fail-closed** — when `api_keys.db` has no usable key **no one (including you) gets in**, so mint the keys first, then restart with the flag; **audit surface**: every `tools/call`, every `resources/read`, and every mount connection (incl. refused ones) appends to the same audit table (time, key, plane method, tool tool, success, detail), read back by `grovefs apikey calls`. A revoke only marks the row revoked (past calls keep attribution), a revoked key authenticates against nothing immediately, **and already-established mounts are closed too** (see below). Storage is one separate local SQLite (`<meta-dir>/meta/api_keys.db`): the control-plane state. Keys minted now use the short format `<16-hex id>:<32-hex secret>` — 49 characters total, the secret carrying 122 random bits (offline brute force and online replay remain out of reach); long keys minted before it still verify unchanged — the check compares digests, never lengths, so there is zero migration — and `apikey rotate` mints a fresh secret for the SAME id when one is lost (label/scope/view binding/audit history all survive; the new plaintext is shown once, too). The echoes below are from real runs:
+One server often faces **multiple different callers** — an agent runtime fronting one `grovefs mcp` service out, several client machines mounting the same `meta-server` over LAN — when you need revocable credentials and attribution audit. `grovefs apikey` mints API keys (**storing only the SHA-256 digest**, the plaintext printed once at `create`, so even a leaked `api_keys.db` can't be turned into a usable credential), and tags each key with a **scope** (`--for admin` is the credential for the governance port that stands in for the DB password, see §3.5.2) and an **owner** (`--owner <account>`, required for `--for admin`): `--for mcp` (opens only the governance interface), `--for mount` (opens only a `--require-api-key` meta/data server), `--for admin` (opens only the governance port `meta-server --control-listen`, and also admits mount+mcp), `--for any` (**default**, mount+mcp only — `any` never upgrades to `admin`; every key minted before the scope concept was this tier, so old deployments need no change). The two entrances share one registry (`<meta-dir>/meta/api_keys.db`), isolated by scope: a mount credential can't be replayed to the governance API, and an agent key can't open the data plane either. A mount key may also carry **two access-control dimensions**: `--view V` **binds the credential to a single physical view** V — using it to `M_OPEN` another view is refused with `E_AUTH` at the handshake (one without `--view` is a system-level key, able to open any view); `--ro` marks it **read-only** — the server refuses write-intent ops per-op with `E_NOTPERM` on the meta plane and content writes with `EROFS` on the data plane, and hints the client a read-only mount in the `M_OPEN` reply ("read-only" is enforced server-side, not relying on the client's `-o ro` self-discipline); read-only/read-write **can be flipped in place** — `apikey set-ro --id <ID> --rw` flips a read-only key back to read-write, without `--rw` (or with `--ro`) back to read-only, a live mount adopts the new verdict on its next second-level revalidation tick, no remint, no reconnect (the one exception: a mount whose read-only already landed in the kernel at handshake still needs a remount to lift the OS-level cap, see set-ro's paragraph in 3.5.1; and the switch holds only for server-routed mounts, a local `--home` mount has no server credential gate and is unaffected). **Governance-plane gate**: `grovefs mcp --require-api-key` gates all **state-reading/writing methods** accordingly — `tools/list`, `tools/call`, `resources/list`, `resources/templates/list`, `resources/read`, `completion/complete` (`initialize` / `ping` / `prompts/*` / `logging/*` are always open so a client can complete the handshake, fetch static playbooks, and control how verbose the server is). **Mount-plane gate**: `meta-server --require-api-key` gates `M_OPEN`, `data-server --require-api-key` gates `OP_OPEN`, the client presents via `mount --api-key <ID:SECRET>` (if you'd rather not put it on the command line, export `GROVEFS_API_KEY='<ID:SECRET>'`, the secret then stays out of argv); **the enabling order matters**: a server **without** `--require-api-key` does **no** key verification at all (a client presenting a made-up key still mounts, verified `MOUNTED`); with it, it is **fail-closed** — when `api_keys.db` has no usable key **no one (including you) gets in**, so mint the keys first, then restart with the flag; **audit surface**: every `tools/call`, every `resources/read`, and every mount connection (incl. refused ones) appends to the same audit table (time, key, plane method, tool tool, success, detail), read back by `grovefs apikey calls`. A revoke only marks the row revoked (past calls keep attribution), a revoked key authenticates against nothing immediately, **and already-established mounts are closed too** (see below). Storage is one separate local SQLite (`<meta-dir>/meta/api_keys.db`): the control-plane state. Keys minted now use the short format `<16-hex id>:<32-hex secret>` — 49 characters total, the secret carrying 122 random bits (offline brute force and online replay remain out of reach); long keys minted before it still verify unchanged — the check compares digests, never lengths, so there is zero migration — and `apikey rotate` mints a fresh secret for the SAME id when one is lost (label/scope/view binding/audit history all survive; the new plaintext is shown once, too). **Each key also carries its bookkeeping into the same row**: a `--note TEXT` remark, an absolute `expires_at` the server computed from `--ttl DUR` (units `s`/`m`/`h`/`d` only — a misspelt duration is refused rather than silently minting a key that never expires), and the `created_by` account that minted it, plus a `secret_hint` column holding an irreversible head-4 + `…` + tail-4 fingerprint. The `list` key column prints exactly that stored fingerprint, so "seeing the key in the list" and "holding a usable credential" remain two different things (only `rotate` ever hands you a plaintext again). The echoes below are from real runs:
 
 ```
 # 1) 铸造一个 key(明文只打印一次;scope 默认 any)
 $ grovefs apikey --meta-dir $HOME_DIR create --label claude-desktop
 apikey created — shown ONCE (only its SHA-256 is stored; save it now):
-  id:    06fc0287c1464bd1
+  id:    01fcf6bb65a742c4
+  owner: <none>
   label: claude-desktop
   scope: any
-  key:   06fc0287c1464bd1:7ddadff0451c46889d8e0a2c77b13490
+  view:  <any>
+  rw:    rw (read-write)
+  expires: never (set one with --ttl, or `apikey update --ttl`)
+  key:   01fcf6bb65a742c4:49d5f536592d49c090ddb10624f05c7e
 
 Present it to a `--require-api-key` server as
-  grovefs mount --meta-server ... --data-servers ... --api-key '06fc0287c1464bd1:7ddadff0451c46889d8e0a2c77b13490' -m /mnt/x
-(or export GROVEFS_API_KEY='...' so it stays out of the command line).
+  grovefs mount --meta-server ... --data-servers ... --api-key '01fcf6bb65a742c4:49d5f536592d49c090ddb10624f05c7e' -m /mnt/x
+(or export GROVEFS_API_KEY='01fcf6bb65a742c4:49d5f536592d49c090ddb10624f05c7e' so it stays out of the command line).
 Scope it to one entrance with `--for mount` / `--for mcp` to keep a mount
-credential out of the governance API (and vice versa).
-Revoke later with: grovefs apikey --meta-dir $HOME_DIR revoke --id 06fc0287c1464bd1
+credential out of the governance API (and vice versa); `--for admin` is the
+governance credential and is never implied by `any`.
+Revoke later with: grovefs apikey --meta-dir $HOME_DIR revoke --id 01fcf6bb65a742c4
+
+# 1b) 备注与有效期一起入账:三笔台账(备注/有效期/铸造者)都随 key 落库,期限由服务端算
+$ grovefs apikey --meta-dir $HOME_DIR create --label nightly --for mount --note "staging box, hand over end of March" --ttl 30d
+apikey created — shown ONCE (only its SHA-256 is stored; save it now):
+  id:    be55fdb6147a4f79
+  owner: <none>
+  label: nightly
+  scope: mount
+  view:  <any>
+  rw:    rw (read-write)
+  note:  staging box, hand over end of March
+  expires: 2026-12-18T15:10:06.069199511+00:00
+  key:   be55fdb6147a4f79:0d4fb3aff1584c74b10630148e42eb4e
 
 # 2) 铸造一个只能挂载的 key;scope 写错直接拒绝(打错一个词不会静默放宽权限)
 $ grovefs apikey --meta-dir $HOME_DIR create --label laptop-alice --for mount
-  id:    aac1f51a0d5641dd   scope: mount   key: aac1f51a...:a5d5450a...
+apikey created — shown ONCE (only its SHA-256 is stored; save it now):
+  id:    18c4bb4091764ad6
+  owner: <none>
+  label: laptop-alice
+  scope: mount
+  view:  <any>
+  rw:    rw (read-write)
+  expires: never (set one with --ttl, or `apikey update --ttl`)
+  key:   18c4bb4091764ad6:3d6997d607be4cf7ba0024a85afedbe6
 $ grovefs apikey --meta-dir $HOME_DIR create --label x --for both
 error: unknown api key scope 'both' (expected any|mcp|mount|admin)      # exit=1
 
 # 2b) 视图绑定 + 只读的 key(访问控制维度)
 $ grovefs apikey --meta-dir $HOME_DIR create --label reader --for mount --view alice --ro
 apikey created — shown ONCE (only its SHA-256 is stored; save it now):
-  id:    7c0e...
-  label: reader
-  scope: mount
-  view:  alice
-  rw:    ro (read-only)
-  key:   7c0e...:…(32 hex secret)     # 只能挂 view alice,写一律被服务端拒
-$ grovefs mount --view bob -m /mnt/b --meta-server ... --data-servers ... --api-key "$READER_KEY"   # 挂别的视图
-error: permission denied: this api key is bound to view 'alice', not 'bob'    # M_OPEN 处 E_AUTH
-$ mkdir /mnt/a/should_fail                                                          # alice 的只读 key
-bash: /mnt/a/should_fail: 只读文件系统                                               # 据握手标志落内核只读;服务端另逐写拒 E_NOTPERM/EROFS
-
-# 2c) 原地切换只读/读写(热生效,不重铸不重连)
-$ grovefs apikey --meta-dir $HOME_DIR set-ro --id 7c0e --rw
-apikey: id='7c0e…' (label 'reader') is now rw (read-write)
-  a LIVE mount presenting this key picks up the new verdict on its next op (within the 1s re-check window) — no reconnect;
-  only a mount the handshake placed kernel read-only needs a remount to lift the OS-level cap.
-$ grovefs apikey --meta-dir $HOME_DIR set-ro --id 7c0e            # 切回只读(默认方向)
-apikey: id='7c0e…' (label 'reader') is now ro (read-only)
-# 前缀歧义/已撤销/未知 id 与 revoke 同样处理:歧义前缀报错、revoked 行不回活、未知 id 报错(exit=1)。
-
-# 2d) secret 丢了不换身份:rotate 为同一 id 重铸 secret(绑定/归属/审计全保留,新明文再展示一次)
-$ grovefs apikey --meta-dir $HOME_DIR rotate --id 7c0e
-apikey rotated — NEW key shown ONCE (only its SHA-256 is stored; save it now):
-  id:    7c0e...
+  id:    a026316b216946dc
   owner: <none>
   label: reader
   scope: mount
   view:  alice
-  key:   7c0e...:<新的 32 位 hex secret>
+  rw:    ro (read-only)
+  expires: never (set one with --ttl, or `apikey update --ttl`)
+  key:   a026316b216946dc:4611085b2d714a519af0a762acad76c6
+$ grovefs mount --view bob -m /mnt/b --meta-server ... --data-servers ... --api-key "$READER_KEY"   # 拿它去挂别的视图
+error: permission denied: this api key is bound to view 'alice', not 'bob'    # M_OPEN 处 E_AUTH
+$ mkdir /mnt/a/should_fail                                                          # alice 的只读 key 挂载
+mkdir: 无法创建目录 “/mnt/a/should_fail”: 只读文件系统                        # 据握手标志落内核只读;服务端另逐写拒 E_NOTPERM/EROFS
+
+# 2c) 原地切换只读/读写(热生效,不重铸不重连)
+$ grovefs apikey --meta-dir $HOME_DIR set-ro --id a026 --rw
+apikey: id='a026316b216946dc' (label 'reader') is now rw (read-write)
+  a LIVE mount presenting this key resumes admitting writes on its next re-check window (≤1s) — no reconnect, no remount.
+$ grovefs apikey --meta-dir $HOME_DIR set-ro --id a026            # 切回只读(默认方向)
+apikey: id='a026316b216946dc' (label 'reader') is now ro (read-only)
+  a LIVE mount presenting this key starts refusing writes on its next re-check window (≤1s) — no reconnect, no remount; its reads keep flowing.
+# 前缀歧义/已撤销/未知 id 与 revoke 同样处理:歧义前缀报错、revoked 行不回活、未知 id 报错(exit=1)。
+
+# 2d) secret 丢了不换身份:rotate 为同一 id 重铸 secret(绑定/归属/审计/台账全保留,新明文再展示一次)
+$ grovefs apikey --meta-dir $HOME_DIR rotate --id a026
+apikey rotated — NEW key shown ONCE (only its SHA-256 is stored; save it now):
+  id:    a026316b216946dc
+  owner: <none>
+  label: reader
+  scope: mount
+  view:  alice
+  key:   a026316b216946dc:942266559f824286b450b4e8a67ad04c
 
   the id and every binding are unchanged — only the secret was replaced;
   the OLD secret fails its next handshake, and a live mount established on it
   stays open until it reconnects — `apikey revoke` is the kill-now verb.
-# 已撤销的 id 拒绝 rotate(revoke 是终态,轮换不复活);要立刻封杀用 revoke。
+# 已撤销的 id 拒绝 rotate(revoke 是终态,轮换不复活);要立刻封杀用 revoke。列表里的指纹同步换成新 secret 的头尾。
 
-# 3) 列表带 scope/view/rw 列,绝不落密文;哈希也不落盘(库内只有摘要)
+# 3) 列表:直接显示 key 指纹(头4…尾4,库里存的那一段,读取时不反推),绝不落明文;台账随行带出
 $ grovefs apikey --meta-dir $HOME_DIR list
-#   id               label            scope   view          rw   created                   last_used                 revoked
-1   296ef5839f514607   agent            mcp     -             rw   2026-10-27T06:57:59...      -                         -
-2   aac1f51a0d5641dd   laptop-alice     mount   -             rw   2026-10-27T06:57:59...      2026-10-27T06:58:02...    -
-3   06fc0287c1464bd1   claude-desktop   any     <any>         rw   2026-10-27T06:57:59...      -                         -
+#   id                 key          owner            label            scope   view         rw   created                   last_used                 expires / revoked / note
+1   9622e52b060e41d8   772a…636e    -                agent            mcp     <any>        rw   2026-11-18T15:10:06.161151695+00:00 -                         never
+2   b381a1693c9b4165   1c5f…1d10    -                lab-agent        any     lab          rw   2026-11-18T15:10:06.124367225+00:00 -                         never
+3   be55fdb6147a4f79   0d4f…eb4e    -                nightly          mount   <any>        rw   2026-11-18T15:10:06.069303270+00:00 -                         expires 2026-12-18T15:10:06.069199511+00:00 | note: staging box, hand over end of March
+4   a026316b216946dc   9422…d04c    -                reader           mount   alice        ro   2026-11-18T15:10:06.032809367+00:00 2026-11-18T15:10:11.311280050+00:00 never
+5   18c4bb4091764ad6   3d69…dbe6    -                laptop-alice     mount   <any>        rw   2026-11-18T15:10:05.984742303+00:00 2026-11-18T15:10:11.259186132+00:00 never
+6   01fcf6bb65a742c4   49d5…5c7e    -                claude-desktop   any     <any>        rw   2026-11-18T15:10:05.965729039+00:00 -                         never
 
 # 3b) 按视图过滤:只列能开 lab 的 key(纯别名也匹配绑定到真实名的 key),并提示系统级 key 数
 $ grovefs apikey --meta-dir $HOME_DIR list --view lab
-#   id               label            scope   view         rw   created                   last_used                 revoked
-1   0cfaffd5fe2e4486   lab-agent        any     lab          rw   2026-10-27T15:31:33...      -                         -
-1 bound key(s) for view 'lab' of 2 total
+#   id                 key          owner            label            scope   view         rw   created                   last_used                 expires / revoked / note
+1   b381a1693c9b4165   1c5f…1d10    -                lab-agent        any     lab          rw   2026-11-18T15:10:06.124367225+00:00 -                         never
+1 bound key(s) for view 'lab' of 6 total
+  note: 4 unbound key(s) admit every view too — plain `apikey list` shows them
 
-# 3c) 凭据多了直接检索:`--label/--owner` 大小写不敏感子串,`--scope` 精确到一档入口
+# 3c) 凭据多了直接检索:`--label/--owner/--note` 大小写不敏感子串,`--scope` 精确到一档入口
 $ grovefs apikey --meta-dir $HOME_DIR list --label alice --scope mount
-#   id               label            scope   view         rw   created                   last_used                 revoked
-1   aac1f51a0d5641dd   laptop-alice     mount   -            rw   2026-10-27T06:57:59...      2026-10-27T06:58:02...    -
+#   id                 key          owner            label            scope   view         rw   created                   last_used                 expires / revoked / note
+1   18c4bb4091764ad6   3d69…dbe6    -                laptop-alice     mount   <any>        rw   2026-11-18T15:10:05.984742303+00:00 2026-11-18T15:10:11.259186132+00:00 never
+$ grovefs apikey --meta-dir $HOME_DIR list --note staging
+#   id                 key          owner            label            scope   view         rw   created                   last_used                 expires / revoked / note
+1   be55fdb6147a4f79   0d4f…eb4e    -                nightly          mount   <any>        rw   2026-11-18T15:10:06.069303270+00:00 -                         expires 2026-12-18T15:10:06.069199511+00:00 | note: staging box, hand over end of March
+
+# 3d) 台账就地可改:`update` 只动备注与期限两笔,其余(身份/绑定/审计)一概不碰
+$ grovefs apikey --meta-dir $HOME_DIR update --id be55 --note "handed to ops" --ttl never
+apikey updated: id='be55fdb6147a4f79' (label 'nightly')
+  note:    handed to ops
+  expires: never
+$ grovefs apikey --meta-dir $HOME_DIR update --id be55 --ttl "3 weeks"     # 时长只认 s/m/h/d 四个单位
+error: bad ttl '3 weeks': expected a count and a unit, like 45m, 24h or 7d   # exit=1
+$ grovefs apikey --meta-dir $HOME_DIR update --id be55                      # 两个 flag 都不给:拒,而不是空转一次
+error: nothing to update: pass --note TEXT and/or --ttl DUR (`--ttl never` removes a deadline)   # exit=1
+# 期限由服务端判:过了 expires 的 key 在 list 里标 EXPIRED(行仍列出)、每一次鉴权都被拒;
+# 给它一个新的 --ttl 就是唯一恢复路径(同一把 key 重新鉴上);revoked 行拒改——吊销是终态。
 
 # 4) 服务端开门时自报门槛;不开门的默认路径行为与从前逐字节一致
-$ grovefs meta-server --meta-dir $HOME_DIR --listen 0.0.0.0:50110 --require-api-key
-meta-server listening on 0.0.0.0:50110 (base $HOME_DIR, role Primary)
+$ grovefs meta-server --meta-dir $HOME_DIR --listen 127.0.0.1:15310 --require-api-key
+meta-server listening on 127.0.0.1:15310 (base $HOME_DIR, role Primary)
+meta-server: metadata backend sqlite — one db file per view under <base>/meta/
 meta-server: api-key auth REQUIRED (present `mount --api-key`, minted by `grovefs apikey create --for mount|any`); a revoke closes live mounts on their next op
-$ grovefs data-server --listen 0.0.0.0:50100 --data-dir /data/cluster --require-api-key --meta-dir $HOME_DIR
+meta-server: views are created explicitly — M_OPEN refuses a name with no existing tree or definition (`grovefs view create --view <name>`, or `--home <dir> init --view <name>`); no empty tree is ever auto-created
+$ grovefs data-server --listen 127.0.0.1:15311 --data-dir /data/cluster --require-api-key --meta-dir $HOME_DIR
 data-server: api-key auth REQUIRED (present `mount --api-key`, minted by `grovefs apikey create --for mount|any`); a revoke closes live connections on the next op
 
 # 5) 客户端拿各种坏凭据去挂:拒因逐字节的原文回到本地 stderr(退出码 1,不留脏挂载)
 $ grovefs mount --view alice -m /mnt/a --meta-server ... --data-servers ...                      # 不带 key
 error: no api key presented: this server requires one (pass `mount --api-key ID:SECRET` or export GROVEFS_API_KEY; mint with `grovefs apikey create --for mount`)
-$ grovefs mount --view alice -m /mnt/a --meta-server ... --data-servers ... --api-key "aac1f51a...:deadbeef"
+$ grovefs mount --view alice -m /mnt/a --meta-server ... --data-servers ... --api-key "18c4bb40...:deadbeef"
 error: authentication failed: invalid api key secret
-$ grovefs mount --view alice -m /mnt/a --meta-server ... --data-servers ... --api-key "00000000...:whatever"
+$ grovefs mount --view alice -m /mnt/a --meta-server ... --data-servers ... --api-key "0000000000000000:whatever"
 error: authentication failed: unknown api key id
 $ grovefs mount --view alice -m /mnt/a --meta-server ... --data-servers ... --api-key "no-colon-here"
 error: malformed api key (expected '<id>:<secret>')
@@ -1146,31 +1195,37 @@ error: authentication failed: this api key is scoped to 'mcp', not 'mount'
 #   反方向同样被拒:把 mount key 塞进 MCP initialize 的 apiKey,tools/list 回 -32001,
 #   且这条跨入口尝试同样被审计成 scope 拒因。
 
-# 6) 挂载连接与治理调用同表审计(method 分平面、tool 分握手)
-$ grovefs apikey --meta-dir $HOME_DIR calls --limit 6
-last 6 call(s), newest first:
+# 6) 挂载连接与治理调用同表审计(method 分平面、tool 分握手;被拒的也入账)
+$ grovefs apikey --meta-dir $HOME_DIR calls --limit 8
+last 8 call(s), newest first:
 ts                        key_id                             method       tool                   ok   detail
-2026-10-27T06:58:02.176356991+00:00 aac1f51a0d5641dd                   meta         M_OPEN                 yes  view='alice' uid=1005
-2026-10-27T06:58:00.180250185+00:00 aac1f51a0d5641dd                   data         OP_OPEN                yes
-2026-10-27T06:58:00.169508131+00:00 -                                  meta         M_OPEN                 no   view='alice': authentication failed: this api key is scoped to 'mcp', not 'mount'
-2026-10-27T06:58:00.164775080+00:00 -                                  meta         M_OPEN                 no   view='alice': authentication failed: invalid api key secret
+2026-11-18T15:10:11.569517381+00:00 -                                  meta         M_OPEN                 no   view='alice': authentication failed: this api key is scoped to 'mcp', not 'mount'
+2026-11-18T15:10:11.535856955+00:00 -                                  meta         M_OPEN                 no   view='alice': malformed api key (expected '<id>:<secret>')
+2026-11-18T15:10:11.502511379+00:00 -                                  meta         M_OPEN                 no   view='alice': authentication failed: unknown api key id
+2026-11-18T15:10:11.485540205+00:00 -                                  meta         M_OPEN                 no   view='alice': authentication failed: invalid api key secret
+2026-11-18T15:10:11.462438861+00:00 -                                  meta         M_OPEN                 no   view='alice': no api key presented: this server requires one (pass `mount --api-key ID:SECRET` or export GROVEFS_API_KEY; mint with `grovefs apikey create --for mount`)
+2026-11-18T15:10:11.344410213+00:00 a026316b216946dc                   meta         M_OPEN                 no   view='bob': key bound to view 'alice'
+2026-11-18T15:10:11.335343137+00:00 a026316b216946dc                   meta         M_OPEN                 yes  view='bob' uid=1005
+2026-11-18T15:10:11.276881451+00:00 18c4bb4091764ad6                   data         OP_OPEN                yes
 
 # 7) 撤销一行输出说清两面契约;历史调用仍保留归属
-$ grovefs apikey --meta-dir $HOME_DIR revoke --id aac1f51a0d5641dd
-apikey: revoked id='aac1f51a0d5641dd' (label 'laptop-alice'); it can no longer authenticate, past calls keep attribution
+$ grovefs apikey --meta-dir $HOME_DIR revoke --id 18c4bb4091764ad6
+apikey: revoked id='18c4bb4091764ad6' (label 'laptop-alice'); it can no longer authenticate, past calls keep attribution
   a LIVE mount presenting this key is refused on its next op (within the 1s re-check window) and unmounts itself;
   a `grovefs mcp` session in flight keeps its identity until it reconnects.
 
 # 8) 封停活挂载:实测撤销后一次写的遭遇(无需运维介入)
 $ printf 'late' > /mnt/a/new.txt
-bash: /mnt/a/new.txt: 权限不够        # EACCES,来自服务端的拒因
-$ cat /mnt/a/grovefs-mount.log        # 挂载自己把原因打出来并卸载
-using remote metadata service at 10.0.0.5:50110
-using remote data service at 10.0.0.5:50100
+bash: /mnt/a/new.txt: 输入/输出错误        # EIO:后台复验 tick 先落地,daemon 正在自卸载
+$ cat /tmp/grovefs-mount--mnt-a.log        # 分离挂载的日志默认落 $TMPDIR,按挂载点命名(`--log-file` 可指定)
+using remote metadata service at 127.0.0.1:15310
+using remote data service at 127.0.0.1:15311
 grovefs: access refused by the server (authentication failed: this api key has been revoked) — unmounting this view
 received termination signal, unmounting cleanly...
-unmounted view 'alice' at /mnt/a
 $ ls /mnt/a                            # 干净的空目录——不是 "Transport endpoint is not connected"
+.  ..
+#   errno 取决于写与自卸载谁先到:那趟写正是复验的载体时拿到服务端的拒因、报 权限不够(EACCES),
+#   复验先落地则报 输入/输出错误(EIO);两者都不是假成功(套件钉的是 rc≠0)。
 #   同期另一个 key 的挂载照旧读写(逐调用方撤销,不像轮换一份共享 token 那样断全部人);
 #   拿被撤销的 key 重挂则 fail-closed:"authentication failed: this api key has been revoked"。
 
@@ -1184,7 +1239,7 @@ $ grovefs mcp --meta-dir $HOME_DIR --require-api-key      # 客户端 initialize
 defined derived view 'release' over base 'team': 1 hide, 0 only, 0 reloc rule(s)
 ```
 
-Six subcommands: `create --label L [--for any|mcp|mount|admin] [--owner ACCOUNT] [--view V] [--ro]` (mints and prints `<id>:<secret>` once — the short 49-char format; `--view`/`--ro` are meaningful only for mount/any scope, `--owner` required for admin), `list [--view V] [--label S] [--owner S] [--scope P]` (id/owner/label/scope/view/rw/created/last_used/revoked, no secret; with `--view` lists only keys that can open that view, a pure alias also matching a key bound to the real name; `--label`/`--owner` are case-insensitive substrings, `--scope` is exact), `revoke --id ID` (accepts an exact id or a unique prefix), `rotate --id ID` (exact id or unique prefix; mints a fresh secret for an active key's SAME id and prints the new key once — the old secret fails its next handshake, an established session lives until it reconnects, a revoked id refuses rotation — rotate replaces a credential, revoke kills one), `set-ro --id ID [--rw|--ro]` (flips an active key's read-only flag in place: default and `--ro` set read-only, `--rw` restores read-write; moves only the write permission, not liveness/auth, a server-established mount becomes hot-effective within ≤1s no reconnect — a local `--home` mount has no server credential gate and is unaffected by the switch; a revoked id refuses to flip), `calls --limit N` (default 20, read back in reverse order). An MCP client that can't customize the handshake may have the operator export `GROVEFS_MCP_API_KEY='<id>:<secret>'` to **pre-authenticate the whole service process** (`grovefs mcp` establishes its identity with that key at startup, the client's initialize need not carry one again); the mount-side counterpart env is `GROVEFS_API_KEY` (takes effect when `--api-key` isn't passed, keeping the secret off the command line). The `data-server`'s key-DB path is given by `--meta-dir <metadata root>`, **defaulting to the node's first `--data-dir`** — no extra parameter for a same-machine deployment, but a data-disk/metadata-root split deployment must point it right (pointing at a directory with no key ever minted is fail-closed, admitting none). Honest boundary: this key authenticates **the caller at the entrance** — it lets a caller (or not) issue governance write commands, let it (or not) open a view tree, and attributes each admission to a specific key, but does not change the governance semantics itself; the view-binding/read-only dimensions are enforced server-side; live-connection revalidation is **op-driven** (checked only with traffic), so the revoke's closure boundary is "that mount's first server round-trip after the revoke" — a read answered entirely by the kernel cache needs no round-trip and is thus not interrupted (closed on the next round-trip); `--token` and `--require-api-key` may coexist, both must pass. Without `--require-api-key`, server behavior is exactly as with no gate (only the audit still lands as usual). e2e in the `apikey` suite (41 assertions: mint / list / digest-not-landed / no-key-refused · wrong-secret-refused · right-key-admitted / call attribution / revoke-instant-and-row-kept / short-id-prefix revoke / env pre-auth / `list --view` filter / default-no-gate regression / `set-ro` in-place ro↔rw flip · still-authentic-after-flip / short 16+32-hex format / `rotate` prefix-rotation-keeps-id · old-secret-refused · new-secret-admitted · digest-only-on-disk · revoked-refuses-rotation / `list --label·--scope` filters) and the `mountkey` suite (76 assertions: scope minting and typo refusal / six refusal-reason classes carried into the protocol / admission and env fallback (argv doesn't leak the secret) / connection audit down to a specific key and view / scope two-way isolation / revoke closes live mounts with no dirty endpoint / other keys unaffected / token-and-key double-gate AND / the data plane's independent gate / failover carrying the credential / no-gate default path no regression / view-bound key refusing across views with audit attribution / read-only key's server-enforced write refusal / `set-ro` on the same live mount rw→ro refuses write · ro→rw admits · no reconnect).
+Seven subcommands: `create --label L [--for any|mcp|mount|admin] [--owner ACCOUNT] [--view V] [--ro] [--note TEXT] [--ttl DUR]` (mints and prints `<id>:<secret>` once — the short 49-char format; `--view`/`--ro` are meaningful only for mount/any scope, `--owner` required for admin; `--note` is a remark stored with the row, `--ttl` is turned into an absolute `expires_at` by the server — units `s`/`m`/`h`/`d` only, a misspelling is refused), `list [--view V] [--label S] [--owner S] [--scope P] [--note S]` (columns id/key/owner/label/scope/view/rw/created/last_used plus one combined `expires / revoked / note` column, a past-deadline row marked `EXPIRED` — still listed, refused at auth; the key column prints the stored head-4…tail-4 fingerprint, neither plaintext nor ciphertext; with `--view` lists only keys that can open that view, a pure alias also matching a key bound to the real name, and adds how many system-level keys stay unbound; `--label`/`--owner`/`--note` are case-insensitive substrings, `--scope` is exact), `revoke --id ID` (accepts an exact id or a unique prefix), `rotate --id ID` (exact id or unique prefix; mints a fresh secret for an active key's SAME id and prints the new key once — the old secret fails its next handshake, an established session lives until it reconnects, a revoked id refuses rotation — rotate replaces a credential, revoke kills one; the fingerprint the list prints follows the new secret), `set-ro --id ID [--rw|--ro]` (flips an active key's read-only flag in place: default and `--ro` set read-only, `--rw` restores read-write; moves only the write permission, not liveness/auth, a server-established mount becomes hot-effective within ≤1s no reconnect — a local `--home` mount has no server credential gate and is unaffected by the switch; a revoked id refuses to flip), `update --id ID [--note TEXT] [--ttl DUR]` (edits only those two bookkeeping fields — identity, bindings and audit history are untouched: `--note ""` clears a remark, `--ttl never` drops a deadline; passing neither flag is refused instead of no-oping; **it is also the only recovery path for an expired key** — give an `EXPIRED` key a new `--ttl` and the same key authenticates again; a revoked id refuses the edit, revocation stays final), `calls --limit N` (default 20, read back in reverse order). An MCP client that can't customize the handshake may have the operator export `GROVEFS_MCP_API_KEY='<id>:<secret>'` to **pre-authenticate the whole service process** (`grovefs mcp` establishes its identity with that key at startup, the client's initialize need not carry one again); the mount-side counterpart env is `GROVEFS_API_KEY` (takes effect when `--api-key` isn't passed, keeping the secret off the command line). The `data-server`'s key-DB path is given by `--meta-dir <metadata root>`, **defaulting to the node's first `--data-dir`** — no extra parameter for a same-machine deployment, but a data-disk/metadata-root split deployment must point it right (pointing at a directory with no key ever minted is fail-closed, admitting none). Honest boundary: this key authenticates **the caller at the entrance** — it lets a caller (or not) issue governance write commands, let it (or not) open a view tree, and attributes each admission to a specific key, but does not change the governance semantics itself; the view-binding/read-only dimensions are enforced server-side; live-connection revalidation is **op-driven** (checked only with traffic), so the revoke's closure boundary is "that mount's first server round-trip after the revoke" — a read answered entirely by the kernel cache needs no round-trip and is thus not interrupted (closed on the next round-trip); `--token` and `--require-api-key` may coexist, both must pass. Without `--require-api-key`, server behavior is exactly as with no gate (only the audit still lands as usual). e2e in the `apikey` suite (56 assertions: mint / list / digest-not-landed / no-key-refused · wrong-secret-refused · right-key-admitted / call attribution / revoke-instant-and-row-kept / short-id-prefix revoke / env pre-auth / `list --view` filter / default-no-gate regression / `set-ro` in-place ro↔rw flip · still-authentic-after-flip / short 16+32-hex format / `rotate` prefix-rotation-keeps-id · old-secret-refused · new-secret-admitted · digest-only-on-disk · revoked-refuses-rotation / `list --label·--scope·--note` filters / `create --note·--ttl` echoing the remark and the server-computed deadline · `list` carrying both for the row · the key column being the stored head+tail fingerprint while the plaintext never reaches the disk · the fingerprint itself stored (derived from no secret at read time) · `update` clearing a remark and `--ttl never` dropping a deadline · refusing when neither flag is given · a past-deadline row listed as `EXPIRED` and refused at every gate · a new `--ttl` letting the SAME key authenticate again · `update` refusing a revoked id) and the `mountkey` suite (76 assertions: scope minting and typo refusal / six refusal-reason classes carried into the protocol / admission and env fallback (argv doesn't leak the secret) / connection audit down to a specific key and view / scope two-way isolation / revoke closes live mounts with no dirty endpoint / other keys unaffected / token-and-key double-gate AND / the data plane's independent gate / failover carrying the credential / no-gate default path no regression / view-bound key refusing across views with audit attribution / read-only key's server-enforced write refusal / `set-ro` on the same live mount rw→ro refuses write · ro→rw admits · no reconnect).
 
 ### 3.5.2 Governing the same metadata from any machine: the remote control plane (`--control-listen` / `--control-server`)
 
@@ -1274,7 +1329,7 @@ Coverage is split by verb (identical across both backends, see "both backends ta
 | `view create` (incl. `--manifest` text) / `define` / `alias` / `list` / `rm` (delete a definition, `--base` delete a whole tree) | `mount` / `umount` (the mountpoint is local) |
 | `view fork` (whole-tree copy, incl. `--empty`) / `graft` (pick a subset + rename/`--dest`) | `gc --data-dir R` (the SQLite-only form scanning this machine's `blocks/` in place) |
 | `view export` / `import` (chunked up/down; locally only `--out` and the input file) | `du --meta-dir` (local tree files) |
-| `apikey create` / `list` / `rotate` / `revoke` / `set-ro` / `calls` | |
+| `apikey create` / `list` / `rotate` / `revoke` / `set-ro` / `calls` / `update` | |
 | `refs rebuild` | |
 | `gc --data-servers … [--apply]` (the server reads its own tree, bytes enumerated against the data-server) | |
 
@@ -1438,7 +1493,7 @@ bob no longer governs 'main'.
 Semantics and boundaries:
 
 - **What is granted is a base view, not a leaf**: if `grant add --base` is given a lens/alias/fork name, the server walks `resolve_base` (≤ 4 hops) up to its base view and **says so**; from then on every fork, rename or extra lens that grows under that base is automatically inside the grant, with no per-name additions — that is the difference between giving someone a patch of ground and giving them a name.
-- **The gateway subtracts capabilities, it never adds them**: the admin key it holds outranks any signed-in account, so the whitelist of verbs a page may press is **hard-coded at 29** (an op not on it answers `… is not available from the console`), and the five destructive/cross-tenant governance verbs plus `login` are not routed at all; `/api/call` matches exactly, so a prefix trick like `apikey.list/../gc.apply` gets nowhere. Those two lists (the gateway's 29 and the server's ACL table) are maintained in two files, so one unit test, `every_routed_op_has_an_access_rule`, checks that every name in the whitelist has a server-side rule, and another, `destructive_ops_are_not_routable`, pins the verbs that are deliberately not routed — drift is caught by `cargo test --lib` rather than by someone clicking a button.
+- **The gateway subtracts capabilities, it never adds them**: the admin key it holds outranks any signed-in account, so the whitelist of verbs a page may press is **hard-coded at 30** (an op not on it answers `… is not available from the console`), and the five destructive/cross-tenant governance verbs plus `login` are not routed at all; `/api/call` matches exactly, so a prefix trick like `apikey.list/../gc.apply` gets nowhere. Those two lists (the gateway's 30 and the server's ACL table) are maintained in two files, so one unit test, `every_routed_op_has_an_access_rule`, checks that every name in the whitelist has a server-side rule, and another, `destructive_ops_are_not_routable`, pins the verbs that are deliberately not routed — drift is caught by `cargo test --lib` rather than by someone clicking a button.
 - **Identity comes from the server, not from the cookie**: the cookie only says "this browser signed in"; every request is re-authorized as its own account, so revoking a grant or `account disable` takes effect on the **next call**, while `account passwd` does not kick out sessions that are already open (that is the gateway's session table; to stop someone immediately, use `disable`).
 - **Anti-enumeration and throttling**: "no such account" and "wrong password" return byte-identical wording and status codes, with timing padded out; the same client IP that fails 5 times within 15 minutes starts receiving 429 (30s baseline, doubling for each further failure), **even if that attempt's password was correct** — the 429 body carries `retryAfter`.
 - **The control store is not a view**: view trees coexist with `refs.db`, `api_keys.db` and `web_accounts.db` under `meta/`, and which files are not view trees is decided by exactly **one** predicate (`meta::is_view_db`) — otherwise a console account library would appear in `view list` as a mountable fake view and drag `refs rebuild`/`gc`/`fork drop` down with it.
@@ -1447,7 +1502,7 @@ Semantics and boundaries:
 - **The last lock cannot be destroyed**: demoting or deleting the **only enabled administrator** is refused (`'rootops' is the only enabled administrator — create a second admin and verify you can sign in as it before demoting this one`); create the second admin and verify you can sign in as it before touching the first.
 - **Feature flag**: `web` is a default feature on top of `native`; `cargo build --no-default-features --features remote-only` produces a client-only binary without the gateway or the page (and therefore without tiny_http).
 
-e2e in the `web` suite (152 checks: the four install-time flag combinations and "a refused startup does not open the port" / five classes of refusal before the gateway binds / security headers and no anonymous reach / the two wrong-login replies byte-identical (anti-enumeration) / CSRF, Origin and the whitelist verb by verb / headless account creation and delegation (including `--password-stdin`, password policy, `view list` not containing the three control stores, and `refs rebuild` still succeeding) / `bob`'s positive capabilities and each over-reach refusal / rotating his own key's secret through the page route `apikey.rotate` (the id survives, the new plaintext appears only in the reply, and neither plaintext is findable in the store) and refusing to rotate someone else's key / revocation and disable effective on the next call / audit attribution `account=bob@ip` with no bleeding into other people's rows / the export→import tri-state / the last-admin protection tri-state and the second admin unlocking it / the 6th sign-in attempt returning 429 with `retryAfter` / a restart with the same bootstrap flags neither re-seeds nor locks itself, while a different `--admin-user` refuses to start); the server-side storage of accounts and grants on both backends (including PG) is covered by the `webauth`/`meta` unit tests in `cargo test --lib`.
+e2e in the `web` suite (173 checks: the four install-time flag combinations and "a refused startup does not open the port" / five classes of refusal before the gateway binds / security headers and no anonymous reach / the two wrong-login replies byte-identical (anti-enumeration) / CSRF, Origin and the whitelist verb by verb / headless account creation and delegation (including `--password-stdin`, password policy, `view list` not containing the three control stores, and `refs rebuild` still succeeding) / `bob`'s positive capabilities and each over-reach refusal / rotating his own key's secret through the page route `apikey.rotate` (the id survives, the new plaintext appears only in the reply, and neither plaintext is findable in the store) and refusing to rotate someone else's key / a **counting** assertion on the routed whitelist (the page routes exactly 30 governance ops with `apikey.update` among them — an op added to the server's ACL table and forgotten here fails red instead of becoming a broken button in the browser) / the key page's bookkeeping: the remark and the **server-computed** deadline travel in the create reply, the minter is stored, listings carry only the head+tail fingerprint and the stored fingerprint equals the head-4/tail-4 of the plaintext printed once at creation (no listing ever carries the plaintext) / expiry is the server's verdict shipped in the row, a new ttl is the recovery path, a misspelt ttl is refused instead of minting a never-expiring key, editing someone else's bookkeeping is refused and `update` refuses a revoked row / revocation and disable effective on the next call / audit attribution `account=bob@ip` with no bleeding into other people's rows / the export→import tri-state / the last-admin protection tri-state and the second admin unlocking it / the 6th sign-in attempt returning 429 with `retryAfter` / a restart with the same bootstrap flags neither re-seeds nor locks itself, while a different `--admin-user` refuses to start); the server-side storage of accounts and grants on both backends (including PG) is covered by the `webauth`/`meta` unit tests in `cargo test --lib`.
 
 ---
 
@@ -3579,7 +3634,7 @@ Development reference: `src/` (10 main modules + `remote/` + `backend/`), protoc
 | Unmount | `grovefs umount -m MP` |
 | Data service | `grovefs data-server --listen IP:PORT --data-dir DIR [--token T] [--require-api-key [--meta-dir D]]` |
 | Govern the same metadata from any machine (using an account key instead of the db password) | `grovefs view --control-server H --api-key K create\|define\|alias\|list\|rm` (with `--meta-store` replaced by `--control-server`, same as above) |
-| Account key (governance port) | `grovefs --home H apikey create --label L --for admin --owner ACCT` (the first key minted on the disk-holding host) / `apikey --control-server H --api-key K list\|create\|revoke\|rotate\|set-ro\|calls` |
+| Account key (governance port) | `grovefs --home H apikey create --label L --for admin --owner ACCT` (the first key minted on the disk-holding host) / `apikey --control-server H --api-key K list\|create\|revoke\|rotate\|set-ro\|calls\|update` |
 | Open a remote governance port | `grovefs meta-server --meta-dir D --listen IP:PORT --control-listen IP:PORT` (the second port runs only governance verbs, accepts only admin keys, audits per call) |
 | Web console (accounts + base-view delegation) | Install-time seeding: `grovefs meta-server … --control-listen H:P --admin-user A --admin-password-file F` (applies only while the accounts table is empty); start it: `grovefs web --control-server H:P --api-key-file K [--listen 127.0.0.1:8787]`; headless management: `web account create\|list\|passwd\|role\|disable\|enable\|rm` and `web grant add\|rm\|list` (passwords only via `--password-file`/`--password-stdin`, §3.5.3) |
 | Metadata service (PostgreSQL backend) | `grovefs meta-server --meta-store postgres://user:pw@host:5432/db --listen IP:PORT` (under PG `--meta-dir` is optional — the server writes no authoritative data locally) |

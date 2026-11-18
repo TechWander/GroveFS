@@ -1450,10 +1450,12 @@ fn gates(op: &str) -> Result<Vec<Gate>, String> {
         // its own views only (enforced in the arms, which is where the scope and
         // owner of a key are known).
         "apikey.create" | "apikey.list" | "apikey.calls" => vec![Gate::Self_],
-        "apikey.revoke" | "apikey.set_ro" | "apikey.rotate" => vec![Gate::Key("id")],
+        "apikey.revoke" | "apikey.set_ro" | "apikey.rotate" | "apikey.update" => {
+            vec![Gate::Key("id")]
+        }
         other => {
             return Err(format!(
-                "control op '{other}' has no access rule (unknown, or added to the dispatcher \n                     without one) — refusing. Known ops: info, whoami, login, def.list/get/put/remove, \n                     stamp, physical.list/has, fork.has/create/drop/graft, view.create/stats/export/import, \n                     view.rm_base, refs.rebuild, gc.scan/apply, apikey.create/list/revoke/rotate/set_ro/calls, \n                     account.list/create/passwd/role/disable/delete, grant.list/add/remove"
+                "control op '{other}' has no access rule (unknown, or added to the dispatcher \n                     without one) — refusing. Known ops: info, whoami, login, def.list/get/put/remove, \n                     stamp, physical.list/has, fork.has/create/drop/graft, view.create/stats/export/import, \n                     view.rm_base, refs.rebuild, gc.scan/apply, apikey.create/list/revoke/rotate/set_ro/update/calls, \n                     account.list/create/passwd/role/disable/delete, grant.list/add/remove"
             ));
         }
     };
@@ -1688,14 +1690,30 @@ fn control_dispatch(
             let live: usize = rt.subs.lock().values().map(|m| m.len()).sum();
             let engines = rt.cache.lock().len();
             let views = rt.views.lock().len();
-            let (accounts, keys) = (
-                rt.web_auth
-                    .as_ref()
-                    .and_then(|w| w.list().ok().map(|v| v.len())),
-                rt.ctl_keys
-                    .as_ref()
-                    .and_then(|k| k.list().ok().map(|v| v.iter().filter(|r| r.revoked_at.is_none()).count())),
-            );
+            // A key past its deadline can no longer authenticate, so it is not
+            // "live" in any sense an operator means. The two counts are still
+            // reported apart: "4 rows expired and sit in the table" is the
+            // fact that needs acting on, and a single number would hide it.
+            let key_rows = rt.ctl_keys.as_ref().and_then(|k| k.list().ok());
+            let (keys, expired_keys) = match &key_rows {
+                Some(v) => (
+                    Some(
+                        v.iter()
+                            .filter(|r| r.revoked_at.is_none() && !r.expired)
+                            .count(),
+                    ),
+                    Some(
+                        v.iter()
+                            .filter(|r| r.revoked_at.is_none() && r.expired)
+                            .count(),
+                    ),
+                ),
+                None => (None, None),
+            };
+            let accounts = rt
+                .web_auth
+                .as_ref()
+                .and_then(|w| w.list().ok().map(|v| v.len()));
             Ok(json!({
                 "backend": rt.control.backend(),
                 "describe": rt.control.describe(),
@@ -1705,6 +1723,7 @@ fn control_dispatch(
                 "definitions": rt.control.list_defs()?.len(),
                 "accounts": accounts,
                 "liveKeys": keys,
+                "expiredKeys": expired_keys,
                 "liveSessions": live,
                 "residentEngines": engines,
                 "residentViews": views,
@@ -1916,6 +1935,21 @@ fn control_dispatch(
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
             let ro = a.get("ro").and_then(|v| v.as_bool()).unwrap_or(false);
+            // Whitespace is not a remark: trim once and let a blank field be
+            // NULL in the store (and so an empty cell in the console) rather
+            // than a run of spaces that looks like an answer.
+            let note = a
+                .get("note")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string);
+            // A typo in `ttl` is refused HERE, so it cannot silently become a
+            // key that never expires.
+            let expires_at = match a.get("ttl").and_then(|v| v.as_str()) {
+                Some(t) => crate::apikeys::expires_from_ttl(t)?,
+                None => None,
+            };
             let mut owner = a
                 .get("owner")
                 .and_then(|v| v.as_str())
@@ -1955,12 +1989,15 @@ fn control_dispatch(
                 // both read this column, so it cannot be pointed at a colleague.
                 owner = Some(who.account.clone());
             }
-            let (id, full) = keys.create_bound(
+            let (id, full) = keys.create_extended(
                 &label,
                 scope,
                 view.as_deref(),
                 ro,
                 owner.as_deref(),
+                note.as_deref(),
+                expires_at.as_deref(),
+                Some(who.account.as_str()),
             )?;
             Ok(json!({
                 "id": id,
@@ -1968,6 +2005,9 @@ fn control_dispatch(
                 "label": label,
                 "scope": scope.as_str(),
                 "owner": owner,
+                "note": note,
+                "expires_at": expires_at,
+                "created_by": who.account,
             }))
         }
         "apikey.list" => {
@@ -1994,6 +2034,15 @@ fn control_dispatch(
                         "created_at": k.created_at,
                         "last_used_at": k.last_used_at,
                         "revoked_at": k.revoked_at,
+                        // The bookkeeping columns. `expired` is the store's own
+                        // verdict (the same comparison the handshake makes), so
+                        // a console cannot render a key as live that will be
+                        // refused on its next mount.
+                        "note": k.note,
+                        "expires_at": k.expires_at,
+                        "expired": k.expired,
+                        "created_by": k.created_by,
+                        "secret_hint": k.secret_hint,
                     })
                 })
                 .collect();
@@ -2047,6 +2096,52 @@ fn control_dispatch(
                 .ok_or_else(|| "no control key store".to_string())?;
             let ro = a.get("ro").and_then(|v| v.as_bool()).unwrap_or(false);
             Ok(json!(keys.set_ro(&req_str(a, "id")?, ro)?))
+        }
+        // Edit the BOOKKEEPING of one visible active key: its remark and/or its
+        // deadline. Deliberately nothing else — `scope` and the view binding
+        // decide what a credential can reach, and moving those under a live
+        // mount is revoke-and-re-mint territory (see `apikey.rotate`'s rule for
+        // why the identity fields survive a secret change). `Gate::Key` is what
+        // keeps a delegated account out of a stranger's key.
+        "apikey.update" => {
+            let keys = rt
+                .ctl_keys
+                .as_ref()
+                .ok_or_else(|| "no control key store".to_string())?;
+            let id = req_str(a, "id")?;
+            let note = a
+                .get("note")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .map(str::to_string);
+            // Three distinct cases, and the console must be able to express all
+            // of them: absent `ttl` = leave the deadline alone, `ttl: "never"` =
+            // remove it, `ttl: "7d"` = set a new one.
+            let expires_at = match a.get("ttl").and_then(|v| v.as_str()) {
+                Some(t) => Some(crate::apikeys::expires_from_ttl(t)?),
+                None => None,
+            };
+            if note.is_none() && expires_at.is_none() {
+                return Err(
+                    "apikey.update needs `note` and/or `ttl` — the rest of a key is fixed when it \
+                     is minted (scope and view binding are, because a live mount must not have \
+                     its reach moved under it)"
+                        .to_string(),
+                );
+            }
+            if !keys.update_fields(&id, note.as_deref(), expires_at.as_ref().map(Option::as_deref))? {
+                return Err(format!(
+                    "nothing updated for api key '{id}': no ACTIVE row — the id is unknown, or the \
+                     key is revoked (revoke is final). A key that merely EXPIRED is extended here, \
+                     with a new `ttl`"
+                ));
+            }
+            Ok(json!({
+                "ok": true,
+                "id": id,
+                "note": note,
+                "expires_at": expires_at.flatten(),
+            }))
         }
         "apikey.calls" => {
             let keys = rt
@@ -2102,7 +2197,7 @@ fn control_dispatch(
         | "account.disable" | "account.delete" | "grant.list" | "grant.add" | "grant.remove"
         | "view.stats" => web_dispatch(rt, who, op, a),
         other => Err(format!(
-            "unknown control op '{other}' (known: info, store.info, whoami, def.list/get/put/remove, stamp, physical.list/has, fork.has/create/drop/graft, view.create/stats/export/import, view.rm_base, refs.rebuild, gc.scan/apply, apikey.create/list/revoke/set_ro/calls, account.list/create/passwd/role/disable/delete, grant.list/add/remove)"
+            "unknown control op '{other}' (known: info, store.info, whoami, def.list/get/put/remove, stamp, physical.list/has, fork.has/create/drop/graft, view.create/stats/export/import, view.rm_base, refs.rebuild, gc.scan/apply, apikey.create/list/revoke/rotate/set_ro/update/calls, account.list/create/passwd/role/disable/delete, grant.list/add/remove)"
         )),
     }
 }
@@ -2281,6 +2376,9 @@ fn web_dispatch(
                                 .filter(|r| {
                                     r.owner.as_deref() == Some(account.as_str())
                                         && r.revoked_at.is_none()
+                                        // An expired row needs no revoking — it
+                                        // already cannot authenticate.
+                                        && !r.expired
                                 })
                                 .count()
                         })
@@ -3963,7 +4061,8 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
     // Live-credential re-check (`--require-api-key`): at most one store lookup
     // per `KEY_RECHECK` window for this session, so a revoke reaches an
     // ESTABLISHED mount, bounded by the re-check window rather than the next
-    // handshake. The same tick refreshes the key's CURRENT `ro` flag, so
+    // handshake — and so does an elapsed `--ttl`, because `live_state` reports
+    // both as not live. The same tick refreshes the key's CURRENT `ro` flag, so
     // `apikey set-ro` hot-swaps this mount's write verdict without a reconnect.
     let mut next_key_check = Instant::now() + crate::apikeys::KEY_RECHECK;
     // A read-only key (`apikey create --ro`) is refused every write-intent op
@@ -3991,7 +4090,12 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
                 let live = store.live_state(&a.id, crate::apikeys::Scope::Mount);
                 match live {
                     None => {
-                        let why = "authentication failed: this api key has been revoked";
+                        // The real cause, in the handshake's own words: a mount
+                        // cut off by an elapsed `--ttl` must not be told its key
+                        // was revoked (one repair is `apikey update --ttl`, the
+                        // other is re-minting). This sentence is also what the
+                        // client prints on stderr and what the audit row stores.
+                        let why = store.dead_reason(&a.id, crate::apikeys::Scope::Mount);
                         let _ = store.log_call(
                             Some(a),
                             "meta",

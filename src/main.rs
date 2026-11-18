@@ -1367,13 +1367,29 @@ enum ApikeyAction {
         /// audit attributes a call to. Required for `--for admin`.
         #[arg(long)]
         owner: Option<String>,
+        /// Attach a REMARK — free text like "kitchen laptop, staging box, hand
+        /// over at the end of March" (`apikey update --note` edits it later,
+        /// `list --note` searches it). The field that turns a registry of
+        /// hundreds from a guessing game into a list.
+        #[arg(long, value_name = "TEXT")]
+        note: Option<String>,
+        /// Make the key expire after this long: `45m`, `24h`, `7d`, `365d`
+        /// (default: never). The deadline is stored and enforced SERVER-side —
+        /// a key past it fails its next handshake, and a mount already running
+        /// on it is refused on its next op (≤1s) — so a lost or parked laptop
+        /// stops being a credential without anyone remembering to revoke it.
+        /// Extend or remove it later with `apikey update --ttl`.
+        #[arg(long, value_name = "DUR")]
+        ttl: Option<String>,
     },
-    /// List every key (id, label, scope, view binding, ro/rw,
-    /// created/last-used/revoked) — never any secret material. Add `--view NAME`
-    /// to show only the keys that can open that view (a pure alias also matches
-    /// keys bound to its real view). `--label`/`--owner` match case-insensitively
-    /// as substrings, `--scope` narrows to one entrance (`any`/`mount`/`mcp`/
-    /// `admin`) — for a registry too big to scan by eye.
+    /// List every key (id, masked key, owner, label, scope, view binding,
+    /// ro/rw, created/last-used/expires/revoked, remark) — never the secret
+    /// itself, only the 8-hex-digit fingerprint that identifies one row (see
+    /// `apikey rotate` for getting a usable key onto a client again). Add
+    /// `--view NAME` to show only the keys that can open that view (a pure alias
+    /// also matches keys bound to its real view). `--label`/`--owner`/`--note`
+    /// match case-insensitively as substrings, `--scope` narrows to one entrance
+    /// (`any`/`mount`/`mcp`/`admin`) — for a registry too big to scan by eye.
     List {
         /// Only keys that can open this view: an exact `--view` binding, or
         /// (when NAME is a pure alias) keys bound to its real view. Unbound
@@ -1386,6 +1402,10 @@ enum ApikeyAction {
         /// Only keys owned by this account (case-insensitive substring).
         #[arg(long)]
         owner: Option<String>,
+        /// Only keys whose REMARK contains this (case-insensitive substring) —
+        /// the free-text field, so `--note staging` finds the staging keys.
+        #[arg(long, value_name = "TEXT")]
+        note: Option<String>,
         /// Only keys with this exact entrance scope: `any`, `mount`, `mcp` or
         /// `admin`.
         #[arg(long, value_name = "SCOPE")]
@@ -1430,6 +1450,26 @@ enum ApikeyAction {
     Calls {
         #[arg(long, default_value_t = 20)]
         limit: usize,
+    },
+    /// Edit the BOOKKEEPING of an active key in place (short id prefix accepted,
+    /// like `revoke`): its remark (`--note TEXT`, `--note ""` clears it) and its
+    /// deadline (`--ttl 7d` from now, `--ttl never` to remove it). The usual
+    /// reason is an expired key: it authenticates nowhere until it is given a
+    /// new `--ttl`. Nothing else about a key is editable, deliberately — `--for`
+    /// and `--view` decide what a credential can REACH, and moving them under a
+    /// running mount would make the binding a suggestion; mint a new key (or
+    /// `set-ro`, which only moves the write verdict). A revoked id is refused:
+    /// revoke is final.
+    Update {
+        #[arg(long)]
+        id: String,
+        /// Replace the remark (an empty value clears it).
+        #[arg(long, value_name = "TEXT")]
+        note: Option<String>,
+        /// New lifetime measured from NOW (`45m`, `24h`, `7d`, `365d`) or
+        /// `never`.
+        #[arg(long, value_name = "DUR")]
+        ttl: Option<String>,
     },
 }
 
@@ -2140,6 +2180,14 @@ impl KeyAdmin {
                             created_at: s(r, "created_at")?,
                             last_used_at: opt(r, "last_used_at"),
                             revoked_at: opt(r, "revoked_at"),
+                            note: opt(r, "note"),
+                            expires_at: opt(r, "expires_at"),
+                            // The SERVER's verdict — this CLI is a client, and a
+                            // client comparing timestamp strings across timezones
+                            // is how a key looks live when it is not.
+                            expired: r.get("expired").and_then(|x| x.as_bool()).unwrap_or(false),
+                            created_by: opt(r, "created_by"),
+                            secret_hint: opt(r, "secret_hint"),
                         })
                     })
                     .collect()
@@ -2147,6 +2195,14 @@ impl KeyAdmin {
         }
     }
 
+    /// Mint a key. `ttl` is a duration spelling (`7d`) resolved to a deadline by
+    /// whichever side OWNS the clock that will enforce it: the server on the
+    /// remote path (and its answer comes back in the reply), this process on the
+    /// local path. Returns `(id, plaintext, deadline)`, the deadline `None` for a
+    /// key that never expires. `created_by` is deliberately NOT a parameter: the
+    /// remote arm lets the server stamp it from the AUTHENTICATED account (a
+    /// client naming its own minter is a claim, not a record), and the local arm
+    /// has no identity to record — it is the store itself.
     fn create(
         &self,
         label: &str,
@@ -2154,9 +2210,24 @@ impl KeyAdmin {
         view: Option<&str>,
         ro: bool,
         owner: Option<&str>,
-    ) -> Result<(String, String), String> {
+        note: Option<&str>,
+        ttl: Option<&str>,
+    ) -> Result<(String, String, Option<String>), String> {
         match self {
-            Self::Local(k) => k.create_bound(label, scope, view, ro, owner),
+            Self::Local(k) => {
+                let expires = grovefs::apikeys::expires_from_ttl(ttl.unwrap_or(""))?;
+                let (id, full) = k.create_extended(
+                    label,
+                    scope,
+                    view,
+                    ro,
+                    owner,
+                    note,
+                    expires.as_deref(),
+                    None,
+                )?;
+                Ok((id, full, expires))
+            }
             // Closes the credential loop: a key for the ADMINISTRATOR of one
             // deployment is itself minted over that deployment's control plane,
             // so a second operator never needs the server's store either.
@@ -2169,6 +2240,8 @@ impl KeyAdmin {
                         "view": view,
                         "ro": ro,
                         "owner": owner,
+                        "note": note,
+                        "ttl": ttl,
                     }),
                 )?;
                 let id = r.get("id").and_then(|v| v.as_str()).ok_or_else(|| {
@@ -2177,7 +2250,41 @@ impl KeyAdmin {
                 let key = r.get("key").and_then(|v| v.as_str()).ok_or_else(|| {
                     "malformed control reply: apikey.create without a key".to_string()
                 })?;
-                Ok((id.to_string(), key.to_string()))
+                let expires = r
+                    .get("expires_at")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                Ok((id.to_string(), key.to_string(), expires))
+            }
+        }
+    }
+
+    /// Edit one ACTIVE key's remark and/or deadline (`apikey update`). `ttl`
+    /// follows [`Self::create`]'s clock rule; `None` leaves the deadline alone
+    /// and `"never"` removes it. Errors name the row that refused, which on the
+    /// remote path is the server's own sentence about ACL and revocation.
+    fn update(&self, id: &str, note: Option<&str>, ttl: Option<&str>) -> Result<(), String> {
+        match self {
+            Self::Local(k) => {
+                let expires = match ttl {
+                    Some(t) => Some(grovefs::apikeys::expires_from_ttl(t)?),
+                    None => None,
+                };
+                if k.update_fields(id, note, expires.as_ref().map(Option::as_deref))? {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "no ACTIVE api key with id '{id}' — the id is unknown, or the key is revoked \
+                         (revoke is final; mint a new one)"
+                    ))
+                }
+            }
+            Self::Remote(c) => {
+                c.call(
+                    "apikey.update",
+                    serde_json::json!({ "id": id, "note": note, "ttl": ttl }),
+                )?;
+                Ok(())
             }
         }
     }
@@ -3817,6 +3924,8 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                     view,
                     ro,
                     owner,
+                    note,
+                    ttl,
                 } => {
                     let scope = grovefs::apikeys::Scope::parse(&r#for)
                         .map_err(Box::<dyn std::error::Error>::from)?;
@@ -3832,8 +3941,16 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         )
                         .into());
                     }
-                    let (id, full) = keys
-                        .create(&label, scope, view.as_deref(), ro, owner.as_deref())
+                    let (id, full, expires) = keys
+                        .create(
+                            &label,
+                            scope,
+                            view.as_deref(),
+                            ro,
+                            owner.as_deref(),
+                            note.as_deref(),
+                            ttl.as_deref(),
+                        )
                         .map_err(Box::<dyn std::error::Error>::from)?;
                     println!(
                         "apikey created — shown ONCE (only its SHA-256 is stored; save it now):"
@@ -3849,6 +3966,18 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                             "ro (read-only)"
                         } else {
                             "rw (read-write)"
+                        }
+                    );
+                    if let Some(n) = note.as_deref().filter(|t| !t.trim().is_empty()) {
+                        println!("  note:  {n}");
+                    }
+                    // Echoed from the side that stored it, so a deadline printed
+                    // here is the deadline the handshake will compare against.
+                    println!(
+                        "  expires: {}",
+                        match &expires {
+                            Some(e) => e.as_str(),
+                            None => "never (set one with --ttl, or `apikey update --ttl`)",
                         }
                     );
                     println!("  key:   {full}");
@@ -3896,6 +4025,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                     view,
                     label,
                     owner,
+                    note,
                     scope,
                 } => {
                     let all = keys.list()?;
@@ -3954,6 +4084,15 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                                 .as_deref()
                                 .is_none_or(|q| r.scope.eq_ignore_ascii_case(q))
                         })
+                        .filter(|r| {
+                            note.as_deref().is_none_or(|q| {
+                                r.note
+                                    .as_deref()
+                                    .unwrap_or("")
+                                    .to_lowercase()
+                                    .contains(&q.to_lowercase())
+                            })
+                        })
                         .collect();
                     if all.is_empty() && view.is_none() {
                         println!(
@@ -3962,14 +4101,39 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         return Ok(());
                     }
                     println!(
-                        "{:<3} {:<18} {:<16} {:<16} {:<7} {:<12} {:<4} {:<25} {:<25} revoked",
-                        "#", "id", "owner", "label", "scope", "view", "rw", "created", "last_used"
+                        "{:<3} {:<18} {:<12} {:<16} {:<16} {:<7} {:<12} {:<4} {:<25} {:<25} {}",
+                        "#",
+                        "id",
+                        "key",
+                        "owner",
+                        "label",
+                        "scope",
+                        "view",
+                        "rw",
+                        "created",
+                        "last_used",
+                        "expires / revoked / note"
                     );
                     for (i, r) in rows.iter().enumerate() {
+                        // The three tail fields share one trailing column: each is
+                        // optional, and a fixed 3 more padded columns would push the
+                        // note — the one field worth reading in full — off the edge.
+                        let mut tail = match (r.revoked_at.as_deref(), r.expired) {
+                            (Some(t), _) => format!("revoked {t}"),
+                            (None, true) => format!("EXPIRED {}", r.expires_at.as_deref().unwrap_or("")),
+                            (None, false) => match r.expires_at.as_deref() {
+                                Some(e) => format!("expires {e}"),
+                                None => "never".to_string(),
+                            },
+                        };
+                        if let Some(n) = r.note.as_deref().filter(|t| !t.is_empty()) {
+                            tail.push_str(&format!(" | note: {n}"));
+                        }
                         println!(
-                            "{:<3} {:<18} {:<16} {:<16} {:<7} {:<12} {:<4} {:<25} {:<25} {}",
+                            "{:<3} {:<18} {:<12} {:<16} {:<16} {:<7} {:<12} {:<4} {:<25} {:<25} {}",
                             i + 1,
                             r.id,
+                            r.secret_hint.as_deref().unwrap_or("-"),
                             r.owner.as_deref().unwrap_or("-"),
                             r.label,
                             r.scope,
@@ -3977,7 +4141,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                             if r.ro { "ro" } else { "rw" },
                             r.created_at,
                             r.last_used_at.as_deref().unwrap_or("-"),
-                            r.revoked_at.as_deref().unwrap_or("-"),
+                            tail,
                         );
                     }
                     if let Some(v) = &view {
@@ -4131,6 +4295,66 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                             } else {
                                 return Err(
                                     format!("apikey id='{}' became revoked concurrently", k.id).into()
+                                );
+                            }
+                        }
+                        n => {
+                            return Err(format!(
+                                "ambiguous id prefix '{id}' matches {n} keys — use a longer prefix or the full id"
+                            )
+                            .into())
+                        }
+                    }
+                }
+                ApikeyAction::Update { id, note, ttl } => {
+                    if note.is_none() && ttl.is_none() {
+                        return Err(
+                            "nothing to update: pass --note TEXT and/or --ttl DUR (`--ttl never` removes a deadline)"
+                                .into(),
+                        );
+                    }
+                    // Same id resolution as `revoke`: exact, else a UNIQUE prefix.
+                    let all = keys.list()?;
+                    let resolved: Vec<_> = if let Some(e) = all.iter().find(|k| k.id == id) {
+                        vec![e]
+                    } else {
+                        all.iter()
+                            .filter(|k| k.id.starts_with(id.as_str()))
+                            .collect()
+                    };
+                    match resolved.len() {
+                        0 => {
+                            return Err(format!(
+                                "no api key with id '{id}' (see `grovefs apikey list`)"
+                            )
+                            .into())
+                        }
+                        1 => {
+                            let k = resolved[0];
+                            if k.revoked_at.is_some() {
+                                return Err(format!(
+                                    "apikey id='{}' is revoked — update edits nothing on a dead key (mint a new one)",
+                                    k.id
+                                )
+                                .into());
+                            }
+                            keys.update(&k.id, note.as_deref(), ttl.as_deref())?;
+                            // Re-read the row instead of echoing the flags: on the
+                            // remote path the SERVER resolved `--ttl` against its own
+                            // clock, and that answer is the one worth printing.
+                            let after = keys.list()?.into_iter().find(|x| x.id == k.id);
+                            println!("apikey updated: id='{}' (label '{}')", k.id, k.label);
+                            if let Some(x) = after {
+                                println!("  note:    {}", x.note.as_deref().unwrap_or("<none>"));
+                                println!(
+                                    "  expires: {}",
+                                    match x.expires_at.as_deref() {
+                                        Some(e) if x.expired => format!(
+                                            "{e}  (EXPIRED — it authenticates nowhere until --ttl gives it a new deadline)"
+                                        ),
+                                        Some(e) => e.to_string(),
+                                        None => "never".to_string(),
+                                    }
                                 );
                             }
                         }
