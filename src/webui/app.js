@@ -53,6 +53,8 @@ const I18N_ZH = {
   'Account': '账号',
   'Password': '口令',
   'password': '口令',
+  'copy': '复制',
+  'copied to clipboard': '已复制到剪贴板',
   'Overview': '总览',
   'Views': '视图',
   'Keys': '密钥',
@@ -363,12 +365,43 @@ function el(tag, attrs, ...kids) {
 }
 
 const clear = (n) => { while (n && n.firstChild) n.removeChild(n.firstChild); return n; };
+/** Same contract as el(), for SVG namespaces — document.createElement('svg')
+    would build an HTMLUnknownElement that renders nothing. */
+function svgEl(tag, attrs, ...kids) {
+  const n = document.createElementNS('http://www.w3.org/2000/svg', tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v === null || v === undefined || v === false) continue;
+    n.setAttribute(k, v === true ? '' : String(v));
+  }
+  for (const kid of kids.flat(4)) if (kid) n.append(kid);
+  return n;
+}
 const wrap = (...nodes) => el('div', null, ...nodes);
 
 function toast(msg, kind) {
   const node = el('div', { class: 'toast ' + (kind || '') }, String(msg));
   $('toast-host').appendChild(node);
   setTimeout(() => node.remove(), kind === 'bad' ? 15000 : 5000);
+}
+
+/** Copy to the clipboard. The console usually runs on plain HTTP inside the
+    cluster, where the async Clipboard API is unavailable (secure-context
+    only) — fall back to the deprecated-but-working execCommand path, with
+    the probe textarea styled by class (CSP forbids inline style). */
+function copyText(txt) {
+  const done = () => toast(t('copied to clipboard'), 'good');
+  const fallback = () => {
+    const ta = document.createElement('textarea');
+    ta.value = txt;
+    ta.className = 'copy-probe';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); done(); } catch { /* nothing else to try */ }
+    ta.remove();
+  };
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(txt).then(done, fallback);
+  } else fallback();
 }
 
 /**
@@ -406,13 +439,21 @@ function ask(title, lines, confirmText) {
   });
 }
 
+/** The shared "nothing here" glyph: a stroke inbox, tinted by its cell. */
+const EMPTY_ICON = () => svgEl('svg', {
+  viewBox: '0 0 24 24', width: 26, height: 26, fill: 'none',
+  stroke: 'currentColor', 'stroke-width': 1.5, 'stroke-linejoin': 'round', 'aria-hidden': 'true',
+},
+  svgEl('path', { d: 'M5 6h14l3 7v6a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1v-6l3-7z' }),
+  svgEl('path', { d: 'M2 13h5l1.5 2.5h7L17 13h5' }));
+
 function tableNode(cols, rows, emptyText) {
   const node = el('table');
   node.appendChild(el('thead', null, el('tr', null, cols.map((c) => el('th', null, c.t)))));
   const body = el('tbody');
   if (!rows || !rows.length) {
-    body.appendChild(el('tr', null, el('td', { colspan: cols.length, class: 'muted' },
-      emptyText || t('nothing here'))));
+    body.appendChild(el('tr', null, el('td', { colspan: cols.length, class: 'empty' },
+      EMPTY_ICON(), el('div', null, emptyText || t('nothing here')))));
   }
   for (const r of rows || []) {
     body.appendChild(el('tr', null, cols.map((c) => {
@@ -644,7 +685,10 @@ async function pageOverview(root) {
   root.appendChild(pageHead(t('Overview'), t('Deployment snapshot, your reach and the latest governance activity.')));
   const info = await api('info', {});
   const cards = el('div', { class: 'cards' });
-  const card = (k, v, sub) => cards.appendChild(el('div', { class: 'card' },
+  const card = (k, v, sub, page) => cards.appendChild(el('div', {
+    class: 'card' + (page ? ' link-card' : ''),
+    ...(page ? { onclick: () => go(page), onkeydown: (ev) => { if (ev.key === 'Enter') go(page); }, tabindex: '0', role: 'button' } : {}),
+  },
     el('div', { class: 'n' }, (v === null || v === undefined) ? '—' : String(v)),
     el('div', { class: 'k' }, k),
     sub ? hint(sub) : null));
@@ -654,12 +698,12 @@ async function pageOverview(root) {
 
   if (isSuper()) {
     const si = await api('store.info', {});
-    card(t('base views'), si.views);
-    card(t('definitions'), si.definitions);
-    card(t('accounts'), si.accounts);
-    card(t('live keys'), si.liveKeys);
-    card(t('mount sessions'), si.liveSessions);
-    card(t('open trees'), si.residentEngines, t('engines this server is holding'));
+    card(t('base views'), si.views, null, 'views');
+    card(t('definitions'), si.definitions, null, 'views');
+    card(t('accounts'), si.accounts, null, 'accounts');
+    card(t('live keys'), si.liveKeys, null, 'keys');
+    card(t('mount sessions'), si.liveSessions, null, 'views');
+    card(t('open trees'), si.residentEngines, t('engines this server is holding'), 'views');
     root.appendChild(cards);
     root.appendChild(bar(el('h2', null, t('This deployment'))));
     root.appendChild(el('dl', { class: 'kv' },
@@ -669,7 +713,7 @@ async function pageOverview(root) {
       el('dt', null, t('first owner')), el('dd', { class: 'muted' },
         t('created by `meta-server --admin-user` while the account store was empty; the rest come from the Accounts page'))));
   } else {
-    card(t('base views you govern'), (ST.who.bases || []).length);
+    card(t('base views you govern'), (ST.who.bases || []).length, null, 'views');
     root.appendChild(cards);
     root.appendChild(bar(el('h2', null, t('Your reach'))));
     root.appendChild(el('p', { class: 'muted' },
@@ -689,9 +733,15 @@ async function pageOverview(root) {
   root.appendChild(calls.ok ? auditTable(calls.r) : el('p', { class: 'err' }, calls.error));
 }
 
+/** ISO stamps are half a table wide; show MM-DD HH:MM:SS and keep the full
+    stamp one hover away (title). */
+const shortTime = (ts) => (typeof ts === 'string' && ts.length >= 19
+  ? ts.slice(5, 19).replace('T', ' ') : String(ts ?? ''));
+const shortStampCell = (ts) => el('span', { title: ts || '' }, shortTime(ts));
+
 function auditTable(rows, emptyText) {
   return tableNode([
-    { t: t('when'), k: 'ts', class: 'mono' },
+    { t: t('when'), render: (r) => shortStampCell(r.ts), class: 'mono' },
     { t: t('key'), render: (r) => r.key_label || r.key_id || null, class: 'mono' },
     { t: t('plane'), k: 'method', class: 'mono' },
     { t: t('op'), k: 'tool', class: 'mono' },
@@ -1017,12 +1067,13 @@ async function pageKeys(root) {
     // request asked for, because the create reply reports the key, not the row.
     modal(t('New api key'), wrap(
       el('p', null, t('This is the only time the secret is shown — GroveFS stores a digest.')),
-      el('p', { class: 'secret' }, r.key),
+      el('div', { class: 'secret-card' },
+        el('code', { class: 'secret' }, r.key),
+        el('button', { type: 'button', class: 'link', onclick: () => copyText(r.key) }, t('copy'))),
       el('p', { class: 'muted' }, t('label ${l} · scope ${s} · owner ${o} · ${b}', {
         l: r.label, s: r.scope, o: r.owner || '—',
         b: args.view ? t('bound to ${v}', { v: args.view }) : t('not bound to a view'),
-      })),
-      el('pre', null, r.key)),
+      }))),
     [{ t: t('I have saved it'), onclick: (btn, err, close) => close() }]);
     await reload();
   }));
@@ -1039,8 +1090,8 @@ async function pageKeys(root) {
     { t: t('scope'), k: 'scope', class: 'mono' },
     { t: t('view'), render: (r) => r.view || el('span', { class: 'muted' }, t('any view')) },
     { t: t('mode'), render: (r) => (r.ro ? t('ro') : t('rw')) },
-    { t: t('created'), k: 'created_at', class: 'muted' },
-    { t: t('last used'), k: 'last_used_at', class: 'muted' },
+    { t: t('created'), render: (r) => shortStampCell(r.created_at), class: 'muted' },
+    { t: t('last used'), render: (r) => shortStampCell(r.last_used_at), class: 'muted' },
     { t: t('state'), render: (r) => (r.revoked_at ? el('span', { class: 'badge off' }, t('revoked')) : el('span', { class: 'badge on-state' }, t('live'))) },
     {
       t: '', class: 'actions', render: (r) => (r.revoked_at ? null : el('div', { class: 'row' }, roBtn(r), revokeBtn(r))),
@@ -1136,8 +1187,8 @@ async function pageAccounts(root) {
     { t: t('account'), k: 'account', class: 'mono' },
     { t: t('role'), render: (r) => el('span', { class: 'badge ' + (r.role === 'admin' ? 'admin' : '') }, r.role) },
     { t: t('delegated bases'), render: (r) => ((r.bases || []).length ? (r.bases || []).join(', ') : el('span', { class: 'muted' }, t('none'))) },
-    { t: t('created'), k: 'created_at', class: 'muted' },
-    { t: t('last sign-in'), k: 'last_login_at', class: 'muted' },
+    { t: t('created'), render: (r) => shortStampCell(r.created_at), class: 'muted' },
+    { t: t('last sign-in'), render: (r) => shortStampCell(r.last_login_at), class: 'muted' },
     { t: t('state'), render: (r) => (r.disabled_at ? el('span', { class: 'badge off' }, t('disabled')) : el('span', { class: 'badge on-state' }, t('enabled'))) },
     {
       t: '', class: 'actions', render: (r) => el('div', { class: 'row' },

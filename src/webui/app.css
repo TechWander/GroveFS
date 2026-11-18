@@ -20,7 +20,7 @@
   --bg: #f5f7fa;
   --bg2: #ffffff;
   --bg3: #e8edf3;
-  --line: #c6d1dc;
+  --line: #cdd8e3;
   --fg: #1a2733;
   --fg-dim: #5a6b7d;
   --accent: #1663b3;
@@ -90,7 +90,7 @@ td, .card .n { font-variant-numeric: tabular-nums; }
   width: 22rem;
   background: var(--bg2);
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: 14px;
   padding: 1.5rem;
   position: relative;
   overflow: hidden;
@@ -125,12 +125,15 @@ td, .card .n { font-variant-numeric: tabular-nums; }
 
 /* ---- chrome ---- */
 
+/* Modern chrome: the sticky header floats over the page on a blur, so the
+   content scrolling under it stays readable without a heavy bar. */
 header {
   display: flex;
   align-items: center;
   gap: 1.25rem;
   padding: .5rem 1.25rem;
-  background: var(--bg2);
+  background: #ffffffd9;
+  backdrop-filter: blur(8px);
   border-bottom: 1px solid var(--line);
   box-shadow: var(--shadow-sm);
   position: sticky;
@@ -173,7 +176,7 @@ main { padding: 1.25rem 1.5rem 2rem; max-width: 1500px; margin: 0 auto; }
     page → section → panel, without ever two titles of the same weight. ---- */
 .page-head { display: flex; align-items: flex-end; gap: 1rem; margin: .1rem 0 1.15rem; }
 .page-head .ph-t { min-width: 0; flex: 1; }
-.page-head h2 { margin: 0; font-size: 19px; letter-spacing: .01em; }
+.page-head h2 { margin: 0; font-size: 22px; letter-spacing: .01em; font-weight: 650; }
 .page-head .ph-t .muted { margin: .2rem 0 0; }
 .page-head .ph-a { display: flex; gap: .5rem; align-items: center; white-space: nowrap; padding-bottom: .15rem; }
 
@@ -222,6 +225,7 @@ button {
   transition: background .12s, border-color .12s;
 }
 button:hover { border-color: var(--accent); }
+button:active:not(:disabled) { transform: translateY(1px); }
 button:disabled { opacity: .45; cursor: default; }
 button.primary {
   background: linear-gradient(180deg, #1c72c9, #1663b3);
@@ -258,7 +262,7 @@ label { font-size: 12px; color: var(--fg-dim); }
 .panel {
   background: var(--bg2);
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: 10px;
   padding: .75rem;
   margin-bottom: 1rem;
   display: flex;
@@ -281,6 +285,20 @@ label { font-size: 12px; color: var(--fg-dim); }
   text-transform: uppercase;
   letter-spacing: .04em;
 }
+
+/* The one-time secret: the highest-value moment of the keys page — give it a
+   soft accent card of its own, with the copy action beside the value. */
+.secret-card {
+  display: flex;
+  align-items: center;
+  gap: .6rem;
+  background: var(--accent-soft);
+  border: 1px solid #bcd4ef;
+  border-radius: 8px;
+  padding: .55rem .75rem;
+}
+.secret-card .secret { margin: 0; flex: 1; min-width: 0; color: var(--accent); font-weight: 600; }
+.copy-probe { position: fixed; top: 0; left: 0; opacity: 0; pointer-events: none; }
 
 .badge {
   border: 1px solid var(--line);
@@ -306,7 +324,7 @@ label { font-size: 12px; color: var(--fg-dim); }
 .col-narrow, .col-wide { min-width: 0; }
 @media (max-width: 900px) { .split { grid-template-columns: 1fr; } }
 
-.list { list-style: none; margin: 0 0 1rem; padding: 0; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; box-shadow: var(--shadow-sm); }
+.list { list-style: none; margin: 0 0 1rem; padding: 0; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; box-shadow: var(--shadow-sm); background: var(--bg2); }
 .list li { padding: .3rem .6rem; border-bottom: 1px solid var(--line); cursor: pointer; display: flex; gap: .5rem; align-items: baseline; }
 .list li:last-child { border-bottom: none; }
 .list li:hover { background: var(--bg3); }
@@ -327,8 +345,8 @@ label { font-size: 12px; color: var(--fg-dim); }
 .card {
   background: var(--bg2);
   border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: .7rem .8rem;
+  border-radius: 10px;
+  padding: .8rem .9rem;
   box-shadow: var(--shadow-sm);
   transition: transform .12s, box-shadow .12s;
   position: relative;
@@ -338,13 +356,30 @@ label { font-size: 12px; color: var(--fg-dim); }
 .card::before { content: ""; position: absolute; inset: 0 0 auto 0; height: 3px; background: var(--accent); opacity: .5; }
 .card:hover { transform: translateY(-1px); box-shadow: var(--shadow-md); }
 .card:hover::before { opacity: .85; }
-.card .n { font-size: 23px; font-weight: 650; color: var(--accent); }
+.card .n { font-size: 28px; font-weight: 650; color: var(--accent); }
 .card .k { font-size: 12px; color: var(--fg-dim); }
+/* Cards that are also links: an arrow fades in at the corner, so the
+   affordance is visible before the first click. */
+.card.link-card { cursor: pointer; }
+.card.link-card::after {
+  content: "→";
+  position: absolute;
+  right: .75rem;
+  bottom: .55rem;
+  color: var(--accent);
+  font-weight: 600;
+  opacity: 0;
+  transform: translateX(-4px);
+  transition: opacity .12s, transform .12s;
+}
+.card.link-card:hover::after, .card.link-card:focus-visible::after { opacity: .9; transform: none; }
 
-.tbl-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; box-shadow: var(--shadow-sm); background: var(--bg2); }
+.tbl-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow-sm); background: var(--bg2); }
 table { border-collapse: collapse; width: 100%; font-size: 13px; }
 th, td { text-align: left; padding: .34rem .6rem; border-bottom: 1px solid var(--line); vertical-align: top; }
-th { background: var(--bg3); color: var(--fg-dim); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; white-space: nowrap; border-bottom: 2px solid var(--line); }
+/* Headings ride on the card ground with a heavier rule below — lighter than
+   a filled band, still unmistakably a header row. */
+th { color: var(--fg-dim); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; white-space: nowrap; border-bottom: 2px solid var(--line); }
 tbody tr:nth-child(even) { background: #fafcfe; }
 tbody tr:last-child td { border-bottom: none; }
 tbody tr:hover { background: #eef3f8; }
@@ -356,8 +391,11 @@ td.wrap { word-break: break-all; }
 /* The empty state is the only row in its tbody — center it instead of a
    left-hugging lone sentence. */
 tbody tr:only-child td[colspan] { text-align: center; padding: 1.3rem .6rem; }
+/* The empty state: a stroke inbox above the sentence, centered and dim. */
+td.empty { text-align: center; padding: 1.9rem .6rem !important; color: var(--fg-dim); }
+td.empty svg { display: block; margin: 0 auto .5rem; opacity: .45; }
 
-.detail { background: var(--bg2); border: 1px solid var(--line); border-radius: 8px; padding: 1rem; box-shadow: var(--shadow-sm); }
+.detail { background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; padding: 1rem; box-shadow: var(--shadow-sm); }
 .detail .head { display: flex; align-items: center; gap: .6rem; margin-bottom: .75rem; padding-bottom: .6rem; border-bottom: 1px solid var(--line); }
 .detail .head h2 { margin: 0; font-size: 17px; }
 .kv { display: grid; grid-template-columns: max-content 1fr; gap: .15rem .9rem; font-size: 13px; margin-bottom: 1rem; }
@@ -405,7 +443,7 @@ pre {
 .modal {
   background: var(--bg2);
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: 14px;
   padding: 1.1rem;
   width: min(34rem, 92vw);
   max-height: 88vh;
