@@ -1450,10 +1450,10 @@ fn gates(op: &str) -> Result<Vec<Gate>, String> {
         // its own views only (enforced in the arms, which is where the scope and
         // owner of a key are known).
         "apikey.create" | "apikey.list" | "apikey.calls" => vec![Gate::Self_],
-        "apikey.revoke" | "apikey.set_ro" => vec![Gate::Key("id")],
+        "apikey.revoke" | "apikey.set_ro" | "apikey.rotate" => vec![Gate::Key("id")],
         other => {
             return Err(format!(
-                "control op '{other}' has no access rule (unknown, or added to the dispatcher \n                     without one) — refusing. Known ops: info, whoami, login, def.list/get/put/remove, \n                     stamp, physical.list/has, fork.has/create/drop/graft, view.create/stats/export/import, \n                     view.rm_base, refs.rebuild, gc.scan/apply, apikey.create/list/revoke/set_ro/calls, \n                     account.list/create/passwd/role/disable/delete, grant.list/add/remove"
+                "control op '{other}' has no access rule (unknown, or added to the dispatcher \n                     without one) — refusing. Known ops: info, whoami, login, def.list/get/put/remove, \n                     stamp, physical.list/has, fork.has/create/drop/graft, view.create/stats/export/import, \n                     view.rm_base, refs.rebuild, gc.scan/apply, apikey.create/list/revoke/rotate/set_ro/calls, \n                     account.list/create/passwd/role/disable/delete, grant.list/add/remove"
             ));
         }
     };
@@ -2005,6 +2005,40 @@ fn control_dispatch(
                 .as_ref()
                 .ok_or_else(|| "no control key store".to_string())?;
             Ok(json!(keys.revoke(&req_str(a, "id")?)?))
+        }
+        // Replace the secret of one VISIBLE active key (the `Gate::Key` rule
+        // above is what enforces that; it is revoke's and set_ro's rule). The
+        // reply shape mirrors `apikey.create` — a plaintext key for one-time
+        // display — because the operation it spares is "revoke, re-mint, and
+        // re-point every binding by hand".
+        "apikey.rotate" => {
+            let keys = rt
+                .ctl_keys
+                .as_ref()
+                .ok_or_else(|| "no control key store".to_string())?;
+            let id = req_str(a, "id")?;
+            let row = keys
+                .list()?
+                .into_iter()
+                .find(|k| k.id == id)
+                .ok_or_else(|| format!("no api key with id '{id}'"))?;
+            if !key_visible(rt, who, &row) {
+                return Err(format!(
+                    "account '{}' may not rotate '{id}': the key belongs to another account \
+                     and is not bound to a view it governs",
+                    who.account
+                ));
+            }
+            let full = keys
+                .rotate(&id)?
+                .ok_or_else(|| "api key is revoked — rotate revives nothing, revoke is final".to_string())?;
+            Ok(json!({
+                "id": id,
+                "key": full,
+                "label": row.label,
+                "scope": row.scope,
+                "owner": row.owner,
+            }))
         }
         "apikey.set_ro" => {
             let keys = rt

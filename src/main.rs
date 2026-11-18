@@ -1328,8 +1328,9 @@ enum ViewAction {
 #[derive(Subcommand)]
 enum ApikeyAction {
     /// Mint a new key labeled `--label` and print the full plaintext
-    /// `<id>:<secret>` ONCE (it is not recoverable afterward — only its
-    /// SHA-256 is stored). Give this to the agent/client; it presents it as
+    /// `<id>:<secret>` ONCE (the secret is not recoverable afterward — only its
+    /// SHA-256 is stored; `apikey rotate` mints a fresh secret for the same id
+    /// when one is lost). Give this to the agent/client; it presents it as
     /// `apiKey` in the MCP `initialize` params, or as `mount --api-key` for a
     /// `meta-server`/`data-server` started with `--require-api-key`.
     Create {
@@ -1370,17 +1371,41 @@ enum ApikeyAction {
     /// List every key (id, label, scope, view binding, ro/rw,
     /// created/last-used/revoked) — never any secret material. Add `--view NAME`
     /// to show only the keys that can open that view (a pure alias also matches
-    /// keys bound to its real view).
+    /// keys bound to its real view). `--label`/`--owner` match case-insensitively
+    /// as substrings, `--scope` narrows to one entrance (`any`/`mount`/`mcp`/
+    /// `admin`) — for a registry too big to scan by eye.
     List {
         /// Only keys that can open this view: an exact `--view` binding, or
         /// (when NAME is a pure alias) keys bound to its real view. Unbound
         /// system keys admit every view and are summarized separately.
         #[arg(long)]
         view: Option<String>,
+        /// Only keys whose label contains this (case-insensitive).
+        #[arg(long)]
+        label: Option<String>,
+        /// Only keys owned by this account (case-insensitive substring).
+        #[arg(long)]
+        owner: Option<String>,
+        /// Only keys with this exact entrance scope: `any`, `mount`, `mcp` or
+        /// `admin`.
+        #[arg(long, value_name = "SCOPE")]
+        scope: Option<String>,
     },
     /// Revoke the key with id `--id` (short id prefix accepted). Revoked keys
     /// fail authentication but stay listed so past audit rows keep attribution.
     Revoke {
+        #[arg(long)]
+        id: String,
+    },
+    /// Replace the secret of an ACTIVE key in place (`--id`, short id prefix
+    /// accepted, like `revoke`) and print the NEW `<id>:<secret>` ONCE — the
+    /// recovery path when the secret of a live credential is lost, sparing the
+    /// revoke-repair dance: the id, label, scope, view binding, ro flag, owner
+    /// and audit history all survive untouched. The old secret fails its next
+    /// handshake; a session already established on it lives until it
+    /// reconnects (rotation replaces a credential, only revocation kills one
+    /// now). A revoked id is refused — rotate never half-resurrects a key.
+    Rotate {
         #[arg(long)]
         id: String,
     },
@@ -2164,6 +2189,18 @@ impl KeyAdmin {
                 .call("apikey.revoke", serde_json::json!({ "id": id }))?
                 .as_bool()
                 .unwrap_or(false)),
+        }
+    }
+
+    /// Replace an active key's secret; like `create`, yields the new plaintext
+    /// for exactly one display (nothing here ever persists it).
+    fn rotate(&self, id: &str) -> Result<Option<String>, String> {
+        match self {
+            Self::Local(k) => k.rotate(id),
+            Self::Remote(c) => {
+                let r = c.call("apikey.rotate", serde_json::json!({ "id": id }))?;
+                Ok(r.get("key").and_then(|v| v.as_str()).map(str::to_string))
+            }
         }
     }
 
@@ -3855,7 +3892,12 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     );
                 }
-                ApikeyAction::List { view } => {
+                ApikeyAction::List {
+                    view,
+                    label,
+                    owner,
+                    scope,
+                } => {
                     let all = keys.list()?;
                     // Resolve an alias name to its real view so keys bound to
                     // the real name also show under `--view <alias>` — read from
@@ -3890,6 +3932,28 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                                         .is_some_and(|x| r.view.as_deref() == Some(x))
                             }
                         })
+                        // Substring searches on the human-facing columns and an
+                        // exact one on scope — a registry of hundreds is only
+                        // manageable if `list` can slice it without `jq`.
+                        .filter(|r| {
+                            label
+                                .as_deref()
+                                .is_none_or(|q| r.label.to_lowercase().contains(&q.to_lowercase()))
+                        })
+                        .filter(|r| {
+                            owner.as_deref().is_none_or(|q| {
+                                r.owner
+                                    .as_deref()
+                                    .unwrap_or("")
+                                    .to_lowercase()
+                                    .contains(&q.to_lowercase())
+                            })
+                        })
+                        .filter(|r| {
+                            scope
+                                .as_deref()
+                                .is_none_or(|q| r.scope.eq_ignore_ascii_case(q))
+                        })
                         .collect();
                     if all.is_empty() && view.is_none() {
                         println!(
@@ -3898,12 +3962,12 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         return Ok(());
                     }
                     println!(
-                        "{:<3} {:<34} {:<16} {:<16} {:<7} {:<12} {:<4} {:<25} {:<25} revoked",
+                        "{:<3} {:<18} {:<16} {:<16} {:<7} {:<12} {:<4} {:<25} {:<25} revoked",
                         "#", "id", "owner", "label", "scope", "view", "rw", "created", "last_used"
                     );
                     for (i, r) in rows.iter().enumerate() {
                         println!(
-                            "{:<3} {:<34} {:<16} {:<16} {:<7} {:<12} {:<4} {:<25} {:<25} {}",
+                            "{:<3} {:<18} {:<16} {:<16} {:<7} {:<12} {:<4} {:<25} {:<25} {}",
                             i + 1,
                             r.id,
                             r.owner.as_deref().unwrap_or("-"),
@@ -3965,6 +4029,59 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                             } else {
                                 println!("apikey: id='{}' became revoked concurrently", k.id);
                             }
+                        }
+                        n => {
+                            return Err(format!(
+                                "ambiguous id prefix '{id}' matches {n} keys — use a longer prefix or the full id"
+                            )
+                            .into())
+                        }
+                    }
+                }
+                ApikeyAction::Rotate { id } => {
+                    // Same id resolution as `revoke`: exact, else a UNIQUE prefix.
+                    let all = keys.list()?;
+                    let resolved: Vec<_> = if let Some(e) = all.iter().find(|k| k.id == id) {
+                        vec![e]
+                    } else {
+                        all.iter()
+                            .filter(|k| k.id.starts_with(id.as_str()))
+                            .collect()
+                    };
+                    match resolved.len() {
+                        0 => {
+                            return Err(format!(
+                                "no api key with id '{id}' (see `grovefs apikey list`)"
+                            )
+                            .into())
+                        }
+                        1 => {
+                            let k = resolved[0];
+                            if k.revoked_at.is_some() {
+                                return Err(format!(
+                                    "apikey id='{}' is revoked — rotate revives nothing (mint a new key)",
+                                    k.id
+                                )
+                                .into());
+                            }
+                            let Some(full) = keys.rotate(&k.id)? else {
+                                return Err(format!(
+                                    "apikey id='{}' became revoked concurrently",
+                                    k.id
+                                )
+                                .into());
+                            };
+                            println!("apikey rotated — NEW key shown ONCE (only its SHA-256 is stored; save it now):");
+                            println!("  id:    {}", k.id);
+                            println!("  owner: {}", k.owner.as_deref().unwrap_or("<none>"));
+                            println!("  label: {}", k.label);
+                            println!("  scope: {}", k.scope);
+                            println!("  view:  {}", k.view.as_deref().unwrap_or("<any>"));
+                            println!("  key:   {full}");
+                            println!();
+                            println!("  the id and every binding are unchanged — only the secret was replaced;");
+                            println!("  the OLD secret fails its next handshake, and a live mount established on it");
+                            println!("  stays open until it reconnects — `apikey revoke` is the kill-now verb.");
                         }
                         n => {
                             return Err(format!(

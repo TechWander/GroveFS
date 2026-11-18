@@ -1,7 +1,8 @@
 //! WEB accounts and the base views they are DELEGATED.
 //!
 //! Why accounts are a separate record and not just another API key: a key is a
-//! machine capability — a random 256-bit secret stored only as a digest, which
+//! machine capability — a random 122-bit secret (rendered as 32 hex chars),
+//! stored only as a digest, which
 //! is exactly what a mount or an agent needs and nothing else. A human login
 //! needs the opposite properties: a password the operator picks and can be
 //! handed a new one out-of-band, and (the part no key column expresses) a SET

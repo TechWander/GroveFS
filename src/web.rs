@@ -143,6 +143,7 @@ const ALLOWED_OPS: &[&str] = &[
     "apikey.list",
     "apikey.create",
     "apikey.revoke",
+    "apikey.rotate",
     "apikey.set_ro",
     "apikey.calls",
     "account.list",

@@ -198,6 +198,9 @@ const I18N_ZH = {
   '(no view binding — every tree)': '（不绑定视图 — 可达所有树）',
   '(choose a view)': '（选择一个视图）',
   'view': '视图',
+  'Lost the secret? Rotate mints a new one for the same id — the second display.': '丢了 secret？轮换会为同一 id 铸一把新的 — 这是第二次展示。',
+  'A key is <id>:<secret> — the id alone is an index, never a credential.': '密钥形如 <id>:<secret> — id 只是索引，从来不是凭据。',
+  'key rotated': '密钥已轮换',
   'Create key': '创建密钥',
   'a delegated account mints client keys only': '委派账号只能铸造客户端密钥',
   'This is the only time the secret is shown — GroveFS stores a digest.': '秘钥仅此一次显示 — GroveFS 只保存摘要。',
@@ -217,6 +220,10 @@ const I18N_ZH = {
   'now read-write': '已改为读写',
   'now read-only': '已改为只读',
   'Revoke': '吊销',
+  'Rotate': '轮换',
+  'Rotate this key?': '轮换这把密钥？',
+  '${l} (${i}) · scope ${s}\n\nThe id, label, scope, view binding and audit history are kept; only the secret is replaced. The old secret stops working at its NEXT handshake — a live mount on it stays open until it reconnects; to kill a credential outright, Revoke it.': '${l}（${i}）· 范围 ${s}\n\n保留 id、标签、范围、视图绑定与审计历史，只替换 secret。旧 secret 在下一次握手时失效 — 基于它的活跃挂载在重连前仍保持打开；要彻底封杀请直接吊销。',
+  'Key rotated': '密钥已轮换',
   'Revoke this key?': '吊销这把密钥？',
   '${l} (${i}) · scope ${s} · ${note}\n\nLive mounts keep working until their next operation.': '${l}（${i}）· 范围 ${s} · ${note}\n\n活跃挂载在其下一次操作前继续可用。',
   'NOT bound to a view — it reaches every tree': '未绑定视图 — 可达所有树',
@@ -1094,7 +1101,7 @@ async function pageKeys(root) {
     { t: t('last used'), render: (r) => shortStampCell(r.last_used_at), class: 'muted' },
     { t: t('state'), render: (r) => (r.revoked_at ? el('span', { class: 'badge off' }, t('revoked')) : el('span', { class: 'badge on-state' }, t('live'))) },
     {
-      t: '', class: 'actions', render: (r) => (r.revoked_at ? null : el('div', { class: 'row' }, roBtn(r), revokeBtn(r))),
+      t: '', class: 'actions', render: (r) => (r.revoked_at ? null : el('div', { class: 'row' }, roBtn(r), rotateBtn(r), revokeBtn(r))),
     },
   ];
   const keyHost = el('div');
@@ -1104,7 +1111,9 @@ async function pageKeys(root) {
   })));
   root.appendChild(keyHost);
   root.appendChild(el('p', { class: 'muted' },
-    t('A key’s secret is shown once, at creation. Revoke is the only way back, and it takes effect on the key’s NEXT call — a live mount keeps its open trees until then.')));
+    t('A key’s secret is shown once, at creation. Revoke is the only way back, and it takes effect on the key’s NEXT call — a live mount keeps its open trees until then.')
+    + ' ' + t('Lost the secret? Rotate mints a new one for the same id — the second display.')
+    + ' ' + t('A key is <id>:<secret> — the id alone is an index, never a credential.')));
   renderKeysTable('');
 
   function renderKeysTable(qRaw) {
@@ -1133,6 +1142,30 @@ function revokeBtn(r) {
     toast(t('revoked'));
     await reload();
   }, { class: 'danger' });
+}
+
+// Rotate = "the secret is lost but the credential stays": same id, label,
+// scope, view binding and audit chain; only the digest is replaced, and the
+// new plaintext gets its one-time display — the same secret-card the create
+// flow shows (old keys carry a longer secret; both formats stay valid).
+function rotateBtn(r) {
+  return action(t('Rotate'), async () => {
+    if (!(await ask(t('Rotate this key?'),
+      t('${l} (${i}) · scope ${s}\n\nThe id, label, scope, view binding and audit history are kept; only the secret is replaced. The old secret stops working at its NEXT handshake — a live mount on it stays open until it reconnects; to kill a credential outright, Revoke it.', { l: r.label, i: r.id, s: r.scope }), t('Rotate')))) return;
+    const res = await api('apikey.rotate', { id: r.id });
+    modal(t('Key rotated'), wrap(
+      el('p', null, t('This is the only time the secret is shown — GroveFS stores a digest.')),
+      el('div', { class: 'secret-card' },
+        el('code', { class: 'secret' }, res.key),
+        el('button', { type: 'button', class: 'link', onclick: () => copyText(res.key) }, t('copy'))),
+      el('p', { class: 'muted' }, t('label ${l} · scope ${s} · owner ${o} · ${b}', {
+        l: res.label, s: res.scope, o: res.owner || '—',
+        b: r.view ? t('bound to ${v}', { v: r.view }) : t('not bound to a view'),
+      }))),
+      [{ t: t('I have saved it'), onclick: (btn, err, close) => close() }]);
+    toast(t('key rotated'));
+    await reload();
+  });
 }
 
 /* -------------------------------------------------------------- accounts --- */

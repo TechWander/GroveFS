@@ -479,18 +479,20 @@ $G apikey --meta-dir /data/cluster create --label node3-ro  --for mount --view t
 $G apikey --meta-dir /data/cluster create --label alice-key --for mount --view alice
 <span class="out"># apikey created — shown ONCE (only its SHA-256 is stored; save it now):</span>
 <span class="out">#   id: aac1f51a…  label: node2-rw  scope: mount  view: team  rw: rw</span>
-<span class="out">#   key: aac1f51a…:64位hexsecret</span>
+<span class="out">#   key: aac1f51a…:32位hexsecret</span>      <span class="cmt"># 新铸 key 统一 16 hex id + 32 hex secret（共 49 字符）；旧长 key 照样鉴得上</span>
 
 <span class="cmt"># 查看注册表：绝不落密文，只有摘要</span>
 $G apikey --meta-dir /data/cluster list
-<span class="cmt"># 按视图过滤、原地切读写/只读、撤销：</span>
+<span class="cmt"># 按视图/label/owner/scope 过滤、轮换 secret、原地切读写/只读、撤销：</span>
 $G apikey --meta-dir /data/cluster list --view team
+$G apikey --meta-dir /data/cluster list --label node --scope mount   <span class="cmt"># 子串匹配 label + 精确 scope，可叠加</span>
+$G apikey --meta-dir /data/cluster rotate --id aac1                   <span class="cmt"># secret 丢了：同一 id 重铸 secret，绑定/归属/审计全留（旧 secret 下次握手即拒）</span>
 $G apikey --meta-dir /data/cluster set-ro --id aac1 --rw      <span class="cmt"># 只读 key 热切回读写，活挂载 1s 内生效</span>
 $G apikey --meta-dir /data/cluster set-ro --id aac1            <span class="cmt"># 不带 --rw 即切回只读</span>
 $G apikey --meta-dir /data/cluster revoke --id 7c0e            <span class="cmt"># 撤销：活挂载在下一次服务端往返被封停、自卸载</span></code></pre>
 <p>开服务端门（<b>两道都要开</b>，且 <b>fail-closed</b>——先铸好 key 再上 flag，否则谁都进不来）：meta-server 加 <code>--require-api-key</code>；data-server 加 <code>--require-api-key --meta-dir /data/cluster</code>（读同一份 key 注册表）。客户端把 token 换成 key：</p>
 <pre><code><span class="cmt"># node2（读写 key）</span>
-export GROVEFS_API_KEY='aac1f51a…:64位hexsecret'      <span class="cmt"># 走 env，不进 argv</span>
+export GROVEFS_API_KEY='aac1f51a…:32位hexsecret'      <span class="cmt"># 走 env，不进 argv</span>
 $G mount --view team -m /mnt/team \
    --data-servers 10.0.0.5:50100 --meta-server 10.0.0.5:50110
 <span class="cmt"># GROVEFS_API_KEY 已导出即生效，无需额外参数；也可显式 --api-key '&lt;id&gt;:&lt;secret&gt;'</span>
@@ -538,7 +540,7 @@ cat > ~/.config/grovefs/grovefs.conf <<'EOF'
 GROVEFS_META_SERVER=10.0.0.5:50110
 GROVEFS_DATA_SERVERS=10.0.0.5:50100
 GROVEFS_TOKEN=s3cret            <span class="cmt"># 文件里有口令就 chmod 600</span>
-GROVEFS_API_KEY=aac1f51a…:64位hexsecret
+GROVEFS_API_KEY=aac1f51a…:32位hexsecret
 EOF
 chmod 600 ~/.config/grovefs/grovefs.conf
 
@@ -797,7 +799,7 @@ $G web --control-server 127.0.0.1:50130 --api-key-file /etc/grovefs/control.key 
 <span class="cmt"># 停人用 disable（可逆、授权原样保留），删号用 account rm</span>
 <span class="cmt"># ⚠ account rm 不撤销该号铸过的 api key——否则一个删号会静默停掉一个在跑的生产挂载</span>
 $G web --control-server 127.0.0.1:50130 --api-key-file /etc/grovefs/control.key account disable --account bob</code></pre>
-<div class="warn"><b>四件容易做错的事</b>：① <b>降级或删除唯一在职的 admin 会被拒</b>——先建第二个 admin 并验证能登进去再动第一个；② <code>account passwd</code> 不踢掉已开的会话（那是网关的会话表），要立即停人是 <code>disable</code>；③ 口令只能从 <code>--password-file</code> / <code>--password-stdin</code> 进去，两者互斥且不存在 <code>--password</code>；④ 页面能点的动词是写死的 28 个白名单，<code>gc.scan</code>、<code>gc.apply</code>、<code>refs rebuild</code>、<code>view rm --base</code>、<code>fork graft</code> 五个保留在 CLI——它们的 dry-run 报告与逐步确认是调用的一部分，想跑这些就回到 §2.2.6 / §2.3.7。</div>
+<div class="warn"><b>四件容易做错的事</b>：① <b>降级或删除唯一在职的 admin 会被拒</b>——先建第二个 admin 并验证能登进去再动第一个；② <code>account passwd</code> 不踢掉已开的会话（那是网关的会话表），要立即停人是 <code>disable</code>；③ 口令只能从 <code>--password-file</code> / <code>--password-stdin</code> 进去，两者互斥且不存在 <code>--password</code>；④ 页面能点的动词是写死的 29 个白名单，<code>gc.scan</code>、<code>gc.apply</code>、<code>refs rebuild</code>、<code>view rm --base</code>、<code>fork graft</code> 五个保留在 CLI——它们的 dry-run 报告与逐步确认是调用的一部分，想跑这些就回到 §2.2.6 / §2.3.7。</div>
 <div class="ok">验收：浏览器打开 <code>https://gfs-console.internal/</code> 能看到登录页；拿 <code>rootops</code> 登录→概览页报出后端与视图数；拿 <code>bob</code> 登录→视图页只列 <code>team</code> 一棵，能建 fork、能在密钥页给自己那棵铸一把 <code>mount</code> key，而“Accounts”页只剩“改自己的口令”；故意输错口令五次→第六次回 <code>429</code> 带 <code>retryAfter</code>；审计页里每一行都带 <code>account=&lt;人&gt;@&lt;ip&gt;</code>。端到端断言见 <code>web</code> 套件（145 条）。</div>
 
 <div class="chnav"><span>全页完</span><a href="#p1">回到第一部分 ↑</a></div>

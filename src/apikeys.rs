@@ -217,13 +217,14 @@ fn sha256_hex(s: &str) -> String {
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// 64 hex chars (256 bits) of secret from two v4 UUIDs (already a dependency).
+/// 32 hex chars (128 bits nominal, 122 of them random — the v4 version/variant
+/// bits are fixed) of secret from one v4 UUID (already a dependency). 122 bits
+/// is comfortably past the 112-bit bar NIST asks of a symmetric credential: an
+/// attacker who steals the store still faces 2^122 SHA-256 preimages, which is
+/// as unreachable as 2^256 was, and the online path cannot be brute-forced at
+/// any rate. The shorter half the operator actually pastes is the point.
 fn gen_secret() -> String {
-    format!(
-        "{:032x}{:032x}",
-        uuid::Uuid::new_v4().as_u128(),
-        uuid::Uuid::new_v4().as_u128(),
-    )
+    uuid::Uuid::new_v4().simple().to_string()
 }
 
 /// One row reader shared by both backends' map closures (column access lives
@@ -528,7 +529,10 @@ impl ApiKeyStore {
         ro: bool,
         owner: Option<&str>,
     ) -> Result<(String, String), String> {
-        let id = uuid::Uuid::new_v4().simple().to_string();
+        // The id is a lookup index, not a secret (auth rests on the digest
+        // comparison), so 64 random bits — with the PRIMARY KEY as the
+        // collision net — keeps it unguessable and short enough to paste.
+        let id = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
         let secret = gen_secret();
         let hash = sha256_hex(&secret);
         let full_key = format!("{id}:{secret}");
@@ -706,6 +710,38 @@ impl ApiKeyStore {
         Ok(rows)
     }
 
+    /// Rotate the secret of an ACTIVE key in place (`apikey rotate`): mint a
+    /// new secret, store only its digest, return the new plaintext
+    /// `"<id>:<secret>"` for one-time display — same contract as
+    /// [`Self::create_bound`]. Everything else (id, label, scope, view
+    /// binding, ro, owner, `created_at`) survives untouched, so audit rows and
+    /// view bindings keep their attribution. Returns `None` if no ACTIVE row
+    /// matched `id` — a revoked key stays dead, the same rule [`Self::set_ro`]
+    /// follows. The OLD secret fails its next handshake (the digest no longer
+    /// matches); a session already established on it lives until its next
+    /// reconnect — [`Self::live_state`] re-checks liveness and `ro`, not the
+    /// secret. To kill a credential NOW rather than replace it, revoke.
+    pub fn rotate(&self, id: &str) -> Result<Option<String>, String> {
+        let secret = gen_secret();
+        let hash = sha256_hex(&secret);
+        let full_key = format!("{id}:{secret}");
+        let n = match &self.backend {
+            Backend::Sqlite(m) => m
+                .lock()
+                .execute(
+                    "UPDATE api_keys SET secret_hash = ?1 WHERE id = ?2 AND revoked_at IS NULL",
+                    params![hash, id],
+                )
+                .map_err(|e| e.to_string())?,
+            Backend::Pg(pool) => pool
+                .execute(
+                    "UPDATE grovefs_control.api_keys SET secret_hash = $1 WHERE id = $2 AND revoked_at IS NULL",
+                    &[&hash, &id],
+                )? as usize,
+        };
+        Ok(if n > 0 { Some(full_key) } else { None })
+    }
+
     /// Revoke a key by id (idempotent: returns false if no ACTIVE row matched,
     /// so the caller can distinguish "revoked now" from "already revoked /
     /// never existed"). Revoked keys fail authentication but stay in the table
@@ -833,6 +869,74 @@ mod tests {
         };
         assert_eq!(stored.len(), 64);
         assert_ne!(stored, key.split_once(':').unwrap().1);
+    }
+
+    /// The short format: 16-hex id + 32-hex secret = a 49-char key an operator
+    /// can actually eyeball and paste.
+    #[test]
+    fn minted_keys_use_the_short_format() {
+        let s = store();
+        let (id, key) = s.create("short").unwrap();
+        assert_eq!(id.len(), 16, "id is 16 hex chars");
+        let (kid, secret) = key.split_once(':').unwrap();
+        assert_eq!(kid, id);
+        assert_eq!(secret.len(), 32, "secret is 32 hex chars");
+        assert_eq!(key.len(), 49);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(secret.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// A legacy long key (32-hex id, 64-hex secret) keeps authenticating:
+    /// the digest compare never looked at lengths, so shortening the mint
+    /// format is zero-migration — old and new keys coexist in one table.
+    #[test]
+    fn legacy_long_keys_still_authenticate() {
+        let s = store();
+        let secret = format!(
+            "{:032x}{:032x}",
+            uuid::Uuid::new_v4().as_u128(),
+            uuid::Uuid::new_v4().as_u128(),
+        );
+        let ts = now_iso();
+        s.exec2(
+            "INSERT INTO api_keys (id, label, secret_hash, created_at, scope, view, ro, owner) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params!["deadbeefcafe0123456789abcdef0123", "legacy", sha256_hex(&secret), ts, "any", None::<String>, 0i64, None::<String>],
+            "INSERT INTO grovefs_control.api_keys (id, label, secret_hash, created_at, scope, view_name, ro, owner) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            &[&"deadbeefcafe0123456789abcdef0123", &"legacy", &sha256_hex(&secret), &ts, &"any", &None::<String>, &0i64, &None::<String>],
+        )
+        .unwrap();
+        let authed = s
+            .authenticate(&format!("deadbeefcafe0123456789abcdef0123:{secret}"))
+            .unwrap();
+        assert_eq!(authed.label, "legacy");
+    }
+
+    /// `rotate` replaces only the secret: the id (and with it every audit row,
+    /// view binding and the label/scope/ro/owner columns) survives, the new
+    /// plaintext authenticates and the old one stops to.
+    #[test]
+    fn rotate_swaps_the_secret_and_keeps_the_identity() {
+        let s = store();
+        let (id, old_key) = s
+            .create_bound("rotator", Scope::Mcp, Some("team"), true, Some("alice"))
+            .unwrap();
+        let new_key = s.rotate(&id).unwrap().expect("active row rotated");
+        let (nid, _) = new_key.split_once(':').unwrap();
+        assert_eq!(nid, id, "the id is stable across rotation");
+        assert_ne!(new_key, old_key);
+        // New secret lives, old secret dies at the next handshake…
+        assert_eq!(s.authenticate(&new_key).unwrap().id, id);
+        assert!(s.authenticate(&old_key).is_err());
+        // …while identity and policy are untouched.
+        let authed = s.authenticate(&new_key).unwrap();
+        assert_eq!(authed.label, "rotator");
+        assert!(authed.ro);
+        assert_eq!(authed.owner.as_deref(), Some("alice"));
+        assert!(authed.binds_to("team") && !authed.binds_to("other"));
+        // Revoked stays revoked — rotate never half-resurrects a key.
+        s.revoke(&id).unwrap();
+        assert!(s.rotate(&id).unwrap().is_none());
+        assert!(s.rotate("nosuchid").unwrap().is_none());
     }
 
     #[test]
