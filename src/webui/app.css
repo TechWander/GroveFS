@@ -29,6 +29,13 @@
 
 * { box-sizing: border-box; }
 
+/* The `hidden` attribute's UA style (display:none) loses to any author
+   display rule — and #login/.page/#modal-host all set one, which made the
+   modal overlay, the sign-in card and ALL five pages render from load time
+   (the "thin fog" over everything). This rule is the spec-recommended guard:
+   hidden always wins, whatever display the element's own selector sets. */
+[hidden] { display: none !important; }
+
 body {
   margin: 0;
   background: var(--bg);
