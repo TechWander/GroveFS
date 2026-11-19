@@ -1460,18 +1460,11 @@ dependencies = [
 
 [[package]]
 name = "treedb"
-version = "0.3.0"
-source = "git+https://github.com/TechWander/treedb.git?tag=v0.3.0#e2bb51dd09ab738519b742cd7c75da9ec2fc99b5"
+version = "0.3.1"
+source = "git+https://github.com/TechWander/treedb.git?tag=v0.3.1#c393d3e8b03ac867a9ca37e4f02ec22b94a15f1e"
 dependencies = [
- "chrono",
  "libc",
- "parking_lot",
- "postgres",
- "rusqlite",
- "sha2",
  "thiserror",
- "tracing",
- "uuid",
 ]
 
 [[package]]
