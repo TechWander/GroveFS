@@ -326,3 +326,122 @@ fn mount_of_unknown_view_is_refused_without_creating_it() {
         .unwrap();
     assert!(m.lookup(ROOT_INO, "ok").is_some());
 }
+
+/// End-to-end closure of the "rogue meta-server arms the honest data-server"
+/// attack. A `meta-server --data-access-key K` mints a Data-Access Capability
+/// on every accepted `M_OPEN`; the client replays it on the data-plane
+/// `OP_OPEN`; a `data-server --data-access-key K` (the SAME secret K) admits
+/// only a capability it can verify. So:
+///   * a mount that passed a GENUINE meta gets a capability the data plane
+///     honors (read/write round-trips), and
+///   * a mount that passed a ROGUE meta — an attacker's meta signing with a
+///     different key K' — holds a capability the honest data plane refuses,
+///     even though the attacker knows the shared cluster token.
+/// This proves the two-plane admission binding, not just the isolated data gate
+/// [`remote_roundtrip`]'s `data_server_dac_gate_*` covers.
+#[test]
+fn genuine_meta_arms_data_but_rogue_meta_does_not() {
+    use grovefs::backend::{self, StorageBackend};
+    use grovefs::remote::client::RemoteBackend;
+    use grovefs::remote::dac;
+    use grovefs::remote::meta::serve_on_meta_dac;
+    use grovefs::remote::server::serve_on_dac;
+    use std::sync::Arc;
+
+    const KEY: &[u8] = b"cluster-shared-hmac-key-K";
+    const ROGUE: &[u8] = b"attacker-forged-key-K-prime";
+
+    // A meta server armed with the real key K (provision the `alice` view).
+    let mdir = tempfile::Builder::new()
+        .prefix("grovefs_e2e_meta_")
+        .tempdir()
+        .unwrap();
+    drop(MetaStore::open_sqlite(mdir.path(), "alice", false).unwrap());
+    let ml = TcpListener::bind("127.0.0.1:0").unwrap();
+    let meta_addr = ml.local_addr().unwrap().to_string();
+    let mbase = mdir.path().to_path_buf();
+    let mkey = KEY.to_vec();
+    std::thread::spawn(move || serve_on_meta_dac(ml, mbase, "", mkey, 0));
+
+    // A ROGUE meta the attacker runs anywhere, signing capabilities with K'.
+    let rdir = tempfile::Builder::new()
+        .prefix("grovefs_e2e_rogue_")
+        .tempdir()
+        .unwrap();
+    drop(MetaStore::open_sqlite(rdir.path(), "alice", false).unwrap());
+    let rl = TcpListener::bind("127.0.0.1:0").unwrap();
+    let rogue_addr = rl.local_addr().unwrap().to_string();
+    let rbase = rdir.path().to_path_buf();
+    let rkey = ROGUE.to_vec();
+    std::thread::spawn(move || serve_on_meta_dac(rl, rbase, "", rkey, 0));
+
+    // The ONE honest data server, gated by the shared secret K.
+    let ddir = tempfile::Builder::new()
+        .prefix("grovefs_e2e_data_")
+        .tempdir()
+        .unwrap();
+    let dl = TcpListener::bind("127.0.0.1:0").unwrap();
+    let data_addr = dl.local_addr().unwrap().to_string();
+    let dback: Arc<dyn StorageBackend> = Arc::from(backend::open_local(ddir.path()).unwrap());
+    let dkey = KEY.to_vec();
+    std::thread::spawn(move || serve_on_dac(dl, dback, "", dkey));
+
+    // Genuine admission: the real meta hands back a capability bound to K.
+    let good = (0..100)
+        .find_map(|_| match RemoteMeta::new(&meta_addr, "alice") {
+            Ok(m) => Some(m),
+            Err(_) => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                None
+            }
+        })
+        .expect("genuine meta should accept M_OPEN");
+    let genuine = good.data_access_capability();
+    assert!(!genuine.is_empty(), "a --data-access-key meta must mint one");
+    assert_eq!(
+        dac::verify(KEY, &genuine, dac::now_secs()),
+        dac::Verdict::Valid,
+        "the shipped capability is verifiable under K"
+    );
+
+    // Replay it on the data plane: opens and performs real read/write.
+    let b = (0..100)
+        .find_map(|_| match RemoteBackend::new_with_dac(&data_addr, "", "", &genuine) {
+            Ok(c) => Some(c),
+            Err(_) => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                None
+            }
+        })
+        .expect("a genuine-meta capability should open the honest data plane");
+    b.create("obj").unwrap();
+    b.write("obj", 0, b"real-data").unwrap();
+    assert_eq!(b.read("obj", 0, 16).unwrap(), b"real-data");
+
+    // Rogue admission: the attacker's meta signs with K', yielding a
+    // capability the honest data server refuses (they cannot forge K's HMAC).
+    let rogue_meta = (0..100)
+        .find_map(|_| match RemoteMeta::new(&rogue_addr, "alice") {
+            Ok(m) => Some(m),
+            Err(_) => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                None
+            }
+        })
+        .expect("rogue meta accepts its own M_OPEN");
+    let forged = rogue_meta.data_access_capability();
+    assert!(!forged.is_empty(), "rogue meta mints under K'");
+    assert_ne!(forged, genuine, "K' and K sign different capabilities");
+    assert_eq!(
+        dac::verify(KEY, &forged, dac::now_secs()),
+        dac::Verdict::Invalid,
+        "the honest key K rejects the rogue K' capability"
+    );
+    let e = RemoteBackend::new_with_dac(&data_addr, "", "", &forged)
+        .err()
+        .expect("the honest data plane must refuse a rogue-meta capability");
+    assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e:?}");
+
+    // And a client that never passed ANY meta (no capability) is refused too.
+    assert!(RemoteBackend::new_with_dac(&data_addr, "", "", "").is_err());
+}

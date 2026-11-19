@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use grovefs::backend::{self, StorageBackend};
 use grovefs::remote::{
-    server::{serve_on, serve_on_auth},
+    server::{serve_on, serve_on_auth, serve_on_dac},
     RemoteBackend,
 };
 
@@ -448,4 +448,93 @@ fn remote_list_walks_every_object_in_pages() {
         }
         assert_eq!(seen, want, "page size {page_size} did not cover the server");
     }
+}
+
+/// A data-server started with `--data-access-key` (verify mode): an `OP_OPEN`
+/// must carry a capability a genuine meta minted. This is the data-plane half
+/// of closing the "rogue meta arms the honest data-server" hole — the attacker
+/// cannot forge the capability, so their mount cannot open data even holding the
+/// shared cluster token. A server WITHOUT the feature (default) ignores the
+/// field entirely, so the whole thing is byte-for-byte opt-in.
+fn spawn_server_dac(token: &str, key: &[u8]) -> (String, tempfile::TempDir) {
+    let dir = tempfile::Builder::new()
+        .prefix("grovefs_rsrv_dac_")
+        .tempdir()
+        .unwrap();
+    let backend: Arc<dyn StorageBackend> = Arc::from(backend::open_local(dir.path()).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let token = token.to_string();
+    let key = key.to_vec();
+    std::thread::spawn(move || serve_on_dac(listener, backend, &token, key));
+    (addr, dir)
+}
+
+#[test]
+fn data_server_dac_gate_admits_valid_and_refuses_forgery() {
+    use grovefs::remote::dac;
+    let key = b"cluster-shared-dac-key";
+    let (addr, _d) = spawn_server_dac("T", key);
+
+    // A capability a genuine meta minted: connects and performs data ops.
+    let valid = dac::issue(key, 0);
+    let good = (0..50)
+        .find_map(|_| match RemoteBackend::new_with_dac(&addr, "T", "", &valid) {
+            Ok(c) => Some(c),
+            Err(_) => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                None
+            }
+        })
+        .expect("a valid capability should open the data session");
+    good.create("obj").unwrap();
+    good.write("obj", 0, b"genuine").unwrap();
+    assert_eq!(good.read("obj", 0, 16).unwrap(), b"genuine");
+
+    // The server is definitely accepting now; every other capability form fails
+    // at the OP_OPEN handshake (fail-fast, no retry masking), all as
+    // PermissionDenied.
+    for (label, presented) in [
+        ("missing", String::new()),
+        ("forged", format!("0.{}", "ab".repeat(32))),
+        ("wrong-key", dac::issue(b"a-different-key", 0)),
+        (
+            "expired",
+            dac::issue(key, dac::now_secs().saturating_sub(10)),
+        ),
+    ] {
+        let e = RemoteBackend::new_with_dac(&addr, "T", "", &presented)
+            .err()
+            .unwrap_or_else(|| panic!("{label} capability must be rejected"));
+        assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "{label} capability: {e:?}"
+        );
+    }
+
+    // The gate is INDEPENDENT of the token: a correct token with no capability
+    // is still refused, and only a capability-bearing client can re-read.
+    assert!(RemoteBackend::new_with_dac(&addr, "T", "", "").is_err());
+}
+
+/// Default-off proof: a data-server WITHOUT `--data-access-key` ignores the
+/// capability field entirely — a client presenting garbage (or none) still
+/// opens, exactly as before the feature existed.
+#[test]
+fn dac_absent_on_server_leaves_behavior_unchanged() {
+    let (addr, _d) = spawn_server_auth(""); // no token, no dac
+    // Non-empty garbage capability on a server that does not verify it: accepted.
+    let c = (0..50)
+        .find_map(|_| match RemoteBackend::new_with_dac(&addr, "", "", "0.deadbeef") {
+            Ok(c) => Some(c),
+            Err(_) => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                None
+            }
+        })
+        .expect("a non-verify server must ignore the capability field");
+    c.create("obj").unwrap();
+    c.write("obj", 0, b"ok").unwrap();
+    assert_eq!(c.read("obj", 0, 4).unwrap(), b"ok");
 }

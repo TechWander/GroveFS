@@ -190,8 +190,8 @@ $G --home /data/gfs mount --view team -m /mnt/team</code></pre>
 <p>多机共享一棵树的能力来自「同一个 meta-server + 同一个 --view」，与后端无关——<b>默认 SQLite 已经足够</b>，PG 不是分布式的前提。拆开的两个服务各管一摊：</p>
 <table>
   <tr><th>服务</th><th>职责</th><th>关键参数</th></tr>
-  <tr><td><code>data-server</code></td><td>收发文件字节，把物理对象写进本节点硬盘目录</td><td><code>--listen</code>、<code>--data-dir</code>、<code>--token</code>、<code>--require-api-key</code>（配 <code>--meta-dir</code> 读注册表）</td></tr>
-  <tr><td><code>meta-server</code></td><td>托管每视图权威树，多客户机挂同一 <code>--view</code> 即共享同一棵；负责锁仲裁、失效推送、API key 门</td><td><code>--listen</code>、<code>--meta-dir</code>（元数据根，视图库在其 <code>meta/</code> 下）、<code>--token</code>、<code>--require-api-key</code>、HA 时 <code>--role/--peer/--witness</code></td></tr>
+  <tr><td><code>data-server</code></td><td>收发文件字节，把物理对象写进本节点硬盘目录</td><td><code>--listen</code>、<code>--data-dir</code>、<code>--token</code>、<code>--require-api-key</code>（配 <code>--meta-dir</code> 读注册表）、<code>--data-access-key</code>（校 <code>OP_OPEN</code> 能力，与 meta 同值）</td></tr>
+  <tr><td><code>meta-server</code></td><td>托管每视图权威树，多客户机挂同一 <code>--view</code> 即共享同一棵；负责锁仲裁、失效推送、API key 门</td><td><code>--listen</code>、<code>--meta-dir</code>（元数据根，视图库在其 <code>meta/</code> 下）、<code>--token</code>、<code>--require-api-key</code>、<code>--data-access-key</code>/<code>--data-access-ttl</code>（签 <code>M_OPEN</code> 能力）、HA 时 <code>--role/--peer/--witness</code></td></tr>
   <tr><td>客户机 <code>mount</code></td><td>远程挂载：<b>不需要 <code>--home</code></b>，本地什么都不落</td><td><code>--view</code>、<code>--meta-server</code>、<code>--data-servers</code>、<code>--token</code>、<code>--api-key</code>、<code>--ro</code></td></tr>
 </table>
 
@@ -507,6 +507,17 @@ mkdir /mnt/team/should_fail
 <span class="cmt"># node1：回读审计（每次连接含被拒的都落表）</span>
 $G apikey --meta-dir /data/cluster calls</code></pre>
 <p>systemd 客户端的对应改法见 2.2.5；systemd 挂载单元被撤销 key 的行为：挂载打印拒因后<b>干净自卸载</b>（退出码 0，<code>Restart=on-failure</code> 不会重拉——这是有意的收手不是崩溃）。</p>
+
+<h4 id="s22-dac">2.2.3· 数据面准入绑定：Data-Access Capability（防 rogue meta-server）</h4>
+<p>token 与 API key 都是<b>入口门</b>，认证“调用方能不能进门”，但不绑定“meta 面与 data 面是同一个可信服务端”。<code>data-server</code> 是扁平 KV、只认共享 token，于是握合法 token 的攻击者可自建<b>恶意 <code>meta-server</code></b>、却把客户端指向<b>诚实的 <code>data-server</code></b>，驱动其读写本不该碰的内容字节。闭合办法：给两服务配同一把共享 HMAC 密钥 <code>K</code>，客户端<b>无需配置</b>。</p>
+<pre><code><span class="cmt"># 生成一把共享密钥（与 token 独立）</span>
+K=$(openssl rand -hex 32)
+<span class="cmt"># node1：两服务同值 K（可写进同一份 root-only env）</span>
+$G meta-server --meta-dir /data/cluster --listen 0.0.0.0:50110 --token "$TOK" --data-access-key "$K"   <span class="cmt"># --data-access-ttl 0=永不过期（默认）</span>
+$G data-server --listen 0.0.0.0:50100 --data-dir /data/cluster --token "$TOK" --data-access-key "$K"
+<span class="cmt"># 客户端照常挂，无任何新参数——能力在 M_OPEN/OP_OPEN 两次握手间自动流转</span>
+$G mount --view team --data-servers 10.0.0.5:50100 --meta-server 10.0.0.5:50110 --token "$TOK" -m /mnt/team</code></pre>
+<p><b>效果</b>：真 meta 在每次 <code>M_OPEN</code> 用 K 签一枚能力交给客户端，客户端在数据面 <code>OP_OPEN</code> 回放，开了 <code>--data-access-key</code> 的 data-server 用同一个 K 校验；rogue meta 没 K 签不出合法能力，其挂载即便持正确 token 也被拒（<code>EACCES</code>）。<b>opt-in，不开逐字节不变</b>。<b>诚实边界</b>：它是“经真 meta 准入的证明”（通道绑定），<b>不是 per-view ACL</b>——能力不编码视图，“某调用方只能碰某棵视图”仍靠上面的 <code>--view</code> 绑定 key。详见 USAGE §6.1.1。</p>
 
 <h4 id="s22-kinds">2.2.4 四种视图（服务端集中定义）</h4>
 <p>与 2.1.3 同一套命令，只是寻址换成 <code>--meta-dir /data/cluster</code>（在存储机上执行）；区别在分发面：定义存在<b>服务端</b>，客户机只需 <code>mount --view &lt;名&gt;</code>，不带任何本地规则文件。改定义热生效（≤2s，已挂载连接自动换形）。</p>

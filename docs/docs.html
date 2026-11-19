@@ -1012,6 +1012,9 @@ sudo grovefs apikey --meta-dir /data calls --limit 8   <span class="cmt"># 审�
       </ul>
     </details>
 
+    <div class="note"><b>正交的一道硬：数据面准入绑定 Data-Access Capability（防 rogue meta-server）</b>。上面三档都只回答「这个调用方能不能进门」，<b>不绑定「meta 面与 data 面是同一个可信服务端」</b>。因为 <code>data-server</code> 是扁平 KV、只认共享 token，手握合法 token 的攻击者可在任意位置自建一个<b>恶意 <code>meta-server</code></b>（伪造自己的权威树/ACL），却把客户端指向<b>诚实的 <code>data-server</code></b>，驱动其读写本不该碰的内容字节。闭合办法：给两服务配同一把共享 HMAC 密钥 <code>K</code>（<code>openssl rand -hex 32</code>），客户端无需配置——真 meta 在每次 <code>M_OPEN</code> 用 K 签一枚能力塞进回包，客户端在数据面 <code>OP_OPEN</code> 回放，开了 <code>--data-access-key</code> 的 data-server 用同一个 K 校验，rogue meta 没 K 签不出来、其挂载即便持正确 token 也被拒。<br>
+    <code>meta-server … --data-access-key "$K" [--data-access-ttl 0]</code>；<code>data-server … --data-access-key "$K"</code>。<b>默认关闭逐字节不变</b>（opt-in）；TTL 默认 <code>0</code>=永不过期（保重连），非零收紧重放窗口。<b>诚实边界</b>：它是「经真 meta 准入的证明」（通道绑定），<b>不是 per-view ACL</b>——能力不编码视图，「某调用方只能碰某棵视图」仍靠第 3 档的 <code>--view</code> 绑定 key。详见 USAGE §6.1.1。</div>
+
     <h3>6.4 换成 PostgreSQL（场景 D）</h3>
     <p>目标：客户端命令<b>一个字不改</b>，把元数据树与控制面从本地 SQLite 换成 PG。<b>这是二选一，不是叠加</b>——同一棵权威树只落一种后端。</p>
     <pre><code><span class="cmt"># ① PG 主机：建库 + 角色（不用预建表，首挂时幂等建 schema）</span>

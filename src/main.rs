@@ -382,6 +382,21 @@ enum Cmd {
         /// historical positional placement.
         #[arg(long = "member-id", value_name = "N")]
         member_id: Option<u64>,
+        /// Require a Data-Access Capability on every `OP_OPEN`, verified under
+        /// this shared HMAC key (hex, e.g. `openssl rand -hex 32`; falls back to
+        /// `GROVEFS_DATA_ACCESS_KEY`). It MUST match the SAME key the cluster's
+        /// `meta-server --data-access-key` signs with: the meta-server mints a
+        /// capability on each accepted `M_OPEN`, the client replays it here, and
+        /// an `OP_OPEN` without a valid one is refused. This closes the
+        /// "malicious meta-server arming a client against this honest
+        /// data-server" hole — a rogue meta cannot forge the capability, so its
+        /// mounts fail to open data even though the client holds the shared
+        /// `--token`. Unset keeps the original token/api-key-only gate
+        /// byte-for-byte. This is proof-of-admission by a genuine meta, NOT a
+        /// per-view data ACL (the data keyspace stays a flat KV; see
+        /// `grovefs::remote::dac`).
+        #[arg(long = "data-access-key", value_name = "HEX")]
+        data_access_key: Option<String>,
     },
     /// Run the central metadata service many `mount --meta-server` clients share.
     ///
@@ -420,6 +435,26 @@ enum Cmd {
         /// reason printed) rather than only refusing the next mount.
         #[arg(long)]
         require_api_key: bool,
+        /// Mint a Data-Access Capability for every accepted `M_OPEN` and ship it
+        /// to the client in the ack, under this shared HMAC key (hex, e.g.
+        /// `openssl rand -hex 32`; falls back to `GROVEFS_DATA_ACCESS_KEY`). It
+        /// MUST match the SAME key every `data-server --data-access-key` verifies
+        /// with. A client that mounted through THIS meta replays the capability
+        /// to the data-server and is admitted; a client driven by a meta that
+        /// lacks the key (a rogue/foreign one) cannot produce it, so the honest
+        /// data-server refuses it. Unset issues no capability and leaves data
+        /// admission gated by token/api-key only (unchanged behavior). See
+        /// `grovefs::remote::dac`.
+        #[arg(long = "data-access-key", value_name = "HEX")]
+        data_access_key: Option<String>,
+        /// Lifetime (seconds) of the minted Data-Access Capability; only
+        /// meaningful with `--data-access-key`. `0` (default) mints a
+        /// NON-EXPIRING capability so a long-lived mount survives a data-server
+        /// restart/reconnect without being cut off mid-session. A nonzero TTL
+        /// bounds the replay window (each `M_OPEN` stamps `now + TTL`) at the
+        /// cost of a remount once it lapses — for stricter deployments.
+        #[arg(long = "data-access-ttl", value_name = "SECS", default_value_t = 0)]
+        data_access_ttl: u64,
         /// HA role: `primary` (default) serves reads+writes and ships snapshots to
         /// `--peer`; `standby` serves reads only from the replicated copy, rejects
         /// writes, and promotes itself if the primary's heartbeats stop.
@@ -2631,6 +2666,12 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             // metadata source resolves below (remote ack byte [2], local
             // `fork <base>` definition).
             let mut content_ro = false;
+            // Data-Access Capability minted by the meta-server for this mount's
+            // admission (empty without `--data-access-key`); forwarded verbatim to
+            // every data-server `OP_OPEN`. A data-server in verify mode refuses a
+            // mount that never passed a genuine meta — closing the rogue-meta-arms-
+            // honest-data hole (see `grovefs::remote::dac`).
+            let mut data_capability = String::new();
             // Metadata source: a central `meta-server` when --meta-server is given (a
             // single authoritative view shared across clients), else this machine's
             // local `<home>/meta/<view>.db`. Both satisfy `MetaProvider`, so the
@@ -2650,6 +2691,8 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                     view_ro = rm.is_readonly_view();
                     // Ack byte [2] flags a FORK: structure writable, content RO.
                     content_ro = rm.is_content_ro_view();
+                    // Ack tail: the Data-Access Capability for the data plane.
+                    data_capability = rm.data_access_capability();
                     Arc::new(rm)
                 }
                 None => {
@@ -2819,10 +2862,11 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                             Vec::with_capacity(addrs.len());
                         for a in &addrs {
                             members.push(Arc::new(
-                                remote::RemoteBackend::new_with_creds(
+                                remote::RemoteBackend::new_with_dac(
                                     a,
                                     token.as_deref().unwrap_or(""),
                                     &api_key,
+                                    &data_capability,
                                 )?
                                 .with_fence(fence_epoch.clone(), fence_refresh.clone()),
                             ));
@@ -2844,10 +2888,11 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         let one = addrs.first().copied().unwrap_or(addr.as_str());
                         println!("using remote data service at {one}");
                         Arc::new(
-                            remote::RemoteBackend::new_with_creds(
+                            remote::RemoteBackend::new_with_dac(
                                 one,
                                 token.as_deref().unwrap_or(""),
                                 &api_key,
+                                &data_capability,
                             )?
                             .with_fence(fence_epoch.clone(), fence_refresh.clone()),
                         )
@@ -3001,6 +3046,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             keys_from,
             store,
             member_id,
+            data_access_key,
         } => {
             // Comma-separated roots = several disks behind one data-server;
             // placement across them is automatic (see PlacementBackend).
@@ -3073,6 +3119,18 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 None => srv,
             };
+            // Data-Access Capability verify mode: flag > env > off. A malformed
+            // hex key is a HARD error (a silently disabled gate would advertise
+            // protection it does not provide).
+            let dac_hex = data_access_key.or_else(|| std::env::var("GROVEFS_DATA_ACCESS_KEY").ok());
+            let srv = match dac_hex.as_deref().map(str::trim) {
+                Some(s) if !s.is_empty() => srv.with_data_access_key(
+                    grovefs::remote::dac::decode_key(s).map_err(|e| {
+                        format!("data-server --data-access-key {e}")
+                    })?,
+                ),
+                _ => srv,
+            };
             srv.serve()?;
         }
         Cmd::MetaServer {
@@ -3095,6 +3153,8 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             control_listen,
             admin_user,
             admin_password_file,
+            data_access_key,
+            data_access_ttl,
         } => {
             let role = if role.eq_ignore_ascii_case("standby") {
                 grovefs::remote::meta::Role::Standby
@@ -3128,6 +3188,19 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                     &meta_base,
                     store.as_deref(),
                 )?);
+            }
+            // Data-Access Capability issuance: flag > env > off, mirroring the
+            // data-server. Only meaningful with a matching `--data-access-key` on
+            // every data-server this cluster's clients write to.
+            let dac_hex = data_access_key.or_else(|| std::env::var("GROVEFS_DATA_ACCESS_KEY").ok());
+            if let Some(s) = dac_hex.as_deref().map(str::trim) {
+                if !s.is_empty() {
+                    srv = srv.with_data_access_key(
+                        grovefs::remote::dac::decode_key(s)
+                            .map_err(|e| format!("meta-server --data-access-key {e}"))?,
+                        data_access_ttl,
+                    );
+                }
             }
             srv = srv.with_ha(role, peer);
             if sync_repl {

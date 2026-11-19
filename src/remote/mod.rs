@@ -15,6 +15,11 @@
 //! `--transport`, defaulting to the framed path for one-key rollback.
 
 pub mod client;
+/// Data-Access Capability (HMAC-signed meta→data admission proof). Only the
+/// servers mint/verify it — the client just carries an opaque string from
+/// `M_OPEN` to `OP_OPEN` — so it stays out of the `remote-only` build graph.
+#[cfg(feature = "native")]
+pub mod dac;
 pub mod meta;
 pub mod proto;
 #[cfg(feature = "native")]

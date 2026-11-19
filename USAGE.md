@@ -119,6 +119,7 @@ cargo build --release                                       # 产物:target/rele
 | `GROVEFS_STRIPE_BYTES` | `mount --stripe-bytes` | 跨 server 条带的分块尺寸(默认 16MiB;只在与多地址 `--data-servers` 列表同时给出时生效,非法值拒绝启动) |
 | `GROVEFS_MEMBER_ID` | `data-server --member-id` | 本 data-server 在条带集群中的稳定身份 id(每个成员唯一的 64 位整数;非法值拒绝启动;不给则该节点按历史位置模式参与条带) |
 | `GROVEFS_TOKEN` | `mount --token`、`meta-server/data-server --token` | 集群准入口令 |
+| `GROVEFS_DATA_ACCESS_KEY` | `meta-server --data-access-key`、`data-server --data-access-key` | 数据面准入绑定(Data-Access Capability)的共享 HMAC 密钥(hex,`openssl rand -hex 32`);两服务必须同值,`mount` 无需设(能力由 meta-server 在 `M_OPEN` 回包签发、客户端自动回放到数据面);§6.1.1 |
 | `GROVEFS_META_DIR` | `meta-server --meta-dir` | 服务端元数据根(优先级:`--meta-dir` 参数 > 本 env > `--home` > `~/.grovefs`) |
 | `GROVEFS_META_STORE` | `--meta-store`(`view`/`apikey`/`mcp`/`meta-server`/`data-server`/`du`/`import`) | 非 SQLite 后端寻址;未给 flag 时由本 env 回退(源码 `resolve_store()`)。`import` 只写本地 SQLite 树,故这里给的是 `postgres://…` 时**如实拒绝** |
 | `GROVEFS_API_KEY` | `mount --api-key` | 已有的 per-caller 凭据 env |
@@ -1747,6 +1748,9 @@ $Y meta-server --meta-dir /data/nodeB --listen 10.0.0.6:50111 --role standby --p
 3  API key(--require-api-key) 服务端逐 op        逐调用方:scope 分平面(mcp|mount|any)、      §3.5.1/§6.1
                                                   --view 绑定拒开它树、--ro 拒写、
                                                   可撤销(活挂载 ≤1s 封停)、全量审计
+4  DAC(--data-access-key)     data 面握手        数据面准入绑定:能力由真 meta 的              §6.1.1
+                                                  M_OPEN 签发、data-server 校验,
+                                                  挡住 rogue meta 复用合法 data-server
 ✗  显示治理(派生/别名/fork)  ——                 不是安全边界:只改呈现,可见即可读、          §3.2-§3.4.1
                                                   可读即可写回(fork 内容除外)
 ```
@@ -1810,6 +1814,27 @@ $Y mount --view alice --data-servers 10.0.0.5:50100 --meta-server 10.0.0.5:50110
 > 数据库里独立存储的单位是「视图」而非「每个客户端」：SQLite 一 view 一个 `.db` 文件、PG 一 view 一个 schema（均非单张表）；数据字节走 data-server → 存进其 `--data-dir` 下的 `blocks/<key>`，树里只存 `data_ref` 引用。
 
 客户端上报的 uid 默认 `geteuid()`，可 `mount --run-as-uid N` 显式覆盖——它只作为条目的属主记进锁仲裁与审计，属 **advisory**（TCP 客户端可伪造），**从不作为访问控制门**。确定性靠 `--token`/`--require-api-key`（准入），「谁能碰哪棵树、读写还是只读」靠 key 的 `--view`/`--ro` 绑定在服务端逐 op 强制。两个必须知道的行为边界：① **加锁类 op（`flock`/`F_SETLK`，含锁续约）归类为写意图**（它们要写中心 `locks` 表），只读 key（`--ro`）对它们的请求一律被拒（`E_NOTPERM`，客户端 FUSE 侧落 `EPERM`，区别于 HA 备机的 `E_ROFS` 切换信号）——只读角色若需共享锁做读协调，得用一把读写 key；② **撤销是 op 驱动**的（服务端每秒在流量上复证一次），被撤销/降级的 key 在该挂载撤销后的首个服务端往返即被拒，完全由内核缓存回答的读不需往返、故不被打断（下一次往返即封）。
+
+### 6.1.1 数据面准入绑定：Data-Access Capability（防 rogue meta-server 复用合法 data-server）
+
+**威胁模型**：token 是集群静态口令、数据面与元数据面共用；`meta-server` 是唯一强制视图隔离的地方，而 `data-server` 只是扁平 KV（key 不透明、无视图归属、无服务端身份认证、明文 TCP）。于是：攻击者只要握着合法的 `--token`，就能在任意位置自建一个**恶意 meta-server**（各改各的权威树、伪造 ACL），却把客户端指向**诚实的 data-server**——数据面只认 token，不认「这次 `OP_OPEN` 是否经过了真 meta 的 `M_OPEN` 准入」，rogue meta 于是能驱动客户端读写它本不该碰的内容字节。这是 token/api-key 两道**入口门**都盖不住的洞：它们认证「调用方能不能进门」，却不绑定「meta 面与 data 面是同一个可信服务端」。
+
+**机制（Data-Access Capability，DAC）**：给两服务配一把**共享 HMAC 密钥 K**（hex，`openssl rand -hex 32`），`mount` 侧无需配置：
+
+```bash
+# 两服务同值 K；客户端照常挂载，能力在握手间自动流转
+$Y meta-server --meta-dir /data/cluster --listen 0.0.0.0:50110 --token s3cr3t --data-access-key "$K"
+$Y data-server --listen 0.0.0.0:50100 --data-dir /data/cluster --token s3cr3t --data-access-key "$K"
+$Y mount --view alice --data-servers 10.0.0.5:50100 --meta-server 10.0.0.5:50110 --token s3cr3t -m /mnt/alice
+```
+
+流转：`meta-server` 每接受一次 `M_OPEN`，就用 K 签一枚能力串（`<expiry>.<hex(HMAC-SHA256_K(expiry))>`）塞进 ack 尾字节；客户端（`RemoteMeta`）存下它，`mount` 把它转发给数据面，客户端（`RemoteBackend`）在每次 `OP_OPEN` 回放到 `data-server`；开了 `--data-access-key` 的 `data-server` 用同一个 K 校验，校验不过直接 `EACCES` 拒开。**rogue meta 没有 K**，签不出合法能力，其挂载即便握着正确 token 也打不开诚实 data-server——这就是被闭合的那一环。
+
+**生命周期**：`meta-server --data-access-ttl SECS`（默认 `0`）控制能力有效期。`0` 签**永不过期**的能力，让长挂载在 data-server 重启/重连时不被半路切断（默认，兼容性最好）；非零 TTL 每次 `M_OPEN` 盖 `now+TTL`，把重放窗口收紧，代价是过期后要重挂——供更严格的部署。
+
+**默认关闭 = 逐字节不变**：两服务都不给 `--data-access-key` 时，ack 不带能力、`OP_OPEN` 不带该字段也不校验，行为与功能出现前完全一致（老端点忽略尾字段，向后兼容）。开启任一侧而另一侧密钥不匹配，会 fail-closed 拒开；hex 非法则服务拒绝启动。
+
+> ⚠ **诚实边界**：DAC 是「**经过真 meta 准入的证明**」（meta↔data 的通道绑定 / channel-binding），**不是 per-view 的数据 ACL**。它绑定的是「这次数据访问源自一次合法 meta 准入」，能力串**不编码视图**——因为数据面是扁平 KV，`OP_OPEN` 的 key 本就不带视图归属，data-server 无从按视图判定。所以：它能挡住「rogue meta 武装客户端去打诚实 data-server」，但**不能**替代 §6.1 的 `--view` 绑定 key 去做「某调用方只能碰某棵视图」的细粒度隔离——后者仍由 meta 面的 `--require-api-key` + `--view`/`--ro` 强制。要真正的按视图内容隔离，仍需独立视图 + 独立 data 存储根。源码与判定语义见 `grovefs::remote::dac`，端到端验证见 `tests/meta_roundtrip.rs::genuine_meta_arms_data_but_rogue_meta_does_not`。
 
 ### 6.2 PostgreSQL 元数据后端（可选）
 
@@ -2610,6 +2635,7 @@ grovefs meta-server --meta-dir /data --listen 0.0.0.0:50110 --token "$TOK"
 | `--data-dir` | `/data` | 数据基目录:服务会在其下自动建 `blocks/` 子目录与 256 个桶,文件字节以 UUID 为 key 存入 `blocks/<2hex>/<key>`。**可传逗号分隔多路径(`/data,/mnt/d2,...`)= 机内多盘自动放置**:整对象按 key 哈希选定一条盘(客户端与 `data_ref` 全不知情,statfs 自动聚合容量)。但根列表对同一存储须**固定**——放置是哈希 mod 根数,列表与对象本身都不记录盘序号,故坏盘用等尺寸克隆盘**原位顶替**(同路径、同一位置、根数不变)照常定位;而增删盘或调换 `--data-dir` 顺序才会重映射所有 key、使旧对象按新布局不可达(放置层不报错、只静默 ENOENT);扩容宜一次性配齐多根,或在 OS 层用 LVM/mdadm 合盘后只挂单路径 `--data-dir`。server 只认这个布局,基目录指错 = 数据"丢"(其实是没去找) |
 | `--token` | grovefs.env 里那串 | 数据面握手(`OP_OPEN`)口令。客户端不带对同一串 → 连接即 `PermissionDenied`,不重试。不给 = LAN-trusted 无鉴权,仅限全可信内网 |
 | (可加 `--require-api-key`) | — | 把数据面准入改成**逐调用方可撤销的 API key**(客户端 `mount --api-key`):只收 `grovefs apikey create --for mount`(或 `any`)铸造的活 key,每次连(含被拒)落审计,且每秒复证活连接——撤销会断掉已建立的连接并使其自卸载。与 `--token` 同时给出则两道都得过;不给 = 行为与从前一致(只是依旧落审计)。key 库路径由 `--meta-dir <元数据根>` 指定,**默认取首个 `--data-dir`**(分盘部署时必须指对,指到没铸造过 key 的目录 = 一个也不放) |
+| (可加 `--data-access-key HEX`) | — | 要求每次 `OP_OPEN` 携带一枚 **Data-Access Capability**,用这把共享 HMAC 密钥(与集群 `meta-server --data-access-key` 同值)校验;无合法能力即拒(`EACCES`)。堵住 rogue meta-server 复用本 honest data-server 的洞——签不出合法能力的客户端即便持正确 token 也打不开数据面。与 `--token`/`--require-api-key` 相互独立、同时开启则都得过;不给 = 行为逐字节不变。非 per-view ACL(数据面是扁平 KV),详见 §6.1.1 |
 
 逐参数解释——`meta-server`:
 
@@ -2619,6 +2645,8 @@ grovefs meta-server --meta-dir /data --listen 0.0.0.0:50110 --token "$TOK"
 | `--listen` | `0.0.0.0:50110` | 同上,缺省 `127.0.0.1:50053` 只接本机;元数据面单独占一个端口,与数据面 50100 互不串扰 |
 | `--token` | 同一串 | 元数据面握手(`M_OPEN`)口令,与数据面相互独立校验、建议用同一份便于管理 |
 | (可加 `--require-api-key`) | — | 元数据面改按 `M_OPEN` 里的 API key 放行(`mount --api-key ID:SECRET`,或客户端 env `GROVEFS_API_KEY`):读的是同一份注册表(SQLite:`<meta-dir>/meta/api_keys.db`;PG:`grovefs_control.api_keys`)——与 `grovefs mcp --require-api-key` / `grovefs apikey --meta-dir` **同一份注册表**,靠 scope 分入口;撤销能在首个往返内封停已建立的挂载(拒因随帧回传,挂载自卸)。详见 §6 / §3.5.1 |
+| (可加 `--data-access-key HEX`) | — | 每接受一次 `M_OPEN`,就用这把共享 HMAC 密钥(hex)签一枚 Data-Access Capability 放进 ack 尾字节交给客户端,客户端再在每次 `OP_OPEN` 回放到 `data-server`。**必须与集群每个 `data-server --data-access-key` 同值**——经本 meta 挂载的客户端因此能开 honest data-server;缺此 key 的 rogue/外来 meta 签不出合法能力,其客户端被 data-server 拒。不给 = 不签发能力、数据面仅由 token/api-key 把关(行为不变)。详见 §6.1.1 |
+| (可配 `--data-access-ttl SECS`) | `0` | 上一行签发能力的有效期(秒),仅在给了 `--data-access-key` 时有意义。`0`(默认)= 永不过期,长挂载跨 data-server 重启/重连不被半路切断;非零 = 每次 `M_OPEN` 盖 `now+TTL`,收紧重放窗口但过期需重挂 |
 | (不传 `--meta-store`) | — | **这就是“数据库用 sqlite3”**——不传即 embedded SQLite,一 view 一 `.db`;传 `postgres://…` 才会切 PG(且与 HA 互斥,见 §11.9) |
 | (不传 `--role/--peer/--witness`) | — | 单权威节点形态:本案例不做主备/仲裁,`192.168.1.10` 宕机 = 元数据面暂停(磁盘数据不丢)。要 HA 按 §11.8 扩 |
 

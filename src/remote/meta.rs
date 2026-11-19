@@ -456,6 +456,12 @@ pub struct RemoteMeta {
     /// EROFS, because the bytes are shared with the base view. Refreshed on
     /// every (re)handshake.
     content_ro: AtomicU8,
+    /// Data-Access Capability minted by the meta-server on this mount's
+    /// `M_OPEN` (see [`crate::remote::dac`]); the client replays it to each
+    /// data-server `OP_OPEN`. `None` when the server runs without
+    /// `--data-access-key`. Set once on the first accepted handshake — the
+    /// capability is stable for a mount, like the member id on the data side.
+    dac: std::sync::OnceLock<String>,
 }
 
 impl RemoteMeta {
@@ -520,6 +526,7 @@ impl RemoteMeta {
             readonly: AtomicU8::new(0),
             paged: AtomicU8::new(0),
             content_ro: AtomicU8::new(0),
+            dac: std::sync::OnceLock::new(),
         };
         // Probe once (connect + handshake) so mount fails fast on a dead server.
         let (s, _) = this.connect_fresh()?;
@@ -543,6 +550,16 @@ impl RemoteMeta {
     /// physical/derived views.
     pub fn is_content_ro_view(&self) -> bool {
         self.content_ro.load(Ordering::SeqCst) != 0
+    }
+
+    /// The Data-Access Capability the meta-server minted for this mount's
+    /// admission (see [`crate::remote::dac`]); empty when the server runs
+    /// without `--data-access-key`. `mount` forwards it to every data-server
+    /// `OP_OPEN`, where a server in verify mode requires it — so a rogue meta
+    /// that lacks the shared key cannot arm a client against the honest data
+    /// plane. Latched on the first accepted `M_OPEN` (stable for the mount).
+    pub fn data_access_capability(&self) -> String {
+        self.dac.get().cloned().unwrap_or_default()
     }
 
     fn get_conn(&self) -> io::Result<(TcpStream, bool)> {
@@ -607,6 +624,18 @@ impl RemoteMeta {
                                 self.readonly.store(ro, Ordering::SeqCst);
                                 self.paged.store(paged, Ordering::SeqCst);
                                 self.content_ro.store(content_ro, Ordering::SeqCst);
+                                // Byte [3..] (optional): a Data-Access Capability
+                                // appended by a `--data-access-key` meta-server.
+                                // An absent tail means the server issues none (and
+                                // matches every pre-DAC server byte-for-byte).
+                                if data.len() > 3 {
+                                    let mut di = 3usize;
+                                    if let Ok(d) = proto::get_key(&data, &mut di) {
+                                        if !d.is_empty() {
+                                            let _ = self.dac.set(d);
+                                        }
+                                    }
+                                }
                                 self.active.store(idx, Ordering::Relaxed);
                                 return Ok((s, false));
                             }

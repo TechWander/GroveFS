@@ -174,6 +174,15 @@ impl StoreKind {
 struct MetaRuntime {
     base: PathBuf,
     token: String,
+    /// Shared HMAC key for minting the Data-Access Capability
+    /// (`--data-access-key`). `Some` => every accepted `M_OPEN` ships a
+    /// capability the client must replay on its data-plane `OP_OPEN`; `None` =>
+    /// the ack carries none and the data plane is gated by token / api-key
+    /// alone (byte-for-byte unchanged). See [`crate::remote::dac`].
+    data_access_key: Option<Vec<u8>>,
+    /// Capability lifetime in seconds; `0` = never expires. See
+    /// [`Self::data_access_key`] and [`crate::remote::dac`].
+    data_access_ttl: u64,
     /// Per-caller credential gate for `M_OPEN` and live sessions; `None` keeps
     /// the static-token/LAN-trusted behavior byte-for-byte.
     keys: Option<Arc<crate::apikeys::ApiKeyStore>>,
@@ -438,6 +447,12 @@ pub struct MetaServer {
     listen: String,
     base: PathBuf,
     token: String,
+    /// Shared HMAC key for the Data-Access Capability (`--data-access-key`),
+    /// moved into [`MetaRuntime`] at `serve()`. `None` (default) issues no
+    /// capability, leaving the data plane gated by token / api-key only.
+    data_access_key: Option<Vec<u8>>,
+    /// Capability lifetime in seconds (`--data-access-ttl`); `0` = never expires.
+    data_access_ttl: u64,
     /// Optional per-caller credential gate (`--require-api-key`), backed by the
     /// same `<base>/meta/api_keys.db` `grovefs apikey` / `grovefs mcp` use.
     keys: Option<Arc<crate::apikeys::ApiKeyStore>>,
@@ -489,6 +504,8 @@ impl MetaServer {
             listen: listen.to_string(),
             base: base.to_path_buf(),
             token: String::new(),
+            data_access_key: None,
+            data_access_ttl: 0,
             keys: None,
             role: Role::Primary,
             peer: None,
@@ -511,6 +528,8 @@ impl MetaServer {
             listen: listen.to_string(),
             base: base.to_path_buf(),
             token: token.to_string(),
+            data_access_key: None,
+            data_access_ttl: 0,
             keys: None,
             role: Role::Primary,
             peer: None,
@@ -534,6 +553,21 @@ impl MetaServer {
     /// established mount instead of only refusing the next one.
     pub fn with_api_keys(mut self, store: crate::apikeys::ApiKeyStore) -> Self {
         self.keys = Some(Arc::new(store));
+        self
+    }
+
+    /// Enable Data-Access Capability issuance: every accepted `M_OPEN` mints an
+    /// HMAC-signed token under `key` and ships it to the client, which must
+    /// replay it to a `data-server` configured with the SAME key. This is the
+    /// meta-server half of closing the "rogue meta reusing a legit data-server"
+    /// hole (see [`crate::remote::dac`]); `ttl_secs = 0` mints non-expiring
+    /// capabilities (the robust default for long-lived mounts), a nonzero TTL
+    /// bounds the replay window at the cost of a remount once it lapses.
+    /// Unset (the default) issues nothing and leaves behavior byte-for-byte
+    /// unchanged.
+    pub fn with_data_access_key(mut self, key: Vec<u8>, ttl_secs: u64) -> Self {
+        self.data_access_key = Some(key);
+        self.data_access_ttl = ttl_secs;
         self
     }
 
@@ -849,6 +883,8 @@ impl MetaServer {
         let rt = Arc::new(MetaRuntime {
             base: self.base.clone(),
             token: self.token.clone(),
+            data_access_key: self.data_access_key.clone(),
+            data_access_ttl: self.data_access_ttl,
             keys: self.keys.clone(),
             cache: Arc::new(Mutex::new(HashMap::new())),
             subs: Arc::new(Mutex::new(HashMap::new())),
@@ -1028,10 +1064,30 @@ pub fn serve_on_meta(listener: TcpListener, base: PathBuf) {
 /// Accept loop with an access token (`""` disables the check). Single-node
 /// (no HA), the shape every test server uses.
 pub fn serve_on_meta_auth(listener: TcpListener, base: PathBuf, token: &str) {
-    serve_on_meta_full(listener, base, token);
+    serve_on_meta_full(listener, base, token, None, 0);
 }
 
-fn serve_on_meta_full(listener: TcpListener, base: PathBuf, token: &str) {
+/// Accept loop that mints a Data-Access Capability under `dac_key` on every
+/// accepted `M_OPEN` (the `meta-server --data-access-key` path), so a test can
+/// drive a real meta→client→data admission without a FUSE mount. See
+/// [`crate::remote::dac`].
+pub fn serve_on_meta_dac(
+    listener: TcpListener,
+    base: PathBuf,
+    token: &str,
+    dac_key: Vec<u8>,
+    dac_ttl: u64,
+) {
+    serve_on_meta_full(listener, base, token, Some(dac_key), dac_ttl);
+}
+
+fn serve_on_meta_full(
+    listener: TcpListener,
+    base: PathBuf,
+    token: &str,
+    dac_key: Option<Vec<u8>>,
+    dac_ttl: u64,
+) {
     // SQLite-only helper (single-node path): the control plane is the local
     // `meta/views` dir, matching `store: StoreKind::Sqlite`.
     let control =
@@ -1039,6 +1095,8 @@ fn serve_on_meta_full(listener: TcpListener, base: PathBuf, token: &str) {
     let rt = Arc::new(MetaRuntime {
         base,
         token: token.to_string(),
+        data_access_key: dac_key,
+        data_access_ttl: dac_ttl,
         keys: None,
         cache: Arc::new(Mutex::new(HashMap::new())),
         subs: Arc::new(Mutex::new(HashMap::new())),
@@ -4503,8 +4561,24 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
     //       with the base view).
     let client_ro = rt.is_derived(&view) || authed.as_ref().map(|a| a.ro).unwrap_or(false);
     let content_ro = is_fork_def(&*rt.control, &view)?;
-    let ack_flags = [client_ro as u8, paged_cap, content_ro as u8];
-    proto::send_response(&mut writer, 0, open_epoch, &ack_flags)?;
+    // The ack body: three flag bytes, then — only when this node mints
+    // Data-Access Capabilities (`--data-access-key`) — a u16-length-prefixed
+    // capability the client must replay to its data-server. Appending it AFTER
+    // the flags keeps old clients working (they read `..3` and ignore the tail);
+    // a data-server NOT in verify mode likewise ignores it. The capability
+    // proves this session passed a genuine meta `M_OPEN`, so a rogue meta that
+    // lacks the shared key cannot arm the honest data plane (see
+    // [`crate::remote::dac`]).
+    let mut ack = vec![client_ro as u8, paged_cap, content_ro as u8];
+    if let Some(key) = &rt.data_access_key {
+        let expiry = if rt.data_access_ttl == 0 {
+            0
+        } else {
+            crate::remote::dac::now_secs().saturating_add(rt.data_access_ttl)
+        };
+        proto::put_key(&mut ack, &crate::remote::dac::issue(key, expiry));
+    }
+    proto::send_response(&mut writer, 0, open_epoch, &ack)?;
 
     // Distinguish a subscriber (becomes an event sink, sends no requests) from a
     // work connection (metadata ops) by peeking the next frame.
@@ -6060,6 +6134,8 @@ mod ha_tests {
         let rt = Arc::new(MetaRuntime {
             base: dir.path().to_path_buf(),
             token: String::new(),
+            data_access_key: None,
+            data_access_ttl: 0,
             keys: None,
             cache: Arc::new(Mutex::new(HashMap::new())),
             views: Arc::new(Mutex::new(HashMap::new())),
@@ -6227,6 +6303,8 @@ mod ha_tests {
         let mut rt = MetaRuntime {
             base: dir.path().to_path_buf(),
             token: String::new(),
+            data_access_key: None,
+            data_access_ttl: 0,
             keys: None,
             cache: Arc::new(Mutex::new(HashMap::new())),
             views: Arc::new(Mutex::new(HashMap::new())),

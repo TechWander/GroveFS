@@ -263,6 +263,12 @@ pub struct DataServer {
     /// list. Defaults to [`proto::NO_MEMBER_ID`] (started without `--member-id`),
     /// which tells the client to keep placing by list position.
     member_id: u64,
+    /// Shared HMAC key for verifying the Data-Access Capability
+    /// (`--data-access-key`). `Some` => every `OP_OPEN` must present a capability
+    /// minted by a genuine meta-server holding the same key; `None` => data access
+    /// is gated by token / api-key alone (the pre-DAC, byte-for-byte behavior).
+    /// See [`crate::remote::dac`].
+    data_access_key: Option<Vec<u8>>,
 }
 
 impl DataServer {
@@ -277,6 +283,7 @@ impl DataServer {
             keys: None,
             fence: Arc::new(Fence::new_in_memory()),
             member_id: proto::NO_MEMBER_ID,
+            data_access_key: None,
         }
     }
 
@@ -293,6 +300,7 @@ impl DataServer {
             keys: None,
             fence: Arc::new(Fence::new_in_memory()),
             member_id: proto::NO_MEMBER_ID,
+            data_access_key: None,
         }
     }
 
@@ -330,6 +338,19 @@ impl DataServer {
         self
     }
 
+    /// Require a Data-Access Capability on every `OP_OPEN`, verified under
+    /// `key` (the same secret a `--data-access-key` meta-server signs with).
+    /// Independent of the static token and api-key gate: when several are
+    /// configured a client must satisfy all of them. This is the data-server
+    /// half of refusing to be armed by a rogue meta-server — a caller that
+    /// never passed a genuine meta `M_OPEN` has no capability to present and is
+    /// turned away (see [`crate::remote::dac`]). Unset keeps behavior
+    /// byte-for-byte unchanged.
+    pub fn with_data_access_key(mut self, key: Vec<u8>) -> Self {
+        self.data_access_key = Some(key);
+        self
+    }
+
     /// Blocks forever serving connections.
     pub fn serve(&self) -> io::Result<()> {
         let listener = TcpListener::bind(&self.listen)?;
@@ -347,6 +368,9 @@ impl DataServer {
         if self.keys.is_some() {
             println!("data-server: api-key auth REQUIRED (present `mount --api-key`, minted by `grovefs apikey create --for mount|any`); a revoke closes live connections on the next op");
         }
+        if self.data_access_key.is_some() {
+            println!("data-server: Data-Access Capability REQUIRED on OP_OPEN (a meta-server started with the same --data-access-key mints it); a client admitted by a different/rogue meta is refused");
+        }
         serve_auth_keys(
             listener,
             self.backend.clone(),
@@ -354,6 +378,7 @@ impl DataServer {
             self.fence.clone(),
             self.keys.clone(),
             self.member_id,
+            self.data_access_key.clone(),
         );
         Ok(())
     }
@@ -369,6 +394,7 @@ pub fn serve_on(listener: TcpListener, backend: Arc<dyn StorageBackend>) {
         Arc::new(Fence::new_in_memory()),
         None,
         proto::NO_MEMBER_ID,
+        None,
     )
 }
 
@@ -380,7 +406,28 @@ pub fn serve_on_auth(
     token: &str,
     fence: Arc<Fence>,
 ) {
-    serve_auth_keys(listener, backend, token, fence, None, proto::NO_MEMBER_ID)
+    serve_auth_keys(listener, backend, token, fence, None, proto::NO_MEMBER_ID, None)
+}
+
+/// Accept loop that additionally REQUIRES a Data-Access Capability on every
+/// `OP_OPEN`, verified under `dac_key` (the `data-server --data-access-key`
+/// path). Independent of `token`: when both are set a client must satisfy both.
+/// The test/embedded counterpart of the CLI flag; see [`crate::remote::dac`].
+pub fn serve_on_dac(
+    listener: TcpListener,
+    backend: Arc<dyn StorageBackend>,
+    token: &str,
+    dac_key: Vec<u8>,
+) {
+    serve_auth_keys(
+        listener,
+        backend,
+        token,
+        Arc::new(Fence::new_in_memory()),
+        None,
+        proto::NO_MEMBER_ID,
+        Some(dac_key),
+    )
 }
 
 /// Accept loop that advertises a stable `member_id` in every `OP_OPEN` ack, so
@@ -395,6 +442,7 @@ pub fn serve_on_member(listener: TcpListener, backend: Arc<dyn StorageBackend>, 
         Arc::new(Fence::new_in_memory()),
         None,
         member_id,
+        None,
     )
 }
 
@@ -410,6 +458,7 @@ fn serve_auth_keys(
     fence: Arc<Fence>,
     keys: Option<Arc<crate::apikeys::ApiKeyStore>>,
     member_id: u64,
+    data_access_key: Option<Vec<u8>>,
 ) {
     let token = token.to_string();
     for stream in listener.incoming() {
@@ -422,8 +471,11 @@ fn serve_auth_keys(
                 let token = token.clone();
                 let fence = fence.clone();
                 let keys = keys.clone();
+                let dac_key = data_access_key.clone();
                 thread::spawn(move || {
-                    if let Err(e) = handle_conn(s, backend, &token, fence, keys, member_id) {
+                    if let Err(e) =
+                        handle_conn(s, backend, &token, fence, keys, member_id, dac_key)
+                    {
                         // A client hanging up is normal; log only real protocol errors.
                         if e.kind() != io::ErrorKind::UnexpectedEof {
                             eprintln!("conn error: {e}");
@@ -443,6 +495,7 @@ fn handle_conn(
     fence: Arc<Fence>,
     keys: Option<Arc<crate::apikeys::ApiKeyStore>>,
     member_id: u64,
+    data_access_key: Option<Vec<u8>>,
 ) -> io::Result<()> {
     stream.set_nodelay(true)?;
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -462,6 +515,10 @@ fn handle_conn(
     // only fails when the server actually demands one — same layout rule as the
     // meta plane's uid field).
     let api_key = proto::get_key(&body, &mut i).unwrap_or_default();
+    // Optional Data-Access Capability appended by a DAC-aware client. Only read
+    // (and required) when this server runs in verify mode; an old client omits
+    // it, and a server without the feature never looks for it.
+    let dac = proto::get_key(&body, &mut i).unwrap_or_default();
     if !token.is_empty() && presented != token {
         proto::send_response(
             &mut writer,
@@ -470,6 +527,25 @@ fn handle_conn(
             b"data-server rejected the access token",
         )?;
         return Ok(());
+    }
+    // Data-Access Capability gate (`--data-access-key`): a caller must present a
+    // capability a genuine meta-server minted, so this node refuses to be armed
+    // by a rogue/foreign meta whose clients still hold the (shared) cluster
+    // token. Refusal cause goes in the payload as elsewhere, but a forged,
+    // missing and expired capability all collapse to one message (probing them
+    // apart would be a free oracle) — see [`crate::remote::dac::verify`].
+    if let Some(key) = &data_access_key {
+        if crate::remote::dac::verify(key, &dac, crate::remote::dac::now_secs())
+            != crate::remote::dac::Verdict::Valid
+        {
+            proto::send_response(
+                &mut writer,
+                EACCES,
+                0,
+                b"data-server requires a Data-Access Capability minted by this cluster's meta-server (start that meta-server with the same --data-access-key, and mount against it)",
+            )?;
+            return Ok(());
+        }
     }
     let mut authed: Option<crate::apikeys::AuthedKey> = None;
     if let Some(store) = &keys {

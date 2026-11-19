@@ -58,6 +58,11 @@ pub struct RemoteBackend {
     /// with `--require-api-key`. Empty for servers gated by the static token (or
     /// by nothing), which is the pre-existing behavior.
     api_key: String,
+    /// Data-Access Capability minted by the mount's meta-server and replayed on
+    /// `OP_OPEN` to a data-server in verify mode (`--data-access-key`). Empty
+    /// when the meta-server issues none — the pre-DAC behavior, byte-for-byte.
+    /// See [`crate::remote::dac`].
+    dac: String,
     /// Set once the first handshake has been accepted: any later refusal is then
     /// an auth LOSS on a live mount (a revoke landing mid-session), which
     /// `OP_OPEN`'s refusal path reports through [`super::signal_auth_loss`].
@@ -112,10 +117,26 @@ impl RemoteBackend {
     /// this connection lives, so a revoke reaches established mounts too (see
     /// [`crate::apikeys::KEY_RECHECK`]).
     pub fn new_with_creds(addr: &str, token: &str, api_key: &str) -> io::Result<Self> {
+        Self::new_with_dac(addr, token, api_key, "")
+    }
+
+    /// Like [`Self::new_with_creds`], but also replays `dac` — the Data-Access
+    /// Capability the mount's meta-server minted at `M_OPEN` — on the `OP_OPEN`
+    /// handshake. A `data-server --data-access-key` refuses an `OP_OPEN` without
+    /// a capability it can verify, so data access becomes contingent on having
+    /// passed a genuine meta admission (see [`crate::remote::dac`]). An empty
+    /// `dac` (a meta-server without the feature) is the unchanged pre-DAC path.
+    pub fn new_with_dac(
+        addr: &str,
+        token: &str,
+        api_key: &str,
+        dac: &str,
+    ) -> io::Result<Self> {
         let this = Self {
             addr: addr.to_string(),
             token: token.to_string(),
             api_key: api_key.to_string(),
+            dac: dac.to_string(),
             opened: AtomicBool::new(false),
             pool: Arc::new(Mutex::new(Vec::new())),
             max_conns: 64,
@@ -213,6 +234,10 @@ impl RemoteBackend {
                     let mut body = Vec::new();
                     proto::put_key(&mut body, &self.token);
                     proto::put_key(&mut body, &self.api_key);
+                    // Optional capability appended by a DAC-aware client (a
+                    // server not in verify mode, and every pre-DAC server,
+                    // ignore this trailing field).
+                    proto::put_key(&mut body, &self.dac);
                     let mut s = s;
                     match Self::call(&mut s, proto::OP_OPEN, &body) {
                         Ok((0, val, _)) => {
