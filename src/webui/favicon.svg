@@ -2,8 +2,8 @@
   <!-- GroveFS mark: three data blocks growing into a tree. -->
   <defs>
     <linearGradient id="lg" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#237dd6"/>
-      <stop offset="1" stop-color="#1663b3"/>
+      <stop offset="0" stop-color="#2b82e0"/>
+      <stop offset="1" stop-color="#1367c8"/>
     </linearGradient>
   </defs>
   <rect width="32" height="32" rx="8" fill="url(#lg)"/>
