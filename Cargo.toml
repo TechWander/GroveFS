@@ -98,11 +98,11 @@ postgres = { version = "0.19", default-features = false, optional = true }
 # sibling clone. Anonymous https on purpose: an SSH URL would make `cargo fetch`
 # prompt for credentials on machines that only have a key for the private
 # remotes. The engine core needs only `libc` + `thiserror` + std, and the pinned
-# tag v0.3.1 keeps its PG migration shim behind an off-by-default
+# tag v0.3.2 keeps its PG migration shim behind an off-by-default
 # `postgres-compat` feature, so nothing else enters our graph (the earlier pin
 # v0.3.0 still carried `postgres`/`rusqlite(bundled)`/`sha2`/`uuid`/`chrono`/
 # `tracing` unconditionally; upstream gated it afterwards).
-treedb = { git = "https://github.com/TechWander/treedb.git", tag = "v0.3.1", optional = true }
+treedb = { git = "https://github.com/TechWander/treedb.git", tag = "v0.3.2", optional = true }
 # Opt-in per-stage latency telemetry (src/stats.rs): high-dynamic-range histograms
 # for offline bottleneck diagnosis. Pure-Rust, zero deps. Only touched when
 # `--stats` / `GROVEFS_STATS=1` is on; the disabled path costs one atomic load.
