@@ -1,94 +1,35 @@
 <!doctype html>
 <!--
-  The GroveFS management console, embedded in the `grovefs web` binary.
+  GroveFS management console — the Vue 3 build's entry document.
 
-  Zero build, zero external assets: this file plus app.css and app.js are the
-  whole UI, so the page a browser gets is provably the page the binary was
-  compiled from (there is no --assets path that could disagree with it, and no
-  CDN for an air-gapped deployment to be missing). The Content-Security-Policy
-  the gateway sends allows 'self' only, which this file respects: no inline
-  script, no inline style attribute, no remote font. The nav icons and the
-  GroveFS mark (three data blocks growing into a tree — also /favicon.svg)
-  are inline `<svg>` DOM (not `data:` images), which the CSP allows; nav icons
-  inherit the button's color via `currentColor`, the mark carries its own.
+  This file is authored in `console/` and built into `src/webui/index.html`,
+  which `web.rs` embeds with `include_str!` and serves at `/`. The contract with
+  the gateway has not changed and cannot be widened:
 
-  Translations: elements carry `data-i18n` (textContent) or `data-i18n-html`
-  (innerHTML, used only where markup like <code> is wanted); app.js fills both
-  from its dictionary at boot and on every language switch.
+    · `/`, `/app.css`, `/app.js`, `/favicon.svg` are the only asset routes, so
+      the build emits those four fixed names and nothing else (see vite.config).
+    · the CSP is `default-src 'none'; script-src 'self'; style-src 'self'; …`,
+      which is why there is no inline script, no inline style attribute, no
+      remote font and no runtime template compiler here.
+    · every string the server sends reaches the page as TEXT: the old file got
+      that by building DOM by hand; this one gets it by having no `v-html`
+      anywhere (and `vue/no-v-html` is an error-level lint rule to keep it so).
+
+  The body is a single mount point on purpose: the pre-Vue version kept a
+  hand-maintained shell here whose ids app.js had to agree with. Now the shell
+  is one component (`App.vue`) and there is exactly one description of the page.
 -->
 <html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="theme-color" content="#f4f7fb">
-<title>GroveFS console</title>
-<link rel="icon" type="image/svg+xml" href="/favicon.svg">
-<link rel="stylesheet" href="/app.css">
-</head>
-<body>
-
-<div id="toast-host" aria-live="polite"></div>
-
-<!-- Sign-in. Shown until /api/session says there is a session. -->
-<section id="login" hidden>
-  <div class="login-card">
-    <div class="brand-row">
-      <svg class="logo" viewBox="0 0 32 32" width="44" height="44" aria-hidden="true"><defs><linearGradient id="lglg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#2b82e0"/><stop offset="1" stop-color="#1367c8"/></linearGradient></defs><rect width="32" height="32" rx="8" fill="url(#lglg)"/><g fill="#fff"><rect x="11.5" y="4" width="9" height="8" rx="2"/><rect x="6.5" y="14" width="9" height="8" rx="2"/><rect x="16.5" y="14" width="9" height="8" rx="2"/><rect x="14" y="24" width="4" height="5" rx="1.5"/></g></svg>
-      <h1>GroveFS</h1>
-    </div>
-    <p class="sub" data-i18n="Governance console">Governance console</p>
-    <button type="button" class="lang-btn lang-login" title="切换语言 / switch language"></button>
-    <form id="login-form" autocomplete="on">
-      <label for="login-account" data-i18n="Account">Account</label>
-      <input id="login-account" name="username" autocomplete="username" spellcheck="false" required>
-      <label for="login-password" data-i18n="Password">Password</label>
-      <input id="login-password" name="password" type="password" autocomplete="current-password" required>
-      <button id="login-btn" type="submit" class="primary" data-i18n="Sign in">Sign in</button>
-      <p id="login-error" class="err" role="alert"></p>
-    </form>
-  </div>
-</section>
-
-<!-- The app. -->
-<div id="app" hidden>
-  <header>
-    <span class="brand">
-      <svg class="logo" viewBox="0 0 32 32" width="22" height="22" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#1367c8"/><g fill="#fff"><rect x="11.5" y="4" width="9" height="8" rx="2"/><rect x="6.5" y="14" width="9" height="8" rx="2"/><rect x="16.5" y="14" width="9" height="8" rx="2"/><rect x="14" y="24" width="4" height="5" rx="1.5"/></g></svg>
-      GroveFS</span>
-    <nav id="nav">
-      <button type="button" data-page="overview" class="on"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M1 1h6v6H1V1zm8 0h6v6H9V1zM1 9h6v6H1V9zm8 0h6v6H9V9z"/></svg><span data-i18n="Overview">Overview</span></button>
-      <button type="button" data-page="views"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M2 1.5A1.5 1.5 0 0 1 3.5 0h5A1.5 1.5 0 0 1 10 1.5v3A1.5 1.5 0 0 1 8.5 6H7v3h5.5A1.5 1.5 0 0 1 14 10.5v3a1.5 1.5 0 0 1-1.5 1.5h-3A1.5 1.5 0 0 1 8 13.5V13H7v.5A1.5 1.5 0 0 1 5.5 15h-3A1.5 1.5 0 0 1 1 13.5v-3A1.5 1.5 0 0 1 2.5 9H5V6H3.5A1.5 1.5 0 0 1 2 4.5v-3zM3 2v3h5V2H3zm0 9v3h3v-3H3zm7 0v3h3v-3h-3z"/></svg><span data-i18n="Views">Views</span></button>
-      <button type="button" data-page="keys"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M10.5 0a5.5 5.5 0 0 0-5.36 6.75L.44 11.44a1.5 1.5 0 0 0-.44 1.06V15a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1h1a1 1 0 0 0 1-1v-1h1c.4 0 .77-.16 1.06-.44l.38-.38A5.5 5.5 0 1 0 10.5 0zm2 5.5a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0z"/></svg><span data-i18n="Keys">Keys</span></button>
-      <button type="button" data-page="accounts"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M8 0a3.5 3.5 0 1 1 0 7 3.5 3.5 0 0 1 0-7zM2 14.5C2 11.5 4.7 9.5 8 9.5s6 2 6 5a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 14.5z"/></svg><span data-i18n="Accounts">Accounts</span></button>
-      <button type="button" data-page="audit"><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M2 0h9l3 3v13a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1V1a1 1 0 0 1 1-1zm2 5h8v1.5H4V5zm0 3.5h8V10H4V8.5zm0 3.5h5v1.5H4V12z"/></svg><span data-i18n="Audit">Audit</span></button>
-    </nav>
-    <div class="who">
-      <button type="button" class="lang-btn lang-app" title="切换语言 / switch language"></button>
-      <span id="who-account"></span>
-      <span id="who-role" class="badge"></span>
-      <button type="button" id="logout" class="link" data-i18n="Sign out">Sign out</button>
-    </div>
-  </header>
-
-  <!--
-    The five sections are empty on purpose: app.js builds and replaces their
-    contents, so there is exactly one place where a table's columns are declared
-    and no static markup that a page's state could disagree with.
-  -->
-  <main>
-    <section id="page-overview" class="page" hidden></section>
-    <section id="page-views" class="page" hidden></section>
-    <section id="page-keys" class="page" hidden></section>
-    <section id="page-accounts" class="page" hidden></section>
-    <section id="page-audit" class="page" hidden></section>
-  </main>
-</div>
-
-<div id="modal-host" hidden></div>
-<!-- The row drawer: a list's full record in a second pane. Empty and hidden
-     until a row is opened (see `drawer()` in app.js). -->
-<div id="drawer-host" hidden></div>
-
-<script src="/app.js"></script>
-</body>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f4f7fb" />
+    <title>GroveFS console</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <script type="module" crossorigin src="/app.js"></script>
+    <link rel="stylesheet" crossorigin href="/app.css">
+  </head>
+  <body>
+    <div id="app"></div>
+  </body>
 </html>

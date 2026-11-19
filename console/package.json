@@ -1,0 +1,40 @@
+{
+  "name": "grovefs-console",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "GroveFS management console — Vue 3 + TypeScript front end that builds into src/webui/{index.html,app.js,app.css}.",
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc -p tsconfig.json --noEmit && vite build",
+    "typecheck": "vue-tsc -p tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "i18n:audit": "node tools/i18n-audit.js"
+  },
+  "dependencies": {
+    "pinia": "4.1.0",
+    "vue": "3.5.45",
+    "vue-router": "5.5.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/node": "26.6.6",
+    "@vitejs/plugin-vue": "6.0.11",
+    "@vue/tsconfig": "0.9.1",
+    "eslint": "10.15.0",
+    "eslint-config-prettier": "10.1.8",
+    "eslint-plugin-vue": "10.12.1",
+    "globals": "17.14.0",
+    "prettier": "3.10.1",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.73.0",
+    "vite": "8.3.8",
+    "vue-tsc": "3.3.14"
+  }
+}

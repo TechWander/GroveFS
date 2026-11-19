@@ -1,0 +1,34 @@
+<!doctype html>
+<!--
+  GroveFS management console — the Vue 3 build's entry document.
+
+  This file is authored in `console/` and built into `src/webui/index.html`,
+  which `web.rs` embeds with `include_str!` and serves at `/`. The contract with
+  the gateway has not changed and cannot be widened:
+
+    · `/`, `/app.css`, `/app.js`, `/favicon.svg` are the only asset routes, so
+      the build emits those four fixed names and nothing else (see vite.config).
+    · the CSP is `default-src 'none'; script-src 'self'; style-src 'self'; …`,
+      which is why there is no inline script, no inline style attribute, no
+      remote font and no runtime template compiler here.
+    · every string the server sends reaches the page as TEXT: the old file got
+      that by building DOM by hand; this one gets it by having no `v-html`
+      anywhere (and `vue/no-v-html` is an error-level lint rule to keep it so).
+
+  The body is a single mount point on purpose: the pre-Vue version kept a
+  hand-maintained shell here whose ids app.js had to agree with. Now the shell
+  is one component (`App.vue`) and there is exactly one description of the page.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f4f7fb" />
+    <title>GroveFS console</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

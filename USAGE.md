@@ -1356,7 +1356,7 @@ e2e 见 `ctlplane` 套件(启动横幅/首个 admin key 必须在主机铸造/�
 
 §3.5.2 让任意一台机器都能治理同一份元数据,但入口仍是终端:动词要记、key 要带、拒因要读。高频的三件事——看视图、发密钥、给同事划一块地方——在浏览器里点更省事;而"这个账号管这一块,包括它派生出的 fork、别名和这块地方的密钥"这种**归属**,一把共享的 admin key 说不清,终端里也没有对应的形状。
 
-管理台补的就是这块,而它**不新增一套治理逻辑**。`grovefs web` 是 `meta-server --control-listen` 前面的一个 HTTP 网关:内嵌单页应用(总览/视图/密钥/账号与授权/审计五页,构建期 `include_str!` 进二进制——没有 CDN、没有 node_modules、离线主机也打得开),把浏览器会话变成一个**账号**,把每次点击转成一个治理 op 转发过去。"谁能碰哪棵树"的判定仍然只在服务端 `gates()`/`authorize()` 一处;网关只做**减法**,它不路由的动词(`gc.scan`/`gc.apply`/`refs.rebuild`/`view.rm_base`/`fork.graft`)在浏览器里永远到不了,哪怕服务端本来会允许。账号、授权、口令摘要都存在**服务端**(SQLite 档 `<meta-dir>/meta/web_accounts.db`,PG 档是控制库里的表;PBKDF2-HMAC-SHA256 21 万轮),登录校验由持有存储的进程做——网关拿不到密码库,这正是它敢只做翻译层的原因。
+管理台补的就是这块,而它**不新增一套治理逻辑**。`grovefs web` 是 `meta-server --control-listen` 前面的一个 HTTP 网关:内嵌单页应用(总览/视图/密钥/账号与授权/审计五页,构建期 `include_str!` 进二进制——页面运行时不碰 CDN、不带 node_modules,离线主机也打得开;前端源码在 `console/`(Vue 3 + TypeScript + Vite),产物提交在 `src/webui/`,故 `cargo build` 仍不需要 node 工具链,改前端才跑 `npm ci && npm run build`,见 `console/README.md`),把浏览器会话变成一个**账号**,把每次点击转成一个治理 op 转发过去。"谁能碰哪棵树"的判定仍然只在服务端 `gates()`/`authorize()` 一处;网关只做**减法**,它不路由的动词(`gc.scan`/`gc.apply`/`refs.rebuild`/`view.rm_base`/`fork.graft`)在浏览器里永远到不了,哪怕服务端本来会允许。账号、授权、口令摘要都存在**服务端**(SQLite 档 `<meta-dir>/meta/web_accounts.db`,PG 档是控制库里的表;PBKDF2-HMAC-SHA256 21 万轮),登录校验由持有存储的进程做——网关拿不到密码库,这正是它敢只做翻译层的原因。
 
 **安装期:第一个管理员只能由持有存储的进程放。** 治理入口若能自己铸管理员,这道门就白设了,所以 bootstrap 挂在 `meta-server` 上而不是 `web` 上:两面 flag 只在账号表**为空**时生效,unit 文件反复读同一个 flag 的重启是幂等的,而换一个 `--admin-user` 会拒绝启动而不是悄悄多塞一个管理员。口令只有 `--admin-password-file`,没有 `--admin-password`——argv 对本机所有进程可见,还会落进 shell history。
 

@@ -1,0 +1,8 @@
+# Installed by `npm ci` / `npm install` — ~200 MB of third-party source that a
+# lockfile already describes. Never belongs in a commit.
+node_modules/
+# `vite build` writes straight into ../src/webui (see vite.config.ts), so a
+# stray `dist/` here would only ever be the wreckage of a changed config.
+dist/
+# Local overrides for `npm run dev` (proxy target, port).
+*.local

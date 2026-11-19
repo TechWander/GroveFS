@@ -1,0 +1,126 @@
+import type {
+  AccountRow,
+  AuditRow,
+  GrantRow,
+  ImportResult,
+  InfoResult,
+  KeyRow,
+  KeySecret,
+  MintKeyArgs,
+  StoreInfo,
+  ViewStats,
+} from '@/types'
+
+/*
+  The console's own promise about what a user can click.
+
+  `Op` is exactly `ALLOWED_OPS` from `web.rs` — the list `/api/session` returns.
+  An op absent from it (the four destructive verbs: `gc.scan`/`gc.apply`,
+  `refs.rebuild`, `view.rm_base`, `fork.graft`) stays an operator CLI command,
+  and a page built against a different binary fails on a NAMED missing op instead
+  of a mystery 403. `OpResult` documents what each answer is shaped like; the
+  `unknown` rows are the verbs whose payload this UI does not read — the server's
+  refusal sentence is what matters there, and it is shown verbatim.
+*/
+
+export type Op =
+  | 'info'
+  | 'whoami'
+  | 'store.info'
+  | 'def.list'
+  | 'def.get'
+  | 'def.put'
+  | 'def.remove'
+  | 'physical.list'
+  | 'stamp'
+  | 'fork.has'
+  | 'fork.create'
+  | 'fork.drop'
+  | 'view.create'
+  | 'view.stats'
+  | 'apikey.list'
+  | 'apikey.create'
+  | 'apikey.revoke'
+  | 'apikey.rotate'
+  | 'apikey.set_ro'
+  | 'apikey.update'
+  | 'apikey.calls'
+  | 'account.list'
+  | 'account.create'
+  | 'account.passwd'
+  | 'account.role'
+  | 'account.disable'
+  | 'account.delete'
+  | 'grant.list'
+  | 'grant.add'
+  | 'grant.remove'
+
+/** A call whose refusal is worth rendering INLINE instead of as a toast: the
+    overview page loads several things at once, and a page that is part answer
+    and one refusal sentence needs the sentence where it belongs. */
+export type Soft<T> = { ok: true; r: T | null } | { ok: false; error: string }
+
+/** A `def.list` entry: `[name, text]` pairs, or the same as an object. */
+export type DefEntry = [string, string] | { name: string; text: string }
+
+export interface OpResult {
+  info: InfoResult
+  whoami: unknown
+  'store.info': StoreInfo
+  'def.list': DefEntry[]
+  'def.get': unknown
+  'def.put': unknown
+  'def.remove': unknown
+  'physical.list': string[]
+  stamp: unknown
+  'fork.has': unknown
+  'fork.create': ForkStats
+  'fork.drop': unknown
+  'view.create': string | { note?: string }
+  'view.stats': ViewStats
+  'apikey.list': KeyRow[]
+  'apikey.create': KeySecret
+  'apikey.revoke': unknown
+  'apikey.rotate': KeySecret
+  'apikey.set_ro': unknown
+  'apikey.update': unknown
+  'apikey.calls': AuditRow[]
+  'account.list': AccountRow[]
+  'account.create': CreatedAccount
+  'account.passwd': unknown
+  'account.role': unknown
+  'account.disable': unknown
+  'account.delete': DeletedAccount
+  'grant.list': GrantRow[]
+  'grant.add': GrantedBase
+  'grant.remove': unknown
+}
+
+/** `fork.create` — the metadata tree that was copied. */
+export interface ForkStats {
+  nodes: number
+  blobs: number
+}
+
+/** `account.create` — including the server's own note about the new row. */
+export interface CreatedAccount {
+  account: string
+  role: string
+  note: string
+}
+
+/** `account.delete` — the reply that says how many keys are still live. */
+export interface DeletedAccount {
+  account: string
+  note: string
+}
+
+/** `grant.add` — a delegation, with the resolved base name when the operator
+    typed an alias instead. */
+export interface GrantedBase {
+  account: string
+  base: string
+  asNamed?: boolean
+}
+
+export type { ImportResult, MintKeyArgs }

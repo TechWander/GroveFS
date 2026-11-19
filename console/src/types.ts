@@ -1,0 +1,173 @@
+/*
+  The wire types of the gateway's `/api/call` replies.
+
+  These are descriptions of what the meta-server already sends, not a new
+  contract: the field names are the JSON's (snake_case, as `server_ext.rs`
+  writes them) and the optionality is exactly what the server omits. The console
+  may not reshape an answer here — a refusal sentence has to arrive with its
+  wording intact, so `CallReply.error` stays a string and nothing is defaulted
+  into it.
+*/
+
+/** What `/api/session` answers as `who` (the server's own `whoami`). */
+export interface Who {
+  account: string
+  role: string
+  super: boolean
+  bases?: string[]
+}
+
+export interface SessionReply {
+  ok?: boolean
+  signedIn?: boolean
+  csrf?: string
+  who?: Who
+  ops?: string[]
+  error?: string
+}
+
+export interface LoginReply {
+  ok?: boolean
+  error?: string
+}
+
+/** One governance call: either `result` or `error`, never both. */
+export interface CallReply<T = unknown> {
+  ok?: boolean
+  result?: T
+  error?: string
+}
+
+/** `info` — the cheap identity/backend answer any signed-in account gets. */
+export interface InfoResult {
+  backend?: string
+  describe?: string
+  actor?: string
+  role?: string
+}
+
+/** `store.info` — the administrator's deployment snapshot. */
+export interface StoreInfo {
+  backend?: string
+  describe?: string
+  base?: string
+  role?: string
+  views?: number
+  definitions?: number
+  accounts?: number | null
+  liveKeys?: number | null
+  expiredKeys?: number | null
+  liveSessions?: number
+  residentEngines?: number
+  residentViews?: number
+  /** `null` means rows are kept until an operator purges them by hand. */
+  auditRetention?: string | null
+}
+
+/** The API's own kind spelling; `derived` is what the console calls a lens. */
+export type ViewKind = 'base' | 'fork' | 'alias' | 'derived' | 'other'
+
+/** A merged row of `physical.list` + `def.list` — the list's cheap view. */
+export interface ViewRow {
+  name: string
+  kind: ViewKind
+  base: string | null
+}
+
+/** `view.stats` — the authority on one name, refined for the selected row. */
+export interface ViewStats {
+  name: string
+  kind: ViewKind
+  base: string | null
+  definition?: string | null
+  stamp?: Stamp
+  tree?: boolean
+  forkTree?: boolean
+  family?: string[]
+  keys?: number | null
+  sessions?: number
+  resident?: boolean
+}
+
+export type Stamp = string | Record<string, string | number> | null | undefined
+
+/** One row of `apikey.list`. */
+export interface KeyRow {
+  id: string
+  label: string
+  scope: string
+  view?: string | null
+  ro?: boolean
+  owner?: string | null
+  created_by?: string | null
+  note?: string | null
+  secret_hint?: string | null
+  created_at?: string | null
+  expires_at?: string | null
+  expired?: boolean
+  revoked_at?: string | null
+  last_used_at?: string | null
+}
+
+/** `apikey.create` / `apikey.rotate` — the only reply that carries a secret. */
+export interface KeySecret {
+  key: string
+  id: string
+  label: string
+  scope: string
+  owner?: string | null
+  created_by?: string | null
+  view?: string | null
+  expires_at?: string | null
+  note?: string | null
+}
+
+/** One row of `apikey.calls` — the governance audit trail. */
+export interface AuditRow {
+  ts: string
+  method?: string
+  tool?: string
+  ok?: boolean
+  detail?: string | null
+  key_label?: string | null
+  key_id?: string | null
+}
+
+/** One row of `account.list`. */
+export interface AccountRow {
+  account: string
+  role: string
+  created_at?: string | null
+  last_login_at?: string | null
+  disabled_at?: string | null
+  bases?: string[]
+}
+
+/** One row of `grant.list` — an account's delegation of one base view. */
+export interface GrantRow {
+  account: string
+  base_view: string
+  perm?: string
+  granted_at?: string | null
+  granted_by?: string | null
+}
+
+/** `POST /api/import` — a dump's outcome. */
+export interface ImportResult {
+  nodes: number
+  blobs: number
+  kind: string
+}
+
+/** `apikey.create`'s `args`, and the two optional ones the CLI also has.
+    A type alias rather than an interface on purpose: `api()` takes a
+    `Record<string, unknown>` payload, and only an alias gets the implicit index
+    signature that makes the two types line up without a cast. */
+export type MintKeyArgs = {
+  label: string
+  scope: string
+  ro: boolean
+  view?: string
+  note?: string
+  ttl?: string
+}

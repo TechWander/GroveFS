@@ -1,0 +1,66 @@
+<script setup lang="ts">
+/*
+  One audit row, in full.
+
+  The table gives you six clipped columns; this gives you the message the server
+  actually wrote, un-wrapped. Line breaks and indentation in a governance refusal
+  separate "why" from "what to do next", which is why it is a `<pre>` and not a
+  paragraph the browser is allowed to flatten.
+*/
+import type { AuditRow } from '@/types'
+import { useUiStore } from '@/stores/ui'
+import { auditActor } from '@/utils/audit'
+import { t } from '@/i18n'
+import BaseDrawer from '@/components/overlay/BaseDrawer.vue'
+import DrawerSection from '@/components/overlay/DrawerSection.vue'
+import KvList from '@/components/layout/KvList.vue'
+import KvRow from '@/components/layout/KvRow.vue'
+import MonoText from '@/components/ui/MonoText.vue'
+import TwoLineCell from '@/components/ui/TwoLineCell.vue'
+import StateBadge from '@/components/ui/StateBadge.vue'
+
+const props = defineProps<{ row: AuditRow }>()
+
+const ui = useUiStore()
+const who = (): string | null => auditActor(props.row)
+</script>
+
+<template>
+  <BaseDrawer
+    :title="props.row.tool || props.row.method || t('governance call')"
+    @close="ui.closeDrawer()"
+  >
+    <template #badges>
+      <StateBadge
+        :label="props.row.ok ? t('ok') : t('failed')"
+        :tone="props.row.ok ? 'good' : 'bad'"
+      />
+    </template>
+
+    <DrawerSection>
+      <KvList>
+        <KvRow label="when" mono :value="props.row.ts || '—'" />
+        <KvRow label="who">
+          <span v-if="who()">{{ who() }}</span>
+          <span v-else class="muted">{{ t('no account on it') }}</span>
+        </KvRow>
+        <KvRow label="plane" mono :value="props.row.method" />
+        <KvRow label="op" mono :value="props.row.tool" />
+        <KvRow label="key">
+          <TwoLineCell
+            v-if="props.row.key_label"
+            :top="props.row.key_label"
+            :sub="props.row.key_id"
+            sub-mono
+          />
+          <MonoText v-else-if="props.row.key_id" :text="props.row.key_id" />
+          <template v-else>—</template>
+        </KvRow>
+      </KvList>
+    </DrawerSection>
+
+    <DrawerSection heading="What the server said">
+      <pre class="plain">{{ props.row.detail || t('nothing recorded') }}</pre>
+    </DrawerSection>
+  </BaseDrawer>
+</template>

@@ -2853,7 +2853,7 @@ account              base view                perm     granted                by
 bob                  main                     manage   2026-11-17T16:39:25.384892614+00:00 rootops</code></pre>
 
     <h4>登录后能做什么</h4>
-    <p>会话是 <code>gfs_sid</code> 一个 <code>HttpOnly; SameSite=Strict</code>  的 cookie，写操作还要带 <code>X-GroveFS-CSRF</code>（登录响应里给），并且 <code>Origin</code> 必须等于 <code>Host</code>。单页应用五页（构建期 <code>include_str!</code> 进二进制，无 CDN、无 node_modules，离线主机也打得开），<b>同一套 ACL 在不同账号身上显示不同的东西</b>：</p>
+    <p>会话是 <code>gfs_sid</code> 一个 <code>HttpOnly; SameSite=Strict</code>  的 cookie，写操作还要带 <code>X-GroveFS-CSRF</code>（登录响应里给），并且 <code>Origin</code> 必须等于 <code>Host</code>。单页应用五页（前端源码在 <code>console/</code>〔Vue 3 + TypeScript + Vite〕，构建产物提交在 <code>src/webui/</code>，安装期 <code>include_str!</code> 进二进制：页面运行时不碰 CDN、不带 node_modules，离线主机也打得开，<code>cargo build</code> 也不需要 node 工具链——改前端才跑 <code>npm ci &amp;&amp; npm run build</code>，见 <code>console/README.md</code>），<b>同一套 ACL 在不同账号身上显示不同的东西</b>：</p>
     <table>
       <thead><tr><th>页</th><th>admin</th><th>user（被授了 <code>main</code>）</th></tr></thead>
       <tbody>
