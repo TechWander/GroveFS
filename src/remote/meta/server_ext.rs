@@ -263,6 +263,9 @@ struct MetaRuntime {
     /// (entries stay resident for the process lifetime — the pre-sweeper
     /// behavior every existing test relies on).
     engine_idle_ms: u64,
+    /// `--audit-retention DUR`, as spelled by the operator; `None` = the audit
+    /// table is append-only (the behavior before the flag existed).
+    audit_retention: Option<String>,
     /// The account-key store that gates the CONTROL port, when
     /// `--control-listen` is set. Deliberately separate from [`Self::keys`]: the
     /// mount gate (`--require-api-key`) and the governance gate are two
@@ -450,6 +453,11 @@ pub struct MetaServer {
     store_unavailable: Option<String>,
     /// Idle engine eviction window (ms); see [`MetaRuntime::engine_idle_ms`].
     engine_idle_ms: u64,
+    /// `--audit-retention DUR`: how long `mcp_calls` rows live, as the
+    /// operator spelled it (`90d`). `None` (the default) keeps today's
+    /// append-forever behavior — nothing is deleted unless it is asked for.
+    /// See [`reap_audit`].
+    audit_retention: Option<String>,
     /// Optional REMOTE CONTROL PLANE address (`--control-listen HOST:PORT`).
     /// Empty/unset keeps the process exactly as before: no governance port, no
     /// admin credentials, nothing new to firewall.
@@ -489,6 +497,7 @@ impl MetaServer {
             store: StoreKind::Sqlite,
             store_unavailable: None,
             engine_idle_ms: DEFAULT_ENGINE_IDLE_MS,
+            audit_retention: None,
             control_listen: None,
             admin_account: None,
         }
@@ -510,6 +519,7 @@ impl MetaServer {
             store: StoreKind::Sqlite,
             store_unavailable: None,
             engine_idle_ms: DEFAULT_ENGINE_IDLE_MS,
+            audit_retention: None,
             control_listen: None,
             admin_account: None,
         }
@@ -686,6 +696,16 @@ impl MetaServer {
         self
     }
 
+    /// Bound the audit trail's growth (`--audit-retention`). Takes the duration
+    /// TEXT rather than seconds so the cutoff is always resolved against the
+    /// server's clock at sweep time (a fixed cutoff computed at startup would
+    /// drift into "keep everything" on a long-lived process), and so
+    /// `store.info` can show the operator what was actually configured.
+    pub fn with_audit_retention(mut self, window: Option<String>) -> Self {
+        self.audit_retention = window;
+        self
+    }
+
     pub fn serve(&self) -> io::Result<()> {
         // A --meta-store scheme this binary cannot serve is refused rather than
         // downgraded: see `with_store`.
@@ -844,6 +864,7 @@ impl MetaServer {
             bases: Arc::new(Mutex::new(HashMap::new())),
             defs: Arc::new(Mutex::new(HashMap::new())),
             engine_idle_ms: self.engine_idle_ms,
+            audit_retention: self.audit_retention.clone(),
             ctl_keys,
             web_auth,
             xfer_owner: Mutex::new(HashMap::new()),
@@ -896,6 +917,33 @@ impl MetaServer {
             );
             let crt = rt.clone();
             thread::spawn(move || gov_accept(cl, crt));
+            // Audit retention, when an operator asked for one. Without this the
+            // trail is append-only forever: every governance call, every MCP
+            // tool call and every mount handshake adds a row, so a deployment
+            // that lives on the console accumulates a table nobody can read.
+            // Sweeping at 1/24 of the window (bounded to 10min..12h) turns
+            // `--audit-retention 90d` into a daily trim, and sleeping FIRST
+            // keeps a boot from starting with a DELETE on the store.
+            if let Some(window) = rt.audit_retention.clone() {
+                let ar = rt.clone();
+                let nap = crate::apikeys::duration_secs(&window)
+                    .ok()
+                    .flatten()
+                    .map(|s| (s / 24).clamp(600, 43_200))
+                    .unwrap_or(86_400);
+                let every = if nap >= 3600 {
+                    format!("~{}h", nap / 3600)
+                } else {
+                    format!("{}min", nap / 60)
+                };
+                println!(
+                    "meta-server: audit rows older than --audit-retention {window} are swept every {every} (`grovefs apikey purge --before {window}` runs the same cut on demand)",
+                );
+                thread::spawn(move || loop {
+                    thread::sleep(std::time::Duration::from_secs(nap as u64));
+                    reap_audit(&ar, &window);
+                });
+            }
         }
         // Fail LOUD on a malformed witness list. `split_addrs` collapses a
         // degenerate input (e.g. a lone comma) to a single bogus entry, which
@@ -1008,6 +1056,7 @@ fn serve_on_meta_full(listener: TcpListener, base: PathBuf, token: &str) {
         // Plain LAN-trusted test server: keep engines resident (no sweeper),
         // exactly the pre-eviction behavior.
         engine_idle_ms: 0,
+        audit_retention: None,
         ctl_keys: None,
         web_auth: None,
         xfer_owner: Mutex::new(HashMap::new()),
@@ -1095,16 +1144,24 @@ fn serve_runtime(listener: TcpListener, rt: Arc<MetaRuntime>) {
 // the local `<meta-dir>`, so the operator's credential replaces a database
 // password. Every call is authenticated as `Scope::Admin` and audited.
 //
-// The framing is one request / one response / one governance verb (see
-// `proto::OP_CONTROL`); there is no session state, so there is nothing to
-// expire and nothing a half-open socket can keep alive.
+// The framing is one request / one response per governance verb (see
+// `proto::OP_CONTROL`). A caller that sends `"pin": true` gets its credential
+// kept on the socket, so its later requests skip the connect, the thread spawn
+// and the two store queries an authentication costs; a caller that sends
+// nothing gets the classic one-request connection, which is what every CLI
+// invocation still asks for. The session is bounded on purpose
+// ([`GOV_PINNED_REQUESTS`], [`GOV_PINNED_IDLE`]) so an identity cannot outlive
+// the process that opened it, and it is re-checked against the store on the
+// same [`crate::apikeys::KEY_RECHECK`] tick a live mount is.
 fn gov_accept(listener: TcpListener, rt: Arc<MetaRuntime>) {
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
-                // Same rationale as the mount plane: the one-shot request
-                // read has no timeout, so a half-open admin client would pin
-                // a thread; keepalive breaks it in ~2 min.
+                // Keepalive on top of the read bound in `handle_gov_conn`: a
+                // pinned connection is held open by design, so the timeout is
+                // what stops a gateway that died mid-session from pinning a
+                // thread forever, and keepalive is what notices the host itself
+                // went away (~2 min).
                 crate::remote::enable_tcp_keepalive(&s);
                 let rt = rt.clone();
                 thread::spawn(move || {
@@ -1124,10 +1181,26 @@ fn gov_accept(listener: TcpListener, rt: Arc<MetaRuntime>) {
 /// envelope in the body. Failures are NEVER a transport-level status, so a
 /// caller can tell "the op said no" from "the server went away".
 fn gov_reply(s: &mut TcpStream, result: serde_json::Value, err: Option<&str>) -> io::Result<()> {
-    let env = match err {
+    gov_reply_pinned(s, result, err, false)
+}
+
+/// [`gov_reply`] plus the answer to a pinning caller's question "may I send
+/// another request on this socket?". `pinned` is only ever ADDED when true, so
+/// the envelope a one-shot caller parses — and every caller built before
+/// sessions existed — is byte-identical to the old one, and silence means no.
+fn gov_reply_pinned(
+    s: &mut TcpStream,
+    result: serde_json::Value,
+    err: Option<&str>,
+    pinned: bool,
+) -> io::Result<()> {
+    let mut env = match err {
         Some(e) => serde_json::json!({"ok": false, "e": e}),
         None => serde_json::json!({"ok": true, "r": result}),
     };
+    if pinned {
+        env["pinned"] = serde_json::json!(true);
+    }
     let data = serde_json::to_vec(&env).unwrap_or_default();
     proto::send_response(s, 0, 0, &data)
 }
@@ -1192,30 +1265,130 @@ fn gov_login(rt: &Arc<MetaRuntime>, a: &serde_json::Value) -> Result<serde_json:
     }))
 }
 
-fn handle_gov_conn(mut s: TcpStream, rt: &Arc<MetaRuntime>) -> io::Result<()> {
-    let _ = s.set_nodelay(true);
-    let (op_code, body) = proto::recv_request(&mut s)?;
+/// One retention pass: drop `mcp_calls` rows older than the window, and say so
+/// only when rows actually went (a sweep that prints every ~hour would bury the
+/// startup lines that matter). A refusal is reported because the next pass will
+/// hit the same wall — an operator wants to know the table is not being trimmed.
+fn reap_audit(rt: &Arc<MetaRuntime>, window: &str) {
+    let Some(keys) = rt.ctl_keys.as_ref() else {
+        return;
+    };
+    let Ok(cutoff) = crate::apikeys::cutoff_from_age(window) else {
+        eprintln!(
+            "meta-server: --audit-retention '{window}' is not a duration (use 45m, 24h, 90d…); no audit sweep is running"
+        );
+        return;
+    };
+    match keys.purge_calls_older_than(&cutoff) {
+        Ok(0) => {}
+        Ok(n) => println!(
+            "meta-server: audit retention '{window}' dropped {n} mcp_calls row(s) older than {cutoff}"
+        ),
+        Err(e) => eprintln!("meta-server: audit retention sweep failed: {e}"),
+    }
+}
+
+/// Requests one pinned governance session answers before the server closes the
+/// socket for its caller's next request to reopen, and how long it may stay
+/// silent first. Both are bounds on an identity held on someone else's behalf;
+/// the client is always answered before a connection ends, so nothing is ever
+/// lost to a bound — the next call simply opens a socket and pays one
+/// authentication again.
+const GOV_PINNED_REQUESTS: usize = 512;
+const GOV_PINNED_IDLE: Duration = Duration::from_secs(300);
+
+/// The credential one governance connection answers for once its caller asked
+/// to be pinned. Holding it is the entire saving: an authenticated request costs
+/// two store queries (an `api_keys` SELECT plus the `last_used_at` UPDATE), and
+/// a session does not repeat them per request.
+struct GovSession {
+    authed: crate::apikeys::AuthedKey,
+    /// The next liveness re-check, on the cadence the mount plane keeps.
+    check: Instant,
+    /// Requests answered so far, against [`GOV_PINNED_REQUESTS`].
+    served: usize,
+}
+
+/// Serve one governance connection: the classic one request / one response for a
+/// caller that does not ask to be pinned, a bounded loop for one that does.
+///
+/// Both directions of a version skew are handled on purpose, not by luck:
+/// - an OLD client against this server sends one request, reads the reply and
+///   closes; the next read here hits EOF and the thread exits, which is the same
+///   ending it always had with one extra `recv`;
+/// - a reply to a caller that did not ask to be pinned carries no `pinned`
+///   field, so a newer client never pools it. No second request is ever written
+///   into a socket the server has already forgotten, so no op can be lost to the
+///   skew.
+fn handle_gov_conn(mut sock: TcpStream, rt: &Arc<MetaRuntime>) -> io::Result<()> {
+    let _ = sock.set_nodelay(true);
+    // A pinned session is held open BETWEEN requests by design, so it must not
+    // be held open forever by an accident: a caller that vanishes mid-session
+    // costs one thread until this fires, and nothing after it.
+    let _ = sock.set_read_timeout(Some(GOV_PINNED_IDLE));
+    let mut sess: Option<GovSession> = None;
+    loop {
+        let (op_code, body) = match proto::recv_request(&mut sock) {
+            Ok(v) => v,
+            // Silence past the idle bound, or a client that went away between
+            // requests: both are a normal end of life, not an error to print.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        if gov_one(&mut sock, rt, &mut sess, op_code, &body)? {
+            continue;
+        }
+        return Ok(());
+    }
+}
+
+/// Answer ONE governance request on `sock`; `Ok(true)` means the connection may
+/// carry another. Every other outcome has been replied to and closes the socket
+/// — a wrong op code, an unreadable body, a caller the store will not
+/// authenticate, a session that just served its last request.
+///
+/// The order of the gates is the one this handler has always had and it matters:
+/// credential first (nothing is audited as anybody until somebody is proven),
+/// then the sign-in case, then the console account's delegations, then the op.
+fn gov_one(
+    sock: &mut TcpStream,
+    rt: &Arc<MetaRuntime>,
+    sess: &mut Option<GovSession>,
+    op_code: u8,
+    body: &[u8],
+) -> io::Result<bool> {
     if op_code != proto::OP_CONTROL {
-        return gov_reply(
-            &mut s,
+        gov_reply(
+            sock,
             serde_json::Value::Null,
             Some(&format!(
                 "this port speaks governance only (expected op {}, got {op_code}) — a mount must use --listen",
                 proto::OP_CONTROL
             )),
-        );
+        )?;
+        return Ok(false);
     }
-    let req: serde_json::Value = match serde_json::from_slice(&body) {
+    let req: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => {
-            return gov_reply(
-                &mut s,
+            gov_reply(
+                sock,
                 serde_json::Value::Null,
                 Some(&format!("malformed control request: {e}")),
-            )
+            )?;
+            return Ok(false);
         }
     };
-    let key = req.get("k").and_then(|v| v.as_str()).unwrap_or("");
+    // "Keep my credential on this socket." Only the gateway's pool asks; a CLI
+    // leaves the field off and gets the one-request connection it expects.
+    let want_pin = req.get("pin").and_then(|v| v.as_bool()).unwrap_or(false);
     let op = req.get("op").and_then(|v| v.as_str()).unwrap_or("");
     let args = req.get("a").cloned().unwrap_or(serde_json::Value::Null);
     // The web console's per-user attribution: WHO signed in, and from where. Only
@@ -1234,23 +1407,76 @@ fn handle_gov_conn(mut s: TcpStream, rt: &Arc<MetaRuntime>) -> io::Result<()> {
         }
     };
     let Some(keys) = rt.ctl_keys.as_ref() else {
-        return gov_reply(
-            &mut s,
+        gov_reply(
+            sock,
             serde_json::Value::Null,
             Some(
                 "this meta-server has no control plane (start it with --control-listen HOST:PORT)",
             ),
-        );
+        )?;
+        return Ok(false);
     };
-    let authed = match keys.authenticate_admin(key) {
-        Ok(a) => a,
-        Err(e) => {
-            // An unauthenticated attempt is audited too (keyless), so a wrong
-            // or revoked credential is visible in `apikey calls` instead of
-            // only in the operator's terminal.
-            let _ = keys.log_call(None, "control", op, false, &e);
-            return gov_reply(&mut s, serde_json::Value::Null, Some(&e));
+    // A session that already exists is re-verified on the KEY_RECHECK tick and
+    // not per request: `apikey revoke` and an elapsed `--ttl` therefore reach a
+    // pooled connection on the first request after the window, which is the
+    // promise the mount plane already makes to a live mount. The refusal is the
+    // handshake's own sentence, and the session ends with it.
+    if let Some(p) = sess.as_mut() {
+        if Instant::now() >= p.check {
+            match keys.revalidate_live(&p.authed.id, crate::apikeys::Scope::Admin) {
+                Ok(()) => p.check = Instant::now() + crate::apikeys::KEY_RECHECK,
+                Err(e) => {
+                    let _ = keys.log_call(
+                        Some(&p.authed),
+                        "control",
+                        op,
+                        false,
+                        &format!("account={} {e}", actor("-")),
+                    );
+                    gov_reply(sock, serde_json::Value::Null, Some(&e))?;
+                    return Ok(false);
+                }
+            }
         }
+    }
+    // Who is asking: the identity this socket pinned on an earlier request, or
+    // the credential presented now. Cloned out first, so the borrow of `sess`
+    // has ended before the pin below writes it.
+    let pinned = sess.as_ref().map(|p| p.authed.clone());
+    let authed = match pinned {
+        Some(a) => a,
+        None => match keys
+            .authenticate_admin(req.get("k").and_then(|v| v.as_str()).unwrap_or(""))
+        {
+            Ok(a) => {
+                if want_pin {
+                    *sess = Some(GovSession {
+                        authed: a.clone(),
+                        check: Instant::now() + crate::apikeys::KEY_RECHECK,
+                        served: 0,
+                    });
+                }
+                a
+            }
+            Err(e) => {
+                // An unauthenticated attempt is audited too (keyless), so a wrong
+                // or revoked credential is visible in `apikey calls` instead of
+                // only in the operator's terminal.
+                let _ = keys.log_call(None, "control", op, false, &e);
+                gov_reply(sock, serde_json::Value::Null, Some(&e))?;
+                return Ok(false);
+            }
+        },
+    };
+    // Whether this socket may carry another request, decided BEFORE the op runs
+    // because every reply below owes the caller that answer. `served` counts the
+    // request being answered now.
+    let keep = match sess.as_mut() {
+        Some(p) => {
+            p.served += 1;
+            p.served < GOV_PINNED_REQUESTS
+        }
+        None => false,
     };
     // Sign-in is the one call made BEFORE there is a principal to authorize, so
     // it is answered here and never reaches `control_dispatch` — where an
@@ -1279,8 +1505,14 @@ fn handle_gov_conn(mut s: TcpStream, rt: &Arc<MetaRuntime>) -> io::Result<()> {
             &detail,
         );
         return match out {
-            Ok(v) => gov_reply(&mut s, v, None),
-            Err(e) => gov_reply(&mut s, serde_json::Value::Null, Some(&e)),
+            Ok(v) => {
+                gov_reply_pinned(sock, v, None, keep)?;
+                Ok(keep)
+            }
+            Err(e) => {
+                gov_reply_pinned(sock, serde_json::Value::Null, Some(&e), keep)?;
+                Ok(keep)
+            }
         };
     }
     let who = match gov_actor(rt, account, &authed) {
@@ -1293,7 +1525,11 @@ fn handle_gov_conn(mut s: TcpStream, rt: &Arc<MetaRuntime>) -> io::Result<()> {
                 false,
                 &format!("account={} {e}", actor("-")),
             );
-            return gov_reply(&mut s, serde_json::Value::Null, Some(&e));
+            // An account that cannot be resolved is that ACCOUNT's problem, not
+            // the socket's: the credential is fine, so another account's next
+            // click on the same pooled connection must not pay for a reconnect.
+            gov_reply_pinned(sock, serde_json::Value::Null, Some(&e), keep)?;
+            return Ok(keep);
         }
     };
     let owner = authed.owner.as_deref().unwrap_or(&authed.label);
@@ -1306,7 +1542,7 @@ fn handle_gov_conn(mut s: TcpStream, rt: &Arc<MetaRuntime>) -> io::Result<()> {
                 true,
                 &format!("account={}", actor(owner)),
             );
-            gov_reply(&mut s, v, None)
+            gov_reply_pinned(sock, v, None, keep)?;
         }
         Err(e) => {
             let _ = keys.log_call(
@@ -1316,9 +1552,12 @@ fn handle_gov_conn(mut s: TcpStream, rt: &Arc<MetaRuntime>) -> io::Result<()> {
                 false,
                 &format!("account={} {e}", actor(owner)),
             );
-            gov_reply(&mut s, serde_json::Value::Null, Some(&e))
+            // A governance refusal is an ANSWER, not a broken connection: the
+            // op said no, the socket did not, so it stays pooled.
+            gov_reply_pinned(sock, serde_json::Value::Null, Some(&e), keep)?;
         }
     }
+    Ok(keep)
 }
 
 fn req_str(a: &serde_json::Value, name: &str) -> Result<String, String> {
@@ -1503,9 +1742,16 @@ fn gates(op: &str) -> Result<Vec<Gate>, String> {
         "apikey.revoke" | "apikey.set_ro" | "apikey.rotate" | "apikey.update" => {
             vec![Gate::Key("id")]
         }
+        // Trimming the audit trail is the one verb that destroys OTHER keys'
+        // history, so it cannot be delegated to the account whose actions it
+        // records. It is also deliberately absent from the console's whitelist:
+        // `grovefs apikey purge` on a CLI, never a button.
+        "apikey.purge" => vec![Gate::Super(
+            "it deletes audit rows belonging to every credential in the deployment",
+        )],
         other => {
             return Err(format!(
-                "control op '{other}' has no access rule (unknown, or added to the dispatcher \n                     without one) — refusing. Known ops: info, whoami, login, def.list/get/put/remove, \n                     stamp, physical.list/has, fork.has/create/drop/graft, view.create/stats/export/import, \n                     view.rm_base, refs.rebuild, gc.scan/apply, apikey.create/list/revoke/rotate/set_ro/update/calls, \n                     account.list/create/passwd/role/disable/delete, grant.list/add/remove"
+                "control op '{other}' has no access rule (unknown, or added to the dispatcher \n                     without one) — refusing. Known ops: info, whoami, login, def.list/get/put/remove, \n                     stamp, physical.list/has, fork.has/create/drop/graft, view.create/stats/export/import, \n                     view.rm_base, refs.rebuild, gc.scan/apply, apikey.create/list/revoke/rotate/set_ro/update/calls/purge, \n                     account.list/create/passwd/role/disable/delete, grant.list/add/remove"
             ));
         }
     };
@@ -1777,6 +2023,11 @@ fn control_dispatch(
                 "liveSessions": live,
                 "residentEngines": engines,
                 "residentViews": views,
+                // What the audit trail costs this deployment, as configured:
+                // `null` means rows are kept until an operator purges them by
+                // hand, which is the fact the console's audit page should say
+                // out loud rather than leave as a silently growing table.
+                "auditRetention": rt.audit_retention,
             }))
         }
         // A delegated caller's list is its own definitions: the same lens/fork
@@ -2261,6 +2512,36 @@ fn control_dispatch(
                 .collect();
             Ok(json!(rows))
         }
+        // Bound the audit trail's growth. `--before` is a duration (`90d`), NOT a
+        // timestamp: the cutoff is computed against THIS process's clock, which
+        // is the same clock that stamped every `ts` in the table (the rule
+        // `apikey.update --ttl` already follows — a client measuring an age
+        // against its own wall clock is how a purge cuts the wrong line).
+        "apikey.purge" => {
+            let keys = rt
+                .ctl_keys
+                .as_ref()
+                .ok_or_else(|| "no control key store".to_string())?;
+            let before = req_str(a, "before")?;
+            let cutoff = crate::apikeys::cutoff_from_age(&before)?;
+            let dry = a
+                .get("dryRun")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let older = keys.count_calls_older_than(&cutoff)?;
+            let deleted = if dry {
+                0
+            } else {
+                keys.purge_calls_older_than(&cutoff)?
+            };
+            Ok(json!({
+                "before": before,
+                "cutoff": cutoff,
+                "older": older,
+                "deleted": deleted,
+                "dryRun": dry,
+            }))
+        }
         // The console's own plane: sign-in identity, accounts and their base-view
         // delegation, and the per-view detail page. Every one of these is judged
         // by `gates` above, exactly like the view verbs.
@@ -2268,7 +2549,7 @@ fn control_dispatch(
         | "account.disable" | "account.delete" | "grant.list" | "grant.add" | "grant.remove"
         | "view.stats" => web_dispatch(rt, who, op, a),
         other => Err(format!(
-            "unknown control op '{other}' (known: info, store.info, whoami, def.list/get/put/remove, stamp, physical.list/has, fork.has/create/drop/graft, view.create/stats/export/import, view.rm_base, refs.rebuild, gc.scan/apply, apikey.create/list/revoke/rotate/set_ro/update/calls, account.list/create/passwd/role/disable/delete, grant.list/add/remove)"
+            "unknown control op '{other}' (known: info, store.info, whoami, def.list/get/put/remove, stamp, physical.list/has, fork.has/create/drop/graft, view.create/stats/export/import, view.rm_base, refs.rebuild, gc.scan/apply, apikey.create/list/revoke/rotate/set_ro/update/calls/purge, account.list/create/passwd/role/disable/delete, grant.list/add/remove)"
         )),
     }
 }
@@ -5795,6 +6076,7 @@ mod ha_tests {
             witness: Some(waddr),
             store: StoreKind::Sqlite,
             engine_idle_ms: 0,
+            audit_retention: None,
             ctl_keys: None,
             web_auth: None,
             xfer_owner: Mutex::new(HashMap::new()),
@@ -5961,6 +6243,7 @@ mod ha_tests {
             witness: None,
             store: StoreKind::Sqlite,
             engine_idle_ms: 60_000,
+            audit_retention: None,
             ctl_keys: None,
             web_auth: None,
             xfer_owner: Mutex::new(HashMap::new()),

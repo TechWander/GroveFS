@@ -283,7 +283,12 @@ fn check_note(note: Option<&str>) -> Result<(), String> {
 /// local wall time, while [`expiry_passed`] compares the parsed instants, so the
 /// display format costs nothing in correctness. `None` means "never expires"
 /// and is stored as NULL.
-pub fn expires_from_ttl(ttl: &str) -> Result<Option<String>, String> {
+/// The count-and-unit parser behind both duration spellings an operator types:
+/// a key's deadline (`expires_from_ttl` below, measured FORWARD from now) and
+/// an audit retention window (`cutoff_from_age`, measured BACKWARD from now).
+/// `None` means "never". The refusal text keeps saying `bad ttl` verbatim —
+/// README/USAGE/docs.html quote it character for character as CLI output.
+pub fn duration_secs(ttl: &str) -> Result<Option<i64>, String> {
     let t = ttl.trim().to_lowercase();
     if t.is_empty() || t == "never" || t == "none" || t == "0" {
         return Ok(None);
@@ -306,9 +311,39 @@ pub fn expires_from_ttl(ttl: &str) -> Result<Option<String>, String> {
             ))
         }
     };
+    Ok(Some(secs))
+}
+
+/// Turn a TTL spelling (`30m`, `24h`, `7d`, `365d`, `never`, or empty) into the
+/// instant it expires at, written in the store's own clock as the same RFC 3339
+/// shape [`now_iso`] stamps everywhere else — an operator reading a row sees
+/// local wall time, while [`expiry_passed`] compares the parsed instants, so the
+/// display format costs nothing in correctness. `None` means "never expires"
+/// and is stored as NULL.
+pub fn expires_from_ttl(ttl: &str) -> Result<Option<String>, String> {
+    let Some(secs) = duration_secs(ttl)? else {
+        return Ok(None);
+    };
     let when = chrono::Local::now()
         + chrono::Duration::try_seconds(secs).ok_or_else(|| format!("ttl '{ttl}' overflows"))?;
     Ok(Some(when.to_rfc3339()))
+}
+
+/// The stamp `ago` back from now — the boundary an audit retention window
+/// keeps everything on or after. Same `to_rfc3339` shape [`log_call`] writes,
+/// which is what makes comparing them as TEXT meaningful; the deadline side of
+/// the store has relied on that ordering convention throughout.
+///
+/// [`log_call`]: Self::log_call
+pub fn cutoff_from_age(ago: &str) -> Result<String, String> {
+    let Some(secs) = duration_secs(ago)? else {
+        return Err(format!(
+            "bad retention '{ago}': audit rows need a real window like 90d, 24h or 365d (`never` would keep everything)"
+        ));
+    };
+    let when = chrono::Local::now()
+        - chrono::Duration::try_seconds(secs).ok_or_else(|| format!("retention '{ago}' overflows"))?;
+    Ok(when.to_rfc3339())
 }
 
 /// One row reader shared by both backends' map closures (column access lives
@@ -894,6 +929,28 @@ impl ApiKeyStore {
             .to_string()
     }
 
+    /// Re-verify a credential a LIVE connection already pinned, and stamp it as
+    /// used. The control plane needs both halves: it stopped presenting the key
+    /// on every request (see `control_remote::GovPool`), so the store has to be
+    /// consulted on the connection instead — otherwise a pinned session would
+    /// sail through a revoke, and `apikey list` would keep reporting a key
+    /// constantly in use as never used again.
+    ///
+    /// Two control-plane queries per [`KEY_RECHECK`] window per connection, on
+    /// arriving traffic — never per request, and never for an idle socket.
+    ///
+    /// The digest is deliberately NOT re-compared, and that is what makes a
+    /// rotation a rotation: `apikey rotate` replaces the credential for the NEXT
+    /// handshake and leaves established sessions alone (its own help says so),
+    /// while `revoke` and an elapsed `--ttl` are columns this reads, so they cut
+    /// a pinned session off within the window exactly as they cut a live mount.
+    pub fn revalidate_live(&self, id: &str, want: Scope) -> Result<(), String> {
+        if self.live_state(id, want).is_none() {
+            return Err(self.dead_reason(id, want));
+        }
+        self.stamp_used(id)
+    }
+
     /// Flip the read-only flag of an ACTIVE key in place (`apikey set-ro`).
     /// Returns false if no active row matched `id` — a revoked key is NOT
     /// resurrected and never authenticates again, and silently flipping a
@@ -1173,6 +1230,48 @@ impl ApiKeyStore {
         )?;
         Ok(rows)
     }
+
+    /// How many audit rows are strictly older than `cutoff` (a stamp in the
+    /// shape [`cutoff_from_age`] produces). This is the dry-run half of
+    /// retention: an operator sees the size of the cut before taking it.
+    pub fn count_calls_older_than(&self, cutoff: &str) -> Result<usize, String> {
+        let mut rows = self.query2(
+            "SELECT count(*) FROM mcp_calls WHERE ts < ?1",
+            params![cutoff],
+            |r| r.get::<_, i64>(0),
+            "SELECT count(*) FROM grovefs_control.mcp_calls WHERE ts < $1",
+            &[&cutoff],
+            |r| r.get::<_, i64>(0),
+        )?;
+        Ok(rows.pop().map(|n| n.max(0) as usize).unwrap_or(0))
+    }
+
+    /// Drop the audit rows older than `cutoff` and report how many went.
+    ///
+    /// Deliberately blunt: an audit trail is the one table where a partial or
+    /// reordered delete would be worse than none, so the predicate is exactly
+    /// what it says (`ts < cutoff`, no sampling, no cap) and the answer is a
+    /// count the caller has to print. Rows are never updated in place, so a
+    /// `ts` written at insert time is the row's own age for the rest of its
+    /// life; comparing them as TEXT is the same convention the key deadlines in
+    /// this table already rely on.
+    ///
+    /// The MCP/audit surface is shared by every tenant in the deployment, so
+    /// this is a SUPERUSER verb — see the gate in the control plane.
+    pub fn purge_calls_older_than(&self, cutoff: &str) -> Result<usize, String> {
+        match &self.backend {
+            Backend::Sqlite(m) => m
+                .lock()
+                .execute("DELETE FROM mcp_calls WHERE ts < ?1", params![cutoff])
+                .map_err(|e| e.to_string()),
+            Backend::Pg(pool) => pool
+                .execute(
+                    "DELETE FROM grovefs_control.mcp_calls WHERE ts < $1",
+                    &[&cutoff],
+                )
+                .map(|n| n as usize),
+        }
+    }
 }
 
 /// How often a live mount session re-verifies its API key against the store.
@@ -1400,6 +1499,54 @@ mod tests {
         assert!(
             s.live_state(&id, Scope::Mount).is_none(),
             "revoke reaches live sessions"
+        );
+    }
+
+    /// A pinned session is re-verified without ever presenting the secret, so
+    /// this is the one function standing between connection reuse and a
+    /// credential that outlived its revoke. Three things it must get right, all
+    /// asserted here: a live row passes, a revoked or expired row refuses with
+    /// the SAME sentence a fresh handshake would use (an operator reading an
+    /// audit line cannot tell one wording from another by repair cost — one says
+    /// `--ttl`, the other says re-mint), and a pass stamps `last_used_at`,
+    /// because a gateway using a key all day is using it.
+    #[test]
+    fn revalidating_a_pinned_session_refuses_the_dead_and_stamps_the_live() {
+        let s = store();
+        let (id, _key) = s.create_for("governor", Scope::Admin).unwrap();
+        let stamp = |s: &ApiKeyStore| {
+            s.list()
+                .unwrap()
+                .into_iter()
+                .find(|k| k.id == id)
+                .unwrap()
+                .last_used_at
+        };
+        // Never presented, never used — and still revalidatable, which is the
+        // whole point: the connection is the thing that authenticated.
+        assert_eq!(stamp(&s), None, "a minted key has not been used yet");
+        s.revalidate_live(&id, Scope::Admin).unwrap();
+        assert!(stamp(&s).is_some(), "a passing re-check IS a use");
+        // Revoked: refused, in the revoke's own words.
+        s.revoke(&id).unwrap();
+        let why = s.revalidate_live(&id, Scope::Admin).unwrap_err();
+        assert!(why.contains("revoked") && !why.contains("expired"), "{why}");
+        // Expired: the opposite repair, and the opposite sentence.
+        let (eid, _) = s.create_for("shortlived", Scope::Admin).unwrap();
+        s.update_fields(&eid, None, Some(Some(&deadline_from_now(-1))))
+            .unwrap();
+        let why = s.revalidate_live(&eid, Scope::Admin).unwrap_err();
+        assert!(why.contains("expired at") && why.contains("--ttl"), "{why}");
+        // Scoped elsewhere: an `mcp` key cannot hold a governance session, even
+        // one established before the scope mattered.
+        let (mid, _) = s.create_for("mcp only", Scope::Mcp).unwrap();
+        let why = s.revalidate_live(&mid, Scope::Admin).unwrap_err();
+        assert!(why.contains("'mcp'") && why.contains("'admin'"), "{why}");
+        // An id the store has never heard of.
+        assert_eq!(
+            s.revalidate_live("ffffffffffffffff", Scope::Admin)
+                .unwrap_err(),
+            "authentication failed: unknown api key id"
         );
     }
 

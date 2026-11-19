@@ -511,6 +511,16 @@ enum Cmd {
         /// the view-count ceiling stops being `max_connections / 12`.
         #[arg(long = "engine-idle-secs", value_name = "SECS", default_value_t = 300)]
         engine_idle_secs: u64,
+        /// Delete call-audit rows (`mcp_calls`) older than this window (`90d`,
+        /// `24h`, `365d`), swept in the background. UNSET is the default and
+        /// keeps every row forever — the number to plan around is one row per
+        /// governance call, per MCP tool call and per mount handshake, so a
+        /// deployment that lives on the web console grows this table whether
+        /// anyone reads it or not. Needs `--control-listen` (that port is what
+        /// opens the store); `grovefs apikey purge --before 90d` runs the same
+        /// cut once, on demand.
+        #[arg(long = "audit-retention", value_name = "DUR")]
+        audit_retention: Option<String>,
         /// WARM floor of each PG view's writer pool: connections pre-filled at
         /// engine open and NEVER reaped (they carry the session's prepared
         /// statements). Default 8, exactly the historical `GROVEFS_PG_WRITE_POOL`
@@ -1457,6 +1467,23 @@ enum ApikeyAction {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Delete call-audit rows older than `--before DUR` (`45m`, `24h`, `90d`,
+    /// `365d`) and report how many went. The trail is append-forever by default
+    /// — one row per governance call, per MCP tool call, per mount handshake —
+    /// so this is the on-demand half of retention; `meta-server
+    /// --audit-retention 90d` runs the same cut in the background. `--dry-run`
+    /// counts what would go without touching it, which is the question to ask
+    /// before destroying history. A SUPERUSER verb, and deliberately NOT a
+    /// console button: the account whose actions are recorded here is not the
+    /// account allowed to trim them.
+    Purge {
+        /// Drop rows older than this window, measured from now.
+        #[arg(long, value_name = "DUR")]
+        before: String,
+        /// Report the count without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Edit the BOOKKEEPING of an active key in place (short id prefix accepted,
     /// like `revoke`): its remark (`--note TEXT`, `--note ""` clears it) and its
     /// deadline (`--ttl 7d` from now, `--ttl never` to remove it). The usual
@@ -2351,6 +2378,42 @@ impl KeyAdmin {
         }
     }
 
+    /// Trim the call audit. Returns `(cutoff, older, deleted)`. The cutoff is
+    /// resolved by whichever side OWNS the clock that stamped the rows — the
+    /// server on the remote arm (its answer comes back in the reply, like
+    /// `update --ttl`), this process on the local arm, which IS the store.
+    fn purge(&self, before: &str, dry_run: bool) -> Result<(String, usize, usize), String> {
+        match self {
+            Self::Local(k) => {
+                let cutoff = grovefs::apikeys::cutoff_from_age(before)?;
+                let older = k.count_calls_older_than(&cutoff)?;
+                let deleted = if dry_run {
+                    0
+                } else {
+                    k.purge_calls_older_than(&cutoff)?
+                };
+                Ok((cutoff, older, deleted))
+            }
+            Self::Remote(c) => {
+                let r = c.call(
+                    "apikey.purge",
+                    serde_json::json!({ "before": before, "dryRun": dry_run }),
+                )?;
+                let n = |f: &str| {
+                    r.get(f)
+                        .and_then(|v| v.as_u64())
+                        .ok_or_else(|| format!("malformed control reply: purge has no '{f}'"))
+                };
+                let cutoff = r
+                    .get("cutoff")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "malformed control reply: purge has no 'cutoff'".to_string())?
+                    .to_string();
+                Ok((cutoff, n("older")? as usize, n("deleted")? as usize))
+            }
+        }
+    }
+
     fn recent_calls(&self, limit: usize) -> Result<Vec<grovefs::apikeys::CallLog>, String> {
         match self {
             Self::Local(k) => k.recent_calls(limit),
@@ -3023,6 +3086,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             witness,
             store,
             engine_idle_secs,
+            audit_retention,
             pg_write_pool,
             pg_write_pool_max,
             pg_read_pool,
@@ -3094,6 +3158,33 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
             srv = srv.with_engine_idle_secs(engine_idle_secs);
+            // A duration typo should stop the server at start, not print a
+            // warning an hour later; and the sweep needs the control port,
+            // because that port is what builds the key/audit store at all.
+            if let Some(w) = &audit_retention {
+                if control_listen.is_none() {
+                    return Err(
+                        "--audit-retention needs --control-listen HOST:PORT: the audit table belongs 
+                         to the control plane, and without that port this process opens no key store 
+                         to sweep"
+                            .into(),
+                    );
+                }
+                match grovefs::apikeys::duration_secs(w) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        return Err(format!(
+                            "--audit-retention '{w}' means keep-forever, which is what not passing 
+                             the flag does — give it a real window like 90d or drop it"
+                        )
+                        .into())
+                    }
+                    Err(e) => {
+                        return Err(format!("--audit-retention: {e}").into())
+                    }
+                }
+            }
+            srv = srv.with_audit_retention(audit_retention);
             // The install-time web owner, if the flags ask for one. Read here and
             // handed to `serve()` as (account, password) — the digest is written
             // by the process that owns the account store, and this value is then
@@ -4401,6 +4492,26 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+                ApikeyAction::Purge { before, dry_run } => {
+                    let (cutoff, older, deleted) = keys.purge(&before, dry_run)?;
+                    if dry_run {
+                        println!(
+                            "apikey purge --dry-run: {older} audit row(s) in {where_keys} are older than {cutoff} — nothing was deleted"
+                        );
+                        if older > 0 {
+                            println!(
+                                "  drop them: rerun without --dry-run, or start the meta-server with --audit-retention {before} to sweep this automatically"
+                            );
+                        }
+                    } else {
+                        println!(
+                            "apikey purged: {deleted} audit row(s) older than {cutoff} deleted from {where_keys} (the count was {older} when the cut began)"
+                        );
+                        println!(
+                            "  this is the trail `grovefs apikey calls` reads: what is gone cannot be listed again"
+                        );
+                    }
+                }
                 ApikeyAction::Calls { limit } => {
                     let rows = keys.recent_calls(limit)?;
                     if rows.is_empty() {
@@ -4461,7 +4572,28 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                     .into()
                 },
             )?;
-            let client = grovefs::control_remote::ControlClient::new(&addr, &key);
+            // A POOLED client, and the worker count is the ceiling: the gateway
+            // is the one caller whose requests keep arriving for days, so it is
+            // the one that must not pay a connect, a server thread and two store
+            // queries per click. Everything else here stays on the one-request
+            // connection — for a CLI the socket it opens is the only one it will
+            // ever need.
+            //
+            // `GROVEFS_GATEWAY_CTL_PIN=0` puts the gateway back on that
+            // one-request path, at runtime, without swapping binaries. It exists
+            // because the pooled win is a MEASURED one and only half of it is
+            // big: serial op latency and per-op server CPU fell clearly, while
+            // the concurrent throughput ceiling moved by less than the
+            // run-to-run spread of the measurement itself. Anyone repeating that
+            // comparison needs both arms inside one deployment, not two
+            // upgrades — and an operator who finds a connection reuse misbehaving
+            // needs a way to turn it off that is not a recompile.
+            let pin = std::env::var("GROVEFS_GATEWAY_CTL_PIN").map(|v| v != "0").unwrap_or(true);
+            let client = if pin {
+                grovefs::control_remote::ControlClient::pooled(&addr, &key, workers.max(1))
+            } else {
+                grovefs::control_remote::ControlClient::new(&addr, &key)
+            };
             match action {
                 // The gateway: foreground, one accept loop, no daemonizing — the
                 // same contract as every other server subcommand here, so a unit

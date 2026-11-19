@@ -420,6 +420,8 @@ const I18N_ZH = {
   'Last calls with it': '它最近的调用',
   'no calls recorded for it yet': '尚未记录到它的调用',
   'the newest ${n} of them, whatever the filter shows': '其中最新的 ${n} 条，与过滤显示无关',
+  'the newest ${n} loaded; the server sweeps rows older than ${w}': '已加载最新 ${n} 条；服务端会清掉早于 ${w} 的记录',
+  'the server keeps every row until an operator purges them (`grovefs apikey purge`)': '服务端会一直保留全部记录，直到有人手工清理（`grovefs apikey purge`）',
   'a fingerprint identifies a key; it does not authorize anything': '指纹用于认出密钥；它不授予任何权限',
   'What each action does — and what GroveFS keeps': '每个操作做什么 — 以及 GroveFS 保存什么',
   'Make ro / Make rw': '改为只读 / 改为读写',
@@ -784,11 +786,16 @@ function chipGroup(items, cur, onPick) {
 
 /** One labelled control inside a filter bar. */
 const fld = (label, ...nodes) => el('div', { class: 'fld' }, el('label', null, label), ...nodes);
-/** The filter row every list page opens with, plus its live result count. */
+/** The filter row every list page opens with. `count` is the live result
+    count; the first control is the search box, which shares the top row with
+    that count, while every labelled filter sits on its own row below — so a
+    page's query and its facets never compete for one line. */
 function filterBar(count, ...controls) {
-  const n = el('div', { class: 'filterbar' }, el('div', { class: 'filterbox' }, ...controls));
+  const q = controls.shift();
   const c = el('span', { class: 'count' }, count || '');
-  n.firstChild.appendChild(c);
+  const n = el('div', { class: 'filterbar' },
+    el('div', { class: 'filterbox filter-top' }, q, c),
+    controls.length ? el('div', { class: 'filterbox filter-opts' }, ...controls) : null);
   n.setCount = (txt) => { c.textContent = txt; };
   return n;
 }
@@ -993,7 +1000,10 @@ async function pageOverview(root) {
       land in two rows instead of a width-dependent ribbon. `tone` is STATE
       only (amber = act on it) — colour never decorates a number here. */
   const card = (k, v, sub, page, tone) => cards.appendChild(el('div', {
-    class: 'card' + (page ? ' link-card' : '') + (tone ? ' ' + tone : ''),
+    // A count gets the display figure; a NAME (the backend, the signed-in
+    // account) is set as a heading so the card grid reads with one rhythm.
+    class: 'card' + (page ? ' link-card' : '') + (tone ? ' ' + tone : '')
+      + (typeof v === 'string' && !/^[\d.,%\s—–-]+$/.test(v) ? ' text' : ''),
     ...(page ? { onclick: () => go(page), onkeydown: (ev) => { if (ev.key === 'Enter') go(page); }, tabindex: '0', role: 'button' } : {}),
   },
     el('div', { class: 'k' }, k),
@@ -1445,7 +1455,7 @@ async function renderNewBase() {
       btn.disabled = false;
       throw e;
     }
-  }));
+  }, { class: 'primary' }));
   panel.appendChild(hint(t('a base view owns physical deletion; lenses, aliases and forks reshape one')));
 }
 
@@ -1682,7 +1692,7 @@ async function pageKeys(root) {
         t('Save it now. From here on the list shows its fingerprint ${h}; Rotate is the only way to obtain a usable secret again.', { h: maskOf(r.key) }))),
     [{ t: t('I have saved it'), onclick: (btn, err, close) => close() }]);
     await reload();
-  }));
+  }, { class: 'primary' }));
   if (!isSuper()) panel.appendChild(hint(t('an unbound key reaches every tree, so a delegated account must name one')));
   root.appendChild(panel);
 
@@ -1868,7 +1878,7 @@ function roBtn(r) {
     await api('apikey.set_ro', { id: r.id, ro: !r.ro });
     toast(r.ro ? t('now read-write') : t('now read-only'));
     await reload();
-  });
+  }, { class: 'mini' });
 }
 
 function revokeBtn(r) {
@@ -1879,7 +1889,7 @@ function revokeBtn(r) {
     await api('apikey.revoke', { id: r.id });
     toast(t('revoked'));
     await reload();
-  }, { class: 'danger' });
+  }, { class: 'mini danger' });
 }
 
 // Rotate = "the secret is lost but the credential stays": same id, label,
@@ -1903,7 +1913,7 @@ function rotateBtn(r) {
       [{ t: t('I have saved it'), onclick: (btn, err, close) => close() }]);
     toast(t('key rotated'));
     await reload();
-  });
+  }, { class: 'mini' });
 }
 
 /* -------------------------------------------------------------- accounts --- */
@@ -1968,7 +1978,7 @@ async function pageAccounts(root) {
       toast(t('${account} created as ${role} — ${note}', { account: r.account, role: r.role, note: r.note }));
       await reload();
     } catch (e) { btn.disabled = false; throw e; }
-  }));
+  }, { class: 'primary' }));
   // Presentation only, and the one place this page hides rather than refuses:
   // a `user` cannot create accounts at any point, so the form would be a
   // guaranteed error toast on every page it is shown on.
@@ -2143,7 +2153,7 @@ async function pageAccounts(root) {
         : t('${account} governs ${base} — that is what the name you chose resolves to', { account: r.account, base: r.base }));
       await reload();
     } catch (e) { btn.disabled = false; throw e; }
-  }));
+  }, { class: 'primary' }));
   root.appendChild(bar(el('h2', null, t('Delegations')),
     hint(t('an account governs a base view AND every lens, fork and alias derived from it'))));
   if (isSuper()) root.appendChild(gp);
@@ -2160,7 +2170,7 @@ async function pageAccounts(root) {
         await api('grant.remove', { account: g.account, base: g.base_view });
         toast(t('withdrawn'));
         await reload();
-      }, { class: 'danger' }),
+      }, { class: 'mini danger' }),
     },
   ];
   const gHost = el('div');
@@ -2302,9 +2312,20 @@ async function pageAudit(root) {
     el('option', { value: '50' }, '50'), el('option', { value: '200' }, '200'), el('option', { value: '1000' }, '1000'));
   limitS.value = String(ST.auditLimit || 50);
   const rows = (await api('apikey.calls', { limit: Number(limitS.value) })) || [];
+  // Where the trail ENDS is a property of the log, not of the activity in it:
+  // "the oldest row here is three weeks old" reads very differently when the
+  // server sweeps at 90d versus when nothing is ever deleted. `store.info`
+  // answers that, and it is a SUPER gate — so a delegated operator's refusal
+  // (soft, not api: this note must never break the page) simply shows no line.
+  const life = await soft('store.info', {});
+  const keep = life.ok && life.r ? life.r.auditRetention : undefined;
   root.appendChild(bar(el('h2', null, t('Governance calls')),
     fld(t('rows to load'), limitS),
-    hint(t('the newest ${n} of them, whatever the filter shows', { n: rows.length }))));
+    hint(keep === undefined
+      ? t('the newest ${n} of them, whatever the filter shows', { n: rows.length })
+      : keep
+        ? t('the newest ${n} loaded; the server sweeps rows older than ${w}', { n: rows.length, w: keep })
+        : t('the server keeps every row until an operator purges them (`grovefs apikey purge`)'))));
 
   const f = ST.auditFilter;
   const qI = el('input', {

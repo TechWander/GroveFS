@@ -43,9 +43,11 @@
 //! above the trait knows whether it is talking to files, PostgreSQL, or a
 //! remote meta-server.
 
+use std::io::BufReader;
 use std::net::TcpStream;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -64,6 +66,9 @@ pub struct ControlClient {
     /// It travels in the request body and is the ONLY thing the server's ACL
     /// can judge a delegated user by — see [`ControlClient::with_actor`].
     actor: Option<(String, String)>,
+    /// Live connections, for a caller that outlives its first request.
+    /// `None` is the classic one-connection-per-call exchange.
+    pool: Option<Arc<GovPool>>,
 }
 
 impl ControlClient {
@@ -72,6 +77,21 @@ impl ControlClient {
             addr: addr.to_string(),
             key: key.to_string(),
             actor: None,
+            pool: None,
+        }
+    }
+
+    /// A client that REUSES its control connections, up to `max` of them, for as
+    /// long as the process lives. Only a long-lived caller should ask for this
+    /// (see [`GovPool`] for what a pooled request stops paying for); a CLI would
+    /// just be naming a socket it uses once and exits with.
+    pub fn pooled(addr: &str, key: &str, max: usize) -> Self {
+        Self {
+            pool: Some(Arc::new(GovPool {
+                max: max.max(1),
+                idle: Mutex::new(Vec::new()),
+            })),
+            ..Self::new(addr, key)
         }
     }
 
@@ -89,6 +109,9 @@ impl ControlClient {
     ///
     /// Cloned, not mutated in place: the gateway derives one client per request
     /// from a shared template, so a session's identity cannot leak into another.
+    /// A pool, if the template has one, is shared by those clones (it lives in an
+    /// `Arc`) — deriving a client per request must not derive a connection per
+    /// request, which is the whole point of having a pool.
     pub fn with_actor(mut self, account: &str, ip: &str) -> Self {
         self.actor = Some((account.to_string(), ip.to_string()));
         self
@@ -103,44 +126,236 @@ impl ControlClient {
     /// server's own refusal text (unknown/revoked key, wrong scope, a governance
     /// refusal), never a bare status code — the point of the envelope.
     pub fn call(&self, op: &str, args: Value) -> Result<Value, String> {
-        let mut req = json!({
-            "k": self.key,
-            "op": op,
-            "a": args,
-        });
-        if let Some((account, ip)) = &self.actor {
-            req["account"] = json!(account);
-            req["ip"] = json!(ip);
+        match &self.pool {
+            Some(pool) => pool.call(&self.addr, &self.key, op, args, self.actor.as_ref()),
+            None => one_shot(&self.addr, &self.key, op, args, self.actor.as_ref()),
         }
-        let body = serde_json::to_vec(&req)
-            .map_err(|e| format!("cannot encode control request: {e}"))?;
-        let mut sock = TcpStream::connect(&self.addr).map_err(|e| {
+    }
+}
+
+/// The classic exchange: connect, one request, one reply, socket gone. This is
+/// what a caller without a pool does, and what every client did before
+/// [`GovPool`] existed — the server answers it identically.
+fn one_shot(
+    addr: &str,
+    key: &str,
+    op: &str,
+    args: Value,
+    actor: Option<&(String, String)>,
+) -> Result<Value, String> {
+    let body = request_body(Some(key), false, op, args, actor)?;
+    let mut conn = GovConn::open(addr)?;
+    let rep = conn.round_trip(addr, &body)?;
+    // The socket is dropped whether or not the server would have kept it: a
+    // one-shot caller means by "one call" exactly that.
+    rep.out
+}
+
+/// The request envelope: the verb, the op's args, the credential when the
+/// connection does not already carry one, and the console's per-user
+/// attribution. `pin` is only ever sent as `true`, so what a one-shot caller
+/// puts on the wire is what it always put there.
+fn request_body(
+    key: Option<&str>,
+    pin: bool,
+    op: &str,
+    args: Value,
+    actor: Option<&(String, String)>,
+) -> Result<Vec<u8>, String> {
+    let mut req = json!({ "op": op, "a": args });
+    if let Some(k) = key {
+        req["k"] = json!(k);
+    }
+    if pin {
+        req["pin"] = json!(true);
+    }
+    if let Some((account, ip)) = actor {
+        req["account"] = json!(account);
+        req["ip"] = json!(ip);
+    }
+    serde_json::to_vec(&req).map_err(|e| format!("cannot encode control request: {e}"))
+}
+
+/// How long this side keeps an idle connection before reopening it rather than
+/// write into a socket the server may already have given up on. The server's own
+/// idle bound is an order of magnitude longer, so this reopen is a choice and
+/// not a failed request.
+const POOL_IDLE: Duration = Duration::from_secs(60);
+
+/// Reusable control connections, for a caller that lives long enough to make
+/// more than one call per process.
+///
+/// One connection per request is right for a CLI: the process is about to exit,
+/// so the connection it just made is the only one it will ever need. It is wrong
+/// for a web gateway whose worker threads turn browser clicks into governance
+/// calls all day — every one of those paid a TCP connect, a thread spawn on the
+/// server, and the two store queries of an authentication (the `api_keys` SELECT
+/// plus its `last_used_at` UPDATE). This holds the socket instead, and the
+/// server holds the credential with it: a request on an established connection
+/// does not present the key at all.
+///
+/// What is deliberately NOT skipped per call: the audit row (one per request,
+/// forever), the console account's delegation lookup (so a withdrawn grant bites
+/// on the next click rather than the next reconnect), and — on the server's own
+/// [`crate::apikeys::KEY_RECHECK`] tick — the credential's liveness, so a revoke
+/// reaches a pooled connection within a second of arriving.
+struct GovPool {
+    /// Ceiling on pooled connections, which is also the ceiling on server
+    /// threads this client can occupy. Never exceeded: a connection is taken out
+    /// of the pool under the lock before it is used, and a return to a full pool
+    /// closes the socket instead. `checkin` decides under the same lock it takes
+    /// to push, so two workers can never both believe one slot is left.
+    max: usize,
+    idle: Mutex<Vec<GovConn>>,
+}
+
+/// One live connection the server has pinned our credential to.
+struct GovConn {
+    /// Read through a buffer: with a socket that survives past one exchange,
+    /// over-reading is normal, and the bytes belong to the next reply on THIS
+    /// connection. Writes go to a separate handle so nothing buffered can be
+    /// reordered behind them.
+    reader: BufReader<TcpStream>,
+    writer: TcpStream,
+    /// When it came back to the pool, against [`POOL_IDLE`].
+    idle_since: Instant,
+}
+
+/// One governance reply unpacked: what the op returned (or the server's own
+/// refusal sentence), and whether the server will answer another request on this
+/// socket. A refusal with `keep == true` is a NORMAL outcome — the op said no,
+/// the connection did not — so a pooled caller must not discard the socket over
+/// it.
+struct GovReply {
+    out: Result<Value, String>,
+    keep: bool,
+}
+
+impl GovConn {
+    /// Connect and split for full-duplex framing.
+    fn open(addr: &str) -> Result<Self, String> {
+        let sock = TcpStream::connect(addr).map_err(|e| {
             format!(
-                "cannot reach the control plane at {}: {e} — is `meta-server --control-listen {}` running?",
-                self.addr, self.addr
+                "cannot reach the control plane at {addr}: {e} — is `meta-server --control-listen {addr}` running?",
             )
         })?;
         let _ = sock.set_nodelay(true);
-        let mut w = sock
-            .try_clone()
-            .map_err(|e| format!("control socket: {e}"))?;
-        proto::send_request(&mut w, proto::OP_CONTROL, &body)
+        let reader = BufReader::new(sock.try_clone().map_err(|e| format!("control socket: {e}"))?);
+        Ok(Self {
+            reader,
+            writer: sock,
+            idle_since: Instant::now(),
+        })
+    }
+
+    /// Write one request, read its reply. The failure text distinguishes the two
+    /// halves because "the server never answered" and "the server answered
+    /// something I cannot parse" are different incidents.
+    fn round_trip(&mut self, addr: &str, body: &[u8]) -> Result<GovReply, String> {
+        proto::send_request(&mut self.writer, proto::OP_CONTROL, body)
             .map_err(|e| format!("control request failed: {e}"))?;
-        let (status, _val, data) =
-            proto::recv_response(&mut sock).map_err(|e| format!("control reply failed: {e}"))?;
-        if status != 0 {
-            return Err(String::from_utf8_lossy(&data).into_owned());
+        let (status, _val, data) = proto::recv_response(&mut self.reader)
+            .map_err(|e| format!("control reply failed: {e}"))?;
+        Ok(reply_of(status, &data, addr))
+    }
+}
+
+/// Unpack one governance reply. Transport status first (a non-zero STATUS is the
+/// server saying it could not even frame an answer), then the `{ok,r}` /
+/// `{ok:false,e}` envelope. The `pinned` field is the server's reuse answer and
+/// is only ever sent as `true`: its absence means one request per socket, which
+/// is what an older server does.
+fn reply_of(status: i32, data: &[u8], addr: &str) -> GovReply {
+    if status != 0 {
+        return GovReply {
+            out: Err(String::from_utf8_lossy(data).into_owned()),
+            keep: false,
+        };
+    }
+    let env: Value = match serde_json::from_slice(data) {
+        Ok(v) => v,
+        Err(e) => {
+            return GovReply {
+                out: Err(format!("malformed control reply from {addr}: {e}")),
+                keep: false,
+            }
         }
-        let env: Value = serde_json::from_slice(&data)
-            .map_err(|e| format!("malformed control reply from {}: {e}", self.addr))?;
-        if env.get("ok").and_then(Value::as_bool) == Some(true) {
-            Ok(env.get("r").cloned().unwrap_or(Value::Null))
-        } else {
-            Err(env
-                .get("e")
-                .and_then(Value::as_str)
-                .unwrap_or("the control plane refused the request")
-                .to_string())
+    };
+    let keep = env.get("pinned").and_then(Value::as_bool) == Some(true);
+    let out = if env.get("ok").and_then(Value::as_bool) == Some(true) {
+        Ok(env.get("r").cloned().unwrap_or(Value::Null))
+    } else {
+        Err(env
+            .get("e")
+            .and_then(Value::as_str)
+            .unwrap_or("the control plane refused the request")
+            .to_string())
+    };
+    GovReply { out, keep }
+}
+
+impl GovPool {
+    /// Borrow a connection, opening one when the pool is empty or every idle
+    /// socket has aged out. The returned flag says which happened, and a new
+    /// socket is the only one that has to present the credential.
+    fn checkout(&self, addr: &str) -> Result<(GovConn, bool), String> {
+        loop {
+            let candidate = self
+                .idle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pop();
+            match candidate {
+                Some(c) if c.idle_since.elapsed() < POOL_IDLE => return Ok((c, false)),
+                // Aged out: closed here rather than written into. Nothing was
+                // ever in flight on an idle socket, so this can lose a request
+                // no more than a reconnect can.
+                Some(c) => drop(c),
+                None => return Ok((GovConn::open(addr)?, true)),
+            }
+        }
+    }
+
+    /// Hand a connection back, or close it. Only a socket the server said `keep`
+    /// about ever reaches this.
+    fn checkin(&self, mut c: GovConn) {
+        c.idle_since = Instant::now();
+        let mut q = self.idle.lock().unwrap_or_else(|e| e.into_inner());
+        if q.len() < self.max {
+            q.push(c);
+        }
+    }
+
+    fn call(
+        &self,
+        addr: &str,
+        key: &str,
+        op: &str,
+        args: Value,
+        actor: Option<&(String, String)>,
+    ) -> Result<Value, String> {
+        let (mut conn, fresh) = self.checkout(addr)?;
+        // A socket the server already pinned does not get the credential again;
+        // a new one presents it and asks to be kept.
+        let body = request_body(if fresh { Some(key) } else { None }, true, op, args, actor)?;
+        match conn.round_trip(addr, &body) {
+            Ok(rep) => {
+                // `keep` is the server's answer, not our guess: false for an
+                // older server, for a session at its request bound, and for any
+                // exchange after which the identity stopped being usable.
+                if rep.keep {
+                    self.checkin(conn);
+                }
+                rep.out
+            }
+            Err(e) => {
+                // NEVER retried on a fresh socket. `view.create`, `grant.add`
+                // and `apikey revoke` are not idempotent: resending a request
+                // whose reply was lost can apply the same change twice. The
+                // caller gets the transport failure and decides; the socket is
+                // dropped here, so its next call starts clean.
+                Err(e)
+            }
         }
     }
 }
@@ -550,5 +765,271 @@ impl ControlStore for RemoteControlStore {
 
     fn base_tree_missing_note(&self, _view: &str) -> Result<Option<String>, String> {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// What the envelope looks like on the wire. The first case is the one that
+    /// is worth a test: a caller that does not ask to be pinned must put
+    /// EXACTLY the body it always put there, `pin` absent. The moment that
+    /// changes, every CLI in the repo starts holding server threads open
+    /// without anyone deciding it should.
+    #[test]
+    fn a_one_shot_request_is_the_classic_envelope() {
+        let body = request_body(Some("abc:secret"), false, "view.list", json!({"x": 1}), None).unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["k"], json!("abc:secret"));
+        assert_eq!(v["op"], json!("view.list"));
+        assert_eq!(v["a"], json!({"x": 1}));
+        assert!(
+            v.get("pin").is_none(),
+            "a one-shot caller must not ask to be pinned: {v}"
+        );
+        assert!(v.get("account").is_none(), "no actor, no attribution: {v}");
+    }
+
+    /// …and a pinned one asks to be kept while still naming the console user,
+    /// because the ACL and the audit row are judged by THAT and not by the key.
+    #[test]
+    fn a_pinned_request_carries_the_attribution_the_acl_needs() {
+        let actor = ("rootops".to_string(), "10.0.0.7".to_string());
+        let body = request_body(Some("abc:secret"), true, "whoami", json!({}), Some(&actor)).unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["pin"], json!(true));
+        assert_eq!(v["account"], json!("rootops"));
+        assert_eq!(v["ip"], json!("10.0.0.7"));
+        // The saving, stated as a body: on a socket that is already pinned, the
+        // credential is not presented again — but the account ALWAYS is, because
+        // a withdrawn delegation has to bite on the next click rather than on
+        // the next reconnect.
+        let body = request_body(None, true, "whoami", json!({}), Some(&actor)).unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert!(v.get("k").is_none(), "a reused request presents no secret: {v}");
+        assert_eq!(v["account"], json!("rootops"));
+    }
+
+    /// The reuse answer comes from the server and nowhere else, and a refusal
+    /// is not the same verdict as a broken socket. Four shapes, all real:
+    /// pinned success, pinned refusal (the op said no, the connection did not),
+    /// the classic envelope with no answer at all (silence means one socket per
+    /// request), and a transport STATUS.
+    #[test]
+    fn only_the_servers_pinned_field_opens_a_session() {
+        let r = reply_of(0, br#"{"ok":true,"r":{"a":1},"pinned":true}"#, "h:1");
+        assert_eq!(r.out.unwrap(), json!({"a": 1}));
+        assert!(r.keep, "the server said it pinned us");
+
+        let r = reply_of(0, br#"{"ok":false,"e":"not permitted","pinned":true}"#, "h:1");
+        assert_eq!(r.out.unwrap_err(), "not permitted");
+        assert!(r.keep, "a governance refusal is an answer, not a broken socket");
+
+        let r = reply_of(0, br#"{"ok":true,"r":7}"#, "h:1");
+        assert_eq!(r.out.unwrap(), json!(7));
+        assert!(!r.keep, "absence means one request per socket");
+
+        let r = reply_of(17, b"boom", "h:1");
+        assert_eq!(r.out.unwrap_err(), "boom");
+        assert!(!r.keep, "a transport status is not a session");
+
+        // Malformed JSON names the peer: "malformed control reply" without an
+        // address is unsearchable in a gateway log that talks to one server.
+        let r = reply_of(0, b"not json", "127.0.0.1:50111");
+        assert!(r.out.unwrap_err().contains("127.0.0.1:50111"));
+        assert!(!r.keep);
+    }
+
+    /// A stand-in for the pinned half of the meta-server's `handle_gov_conn`:
+    /// answer every request on the socket it arrives on and count what came in.
+    /// The counts under test are the CONNECTION total and which requests
+    /// presented the credential — the two things a pooled caller claims to have
+    /// changed. Replies echo the op back, so a client that read the wrong
+    /// socket's reply would fail the assertion instead of passing quietly.
+    struct FakeCtl {
+        addr: String,
+        conns: Arc<AtomicUsize>,
+        requests: Arc<AtomicUsize>,
+        /// Requests that arrived on a socket already pinned, without a `k`:
+        /// exactly what reuse is supposed to produce.
+        keyless: Arc<AtomicUsize>,
+    }
+
+    impl FakeCtl {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let conns = Arc::new(AtomicUsize::new(0));
+            let requests = Arc::new(AtomicUsize::new(0));
+            let keyless = Arc::new(AtomicUsize::new(0));
+            let (c2, r2, k2) = (conns.clone(), requests.clone(), keyless.clone());
+            std::thread::spawn(move || {
+                for sock in listener.incoming() {
+                    let Ok(mut sock) = sock else { continue };
+                    c2.fetch_add(1, Ordering::SeqCst);
+                    // One thread per accepted socket, requests served in order:
+                    // the shape the real handler has for a pinned caller.
+                    loop {
+                        let Ok((_op, body)) = proto::recv_request(&mut sock) else {
+                            break;
+                        };
+                        let req: Value =
+                            serde_json::from_slice(&body).unwrap_or(Value::Null);
+                        if req.get("pin").and_then(Value::as_bool) == Some(true)
+                            && req.get("k").and_then(Value::as_str).unwrap_or("").is_empty()
+                        {
+                            k2.fetch_add(1, Ordering::SeqCst);
+                        }
+                        r2.fetch_add(1, Ordering::SeqCst);
+                        let env = serde_json::to_vec(&json!({
+                            "ok": true, "r": req["op"], "pinned": true
+                        }))
+                        .unwrap();
+                        let mut w = sock.try_clone().unwrap();
+                        if proto::send_response(&mut w, 0, 0, &env).is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+            Self {
+                addr,
+                conns,
+                requests,
+                keyless,
+            }
+        }
+    }
+
+    /// The claim the pool is built on: three calls, one socket, one credential.
+    /// If reuse silently stopped working this test would see three connections
+    /// (a performance lie); if the credential started riding on every request
+    /// again it would see zero keyless ones (an efficiency lie); if a reply were
+    /// read off the wrong exchange, the echoed op would not match.
+    #[test]
+    fn a_pooled_caller_presents_the_credential_once_per_connection() {
+        let fake = FakeCtl::start();
+        let ctl = ControlClient::pooled(&fake.addr, "abc:secret", 2);
+        for op in ["info", "whoami", "def.list"] {
+            assert_eq!(
+                ctl.call(op, json!({})).unwrap(),
+                json!(op),
+                "the reply must be the answer to THIS call"
+            );
+        }
+        assert_eq!(fake.conns.load(Ordering::SeqCst), 1, "three calls, one socket");
+        assert_eq!(fake.requests.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            fake.keyless.load(Ordering::SeqCst),
+            2,
+            "only the request that establishes the session carries k"
+        );
+    }
+
+    /// The other half: without a pool nothing changed, per call or per byte.
+    /// This is what every CLI does, and what the server must keep serving
+    /// unchanged for as long as old binaries are in people's shells.
+    #[test]
+    fn an_unpooled_caller_still_opens_one_connection_per_call() {
+        let fake = FakeCtl::start();
+        let ctl = ControlClient::new(&fake.addr, "abc:secret");
+        for op in ["info", "whoami"] {
+            assert_eq!(ctl.call(op, json!({})).unwrap(), json!(op));
+        }
+        assert_eq!(fake.conns.load(Ordering::SeqCst), 2, "no pool, no reuse");
+        assert_eq!(
+            fake.keyless.load(Ordering::SeqCst),
+            0,
+            "a one-shot request always presents the credential"
+        );
+    }
+
+    /// A refusal the server answered while keeping the session must reach the
+    /// caller as the server's own sentence AND leave the socket in the pool —
+    /// otherwise a user pressing one forbidden button would cost the gateway a
+    /// reconnect, and an ACL text would arrive as a transport error.
+    #[test]
+    fn a_refusal_on_a_pinned_socket_is_answered_and_kept() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let conns = Arc::new(AtomicUsize::new(0));
+        let hits = Arc::new(AtomicUsize::new(0));
+        let (c2, h2) = (conns.clone(), hits.clone());
+        std::thread::spawn(move || {
+            for sock in listener.incoming() {
+                let Ok(mut sock) = sock else { continue };
+                let (conns, hits) = (c2.clone(), h2.clone());
+                // A thread per accepted socket, serving it until it closes: so a
+                // reconnect is counted rather than hanging this test.
+                std::thread::spawn(move || {
+                    conns.fetch_add(1, Ordering::SeqCst);
+                    loop {
+                        let Ok((_op, body)) = proto::recv_request(&mut sock) else {
+                            return;
+                        };
+                        let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                        let n = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                        // Refuse exactly ONE request — the second — and stay
+                        // open, which is what the real handler does with a
+                        // governance refusal on a session.
+                        let env = if n == 2 {
+                            json!({"ok": false, "e": "'view.rm' is not per-view governance", "pinned": true})
+                        } else {
+                            json!({"ok": true, "r": req["op"], "pinned": true})
+                        };
+                        let data = serde_json::to_vec(&env).unwrap();
+                        let mut w = sock.try_clone().unwrap();
+                        if proto::send_response(&mut w, 0, 0, &data).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let ctl = ControlClient::pooled(&addr, "abc:secret", 1);
+        assert_eq!(ctl.call("info", json!({})).unwrap(), json!("info"));
+        let e = ctl.call("view.rm", json!({"view": "x"})).unwrap_err();
+        assert!(e.contains("not per-view governance"), "the server's words: {e}");
+        // Third call lands on the SAME socket: it got no reply if the refusal
+        // threw the connection away, so the count below is the claim.
+        assert_eq!(ctl.call("whoami", json!({})).unwrap(), json!("whoami"));
+        assert_eq!(
+            conns.load(Ordering::SeqCst),
+            1,
+            "a refusal must not cost the gateway a reconnect"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 3, "three requests, one connection");
+    }
+
+    /// Both paths must describe an unreachable plane in the one sentence the
+    /// docs and the gateway's startup probe print. A pool that invented its own
+    /// wording would leave half the deployments with advice nobody recognizes.
+    #[test]
+    fn an_unreachable_plane_is_named_the_same_way_either_way() {
+        // Nothing listens on 1; the connect fails before a byte is written.
+        for (what, r) in [
+            (
+                "pooled",
+                GovPool {
+                    max: 1,
+                    idle: Mutex::new(Vec::new()),
+                }
+                .call("127.0.0.1:1", "k:s", "info", json!({}), None),
+            ),
+            (
+                "one-shot",
+                one_shot("127.0.0.1:1", "k:s", "info", json!({}), None),
+            ),
+        ] {
+            let e = r.unwrap_err();
+            assert!(
+                e.contains("cannot reach the control plane at 127.0.0.1:1")
+                    && e.contains("--control-listen"),
+                "{what}: {e}"
+            );
+        }
     }
 }
