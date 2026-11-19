@@ -535,7 +535,7 @@ impl ApiKeyStore {
             // FIRST entry, where the control schema lives.
             Some(u) if crate::pg_store::is_pg_store(u) => Self::open_pg(u),
             Some(u) if u.contains("://") => Err(format!(
-                "`{u}` is not a --meta-store scheme GroveFS supports: credentials live in a local SQLite file or PostgreSQL (`postgres://…`)"
+                "`{u}` is not a --meta-store scheme GroveFS supports: credentials live in a local SQLite file or PostgreSQL (`postgres://…`); a `treedb://` tree store keeps its keys in the LOCAL SQLite beside its meta-server's --meta-dir, so mint them without --meta-store"
             )),
             _ => Self::open(base),
         }

@@ -3070,6 +3070,12 @@ impl MetaProvider for MetaEngine {
 pub enum MetaStore {
     Sqlite(MetaEngine),
     Pg(Box<crate::pg_store::PgEngine>),
+    /// EXPERIMENTAL: the sibling `treedb` engine. Only this variant and the
+    /// `#[cfg(feature = "treedb")]` dispatch arms beside it exist under that
+    /// feature — a default build compiles the two backends above exactly as
+    /// before, which is what makes the spike safe to land beside production.
+    #[cfg(feature = "treedb")]
+    Treedb(Box<crate::treedb_store::TreedbStore>),
 }
 
 impl MetaStore {
@@ -3092,10 +3098,21 @@ impl MetaStore {
             .map(|p| MetaStore::Pg(Box::new(p)))
     }
 
+    /// Open a treedb store: one base view inside the treedb instance at `addr`
+    /// (`host:port`). Opening resolves the view id, and CREATES the view when it
+    /// is missing — same "the store owns its tree" contract as [`Self::open_pg`].
+    #[cfg(feature = "treedb")]
+    pub fn open_treedb(addr: &str, view: &str, readonly: bool) -> std::io::Result<Self> {
+        crate::treedb_store::TreedbStore::open(addr, view, readonly)
+            .map(|t| MetaStore::Treedb(Box::new(t)))
+    }
+
     pub fn get_epoch(&self) -> i64 {
         match self {
             MetaStore::Sqlite(m) => m.get_epoch(),
             MetaStore::Pg(p) => p.get_epoch(),
+            #[cfg(feature = "treedb")]
+            MetaStore::Treedb(t) => t.get_epoch(),
         }
     }
 
@@ -3105,6 +3122,8 @@ impl MetaStore {
                 .set_epoch(e)
                 .map_err(|err| std::io::Error::other(err.to_string())),
             MetaStore::Pg(p) => p.set_epoch(e),
+            #[cfg(feature = "treedb")]
+            MetaStore::Treedb(t) => t.set_epoch(e),
         }
     }
 
@@ -3114,6 +3133,8 @@ impl MetaStore {
                 .backup_to_bytes()
                 .map_err(|err| std::io::Error::other(err.to_string())),
             MetaStore::Pg(p) => p.backup_to_bytes(),
+            #[cfg(feature = "treedb")]
+            MetaStore::Treedb(t) => t.backup_to_bytes(),
         }
     }
 
@@ -3125,6 +3146,8 @@ impl MetaStore {
         match self {
             MetaStore::Sqlite(_) => 0,
             MetaStore::Pg(p) => p.shrink_pools(),
+            #[cfg(feature = "treedb")]
+            MetaStore::Treedb(t) => t.shrink_pools(),
         }
     }
 }
@@ -3134,42 +3157,56 @@ impl MetaProvider for MetaStore {
         match self {
             MetaStore::Sqlite(m) => m.lookup(parent, name),
             MetaStore::Pg(p) => p.lookup(parent, name),
+            #[cfg(feature = "treedb")]
+            MetaStore::Treedb(t) => t.lookup(parent, name),
         }
     }
     fn getattr(&self, ino: i64) -> Option<NodeInfo> {
         match self {
             MetaStore::Sqlite(m) => m.getattr(ino),
             MetaStore::Pg(p) => p.getattr(ino),
+            #[cfg(feature = "treedb")]
+            MetaStore::Treedb(t) => t.getattr(ino),
         }
     }
     fn readdir(&self, parent: i64) -> Vec<NodeInfo> {
         match self {
             MetaStore::Sqlite(m) => m.readdir(parent),
             MetaStore::Pg(p) => p.readdir(parent),
+            #[cfg(feature = "treedb")]
+            MetaStore::Treedb(t) => t.readdir(parent),
         }
     }
     fn readdir_page(&self, parent: i64, offset: usize, limit: usize) -> Vec<NodeInfo> {
         match self {
             MetaStore::Sqlite(m) => m.readdir_page(parent, offset, limit),
             MetaStore::Pg(p) => p.readdir_page(parent, offset, limit),
+            #[cfg(feature = "treedb")]
+            MetaStore::Treedb(t) => t.readdir_page(parent, offset, limit),
         }
     }
     fn create_nodes_batch(&self, items: &[NewNode<'_>]) -> Vec<Result<NodeInfo, MetaError>> {
         match self {
             MetaStore::Sqlite(m) => MetaProvider::create_nodes_batch(m, items),
             MetaStore::Pg(p) => MetaProvider::create_nodes_batch(&**p, items),
+            #[cfg(feature = "treedb")]
+            MetaStore::Treedb(t) => MetaProvider::create_nodes_batch(&**t, items),
         }
     }
     fn supports_create_batch(&self) -> bool {
         match self {
             MetaStore::Sqlite(m) => MetaProvider::supports_create_batch(m),
             MetaStore::Pg(p) => MetaProvider::supports_create_batch(&**p),
+            #[cfg(feature = "treedb")]
+            MetaStore::Treedb(t) => MetaProvider::supports_create_batch(&**t),
         }
     }
     fn set_read_pool(&self, n: usize) {
         match self {
             MetaStore::Sqlite(m) => MetaProvider::set_read_pool(m, n),
             MetaStore::Pg(p) => MetaProvider::set_read_pool(&**p, n),
+            #[cfg(feature = "treedb")]
+            MetaStore::Treedb(t) => MetaProvider::set_read_pool(&**t, n),
         }
     }
     fn supports_paged_readdir(&self) -> bool {
@@ -3183,6 +3220,8 @@ impl MetaProvider for MetaStore {
         match self {
             MetaStore::Sqlite(m) => MetaProvider::supports_paged_readdir(m),
             MetaStore::Pg(p) => MetaProvider::supports_paged_readdir(&**p),
+            #[cfg(feature = "treedb")]
+            MetaStore::Treedb(t) => MetaProvider::supports_paged_readdir(&**t),
         }
     }
     #[allow(clippy::too_many_arguments)]
@@ -3199,6 +3238,8 @@ impl MetaProvider for MetaStore {
         match self {
             MetaStore::Sqlite(m) => m.create_node(parent, name, is_dir, data_ref, mode, uid, gid),
             MetaStore::Pg(p) => p.create_node(parent, name, is_dir, data_ref, mode, uid, gid),
+            #[cfg(feature = "treedb")]
+            MetaStore::Treedb(t) => t.create_node(parent, name, is_dir, data_ref, mode, uid, gid),
         }
     }
     fn create_symlink(
@@ -3212,30 +3253,40 @@ impl MetaProvider for MetaStore {
         match self {
             MetaStore::Sqlite(m) => m.create_symlink(parent, name, target, uid, gid),
             MetaStore::Pg(p) => p.create_symlink(parent, name, target, uid, gid),
+            #[cfg(feature = "treedb")]
+            MetaStore::Treedb(t) => t.create_symlink(parent, name, target, uid, gid),
         }
     }
     fn link_node(&self, src_ino: i64, new_parent: i64, new_name: &str) -> Result<i64, MetaError> {
         match self {
             MetaStore::Sqlite(m) => m.link_node(src_ino, new_parent, new_name),
             MetaStore::Pg(p) => p.link_node(src_ino, new_parent, new_name),
+            #[cfg(feature = "treedb")]
+            MetaStore::Treedb(t) => t.link_node(src_ino, new_parent, new_name),
         }
     }
     fn unlink(&self, parent: i64, name: &str) -> Result<Option<String>, MetaError> {
         match self {
             MetaStore::Sqlite(m) => m.unlink(parent, name),
             MetaStore::Pg(p) => p.unlink(parent, name),
+            #[cfg(feature = "treedb")]
+            MetaStore::Treedb(t) => t.unlink(parent, name),
         }
     }
     fn supports_unlink_batch(&self) -> bool {
         match self {
             MetaStore::Sqlite(m) => MetaProvider::supports_unlink_batch(m),
             MetaStore::Pg(p) => MetaProvider::supports_unlink_batch(&**p),
+            #[cfg(feature = "treedb")]
+            MetaStore::Treedb(t) => MetaProvider::supports_unlink_batch(&**t),
         }
     }
     fn unlink_nodes_batch(&self, items: &[(i64, &str)]) -> Vec<Result<Option<String>, MetaError>> {
         match self {
             MetaStore::Sqlite(m) => MetaProvider::unlink_nodes_batch(m, items),
             MetaStore::Pg(p) => MetaProvider::unlink_nodes_batch(&**p, items),
+            #[cfg(feature = "treedb")]
+            MetaStore::Treedb(t) => MetaProvider::unlink_nodes_batch(&**t, items),
         }
     }
     fn rename(
@@ -3249,30 +3300,40 @@ impl MetaProvider for MetaStore {
         match self {
             MetaStore::Sqlite(m) => m.rename(parent, name, new_parent, new_name, noreplace),
             MetaStore::Pg(p) => p.rename(parent, name, new_parent, new_name, noreplace),
+            #[cfg(feature = "treedb")]
+            MetaStore::Treedb(t) => t.rename(parent, name, new_parent, new_name, noreplace),
         }
     }
     fn set_mode(&self, ino: i64, mode: u32) {
         match self {
             MetaStore::Sqlite(m) => m.set_mode(ino, mode),
             MetaStore::Pg(p) => p.set_mode(ino, mode),
+            #[cfg(feature = "treedb")]
+            MetaStore::Treedb(t) => t.set_mode(ino, mode),
         }
     }
     fn set_uid_gid(&self, ino: i64, uid: u32, gid: u32) {
         match self {
             MetaStore::Sqlite(m) => m.set_uid_gid(ino, uid, gid),
             MetaStore::Pg(p) => p.set_uid_gid(ino, uid, gid),
+            #[cfg(feature = "treedb")]
+            MetaStore::Treedb(t) => t.set_uid_gid(ino, uid, gid),
         }
     }
     fn set_times(&self, ino: i64, atime: Option<i64>, mtime: Option<i64>) {
         match self {
             MetaStore::Sqlite(m) => m.set_times(ino, atime, mtime),
             MetaStore::Pg(p) => p.set_times(ino, atime, mtime),
+            #[cfg(feature = "treedb")]
+            MetaStore::Treedb(t) => t.set_times(ino, atime, mtime),
         }
     }
     fn touch_mtime(&self, ino: i64) {
         match self {
             MetaStore::Sqlite(m) => m.touch_mtime(ino),
             MetaStore::Pg(p) => p.touch_mtime(ino),
+            #[cfg(feature = "treedb")]
+            MetaStore::Treedb(t) => t.touch_mtime(ino),
         }
     }
     #[allow(clippy::too_many_arguments)]
@@ -3289,6 +3350,8 @@ impl MetaProvider for MetaStore {
         match self {
             MetaStore::Sqlite(m) => m.lock_op(ino, owner, start, end, ty, pid, sid),
             MetaStore::Pg(p) => p.lock_op(ino, owner, start, end, ty, pid, sid),
+            #[cfg(feature = "treedb")]
+            MetaStore::Treedb(t) => t.lock_op(ino, owner, start, end, ty, pid, sid),
         }
     }
     fn get_lock(
@@ -3302,30 +3365,40 @@ impl MetaProvider for MetaStore {
         match self {
             MetaStore::Sqlite(m) => m.get_lock(ino, owner, start, end, ty),
             MetaStore::Pg(p) => p.get_lock(ino, owner, start, end, ty),
+            #[cfg(feature = "treedb")]
+            MetaStore::Treedb(t) => t.get_lock(ino, owner, start, end, ty),
         }
     }
     fn release_locks_of_owner(&self, owner: u64) {
         match self {
             MetaStore::Sqlite(m) => m.release_locks_of_owner(owner),
             MetaStore::Pg(p) => p.release_locks_of_owner(owner),
+            #[cfg(feature = "treedb")]
+            MetaStore::Treedb(t) => t.release_locks_of_owner(owner),
         }
     }
     fn renew_locks(&self, sid: u64) {
         match self {
             MetaStore::Sqlite(m) => m.renew_locks(sid),
             MetaStore::Pg(p) => p.renew_locks(sid),
+            #[cfg(feature = "treedb")]
+            MetaStore::Treedb(t) => t.renew_locks(sid),
         }
     }
     fn fence_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
         match self {
             MetaStore::Sqlite(m) => m.fence_handle(),
             MetaStore::Pg(p) => p.fence_handle(),
+            #[cfg(feature = "treedb")]
+            MetaStore::Treedb(t) => t.fence_handle(),
         }
     }
     fn dump_tree(&self) -> Vec<(i64, i64, String, bool, Option<String>)> {
         match self {
             MetaStore::Sqlite(m) => MetaProvider::dump_tree(m),
             MetaStore::Pg(p) => MetaProvider::dump_tree(&**p),
+            #[cfg(feature = "treedb")]
+            MetaStore::Treedb(t) => MetaProvider::dump_tree(&**t),
         }
     }
 }

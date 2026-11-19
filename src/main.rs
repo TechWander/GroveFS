@@ -492,6 +492,12 @@ enum Cmd {
         /// `VACUUM INTO`-based and only makes sense on the embedded SQLite
         /// backend; under PG, run PostgreSQL's own streaming/logical replication
         /// for HA instead.
+        /// EXPERIMENTAL (`--features treedb` builds only): `treedb://host:port`
+        /// places the view TREES in a treedb server while the control plane
+        /// (definitions, keys, accounts) stays in local SQLite under
+        /// `<meta-dir>`; it rejects `--role standby`/`--peer`/`--witness`,
+        /// `view export/import` and `gc` audits, and no other subcommand drives
+        /// it (govern its views through this server with `--meta-server`).
         /// Any other `scheme://` URI is refused at startup — it is never
         /// silently served by SQLite.
         #[arg(long = "meta-store", value_name = "URI")]
@@ -1768,6 +1774,30 @@ fn open_existing_view(base: &Path, view: &str) -> Result<MetaEngine, Box<dyn std
 /// snapshot shipping is SQLite-only, and PostgreSQL has its own replication.
 fn resolve_store(explicit: Option<String>) -> Option<String> {
     explicit.or_else(|| std::env::var("GROVEFS_META_STORE").ok())
+}
+
+/// Refuse a `treedb://` --meta-store on every command EXCEPT `meta-server`.
+///
+/// Only a treedb-capable `meta-server` drives that engine; every other
+/// command's backend is a local SQLite file or a PG schema, so letting one of
+/// them accept the URI would answer questions about bytes that are not the
+/// trees the operator named — the same refuse-not-downgrade rule
+/// `MetaServer::with_store` applies to an unknown scheme. Views under a treedb
+/// store are governed through the server: `--meta-server <host:port>`.
+///
+/// The scheme string is spelled out here rather than imported because the lib
+/// module behind it is feature-gated while this refusal must exist in EVERY
+/// build; keep it equal to `grovefs::treedb_store::SCHEME`.
+fn refuse_treedb_store(store: Option<&str>, cmd: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if store.is_some_and(|u| u.starts_with("treedb://")) {
+        return Err(format!(
+            "{cmd} does not drive --meta-store treedb://…: only `grovefs meta-server --meta-store \
+             treedb://host:port` (an EXPERIMENTAL `--features treedb` build) serves that engine, \
+             so manage its views through it (`--meta-server <host:port>`)"
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Resolve the admin credential for a `--control-server` call: the flag wins,
@@ -3130,6 +3160,10 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let vbase = db_path.unwrap_or_else(|| base.clone());
             let store = resolve_store(store);
+            // A treedb tree store is driven by its meta-server, never from here:
+            // the branches below would create a local `<view>.db` that no
+            // treedb meta-server ever reads.
+            refuse_treedb_store(store.as_deref(), "grovefs view")?;
             let store_is_pg = store.as_deref().is_some_and(grovefs::pg_store::is_pg_store);
             // The same `ControlStore` the MCP server drives — except that with
             // `--control-server` it is a thin client of the meta-server's
@@ -3872,6 +3906,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             // (or `GROVEFS_META_STORE`) binds definitions, keys and the call audit to
             // the shared `grovefs_control` schema; unset governs the local files.
             let store = resolve_store(store);
+            refuse_treedb_store(store.as_deref(), "grovefs mcp")?;
             grovefs::mcp::serve(
                 db_path.unwrap_or_else(|| base.clone()),
                 store.as_deref(),
@@ -4480,6 +4515,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let rbase = db_path.unwrap_or_else(|| base.clone());
             let store = resolve_store(store);
+            refuse_treedb_store(store.as_deref(), "grovefs refs")?;
             match action {
                 RefsAction::Rebuild => {
                     if store.as_deref().is_some_and(grovefs::pg_store::is_pg_store) {
@@ -4591,6 +4627,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             // there is no offline page tree to walk here, so this refuses rather
             // than reporting "nothing to reclaim".
             let offline_store = resolve_store(None);
+            refuse_treedb_store(offline_store.as_deref(), "grovefs gc")?;
             if offline_store.as_deref().is_some_and(grovefs::pg_store::is_pg_store) {
                 return Err("`gc` audits LOCAL page files under <data-dir>/blocks; a PostgreSQL deployment's trees are schemas and its bytes are owned by the data servers — reclaim there with the DBA/data-server tooling, not this command".into());
             }
@@ -4679,7 +4716,9 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             // cluster, printing a success about a tree nothing ever reads: the
             // same refuse-not-downgrade rule `Cmd::View` applies to the other
             // file-level physical ops.
-            if let Some(u) = resolve_store(store).as_deref() {
+            let imp_store = resolve_store(store);
+            refuse_treedb_store(imp_store.as_deref(), "grovefs import")?;
+            if let Some(u) = imp_store.as_deref() {
                 if grovefs::pg_store::is_pg_store(u) {
                     return Err(
                         "import operates on a local SQLite view db; under a PostgreSQL deployment (--meta-store postgres://…, or GROVEFS_META_STORE) a base tree is a PG schema (create one with `view create`) and its bytes move through a mounted path — drop --meta-store for a local store"

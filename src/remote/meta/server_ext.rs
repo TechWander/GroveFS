@@ -98,13 +98,38 @@ impl HaState {
 /// replication/logical decoding for durability, so GroveFS-native HA
 /// (`--role standby`/`--peer`/`--witness`) is rejected at `serve()` time and
 /// [`MetaStore::backup_to_bytes`] reports unsupported for this variant.
+///
+/// The third kind, behind `--features treedb`, is the EXPERIMENTAL sibling
+/// engine (`--meta-store treedb://host:port`): trees live inside a treedb
+/// server, and — unlike the PG backend — the CONTROL plane stays in local
+/// SQLite under `--meta-dir`, because treedb has no table for view definitions,
+/// api keys or web grants yet. That split is what [`StoreKind::control_uri`]
+/// encodes; nothing else may assume "not SQLite" means "control lives remote".
 #[derive(Clone, Debug)]
 pub enum StoreKind {
     Sqlite,
     Pg(String),
+    /// `treedb://host:port` — the address only, parsed once at `with_store()`.
+    #[cfg(feature = "treedb")]
+    Treedb(String),
 }
 
 impl StoreKind {
+    /// Where the CONTROL plane (api keys, web accounts, view definitions,
+    /// placement) lives: `Some(uri)` means shared tables inside that PostgreSQL
+    /// store, `None` means the local SQLite files and `meta/views/` under
+    /// `--meta-dir`. A treedb backend returns `None` deliberately — the engine
+    /// serves trees, not credentials — so every control-plane site keeps working
+    /// over a treedb deployment without knowing treedb exists.
+    pub(crate) fn control_uri(&self) -> Option<&str> {
+        match self {
+            StoreKind::Pg(u) => Some(u.as_str()),
+            StoreKind::Sqlite => None,
+            #[cfg(feature = "treedb")]
+            StoreKind::Treedb(_) => None,
+        }
+    }
+
     /// Backend name as the startup banner states it. Lower-case, stable, and
     /// argument-free on purpose: the URI is NEVER part of this, because a
     /// `postgres://user:pw@host/db` URI embeds a credential and the banner goes
@@ -115,6 +140,8 @@ impl StoreKind {
         match self {
             StoreKind::Sqlite => "sqlite",
             StoreKind::Pg(_) => "postgres",
+            #[cfg(feature = "treedb")]
+            StoreKind::Treedb(_) => "treedb",
         }
     }
 
@@ -131,6 +158,11 @@ impl StoreKind {
             ),
             StoreKind::Pg(_) => {
                 "one schema per view in PostgreSQL; <base> holds no trees".to_string()
+            }
+            #[cfg(feature = "treedb")]
+            StoreKind::Treedb(_) => {
+                "one tree per view in the treedb server; <base> holds definitions and keys only"
+                    .to_string()
             }
         }
     }
@@ -611,10 +643,27 @@ impl MetaServer {
     /// remembered and refused by `serve()`. Falling back would start a server
     /// that stores metadata somewhere other than where the operator said, which
     /// is the one outcome a `--meta-store` flag must never produce.
+    ///
+    /// * `treedb://host:port` — EXPERIMENTAL (`--features treedb`) metadata
+    ///   engine, one treedb view per GroveFS base view. Only the TREE side moves
+    ///   there; definitions, keys and accounts stay in local SQLite, so
+    ///   `--meta-dir` still means something under this scheme.
     pub fn with_store(mut self, uri: Option<String>) -> Self {
         match uri {
             Some(u) if crate::pg_store::is_pg_store(&u) => {
                 self.store = StoreKind::Pg(u);
+            }
+            #[cfg(feature = "treedb")]
+            Some(u) if crate::treedb_store::is_treedb_store(&u) => {
+                // A malformed address is refused exactly like an unknown scheme:
+                // `serve()` reports it, the server never starts on a default.
+                match crate::treedb_store::parse_addr(&u) {
+                    Ok(addr) => self.store = StoreKind::Treedb(addr),
+                    Err(e) => {
+                        self.store_unavailable = Some(format!("`{u}` is not a valid --meta-store treedb address: {e}"));
+                        self.store = StoreKind::Sqlite;
+                    }
+                }
             }
             Some(u) if u.contains("://") => {
                 self.store_unavailable = Some(format!(
@@ -660,6 +709,11 @@ impl MetaServer {
                 // rather than with a catch-all is what stops a future variant
                 // from silently borrowing another backend's remedy text.
                 StoreKind::Sqlite => unreachable!("HA refusal is built per non-Sqlite store"),
+                #[cfg(feature = "treedb")]
+                StoreKind::Treedb(_) => (
+                    "treedb://…",
+                    "treedb recovers from its own WAL and snapshots, but GroveFS-native\n                     snapshot shipping is not implemented for it — run the meta-server single-instance.",
+                ),
             };
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -670,8 +724,9 @@ impl MetaServer {
         }
         // SQLite trees live under `<base>/meta`; a PG store writes nothing
         // locally, so creating that directory would be a misleading footprint
-        // (an empty `meta/` on a host that has no local metadata at all).
-        if matches!(self.store, StoreKind::Sqlite) {
+        // (an empty `meta/` on a host that has no local metadata at all). Under
+        // treedb the directory IS still needed — the control plane stayed local.
+        if self.store.control_uri().is_none() {
             std::fs::create_dir_all(self.base.join("meta"))?;
         }
         // The CONTROL port's own credential store. Built here (and only here)
@@ -683,10 +738,7 @@ impl MetaServer {
         let (ctl_keys, web_auth, admin_note) = match &self.control_listen {
             None => (None, None, None),
             Some(_) => {
-                let store_uri = match &self.store {
-                    StoreKind::Pg(u) => Some(u.as_str()),
-                    StoreKind::Sqlite => None,
-                };
+                let store_uri = self.store.control_uri();
                 let keys = Arc::new(
                     crate::apikeys::ApiKeyStore::open_for(&self.base, store_uri)
                         .map_err(io::Error::other)?,
@@ -772,13 +824,7 @@ impl MetaServer {
         // definitions/aliases/forks from the shared `grovefs_control` schema, a
         // SQLite store from the local `meta/views` dir — one system of record per
         // backend, never a local file the PG deployment would ignore.
-        let control = crate::mcp::control_store_for(
-            &self.base,
-            match &self.store {
-                StoreKind::Pg(uri) => Some(uri.as_str()),
-                StoreKind::Sqlite => None,
-            },
-        )
+        let control = crate::mcp::control_store_for(&self.base, self.store.control_uri())
         .map_err(io::Error::other)?;
         let rt = Arc::new(MetaRuntime {
             base: self.base.clone(),
@@ -842,6 +888,10 @@ impl MetaServer {
                 match &self.store {
                     StoreKind::Pg(_) => "grovefs_control.web_accounts/web_grants",
                     StoreKind::Sqlite => "meta/web_accounts.db",
+                    #[cfg(feature = "treedb")]
+                    StoreKind::Treedb(_) => {
+                        "meta/web_accounts.db (local: treedb serves trees, not accounts)"
+                    }
                 }
             );
             let crt = rt.clone();
@@ -1911,6 +1961,27 @@ fn control_dispatch(
                     let note = seed_if_manifest(&eng, be.as_deref(), manifest)?;
                     format!("created BASE view '{view}' at {}{note}", mp.display())
                 }
+                #[cfg(feature = "treedb")]
+                StoreKind::Treedb(addr) => {
+                    // `has_physical` above enumerates local db files, so it
+                    // cannot see a treedb view: the duplicate check belongs here,
+                    // against the engine's own list.
+                    if crate::treedb_store::TreedbStore::list_views(addr)
+                        .map_err(|e| format!("view create: {e}"))?
+                        .iter()
+                        .any(|v| v == &view)
+                    {
+                        return Err(format!(
+                            "view '{view}' already exists in treedb at {addr} — remove it first (`view rm --view {view} --base`)"
+                        ));
+                    }
+                    let eng = crate::meta::MetaStore::open_treedb(addr, &view, false)
+                        .map_err(|e| format!("view create: {e}"))?;
+                    // Like PG: the bytes belong to the data servers, so there is
+                    // no local root a manifest `touch` line could write into.
+                    let note = seed_if_manifest(&eng, None, manifest)?;
+                    format!("created BASE view '{view}' in treedb at {addr}{note}")
+                }
             };
             rt.evict();
             Ok(json!(report))
@@ -2623,6 +2694,16 @@ fn view_export_stage(
     }
     let definition = rt.control.get_def_raw(view)?;
     refuse_virtual_for_export(view, definition.as_deref())?;
+    // Refused BEFORE any staging file or handle exists: the dump readers below
+    // are SQLite/PG-shaped SQL, and a treedb tree has no equivalent yet.
+    #[cfg(feature = "treedb")]
+    if matches!(rt.store, StoreKind::Treedb(_)) {
+        return Err(
+            "view export/import is not implemented for a treedb store — treedb snapshots its \
+             own directory (`treedb snapshot`), which is the durable dump of these trees"
+                .to_string(),
+        );
+    }
     let dir = xfer_dir(rt);
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     sweep_xfer(&dir);
@@ -2637,6 +2718,11 @@ fn view_export_stage(
         StoreKind::Pg(uri) => {
             crate::pg_store::export_view(uri, view, &path, true, definition.clone())?
         }
+        #[cfg(feature = "treedb")]
+        // The guard above already refused treedb, and naming the variant here
+        // instead of with a catch-all is what keeps a future backend from
+        // quietly reusing SQLite's dump reader.
+        StoreKind::Treedb(_) => unreachable!("export is refused for a treedb store above"),
     };
     let size = std::fs::metadata(&path)
         .map_err(|e| format!("cannot stat staged export {handle}: {e}"))?
@@ -2806,6 +2892,15 @@ fn view_import_commit(
     let st = match &rt.store {
         StoreKind::Sqlite => crate::meta::import_view(&rt.base, &view, &path, replace)?,
         StoreKind::Pg(uri) => crate::pg_store::import_view(uri, &view, &path, replace)?,
+        #[cfg(feature = "treedb")]
+        // No dump reader for treedb (see `view_export_stage`): the tree can only
+        // be created empty and written through a mount.
+        StoreKind::Treedb(_) => {
+            return Err(
+                "view export/import is not implemented for a treedb store — create the base with \
+                 `view create` and write it through a mount".to_string(),
+            )
+        }
     };
     if let Some(base) = &as_fork {
         if let Err(e) = rt.control.put_def(&view, &format!("fork {base}\n")) {
@@ -2845,6 +2940,15 @@ fn drop_imported_tree(rt: &Arc<MetaRuntime>, view: &str) -> String {
                 "the imported tree could NOT be removed ({e}) — drop schema for '{view}' by hand"
             ),
         },
+        #[cfg(feature = "treedb")]
+        StoreKind::Treedb(addr) => {
+            match crate::treedb_store::TreedbStore::drop_view(addr, view) {
+                Ok(_) => "the imported tree was removed again".to_string(),
+                Err(e) => format!(
+                    "the imported tree could NOT be removed ({e}) — drop view '{view}' in treedb at {addr} by hand"
+                ),
+            }
+        }
     }
 }
 
@@ -2925,6 +3029,18 @@ fn view_rm_base(
                 rm.blob_refs.len()
             )
         }
+        #[cfg(feature = "treedb")]
+        StoreKind::Treedb(addr) => {
+            // treedb keeps the holder count inside the tree itself, so there is
+            // no separate ledger to consult and nothing to report about refs
+            // that other views still hold: dropping a view frees exactly its own
+            // rows. The BYTES are a data server's business, as under PG.
+            crate::treedb_store::TreedbStore::drop_view(addr, view)
+                .map_err(|e| format!("cannot drop treedb view '{view}' at {addr}: {e}"))?;
+            format!(
+                "removed base view '{view}' from treedb at {addr}; content objects are not touched — they belong to the data server(s)"
+            )
+        }
     };
     // Drop cached engines: the tree they point at no longer exists.
     rt.evict();
@@ -2949,6 +3065,14 @@ fn refs_rebuild(rt: &Arc<MetaRuntime>) -> Result<serde_json::Value, String> {
                 rt.base.join("meta").join("refs.db").display()
             )))
         }
+        #[cfg(feature = "treedb")]
+        // There is no ledger to rebuild: treedb derives the holder count from
+        // the live tree inside each op, so a stale count is not a state it can
+        // reach. Refusing beats rewriting rows the engine owns.
+        StoreKind::Treedb(_) => Err(
+            "`refs rebuild` has nothing to do for a treedb store: holder counts are maintained \
+             inside the engine, never in a separate ledger".to_string(),
+        ),
     }
 }
 
@@ -2969,6 +3093,15 @@ fn gc_picture(rt: &Arc<MetaRuntime>) -> Result<crate::gc::Picture, String> {
                 ),
             })
         }
+        // An empty Picture is NOT an acceptable answer here: every byte would
+        // look unreferenced and an audit that trusts it would delete live data.
+        // treedb can dump its trees (`dump_tree` feeds `du`), but the ledger
+        // side has no aggregate query yet, so the audit refuses to judge.
+        #[cfg(feature = "treedb")]
+        StoreKind::Treedb(_) => Err(
+            "gc audit is not implemented for a treedb store — it would report every object as \
+             garbage, which is worse than refusing".to_string(),
+        ),
     }
 }
 
@@ -3149,6 +3282,8 @@ fn gc_audit(
     let meta = match &rt.store {
         StoreKind::Sqlite => rt.base.display().to_string(),
         StoreKind::Pg(_) => "PostgreSQL (one schema per view; the URI is never echoed)".to_string(),
+        #[cfg(feature = "treedb")]
+        StoreKind::Treedb(addr) => format!("treedb://{addr} (one tree per view)"),
     };
     let cand = |c: &crate::gc::Judged| {
         json!({
@@ -3316,8 +3451,9 @@ fn evict_idle(rt: &MetaRuntime) -> usize {
 /// write is refused at the SQLite layer, not merely discouraged); a primary
 /// opens read-write. Under [`StoreKind::Pg`] the standby/readonly path never
 /// fires (`serve()` refuses the combination), so `readonly` is passed through
-/// as `false`. Keyed by the on-disk tree name — derived display views live in
-/// [`MetaRuntime::views`] and are resolved by [`view_provider`].
+/// as `false` — the same for [`StoreKind::Treedb`], which is refused against
+/// `--role standby` at startup. Keyed by the on-disk tree name — derived display
+/// views live in [`MetaRuntime::views`] and are resolved by [`view_provider`].
 fn store_for(rt: &MetaRuntime, view: &str) -> io::Result<Arc<MetaStore>> {
     let mut m = rt.cache.lock();
     if let Some((e, stamp)) = m.get_mut(view) {
@@ -3345,6 +3481,25 @@ fn store_for(rt: &MetaRuntime, view: &str) -> io::Result<Arc<MetaStore>> {
                     crate::pg_store::redact_uri(uri)
                 ))
             })?,
+        #[cfg(feature = "treedb")]
+        // Opening a treedb store resolves the view id and, for a writable
+        // handle, creates the tree when it is missing — which `M_OPEN` must
+        // never do (the banner promises no empty tree is ever auto-created).
+        // So existence is confirmed against the engine's own list first; the
+        // result is cached per view like every other backend, so this costs one
+        // `ListViews` per cold view, not one per mount.
+        StoreKind::Treedb(addr) => {
+            let known = crate::treedb_store::TreedbStore::list_views(addr)
+                .map_err(|e| io::Error::other(format!("treedb list views at {addr}: {e}")))?;
+            if !known.iter().any(|v| v == view) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no base tree '{view}' in treedb at {addr} — create it (`view create`)"),
+                ));
+            }
+            MetaStore::open_treedb(addr, view, false)
+                .map_err(|e| io::Error::other(format!("treedb open for view='{view}' at {addr}: {e}")))?
+        }
     };
     let engine = Arc::new(store);
     m.insert(
@@ -3389,6 +3544,16 @@ fn view_exists(rt: &MetaRuntime, view: &str) -> io::Result<bool> {
     let control = &*rt.control;
     if control.has_def(view).map_err(io::Error::other)? {
         return Ok(true);
+    }
+    // A treedb tree is invisible to the control store's physical enumeration
+    // (that lists local db files), so under this backend the ENGINE is asked —
+    // the same source `store_for` gates on, so the two can never disagree about
+    // what exists.
+    #[cfg(feature = "treedb")]
+    if let StoreKind::Treedb(addr) = &rt.store {
+        return crate::treedb_store::TreedbStore::list_views(addr)
+            .map(|vs| vs.iter().any(|v| v == view))
+            .map_err(io::Error::other);
     }
     control.has_physical(view).map_err(io::Error::other)
 }
@@ -3956,14 +4121,34 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
             // the meta-server host rather than `--meta-dir <meta-dir> --view
             // <name>` (which they must mentally expand) (§6-5).
             let root = rt.base.display();
-            let hint = if rt.control.backend() == "postgres" {
-                format!("a PG base view is a schema: create it first with `grovefs view --meta-store postgres://… --meta-dir {root} create --view {view}`, or restore the schema from a dump")
-            } else {
-                format!("create it first: `grovefs view --meta-dir {root} create --view {view}` (or `grovefs --home {root} init --view {view}`, or seed it with `grovefs view import`)")
+            let hint = match &rt.store {
+                // Under treedb the CONTROL store is local SQLite, so naming it
+                // in the hint would tell the operator to create a db file this
+                // server never reads: a treedb base tree is made through the
+                // server's own governance port.
+                #[cfg(feature = "treedb")]
+                StoreKind::Treedb(addr) => format!(
+                    "a treedb base view is a tree inside the engine at {addr}: create it against this meta-server (`grovefs view --control-server <host:port> --api-key <admin-key> create --view {view}`)"
+                ),
+                _ if rt.control.backend() == "postgres" => format!(
+                    "a PG base view is a schema: create it first with `grovefs view --meta-store postgres://… --meta-dir {root} create --view {view}`, or restore the schema from a dump"
+                ),
+                _ => format!(
+                    "create it first: `grovefs view --meta-dir {root} create --view {view}` (or `grovefs --home {root} init --view {view}`, or seed it with `grovefs view import`)"
+                ),
             };
             // `view` is the POST-ALIAS real name; name the alias the caller
             // actually mounted too, so "pub does not exist" never reads as
             // if the alias itself were unknown.
+            #[cfg(feature = "treedb")]
+            let backend = if matches!(rt.store, StoreKind::Treedb(_)) {
+                // The store that was actually asked about, not the one holding
+                // the credentials.
+                "treedb"
+            } else {
+                rt.control.backend()
+            };
+            #[cfg(not(feature = "treedb"))]
             let backend = rt.control.backend();
             let where_ = if presented_name != view {
                 format!("{backend}; mounted as alias '{presented_name}' -> '{view}'")

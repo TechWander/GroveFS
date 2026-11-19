@@ -518,6 +518,7 @@ dependencies = [
  "tiny_http",
  "tracing",
  "tracing-subscriber",
+ "treedb",
  "uuid",
 ]
 
@@ -1455,6 +1456,21 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
+]
+
+[[package]]
+name = "treedb"
+version = "0.3.0"
+dependencies = [
+ "chrono",
+ "libc",
+ "parking_lot",
+ "postgres",
+ "rusqlite",
+ "sha2",
+ "thiserror",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
