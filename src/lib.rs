@@ -44,10 +44,11 @@ pub mod mcp;
 pub mod meta;
 #[cfg(feature = "native")]
 pub mod pg_store;
-/// EXPERIMENTAL third metadata backend: the sibling `treedb` engine over its own
+/// EXPERIMENTAL third metadata backend: the `treedb` engine over its own
 /// binary protocol. Its own feature, deliberately outside `native`, so the
-/// default build never compiles a line of it — see `Cargo.toml`'s `treedb`
-/// feature note for the path-dependency hazard.
+/// default build never compiles a line of it. It is a tagged git dependency
+/// rather than a sibling path, so any checkout resolves it — `Cargo.toml`
+/// carries the why beside the feature gate.
 #[cfg(feature = "treedb")]
 pub mod treedb_store;
 pub mod platform;

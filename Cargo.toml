@@ -44,17 +44,18 @@ remote-only = []
 # stack. Deliberately NOT part of `native`: a client build gains nothing from
 # linking an HTTP server, and `remote-only`/WinFsp must stay free of it.
 web = ["native", "dep:tiny_http"]
-# EXPERIMENTAL metadata engine (`grovefs --meta-store treedb://host:port`), the
-# sibling `../treedb` crate: single-process epoll event loop, custom binary
-# protocol, own WAL + snapshot recovery. OFF by default, and deliberately NOT
-# part of `native`: the whole point of the spike is that the default build and
-# the default backend path stay byte-identical.
+# EXPERIMENTAL metadata engine (`grovefs --meta-store treedb://host:port`):
+# single-process epoll event loop, custom binary protocol, own WAL + snapshot
+# recovery. OFF by default, and deliberately NOT part of `native`: the whole
+# point of the spike is that the default build and the default backend path
+# stay byte-identical.
 #
-# KNOWN HAZARD of this line: a path dependency is resolved even when the feature
-# is off, so a checkout WITHOUT `../treedb` next to this repo fails to build for
-# ANY feature set. Landing this on a shared branch therefore needs a dependency
-# distribution decision first (vendored copy / workspace / registry) — see
-# treedb/DESIGN.md §10 stage B.
+# The dependency is a public GIT TAG, not `path = "../treedb"`. That matters
+# more than it looks: an optional path dependency is still RESOLVED when the
+# feature is off, so a checkout without the sibling clone could not build for
+# ANY feature set — which is why this backend stayed on a branch. Pinning a
+# tag removes the hazard. Co-developing against a local treedb is a temporary
+# `[patch."https://github.com/TechWander/treedb.git"]` block, never a commit.
 treedb = ["native", "dep:treedb"]
 
 [dependencies]
@@ -90,11 +91,13 @@ dirs = "5"
 # OPTIONAL: the server-side/control-plane subtree only, never the `remote-only`
 # client, so tokio is dropped from the Windows build's graph.
 postgres = { version = "0.19", default-features = false, optional = true }
-# The experimental GroveFS-specific metadata engine (feature `treedb`). Path
-# dependency on the sibling repo, off by default; it links only `libc` +
+# The experimental GroveFS-specific metadata engine (feature `treedb`), pinned
+# to a tag so any checkout resolves it without a sibling clone. Anonymous https
+# on purpose: an SSH URL would make `cargo fetch` prompt for credentials on
+# machines that only have a key for the private remotes. It links only `libc` +
 # `thiserror` + std, so it adds no new transitive dependency to the `native`
 # graph (its PG/SQLite migration-shim modules do, and those are dead code here).
-treedb = { path = "../treedb", optional = true }
+treedb = { git = "https://github.com/TechWander/treedb.git", tag = "v0.3.0", optional = true }
 # Opt-in per-stage latency telemetry (src/stats.rs): high-dynamic-range histograms
 # for offline bottleneck diagnosis. Pure-Rust, zero deps. Only touched when
 # `--stats` / `GROVEFS_STATS=1` is on; the disabled path costs one atomic load.

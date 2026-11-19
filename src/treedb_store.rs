@@ -1,22 +1,22 @@
-//! GroveFS 元数据的 **treedb** 后端 —— 实验 spike（`treedb/DESIGN.md` §10 阶段 B）。
+//! GroveFS 元数据的 **treedb** 后端 —— 实验 spike（treedb 仓的 `DESIGN.md` §10 阶段 B）。
 //!
 //! 整个模块只在 `--features treedb` 下存在，入口是
 //! `meta-server --meta-store treedb://host:port`。默认后端路径（SQLite / PG）逐字节
 //! 不变：本文件不被编译时，`StoreKind` 里也没有 `Treedb` 之外的 treedb 痕迹。
 //!
 //! 这里**不做 SQL 翻译**：每个 [`MetaProvider`] 方法映射成一条或几条 treedb 二进制
-//! op（[`treedb::engine::model::Op`]）。语义边界按 `treedb/DESIGN.md` §5 划分 ——
+//! op（[`treedb::engine::model::Op`]）。语义边界按 treedb 仓 `DESIGN.md` §5 划分 ——
 //! fd/open 状态、字节本体都留在 grovefs 侧，引擎只管名字空间与引用账本。
 //!
 //! ## 单位与形状上的三处翻译
 //!
 //! | grovefs | treedb | 处理 |
-//!|---|---|---|
-//!| `NodeInfo.{atime,mtime,ctime}` 是 epoch **秒** | `Node` 里是 **毫秒** | 进出各折一次（[`ms_to_s`] / [`s_to_ms`]） |
-//!| `data_ref: Option<String>`（形如 `1:4096:dev0`） | `DataRef = Vec<u8>`，空串 = 没有内容 | 字节直通，空串 ↔ `None` |
-//!| 富 errno 会被压进 `MetaError` 的 6 个变体 | 引擎回裸 POSIX errno | [`Fail::to_meta`] 一张显式映射表，未知码归 `Db` 并带上原文 |
+//! |---|---|---|
+//! | `NodeInfo.{atime,mtime,ctime}` 是 epoch **秒** | `Node` 里是 **毫秒** | 进出各折一次（[`ms_to_s`] / [`s_to_ms`]） |
+//! | `data_ref: Option<String>`（形如 `1:4096:dev0`） | `DataRef = Vec<u8>`，空串 = 没有内容 | 字节直通，空串 ↔ `None` |
+//! | 富 errno 会被压进 `MetaError` 的 6 个变体 | 引擎回裸 POSIX errno | [`Fail::to_meta`] 一张显式映射表，未知码归 `Db` 并带上原文 |
 //!
-//! ## 明确接不了的东西（spike 的诚实边界，见 `treedb/DESIGN.md` §5.3 / §8）
+//! ## 明确接不了的东西（spike 的诚实边界，见 treedb 仓 `DESIGN.md` §5.3 / §8）
 //!
 //! - **硬链接**：引擎没有 `Link` op，一个 inode 只有一条目录项路径。`link_node` 回
 //!   `EPERM`，不是"假装成功"。
@@ -175,7 +175,7 @@ impl Fail {
 
     /// treedb 的富 errno → grovefs 那 6 个 `MetaError` 变体。这张表就是
     /// 「协议表达能力被压扁」的地方：ESTALE/ELOOP/EXDEV 这些到 `Db` 里，
-    /// 上层统一给 EIO。要恢复语义得先扩 `MetaError`（见 treedb/DESIGN.md §10）。
+    /// 上层统一给 EIO。要恢复语义得先扩 `MetaError`（见 treedb 仓 DESIGN.md §10）。
     fn to_meta(&self) -> MetaError {
         match self.code.unwrap_or(0) {
             errno::EEXIST => MetaError::Exists,

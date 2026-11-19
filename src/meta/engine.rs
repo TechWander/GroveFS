@@ -3070,7 +3070,8 @@ impl MetaProvider for MetaEngine {
 pub enum MetaStore {
     Sqlite(MetaEngine),
     Pg(Box<crate::pg_store::PgEngine>),
-    /// EXPERIMENTAL: the sibling `treedb` engine. Only this variant and the
+    /// EXPERIMENTAL: the `treedb` engine, reached over its own protocol as a
+    /// tagged git dependency. Only this variant and the
     /// `#[cfg(feature = "treedb")]` dispatch arms beside it exist under that
     /// feature — a default build compiles the two backends above exactly as
     /// before, which is what makes the spike safe to land beside production.

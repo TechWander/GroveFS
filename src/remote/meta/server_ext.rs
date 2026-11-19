@@ -99,12 +99,12 @@ impl HaState {
 /// (`--role standby`/`--peer`/`--witness`) is rejected at `serve()` time and
 /// [`MetaStore::backup_to_bytes`] reports unsupported for this variant.
 ///
-/// The third kind, behind `--features treedb`, is the EXPERIMENTAL sibling
-/// engine (`--meta-store treedb://host:port`): trees live inside a treedb
-/// server, and — unlike the PG backend — the CONTROL plane stays in local
-/// SQLite under `--meta-dir`, because treedb has no table for view definitions,
-/// api keys or web grants yet. That split is what [`StoreKind::control_uri`]
-/// encodes; nothing else may assume "not SQLite" means "control lives remote".
+/// The third kind, behind `--features treedb`, is the EXPERIMENTAL engine
+/// (`--meta-store treedb://host:port`): trees live inside a treedb server, and
+/// — unlike the PG backend — the CONTROL plane stays in local SQLite under
+/// `--meta-dir`, because treedb has no table for view definitions, api keys or
+/// web grants yet. That split is what [`StoreKind::control_uri`] encodes;
+/// nothing else may assume "not SQLite" means "control lives remote".
 #[derive(Clone, Debug)]
 pub enum StoreKind {
     Sqlite,

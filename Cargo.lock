@@ -1461,6 +1461,7 @@ dependencies = [
 [[package]]
 name = "treedb"
 version = "0.3.0"
+source = "git+https://github.com/TechWander/treedb.git?tag=v0.3.0#e2bb51dd09ab738519b742cd7c75da9ec2fc99b5"
 dependencies = [
  "chrono",
  "libc",
