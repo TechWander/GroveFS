@@ -91,12 +91,20 @@ dirs = "5"
 # OPTIONAL: the server-side/control-plane subtree only, never the `remote-only`
 # client, so tokio is dropped from the Windows build's graph.
 postgres = { version = "0.19", default-features = false, optional = true }
-# The experimental GroveFS-specific metadata engine (feature `treedb`), pinned
-# to a tag so any checkout resolves it without a sibling clone. Anonymous https
-# on purpose: an SSH URL would make `cargo fetch` prompt for credentials on
-# machines that only have a key for the private remotes. It links only `libc` +
-# `thiserror` + std, so it adds no new transitive dependency to the `native`
-# graph (its PG/SQLite migration-shim modules do, and those are dead code here).
+# Optional metadata-engine backend (feature `treedb`, `--meta-store treedb://...`).
+# The engine is a separate database project and is deliberately *not*
+# GroveFS-specific: the adapter (op mapping, MetaProvider, GC clues) lives here,
+# behind this feature. Pinned to a tag so any checkout resolves it without a
+# sibling clone. Anonymous https on purpose: an SSH URL would make `cargo fetch`
+# prompt for credentials on machines that only have a key for the private
+# remotes. The engine core needs only `libc` + `thiserror` + std, but the pinned
+# tag v0.3.0 still carries `postgres`/`rusqlite(bundled)`/`sha2`/`uuid`/
+# `chrono`/`tracing` unconditionally for its PG migration shim, and this
+# integration uses none of it (only `treedb::net::Client` and
+# `treedb::engine::model::Op`). It adds no crate grovefs didn't already resolve,
+# but it does widen the reason those crates are here. Upstream moved that shim
+# behind an off-by-default `postgres-compat` feature after this pin, so the next
+# tag bump shrinks the graph back to the two crates above.
 treedb = { git = "https://github.com/TechWander/treedb.git", tag = "v0.3.0", optional = true }
 # Opt-in per-stage latency telemetry (src/stats.rs): high-dynamic-range histograms
 # for offline bottleneck diagnosis. Pure-Rust, zero deps. Only touched when
