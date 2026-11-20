@@ -101,10 +101,13 @@ impl HaState {
 ///
 /// The third kind, behind `--features treedb`, is the EXPERIMENTAL engine
 /// (`--meta-store treedb://host:port`): trees live inside a treedb server, and
-/// — unlike the PG backend — the CONTROL plane stays in local SQLite under
-/// `--meta-dir`, because treedb has no table for view definitions, api keys or
-/// web grants yet. That split is what [`StoreKind::control_uri`] encodes;
-/// nothing else may assume "not SQLite" means "control lives remote".
+/// — unlike the PG backend — the control TABLES (credentials, accounts,
+/// grants) stay in local SQLite under `--meta-dir` until
+/// `GROVEFS_TREEDB_CONTROL=engine` moves them into the engine's generic tables
+/// (treedb DESIGN.md §10 C 4). The view DEFINITIONS and placement always stay
+/// local for now, because treedb has no table for them. That split is what
+/// [`StoreKind::control_tables_uri`] encodes; nothing else may assume "not
+/// SQLite" means "control lives remote".
 #[derive(Clone, Debug)]
 pub enum StoreKind {
     Sqlite,
@@ -130,17 +133,19 @@ impl StoreKind {
         }
     }
 
-    /// Where the CREDENTIAL stores (`api_keys`, `api_key_usage`, `mcp_calls`)
-    /// live — the same answer as [`Self::control_uri`] under PG, but under treedb
-    /// it turns into the engine URI **once `GROVEFS_TREEDB_CONTROL=engine` says
-    /// the control plane has been moved there**.
+    /// Where the CREDENTIAL and ACCOUNT stores (`api_keys`, `api_key_usage`,
+    /// `mcp_calls`, `web_accounts`, `web_grants`) live — the same answer as
+    /// [`Self::control_uri`] under PG, but under treedb it turns into the engine
+    /// URI **once `GROVEFS_TREEDB_CONTROL=engine` says those tables have been
+    /// moved there**.
     ///
     /// Deliberately a second accessor rather than a wider `control_uri`: the
-    /// view DEFINITIONS and the account table still live in local files (that is
-    /// the next milestone), so a treedb deployment can have its keys in the
-    /// engine while everything else stays on disk. With the switch off it answers
-    /// exactly what `control_uri` does, i.e. today's local-SQLite shape.
-    pub(crate) fn keys_uri(&self) -> Option<String> {
+    /// view DEFINITIONS and placement still live in local files (nothing in the
+    /// engine models them yet), so a treedb deployment can have every row-table
+    /// in the engine while the tree-side bookkeeping stays on disk. With the
+    /// switch off it answers exactly what `control_uri` does, i.e. today's
+    /// local-SQLite shape.
+    pub(crate) fn control_tables_uri(&self) -> Option<String> {
         match self {
             StoreKind::Pg(u) => Some(u.clone()),
             StoreKind::Sqlite => None,
@@ -799,7 +804,8 @@ impl MetaServer {
         // SQLite trees live under `<base>/meta`; a PG store writes nothing
         // locally, so creating that directory would be a misleading footprint
         // (an empty `meta/` on a host that has no local metadata at all). Under
-        // treedb the directory IS still needed — the control plane stayed local.
+        // treedb the directory IS still needed — the view definitions and the
+        // placement table never leave `--meta-dir`, whatever the switch says.
         if self.store.control_uri().is_none() {
             std::fs::create_dir_all(self.base.join("meta"))?;
         }
@@ -812,17 +818,19 @@ impl MetaServer {
         let (ctl_keys, web_auth, admin_note) = match &self.control_listen {
             None => (None, None, None),
             Some(_) => {
-                // 凭据表可能已经比控制面先搬进引擎（`GROVEFS_TREEDB_CONTROL=engine`），
-                // 所以这里问的是 `keys_uri`：视图定义与账户表还在本地，用 `control_uri`
+                // 凭据表与账户表可能已经比视图定义先搬进引擎
+                // （`GROVEFS_TREEDB_CONTROL=engine`），所以这里问的是
+                // `control_tables_uri`：视图定义与 placement 还在本地，用 `control_uri`
                 // 会让 meta-server 读一份刚被 `apikey create` 写空的本地库。
-                let keys_uri = self.store.keys_uri();
+                let keys_uri = self.store.control_tables_uri();
                 let keys = Arc::new(
                     crate::apikeys::ApiKeyStore::open_for(&self.base, keys_uri.as_deref())
                         .map_err(io::Error::other)?,
                 );
-                let store_uri = self.store.control_uri();
+                // 账户表跟凭据同一个出口：M1b 之后它们同进同退，两个出口迟早
+                // 会说两句话（一个进引擎、一个留在磁盘）。
                 let web = Arc::new(
-                    crate::webauth::WebAuthStore::open_for(&self.base, store_uri)
+                    crate::webauth::WebAuthStore::open_for(&self.base, keys_uri.as_deref())
                         .map_err(io::Error::other)?,
                 );
                 // Install-time owner (`--admin-user` + `--admin-password-file`).
@@ -901,9 +909,16 @@ impl MetaServer {
         // The control plane FOLLOWS the metadata backend: a PG store reads view
         // definitions/aliases/forks from the shared `grovefs_control` schema, a
         // SQLite store from the local `meta/views` dir — one system of record per
-        // backend, never a local file the PG deployment would ignore.
-        let control = crate::mcp::control_store_for(&self.base, self.store.control_uri())
-        .map_err(io::Error::other)?;
+        // backend, never a local file the PG deployment would ignore. Under treedb
+        // the definitions stay local (nothing in the engine models them) but the
+        // TREE inventory is the engine's: a base view there has no `meta/*.db`,
+        // and a delegation that cannot resolve its base would authorize nothing.
+        let control = match &self.store {
+            #[cfg(feature = "treedb")]
+            StoreKind::Treedb(addr) => crate::mcp::control_store_for_treedb(&self.base, addr),
+            _ => crate::mcp::control_store_for(&self.base, self.store.control_uri())
+                .map_err(io::Error::other)?,
+        };
         let rt = Arc::new(MetaRuntime {
             base: self.base.clone(),
             token: self.token.clone(),
@@ -971,7 +986,14 @@ impl MetaServer {
                     StoreKind::Sqlite => "meta/web_accounts.db",
                     #[cfg(feature = "treedb")]
                     StoreKind::Treedb(_) => {
-                        "meta/web_accounts.db (local: treedb serves trees, not accounts)"
+                        // Same switch as the credentials (M1a/M1b): when it is on,
+                        // the engine's generic tables are the store and the local
+                        // file is read by nobody.
+                        if crate::apikeys::ApiKeyStore::treedb_control_enabled() {
+                            "the treedb engine's generic tables (GROVEFS_TREEDB_CONTROL=engine)"
+                        } else {
+                            "meta/web_accounts.db (local: the engine's control tables are off)"
+                        }
                     }
                 }
             );
@@ -2296,9 +2318,10 @@ fn control_dispatch(
                 }
                 #[cfg(feature = "treedb")]
                 StoreKind::Treedb(addr) => {
-                    // `has_physical` above enumerates local db files, so it
-                    // cannot see a treedb view: the duplicate check belongs here,
-                    // against the engine's own list.
+                    // The generic `has_physical` check above already sees the
+                    // engine's trees (`mcp::TreedbControlStore`), so this is the
+                    // race guard for a view created between that check and here —
+                    // against the engine's own list, which is the only authority.
                     if crate::treedb_store::TreedbStore::list_views(addr)
                         .map_err(|e| format!("view create: {e}"))?
                         .iter()

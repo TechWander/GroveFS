@@ -30,13 +30,12 @@
 //! 与 SQL 档的语义必须逐条对齐，凡是这里自己决定的地方都写了理由；`apikeys.rs` 那边
 //! 只负责「哪个后端」与参数归一化（[`super::note_and_deadline`] 是两边共用的一条）。
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use treedb::engine::model::{errno, ColumnDef, Op, Reply, TableDef, COND_NONE, PUT_IF_ABSENT, ROW_PK};
+use treedb::engine::model::{errno, Op, Reply, TableDef, PUT_IF_ABSENT, ROW_PK};
 
 use super::{expiry_passed, now_ms, CallLog, KeyInfo, StoredKey};
-use crate::treedb_store::ConnPool;
+use crate::control_treedb::{col, flag, is_set, opt, opt_str, text, Rows, PAGE};
 
 /// 引擎的 `tables` 没有命名空间，前缀是唯一的隔离手段。
 const T_KEYS: &str = "grovefs_control__api_keys";
@@ -70,155 +69,23 @@ const MC_OK: usize = 5;
 const MC_DETAIL: usize = 6;
 const MC_COLS: usize = 7;
 
-/// 翻页大小。`RowList` 的游标是「上一页最后一行的主键」，所以每页从树上直接定位，
-/// 不存在 `skip(n)` 那种越翻越慢。
-const PAGE: u32 = 512;
-
-/// 一次调用的失败面：留着引擎的 errno，因为 `TableCreate` 撞 `EEXIST` 是**成功**。
-struct CtlErr {
-    code: Option<u16>,
-    msg: String,
-}
-
-impl CtlErr {
-    fn is(&self, code: u16) -> bool {
-        self.code == Some(code)
-    }
-}
-
-impl std::fmt::Display for CtlErr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.code {
-            Some(c) => write!(f, "treedb control: errno {c} ({})", self.msg),
-            None => write!(f, "treedb control: {}", self.msg),
-        }
-    }
-}
+/// 翻页大小与 errno 都在 [`crate::control_treedb`]：两张表（凭据、账户）用的是同一套
+/// 管道，分两份写只会漂。
 
 pub(super) struct TreedbKeys {
-    pool: Arc<ConnPool>,
+    rows: Rows,
     /// `mcp_calls` 主键后半段的自增。每行一个值、撞键就重取，见 [`Self::log_call`]。
     seq: AtomicU64,
 }
 
 impl TreedbKeys {
-    /// 打开（或首次创建）三张表。`EEXIST` 视为成功 —— 与
-    /// `server_ext::resolve_or_create_view` 同一套路，多个进程同时启动时赢家随便。
+    /// 打开（或首次创建）三张表。`EEXIST` 视为成功（[`Rows::create`]）。
     pub(super) fn open(addr: &str) -> Result<Self, String> {
-        let pool =
-            ConnPool::for_addr(addr).map_err(|e| format!("treedb control ({addr}): {e}"))?;
-        let me = Self { pool, seq: AtomicU64::new(0) };
+        let rows = Rows::open(addr)?;
         for def in [keys_def(), usage_def(), calls_def()] {
-            let name = String::from_utf8_lossy(&def.name).into_owned();
-            match me.call(Op::TableCreate { def }) {
-                Ok(_) => {}
-                Err(e) if e.is(errno::EEXIST) => {}
-                Err(e) => return Err(format!("creating table {name}: {e}")),
-            }
+            rows.create(def)?;
         }
-        Ok(me)
-    }
-
-    fn call(&self, op: Op) -> Result<Reply, CtlErr> {
-        let r = self
-            .pool
-            .xcall(&op)
-            .map_err(|f| CtlErr { code: f.code, msg: f.msg })?;
-        // 引擎的拒绝（`EEXIST`/`EAGAIN`）也是正常路径的一部分，所以从 `Reply::Err`
-        // 里把 errno 捞回来，而不是压成一句字符串 —— `open` 与 `edit_live` 靠它分流。
-        crate::treedb_store::reply_fail(r)
-            .map_err(|f| CtlErr { code: f.code, msg: f.msg })
-    }
-
-    fn unexpected(what: &str, r: &Reply) -> String {
-        match r {
-            Reply::Err { code, msg } => format!(
-                "treedb control: {what}: errno {code} ({})",
-                String::from_utf8_lossy(msg)
-            ),
-            other => format!("treedb control: {what}: unexpected reply {other:?}"),
-        }
-    }
-
-    // ---- 行级原语 -----------------------------------------------------------
-
-    fn get_row(&self, table: &str, key: &[u8]) -> Result<Option<Vec<Vec<u8>>>, String> {
-        let r = self
-            .call(Op::RowGet { table: table.as_bytes().to_vec(), key: key.to_vec() })
-            .map_err(|e| e.to_string())?;
-        match r {
-            Reply::Row(row) => Ok(row.map(|r| r.cols)),
-            other => Err(Self::unexpected("RowGet", &other)),
-        }
-    }
-
-    /// 写一行。`cond` 是 `(列号, 期望字节)`：不命中 → `EAGAIN`，也就是 SQL 那句
-    /// `WHERE … AND revoked_at IS NULL` 的语义（`RowPut` 是整行覆盖，没法「只改一列」，
-    /// 所以每个就地修改都是读 → 改 → 带 CAS 写回）。
-    fn put_row(
-        &self,
-        table: &str,
-        key: &[u8],
-        cols: Vec<Vec<u8>>,
-        flags: u32,
-        cond: Option<(u32, Vec<u8>)>,
-    ) -> Result<(), CtlErr> {
-        let (cond_col, cond_val) = cond.unwrap_or((COND_NONE, Vec::new()));
-        match self.call(Op::RowPut {
-            table: table.as_bytes().to_vec(),
-            key: key.to_vec(),
-            cols,
-            flags,
-            cond_col,
-            cond_val,
-        })? {
-            Reply::Row(_) => Ok(()),
-            other => Err(CtlErr { code: None, msg: Self::unexpected("RowPut", &other) }),
-        }
-    }
-
-    /// 按主键序读完一张表。`RowList` 的 `column = ROW_PK` 就是「全表按主键序」。
-    fn scan(&self, table: &str) -> Result<Vec<(Vec<u8>, Vec<Vec<u8>>)>, String> {
-        let mut out = Vec::new();
-        let mut from: Vec<u8> = Vec::new();
-        loop {
-            let r = self
-                .call(Op::RowList {
-                    table: table.as_bytes().to_vec(),
-                    column: ROW_PK,
-                    value: Vec::new(),
-                    from: from.clone(),
-                    limit: PAGE,
-                })
-                .map_err(|e| e.to_string())?;
-            match r {
-                Reply::Rows { rows, end } => {
-                    let last = rows.last().map(|r| r.key.clone());
-                    out.extend(rows.into_iter().map(|r| (r.key, r.cols)));
-                    match last {
-                        Some(k) if !end => from = k,
-                        _ => return Ok(out),
-                    }
-                }
-                other => return Err(Self::unexpected("RowList", &other)),
-            }
-        }
-    }
-
-    fn del_row(&self, table: &str, key: &[u8]) -> Result<(), String> {
-        match self
-            .call(Op::RowDelete {
-                table: table.as_bytes().to_vec(),
-                key: key.to_vec(),
-                flags: 0,
-                cond_col: COND_NONE,
-                cond_val: Vec::new(),
-            })
-            .map_err(|e| e.to_string())?
-        {
-            Reply::Ok => Ok(()),
-            other => Err(Self::unexpected("RowDelete", &other)),
-        }
+        Ok(Self { rows, seq: AtomicU64::new(0) })
     }
 
     // ---- api_keys ----------------------------------------------------------
@@ -253,12 +120,12 @@ impl TreedbKeys {
         cols[AK_CREATED_BY] = opt(created_by);
         cols[AK_EXPIRES_AT] = opt(expires_at);
         // revoked_at 留空 = 活着；`create_extended` 从不造已撤销的行。
-        self.put_row(T_KEYS, id.as_bytes(), cols, PUT_IF_ABSENT, None)
+        self.rows.put(T_KEYS, id.as_bytes(), cols, PUT_IF_ABSENT, None)
             .map_err(|e| e.to_string())
     }
 
     pub(super) fn fetch_key(&self, id: &str) -> Result<Option<StoredKey>, String> {
-        Ok(self.get_row(T_KEYS, id.as_bytes())?.map(|c| stored(&c)))
+        Ok(self.rows.get(T_KEYS, id.as_bytes())?.map(|c| stored(&c)))
     }
 
     /// 记录一次鉴权。**无条件覆盖**：SQL 那句 `UPDATE … WHERE id = ?` 命中 0 行时也是
@@ -266,7 +133,7 @@ impl TreedbKeys {
     /// —— 孤儿 usage 行不会被读到，删 key 时顺手删它（见 `apikeys` 的注释）。
     pub(super) fn stamp_used(&self, id: &str) -> Result<(), String> {
         let cols = vec![super::now_iso().into_bytes()];
-        self.put_row(T_USAGE, id.as_bytes(), cols, 0, None)
+        self.rows.put(T_USAGE, id.as_bytes(), cols, 0, None)
             .map_err(|e| e.to_string())
     }
 
@@ -278,14 +145,14 @@ impl TreedbKeys {
         id: &str,
         edit: impl FnOnce(&mut Vec<Vec<u8>>),
     ) -> Result<bool, String> {
-        let Some(mut cols) = self.get_row(T_KEYS, id.as_bytes())? else {
+        let Some(mut cols) = self.rows.get(T_KEYS, id.as_bytes())? else {
             return Ok(false);
         };
         if !cols[AK_REVOKED_AT].is_empty() {
             return Ok(false);
         }
         edit(&mut cols);
-        match self.put_row(
+        match self.rows.put(
             T_KEYS,
             id.as_bytes(),
             cols,
@@ -340,20 +207,21 @@ impl TreedbKeys {
     /// 数），在这里拼回去。
     pub(super) fn list(&self) -> Result<Vec<KeyInfo>, String> {
         let usage: std::collections::HashMap<Vec<u8>, Option<String>> = self
+            .rows
             .scan(T_USAGE)?
             .into_iter()
             .map(|(k, cols)| (k, opt_str(&cols[0])))
             .collect();
         let mut out = Vec::new();
-        for (key, c) in self.scan(T_KEYS)? {
+        for (key, c) in self.rows.scan(T_KEYS)? {
             out.push(KeyInfo {
                 id: String::from_utf8_lossy(&key).into_owned(),
                 owner: opt_str(&c[AK_OWNER]),
-                label: text_str(&c[AK_LABEL]),
-                scope: text_str(&c[AK_SCOPE]),
+                label: text(&c[AK_LABEL]),
+                scope: text(&c[AK_SCOPE]),
                 view: opt_str(&c[AK_VIEW]),
                 ro: is_set(&c[AK_RO]),
-                created_at: text_str(&c[AK_CREATED_AT]),
+                created_at: text(&c[AK_CREATED_AT]),
                 last_used_at: usage.get(&key).cloned().flatten(),
                 revoked_at: opt_str(&c[AK_REVOKED_AT]),
                 note: opt_str(&c[AK_NOTE]),
@@ -403,7 +271,7 @@ impl TreedbKeys {
             .unwrap_or(0);
         for _ in 0..8 {
             let seq = self.seq.fetch_add(1, Ordering::Relaxed);
-            match self.put_row(T_CALLS, &call_key(ts_us, seq), cols.clone(), PUT_IF_ABSENT, None) {
+            match self.rows.put(T_CALLS, &call_key(ts_us, seq), cols.clone(), PUT_IF_ABSENT, None) {
                 Ok(()) => return Ok(()),
                 Err(e) if e.is(errno::EEXIST) => continue,
                 Err(e) => return Err(e.to_string()),
@@ -421,6 +289,7 @@ impl TreedbKeys {
         while out.len() < limit {
             let want = (limit - out.len()).min(PAGE as usize) as u32;
             let r = self
+                .rows
                 .call(Op::RowList {
                     table: T_CALLS.as_bytes().to_vec(),
                     column: ROW_PK,
@@ -438,7 +307,7 @@ impl TreedbKeys {
                         _ => break,
                     }
                 }
-                other => return Err(Self::unexpected("RowList", &other)),
+                other => return Err(crate::control_treedb::unexpected("RowList", &other)),
             }
         }
         Ok(out)
@@ -449,9 +318,10 @@ impl TreedbKeys {
     /// 量级与今天 SQLite 那条逐行 `DELETE` 同阶，索引换不来一个量级。
     pub(super) fn count_calls_older_than(&self, cutoff: &str) -> Result<usize, String> {
         Ok(self
+            .rows
             .scan(T_CALLS)?
             .into_iter()
-            .filter(|(_, c)| text_str(&c[MC_TS]).as_str() < cutoff)
+            .filter(|(_, c)| text(&c[MC_TS]).as_str() < cutoff)
             .count())
     }
 
@@ -459,9 +329,9 @@ impl TreedbKeys {
     /// 与 [`Self::count_calls_older_than`] 用同一条比较，所以 dry-run 与实删对得上。
     pub(super) fn purge_calls_older_than(&self, cutoff: &str) -> Result<usize, String> {
         let mut n = 0;
-        for (key, c) in self.scan(T_CALLS)? {
-            if text_str(&c[MC_TS]).as_str() < cutoff {
-                self.del_row(T_CALLS, &key)?;
+        for (key, c) in self.rows.scan(T_CALLS)? {
+            if text(&c[MC_TS]).as_str() < cutoff {
+                self.rows.del(T_CALLS, &key)?;
                 n += 1;
             }
         }
@@ -470,28 +340,6 @@ impl TreedbKeys {
 }
 
 // ---- 编码 ----------------------------------------------------------------
-
-/// 列值：文本原样，`None` 存空字节串（引擎没有 NULL）。
-fn opt(v: Option<&str>) -> Vec<u8> {
-    v.map(|s| s.as_bytes().to_vec()).unwrap_or_default()
-}
-
-/// 空字节串 → `None`。这是「没有 NULL」那条约定的反向，两个方向必须成对改。
-fn opt_str(b: &[u8]) -> Option<String> {
-    if b.is_empty() { None } else { Some(String::from_utf8_lossy(b).into_owned()) }
-}
-
-fn text_str(b: &[u8]) -> String {
-    String::from_utf8_lossy(b).into_owned()
-}
-
-fn flag(b: bool) -> Vec<u8> {
-    vec![if b { b'1' } else { b'0' }]
-}
-
-fn is_set(b: &[u8]) -> bool {
-    b.first() == Some(&b'1')
-}
 
 /// `mcp_calls` 的主键：两个 8 字节大端取反，所以「新」排在「旧」前面。
 fn call_key(ts_us: i64, seq: u64) -> Vec<u8> {
@@ -503,9 +351,9 @@ fn call_key(ts_us: i64, seq: u64) -> Vec<u8> {
 
 fn stored(c: &[Vec<u8>]) -> StoredKey {
     StoredKey {
-        label: text_str(&c[AK_LABEL]),
-        secret_hash: text_str(&c[AK_HASH]),
-        scope: text_str(&c[AK_SCOPE]),
+        label: text(&c[AK_LABEL]),
+        secret_hash: text(&c[AK_HASH]),
+        scope: text(&c[AK_SCOPE]),
         revoked_at: opt_str(&c[AK_REVOKED_AT]),
         view: opt_str(&c[AK_VIEW]),
         ro: is_set(&c[AK_RO]),
@@ -516,21 +364,17 @@ fn stored(c: &[Vec<u8>]) -> StoredKey {
 
 fn call_log(c: &[Vec<u8>]) -> CallLog {
     CallLog {
-        ts: text_str(&c[MC_TS]),
+        ts: text(&c[MC_TS]),
         key_id: opt_str(&c[MC_KEY_ID]),
         key_label: opt_str(&c[MC_KEY_LABEL]),
-        method: text_str(&c[MC_METHOD]),
-        tool: text_str(&c[MC_TOOL]),
+        method: text(&c[MC_METHOD]),
+        tool: text(&c[MC_TOOL]),
         ok: is_set(&c[MC_OK]),
-        detail: text_str(&c[MC_DETAIL]),
+        detail: text(&c[MC_DETAIL]),
     }
 }
 
 // ---- 表形状 --------------------------------------------------------------
-
-fn col(name: &str, flags: u32) -> ColumnDef {
-    ColumnDef { name: name.as_bytes().to_vec(), flags }
-}
 
 fn keys_def() -> TableDef {
     TableDef {

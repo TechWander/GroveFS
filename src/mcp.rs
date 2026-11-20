@@ -511,6 +511,157 @@ impl ControlStore for FileControlStore {
     }
 }
 
+/// The control plane of a `--meta-store treedb://…` deployment: DEFINITIONS stay
+/// in the local files under `--meta-dir` (nothing in the engine models a lens,
+/// alias or fork yet), while the TREE INVENTORY comes from the engine.
+///
+/// Why the second half is not optional: a base view in treedb has no
+/// `meta/<name>.db`, so a file-only store answers `has_physical == false` for
+/// every one of them. Everything that resolves a name would then refuse with
+/// `view 'x' has neither a definition nor a tree` — including
+/// [`crate::webauth::resolve_base`], which is what turns a DELEGATION
+/// (`web grant add`) into an authorization. M1b's accounts would be able to sign
+/// in and govern nothing.
+///
+/// The wrapper is deliberately thin: every definition verb is one hop to the file
+/// store (so hot-reload stamps, fork trees and the ledger keep the exact
+/// semantics they have today); only the two backend-dependent questions —
+/// [`ControlStore::list_physical`] / [`ControlStore::has_physical`] — are
+/// answered from both sides.
+#[cfg(feature = "treedb")]
+pub struct TreedbControlStore {
+    base: PathBuf,
+    addr: String,
+}
+
+#[cfg(feature = "treedb")]
+impl TreedbControlStore {
+    pub fn new(base: &Path, addr: &str) -> Self {
+        Self {
+            base: base.to_path_buf(),
+            addr: addr.to_string(),
+        }
+    }
+
+    fn local(&self) -> FileControlStore {
+        FileControlStore::new(&self.base)
+    }
+
+    /// The engine's tree names. One pooled round trip per call; this sits on the
+    /// governance path (ACL resolution), never on the data path.
+    fn engine_views(&self) -> Result<Vec<String>, String> {
+        crate::control_treedb::Rows::open(&self.addr)?.views()
+    }
+}
+
+#[cfg(feature = "treedb")]
+impl ControlStore for TreedbControlStore {
+    fn backend(&self) -> &'static str {
+        "treedb"
+    }
+
+    fn describe(&self) -> String {
+        format!(
+            "{} (definitions) + treedb {} (trees)",
+            self.base.display(),
+            self.addr
+        )
+    }
+
+    fn list_defs(&self) -> Result<Vec<(String, String)>, String> {
+        self.local().list_defs()
+    }
+
+    fn get_def_raw(&self, name: &str) -> Result<Option<String>, String> {
+        self.local().get_def_raw(name)
+    }
+
+    fn put_def(&self, name: &str, text: &str) -> Result<(), String> {
+        self.local().put_def(name, text)
+    }
+
+    fn remove_def(&self, name: &str) -> Result<bool, String> {
+        self.local().remove_def(name)
+    }
+
+    fn stamp(&self, name: &str) -> Option<String> {
+        self.local().stamp(name)
+    }
+
+    fn list_physical(&self) -> Result<Vec<String>, String> {
+        let mut out = self.local().list_physical()?;
+        out.extend(self.engine_views()?);
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
+    fn has_physical(&self, name: &str) -> Result<bool, String> {
+        if self.local().has_physical(name)? {
+            return Ok(true);
+        }
+        Ok(self.engine_views()?.iter().any(|v| v == name))
+    }
+
+    fn store_for_db_path(&self, _db: &Path) -> Arc<dyn ControlStore> {
+        // Bound to the address, like the PG store: re-pointing the definition root
+        // would split definitions and trees across two systems of record.
+        Arc::new(Self {
+            base: self.base.clone(),
+            addr: self.addr.clone(),
+        })
+    }
+
+    fn has_fork_tree(&self, name: &str) -> Result<bool, String> {
+        self.local().has_fork_tree(name)
+    }
+
+    fn create_fork_tree(
+        &self,
+        base: &str,
+        name: &str,
+        seed: bool,
+    ) -> Result<crate::meta::ForkStats, String> {
+        self.local().create_fork_tree(base, name, seed)
+    }
+
+    fn graft_tree(
+        &self,
+        dst: &str,
+        src: &str,
+        items: &[crate::meta::GraftItem],
+        dest: &str,
+        skip_existing: bool,
+    ) -> Result<crate::meta::GraftStats, String> {
+        self.local().graft_tree(dst, src, items, dest, skip_existing)
+    }
+
+    fn destroy_fork_tree(&self, name: &str) {
+        self.local().destroy_fork_tree(name)
+    }
+
+    fn drop_fork_tree(&self, name: &str) -> Result<(), String> {
+        self.local().drop_fork_tree(name)
+    }
+
+    fn open_ro_view(&self, view: &str) -> Result<Arc<dyn MetaProvider>, String> {
+        self.local().open_ro_view(view)
+    }
+
+    fn base_tree_missing_note(&self, view: &str) -> Result<Option<String>, String> {
+        self.local().base_tree_missing_note(view)
+    }
+}
+
+/// The control plane for a treedb metadata backend (see
+/// [`TreedbControlStore`]). Kept separate from [`control_store_for`] so that
+/// function cannot be handed a treedb URI by accident: only a caller that KNOWS
+/// the backend is treedb (the meta-server, from `StoreKind`) builds this one.
+#[cfg(feature = "treedb")]
+pub fn control_store_for_treedb(base: &Path, addr: &str) -> Arc<dyn ControlStore> {
+    Arc::new(TreedbControlStore::new(base, addr))
+}
+
 /// The PostgreSQL control plane: definitions in `grovefs_control.view_defs`,
 /// physical views resolved as the `grovefs_v_<hex>` schemas [`crate::pg_store`]
 /// creates, and (through [`crate::apikeys::ApiKeyStore::open_pg`]) the key and

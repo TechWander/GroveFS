@@ -51,6 +51,12 @@ pub mod pg_store;
 /// carries the why beside the feature gate.
 #[cfg(feature = "treedb")]
 pub mod treedb_store;
+/// The CONTROL PLANE's row plumbing on top of the engine's generic tables
+/// ([`treedb_store`]'s neighbour): one call, one reply, one row. Shared by the
+/// credential store ([`apikeys`]) and the sign-in accounts ([`webauth`]) so the
+/// engine's errno handling exists once — see treedb DESIGN.md §10 C 4.
+#[cfg(feature = "treedb")]
+pub(crate) mod control_treedb;
 pub mod platform;
 pub mod remote;
 pub mod stats;

@@ -1355,7 +1355,7 @@ e2e in the `ctlplane` suite (startup banner / the first admin key must be minted
 
 §3.5.2 let any machine govern the same metadata, but the door is still a terminal: verbs to remember, a key to carry, refusal reasons to read. The three highest-frequency things — look at the views, hand out a key, give a colleague a patch of ground — are cheaper to click. And "**this** account governs **this** patch, including the forks and aliases derived from it and the keys bound to it" is a claim about ownership that one shared admin key cannot express and the terminal has no shape for.
 
-The console adds exactly that, and it **does not add a second body of governance logic**. `grovefs web` is an HTTP gateway in front of `meta-server --control-listen`: an embedded single-page app (Overview / Views / Keys / Accounts / Audit — `include_str!`'d into the binary at build time, so no CDN, no node_modules, and it opens on an air-gapped host), which turns a browser session into an **account** and every click into one governance op forwarded onward. "Who may touch which tree" is still decided in exactly one place, server-side `gates()`/`authorize()`; the gateway only **subtracts** — the verbs it does not route (`gc.scan`/`gc.apply`/`refs.rebuild`/`view.rm_base`/`fork.graft`) can never reach the server from a browser, even where the server itself would have allowed them. Accounts, grants and password digests live on the **server** (SQLite: `<meta-dir>/meta/web_accounts.db`; PG: tables in the control DB; PBKDF2-HMAC-SHA256, 210,000 rounds), and sign-ins are verified by the process that holds the store — the gateway never sees the password library, which is exactly why it can afford to be only a translation layer.
+The console adds exactly that, and it **does not add a second body of governance logic**. `grovefs web` is an HTTP gateway in front of `meta-server --control-listen`: an embedded single-page app (Overview / Views / Keys / Accounts / Audit — `include_str!`'d into the binary at build time, so no CDN, no node_modules, and it opens on an air-gapped host), which turns a browser session into an **account** and every click into one governance op forwarded onward. "Who may touch which tree" is still decided in exactly one place, server-side `gates()`/`authorize()`; the gateway only **subtracts** — the verbs it does not route (`gc.scan`/`gc.apply`/`refs.rebuild`/`view.rm_base`/`fork.graft`) can never reach the server from a browser, even where the server itself would have allowed them. Accounts, grants and password digests live on the **server** (SQLite: `<meta-dir>/meta/web_accounts.db`; PG: tables in the control DB; treedb with `GROVEFS_TREEDB_CONTROL=engine`: the engine's generic tables; PBKDF2-HMAC-SHA256, 210,000 rounds), and sign-ins are verified by the process that holds the store — the gateway never sees the password library, which is exactly why it can afford to be only a translation layer.
 
 **Install time: the first administrator can only be placed by the process that holds the store.** If the governance entry point could mint its own administrators, the gate would be decorative — so bootstrap hangs off `meta-server`, not off `web`. Both flags apply only while the accounts table is **empty**; a restart that re-reads the same unit file is idempotent, while a different `--admin-user` refuses to start rather than quietly adding a second administrator. The password comes only from `--admin-password-file`, never `--admin-password` — argv is visible to every process on the machine and lands in the shell history.
 
@@ -1969,7 +1969,7 @@ ps aux | grep grovefs                     # 查看在跑的 server / mount
 
 ## 10. Verification and regression
 
-The full board is **44 stages** in all: `build` → `unit` → **41 suites** → `bench`. **The first 43 stages gate GREEN; `bench` only prints throughput reference numbers and never gates** (for pure functional regression only, use `SKIP_BENCH=1`). `pg`/`pg_parallel`/`evict`/`control`/`forksrv` auto-SKIP their whole stage on hosts with no reachable PostgreSQL, and `xfer`/`gcremote` skip just their PG arm and run the SQLite arm — and `client` skips its whole stage on a host without the sibling `grovefs-client` checkout, its binary, or the `fusermount` helper — none of them lower GREEN; the `treedb` stage — the self-check of the experimental backend — SELF-SKIPS on a default build (no `--features treedb`), also without lowering GREEN. The same holds for `treedbmatrix` (the posix/e2e assertion matrix replayed on that backend, gated on the `pass=39 fail=0 skip=10` contract triple) and `treedbctl` (the control plane's third arm: with `GROVEFS_TREEDB_CONTROL=engine` keys and audit rows land in the engine's generic tables; off by default).
+The full board is **44 stages** in all: `build` → `unit` → **41 suites** → `bench`. **The first 43 stages gate GREEN; `bench` only prints throughput reference numbers and never gates** (for pure functional regression only, use `SKIP_BENCH=1`). `pg`/`pg_parallel`/`evict`/`control`/`forksrv` auto-SKIP their whole stage on hosts with no reachable PostgreSQL, and `xfer`/`gcremote` skip just their PG arm and run the SQLite arm — and `client` skips its whole stage on a host without the sibling `grovefs-client` checkout, its binary, or the `fusermount` helper — none of them lower GREEN; the `treedb` stage — the self-check of the experimental backend — SELF-SKIPS on a default build (no `--features treedb`), also without lowering GREEN. The same holds for `treedbmatrix` (the posix/e2e assertion matrix replayed on that backend, gated on the `pass=39 fail=0 skip=10` contract triple) and `treedbctl` (the control plane's third arm: with `GROVEFS_TREEDB_CONTROL=engine` keys, audit rows and web accounts/grants land in the engine's generic tables; off by default).
 
 ```bash
 export LC_ALL=C LANG=C                                 # 仓库根目录下执行(PKG_CONFIG 不必设:无 crate 查 pkg-config,§1)
@@ -2260,7 +2260,7 @@ sudo systemctl restart grove-data-server && cat /mnt/alice/from_a.txt
 sudo systemctl stop grove-mount@alice && findmnt -T /mnt/alice | grep -q grovefs && echo "残留!" || echo "已卸载"
 ```
 
-All passing means the deployment is complete. To run the full regression (40 gated stages) see §10 and §12.7.
+All passing means the deployment is complete. To run the full regression (43 gated stages) see §10 and §12.7.
 
 ### 11.8 HA primary/standby topology (modified from §11.4)
 
@@ -2466,7 +2466,7 @@ HA topology rolling upgrade (writes uninterrupted, except the instant of switcho
 
 ### 12.7 Regression verification after changes
 
-After any upgrade/config change, run the full board (40 gated stages) on a machine with a build environment, or only the planes you care about:
+After any upgrade/config change, run the full board (43 gated stages) on a machine with a build environment, or only the planes you care about:
 
 ```bash
 bash .build-bin/run_all.sh                    # 全板(build 自动前置)

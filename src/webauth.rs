@@ -16,7 +16,11 @@
 //! SQLite the two tables sit in `<base>/meta/web_accounts.db` beside
 //! `api_keys.db`; under PostgreSQL they are `grovefs_control.web_accounts` /
 //! `web_grants`, so a secondary meta-server (or a second web gateway aimed at
-//! the same URI) sees the same accounts with nothing to colocate.
+//! the same URI) sees the same accounts with nothing to colocate. Under
+//! `--meta-store treedb://…` with `GROVEFS_TREEDB_CONTROL=engine` they are the
+//! engine's generic tables `grovefs_control__web_accounts` / `__web_grants`
+//! ([`treedb_ctl`], treedb DESIGN.md §10 C 4 milestone M1b); the switch is off
+//! by default and then the local file is still the store.
 //!
 //! **The server verifies passwords.** The web gateway
 //! ([`crate::web`]) holds the ONE root admin key and forwards the credentials a
@@ -312,10 +316,26 @@ pub struct LoginOk {
 /// The two backend spellings of the same account/grant schema, exactly as
 /// [`crate::apikeys::ApiKeyStore`] does it: identical columns and refusals on
 /// both, dialect differences confined to the SQL strings.
+///
+/// **Why the engine arm is not in this dispatcher** (treedb DESIGN.md §10 C 4,
+/// milestone M1b): `exec2`/`query2` dispatch between two SQL DIALECTS, and the
+/// engine has no SQL. So the third arm lives one level up, in each verb, the same
+/// way [`crate::apikeys`] does it — see [`Self::treedb`]. The `Treedb` arm inside
+/// `exec2`/`query2` is therefore "never reached", left as a refusal rather than
+/// `unreachable!()` for the PG arm's reason: a missed delegation should answer
+/// with a sentence, not a panic in a server.
 enum Backend {
     Sqlite(parking_lot::Mutex<Connection>),
     Pg(PgPool),
+    /// The account + grant rows, in the treedb engine's generic tables.
+    #[cfg(feature = "treedb")]
+    Treedb(Box<treedb_ctl::TreedbAccounts>),
 }
+
+/// The control plane in the `treedb` engine's generic tables (M1b). A child
+/// module so it can reuse this module's row types and password-free helpers.
+#[cfg(feature = "treedb")]
+mod treedb_ctl;
 
 const ACCOUNTS_DDL_SQLITE: &str = "CREATE TABLE IF NOT EXISTS web_accounts (
     account       TEXT PRIMARY KEY,
@@ -353,6 +373,15 @@ const GRANTS_DDL_PG: &str = "CREATE TABLE IF NOT EXISTS grovefs_control.web_gran
 
 fn now_iso() -> String {
     chrono::Local::now().to_rfc3339()
+}
+
+/// Reached only if a verb forgot its delegation — the same shape as
+/// [`crate::apikeys`]'s, so a missed arm answers in words instead of panicking in
+/// a running server.
+#[cfg(feature = "treedb")]
+fn missed_delegation<T>() -> Result<T, String> {
+    Err("treedb control: this webauth verb has no engine path (a delegation was missed)"
+        .to_string())
 }
 
 /// The account + delegation store. Cheap to share (wrap in an `Arc`); the
@@ -394,16 +423,55 @@ impl WebAuthStore {
 
     /// Route by metadata backend, the same rule the keys and definitions
     /// follow: a PostgreSQL URI (inline list or `file:` registry) uses the
-    /// shared schema, anything else the local file. An unknown `scheme://` is
-    /// refused rather than quietly falling back to a file the deployment never
-    /// reads.
+    /// shared schema, a `treedb://` URI the engine's generic tables (behind the
+    /// same `GROVEFS_TREEDB_CONTROL` switch the credentials use), anything else
+    /// the local file. An unknown `scheme://` is refused rather than quietly
+    /// falling back to a file the deployment never reads.
     pub fn open_for(base: &std::path::Path, store_uri: Option<&str>) -> Result<Self, String> {
         match store_uri {
             Some(u) if crate::pg_store::is_pg_store(u) => Self::open_pg(u),
+            #[cfg(feature = "treedb")]
+            Some(u) if crate::treedb_store::is_treedb_store(u) => Self::open_treedb(u),
             Some(u) if u.contains("://") => Err(format!(
                 "`{u}` is not a --meta-store scheme GroveFS supports: web accounts live in a local SQLite file or PostgreSQL (`postgres://…`)"
             )),
             _ => Self::open(base),
+        }
+    }
+
+    /// The accounts in the treedb engine's generic tables (treedb DESIGN.md §10
+    /// C 4, milestone M1b). Opt-in per process: `GROVEFS_TREEDB_CONTROL=engine`,
+    /// read through the SAME function the credential store reads, so the two
+    /// halves of the control plane can never disagree about what the switch says.
+    ///
+    /// Why a switch at all: until the tables are filled by the migration, routing
+    /// here unconditionally would report every account as unknown. The operator
+    /// would see "nobody can log in", not "the migration has not run" — and this
+    /// store decides who may log in.
+    #[cfg(feature = "treedb")]
+    pub fn open_treedb(uri: &str) -> Result<Self, String> {
+        if !crate::apikeys::ApiKeyStore::treedb_control_enabled() {
+            return Err(format!(
+                "`{uri}` is a treedb tree store: its sign-in accounts live in the engine's generic \
+                 tables, which are only read when `{}` is set to `engine`; without it, keep the \
+                 accounts in the LOCAL SQLite beside the meta-server's --meta-dir",
+                crate::apikeys::ApiKeyStore::TREEDB_CONTROL_ENV
+            ));
+        }
+        let addr = crate::treedb_store::parse_addr(uri)?;
+        Ok(Self {
+            backend: Backend::Treedb(Box::new(treedb_ctl::TreedbAccounts::open(&addr)?)),
+        })
+    }
+
+    /// The engine backend's handle; `None` under SQLite/PG. Every verb's first
+    /// line is this question, which is what keeps the third arm out of the SQL
+    /// dispatchers (see [`Backend`]).
+    #[cfg(feature = "treedb")]
+    fn treedb(&self) -> Option<&treedb_ctl::TreedbAccounts> {
+        match &self.backend {
+            Backend::Treedb(k) => Some(k),
+            _ => None,
         }
     }
 
@@ -423,6 +491,10 @@ impl WebAuthStore {
                 .map(|_| ())
                 .map_err(|e| e.to_string()),
             Backend::Pg(pool) => pool.execute(sql_p, pp).map(|_| ()),
+            // Unreachable by construction: every verb that can reach `exec2`
+            // returned early through `treedb()` (see `missed_delegation`).
+            #[cfg(feature = "treedb")]
+            Backend::Treedb(_) => missed_delegation(),
         }
     }
 
@@ -452,6 +524,10 @@ impl WebAuthStore {
                 Ok(rows)
             }
             Backend::Pg(pool) => pool.query(sql_p, pp, mp),
+            // Same as `exec2`: a verb that forgot its `treedb()` delegation
+            // lands here instead of silently running SQL against nothing.
+            #[cfg(feature = "treedb")]
+            Backend::Treedb(_) => missed_delegation(),
         }
     }
 
@@ -459,6 +535,10 @@ impl WebAuthStore {
     /// safe to leave on the command line: it can only ever fill an EMPTY store,
     /// never overwrite or add a second owner.
     pub fn is_empty(&self) -> Result<bool, String> {
+        #[cfg(feature = "treedb")]
+        if let Some(k) = self.treedb() {
+            return k.is_empty();
+        }
         let n: Vec<i64> = self.query2(
             "SELECT COUNT(*) FROM web_accounts",
             &[],
@@ -473,6 +553,10 @@ impl WebAuthStore {
     /// The bases delegated to one account, sorted (the UI and the ACL both want
     /// a stable order).
     pub fn bases_of(&self, account: &str) -> Result<Vec<String>, String> {
+        #[cfg(feature = "treedb")]
+        if let Some(k) = self.treedb() {
+            return k.bases_of(account);
+        }
         let mut v = self.query2(
             "SELECT base_view FROM web_grants WHERE account = ?1 ORDER BY base_view",
             params![account],
@@ -488,6 +572,10 @@ impl WebAuthStore {
 
     /// Every account, with its grants folded in, sorted by name.
     pub fn list(&self) -> Result<Vec<AccountInfo>, String> {
+        #[cfg(feature = "treedb")]
+        if let Some(k) = self.treedb() {
+            return k.list();
+        }
         let rows = self.query2(
             "SELECT account, role, created_at, disabled_at, last_login_at FROM web_accounts ORDER BY account",
             &[],
@@ -535,6 +623,10 @@ impl WebAuthStore {
     /// asked for. The last admin can still hand the keys over deliberately by
     /// creating a second admin first.
     pub fn active_admins(&self) -> Result<usize, String> {
+        #[cfg(feature = "treedb")]
+        if let Some(k) = self.treedb() {
+            return k.active_admins();
+        }
         let n = self.query2(
             "SELECT COUNT(*) FROM web_accounts WHERE role = 'admin' AND disabled_at IS NULL",
             &[],
@@ -553,6 +645,10 @@ impl WebAuthStore {
     /// The stored digest + liveness for one account, in the shape the login
     /// path needs. Kept private so no caller can print a hash.
     fn fetch(&self, account: &str) -> Result<Option<(String, String, Option<String>)>, String> {
+        #[cfg(feature = "treedb")]
+        if let Some(k) = self.treedb() {
+            return k.fetch(account);
+        }
         let mut rows = self.query2(
             "SELECT pw_hash, role, disabled_at FROM web_accounts WHERE account = ?1",
             params![account],
@@ -580,6 +676,10 @@ impl WebAuthStore {
     /// [`hash_password`]). Fails if the name exists — a create that quietly
     /// resets a password would be a login bypass with the wrong name.
     pub fn create(&self, account: &str, pw_hash: &str, role: Role) -> Result<(), String> {
+        #[cfg(feature = "treedb")]
+        if let Some(k) = self.treedb() {
+            return k.create(account, pw_hash, role);
+        }
         let ts = now_iso();
         let r = role.as_str();
         self.exec2(
@@ -594,6 +694,10 @@ impl WebAuthStore {
     /// or the account's own holder through a verified login) — this store does
     /// not decide, it only refuses an unknown name.
     pub fn set_password(&self, account: &str, pw_hash: &str) -> Result<bool, String> {
+        #[cfg(feature = "treedb")]
+        if let Some(k) = self.treedb() {
+            return k.set_password(account, pw_hash);
+        }
         let n = self.changes2(
             "UPDATE web_accounts SET pw_hash = ?1 WHERE account = ?2",
             params![pw_hash, account],
@@ -604,6 +708,10 @@ impl WebAuthStore {
     }
 
     pub fn set_role(&self, account: &str, role: Role) -> Result<bool, String> {
+        #[cfg(feature = "treedb")]
+        if let Some(k) = self.treedb() {
+            return k.set_role(account, role);
+        }
         let r = role.as_str();
         let n = self.changes2(
             "UPDATE web_accounts SET role = ?1 WHERE account = ?2",
@@ -618,6 +726,10 @@ impl WebAuthStore {
     /// audit history stay attributable, exactly like a revoked key keeps its
     /// row. A disabled account fails every login and every gated call.
     pub fn set_disabled(&self, account: &str, disabled: bool) -> Result<bool, String> {
+        #[cfg(feature = "treedb")]
+        if let Some(k) = self.treedb() {
+            return k.set_disabled(account, disabled);
+        }
         let ts = if disabled { Some(now_iso()) } else { None };
         let n = self.changes2(
             "UPDATE web_accounts SET disabled_at = ?1 WHERE account = ?2",
@@ -634,6 +746,10 @@ impl WebAuthStore {
     /// minted are NOT touched — they are machine credentials that may be
     /// serving live mounts; the UI tells the operator to revoke them.
     pub fn delete(&self, account: &str) -> Result<bool, String> {
+        #[cfg(feature = "treedb")]
+        if let Some(k) = self.treedb() {
+            return k.delete(account);
+        }
         self.exec2(
             "DELETE FROM web_grants WHERE account = ?1",
             params![account],
@@ -650,6 +766,10 @@ impl WebAuthStore {
     }
 
     fn stamp_login(&self, account: &str) -> Result<(), String> {
+        #[cfg(feature = "treedb")]
+        if let Some(k) = self.treedb() {
+            return k.stamp_login(account);
+        }
         let ts = now_iso();
         self.exec2(
             "UPDATE web_accounts SET last_login_at = ?1 WHERE account = ?2",
@@ -670,6 +790,10 @@ impl WebAuthStore {
         base_view: &str,
         granted_by: Option<&str>,
     ) -> Result<(), String> {
+        #[cfg(feature = "treedb")]
+        if let Some(k) = self.treedb() {
+            return k.grant(account, base_view, granted_by);
+        }
         let ts = now_iso();
         self.exec2(
             "INSERT INTO web_grants (account, base_view, perm, granted_at, granted_by) VALUES (?1, ?2, 'manage', ?3, ?4)
@@ -682,6 +806,10 @@ impl WebAuthStore {
     }
 
     pub fn ungrant(&self, account: &str, base_view: &str) -> Result<bool, String> {
+        #[cfg(feature = "treedb")]
+        if let Some(k) = self.treedb() {
+            return k.ungrant(account, base_view);
+        }
         let n = self.changes2(
             "DELETE FROM web_grants WHERE account = ?1 AND base_view = ?2",
             params![account, base_view],
@@ -692,6 +820,10 @@ impl WebAuthStore {
     }
 
     pub fn list_grants(&self) -> Result<Vec<GrantInfo>, String> {
+        #[cfg(feature = "treedb")]
+        if let Some(k) = self.treedb() {
+            return k.list_grants();
+        }
         self.query2(
             "SELECT account, base_view, perm, granted_at, granted_by FROM web_grants ORDER BY account, base_view",
             &[],
@@ -733,6 +865,9 @@ impl WebAuthStore {
                 .map(|n| n as u64)
                 .map_err(|e| e.to_string()),
             Backend::Pg(pool) => pool.execute(sql_p, pp),
+            // Same as `exec2`.
+            #[cfg(feature = "treedb")]
+            Backend::Treedb(_) => missed_delegation(),
         }
     }
 

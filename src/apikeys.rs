@@ -605,7 +605,7 @@ impl ApiKeyStore {
     /// Whether this process has been told to keep its control plane in the
     /// treedb engine (`GROVEFS_TREEDB_CONTROL=engine`). One reader, so the route
     /// decision (`open_treedb`) and the address the servers pass in
-    /// (`StoreKind::keys_uri`) cannot disagree about what the switch says.
+    /// (`StoreKind::control_tables_uri`) cannot disagree about what the switch says.
     #[cfg(feature = "treedb")]
     pub fn treedb_control_enabled() -> bool {
         std::env::var(Self::TREEDB_CONTROL_ENV)
