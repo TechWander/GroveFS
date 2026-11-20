@@ -57,6 +57,11 @@ pub mod treedb_store;
 /// engine's errno handling exists once — see treedb DESIGN.md §10 C 4.
 #[cfg(feature = "treedb")]
 pub(crate) mod control_treedb;
+/// The CONTROL PLANE's move into those tables (treedb DESIGN.md §10 C 4,
+/// milestone M2): `grovefs control-migrate --to engine` reads the local SQLite
+/// files and writes the generic tables, then verifies by reading them back.
+#[cfg(feature = "treedb")]
+pub mod control_migrate;
 pub mod platform;
 pub mod remote;
 pub mod stats;

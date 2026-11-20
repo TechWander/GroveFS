@@ -35,7 +35,7 @@
 use treedb::engine::model::{errno, TableDef, PUT_IF_ABSENT, PUT_IF_EXISTS, COL_INDEX};
 
 use super::{AccountInfo, GrantInfo, Role};
-use crate::control_treedb::{col, opt, opt_str, text, Rows};
+use crate::control_treedb::{col, dump, opt, opt_str, put_fields, text, Fields, Rows};
 
 /// Engine `tables` are one flat namespace (treedb §5.3), so the prefix is the only
 /// isolation — and the price is one GROVEFS control plane per engine instance.
@@ -321,7 +321,10 @@ impl TreedbAccounts {
 
 /// `account \0 base_view`. The separator cannot occur in either half: account
 /// names are `[a-z0-9._-]` and view names are validated text.
-fn grant_key(account: &str, base_view: &str) -> Vec<u8> {
+///
+/// `pub(crate)` is for M2: `control-migrate` must derive the SAME key from a
+/// local SQLite row, otherwise the migrated grant is a second row beside it.
+pub(crate) fn grant_key(account: &str, base_view: &str) -> Vec<u8> {
     let mut k = Vec::with_capacity(account.len() + 1 + base_view.len());
     k.extend_from_slice(account.as_bytes());
     k.push(0);
@@ -334,6 +337,14 @@ fn grant_key(account: &str, base_view: &str) -> Vec<u8> {
 fn bump(old: &[u8]) -> Vec<u8> {
     let n = <[u8; 8]>::try_from(old).map(u64::from_be_bytes).unwrap_or(0);
     (n + 1).to_be_bytes().to_vec()
+}
+
+/// The `rev` a row starts life with — the same value [`TreedbAccounts::create`]
+/// writes, so a migrated account is byte-identical to one created here. M2's
+/// reason to reach for it: the local SQLite table has no such column (there was
+/// nothing to CAS on before the move), so the migration has to seed it.
+pub(crate) fn initial_rev() -> Vec<u8> {
+    bump(&[])
 }
 
 // ---- table shapes ----------------------------------------------------------
@@ -370,4 +381,43 @@ fn grants_def() -> TableDef {
             col("granted_by", 0),
         ],
     }
+}
+
+// ---- migration surface (M2: `grovefs control-migrate --to engine`) ---------
+//
+// The engine column order ↔ the LOCAL SQLite column names, plus the table shapes,
+// handed out so the migration fills and compares by NAME and copies no index.
+// **These lists change together with the `WA_*`/`WG_*` block above**: they restate
+// it, and an out-of-order name writes a value into the neighbouring column.
+
+pub(crate) const ACCOUNT_COLS: [&str; WA_COLS] = [
+    "pw_hash",
+    "role",
+    "created_at",
+    "disabled_at",
+    "last_login_at",
+    "rev",
+];
+
+pub(crate) const GRANT_COLS: [&str; WG_COLS] =
+    ["account", "base_view", "perm", "granted_at", "granted_by"];
+
+pub(crate) fn tables() -> [TableDef; 2] {
+    [accounts_def(), grants_def()]
+}
+
+pub(crate) fn put_account(rows: &Rows, key: &[u8], f: &Fields) -> Result<(), String> {
+    put_fields(rows, T_ACCOUNTS, key, &ACCOUNT_COLS, f)
+}
+
+pub(crate) fn put_grant(rows: &Rows, key: &[u8], f: &Fields) -> Result<(), String> {
+    put_fields(rows, T_GRANTS, key, &GRANT_COLS, f)
+}
+
+pub(crate) fn dump_accounts(rows: &Rows) -> Result<Vec<(Vec<u8>, Fields)>, String> {
+    dump(rows, T_ACCOUNTS, &ACCOUNT_COLS)
+}
+
+pub(crate) fn dump_grants(rows: &Rows) -> Result<Vec<(Vec<u8>, Fields)>, String> {
+    dump(rows, T_GRANTS, &GRANT_COLS)
 }

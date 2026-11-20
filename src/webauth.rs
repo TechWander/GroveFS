@@ -334,8 +334,12 @@ enum Backend {
 
 /// The control plane in the `treedb` engine's generic tables (M1b). A child
 /// module so it can reuse this module's row types and password-free helpers.
+///
+/// `pub(crate)` for M2: `control_migrate` needs the column names, the table
+/// shapes and the key derivation declared here, so the migration cannot drift
+/// from the storage format (or from the key) the serving process will look up.
 #[cfg(feature = "treedb")]
-mod treedb_ctl;
+pub(crate) mod treedb_ctl;
 
 const ACCOUNTS_DDL_SQLITE: &str = "CREATE TABLE IF NOT EXISTS web_accounts (
     account       TEXT PRIMARY KEY,

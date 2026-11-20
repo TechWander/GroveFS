@@ -799,6 +799,37 @@ NOTES
         #[command(subcommand)]
         action: ApikeyAction,
     },
+    /// Move the control plane's LOCAL rows into the `treedb` engine's generic
+    /// tables (treedb DESIGN.md §10 C 4, milestone M2).
+    ///
+    /// The control-plane rows — credentials, call audit, sign-in accounts,
+    /// delegations — live in `<meta-dir>/meta/api_keys.db` and
+    /// `<meta-dir>/meta/web_accounts.db` until `GROVEFS_TREEDB_CONTROL=engine`
+    /// routes the servers to the engine instead. That switch is off by default
+    /// because the engine's tables start EMPTY: turning it on before this command
+    /// runs reports every key and account as unknown ("nobody can log in").
+    ///
+    /// Run it with the serving process stopped and the switch unset — the command
+    /// refuses to run with the switch on, because then the engine is the live
+    /// store and this would put stale rows on top of it. It is idempotent (a rerun
+    /// overwrites), it writes byte for byte, and it verifies every table by
+    /// reading it back (key set both ways, then every column): a mismatch exits
+    /// non-zero rather than leaving a half-copied control plane.
+    ControlMigrate {
+        /// Where to move them. `engine` is the only target.
+        #[arg(long = "to", value_name = "TARGET", default_value = "engine")]
+        to: String,
+        /// The metadata root holding `meta/api_keys.db` and
+        /// `meta/web_accounts.db` — same option name and directory as
+        /// `meta-server --meta-dir`; falls back to the global `--home`.
+        #[arg(long = "meta-dir", value_name = "DIR")]
+        db_path: Option<PathBuf>,
+        /// The engine to write into: `treedb://HOST:PORT` (or the
+        /// `GROVEFS_META_STORE` env). Never guessed — it is the same URI the
+        /// `meta-server` will be started with.
+        #[arg(long = "meta-store", value_name = "URI")]
+        store: Option<String>,
+    },
     /// Serve the MANAGEMENT CONSOLE, and administer its sign-in accounts.
     ///
     /// With no subcommand this is a small HTTP gateway in front of `meta-server
@@ -1838,7 +1869,10 @@ fn resolve_store(explicit: Option<String>) -> Option<String> {
     explicit.or_else(|| std::env::var("GROVEFS_META_STORE").ok())
 }
 
-/// Refuse a `treedb://` --meta-store on every command EXCEPT `meta-server`.
+/// Refuse a `treedb://` --meta-store on every command EXCEPT `meta-server` and
+/// `control-migrate` — the latter takes that URI deliberately, because its whole
+/// job is filling the engine's control tables (treedb DESIGN.md §10 C 4, M2), and
+/// it does not go through this refusal.
 ///
 /// Only a treedb-capable `meta-server` drives that engine; every other
 /// command's backend is a local SQLite file or a PG schema, so letting one of
@@ -1860,6 +1894,74 @@ fn refuse_treedb_store(store: Option<&str>, cmd: &str) -> Result<(), Box<dyn std
         .into());
     }
     Ok(())
+}
+
+/// `grovefs control-migrate --to engine` (M2): hand the local control plane's
+/// rows to the engine's generic tables, then verify them by reading back.
+///
+/// The variant exists in EVERY build so an operator gets a sentence instead of
+/// clap's "unrecognized subcommand"; only this body is feature-gated.
+#[cfg(feature = "treedb")]
+fn control_migrate_cmd(
+    to: &str,
+    base: &Path,
+    store: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if to != "engine" {
+        return Err(format!(
+            "`--to {to}` is not a target this build knows: the control plane can only move into \
+             the treedb engine (`--to engine`), which the servers then read through `{}`=`engine`",
+            grovefs::apikeys::ApiKeyStore::TREEDB_CONTROL_ENV
+        )
+        .into());
+    }
+    // No default and no guessing: the URI has to be the one the meta-server will
+    // be started with, and a wrong one would fill a different engine.
+    let uri = match store {
+        Some(u) if grovefs::treedb_store::is_treedb_store(&u) => u,
+        Some(u) => {
+            return Err(format!(
+                "`--meta-store {u}` does not name an engine: control-migrate --to engine writes \
+                 the treedb generic tables. A postgres://… store already keeps its control plane \
+                 in PG, and a local file has nothing to move"
+            )
+            .into())
+        }
+        None => {
+            return Err(
+                "control-migrate --to engine needs `--meta-store treedb://HOST:PORT` (or \
+                 GROVEFS_META_STORE): it writes the engine that `meta-server --meta-store \
+                 treedb://…` will read, and it will not guess the address"
+                    .into(),
+            )
+        }
+    };
+    let mut say = |line: &str| println!("{line}");
+    let report = grovefs::control_migrate::run(base, &uri, &mut say)?;
+    println!(
+        "\nmigrated {} rows across {} tables — every table read back from the engine and compared \
+         column by column",
+        report.rows, report.tables
+    );
+    println!(
+        "next: start the servers with the same --meta-store and {}={} — the local files are \
+         untouched, so unsetting the switch is the rollback",
+        grovefs::apikeys::ApiKeyStore::TREEDB_CONTROL_ENV,
+        "engine"
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "treedb"))]
+fn control_migrate_cmd(
+    _to: &str,
+    _base: &Path,
+    _store: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    Err("`grovefs control-migrate` moves the control plane into the treedb engine, which exists \
+         only in an EXPERIMENTAL `--features treedb` build: rebuild with `cargo build --release \
+         --features treedb`"
+        .into())
 }
 
 /// Resolve the admin credential for a `--control-server` call: the flag wins,
@@ -4613,6 +4715,14 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
+        }
+        Cmd::ControlMigrate { to, db_path, store } => {
+            // The one command that WANTS a `treedb://` --meta-store (hence no
+            // `refuse_treedb_store` here): its whole job is writing that engine's
+            // control tables. The switch guard inside rejects the case where the
+            // engine is already the live store.
+            let mig_base = db_path.unwrap_or_else(|| base.clone());
+            control_migrate_cmd(&to, &mig_base, resolve_store(store))?;
         }
         #[cfg(feature = "web")]
         Cmd::Web {

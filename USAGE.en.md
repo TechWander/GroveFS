@@ -33,6 +33,7 @@ One table covers every capability. The left column is **what you want to accompl
 | Swap metadata to the PostgreSQL backend | `--meta-store postgres://…` everywhere | §4.1, §6.2, §15.3 |
 | Govern the same metadata from any machine (never hand out the DB password) | `meta-server --control-listen` + `view`/`apikey`/`refs --control-server --api-key` | §3.5.2 |
 | Manage views and keys from a browser, and delegate base views to accounts (create accounts / grant) | `grovefs web` + `web account` / `web grant` | §3.5.3 |
+| Move keys/audit/accounts/grants into the treedb engine (experimental) | `control-migrate --to engine` | §3.5.4 |
 | Primary/standby HA with real fencing | `meta-server --role/--peer/--sync-repl/--witness` | §5.5, §11.8 |
 | Reconcile a broken ledger / audit who is calling | `refs rebuild` / `apikey calls` | §5.3, §3.5.1 |
 | Slim down long commands (env vars + config file) | `GROVEFS_*` / `~/.config/grovefs/grovefs.conf` | §1.1, §15.15 |
@@ -1507,6 +1508,49 @@ Semantics and boundaries:
 
 e2e in the `web` suite (178 checks: the four install-time flag combinations and "a refused startup does not open the port" / five classes of refusal before the gateway binds / security headers and no anonymous reach / the two wrong-login replies byte-identical (anti-enumeration) / CSRF, Origin and the whitelist verb by verb / headless account creation and delegation (including `--password-stdin`, password policy, `view list` not containing the three control stores, and `refs rebuild` still succeeding) / `bob`'s positive capabilities and each over-reach refusal / rotating his own key's secret through the page route `apikey.rotate` (the id survives, the new plaintext appears only in the reply, and neither plaintext is findable in the store) and refusing to rotate someone else's key / a **counting** assertion on the routed whitelist (the page routes exactly 30 governance ops with `apikey.update` among them — an op added to the server's ACL table and forgotten here fails red instead of becoming a broken button in the browser) / the key page's bookkeeping: the remark and the **server-computed** deadline travel in the create reply, the minter is stored, listings carry only the head+tail fingerprint and the stored fingerprint equals the head-4/tail-4 of the plaintext printed once at creation (no listing ever carries the plaintext) / expiry is the server's verdict shipped in the row, a new ttl is the recovery path, a misspelt ttl is refused instead of minting a never-expiring key, editing someone else's bookkeeping is refused and `update` refuses a revoked row / revocation and disable effective on the next call / audit attribution `account=bob@ip` with no bleeding into other people's rows / the export→import tri-state / the last-admin protection tri-state and the second admin unlocking it / the 6th sign-in attempt returning 429 with `retryAfter` / a restart with the same bootstrap flags neither re-seeds nor locks itself, while a different `--admin-user` refuses to start); the server-side storage of accounts and grants on both backends (including PG) is covered by the `webauth`/`meta` unit tests in `cargo test --lib`.
 
+### 3.5.4 Moving the control plane into the treedb engine (experimental): `grovefs control-migrate --to engine`
+
+The three things §3.5.1–§3.5.3 install — credentials, audit, and sign-in accounts with their grants — live in two local files by default: `<meta-dir>/meta/api_keys.db` and `<meta-dir>/meta/web_accounts.db`. The experimental treedb backend can keep them in the engine's generic tables instead (`grovefs_control__api_keys` / `api_key_usage` / `mcp_calls` / `web_accounts` / `web_grants`), but that switch (`GROVEFS_TREEDB_CONTROL=engine`) is **OFF by default** for one reason: those tables start **empty**, so turning the switch on before the move reports every key and account as unknown — the symptom is "nobody can log in", not "the migration did not run". `control-migrate` is that move, and the only step in the M1–M4 switch order that writes data into the engine.
+
+```bash
+# 1) stop the serving meta-server first (the boundary below says why)
+# 2) leave the switch unset; hand the two local files to the engine (same URI
+#    the meta-server uses)
+GROVEFS_TREEDB_CONTROL= grovefs control-migrate --to engine \
+    --meta-dir /srv/grovefs --meta-store treedb://10.0.0.10:7301
+source /srv/grovefs/meta/api_keys.db
+source /srv/grovefs/meta/web_accounts.db
+engine treedb://10.0.0.10:7301
+grovefs_control__api_keys                   1 rows written, verified
+grovefs_control__api_key_usage              1 rows written, verified
+grovefs_control__mcp_calls                  7 rows written, verified
+grovefs_control__web_accounts               2 rows written, verified
+grovefs_control__web_grants                 1 rows written, verified
+
+migrated 12 rows across 5 tables — every table read back from the engine and compared column by column
+next: start the servers with the same --meta-store and GROVEFS_TREEDB_CONTROL=engine — the local files are untouched, so unsetting the switch is the rollback
+
+# 3) start with the same URI and the switch ON: old keys and old passwords
+#    work immediately
+GROVEFS_TREEDB_CONTROL=engine grovefs meta-server --meta-dir /srv/grovefs \
+    --meta-store treedb://10.0.0.10:7301 --control-listen 0.0.0.0:7302
+```
+
+Those five counts come from one real run of stage 9 of the `treedbctl` suite on the board (with the directory changed to this document's example path); the numbers follow the deployment, the five table shapes do not.
+
+Semantics and boundaries:
+
+- **Values are moved as bytes, never recomputed**: `secret_hash` (SHA-256) and `pw_hash` (PBKDF2) travel untouched, which is why **an old key still authenticates and an old password still signs in** after the move. The design document's "`secret_enc` is copied as it lies, never re-wrapped, and `<base>/meta/store.key` travels with the directory" has no counterpart in this tree: what is stored here is a one-way digest plus a display hint (`secret_hint`) — there is no ciphertext to re-wrap and no wrapping material. Leaving the digest alone is the strongest reading of "never re-derive a credential".
+- **Three things are not a plain copy**: (1) `api_keys.last_used_at` becomes a row of `api_key_usage` (a separate table in the engine, so a per-request stamp never CASes the credential row) — **only a key that was used has one**; (2) the local audit table has no id, so the engine key is derived as `!ts_us || !seq` from `ts` plus insertion order within the same microsecond, which keeps "newest N" in the same order as the local `ORDER BY rowid DESC`; (3) `web_accounts` has no `rev` column locally (before the move a row had one writer, so there was nothing to CAS), so the migration seeds its birth value — a migrated row is byte-identical to one created in the engine.
+- **Idempotent**: every write is an unconditional overwrite (not a colliding insert), so a rerun copies and verifies again; there is no "already migrated" marker to fall out of step with the rows themselves.
+- **A full read-back follows every run**: each table is dumped from the engine as soon as it is written, the key set is compared in both directions (what is missing, what is extra), then every column byte; a mismatch names the table, the key, the column and both sides. Any difference exits non-zero — M3 (delete the switch) must not start from a half copy.
+- **Four refusals**: the switch is already ON (then the engine is the live store and copying onto it would resurrect a revoked key and revert a rotated password), `--to` is not `engine`, no `--meta-store` was given (it never guesses an address), and the URI is `postgres://` (a PG store already keeps its control plane in the control schema). A default build (no `--features treedb`) answers with a named refusal instead of "unrecognized subcommand".
+- **The source is opened read-only and never deleted**: both `.db` files are opened with `SQLITE_OPEN_READ_ONLY` and are still there afterwards — the rollback is **unsetting the switch** and restarting, and not deleting the source is also what makes a rerun safe.
+- **Stop the serving process first**: the source is read-only, so this command never writes it, but a live `meta-server` can commit a new row between the read and the read-back, and that row would be reported as missing from the engine. A half-finished run is safe either way: overwrite plus full comparison, rerun at will — there is no "half-migrated" state.
+- **Boundary**: only these five tables move. View **definitions** and placement stay local forever (the PG store's definition tables have no counterpart on this backend), so a treedb deployment is "definitions local + trees in the engine + rows in the engine".
+
+e2e in stage 9 of the `treedbctl` suite (88 checks in all): with the switch OFF the suite builds a local control plane, migrates, and asserts that the `migrated N rows` total equals what SQLite counts itself, that all five tables say `written, verified`, and that a rerun reports the same number; then the four refusals; then, with the switch ON and the server restarted, the account/grant/audit/usage rows are all served (`carol` was never an `--admin-user`, so she can only come from the migration), **the old admin key still governs**, **the old password still signs in**, both local files are still in place, and an engine restart loses nothing.
+
 ---
 
 ## 4. Production topology: central storage + multiple client LAN mounts
@@ -1969,7 +2013,7 @@ ps aux | grep grovefs                     # 查看在跑的 server / mount
 
 ## 10. Verification and regression
 
-The full board is **44 stages** in all: `build` → `unit` → **41 suites** → `bench`. **The first 43 stages gate GREEN; `bench` only prints throughput reference numbers and never gates** (for pure functional regression only, use `SKIP_BENCH=1`). `pg`/`pg_parallel`/`evict`/`control`/`forksrv` auto-SKIP their whole stage on hosts with no reachable PostgreSQL, and `xfer`/`gcremote` skip just their PG arm and run the SQLite arm — and `client` skips its whole stage on a host without the sibling `grovefs-client` checkout, its binary, or the `fusermount` helper — none of them lower GREEN; the `treedb` stage — the self-check of the experimental backend — SELF-SKIPS on a default build (no `--features treedb`), also without lowering GREEN. The same holds for `treedbmatrix` (the posix/e2e assertion matrix replayed on that backend, gated on the `pass=39 fail=0 skip=10` contract triple) and `treedbctl` (the control plane's third arm: with `GROVEFS_TREEDB_CONTROL=engine` keys, audit rows and web accounts/grants land in the engine's generic tables; off by default).
+The full board is **44 stages** in all: `build` → `unit` → **41 suites** → `bench`. **The first 43 stages gate GREEN; `bench` only prints throughput reference numbers and never gates** (for pure functional regression only, use `SKIP_BENCH=1`). `pg`/`pg_parallel`/`evict`/`control`/`forksrv` auto-SKIP their whole stage on hosts with no reachable PostgreSQL, and `xfer`/`gcremote` skip just their PG arm and run the SQLite arm — and `client` skips its whole stage on a host without the sibling `grovefs-client` checkout, its binary, or the `fusermount` helper — none of them lower GREEN; the `treedb` stage — the self-check of the experimental backend — SELF-SKIPS on a default build (no `--features treedb`), also without lowering GREEN. The same holds for `treedbmatrix` (the posix/e2e assertion matrix replayed on that backend, gated on the `pass=39 fail=0 skip=10` contract triple) and `treedbctl` (the control plane's third arm: with `GROVEFS_TREEDB_CONTROL=engine` keys, audit rows and web accounts/grants land in the engine's generic tables; off by default — and it also covers the `control-migrate` move of §3.5.4).
 
 ```bash
 export LC_ALL=C LANG=C                                 # 仓库根目录下执行(PKG_CONFIG 不必设:无 crate 查 pkg-config,§1)

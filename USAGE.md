@@ -32,6 +32,7 @@
 | 挂着但没人读写的视图白占 12 条 PG 连接 | `meta-server --pg-write-pool`/`--pg-read-pool`(暖地板) + 各自 `-max`(突发上限) + `--pg-pool-idle-secs`；单视图用 `grovefs view pool` 覆盖 | §6.2 |
 | 任意机器治理同一份元数据(不发数据库密码) | `meta-server --control-listen` + `view`/`apikey`/`refs --control-server --api-key` | §3.5.2 |
 | 在浏览器里管视图与密钥,并给账号划基视图(可建号/授权) | `grovefs web` + `web account` / `web grant` | §3.5.3 |
+| 把密钥/审计/账号/授权搬进 treedb 引擎(实验) | `control-migrate --to engine` | §3.5.4 |
 | 主备高可用与真 fencing | `meta-server --role/--peer/--sync-repl/--witness` | §5.5、§11.8 |
 | 回收账本不一致 / 审计谁在调用 | `refs rebuild` / `apikey calls` | §5.3、§3.5.1 |
 | 长命令瘦身(环境变量 + 配置文件) | `GROVEFS_*` / `~/.config/grovefs/grovefs.conf` | §1.1、§15.15 |
@@ -1511,6 +1512,47 @@ bob no longer governs 'main'.
 
 e2e 见 `web` 套件(178 条:安装期 bootstrap 四种 flag 组合与"被拒的启动不开端口"/网关启动前五类拒绝/安全头与匿名不可达/两条错登录回复逐字节相同(防枚举)/CSRF·Origin·白名单逐动词/headless 建号与授权(含 `--password-stdin`、口令策略、`view list` 不含三个控制库、`refs rebuild` 必须成功)/`bob` 的正向能力与越权拒因逐条/经页面路由 `apikey.rotate` 轮换自己 key 的 secret(id 不变、新明文只出现在回包里、库中两个明文都搜不到)与别人的 key 拒旋/路由白名单**计数断言**(页面恰好路由 30 个治理 op、`apikey.update` 在内——服务端 ACL 新增了 op而控制台漏接会在这里红,而不是变成浏览器里一个坏按钮)/密钥页的台账:备注与**服务端算出的**期限随回包给出、铸造者入库,列表只给头尾指纹且服务端存的指纹等于创建时那次明文打印的头4尾4(任何列表都不含明文)/过期由服务端判定并随行返回、新的 ttl 是恢复路径、拼错的 ttl 被拒、跨账号改台账被拒、`update` 拒绝 revoked 行/撤权与 disable 的下一次调用即失效/审计归属 `account=bob@ip` 且不串看别人的行/export→import 三态/最后一把 admin 三态保护与第二 admin 解锁/第 6 次登录 429 与 `retryAfter`/重启 bootstrap 幂等与换名拒绝);账号与授权的服务端存储两档(含 PG)由 `cargo test --lib` 的 `webauth`/`meta` 单测覆盖。
 
+### 3.5.4 把控制面搬进 treedb 引擎(实验):`grovefs control-migrate --to engine`
+
+§3.5.1–§3.5.3 的三样东西——密钥、审计、账号与授权——默认住在两个本地文件里:`<meta-dir>/meta/api_keys.db` 与 `<meta-dir>/meta/web_accounts.db`。实验性的 treedb 后端能让它们改住引擎的通用表(`grovefs_control__api_keys` / `api_key_usage` / `mcp_calls` / `web_accounts` / `web_grants`),但那个开关(`GROVEFS_TREEDB_CONTROL=engine`)**默认关**,理由只有一条:引擎里那几张表刚建出来是**空的**,先开开关再搬家,服务端会把所有密钥和账号判成不存在——症状是"谁都登录不了",不是"迁移没做"。`control-migrate` 就是那道搬家的命令,也是 M1–M4 切换顺序里唯一一步"把数据写进引擎"的。
+
+```bash
+# 1) 先停掉正在服务的 meta-server(理由见下面的边界)
+# 2) 开关保持未设,把两个本地文件搬进引擎(URI 与 meta-server 用同一个)
+GROVEFS_TREEDB_CONTROL= grovefs control-migrate --to engine \
+    --meta-dir /srv/grovefs --meta-store treedb://10.0.0.10:7301
+source /srv/grovefs/meta/api_keys.db
+source /srv/grovefs/meta/web_accounts.db
+engine treedb://10.0.0.10:7301
+grovefs_control__api_keys                   1 rows written, verified
+grovefs_control__api_key_usage              1 rows written, verified
+grovefs_control__mcp_calls                  7 rows written, verified
+grovefs_control__web_accounts               2 rows written, verified
+grovefs_control__web_grants                 1 rows written, verified
+
+migrated 12 rows across 5 tables — every table read back from the engine and compared column by column
+next: start the servers with the same --meta-store and GROVEFS_TREEDB_CONTROL=engine — the local files are untouched, so unsetting the switch is the rollback
+
+# 3) 用同一个 URI + 打开的开关启动,老凭据/老口令即刻可用
+GROVEFS_TREEDB_CONTROL=engine grovefs meta-server --meta-dir /srv/grovefs \
+    --meta-store treedb://10.0.0.10:7301 --control-listen 0.0.0.0:7302
+```
+
+上面那五行读数来自板子上 `treedbctl` 套件第 9 段的一次实跑(目录改成了本文的示例路径);行数随部署而变,五张表的形状不变。
+
+语义与边界:
+
+- **值是字节搬运,不是重算**:`secret_hash`(SHA-256)与 `pw_hash`(PBKDF2)原样过去,所以搬家后**旧 key 仍能鉴权、旧口令仍能登录**。设计文档里那句"`secret_enc` 原样搬、绝不重新包裹"在本仓没有对应物——这里存的本来就是单向摘要加一截给人看的指纹(`secret_hint`),没有可"再包裹"的密文,也没有 `meta/store.key` 这样的包裹材料;摘要一字不动,是"绝不重算凭据"的最强读法。
+- **三处不是照抄**:① `api_keys.last_used_at` 拆成 `api_key_usage` 的一行(引擎里它单独一张表,免得每次鉴权都去 CAS 凭据行),**只有用过的 key 才有这一行**;② `mcp_calls` 在本地没有 id,引擎主键按 `!ts_us || !seq` 从 `ts` 加同微秒内的插入序派生,所以搬完之后"最新 N 条"的顺序与本地 `ORDER BY rowid DESC` 一致;③ `web_accounts` 在本地没有 `rev` 列(搬家前每行只有一个写者,没有可 CAS 的东西),迁移补上出生值,于是搬过去的行与引擎里新建的行逐字节同形。
+- **幂等**:每次写都是无条件覆盖(不是"撞键失败"),重跑一遍就是再搬一遍并再验一遍;没有"已迁移"标记会与行本身对不上。
+- **跑完全量回读比对**:每张表写完立刻从引擎读回来,先比键集合(两个方向:少了谁、多了谁),再逐列比字节;错误信息点名"哪张表、哪个键、哪一列、两边各是什么"。任何一处不等就非零退出——M3(删开关)不能从一份半截副本开始。
+- **四个拒绝**:开关已开(此时引擎是活库,搬过去就是用陈旧行覆盖——撤销过的 key 复活、轮换过的口令回退)、`--to` 不是 `engine`、没给 `--meta-store`(绝不猜地址)、给的是 `postgres://`(PG 档控制面本来就在控制库)。默认构建(无 `--features treedb`)给具名拒绝,而不是"未知子命令"。
+- **源文件只读且不删**:两个 `.db` 以 `SQLITE_OPEN_READ_ONLY` 打开,命令跑完它们还在原地——回滚就是**取消开关**重启;也正因为它不删源,重跑才安全。
+- **先停服务**:源是只读打开的,命令绝不会写它;但一个还在服务的 `meta-server` 会在"读"与"回读比对"之间提交新行,那条行会被报成"引擎里缺一行"。半途而废的跑法也安全:覆盖写 + 全量比对,重跑即可,不存在"搬到一半的状态"。
+- **边界**:这条命令只搬这五张表。视图**定义**与 placement 仍永远在本地(PG 档那套定义表在 treedb 档没有对应物),所以 treedb 档是"定义本地 + 树在引擎 + 行表在引擎"。
+
+e2e 见 `treedbctl` 套件第 9 段(88 条总数):开关关时先建出本地控制面 → 迁移 → 断言 `migrated N rows` 里的 N 等于 SQLite 自己数出的总和、五张表逐张 `written, verified`、重跑同数 → 四个拒绝逐条 → 开关打开重启后:账号/授权/审计/用量行全在(其中 `carol` 从来不是 `--admin-user`,只可能来自迁移)、**旧 admin key 仍能治理**、**旧口令仍能登录**、本地两个文件仍在,再重启引擎也不丢。
+
 ## 4. 生产拓扑:中心存储 + 多客户机 LAN 挂载
 
 真实场景:数据放中心集群,多台客户机经 LAN 挂载,同一用户跨机器看到**同一份权威视图**。
@@ -2028,7 +2070,7 @@ ps aux | grep grovefs                     # 查看在跑的 server / mount
 
 ## 10. 验证与回归
 
-全板一共 **44 段**:`build` → `unit` → **41 个套件** → `bench`。**前 43 段门控 GREEN,`bench` 只打吞吐参考值、永不门控**(只要纯功能回归就 `SKIP_BENCH=1`)。`pg`/`pg_parallel`/`evict`/`control`/`forksrv` 在无可达 PostgreSQL 的主机上整段自动 SKIP,`client` 在没有同级 `grovefs-client` 检出(或其二进制、`fusermount` 助手)的机器上整段 SKIP,`xfer`/`gcremote` 则跳过 PG 臂只跑 SQLite 臂,都不拉低 GREEN;`treedb` 段是实验性后端的自检,`treedbmatrix` 把 posix/e2e 的整体断言矩阵在那个后端上重放(只认 `pass=39 fail=0 skip=10` 这个契约三元组),`treedbctl` 是控制面第三臂(`GROVEFS_TREEDB_CONTROL=engine` 时凭据、审计与 web 账号/授权行落进引擎的通用表,默认关)——这三个都在默认构建(未开 `--features treedb`)整段 SELF-SKIP,同样不拉低 GREEN。
+全板一共 **44 段**:`build` → `unit` → **41 个套件** → `bench`。**前 43 段门控 GREEN,`bench` 只打吞吐参考值、永不门控**(只要纯功能回归就 `SKIP_BENCH=1`)。`pg`/`pg_parallel`/`evict`/`control`/`forksrv` 在无可达 PostgreSQL 的主机上整段自动 SKIP,`client` 在没有同级 `grovefs-client` 检出(或其二进制、`fusermount` 助手)的机器上整段 SKIP,`xfer`/`gcremote` 则跳过 PG 臂只跑 SQLite 臂,都不拉低 GREEN;`treedb` 段是实验性后端的自检,`treedbmatrix` 把 posix/e2e 的整体断言矩阵在那个后端上重放(只认 `pass=39 fail=0 skip=10` 这个契约三元组),`treedbctl` 是控制面第三臂(`GROVEFS_TREEDB_CONTROL=engine` 时凭据、审计与 web 账号/授权行落进引擎的通用表,默认关;并覆盖 §3.5.4 的 `control-migrate` 搬家)——这三个都在默认构建(未开 `--features treedb`)整段 SELF-SKIP,同样不拉低 GREEN。
 
 ```bash
 export LC_ALL=C LANG=C                                 # 仓库根目录下执行(PKG_CONFIG 不必设:无 crate 查 pkg-config,§1)

@@ -77,8 +77,12 @@ use crate::control::PgPool;
 /// §10 C 4, milestone M1). A child module so it can reuse this module's private
 /// helpers (`now_iso`, `expiry_passed`, `StoredKey`, …) instead of copying them —
 /// two copies of the verification inputs are exactly how two backends drift.
+///
+/// `pub(crate)` for M2: `control_migrate` needs the column names and the table
+/// shapes this module declares, so the migration cannot drift from the storage
+/// format it is filling.
 #[cfg(feature = "treedb")]
-mod treedb_ctl;
+pub(crate) mod treedb_ctl;
 
 /// A successfully authenticated key's identity (never the secret or hash).
 ///

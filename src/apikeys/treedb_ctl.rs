@@ -35,7 +35,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use treedb::engine::model::{errno, Op, Reply, TableDef, PUT_IF_ABSENT, ROW_PK};
 
 use super::{expiry_passed, now_ms, CallLog, KeyInfo, StoredKey};
-use crate::control_treedb::{col, flag, is_set, opt, opt_str, text, Rows, PAGE};
+use crate::control_treedb::{
+    col, dump, flag, is_set, opt, opt_str, put_fields, text, Fields, Rows, PAGE,
+};
 
 /// 引擎的 `tables` 没有命名空间，前缀是唯一的隔离手段。
 const T_KEYS: &str = "grovefs_control__api_keys";
@@ -342,7 +344,10 @@ impl TreedbKeys {
 // ---- 编码 ----------------------------------------------------------------
 
 /// `mcp_calls` 的主键：两个 8 字节大端取反，所以「新」排在「旧」前面。
-fn call_key(ts_us: i64, seq: u64) -> Vec<u8> {
+///
+/// `pub(crate)` 是给 M2 的：`control-migrate` 必须用**同一个**公式给本地审计行
+/// 算键，否则迁移过去的行在 `recent_calls` 里的顺序与今天不同。
+pub(crate) fn call_key(ts_us: i64, seq: u64) -> Vec<u8> {
     let mut k = Vec::with_capacity(16);
     k.extend_from_slice(&(!(ts_us as u64)).to_be_bytes());
     k.extend_from_slice(&(!seq).to_be_bytes());
@@ -409,7 +414,7 @@ fn usage_def() -> TableDef {
 fn calls_def() -> TableDef {
     TableDef {
         name: T_CALLS.as_bytes().to_vec(),
-        // 主键 = `!ts_us || !seq`（[`call_key`]），所以这里不从主键拆 ts_us 列；
+        // 主键 = `!ts_us || !seq`（[`call_key`]），所以这里不从主键拆 ts_us 列 ；
         // `ts` 是给人看的那份文本，与 SQL 档逐字相同。
         columns: vec![
             col("ts", 0),
@@ -421,4 +426,58 @@ fn calls_def() -> TableDef {
             col("detail", 0),
         ],
     }
+}
+
+// ---- 迁移面（M2：`grovefs control-migrate --to engine`）--------------------
+//
+// 三张表的「引擎列序 ↔ 本地 SQLite 列名」与开表用的 DDL 交出去，迁移那边只按名
+// 填值、按名比对，不抄任何列号。**列名与上面 `AK_*` 那一段必须同时改**：名字列
+// 表是从那段常量复述出来的，顺序错了 `put_fields` 会把值写进隔壁列。
+
+pub(crate) const KEY_COLS: [&str; AK_COLS] = [
+    "label",
+    "secret_hash",
+    "secret_hint",
+    "scope",
+    "view",
+    "ro",
+    "owner",
+    "note",
+    "created_at",
+    "created_by",
+    "expires_at",
+    "revoked_at",
+];
+/// 引擎里这张表的唯一一列，本地是 `api_keys.last_used_at`（M1 把它拆了出来，
+/// 免得每次鉴权都去 CAS 凭据行）。
+pub(crate) const USAGE_COLS: [&str; 1] = ["last_used_at"];
+pub(crate) const CALL_COLS: [&str; MC_COLS] =
+    ["ts", "key_id", "key_label", "method", "tool", "ok", "detail"];
+
+pub(crate) fn tables() -> [TableDef; 3] {
+    [keys_def(), usage_def(), calls_def()]
+}
+
+pub(crate) fn put_key(rows: &Rows, key: &[u8], f: &Fields) -> Result<(), String> {
+    put_fields(rows, T_KEYS, key, &KEY_COLS, f)
+}
+
+pub(crate) fn put_usage(rows: &Rows, key: &[u8], f: &Fields) -> Result<(), String> {
+    put_fields(rows, T_USAGE, key, &USAGE_COLS, f)
+}
+
+pub(crate) fn put_call(rows: &Rows, key: &[u8], f: &Fields) -> Result<(), String> {
+    put_fields(rows, T_CALLS, key, &CALL_COLS, f)
+}
+
+pub(crate) fn dump_keys(rows: &Rows) -> Result<Vec<(Vec<u8>, Fields)>, String> {
+    dump(rows, T_KEYS, &KEY_COLS)
+}
+
+pub(crate) fn dump_usage(rows: &Rows) -> Result<Vec<(Vec<u8>, Fields)>, String> {
+    dump(rows, T_USAGE, &USAGE_COLS)
+}
+
+pub(crate) fn dump_calls(rows: &Rows) -> Result<Vec<(Vec<u8>, Fields)>, String> {
+    dump(rows, T_CALLS, &CALL_COLS)
 }

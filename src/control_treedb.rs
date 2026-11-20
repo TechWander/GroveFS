@@ -266,6 +266,80 @@ pub(crate) fn is_set(b: &[u8]) -> bool {
     b.first() == Some(&b'1')
 }
 
+// ---- named rows (M2: `control-migrate`) -----------------------------------
+
+/// One row's values addressed by NAME, never by index.
+///
+/// Its one user is `control-migrate`, which builds a value per LOCAL SQLite row
+/// and compares it with one dumped from the engine. Names make two things
+/// possible that indices cannot: a mismatch can say *which column* differs, and
+/// neither side has to learn the other's column order — an old local file that
+/// lacks a later column simply answers the empty byte string (the engine's NULL)
+/// instead of shifting every following value by one.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Fields(pub(crate) Vec<(String, Vec<u8>)>);
+
+impl Fields {
+    pub(crate) fn push(&mut self, name: &str, value: Vec<u8>) {
+        self.0.push((name.to_string(), value));
+    }
+
+    /// The column's bytes; a name this row does not carry is empty, which is how
+    /// every optional column in these tables is encoded anyway.
+    pub(crate) fn get(&self, name: &str) -> &[u8] {
+        self.0.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_slice()).unwrap_or(b"")
+    }
+
+    /// Fill a column the LOCAL row does not have (a field that only exists on the
+    /// engine side). Replaces in place, so [`Self::get`] keeps answering with the
+    /// new bytes instead of the first, empty entry.
+    pub(crate) fn set(&mut self, name: &str, value: Vec<u8>) {
+        match self.0.iter_mut().find(|(n, _)| n == name) {
+            Some(slot) => slot.1 = value,
+            None => self.0.push((name.to_string(), value)),
+        }
+    }
+}
+
+/// Write one row from named fields. `names` is the ENGINE column order and each
+/// entry names the local column that feeds that slot; the list lives beside the
+/// column indices in each store's `treedb_ctl`, so the order is stated once.
+/// Unconditional (`flags = 0`): M2's contract is "rerun overwrites", not
+/// "rerun collides", and the write is followed by a full read-back comparison.
+pub(crate) fn put_fields(
+    rows: &Rows,
+    table: &str,
+    key: &[u8],
+    names: &[&str],
+    f: &Fields,
+) -> Result<(), String> {
+    let cols: Vec<Vec<u8>> = names.iter().map(|n| f.get(n).to_vec()).collect();
+    rows.put(table, key, cols, 0, None).map_err(|e| e.to_string())
+}
+
+/// Read a whole table back as named fields — the migrate command's verify pass.
+/// The keys come back exactly as the engine stored them, so the comparison covers
+/// the primary key as well as every column.
+pub(crate) fn dump(
+    rows: &Rows,
+    table: &str,
+    names: &[&str],
+) -> Result<Vec<(Vec<u8>, Fields)>, String> {
+    Ok(rows
+        .scan(table)?
+        .into_iter()
+        .map(|(k, cols)| {
+            let mut f = Fields::default();
+            for (i, n) in names.iter().enumerate() {
+                // A short row (a table written by an older build) reads as empty
+                // rather than panicking: the comparison then reports the column.
+                f.push(n, cols.get(i).cloned().unwrap_or_default());
+            }
+            (k, f)
+        })
+        .collect())
+}
+
 pub(crate) fn col(name: &str, flags: u32) -> ColumnDef {
     ColumnDef { name: name.as_bytes().to_vec(), flags }
 }
