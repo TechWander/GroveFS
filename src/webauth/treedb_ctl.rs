@@ -2,12 +2,12 @@
 //! (treedb DESIGN.md §10 C 4, milestone M1b) — the second half of "the control
 //! plane moves into the engine", beside [`super::super::apikeys`]' credentials.
 //!
-//! Same switch, same routing rule, same row plumbing: the three entry points are
-//! `GROVEFS_TREEDB_CONTROL=engine`, the `--meta-store treedb://…` URI, and
-//! [`crate::control_treedb::Rows`]. The reason the switch exists is stated once in
-//! [`super::WebAuthStore::open_treedb`]: until the tables are FILLED, routing here
-//! by default would report every account as unknown, which reads as "nobody can
-//! log in" rather than "the migration has not run".
+//! Same routing rule as the credentials, same row plumbing: the entry points are
+//! the `--meta-store treedb://…` URI and [`crate::control_treedb::Rows`] (there
+//! is no switch since M3). Why an un-migrated deployment is REFUSED rather than
+//! served empty is stated once in [`super::WebAuthStore::open_treedb`]: until the
+//! tables are FILLED, routing here would report every account as unknown, which
+//! reads as "nobody can log in" rather than "the migration has not run".
 //!
 //! **Two tables, six and five columns, and one of them is a `rev`.**
 //! `RowPut` replaces the whole row (the engine has no "update this column"), so

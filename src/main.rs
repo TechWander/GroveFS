@@ -799,22 +799,25 @@ NOTES
         #[command(subcommand)]
         action: ApikeyAction,
     },
-    /// Move the control plane's LOCAL rows into the `treedb` engine's generic
-    /// tables (treedb DESIGN.md §10 C 4, milestone M2).
+    /// Copy the control plane's LOCAL rows into the `treedb` engine's generic
+    /// tables (treedb DESIGN.md §10 C 4, milestone M2; required before M3 serves).
     ///
-    /// The control-plane rows — credentials, call audit, sign-in accounts,
-    /// delegations — live in `<meta-dir>/meta/api_keys.db` and
-    /// `<meta-dir>/meta/web_accounts.db` until `GROVEFS_TREEDB_CONTROL=engine`
-    /// routes the servers to the engine instead. That switch is off by default
-    /// because the engine's tables start EMPTY: turning it on before this command
-    /// runs reports every key and account as unknown ("nobody can log in").
+    /// Up to M2 the control-plane rows — credentials, call audit, sign-in
+    /// accounts, delegations — lived in `<meta-dir>/meta/api_keys.db` and
+    /// `<meta-dir>/meta/web_accounts.db`, and a switch said whether to read them
+    /// or the engine. Since M3 there is no switch: under `--meta-store treedb://…`
+    /// the engine's tables ARE the control plane, so a deployment that still keeps
+    /// rows in those files either runs this command or is refused at startup ("the
+    /// engine holds 0 rows but the files still hold N") — the same no-login symptom
+    /// the switch used to prevent, now caught where it can be explained.
     ///
-    /// Run it with the serving process stopped and the switch unset — the command
-    /// refuses to run with the switch on, because then the engine is the live
-    /// store and this would put stale rows on top of it. It is idempotent (a rerun
-    /// overwrites), it writes byte for byte, and it verifies every table by
-    /// reading it back (key set both ways, then every column): a mismatch exits
-    /// non-zero rather than leaving a half-copied control plane.
+    /// Run it with the serving process stopped, before starting the new one. It is
+    /// idempotent (a rerun overwrites), it writes byte for byte, and it verifies
+    /// every table by reading it back (key set both ways, then every column): a
+    /// mismatch exits non-zero rather than leaving a half-copied control plane.
+    /// The source files are left untouched — the server's first start after a
+    /// verified copy retires them to `*.pre-treedb`, and renaming them back is the
+    /// rollback.
     ControlMigrate {
         /// Where to move them. `engine` is the only target.
         #[arg(long = "to", value_name = "TARGET", default_value = "engine")]
@@ -1910,8 +1913,8 @@ fn control_migrate_cmd(
     if to != "engine" {
         return Err(format!(
             "`--to {to}` is not a target this build knows: the control plane can only move into \
-             the treedb engine (`--to engine`), which the servers then read through `{}`=`engine`",
-            grovefs::apikeys::ApiKeyStore::TREEDB_CONTROL_ENV
+             the treedb engine (`--to engine`), which is where the servers keep it under \
+             `--meta-store treedb://…`"
         )
         .into());
     }
@@ -1944,10 +1947,8 @@ fn control_migrate_cmd(
         report.rows, report.tables
     );
     println!(
-        "next: start the servers with the same --meta-store and {}={} — the local files are \
-         untouched, so unsetting the switch is the rollback",
-        grovefs::apikeys::ApiKeyStore::TREEDB_CONTROL_ENV,
-        "engine"
+        "next: start the servers with the same --meta-store — the first one retires the local \
+         files to *.pre-treedb once it can serve, and renaming them back is the rollback"
     );
     Ok(())
 }
@@ -4719,8 +4720,9 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::ControlMigrate { to, db_path, store } => {
             // The one command that WANTS a `treedb://` --meta-store (hence no
             // `refuse_treedb_store` here): its whole job is writing that engine's
-            // control tables. The switch guard inside rejects the case where the
-            // engine is already the live store.
+            // control tables. Since M3 it also refuses when the sources are
+            // already retired (`*.pre-treedb`), because that means a verified
+            // copy is what the engine is serving.
             let mig_base = db_path.unwrap_or_else(|| base.clone());
             control_migrate_cmd(&to, &mig_base, resolve_store(store))?;
         }

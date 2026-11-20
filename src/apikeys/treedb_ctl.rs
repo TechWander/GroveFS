@@ -7,9 +7,10 @@
 //! 任何 SQL 拼装。`exec2`/`query2` 里那个 `Backend::Treedb(_) => Err(...)` 分支因此
 //! 永远不该被走到，留成拒绝而不是 `unreachable!()`（同 PG 分支的理由）。
 //!
-//! **开关**：`GROVEFS_TREEDB_CONTROL=engine` 且 `--meta-store treedb://…`，**默认关**。
-//! M1 落地而 M2（迁移）还没跑时，引擎里的控制面是空的，默认切过去等于把所有密钥与
-//! 账户判成不存在 —— 症状是「谁都登录不了」，不是「迁移没做」。M3 完成后删掉开关。
+//! **入口**：`--meta-store treedb://…` 即走这里 —— 没有开关（M3 删掉了
+//! `GROVEFS_TREEDB_CONTROL`）。引擎里的控制面为空而本地旧文件还有行时，服务端启动会
+//! 拒绝并点名 `grovefs control-migrate`，否则症状是「谁都登录不了」，不是「迁移没做」；
+//! 迁移跑过之后，`control_migrate::settle` 把旧文件改名为 `*.pre-treedb`。
 //!
 //! **形状**（与 §10 C 4 逐条对应，改动时两处一起改）：
 //! - 表名一律 `grovefs_control__` 前缀：引擎的 `tables` 是一张平表，没有命名空间也

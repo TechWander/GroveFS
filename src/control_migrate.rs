@@ -2,12 +2,22 @@
 //! tables** (treedb DESIGN.md §10 C 4): `grovefs control-migrate --to engine`.
 //!
 //! M1 taught the servers to keep credentials, audit, sign-in accounts and
-//! delegations in the engine — behind `GROVEFS_TREEDB_CONTROL=engine` and
-//! **default off**, precisely because those tables start empty: flipping the
-//! switch before this command runs would report every key and account as
-//! unknown. This module fills them from the files the switch moves away from:
-//! `<base>/meta/api_keys.db` (keys + audit) and `<base>/meta/web_accounts.db`
-//! (accounts + grants).
+//! delegations in the engine; M3 made that unconditional, so the two local files
+//! this module reads are now **pre-M3 leftovers**: `<base>/meta/api_keys.db`
+//! (keys + audit) and `<base>/meta/web_accounts.db` (accounts + grants). They are
+//! the only source this command has, and nothing but this command reads them once
+//! the engine holds rows.
+//!
+//! M3's two halves live in [`settle`], which every store-open goes through:
+//! * **refuse to serve an unmigrated deployment.** Engine empty + local files
+//!   holding rows ⇒ error naming this command. The alternative is the symptom the
+//!   switch existed to prevent: every key and account reported as unknown, which
+//!   an operator reads as "nobody can log in", not as "the migration was not
+//!   run".
+//! * **retire the files once the engine can serve.** Engine holds rows ⇒ rename
+//!   both to `<name>.pre-treedb` (never over an existing copy), so a later
+//!   `control-migrate` cannot put stale rows back on a live control plane. The
+//!   rename is the cutover and the rollback is `mv` back + the old binary.
 //!
 //! Four rules, each with the reason it exists:
 //!
@@ -26,8 +36,8 @@
 //! 3. **Nothing is trusted until it is read back.** After the writes each table
 //!    is dumped from the engine and compared with what was read locally: the key
 //!    set in both directions, then every column, byte for byte. A mismatch is an
-//!    error and a non-zero exit — M3 (delete the switch) must not start on a
-//!    partial copy.
+//!    error and a non-zero exit — the cutover renames away the only other copy,
+//!    so it must never start on a partial one.
 //! 4. **Column names, never indices.** The engine column order ↔ local column
 //!    name mapping lives in each store's `treedb_ctl` (`KEY_COLS`,
 //!    `ACCOUNT_COLS`, …) right beside the indices it restates. Two things follow:
@@ -42,16 +52,20 @@
 //! account row has no CAS counter to copy.
 //!
 //! Deliberately NOT this module's job: creating views, moving trees, and above
-//! all **deleting the local files**. They stay where they are, because the
-//! rollback is "unset the switch" — a migration that also ate its own source
-//! would take that away.
+//! all **deleting the local files**. This command only ever writes to the
+//! engine; the rename to `*.pre-treedb` is [`settle`]'s, run by the serving
+//! process, and it only ever renames. A migration that also ate its own source
+//! would take away the one thing the rollback (`mv` back + the old binary) needs.
 //!
-//! Stop the serving process first. The source is opened READ-ONLY (this command
-//! may only write to the engine), but a live SQLite writer can still commit a row
-//! between the read and the read-back, and that row would be reported as missing.
+//! **Run this BEFORE the new server starts, not while it runs.** The source is
+//! opened READ-ONLY, but a live SQLite writer can still commit a row between the
+//! read and the read-back, and that row would be reported as missing. A running
+//! M3 server would also rename the sources out from under the read — and both
+//! happen for the same reason: the files are only stable when nothing serves
+//! them.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::types::Value;
 use rusqlite::{Connection, OpenFlags};
@@ -79,24 +93,35 @@ pub struct Report {
 /// command prints them as they happen, so a run that dies halfway still says how
 /// far it got.
 pub fn run(base: &Path, uri: &str, say: &mut dyn FnMut(&str)) -> Result<Report, String> {
-    if crate::apikeys::ApiKeyStore::treedb_control_enabled() {
-        return Err(format!(
-            "`{}` is set to `engine`: the engine's control tables are the LIVE store right now, so \
-             writing the local files into them would put stale rows on top of live ones (a revoked \
-             key came back, a rotated password reverted). Unset it, migrate, then set it again",
-            crate::apikeys::ApiKeyStore::TREEDB_CONTROL_ENV
-        ));
-    }
     let addr = treedb_store::parse_addr(uri)?;
 
-    let keys_path = base.join("meta").join("api_keys.db");
-    let accounts_path = base.join("meta").join("web_accounts.db");
+    let [keys_path, accounts_path] = local_files(base);
     let keys = open_local(&keys_path)?;
     let accounts = open_local(&accounts_path)?;
     if keys.is_none() && accounts.is_none() {
+        // A `.pre-treedb` sibling means this deployment has already cut over:
+        // the files were renamed by [`settle`] after a verified copy. Saying so
+        // is the difference between "you are in the wrong directory" and "this
+        // ran already", and only the second one has a rollback to explain.
+        let retired: Vec<String> = [&keys_path, &accounts_path]
+            .iter()
+            .map(|p| retired_name(p))
+            .filter(|p| p.exists())
+            .map(|p| p.display().to_string())
+            .collect();
+        if !retired.is_empty() {
+            return Err(format!(
+                "the control plane has already been retired into the engine: {}. A `.pre-treedb` \
+                 name means this deployment cut over (the serving process renamed them after a \
+                 verified copy). To copy again, stop the server and rename them back first \
+                 (`mv <name>.pre-treedb <name>`) — that is also the rollback to a build that reads \
+                 the local files",
+                retired.join(", ")
+            ));
+        }
         return Err(format!(
             "nothing to migrate: neither {} nor {} exists. This is either not the \
-             meta-server's --meta-dir, or the control plane is already where the switch points",
+             meta-server's --meta-dir, or the control plane here is in the engine already",
             keys_path.display(),
             accounts_path.display()
         ));
@@ -130,6 +155,159 @@ pub fn run(base: &Path, uri: &str, say: &mut dyn FnMut(&str)) -> Result<Report, 
         say(&format!("{:<38} {:>6} rows written, verified", table_name(mv), expected.len()));
     }
     Ok(Report { tables: moves.len(), rows: total })
+}
+
+// ---- M3: the two halves every store-open runs ------------------------------
+
+/// The two local files a pre-M3 deployment kept its control plane in, in the
+/// order the servers open them.
+fn local_files(base: &Path) -> [PathBuf; 2] {
+    let meta = base.join("meta");
+    [meta.join("api_keys.db"), meta.join("web_accounts.db")]
+}
+
+/// Where a retired file goes: `<name>.pre-treedb`, beside it.
+fn retired_name(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".pre-treedb");
+    PathBuf::from(s)
+}
+
+/// `GROVEFS_TREEDB_CONTROL` is retired (M3). It is no longer read; a unit file
+/// that still sets it gets one line saying so, because the alternative is an
+/// operator who believes a switch is still steering their deployment.
+pub(crate) fn retired_switch_note() -> Option<String> {
+    std::env::var_os("GROVEFS_TREEDB_CONTROL")
+        .filter(|v| !v.is_empty())
+        .map(|v| {
+            format!(
+                "GROVEFS_TREEDB_CONTROL={} is no longer read (M3): under `--meta-store treedb://…` \
+                 the control plane ALWAYS lives in the engine's generic tables; drop it from the unit \
+                 file",
+                v.to_string_lossy()
+            )
+        })
+}
+
+/// **M3's cutover, run by every process that opens the control plane.**
+///
+/// Two questions, in this order, and the answers are the two halves of M3:
+///
+/// 1. *Is there anything to move?* The local files still hold rows while the
+///    engine's tables are empty ⇒ refuse, naming `control-migrate`. Serving from
+///    an empty engine is the "nobody can log in" failure the old switch existed
+///    to make impossible; now that the switch is gone this is where it is caught.
+/// 2. *Can the engine serve?* It holds rows (or there was nothing to lose) ⇒
+///    retire the files to `<name>.pre-treedb`. That is the cutover: after it,
+///    `control-migrate` refuses (see [`run`]) instead of putting stale rows back
+///    on top of a live control plane.
+///
+/// The "anything to move" count comes from [`moves`] — the same table of sources
+/// the command copies — so this guard cannot disagree with the command about what
+/// is in those files.
+///
+/// Printed to STDERR: a CLI's stdout stays machine-readable (`apikey list` must
+/// not grow a housekeeping line), and a server's stderr goes to the journal with
+/// the rest of the banner.
+pub(crate) fn settle(base: &Path, addr: &str) -> Result<(), String> {
+    let [keys_path, accounts_path] = local_files(base);
+    if !keys_path.is_file() && !accounts_path.is_file() {
+        // Steady state (or a fresh deployment): two `stat`s, no engine traffic.
+        return Ok(());
+    }
+    let keys = open_local(&keys_path)?;
+    let accounts = open_local(&accounts_path)?;
+    let moves = moves();
+    let mut local: Vec<usize> = Vec::with_capacity(moves.len());
+    for mv in &moves {
+        let conn = match mv.db {
+            Db::Keys => keys.as_ref(),
+            Db::Accounts => accounts.as_ref(),
+        };
+        local.push(read_source(conn, mv)?.len());
+    }
+    let pending: usize = local.iter().sum();
+
+    let rows = Rows::open(addr)?;
+    let mut engine: Vec<u64> = Vec::with_capacity(moves.len());
+    for mv in &moves {
+        rows.create(mv.def.clone())?;
+        engine.push(rows.total(&table_name(mv))?);
+    }
+    let live: u64 = engine.iter().sum();
+    let present: Vec<&Path> = [&keys_path, &accounts_path]
+        .into_iter()
+        .map(PathBuf::as_path)
+        .filter(|p| p.is_file())
+        .collect();
+    if live == 0 && pending > 0 {
+        return Err(format!(
+            "refusing to serve an unmigrated control plane: the engine at {addr} holds 0 rows, \
+             but {} still holds {pending} (keys, usage, audit, accounts, grants). Under \
+             `--meta-store treedb://…` the control plane lives ONLY in the engine's generic tables, \
+             so starting now would report every key and account as unknown. Run \
+             `grovefs control-migrate --to engine --meta-dir {} --meta-store treedb://{addr}` first \
+             — it copies, verifies every column, and then this process retires the old files to \
+             `*.pre-treedb` (treedb DESIGN.md §10 C 4, M3)",
+            present
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" and "),
+            base.display(),
+        ));
+    }
+    // The engine can serve (or there was nothing in those files to lose): cut
+    // over. A previous `.pre-treedb` copy is never overwritten — two copies of a
+    // control plane are worth keeping one of, and silently eating the older one
+    // would remove the only evidence of what was there before.
+    //
+    // Before the rename, say so when the engine holds FEWER rows than the file:
+    // the rows are not lost (the copy keeps them) but they stop being served,
+    // and "my key disappeared" is a bad way to learn that. Counts, not a set
+    // comparison, because this runs on every start of a pre-cutover deployment
+    // and a difference of counts already means "someone wrote after the copy".
+    for (mv, (local_rows, engine_rows)) in moves.iter().zip(local.iter().zip(&engine)) {
+        if *local_rows as u64 > *engine_rows {
+            let src = match mv.db {
+                Db::Keys => &keys_path,
+                Db::Accounts => &accounts_path,
+            };
+            eprintln!(
+                "grovefs: {} — the engine holds {engine_rows} rows, {} holds {local_rows}: {} \
+                 row(s) exist only in the copy about to be retired (stop, rename it back and rerun \
+                 `grovefs control-migrate` if they are needed)",
+                table_name(mv),
+                src.display(),
+                *local_rows as u64 - *engine_rows,
+            );
+        }
+    }
+    // The rename moves the main file only. SQLite's `-wal`/`-shm` siblings stay
+    // under their old names on purpose: `mv` back has to find a matching pair, so
+    // a rollback gets exactly the database that was being served, not one with
+    // its last committed (still uncheckpointed) rows missing.
+    for path in present {
+        let to = retired_name(path);
+        if to.exists() {
+            eprintln!(
+                "grovefs: leaving {} in place — {} already exists (nothing reads it; delete the \
+                 extra copy when you no longer need it)",
+                path.display(),
+                to.display()
+            );
+            continue;
+        }
+        std::fs::rename(path, &to)
+            .map_err(|e| format!("retiring {} to {}: {e}", path.display(), to.display()))?;
+        eprintln!(
+            "grovefs: control plane cut over — {} → {} (the engine's generic tables are the live \
+             store; rename back to roll back to a build that reads the files)",
+            path.display(),
+            to.display()
+        );
+    }
+    Ok(())
 }
 
 // ---- what moves, and how ----------------------------------------------------

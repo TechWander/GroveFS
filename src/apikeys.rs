@@ -602,42 +602,20 @@ impl ApiKeyStore {
         })
     }
 
-    /// 把控制面写进 treedb 引擎的通用表需要显式带上这个开关（见 [`Self::open_treedb`]）。
-    #[cfg(feature = "treedb")]
-    pub const TREEDB_CONTROL_ENV: &'static str = "GROVEFS_TREEDB_CONTROL";
-
-    /// Whether this process has been told to keep its control plane in the
-    /// treedb engine (`GROVEFS_TREEDB_CONTROL=engine`). One reader, so the route
-    /// decision (`open_treedb`) and the address the servers pass in
-    /// (`StoreKind::control_tables_uri`) cannot disagree about what the switch says.
-    #[cfg(feature = "treedb")]
-    pub fn treedb_control_enabled() -> bool {
-        std::env::var(Self::TREEDB_CONTROL_ENV)
-            .map(|v| v == "engine")
-            .unwrap_or(false)
-    }
-
     /// The control plane in the treedb engine's generic tables
-    /// ([`treedb_ctl`]). Opt-in per process: `GROVEFS_TREEDB_CONTROL=engine`.
+    /// ([`treedb_ctl`]). **Unconditional since M3**: under `--meta-store
+    /// treedb://…` these tables ARE the credential store — the switch that used to
+    /// gate this is gone, because a deployment that never migrated is now refused
+    /// by [`crate::control_migrate::settle`] (with a sentence naming the command)
+    /// instead of being served an empty store.
     ///
-    /// Why a switch and not just "route on the URI": until the control tables have
-    /// been FILLED (the migration milestone), they are empty — routing there
-    /// unconditionally would report every key and account as unknown, which an
-    /// operator would read as "nobody can log in", not as "the migration was not
-    /// run". The switch is deleted once the migration lands.
+    /// `settle` also retires the pre-M3 local files into `*.pre-treedb` here, so
+    /// every entry into the engine route goes through one cutover. Nothing else
+    /// reads those files once the engine holds rows.
     #[cfg(feature = "treedb")]
-    pub fn open_treedb(uri: &str) -> Result<Self, String> {
-        let on = Self::treedb_control_enabled();
-        if !on {
-            return Err(format!(
-                "`{uri}` is a treedb tree store: its control plane lives in the engine's generic \
-                 tables, which are only read when `{}` is set to `engine` (and only after they have \
-                 been filled); without it, mint and check keys against the LOCAL SQLite beside the \
-                 meta-server's --meta-dir",
-                Self::TREEDB_CONTROL_ENV
-            ));
-        }
+    pub fn open_treedb(base: &Path, uri: &str) -> Result<Self, String> {
         let addr = crate::treedb_store::parse_addr(uri)?;
+        crate::control_migrate::settle(base, &addr)?;
         let keys = treedb_ctl::TreedbKeys::open(&addr)?;
         Ok(Self {
             backend: Backend::Treedb(Box::new(keys)),
@@ -655,10 +633,10 @@ impl ApiKeyStore {
             // ([`crate::pg_store::is_pg_store`]); the pool binds the registry's
             // FIRST entry, where the control schema lives.
             Some(u) if crate::pg_store::is_pg_store(u) => Self::open_pg(u),
-            // A `treedb://` tree store: the control plane moves into the engine's
-            // generic tables, behind [`Self::TREEDB_CONTROL_ENV`] (see `open_treedb`).
+            // A `treedb://` tree store: the control plane lives in the engine's
+            // generic tables (see `open_treedb`, which also runs M3's cutover).
             #[cfg(feature = "treedb")]
-            Some(u) if crate::treedb_store::is_treedb_store(u) => Self::open_treedb(u),
+            Some(u) if crate::treedb_store::is_treedb_store(u) => Self::open_treedb(base, u),
             Some(u) if u.contains("://") => Err(format!(
                 "`{u}` is not a --meta-store scheme GroveFS supports: credentials live in a local SQLite file or PostgreSQL (`postgres://…`)"
             )),
@@ -1503,7 +1481,13 @@ mod tests {
                     |r| r.get::<_, String>(0),
                 )
                 .unwrap(),
+            // `store()` above opens the FILE backend; these two arms exist so the
+            // match stays exhaustive when the experimental backends are compiled
+            // in (`cargo test --features treedb` was not even buildable without
+            // the treedb arm, which is why M3 added it).
             Backend::Pg(_) => unreachable!("unit store is the file backend"),
+            #[cfg(feature = "treedb")]
+            Backend::Treedb(_) => unreachable!("unit store is the file backend"),
         };
         assert_eq!(stored.len(), 64);
         assert_ne!(stored, key.split_once(':').unwrap().1);

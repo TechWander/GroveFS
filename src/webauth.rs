@@ -17,10 +17,11 @@
 //! `api_keys.db`; under PostgreSQL they are `grovefs_control.web_accounts` /
 //! `web_grants`, so a secondary meta-server (or a second web gateway aimed at
 //! the same URI) sees the same accounts with nothing to colocate. Under
-//! `--meta-store treedb://…` with `GROVEFS_TREEDB_CONTROL=engine` they are the
-//! engine's generic tables `grovefs_control__web_accounts` / `__web_grants`
-//! ([`treedb_ctl`], treedb DESIGN.md §10 C 4 milestone M1b); the switch is off
-//! by default and then the local file is still the store.
+//! `--meta-store treedb://…` they are the engine's generic tables
+//! `grovefs_control__web_accounts` / `__web_grants` ([`treedb_ctl`], treedb
+//! DESIGN.md §10 C 4 milestones M1b/M3). There is no switch: a local file left
+//! over from before M3 is copied over by `control-migrate` and then retired to
+//! `*.pre-treedb` by [`crate::control_migrate::settle`].
 //!
 //! **The server verifies passwords.** The web gateway
 //! ([`crate::web`]) holds the ONE root admin key and forwards the credentials a
@@ -427,15 +428,15 @@ impl WebAuthStore {
 
     /// Route by metadata backend, the same rule the keys and definitions
     /// follow: a PostgreSQL URI (inline list or `file:` registry) uses the
-    /// shared schema, a `treedb://` URI the engine's generic tables (behind the
-    /// same `GROVEFS_TREEDB_CONTROL` switch the credentials use), anything else
-    /// the local file. An unknown `scheme://` is refused rather than quietly
-    /// falling back to a file the deployment never reads.
+    /// shared schema, a `treedb://` URI the engine's generic tables (M3: the same
+    /// route the credentials take — no switch), anything else the local file. An
+    /// unknown `scheme://` is refused rather than quietly falling back to a file
+    /// the deployment never reads.
     pub fn open_for(base: &std::path::Path, store_uri: Option<&str>) -> Result<Self, String> {
         match store_uri {
             Some(u) if crate::pg_store::is_pg_store(u) => Self::open_pg(u),
             #[cfg(feature = "treedb")]
-            Some(u) if crate::treedb_store::is_treedb_store(u) => Self::open_treedb(u),
+            Some(u) if crate::treedb_store::is_treedb_store(u) => Self::open_treedb(base, u),
             Some(u) if u.contains("://") => Err(format!(
                 "`{u}` is not a --meta-store scheme GroveFS supports: web accounts live in a local SQLite file or PostgreSQL (`postgres://…`)"
             )),
@@ -444,25 +445,16 @@ impl WebAuthStore {
     }
 
     /// The accounts in the treedb engine's generic tables (treedb DESIGN.md §10
-    /// C 4, milestone M1b). Opt-in per process: `GROVEFS_TREEDB_CONTROL=engine`,
-    /// read through the SAME function the credential store reads, so the two
-    /// halves of the control plane can never disagree about what the switch says.
+    /// C 4, milestone M1b; unconditional since M3). The same [`settle`] the
+    /// credential store runs gates this one too: an unmigrated deployment is
+    /// refused by name, and the pre-M3 local files are retired once the engine can
+    /// serve — so "who may log in" is never answered from an empty table.
     ///
-    /// Why a switch at all: until the tables are filled by the migration, routing
-    /// here unconditionally would report every account as unknown. The operator
-    /// would see "nobody can log in", not "the migration has not run" — and this
-    /// store decides who may log in.
+    /// [`settle`]: crate::control_migrate::settle
     #[cfg(feature = "treedb")]
-    pub fn open_treedb(uri: &str) -> Result<Self, String> {
-        if !crate::apikeys::ApiKeyStore::treedb_control_enabled() {
-            return Err(format!(
-                "`{uri}` is a treedb tree store: its sign-in accounts live in the engine's generic \
-                 tables, which are only read when `{}` is set to `engine`; without it, keep the \
-                 accounts in the LOCAL SQLite beside the meta-server's --meta-dir",
-                crate::apikeys::ApiKeyStore::TREEDB_CONTROL_ENV
-            ));
-        }
+    pub fn open_treedb(base: &std::path::Path, uri: &str) -> Result<Self, String> {
         let addr = crate::treedb_store::parse_addr(uri)?;
+        crate::control_migrate::settle(base, &addr)?;
         Ok(Self {
             backend: Backend::Treedb(Box::new(treedb_ctl::TreedbAccounts::open(&addr)?)),
         })

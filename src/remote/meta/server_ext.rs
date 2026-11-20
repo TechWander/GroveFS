@@ -101,13 +101,13 @@ impl HaState {
 ///
 /// The third kind, behind `--features treedb`, is the EXPERIMENTAL engine
 /// (`--meta-store treedb://host:port`): trees live inside a treedb server, and
-/// — unlike the PG backend — the control TABLES (credentials, accounts,
-/// grants) stay in local SQLite under `--meta-dir` until
-/// `GROVEFS_TREEDB_CONTROL=engine` moves them into the engine's generic tables
-/// (treedb DESIGN.md §10 C 4). The view DEFINITIONS and placement always stay
-/// local for now, because treedb has no table for them. That split is what
-/// [`StoreKind::control_tables_uri`] encodes; nothing else may assume "not
-/// SQLite" means "control lives remote".
+/// the control TABLES (credentials, accounts, grants) live in that engine's
+/// generic tables — unconditionally since M3 (the `GROVEFS_TREEDB_CONTROL`
+/// switch is gone; an unmigrated deployment is refused by name instead of being
+/// served an empty store, see `control_migrate::settle`). The view DEFINITIONS
+/// and placement still stay local for now, because treedb has no table for
+/// them. That split is what [`StoreKind::control_tables_uri`] encodes; nothing
+/// else may assume "not SQLite" means "control lives remote".
 #[derive(Clone, Debug)]
 pub enum StoreKind {
     Sqlite,
@@ -135,23 +135,19 @@ impl StoreKind {
 
     /// Where the CREDENTIAL and ACCOUNT stores (`api_keys`, `api_key_usage`,
     /// `mcp_calls`, `web_accounts`, `web_grants`) live — the same answer as
-    /// [`Self::control_uri`] under PG, but under treedb it turns into the engine
-    /// URI **once `GROVEFS_TREEDB_CONTROL=engine` says those tables have been
-    /// moved there**.
+    /// [`Self::control_uri`] under PG, but under treedb it is the engine URI,
+    /// always (M3: the switch that used to gate it is gone).
     ///
     /// Deliberately a second accessor rather than a wider `control_uri`: the
     /// view DEFINITIONS and placement still live in local files (nothing in the
-    /// engine models them yet), so a treedb deployment can have every row-table
-    /// in the engine while the tree-side bookkeeping stays on disk. With the
-    /// switch off it answers exactly what `control_uri` does, i.e. today's
-    /// local-SQLite shape.
+    /// engine models them yet), so a treedb deployment has every row-table in the
+    /// engine while the tree-side bookkeeping stays on disk.
     pub(crate) fn control_tables_uri(&self) -> Option<String> {
         match self {
             StoreKind::Pg(u) => Some(u.clone()),
             StoreKind::Sqlite => None,
             #[cfg(feature = "treedb")]
-            StoreKind::Treedb(addr) => crate::apikeys::ApiKeyStore::treedb_control_enabled()
-                .then(|| format!("{}{addr}", crate::treedb_store::SCHEME)),
+            StoreKind::Treedb(addr) => Some(format!("{}{addr}", crate::treedb_store::SCHEME)),
         }
     }
 
@@ -805,7 +801,7 @@ impl MetaServer {
         // locally, so creating that directory would be a misleading footprint
         // (an empty `meta/` on a host that has no local metadata at all). Under
         // treedb the directory IS still needed — the view definitions and the
-        // placement table never leave `--meta-dir`, whatever the switch says.
+        // placement table never leave `--meta-dir`.
         if self.store.control_uri().is_none() {
             std::fs::create_dir_all(self.base.join("meta"))?;
         }
@@ -818,10 +814,10 @@ impl MetaServer {
         let (ctl_keys, web_auth, admin_note) = match &self.control_listen {
             None => (None, None, None),
             Some(_) => {
-                // 凭据表与账户表可能已经比视图定义先搬进引擎
-                // （`GROVEFS_TREEDB_CONTROL=engine`），所以这里问的是
-                // `control_tables_uri`：视图定义与 placement 还在本地，用 `control_uri`
-                // 会让 meta-server 读一份刚被 `apikey create` 写空的本地库。
+                // 凭据表与账户表住在引擎的通用表里（M3：开关已删），而视图定义与
+                // placement 还在本地 —— 所以这里问的是 `control_tables_uri`：用
+                // `control_uri` 会让 meta-server 去读一份已经被 `settle` 退休的本地库。
+                // 这条路径也跑 M3 的切写（未迁移则拒启、已迁移则把老文件改名）。
                 let keys_uri = self.store.control_tables_uri();
                 let keys = Arc::new(
                     crate::apikeys::ApiKeyStore::open_for(&self.base, keys_uri.as_deref())
@@ -871,6 +867,16 @@ impl MetaServer {
             self.store.backend_name(),
             self.store.backend_layout()
         );
+        // The switch that used to select this route was deleted (M3). A unit file
+        // that still sets it gets exactly one line saying so: otherwise an
+        // operator keeps believing a knob is steering the deployment, and the next
+        // person to read that file believes it too.
+        #[cfg(feature = "treedb")]
+        if matches!(self.store, StoreKind::Treedb(_)) {
+            if let Some(note) = crate::control_migrate::retired_switch_note() {
+                println!("meta-server: {note}");
+            }
+        }
         // Instance registry, NAMES only (URIs embed passwords and the banner
         // lands in the journal): an operator running a multi-instance
         // deployment must see at startup which instance carries the control
@@ -985,16 +991,7 @@ impl MetaServer {
                     StoreKind::Pg(_) => "grovefs_control.web_accounts/web_grants",
                     StoreKind::Sqlite => "meta/web_accounts.db",
                     #[cfg(feature = "treedb")]
-                    StoreKind::Treedb(_) => {
-                        // Same switch as the credentials (M1a/M1b): when it is on,
-                        // the engine's generic tables are the store and the local
-                        // file is read by nobody.
-                        if crate::apikeys::ApiKeyStore::treedb_control_enabled() {
-                            "the treedb engine's generic tables (GROVEFS_TREEDB_CONTROL=engine)"
-                        } else {
-                            "meta/web_accounts.db (local: the engine's control tables are off)"
-                        }
-                    }
+                    StoreKind::Treedb(_) => "the treedb engine's generic tables",
                 }
             );
             let crt = rt.clone();

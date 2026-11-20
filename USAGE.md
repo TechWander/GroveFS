@@ -1358,7 +1358,7 @@ e2e 见 `ctlplane` 套件(启动横幅/首个 admin key 必须在主机铸造/�
 
 §3.5.2 让任意一台机器都能治理同一份元数据,但入口仍是终端:动词要记、key 要带、拒因要读。高频的三件事——看视图、发密钥、给同事划一块地方——在浏览器里点更省事;而"这个账号管这一块,包括它派生出的 fork、别名和这块地方的密钥"这种**归属**,一把共享的 admin key 说不清,终端里也没有对应的形状。
 
-管理台补的就是这块,而它**不新增一套治理逻辑**。`grovefs web` 是 `meta-server --control-listen` 前面的一个 HTTP 网关:内嵌单页应用(总览/视图/密钥/账号与授权/审计五页,构建期 `include_str!` 进二进制——页面运行时不碰 CDN、不带 node_modules,离线主机也打得开;前端源码在 `console/`(Vue 3 + TypeScript + Vite),产物提交在 `src/webui/`,故 `cargo build` 仍不需要 node 工具链,改前端才跑 `npm ci && npm run build`,见 `console/README.md`),把浏览器会话变成一个**账号**,把每次点击转成一个治理 op 转发过去。"谁能碰哪棵树"的判定仍然只在服务端 `gates()`/`authorize()` 一处;网关只做**减法**,它不路由的动词(`gc.scan`/`gc.apply`/`refs.rebuild`/`view.rm_base`/`fork.graft`)在浏览器里永远到不了,哪怕服务端本来会允许。账号、授权、口令摘要都存在**服务端**(SQLite 档 `<meta-dir>/meta/web_accounts.db`,PG 档是控制库里的表,treedb 档(`GROVEFS_TREEDB_CONTROL=engine`)是引擎的通用表;PBKDF2-HMAC-SHA256 21 万轮),登录校验由持有存储的进程做——网关拿不到密码库,这正是它敢只做翻译层的原因。
+管理台补的就是这块,而它**不新增一套治理逻辑**。`grovefs web` 是 `meta-server --control-listen` 前面的一个 HTTP 网关:内嵌单页应用(总览/视图/密钥/账号与授权/审计五页,构建期 `include_str!` 进二进制——页面运行时不碰 CDN、不带 node_modules,离线主机也打得开;前端源码在 `console/`(Vue 3 + TypeScript + Vite),产物提交在 `src/webui/`,故 `cargo build` 仍不需要 node 工具链,改前端才跑 `npm ci && npm run build`,见 `console/README.md`),把浏览器会话变成一个**账号**,把每次点击转成一个治理 op 转发过去。"谁能碰哪棵树"的判定仍然只在服务端 `gates()`/`authorize()` 一处;网关只做**减法**,它不路由的动词(`gc.scan`/`gc.apply`/`refs.rebuild`/`view.rm_base`/`fork.graft`)在浏览器里永远到不了,哪怕服务端本来会允许。账号、授权、口令摘要都存在**服务端**(SQLite 档 `<meta-dir>/meta/web_accounts.db`,PG 档是控制库里的表,treedb 档是引擎的通用表;PBKDF2-HMAC-SHA256 21 万轮),登录校验由持有存储的进程做——网关拿不到密码库,这正是它敢只做翻译层的原因。
 
 **安装期:第一个管理员只能由持有存储的进程放。** 治理入口若能自己铸管理员,这道门就白设了,所以 bootstrap 挂在 `meta-server` 上而不是 `web` 上:两面 flag 只在账号表**为空**时生效,unit 文件反复读同一个 flag 的重启是幂等的,而换一个 `--admin-user` 会拒绝启动而不是悄悄多塞一个管理员。口令只有 `--admin-password-file`,没有 `--admin-password`——argv 对本机所有进程可见,还会落进 shell history。
 
@@ -1514,12 +1514,15 @@ e2e 见 `web` 套件(178 条:安装期 bootstrap 四种 flag 组合与"被拒的
 
 ### 3.5.4 把控制面搬进 treedb 引擎(实验):`grovefs control-migrate --to engine`
 
-§3.5.1–§3.5.3 的三样东西——密钥、审计、账号与授权——默认住在两个本地文件里:`<meta-dir>/meta/api_keys.db` 与 `<meta-dir>/meta/web_accounts.db`。实验性的 treedb 后端能让它们改住引擎的通用表(`grovefs_control__api_keys` / `api_key_usage` / `mcp_calls` / `web_accounts` / `web_grants`),但那个开关(`GROVEFS_TREEDB_CONTROL=engine`)**默认关**,理由只有一条:引擎里那几张表刚建出来是**空的**,先开开关再搬家,服务端会把所有密钥和账号判成不存在——症状是"谁都登录不了",不是"迁移没做"。`control-migrate` 就是那道搬家的命令,也是 M1–M4 切换顺序里唯一一步"把数据写进引擎"的。
+§3.5.1–§3.5.3 的三样东西——密钥、审计、账号与授权——默认住在两个本地文件里:`<meta-dir>/meta/api_keys.db` 与 `<meta-dir>/meta/web_accounts.db`。treedb 档(`--meta-store treedb://…`)把它们放进引擎的通用表(`grovefs_control__api_keys` / `api_key_usage` / `mcp_calls` / `web_accounts` / `web_grants`),**没有开关**——M3 删掉了曾经用来选路的 `GROVEFS_TREEDB_CONTROL`。没有开关之后,"引擎是空的、文件里还有行"这个事故被拆成两半,各自有一个明确的回答:
+
+- **还没搬**:引擎里那几张表是空的,而本地文件还有行 ⇒ 服务端**拒绝启动**,点名先跑 `control-migrate`。否则症状是"谁都登录不了",而不是"迁移没做"。
+- **搬过之后**:服务端第一次启动时把两个文件改名成 `api_keys.db.pre-treedb` / `web_accounts.db.pre-treedb`,并把引擎当活库。**改名就是切写**;回滚 = 把名字改回来 + 换回读本地文件的旧二进制。
 
 ```bash
 # 1) 先停掉正在服务的 meta-server(理由见下面的边界)
-# 2) 开关保持未设,把两个本地文件搬进引擎(URI 与 meta-server 用同一个)
-GROVEFS_TREEDB_CONTROL= grovefs control-migrate --to engine \
+# 2) 把两个本地文件搬进引擎(URI 与 meta-server 用同一个)
+grovefs control-migrate --to engine \
     --meta-dir /srv/grovefs --meta-store treedb://10.0.0.10:7301
 source /srv/grovefs/meta/api_keys.db
 source /srv/grovefs/meta/web_accounts.db
@@ -1531,11 +1534,18 @@ grovefs_control__web_accounts               2 rows written, verified
 grovefs_control__web_grants                 1 rows written, verified
 
 migrated 12 rows across 5 tables — every table read back from the engine and compared column by column
-next: start the servers with the same --meta-store and GROVEFS_TREEDB_CONTROL=engine — the local files are untouched, so unsetting the switch is the rollback
+next: start the servers with the same --meta-store — the first one retires the local files to *.pre-treedb once it can serve, and renaming them back is the rollback
 
-# 3) 用同一个 URI + 打开的开关启动,老凭据/老口令即刻可用
-GROVEFS_TREEDB_CONTROL=engine grovefs meta-server --meta-dir /srv/grovefs \
+# 3) 用同一个 URI 启动:这次启动把两个文件改名退休,老凭据/老口令即刻可用
+#    (忘了先跑第 2 步的话,这一步是拒绝启动并点名 control-migrate)
+grovefs meta-server --meta-dir /srv/grovefs \
     --meta-store treedb://10.0.0.10:7301 --control-listen 0.0.0.0:7302
+grovefs: control plane cut over — /srv/grovefs/meta/api_keys.db → /srv/grovefs/meta/api_keys.db.pre-treedb (...)
+grovefs: control plane cut over — /srv/grovefs/meta/web_accounts.db → /srv/grovefs/meta/web_accounts.db.pre-treedb (...)
+
+# 4) 回滚(换回读本地文件的旧二进制):停服务、改回名字、重启
+mv /srv/grovefs/meta/api_keys.db.pre-treedb /srv/grovefs/meta/api_keys.db
+mv /srv/grovefs/meta/web_accounts.db.pre-treedb /srv/grovefs/meta/web_accounts.db
 ```
 
 上面那五行读数来自板子上 `treedbctl` 套件第 9 段的一次实跑(目录改成了本文的示例路径);行数随部署而变,五张表的形状不变。
@@ -1545,13 +1555,15 @@ GROVEFS_TREEDB_CONTROL=engine grovefs meta-server --meta-dir /srv/grovefs \
 - **值是字节搬运,不是重算**:`secret_hash`(SHA-256)与 `pw_hash`(PBKDF2)原样过去,所以搬家后**旧 key 仍能鉴权、旧口令仍能登录**。设计文档里那句"`secret_enc` 原样搬、绝不重新包裹"在本仓没有对应物——这里存的本来就是单向摘要加一截给人看的指纹(`secret_hint`),没有可"再包裹"的密文,也没有 `meta/store.key` 这样的包裹材料;摘要一字不动,是"绝不重算凭据"的最强读法。
 - **三处不是照抄**:① `api_keys.last_used_at` 拆成 `api_key_usage` 的一行(引擎里它单独一张表,免得每次鉴权都去 CAS 凭据行),**只有用过的 key 才有这一行**;② `mcp_calls` 在本地没有 id,引擎主键按 `!ts_us || !seq` 从 `ts` 加同微秒内的插入序派生,所以搬完之后"最新 N 条"的顺序与本地 `ORDER BY rowid DESC` 一致;③ `web_accounts` 在本地没有 `rev` 列(搬家前每行只有一个写者,没有可 CAS 的东西),迁移补上出生值,于是搬过去的行与引擎里新建的行逐字节同形。
 - **幂等**:每次写都是无条件覆盖(不是"撞键失败"),重跑一遍就是再搬一遍并再验一遍;没有"已迁移"标记会与行本身对不上。
-- **跑完全量回读比对**:每张表写完立刻从引擎读回来,先比键集合(两个方向:少了谁、多了谁),再逐列比字节;错误信息点名"哪张表、哪个键、哪一列、两边各是什么"。任何一处不等就非零退出——M3(删开关)不能从一份半截副本开始。
-- **四个拒绝**:开关已开(此时引擎是活库,搬过去就是用陈旧行覆盖——撤销过的 key 复活、轮换过的口令回退)、`--to` 不是 `engine`、没给 `--meta-store`(绝不猜地址)、给的是 `postgres://`(PG 档控制面本来就在控制库)。默认构建(无 `--features treedb`)给具名拒绝,而不是"未知子命令"。
-- **源文件只读且不删**:两个 `.db` 以 `SQLITE_OPEN_READ_ONLY` 打开,命令跑完它们还在原地——回滚就是**取消开关**重启;也正因为它不删源,重跑才安全。
-- **先停服务**:源是只读打开的,命令绝不会写它;但一个还在服务的 `meta-server` 会在"读"与"回读比对"之间提交新行,那条行会被报成"引擎里缺一行"。半途而废的跑法也安全:覆盖写 + 全量比对,重跑即可,不存在"搬到一半的状态"。
+- **跑完全量回读比对**:每张表写完立刻从引擎读回来,先比键集合(两个方向:少了谁、多了谁),再逐列比字节;错误信息点名"哪张表、哪个键、哪一列、两边各是什么"。任何一处不等就非零退出——切写会把本地文件改名拿走,不能从一份半截副本开始。
+- **四个拒绝**:源文件已经改过名(`*.pre-treedb` 在,说明这台已经切过写)、`--to` 不是 `engine`、没给 `--meta-store`(绝不猜地址)、给的是 `postgres://`(PG 档控制面本来就在控制库)。第一个拒绝同时给出回滚改名(`mv <name>.pre-treedb <name>`)。默认构建(无 `--features treedb`)给具名拒绝,而不是"未知子命令"。
+- **命令只读源、不改名、不删**:两个 `.db` 以 `SQLITE_OPEN_READ_ONLY` 打开,命令跑完它们还在原地。改名是服务端做的(见下一条),所以"重跑安全"与"回滚是改名"两件事不矛盾。
+- **切写由谁做**:每个打开控制面的进程(meta-server、`apikey`/`web` 等 CLI)都先跑一次同一道工序:两个文件都不在 ⇒ 两次 `stat` 就返回(稳态零引擎流量);在而引擎**空** ⇒ 拒绝启动;在而引擎**有行** ⇒ 改名退休,目标名已存在则保留原文件并打一行说明(绝不覆盖旧副本)。若文件里有一行是引擎没有的(拷贝之后又往文件里写过),改名之前按表点名报出数量——行不会丢,只是从活库里退下去,这一点必须说出来。除改名那一行外,这道工序不往 stdout 写任何东西(`apikey list` 的 stdout 保持机器可读)。改名只动主文件:`api_keys.db-wal` / `-shm` 这类伴生文件留在原名下——它们属于"被服务时的那个库",回滚 `mv` 回去必须能找到原来的配对,否则拿到的是缺最后几次提交的版本。
+- **切写后的 CLI 也得指同一个引擎**:服务端不再读那两个文件,所以铸 key、建号也得带 `--meta-store treedb://…`(`grovefs apikey --meta-dir D --meta-store treedb://10.0.0.10:7301 create …`)。用裸 `--meta-dir` 铸的 key 落在本地文件里,服务端看不见;忘了也不会静默丢——下一个打开控制面的进程会把这个新文件改名退休,并按表点名"只有这份副本才有的行"——但刚铸的 key 在那之前登不进去。
+- **先停服务**:源是只读打开的,命令绝不会写它;但一个还在服务的 `meta-server` 会在"读"与"回读比对"之间提交新行,那条行会被报成"引擎里缺一行"(在 M3 里它还会把源文件从读的下面改名拿走)。半途而废的跑法也安全:覆盖写 + 全量比对,重跑即可,不存在"搬到一半的状态"。
 - **边界**:这条命令只搬这五张表。视图**定义**与 placement 仍永远在本地(PG 档那套定义表在 treedb 档没有对应物),所以 treedb 档是"定义本地 + 树在引擎 + 行表在引擎"。
 
-e2e 见 `treedbctl` 套件第 9 段(88 条总数):开关关时先建出本地控制面 → 迁移 → 断言 `migrated N rows` 里的 N 等于 SQLite 自己数出的总和、五张表逐张 `written, verified`、重跑同数 → 四个拒绝逐条 → 开关打开重启后:账号/授权/审计/用量行全在(其中 `carol` 从来不是 `--admin-user`,只可能来自迁移)、**旧 admin key 仍能治理**、**旧口令仍能登录**、本地两个文件仍在,再重启引擎也不丢。
+e2e 见 `treedbctl` 套件第 1 段与第 9 段(111 条总数):第 1 段证"没有开关"——裸的 `--meta-store` 直接写引擎、不留本地文件、旧变量不管设什么都改变不了目标,但服务端会打一行"已不再读";第 9 段用一台真·旧部署(本地 SQLite 树 + 两个本地文件)走完切写全程:指向空引擎 ⇒ 拒绝启动并点名 `control-migrate`、源文件没被动过 → 迁移 → 断言 `migrated N rows` 里的 N 等于 SQLite 自己数出的总和、五张表逐张 `written, verified`、重跑同数 → 三个目标侧拒绝逐条 → 首次启动:两个文件都改名为 `*.pre-treedb`、账号/授权/审计/用量行全在(其中 `carol` 从来不是 `--admin-user`,只可能来自迁移)、**旧 admin key 仍能治理**、**旧口令仍能登录**、稳态 CLI 的 stderr 为空 → 源已退休后再跑迁移被拒并给出 `mv` 回滚 → 改名回来可再搬一次;拷贝后往文件里新写的行在退休前按表点名报出 → 重启引擎不丢,且之后的启动不再打切写行。
 
 ## 4. 生产拓扑:中心存储 + 多客户机 LAN 挂载
 
@@ -2070,7 +2082,7 @@ ps aux | grep grovefs                     # 查看在跑的 server / mount
 
 ## 10. 验证与回归
 
-全板一共 **44 段**:`build` → `unit` → **41 个套件** → `bench`。**前 43 段门控 GREEN,`bench` 只打吞吐参考值、永不门控**(只要纯功能回归就 `SKIP_BENCH=1`)。`pg`/`pg_parallel`/`evict`/`control`/`forksrv` 在无可达 PostgreSQL 的主机上整段自动 SKIP,`client` 在没有同级 `grovefs-client` 检出(或其二进制、`fusermount` 助手)的机器上整段 SKIP,`xfer`/`gcremote` 则跳过 PG 臂只跑 SQLite 臂,都不拉低 GREEN;`treedb` 段是实验性后端的自检,`treedbmatrix` 把 posix/e2e 的整体断言矩阵在那个后端上重放(只认 `pass=39 fail=0 skip=10` 这个契约三元组),`treedbctl` 是控制面第三臂(`GROVEFS_TREEDB_CONTROL=engine` 时凭据、审计与 web 账号/授权行落进引擎的通用表,默认关;并覆盖 §3.5.4 的 `control-migrate` 搬家)——这三个都在默认构建(未开 `--features treedb`)整段 SELF-SKIP,同样不拉低 GREEN。
+全板一共 **44 段**:`build` → `unit` → **41 个套件** → `bench`。**前 43 段门控 GREEN,`bench` 只打吞吐参考值、永不门控**(只要纯功能回归就 `SKIP_BENCH=1`)。`pg`/`pg_parallel`/`evict`/`control`/`forksrv` 在无可达 PostgreSQL 的主机上整段自动 SKIP,`client` 在没有同级 `grovefs-client` 检出(或其二进制、`fusermount` 助手)的机器上整段 SKIP,`xfer`/`gcremote` 则跳过 PG 臂只跑 SQLite 臂,都不拉低 GREEN;`treedb` 段是实验性后端的自检,`treedbmatrix` 把 posix/e2e 的整体断言矩阵在那个后端上重放(只认 `pass=39 fail=0 skip=10` 这个契约三元组),`treedbctl` 是控制面第三臂(凭据、审计与 web 账号/授权行落进引擎的通用表,**无开关**——M3 已删;并覆盖 §3.5.4 的 `control-migrate` 搬家与切写/退休)——这三个都在默认构建(未开 `--features treedb`)整段 SELF-SKIP,同样不拉低 GREEN。
 
 ```bash
 export LC_ALL=C LANG=C                                 # 仓库根目录下执行(PKG_CONFIG 不必设:无 crate 查 pkg-config,§1)
