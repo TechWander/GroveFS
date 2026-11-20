@@ -16,10 +16,28 @@
 //! | `data_ref: Option<String>`（形如 `1:4096:dev0`） | `DataRef = Vec<u8>`，空串 = 没有内容 | 字节直通，空串 ↔ `None` |
 //! | 富 errno 会被压进 `MetaError` 的 6 个变体 | 引擎回裸 POSIX errno | [`Fail::to_meta`] 一张显式映射表，未知码归 `Db` 并带上原文 |
 //!
+//! ## 这一层实际动用的引擎面
+//!
+//! 引擎的 op 面是 51 条（treedb 仓 `DESIGN.md` §4.2，三档 22/22/7），本适配层只调其中
+//! **13 条**：视图面 `CreateView`/`DropView`/`ListViews`，树面 `Lookup`/`Getattr`/
+//! `Setattr`/`Create`/`Mkdir`/`Symlink`/`Unlink`/`Rmdir`/`Rename`/`ReadDir`。本层不调用的那些不是白做的：
+//! `Key*`/`Audit*`/`Def*`/`Place*`/`Table*`/`Row*` 是给控制面搬进来准备的（现在还在本地
+//! SQLite）；`ReadDirPlus` 协议已闭合但调用未接（readdir 属性仍是 N 次往返）；`Lock*`
+//! 只有整 inode 形状，给不了 POSIX 记录锁；`WalFetch`/`SnapFetch` 是异步副本，不是
+//! 这里要的同步提升。
+//!
 //! ## 明确接不了的东西（spike 的诚实边界，见 treedb 仓 `DESIGN.md` §5.3 / §8）
 //!
 //! - **硬链接**：引擎没有 `Link` op，一个 inode 只有一条目录项路径。`link_node` 回
-//!   `EPERM`，不是"假装成功"。
+//!   `EPERM`，不是"假装成功"。这条缺口占多大**面积**已实测：`posix`+`e2e` 两套矩阵
+//!   逐标签重放过来的是 36 条（基线共 37 条，唯一没搬的是要 PTY 的 tty 默认日志），
+//!   加上硬链接正反两面与本夹具自检共 49 条 = 39 OK + 10 SKIP，那 10 条全部是
+//!   硬链接，其余每一格都过（配方 `.build-bin/test_treedb_matrix.sh`，板上
+//!   `FEATURES_TREEDB=1` 走 `treedbmatrix` 那一行；结论在 treedb 仓 `DESIGN.md` §10 阶段 C 1）。
+//! - **引擎的认证面本层未接**：treedb 自 v0.3.6 起有共享密钥双向握手
+//!   （`Client::connect_auth`），而本适配层四处都走不带密钥的 `Client::connect` ——
+//!   即引擎端口上的隔离现在只能靠网络层。要接得先定一个传 key 的入口（额外旗标
+//!   还是 `treedb://` URI 参数），不能默默打开。
 //! - **POSIX 记录锁**：引擎的锁 key 是 `(view, ino, owner)`，**没有字节区间**，也就
 //!   没有合并/拆分和 `release-all-of-owner`。`lock_op` 一律回 `EPERM`（`flock` 在这
 //!   个后端上可见地失败），`get_lock` 回 `None`。给错语义比给不了更糟。
