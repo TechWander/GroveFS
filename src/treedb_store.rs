@@ -20,9 +20,17 @@
 //!
 //! 引擎的 op 面是 51 条（treedb 仓 `DESIGN.md` §4.2，三档 22/22/7），本适配层只调其中
 //! **13 条**：视图面 `CreateView`/`DropView`/`ListViews`，树面 `Lookup`/`Getattr`/
-//! `Setattr`/`Create`/`Mkdir`/`Symlink`/`Unlink`/`Rmdir`/`Rename`/`ReadDir`。本层不调用的那些不是白做的：
-//! `Key*`/`Audit*`/`Def*`/`Place*`/`Table*`/`Row*` 是给控制面搬进来准备的（现在还在本地
-//! SQLite）；`ReadDirPlus` 协议已闭合但调用未接（readdir 属性仍是 N 次往返）；`Lock*`
+//! `Setattr`/`Create`/`Mkdir`/`Symlink`/`Unlink`/`Rmdir`/`Rename`/`ReadDirPlus`。条数与上一版
+//! 一样，但最后一项换过：目录列表走 `ReadDirPlus`，不再走 `ReadDir`。理由是 `ReadDir`
+//! 一页只给名字，属性得逐条 `Getattr` 回头补 —— 一页 1000 条就是 1 次列表 + 16 次批量属性
+//! （一批 64 条）= 17 次往返。实测两臂对照（同一份 `du` 走完一棵 3000 条的树，
+//! 配方 `.build-bin/bench_treedb_readdir.sh`）：引擎应用的 op 数 **3006 → 6**；把引擎放到
+//! 每段 2 ms 延迟的 TCP 代理后面，墙钟 **256 ms → 52 ms**；同机 loopback 上则量不出差别
+//! （28 ms vs 24 ms，在噪声里）。这项收益的单位是往返，本机测试恰好把它藏起来，所以
+//! 两个数都要写。
+//!
+//! 本层不调用的那些不是白做的：`Key*`/`Audit*`/`Def*`/`Place*`/`Table*`/`Row*` 是给控制面
+//! 搬进来准备的（现在还在本地 SQLite，迁法见 treedb 仓 `DESIGN.md` §10 阶段 C 4）；`Lock*`
 //! 只有整 inode 形状，给不了 POSIX 记录锁；`WalFetch`/`SnapFetch` 是异步副本，不是
 //! 这里要的同步提升。
 //!
@@ -34,10 +42,13 @@
 //!   加上硬链接正反两面与本夹具自检共 49 条 = 39 OK + 10 SKIP，那 10 条全部是
 //!   硬链接，其余每一格都过（配方 `.build-bin/test_treedb_matrix.sh`，板上
 //!   `FEATURES_TREEDB=1` 走 `treedbmatrix` 那一行；结论在 treedb 仓 `DESIGN.md` §10 阶段 C 1）。
-//! - **引擎的认证面本层未接**：treedb 自 v0.3.6 起有共享密钥双向握手
-//!   （`Client::connect_auth`），而本适配层四处都走不带密钥的 `Client::connect` ——
-//!   即引擎端口上的隔离现在只能靠网络层。要接得先定一个传 key 的入口（额外旗标
-//!   还是 `treedb://` URI 参数），不能默默打开。
+//! - **引擎的认证面已接，入口是环境变量**：`GROVEFS_TREEDB_KEY_FILE=/path` 给密钥
+//!   文件路径（与 `GROVEFS_JOIN_KEY_FILE` / `GROVEFS_ROSTER_KEY_FILE` 同规：密钥字节
+//!   永远不进 argv），设了就对每条连接跑 v5 双向握手（`Client::connect_auth`），
+//!   没设就不握手。读不动密钥时**每次 open 都失败**，不降级成不认证。为什么不走
+//!   `treedb://` URI 参数：`serve()` 解析完就把 `StoreKind::Treedb` 的 payload 定成了
+//!   裸 `host:port`，`server_ext.rs` 里有十处操作者可见的文案在插 `{addr}`；要带
+//!   query 就得改那个文件——而它是另一个主题正在动的地方。
 //! - **POSIX 记录锁**：引擎的锁 key 是 `(view, ino, owner)`，**没有字节区间**，也就
 //!   没有合并/拆分和 `release-all-of-owner`。`lock_op` 一律回 `EPERM`（`flock` 在这
 //!   个后端上可见地失败），`get_lock` 回 `None`。给错语义比给不了更糟。
@@ -55,13 +66,14 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
 use treedb::engine::model::{
     errno, Kind, Node, Op, Reply, RENAME_NOREPLACE, SA_ATIME, SA_DATA_REF, SA_GID, SA_MODE,
     SA_MTIME, SA_UID,
 };
+use treedb::net::auth::Key;
 use treedb::net::Client;
 
 use crate::meta::{LockConflict, LockType, MetaError, MetaProvider, NodeInfo, NodeKind};
@@ -77,9 +89,8 @@ const DEFAULT_CONNS: usize = 4;
 const CONNECT_TIMEOUT_MS: u64 = 3_000;
 /// `ReadDir` 一页取多少条（引擎侧上限 4096，协议里 `limit=0` 表示 1000）。
 const PAGE: u32 = 1000;
-/// 一批 `Getattr` 塞进一次 pipeline 的条数。`Dirents` 不带属性，所以一页目录
-/// 的真实成本是「1 次 ReadDir + N/本值 次 pipeline」—— 这一条是 §11 里
-/// `ReadDirPlus` 该被补上的原因。
+/// 一批 `Getattr` 塞进一次 pipeline 的条数。自从分页改走 `ReadDirPlus`，它
+/// 只服务一件事：补回 `NodeAttr` 不带的那个字段（symlink 目标），见 [`TreedbStore::attrs`]。
 const ATTR_BATCH: usize = 64;
 
 /// 这个 `--meta-store` URI 是不是指向 treedb。
@@ -106,6 +117,36 @@ pub fn parse_addr(uri: &str) -> Result<String, String> {
     rest.parse::<std::net::SocketAddr>()
         .map_err(|e| format!("{SCHEME}{rest}: {e}"))?;
     Ok(rest.to_string())
+}
+
+/// 引擎握手密钥的来源。这个环境变量给的是**路径**，密钥字节本身永远不进
+/// argv —— 与 `GROVEFS_JOIN_KEY_FILE`、`GROVEFS_ROSTER_KEY_FILE` 同规。
+pub const KEY_FILE_ENV: &str = "GROVEFS_TREEDB_KEY_FILE";
+
+/// 进程内解析一次密钥。三档语义，第三档是这个函数存在的全部理由：
+///
+/// - 未设置 / 空串 → `None`：不握手。引擎没配 `--auth-key-file` 时就该这么搭档。
+/// - 设了且读得动 → `Some`。
+/// - 设了但读不动（文件缺失、长度不对、全零）→ **每次 open 都拿这个错误失败**。
+///   这一档绝不能降级成 `None`：那会把「密钥配错」变成悄悄不认证，运维只能在
+///   引擎那一边的 EADV 海里找原因。fail-closed 的方向是当场报错，不是装死。
+fn auth_key() -> Result<Option<Arc<Key>>, String> {
+    static KEY: OnceLock<Result<Option<Arc<Key>>, String>> = OnceLock::new();
+    match KEY.get_or_init(|| {
+        let path = match std::env::var(KEY_FILE_ENV) {
+            Ok(p) if !p.trim().is_empty() => p,
+            // 没设、或者设成空串：都算「这个部署不要认证」。
+            _ => return Ok(None),
+        };
+        // 错误串里只给路径与引擎的原文，不给密钥字节。
+        match Key::load(std::path::Path::new(&path)) {
+            Ok(k) => Ok(Some(Arc::new(k))),
+            Err(e) => Err(format!("{KEY_FILE_ENV}={path}: {e}")),
+        }
+    }) {
+        Ok(k) => Ok(k.clone()),
+        Err(e) => Err(e.clone()),
+    }
 }
 
 fn conn_count() -> usize {
@@ -183,6 +224,21 @@ struct Fail {
     msg: String,
 }
 
+/// 一条「不该出现在这条路径上」的应答 → 操作者读得懂的串。
+///
+/// 为什么不直接 `{other:?}`：那样会把引擎的拒绝文案打成字节数组（真实样本：
+/// `Err { code: 68, msg: [97, 117, 116, …] }`），而没人能在日志里反解那串数 ——
+/// 「没配密钥就被引擎拒了」这条第一手线索就是这么丢掉的。
+fn unexpected(what: &str, r: &Reply) -> String {
+    match r {
+        Reply::Err { code, msg } => format!(
+            "{what}: engine refused with errno {code} ({})",
+            String::from_utf8_lossy(msg)
+        ),
+        other => format!("{what}: unexpected reply {other:?}"),
+    }
+}
+
 impl Fail {
     fn code(code: u16, msg: Vec<u8>) -> Fail {
         Fail { code: Some(code), msg: String::from_utf8_lossy(&msg).into_owned() }
@@ -247,6 +303,9 @@ pub struct TreedbStore {
     /// round-robin 的长连接池。`Client` 内含 `TcpStream`，不是 `Sync`，所以每条
     /// 连接各自一把锁：一个 op 锁一条，`N` 条给 `N` 路并发。
     conns: Vec<Mutex<Client>>,
+    /// 握手密钥，`None` = 不认证。重连路径要靠它重建同一条连接，所以存在句柄上，
+    /// 而不是每次重读环境变量：进程中途改 env 不该改变一个已有 store 的语义。
+    key: Option<Arc<Key>>,
     rr: AtomicUsize,
     readonly: bool,
     /// 见模块头的「HA」条目：这个后端拒绝 `--role standby/--peer/--witness`，
@@ -260,10 +319,13 @@ impl TreedbStore {
     /// 连接 + 把 view 对上号。`readonly` 档绝不在远端建树：只查，查不到就失败
     /// （standby 不该有创建权）。
     pub fn open(addr: &str, view: &str, readonly: bool) -> io::Result<Self> {
+        // 先定密钥再拨号：配错了要在第一条连接之前就报清楚，别让「连上了
+        // 但每个 op 都 EADV」变成现场症状。
+        let key = auth_key().map_err(io::Error::other)?;
         let n = conn_count();
         let mut conns = Vec::with_capacity(n);
         for _ in 0..n {
-            let c = Client::connect(addr, CONNECT_TIMEOUT_MS)
+            let c = Client::connect_auth(addr, CONNECT_TIMEOUT_MS, key.as_deref())
                 .map_err(|e| io::Error::other(format!("treedb connect {addr}: {e}")))?;
             conns.push(Mutex::new(c));
         }
@@ -272,6 +334,7 @@ impl TreedbStore {
             view: view.to_string(),
             view_id: 0,
             conns,
+            key,
             rr: AtomicUsize::new(0),
             readonly,
             epoch: Arc::new(AtomicI64::new(0)),
@@ -290,7 +353,8 @@ impl TreedbStore {
 
     /// 删掉一个 view 的整棵树。返回 `Ok(false)` = 本来就没有。
     pub fn drop_view(addr: &str, view: &str) -> io::Result<bool> {
-        let mut c = Client::connect(addr, CONNECT_TIMEOUT_MS)
+        let key = auth_key().map_err(io::Error::other)?;
+        let mut c = Client::connect_auth(addr, CONNECT_TIMEOUT_MS, key.as_deref())
             .map_err(|e| io::Error::other(format!("treedb connect {addr}: {e}")))?;
         match c.call(&Op::DropView { name: view.as_bytes().to_vec() }) {
             Ok(Reply::Ok) => Ok(true),
@@ -299,21 +363,22 @@ impl TreedbStore {
                 "treedb DropView '{view}': errno {code} ({})",
                 String::from_utf8_lossy(&msg)
             ))),
-            Ok(other) => Err(io::Error::other(format!("treedb DropView '{view}': {other:?}"))),
+            Ok(other) => Err(io::Error::other(unexpected("treedb DropView", &other))),
             Err(e) => Err(io::Error::other(format!("treedb DropView '{view}': {e}"))),
         }
     }
 
     /// 这个 treedb 实例里现存的 view 名（`view list` 在 treedb 档下的权威来源）。
     pub fn list_views(addr: &str) -> io::Result<Vec<String>> {
-        let mut c = Client::connect(addr, CONNECT_TIMEOUT_MS)
+        let key = auth_key().map_err(io::Error::other)?;
+        let mut c = Client::connect_auth(addr, CONNECT_TIMEOUT_MS, key.as_deref())
             .map_err(|e| io::Error::other(format!("treedb connect {addr}: {e}")))?;
         match c.call(&Op::ListViews) {
             Ok(Reply::Views(v)) => Ok(v
                 .into_iter()
                 .map(|(name, _, _)| String::from_utf8_lossy(&name).into_owned())
                 .collect()),
-            Ok(other) => Err(io::Error::other(format!("treedb ListViews: {other:?}"))),
+            Ok(other) => Err(io::Error::other(unexpected("treedb ListViews", &other))),
             Err(e) => Err(io::Error::other(format!("treedb ListViews: {e}"))),
         }
     }
@@ -345,7 +410,7 @@ impl TreedbStore {
             Ok(r) => Ok(r),
             Err(e) if op.is_readonly() => {
                 let last: String;
-                match Client::connect(&self.addr, CONNECT_TIMEOUT_MS) {
+                match Client::connect_auth(&self.addr, CONNECT_TIMEOUT_MS, self.key.as_deref()) {
                     Ok(c) => {
                         *g = c;
                         last = match g.call(op) {
@@ -382,15 +447,16 @@ impl TreedbStore {
     fn want_node(r: Reply) -> Result<Node, Fail> {
         match Self::val(r)? {
             Reply::Node(n) => Ok(n),
-            other => Err(Fail::db(format!("treedb: expected Node, got {other:?}"))),
+            other => Err(Fail::db(unexpected("treedb: expected Node", &other))),
         }
     }
 
     fn want_freed(r: Reply) -> Result<Option<String>, Fail> {
         match Self::val(r)? {
             Reply::NodeRef(d) => Ok(key_to_str(&d)),
-            other => Err(Fail::db(format!(
-                "treedb: expected NodeRef (GC 线索), got {other:?}"
+            other => Err(Fail::db(unexpected(
+                "treedb: expected NodeRef (GC 线索)",
+                &other,
             ))),
         }
     }
@@ -398,7 +464,7 @@ impl TreedbStore {
     fn want_ok(r: Reply) -> Result<(), Fail> {
         match Self::val(r)? {
             Reply::Ok | Reply::Pong => Ok(()),
-            other => Err(Fail::db(format!("treedb: expected Ok, got {other:?}"))),
+            other => Err(Fail::db(unexpected("treedb: expected Ok", &other))),
         }
     }
 
@@ -431,7 +497,7 @@ impl TreedbStore {
             Ok(Reply::Err { code: errno::EEXIST, .. }) => self
                 .lookup_view_id()?
                 .ok_or_else(|| Fail::db("treedb: CreateView said EEXIST but ListViews has no row")),
-            Ok(other) => Err(Fail::db(format!("treedb CreateView: {other:?}"))),
+            Ok(other) => Err(Fail::db(unexpected("treedb CreateView", &other))),
             Err(e) => Err(e),
         }
     }
@@ -451,39 +517,87 @@ impl TreedbStore {
 
     // ---------------------------------------------------------------- 名字空间
 
-    /// `Dirents` 只有 ino/kind/name，属性要另取。分页 + 批 `Getattr`。
+    /// 一页目录：一条 `ReadDirPlus` 同时拿回 ino/kind/name/属性四个平行数组。
+    ///
+    /// 以前这里是 `ReadDir` + ⌈N/64⌉ 批 `Getattr`（那一批走 pipeline，不是逐条
+    /// 往返，但一页仍然要多个往返、多张应答帧）。引擎自协议 v3 就有带属性的那一
+    /// 档，本层 pin 的版本里始终有 —— 换过来之后一整页只有**一次**往返。
+    ///
+    /// 要补的唯一例外是符号链接：`NodeAttr` 为了不让每条重付 ino/kind/name 三份
+    /// 字节，索性不带 `link`（treedb 仓 `DESIGN.md` §4.2），所以这一页里的 symlink
+    /// 还得各取一次属性。数据目录里 symlink 罕见，这个补丁通常整页为空。
     fn page(&self, parent: i64, offset: u64, limit: u32) -> Result<Vec<NodeInfo>, Fail> {
-        let op = Op::ReadDir { view: self.vid(), parent: parent as u64, offset, limit };
-        let (inos, names) = match Self::val(self.xcall(&op)?)? {
-            Reply::Dirents { inos, names, .. } => (inos, names),
-            other => return Err(Fail::db(format!("treedb ReadDir: {other:?}"))),
+        let op = Op::ReadDirPlus { view: self.vid(), parent: parent as u64, offset, limit };
+        let (inos, kinds, names, attrs) = match Self::val(self.xcall(&op)?)? {
+            Reply::DirentsPlus { inos, kinds, names, attrs, .. } => (inos, kinds, names, attrs),
+            other => return Err(Fail::db(unexpected("treedb ReadDirPlus", &other))),
         };
-        if inos.is_empty() {
-            return Ok(Vec::new());
+        // 四条数组同长是引擎侧的承诺（少一项就是整页错位，那比一个零属性糟得多），
+        // 但这是一份跨版本的线协议，宁可在这里当断言查一遍，也不要拿越界下标去索引。
+        if kinds.len() != inos.len() || attrs.len() != inos.len() || names.len() != inos.len() {
+            return Err(Fail::db(format!(
+                "treedb DirentsPlus: parallel arrays disagree ({} ino / {} kind / {} attr / {} name)",
+                inos.len(),
+                kinds.len(),
+                attrs.len(),
+                names.len()
+            )));
         }
-        let infos: HashMap<i64, NodeInfo> = self
-            .attrs(&inos)?
-            .into_iter()
-            .map(|n| (n.id, n))
-            .collect();
-        // 名字以 `Dirents` 的那份为准（它就是这页的排序键），属性以 `Getattr` 的那份
-        // 为准。两次读之间条目被删掉是真实结果，按 POSIX「readdir 可以返回刚消失的
-        // 名字」处理：跳过取不到属性的条目，但绝不返回半个条目。
-        Ok(inos
-            .iter()
-            // `Names` 只有借用迭代（引擎侧把一页名字存在一份扁平 blob 里，逐条
-            // 交 `&[u8]`，不再拆成 N 个拥有块）：上游 v0.3.3 起按值的
-            // `zip(names)` 要写成 `zip(&names)`。
-            .zip(&names)
-            .filter_map(|(ino, name)| {
-                let mut n = infos.get(&(*ino as i64))?.clone();
-                n.name = String::from_utf8_lossy(name).into_owned();
-                Some(n)
-            })
-            .collect())
+        let mut out = Vec::with_capacity(inos.len());
+        let mut links: Vec<u64> = Vec::new();
+        for i in 0..inos.len() {
+            // `nlink == 0` 只可能是引擎那档「dentry 比 inode 新」的兜底零值（真节点
+            // 至少有一条名字）。按 POSIX「readdir 可以返回刚消失的名字」走宽松一侧：
+            // 这一条整个不交，绝不回半个条目 —— 与 `ReadDir` + `Getattr` 那版的
+            // `filter_map` 行为一致。
+            if attrs[i].nlink == 0 {
+                continue;
+            }
+            let kind = Kind::from_code(kinds[i]).map_err(|e| {
+                Fail::db(format!("treedb DirentsPlus: kind byte {} at row {i}: {e}", kinds[i]))
+            })?;
+            let kind = kind_of(kind);
+            if matches!(kind, NodeKind::Symlink) {
+                links.push(inos[i]);
+            }
+            let a = &attrs[i];
+            out.push(NodeInfo {
+                id: inos[i] as i64,
+                parent_id: parent,
+                name: String::from_utf8_lossy(names.get(i)).into_owned(),
+                kind,
+                data_ref: key_to_str(&a.data_ref),
+                link_target: None,
+                mode: a.mode,
+                uid: a.uid,
+                gid: a.gid,
+                mtime: ms_to_s(a.mtime),
+                atime: ms_to_s(a.atime),
+                ctime: ms_to_s(a.ctime),
+                nlink: a.nlink as u64,
+                size: a.size,
+            });
+        }
+        if !links.is_empty() {
+            let filled: HashMap<i64, Option<String>> = self
+                .attrs(&links)?
+                .into_iter()
+                .map(|n| (n.id, n.link_target))
+                .collect();
+            for n in out.iter_mut() {
+                if matches!(n.kind, NodeKind::Symlink) {
+                    n.link_target = filled.get(&n.id).cloned().flatten();
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// 一批 ino 的属性，按 [`ATTR_BATCH`] 分块走 pipeline。
+    ///
+    /// `page()` 改走 `ReadDirPlus` 之后，这是全文件唯一还在逐条取属性的地方，而且
+    /// 只在「这一页里有符号链接」时才被调用 —— 为的是 `NodeAttr` 故意不带
+    /// 的 `link` 字段。
     fn attrs(&self, inos: &[u64]) -> Result<Vec<NodeInfo>, Fail> {
         let mut out = Vec::with_capacity(inos.len());
         for chunk in inos.chunks(ATTR_BATCH) {
