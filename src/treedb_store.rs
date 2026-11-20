@@ -82,8 +82,12 @@ use crate::meta::{LockConflict, LockType, MetaError, MetaProvider, NodeInfo, Nod
 pub const SCHEME: &str = "treedb://";
 /// 没写地址时的落点，与 `treedb-server` 的 `--listen` 默认值一致。
 pub const DEFAULT_ADDR: &str = "127.0.0.1:7777";
-/// 每个 store 握几条长连接。op 之间没有事务关系，round-robin 出去就是并行；
-/// 一条连接同时只能有一个在飞的请求（`Client::call` 是一问一答）。
+/// **每进程**握几条长连接：池按地址共享，与视图数无关。op 之间没有事务关系，
+/// round-robin 出去就是并行；一条连接同时只能有一个在飞的请求（`Client::call`
+/// 是一问一答）。
+///
+/// 2026-11-20 之前这里是「每个 store 自己拨这么多条」，而 store 是每个 view 一个：
+/// 1 万视图 = 4 万条连接。实测见 `.build-bin/probe_treedb_pool.sh`。
 const DEFAULT_CONNS: usize = 4;
 /// 拨号超时。数据目录在本机，1 s 足够；超了说明服务端没起来，早报错比挂着好。
 const CONNECT_TIMEOUT_MS: u64 = 3_000;
@@ -293,21 +297,114 @@ fn log_list_failure(op: &str, parent: i64, f: &Fail) {
     );
 }
 
+/// 进程级的连接池，**按地址共享**，不按视图切分。
+///
+/// treedb 的每条 op 自带 `view` 字段（[`TreedbStore::vid`]），连接上没有 per-view
+/// 状态 —— 只有握手密钥与 pipeline 顺序 —— 所以「一个 view 一个池」纯属记账，代价
+/// 却是每个视图 `DEFAULT_CONNS` 条 socket。实测（`.build-bin/probe_treedb_pool.sh`，
+/// 2026-11-20）：顺序打开 1/5/10/25 个视图，引擎侧 established socket 是
+/// 4/20/40/100 条；改成共享池之后同样是 4 条。
+///
+/// 池只增不减：地址是配置项（一个进程就一个），数量有界；而「空闲视图归还连接」
+/// 这件事在没有 per-view 连接之后已经没有含义了。
+struct ConnPool {
+    addr: String,
+    /// 握手密钥。重连路径要靠它重建同一条连接，所以存在池上；`auth_key()` 本身
+    /// 就是进程内解析一次（`OnceLock`），一个池里不可能混进两把密钥。
+    key: Option<Arc<Key>>,
+    /// round-robin 的长连接。`Client` 内含 `TcpStream`，不是 `Sync`，所以每条连接
+    /// 各自一把锁：一个 op 锁一条，`N` 条给 `N` 路并发（跨视图共享）。
+    conns: Vec<Mutex<Client>>,
+    rr: AtomicUsize,
+}
+
+impl ConnPool {
+    /// 取（或拨出）`addr` 的进程级池。第一次调用会 dial `GROVEFS_TREEDB_CONNS`
+    /// 条；之后的视图直接复用同一个 `Arc`。
+    fn for_addr(addr: &str) -> io::Result<Arc<ConnPool>> {
+        static POOLS: OnceLock<Mutex<HashMap<String, Arc<ConnPool>>>> = OnceLock::new();
+        let pools = POOLS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut m = pools.lock();
+        if let Some(p) = m.get(addr) {
+            return Ok(Arc::clone(p));
+        }
+        // 先定密钥再拨号：配错了要在第一条连接之前就报清楚，别让「连上了
+        // 但每个 op 都 EADV」变成现场症状。
+        let key = auth_key().map_err(io::Error::other)?;
+        let n = conn_count();
+        let mut conns = Vec::with_capacity(n);
+        for _ in 0..n {
+            let c = Client::connect_auth(addr, CONNECT_TIMEOUT_MS, key.as_deref())
+                .map_err(|e| io::Error::other(format!("treedb connect {addr}: {e}")))?;
+            conns.push(Mutex::new(c));
+        }
+        let pool = Arc::new(ConnPool {
+            addr: addr.to_string(),
+            key,
+            conns,
+            rr: AtomicUsize::new(0),
+        });
+        m.insert(addr.to_string(), Arc::clone(&pool));
+        Ok(pool)
+    }
+
+    fn len(&self) -> usize {
+        self.conns.len()
+    }
+
+    /// 取一条连接的索引。round-robin 不做负载判定：连接数是个位数，
+    /// 真正决定并行度的是「同一刻有几条不在等应答」。
+    fn slot(&self) -> usize {
+        self.rr.fetch_add(1, Ordering::Relaxed) % self.conns.len()
+    }
+
+    /// 发一个 op、收它的应答。传输失败时**只对只读 op** 重连重试一次：
+    /// 写 op 的失败可能发生在「引擎已提交、应答没读到」之后，重发就是二次生效
+    /// （`Create` 变 `EEXIST`、`RefUp` 把计数加两遍）。写失败让调用方看到 EIO。
+    fn xcall(&self, op: &Op) -> Result<Reply, Fail> {
+        let i = self.slot();
+        let mut g = self.conns[i].lock();
+        match g.call(op) {
+            Ok(r) => Ok(r),
+            Err(e) if op.is_readonly() => {
+                let last: String;
+                match Client::connect_auth(&self.addr, CONNECT_TIMEOUT_MS, self.key.as_deref()) {
+                    Ok(c) => {
+                        *g = c;
+                        last = match g.call(op) {
+                            Ok(r) => return Ok(r),
+                            Err(e2) => e2.to_string(),
+                        };
+                    }
+                    Err(re) => last = format!("{e}; reconnect: {re}"),
+                }
+                Err(Fail::db(format!("treedb transport: {last}")))
+            }
+            Err(e) => Err(Fail::db(format!("treedb transport: {e}"))),
+        }
+    }
+
+    /// 一次 pipeline：同一批回包按请求顺序返回，长度与入参一致。
+    fn pipeline(&self, ops: &[Op]) -> Result<Vec<Reply>, Fail> {
+        let i = self.slot();
+        let mut g = self.conns[i].lock();
+        // pipeline 里可能混着写（attrs 批取混着 Setattr 的场景本 spike 没有），
+        // 所以一律不自动重试。
+        g.pipeline(ops)
+            .map_err(|e| Fail::db(format!("treedb pipeline: {e}")))
+    }
+}
+
 /// 一个 base view 在 treedb 里的句柄。`MetaStore::Treedb` 唯一持有的东西。
 pub struct TreedbStore {
-    addr: String,
+    /// 进程级共享连接池（按地址）。每个视图各拨一份是 2026-11-20 之前的形状：
+    /// 1 万视图 = 4 万条连接 —— 见 [`ConnPool`]。
+    pool: Arc<ConnPool>,
     view: String,
     /// 引擎里的 view id，open 时解析好。id 从 1 起发、且 drop 后永不复用
     /// （`dropped_view_id_is_never_reused_across_reopen`），所以一个活的 store
     /// 句柄上的 id 不会漂。
     view_id: u32,
-    /// round-robin 的长连接池。`Client` 内含 `TcpStream`，不是 `Sync`，所以每条
-    /// 连接各自一把锁：一个 op 锁一条，`N` 条给 `N` 路并发。
-    conns: Vec<Mutex<Client>>,
-    /// 握手密钥，`None` = 不认证。重连路径要靠它重建同一条连接，所以存在句柄上，
-    /// 而不是每次重读环境变量：进程中途改 env 不该改变一个已有 store 的语义。
-    key: Option<Arc<Key>>,
-    rr: AtomicUsize,
     readonly: bool,
     /// 见模块头的「HA」条目：这个后端拒绝 `--role standby/--peer/--witness`，
     /// epoch 因此没有消费者，留个进程内计数只为让 `get_epoch()` 有个诚实的值。
@@ -320,23 +417,11 @@ impl TreedbStore {
     /// 连接 + 把 view 对上号。`readonly` 档绝不在远端建树：只查，查不到就失败
     /// （standby 不该有创建权）。
     pub fn open(addr: &str, view: &str, readonly: bool) -> io::Result<Self> {
-        // 先定密钥再拨号：配错了要在第一条连接之前就报清楚，别让「连上了
-        // 但每个 op 都 EADV」变成现场症状。
-        let key = auth_key().map_err(io::Error::other)?;
-        let n = conn_count();
-        let mut conns = Vec::with_capacity(n);
-        for _ in 0..n {
-            let c = Client::connect_auth(addr, CONNECT_TIMEOUT_MS, key.as_deref())
-                .map_err(|e| io::Error::other(format!("treedb connect {addr}: {e}")))?;
-            conns.push(Mutex::new(c));
-        }
+        let pool = ConnPool::for_addr(addr)?;
         let mut st = TreedbStore {
-            addr: addr.to_string(),
+            pool,
             view: view.to_string(),
             view_id: 0,
-            conns,
-            key,
-            rr: AtomicUsize::new(0),
             readonly,
             epoch: Arc::new(AtomicI64::new(0)),
             fence: Arc::new(AtomicU64::new(0)),
@@ -395,46 +480,13 @@ impl TreedbStore {
 
     // ---------------------------------------------------------------- 传输层
 
-    /// 取一条连接的索引。round-robin 不做负载判定：连接数是个位数，
-    /// 真正决定并行度的是「同一刻有几条不在等应答」。
-    fn slot(&self) -> usize {
-        self.rr.fetch_add(1, Ordering::Relaxed) % self.conns.len()
-    }
-
-    /// 发一个 op、收它的应答。传输失败时**只对只读 op** 重连重试一次：
-    /// 写 op 的失败可能发生在「引擎已提交、应答没读到」之后，重发就是二次生效
-    /// （`Create` 变 `EEXIST`、`RefUp` 把计数加两遍）。写失败让调用方看到 EIO。
+    /// 走进程级共享池（见 [`ConnPool`]）：连接不归这个视图，归这个地址。
     fn xcall(&self, op: &Op) -> Result<Reply, Fail> {
-        let i = self.slot();
-        let mut g = self.conns[i].lock();
-        match g.call(op) {
-            Ok(r) => Ok(r),
-            Err(e) if op.is_readonly() => {
-                let last: String;
-                match Client::connect_auth(&self.addr, CONNECT_TIMEOUT_MS, self.key.as_deref()) {
-                    Ok(c) => {
-                        *g = c;
-                        last = match g.call(op) {
-                            Ok(r) => return Ok(r),
-                            Err(e2) => e2.to_string(),
-                        };
-                    }
-                    Err(re) => last = format!("{e}; reconnect: {re}"),
-                }
-                Err(Fail::db(format!("treedb transport: {last}")))
-            }
-            Err(e) => Err(Fail::db(format!("treedb transport: {e}"))),
-        }
+        self.pool.xcall(op)
     }
 
-    /// 一次 pipeline：同一批回包按请求顺序返回，长度与入参一致。
     fn xpipe(&self, ops: &[Op]) -> Result<Vec<Reply>, Fail> {
-        let i = self.slot();
-        let mut g = self.conns[i].lock();
-        // pipeline 里可能混着写（attrs 批取混着 Setattr 的场景本 spike 没有），
-        // 所以一律不自动重试。
-        g.pipeline(ops)
-            .map_err(|e| Fail::db(format!("treedb pipeline: {e}")))
+        self.pool.pipeline(ops)
     }
 
     /// 把 [`Reply::Err`] 变成 [`Fail`]，其余原样交出。
@@ -1035,9 +1087,9 @@ impl TreedbStore {
         ))
     }
 
-    /// treedb 的连接是 open 时定死的 `GROVEFS_TREEDB_CONNS` 条，没有「burst 之后
-    /// 缩回地板」这回事，所以 sweeper 问的时候答 0，但**别**据此关掉回收线程：
-    /// 这个后端真正的资源回收单位是整个 store（`rt.evict()`）。
+    /// treedb 的连接是池级的：整个进程几条，与视图数无关（见 [`ConnPool`]），
+    /// 所以 sweeper 问的时候答 0，但**别**据此关掉回收线程 —— 这个后端没有
+    /// 「每个视图一份连接」需要归还，真正的资源回收单位是缓存的 store 本身。
     pub fn shrink_pools(&self) -> usize {
         0
     }
@@ -1045,11 +1097,11 @@ impl TreedbStore {
     /// 诊断用：地址、view id、连接数。给 banner 与 `view info` 留一个可读出口。
     pub fn describe(&self) -> String {
         format!(
-            "treedb {} view='{}' id={} conns={}",
-            self.addr,
+            "treedb {} view='{}' id={} conns={} (shared by every view in this process)",
+            self.pool.addr,
             self.view,
             self.view_id,
-            self.conns.len()
+            self.pool.len()
         )
     }
 }
