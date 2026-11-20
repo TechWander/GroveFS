@@ -4100,6 +4100,18 @@ fn is_fork_def(store: &dyn crate::mcp::ControlStore, view: &str) -> io::Result<b
     ))
 }
 
+/// The BASE view named by `view`'s definition: `Some(base)` for a derived view
+/// (a lens over a physical tree) and for a fork (an independent tree seeded
+/// from a base), `None` for a physical view. Read per `M_OPEN` from the control
+/// store; the name rides the ack's definition tail so the client can print the
+/// contract the flags imply, in the same words a local mount uses.
+fn view_base_name(store: &dyn crate::mcp::ControlStore, view: &str) -> io::Result<Option<String>> {
+    Ok(match store.get_def(view).map_err(io::Error::other)? {
+        Some(ViewDef::Derived(base, _)) | Some(ViewDef::Fork(base)) => Some(base),
+        _ => None,
+    })
+}
+
 // --- server-side invalidation event bus ------------------------------------
 
 /// A pending kernel-cache invalidation the server pushes to a view's other
@@ -4605,23 +4617,44 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
     //       with the base view).
     let client_ro = rt.is_derived(&view) || authed.as_ref().map(|a| a.ro).unwrap_or(false);
     let content_ro = is_fork_def(&*rt.control, &view)?;
-    // The ack body: three flag bytes, then — only when this node mints
-    // Data-Access Capabilities (`--data-access-key`) — a u16-length-prefixed
-    // capability the client must replay to its data-server. Appending it AFTER
-    // the flags keeps old clients working (they read `..3` and ignore the tail);
-    // a data-server NOT in verify mode likewise ignores it. The capability
-    // proves this session passed a genuine meta `M_OPEN`, so a rogue meta that
-    // lacks the shared key cannot arm the honest data plane (see
-    // [`crate::remote::dac`]).
+    // The names the flags imply, so a remote mount can STATE its contract in
+    // the same words a local mount prints (a derived name: "write to base view
+    // X"; a fork: "of base X"; an alias: "resolves to real view X"). Without
+    // them the operator only finds out from an EROFS at the first write.
+    // `presented_name != view` means pure-alias resolution swapped the tree
+    // above; a derived name and a fork both carry a `base` in their definition.
+    let def_base = view_base_name(&*rt.control, &view)?;
+    let alias_of = (presented_name != view).then(|| view.clone());
+    // The ack body: three flag bytes, then a definition tail of up to three
+    // u16-length-prefixed keys — every slot is always written, an unused one as
+    // the empty string —
+    //   [3] the Data-Access Capability this node mints (`--data-access-key`),
+    //       which the client must replay to its data-server (see
+    //       [`crate::remote::dac`]: it proves this session passed a genuine
+    //       meta `M_OPEN`, so a rogue meta lacking the shared key cannot arm
+    //       the honest data plane);
+    //   [4] the BASE view of a derived view or of a fork;
+    //   [5] the REAL view name a presented alias resolved to.
+    // Appending the tail keeps old clients working (they read `..3`, read at
+    // most the first tail key, and ignore the rest); a data-server NOT in
+    // verify mode likewise ignores it. Writing the empty placeholders is what
+    // lets an old client keep reading slot [3] as "no capability" when this
+    // node issues none but still has a name to report.
     let mut ack = vec![client_ro as u8, paged_cap, content_ro as u8];
-    if let Some(key) = &rt.data_access_key {
-        let expiry = if rt.data_access_ttl == 0 {
-            0
-        } else {
-            crate::remote::dac::now_secs().saturating_add(rt.data_access_ttl)
-        };
-        proto::put_key(&mut ack, &crate::remote::dac::issue(key, expiry));
-    }
+    let capability = match &rt.data_access_key {
+        Some(key) => {
+            let expiry = if rt.data_access_ttl == 0 {
+                0
+            } else {
+                crate::remote::dac::now_secs().saturating_add(rt.data_access_ttl)
+            };
+            crate::remote::dac::issue(key, expiry)
+        }
+        None => String::new(),
+    };
+    proto::put_key(&mut ack, &capability);
+    proto::put_key(&mut ack, def_base.as_deref().unwrap_or(""));
+    proto::put_key(&mut ack, alias_of.as_deref().unwrap_or(""));
     proto::send_response(&mut writer, 0, open_epoch, &ack)?;
 
     // Distinguish a subscriber (becomes an event sink, sends no requests) from a

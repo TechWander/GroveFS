@@ -462,6 +462,17 @@ pub struct RemoteMeta {
     /// `--data-access-key`. Set once on the first accepted handshake — the
     /// capability is stable for a mount, like the member id on the data side.
     dac: std::sync::OnceLock<String>,
+    /// The BASE view named by the definition tail of the `M_OPEN` ack: set for
+    /// a DERIVED view (a lens over a physical tree) and for a fork (an
+    /// independent tree seeded from a base). Empty/absent for a physical view
+    /// and for any peer that sends no definition tail. It exists so a REMOTE
+    /// mount can state the contract its flags imply ("write to base view X",
+    /// "fork of base X") in the same words a local mount prints.
+    base: std::sync::OnceLock<String>,
+    /// The REAL view name a presented ALIAS resolved to, from the ack's
+    /// definition tail (the server does the resolution, so the client cannot
+    /// derive it locally). Absent when the presented name was not an alias.
+    alias_real: std::sync::OnceLock<String>,
 }
 
 impl RemoteMeta {
@@ -527,6 +538,8 @@ impl RemoteMeta {
             paged: AtomicU8::new(0),
             content_ro: AtomicU8::new(0),
             dac: std::sync::OnceLock::new(),
+            base: std::sync::OnceLock::new(),
+            alias_real: std::sync::OnceLock::new(),
         };
         // Probe once (connect + handshake) so mount fails fast on a dead server.
         let (s, _) = this.connect_fresh()?;
@@ -560,6 +573,20 @@ impl RemoteMeta {
     /// plane. Latched on the first accepted `M_OPEN` (stable for the mount).
     pub fn data_access_capability(&self) -> String {
         self.dac.get().cloned().unwrap_or_default()
+    }
+
+    /// The BASE view the server named in the `M_OPEN` definition tail — the
+    /// tree a derived view renders or the tree a fork was seeded from. `None`
+    /// for a physical view (and for a peer too old to send the tail), so the
+    /// caller can print the contract ONLY when there is one to print.
+    pub fn base_view(&self) -> Option<String> {
+        self.base.get().cloned()
+    }
+
+    /// The REAL view name a presented ALIAS resolved to, as reported in the
+    /// `M_OPEN` definition tail. `None` when no alias was involved.
+    pub fn resolved_alias(&self) -> Option<String> {
+        self.alias_real.get().cloned()
     }
 
     fn get_conn(&self) -> io::Result<(TcpStream, bool)> {
@@ -624,15 +651,30 @@ impl RemoteMeta {
                                 self.readonly.store(ro, Ordering::SeqCst);
                                 self.paged.store(paged, Ordering::SeqCst);
                                 self.content_ro.store(content_ro, Ordering::SeqCst);
-                                // Byte [3..] (optional): a Data-Access Capability
-                                // appended by a `--data-access-key` meta-server.
-                                // An absent tail means the server issues none (and
-                                // matches every pre-DAC server byte-for-byte).
+                                // Byte [3..] (optional): the definition tail.
+                                // Three key slots, an unused one written as the
+                                // empty string: [3] the Data-Access Capability
+                                // (`--data-access-key`), [4] the base view of a
+                                // derived view or fork, [5] the real name an
+                                // alias resolved to. A missing tail is every
+                                // pre-DAC server, and a MISSING slot after a
+                                // present one is an older peer — both just leave
+                                // the later names unset.
                                 if data.len() > 3 {
                                     let mut di = 3usize;
                                     if let Ok(d) = proto::get_key(&data, &mut di) {
                                         if !d.is_empty() {
                                             let _ = self.dac.set(d);
+                                        }
+                                    }
+                                    if let Ok(b) = proto::get_key(&data, &mut di) {
+                                        if !b.is_empty() {
+                                            let _ = self.base.set(b);
+                                        }
+                                    }
+                                    if let Ok(a) = proto::get_key(&data, &mut di) {
+                                        if !a.is_empty() {
+                                            let _ = self.alias_real.set(a);
                                         }
                                     }
                                 }

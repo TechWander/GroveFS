@@ -578,13 +578,14 @@ $ grovefs --home $BASE mount --view docsonly -m /mnt/lens &   # 本地：直挂�
 derived view 'docsonly' over base 'team': 0 hide, 1 only, 0 reloc rule(s)
 note: derived (virtual) views mount read-only — write to base view 'team'
 $ grovefs mount --view docsonly --meta-server 10.0.0.5:50110 --data-servers 10.0.0.5:50100 -m /mnt/lens_r &   # 远程：同样只给名，M_OPEN 握手带只读标志
+note: derived (virtual) views mount read-only — write to base view 'team'      # 与本地同一行：基底名随 ack 尾部回来
 $ ls /mnt/lens                       # 只有 docs;基名 team 挂出来仍是全树，且可写
 docs
 $ echo x > /mnt/lens/docs/new.md     # 经虚拟视图的写一律拒绝
 bash: /mnt/lens/docs/new.md: Read-only file system
 ```
 
-语义与守卫(第 9 节 e2e 验证):define 拒绝 `name == base`、拒绝 base 本身是派生视图(不嵌套)、拒绝遮蔽物理 `<name>.db`、非法规则 fail-fast;**虚拟视图一律只读(硬契约)**——写只属于原(基名)视图,三层强制:`meta-server` 在 `M_OPEN` 握手回包里带派生标志,客户端直接落内核只读挂载(写/`flock` 写锁即时 `EROFS`、零往返);服务端另对派生名的写意图 op 加独立权威门禁(回 `E_NOTPERM`→`EPERM`,有意不用 `E_ROFS` 以免被误读为 HA 故障转移信号),旧/伪造客户端绕不过;本地(`--home`)派生挂载在挂载时同判强制 RO。**改定义热生效**——`meta-server` 每次分发 op 前检查定义版本(SQLite 看文件 mtime、PG 看 `xmin`),替换后已建立的挂载在客户端 TTL(≤2s)内自动切新形状、不需重挂(实测 ≤5s 断言,见第 9 节;换形后只读契约不变),`view rm` 则不热作用(已挂载者保持旧形状到重挂,避免正在用的树被抽掉);同名多客户端由服务端**同一份定义**渲染,虚拟 inode 跨机一致;共享 meta-server 下派生订阅者同时注册进自身名与 base 名两个桶、写双播,基侧写在非 `--no-cache` 下也能对派生挂载即时可见;要按名限制某调用方只能读这棵派生视图,铸一把 `--view docsonly --ro` 的 key(写永远走基名,派生挂载本就一律只读)。本地模式(`--home`)同机制:挂载不带 `--layout` 时自动解析 `<home>/meta/views/<view>.layout`(显式 `--layout` 优先,不叠两层透镜;热重载仅限 meta-server,本地挂载在挂载时解析一次)。注意:SQLite 档 `grovefs view` 操作服务端本地文件,需在 meta-server 所在机器执行,HA 部署下 `meta/views/` 要随控制面库(`api_keys.db`/`refs.db`)手工同步到备机;PG 档定义在共享存储(`grovefs_control`),带同一 `--meta-store` 从任意可达节点治理即可、无本地文件要同步(§6.2);它同样**不是安全边界**,直挂基名仍见全树(能拦住的是 token / key,不是形状)。
+语义与守卫(第 9 节 e2e 验证):define 拒绝 `name == base`、拒绝 base 本身是派生视图(不嵌套)、拒绝遮蔽物理 `<name>.db`、非法规则 fail-fast;**虚拟视图一律只读(硬契约)**——写只属于原(基名)视图,三层强制:`meta-server` 在 `M_OPEN` 握手回包里带派生标志,客户端直接落内核只读挂载(写/`flock` 写锁即时 `EROFS`、零往返;回包尾部同时带基底名与别名解析到的真实名,所以**远程挂载打印的契约行与本地逐字一致**),服务端另对派生名的写意图 op 加独立权威门禁(回 `E_NOTPERM`→`EPERM`,有意不用 `E_ROFS` 以免被误读为 HA 故障转移信号),旧/伪造客户端绕不过;本地(`--home`)派生挂载在挂载时同判强制 RO。**改定义热生效**——`meta-server` 每次分发 op 前检查定义版本(SQLite 看文件 mtime、PG 看 `xmin`),替换后已建立的挂载在客户端 TTL(≤2s)内自动切新形状、不需重挂(实测 ≤5s 断言,见第 9 节;换形后只读契约不变),`view rm` 则不热作用(已挂载者保持旧形状到重挂,避免正在用的树被抽掉);同名多客户端由服务端**同一份定义**渲染,虚拟 inode 跨机一致;共享 meta-server 下派生订阅者同时注册进自身名与 base 名两个桶、写双播,基侧写在非 `--no-cache` 下也能对派生挂载即时可见;要按名限制某调用方只能读这棵派生视图,铸一把 `--view docsonly --ro` 的 key(写永远走基名,派生挂载本就一律只读)。本地模式(`--home`)同机制:挂载不带 `--layout` 时自动解析 `<home>/meta/views/<view>.layout`(显式 `--layout` 优先,不叠两层透镜;热重载仅限 meta-server,本地挂载在挂载时解析一次)。注意:SQLite 档 `grovefs view` 操作服务端本地文件,需在 meta-server 所在机器执行,HA 部署下 `meta/views/` 要随控制面库(`api_keys.db`/`refs.db`)手工同步到备机;PG 档定义在共享存储(`grovefs_control`),带同一 `--meta-store` 从任意可达节点治理即可、无本地文件要同步(§6.2);它同样**不是安全边界**,直挂基名仍见全树(能拦住的是 token / key,不是形状)。
 
 ### 3.3 存量数据零拷贝导入(`grovefs import`):目录原地不动,客户端连接即得
 
@@ -690,7 +691,7 @@ $ grovefs view --meta-dir $BASE rm --name lab
 removed fork view 'lab' of base 'team' (its own metadata tree is gone; content bytes stay while any view — including 'team' — still holds a name for them)
 ```
 
-语义与守卫:`view fork` 拒绝 `name == base`、拒绝目标名已有定义或已有物理 db、拒绝基名本身有定义(派生/别名/fork 不能当基)、拒绝基名在该 store 里没有物理树(两档同一句话:SQLite 找 `meta/<base>.db`、PG 找 `grovefs_v_<hex>`);`alias` 拒绝指向 fork(fork 是树身份,不是公开名——给它发 key 用 `apikey create --view lab`),`import` 拒绝 fork 目标。**结构面可写、内容面只读**:`mkdir`/`rename`/`unlink`/`symlink`/`link`/`chmod`/空对象 `create` 放行,`write`/`truncate` 一律 `EROFS`;本地(`--home`)与 `meta-server` 两条路径同判(后者靠 `M_OPEN` 回包第 3 个标志字节)。删除只摘 fork 自己的 `node` 行:共享对象由跨视图账本判定,只有**最后一个持有视图**摘名后才真正回收;`view rm --name <fork>` 删定义 + 自己那棵 `<name>.db`(+WAL/SHM)并 `refs rebuild` 重算账本,基视图与字节分毫不动。诚实边界:内容写门是**客户端门**,绕过 FUSE 直连 data-server 的 raw 协议客户端仍能写字节——硬边界仍是服务端 token+API key(§6)。可见性:`view list` 同时列出定义槽(派生/别名/fork)与**裸基视图**(无定义的物理树);`apikey list --view V` 只列能开 V 的 key(纯别名也匹配绑定到真实名的 key),并汇总未绑定 key 数。e2e 见 `fork` 套件(75 条断言,含 `--empty` 空种子与 `view graft` 接枝)。
+语义与守卫:`view fork` 拒绝 `name == base`、拒绝目标名已有定义或已有物理 db、拒绝基名本身有定义(派生/别名/fork 不能当基)、拒绝基名在该 store 里没有物理树(两档同一句话:SQLite 找 `meta/<base>.db`、PG 找 `grovefs_v_<hex>`);`alias` 拒绝指向 fork(fork 是树身份,不是公开名——给它发 key 用 `apikey create --view lab`),`import` 拒绝 fork 目标。**结构面可写、内容面只读**:`mkdir`/`rename`/`unlink`/`symlink`/`link`/`chmod`/空对象 `create` 放行,`write`/`truncate` 一律 `EROFS`;本地(`--home`)与 `meta-server` 两条路径同判(后者靠 `M_OPEN` 回包第 3 个标志字节)。删除只摘 fork 自己的 `node` 行:共享对象由跨视图账本判定,只有**最后一个持有视图**摘名后才真正回收;`view rm --name <fork>` 删定义 + 自己那棵 `<name>.db`(+WAL/SHM)并 `refs rebuild` 重算账本,基视图与字节分毫不动。诚实边界:内容写门是**客户端门**,绕过 FUSE 直连 data-server 的 raw 协议客户端仍能写字节——硬边界仍是服务端 token+API key(§6)。可见性:`view list` 同时列出定义槽(派生/别名/fork)与**裸基视图**(无定义的物理树);`apikey list --view V` 只列能开 V 的 key(纯别名也匹配绑定到真实名的 key),并汇总未绑定 key 数。e2e 见 `fork` 套件(76 条断言,含 `--empty` 空种子与 `view graft` 接枝)。
 
 #### 定制 fork 视图:从建到删的七个动作
 
@@ -2082,7 +2083,7 @@ ps aux | grep grovefs                     # 查看在跑的 server / mount
 
 ## 10. 验证与回归
 
-全板一共 **44 段**:`build` → `unit` → **41 个套件** → `bench`。**前 43 段门控 GREEN,`bench` 只打吞吐参考值、永不门控**(只要纯功能回归就 `SKIP_BENCH=1`)。`pg`/`pg_parallel`/`evict`/`control`/`forksrv` 在无可达 PostgreSQL 的主机上整段自动 SKIP,`client` 在没有同级 `grovefs-client` 检出(或其二进制、`fusermount` 助手)的机器上整段 SKIP,`xfer`/`gcremote` 则跳过 PG 臂只跑 SQLite 臂,都不拉低 GREEN;`treedb` 段是实验性后端的自检,`treedbmatrix` 把 posix/e2e 的整体断言矩阵在那个后端上重放(只认 `pass=39 fail=0 skip=10` 这个契约三元组),`treedbctl` 是控制面第三臂(凭据、审计与 web 账号/授权行落进引擎的通用表,**无开关**——M3 已删;并覆盖 §3.5.4 的 `control-migrate` 搬家与切写/退休)——这三个都在默认构建(未开 `--features treedb`)整段 SELF-SKIP,同样不拉低 GREEN。
+全板一共 **44 段**:`build` → `unit` → **41 个套件** → `bench`。**前 43 段门控 GREEN,`bench` 只打吞吐参考值、永不门控**(只要纯功能回归就 `SKIP_BENCH=1`)。`pg`/`pg_parallel`/`evict`/`control`/`forksrv` 在无可达 PostgreSQL 的主机上整段自动 SKIP,`client` 在没有同级 `grovefs-client` 检出(或其二进制、`fusermount` 助手)的机器上整段 SKIP,`xfer`/`gcremote` 则跳过 PG 臂只跑 SQLite 臂,都不拉低 GREEN;`treedb` 段是实验性后端的自检,`treedbmatrix` 把 posix/e2e 的整体断言矩阵在那个后端上重放(只认 `pass=39 fail=0 skip=10` 这个契约三元组),`treedbctl` 是控制面第三臂(凭据、审计与 web 账号/授权行落进引擎的通用表,**无开关**——M3 已删;并覆盖 §3.5.4 的 `control-migrate` 搬家与切写/退休)——这三个都在默认构建(未开 `--features treedb`)整段 SELF-SKIP,同样不拉低 GREEN。**套件内的能力自跳**:某个构建没带另一分支的能力时(可逆凭据存储 `apikey secret`、控制台多出来的 op、`manager` 注册平面、新版 `--audit-retention` 契约),相应断言逐条打 `SKIP:` 并计入 `SUMMARY` 的 `skip=`,该行仍判 PASS——`FAIL` 只留给真正的回归,而 `skip=` 是解释性读数、不是门(门仍看 `fail` 与 `rc`);门本身按能力探测(子命令是否存在、`--audit-retention never` 被接还是被拒),所以能力落地那天自己就开。
 
 ```bash
 export LC_ALL=C LANG=C                                 # 仓库根目录下执行(PKG_CONFIG 不必设:无 crate 查 pkg-config,§1)
@@ -2540,7 +2541,7 @@ HA 拓扑滚动升级(写不中断,切换瞬间除外):
   grovefs gc --meta-dir D --apply --older-than 0 --json   # 立即回收 + 机器可读
   ```
 
-  守卫:任何视图树读不开就整体中止(跳过一棵树会把它的对象全误判成孤儿);账本仍持有的键只报告不删;`--data-dir` 与所有树零交集时拒绝(防 `--meta-dir`/`--data-dir` 配错,`--force` 可越过);PG 部署直接拒绝(树是 schema,字节归 data-server)。e2e 见 `gc` 套件(41 条断言:干净库/out-of-band 删树→held→rebuild→孤儿→grace→真删/非对象不删/本库挂载拒与他库同名不拦/错根防呆/PG 与非法时长拒绝/`--json` 字段)。
+  守卫:任何视图树读不开就整体中止(跳过一棵树会把它的对象全误判成孤儿);账本仍持有的键只报告不删;`--data-dir` 与所有树零交集时拒绝(防 `--meta-dir`/`--data-dir` 配错,`--force` 可越过);PG 部署直接拒绝(树是 schema,字节归 data-server)。e2e 见 `gc` 套件(42 条断言:干净库/out-of-band 删树→held→rebuild→孤儿→grace→真删/非对象不删/本库挂载拒与他库同名不拦/错根防呆/PG 与非法时长拒绝/`--json` 字段)。
 
   **两档后端通用的是远程形态**:服务端读自己的树(SQLite/PG),字节向 data-server 枚举——操作员机器上既不需要 `meta/` 也不需要 `blocks/`,PG 部署下的孤儿回收就走它:
 

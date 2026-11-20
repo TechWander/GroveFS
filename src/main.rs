@@ -2796,6 +2796,27 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                     content_ro = rm.is_content_ro_view();
                     // Ack tail: the Data-Access Capability for the data plane.
                     data_capability = rm.data_access_capability();
+                    // The ack's definition tail names what the flags imply — the
+                    // real tree an alias resolved to, the base view of a lens or
+                    // a fork — so a REMOTE mount states the same contract a
+                    // local mount prints below, instead of leaving the operator
+                    // to discover it from EROFS at the first write.
+                    if let Some(real) = rm.resolved_alias() {
+                        println!(
+                            "alias view '{view}' resolves to real view '{real}' (full tree, writable)"
+                        );
+                    }
+                    if let Some(b) = rm.base_view() {
+                        if content_ro {
+                            println!(
+                                "fork view '{view}' of base '{b}': independent tree — structure writable, content read-only (EROFS)"
+                            );
+                        } else {
+                            println!(
+                                "note: derived (virtual) views mount read-only — write to base view '{b}'"
+                            );
+                        }
+                    }
                     Arc::new(rm)
                 }
                 None => {
