@@ -5437,13 +5437,17 @@ fn dispatch_meta(
                 Ok(v) => v,
                 Err(_) => return (E_DB, 0, Vec::new(), Vec::new()),
             };
-            match engine.lookup(parent, &name) {
-                Some(n) => {
+            match engine.lookup_checked(parent, &name) {
+                Ok(Some(n)) => {
                     let mut d = Vec::new();
                     put_node(&mut d, &n);
                     (0, 0, d, Vec::new())
                 }
-                None => (E_NOTFOUND, 0, Vec::new(), Vec::new()),
+                Ok(None) => (E_NOTFOUND, 0, Vec::new(), Vec::new()),
+                // "Could not ask" is NOT "not there": the client maps E_DB to
+                // EIO, which is what an operator sees during an engine outage
+                // instead of a mass delete (see `MetaProvider::lookup_checked`).
+                Err(e) => bail!(e),
             }
         }
         M_GETATTR => {
@@ -5451,13 +5455,14 @@ fn dispatch_meta(
                 Ok(v) => v,
                 Err(_) => return (E_DB, 0, Vec::new(), Vec::new()),
             };
-            match engine.getattr(ino) {
-                Some(n) => {
+            match engine.getattr_checked(ino) {
+                Ok(Some(n)) => {
                     let mut d = Vec::new();
                     put_node(&mut d, &n);
                     (0, 0, d, Vec::new())
                 }
-                None => (E_NOTFOUND, 0, Vec::new(), Vec::new()),
+                Ok(None) => (E_NOTFOUND, 0, Vec::new(), Vec::new()),
+                Err(e) => bail!(e),
             }
         }
         M_READDIR => {
@@ -5465,7 +5470,12 @@ fn dispatch_meta(
                 Ok(v) => v,
                 Err(_) => return (E_DB, 0, Vec::new(), Vec::new()),
             };
-            let nodes = engine.readdir(parent);
+            let nodes = match engine.readdir_checked(parent) {
+                Ok(v) => v,
+                // A failed listing must not go back as an empty one: the client
+                // reads an empty page as "directory ended" and truncates `ls`.
+                Err(e) => return bail!(e),
+            };
             let mut d = Vec::new();
             put_nodes(&mut d, &nodes);
             (0, 0, d, Vec::new())
@@ -5487,7 +5497,10 @@ fn dispatch_meta(
             // directory per kernel buffer. Reached only for a server whose store
             // advertises paging (the M_READDIRP cap), so `engine` is a physical
             // MetaStore, never a non-paging derived lens.
-            let nodes = engine.readdir_page(parent, offset as usize, limit as usize);
+            let nodes = match engine.readdir_page_checked(parent, offset as usize, limit as usize) {
+                Ok(v) => v,
+                Err(e) => return bail!(e),
+            };
             let mut d = Vec::new();
             put_nodes(&mut d, &nodes);
             (0, 0, d, Vec::new())

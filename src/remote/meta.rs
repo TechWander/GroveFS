@@ -765,10 +765,60 @@ impl RemoteMeta {
     }
 
     // ---- response interpretation helpers ----
-    fn call_node(&self, op: u8, body: &[u8]) -> Option<NodeInfo> {
+    /// One node read (LOOKUP/GETATTR), with the failure channel the wire format
+    /// has always had and this client used to throw away.
+    ///
+    /// `E_NOTFOUND` is the server SAYING "no such entry" — that is `Ok(None)`.
+    /// Everything else is a failure to answer and must travel as one: a
+    /// transport error (`round_trip` already retried a stale pooled socket), a
+    /// mid-session auth refusal, `E_DB`, or a node frame the parser rejects.
+    /// The old `_ => None` folded all of those into "absent", which the FUSE
+    /// layer can only report as `ENOENT`: an outage looked like a mass delete.
+    fn call_node_checked(&self, op: u8, body: &[u8]) -> Result<Option<NodeInfo>, MetaError> {
         match self.round_trip(op, body) {
-            Ok((0, _, data)) if !data.is_empty() => node_from(&data, &mut 0).ok(),
-            _ => None,
+            Ok((0, _, data)) => {
+                if data.is_empty() {
+                    return Ok(None);
+                }
+                node_from(&data, &mut 0)
+                    .map(Some)
+                    .map_err(|_| MetaError::Db("remote meta: bad node frame".to_string()))
+            }
+            Ok((E_NOTFOUND, _, _)) => Ok(None),
+            Ok((c, _, _)) => Err(err_from_code(c)),
+            Err(_) => Err(MetaError::Db("remote meta transport".to_string())),
+        }
+    }
+
+    /// One full listing, with the failure channel. `Ok(empty)` is a listing the
+    /// server actually served — never what a dead peer becomes.
+    fn readdir_rpc(&self, parent: i64) -> Result<Vec<NodeInfo>, MetaError> {
+        let mut b = Vec::new();
+        put_i64(&mut b, parent);
+        match self.round_trip(M_READDIR, &b) {
+            Ok((0, _, data)) => nodes_from(&data)
+                .map_err(|_| MetaError::Db("remote meta: bad listing frame".to_string())),
+            Ok((c, _, _)) => Err(err_from_code(c)),
+            Err(_) => Err(MetaError::Db("remote meta transport".to_string())),
+        }
+    }
+
+    /// One page of the listing, with the failure channel.
+    fn readdir_page_rpc(
+        &self,
+        parent: i64,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<NodeInfo>, MetaError> {
+        let mut b = Vec::new();
+        put_i64(&mut b, parent);
+        proto::put_u64(&mut b, offset as u64);
+        proto::put_u64(&mut b, limit as u64);
+        match self.round_trip(M_READDIRP, &b) {
+            Ok((0, _, data)) => nodes_from(&data)
+                .map_err(|_| MetaError::Db("remote meta: bad listing frame".to_string())),
+            Ok((c, _, _)) => Err(err_from_code(c)),
+            Err(_) => Err(MetaError::Db("remote meta transport".to_string())),
         }
     }
 
@@ -851,54 +901,69 @@ impl RemoteMeta {
 
 impl MetaProvider for RemoteMeta {
     fn lookup(&self, parent: i64, name: &str) -> Option<NodeInfo> {
+        self.lookup_checked(parent, name).ok().flatten()
+    }
+
+    fn lookup_checked(&self, parent: i64, name: &str) -> Result<Option<NodeInfo>, MetaError> {
         let mut b = Vec::new();
         put_i64(&mut b, parent);
         proto::put_key(&mut b, name);
-        self.call_node(M_LOOKUP, &b)
+        self.call_node_checked(M_LOOKUP, &b)
     }
 
     fn getattr(&self, ino: i64) -> Option<NodeInfo> {
+        self.getattr_checked(ino).ok().flatten()
+    }
+
+    fn getattr_checked(&self, ino: i64) -> Result<Option<NodeInfo>, MetaError> {
         let mut b = Vec::new();
         put_i64(&mut b, ino);
-        self.call_node(M_GETATTR, &b)
+        self.call_node_checked(M_GETATTR, &b)
     }
 
     fn readdir(&self, parent: i64) -> Vec<NodeInfo> {
-        let mut b = Vec::new();
-        put_i64(&mut b, parent);
-        match self.round_trip(M_READDIR, &b) {
-            Ok((0, _, data)) => nodes_from(&data).unwrap_or_default(),
-            _ => Vec::new(),
-        }
+        self.readdir_checked(parent).unwrap_or_default()
+    }
+
+    fn readdir_checked(&self, parent: i64) -> Result<Vec<NodeInfo>, MetaError> {
+        self.readdir_rpc(parent)
     }
 
     fn readdir_page(&self, parent: i64, offset: usize, limit: usize) -> Vec<NodeInfo> {
+        self.readdir_page_checked(parent, offset, limit)
+            .unwrap_or_default()
+    }
+
+    fn readdir_page_checked(
+        &self,
+        parent: i64,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<NodeInfo>, MetaError> {
         // Only page over the wire when the handshake said the server's store can
         // page. Otherwise slice a single full listing (the pre-paging behaviour).
         if self.paged.load(Ordering::SeqCst) == 0 {
-            return self
-                .readdir(parent)
+            return Ok(self
+                .readdir_checked(parent)?
                 .into_iter()
                 .skip(offset)
                 .take(limit)
-                .collect();
+                .collect());
         }
-        let mut b = Vec::new();
-        put_i64(&mut b, parent);
-        proto::put_u64(&mut b, offset as u64);
-        proto::put_u64(&mut b, limit as u64);
-        match self.round_trip(M_READDIRP, &b) {
-            Ok((0, _, data)) => nodes_from(&data).unwrap_or_default(),
-            // A failed page RPC (a transient transport error) must not
-            // truncate the directory: fall back to slicing one full listing.
-            // `round_trip` already re-handshakes on a stale socket, so `paged`
-            // reflects the live node before the next page call.
-            _ => self
-                .readdir(parent)
+        match self.readdir_page_rpc(parent, offset, limit) {
+            Ok(page) => Ok(page),
+            // A failed page RPC must not truncate the directory. Falling back to
+            // one full listing covers the useful non-failure case — a server
+            // that just re-handshook without the paging cap, or an M_READDIRP
+            // this build's peer does not serve — and it goes through the CHECKED
+            // read, so a transport failure that survives the retry comes back as
+            // an error, never as an empty page (= "end of directory").
+            Err(_) => Ok(self
+                .readdir_checked(parent)?
                 .into_iter()
                 .skip(offset)
                 .take(limit)
-                .collect(),
+                .collect()),
         }
     }
 

@@ -3186,6 +3186,51 @@ impl MetaProvider for MetaStore {
             MetaStore::Treedb(t) => t.readdir_page(parent, offset, limit),
         }
     }
+    // ---- the read side's failure channel, forwarded to the live variant ----
+    // The meta-server dispatches through `&dyn MetaProvider` pointing at a
+    // MetaStore, so a treedb-backed server needs the channel forwarded here:
+    // the trait default would call this type's UNCHECKED read and an engine
+    // outage would be flattened back into ENOENT one layer above the fix.
+    // SQLite and PostgreSQL keep their own defaults (their reads still collapse
+    // an error into `None`/empty at the SQL call — a separate, local-disk-only
+    // failure path), so this dispatch changes nothing for them.
+    fn lookup_checked(&self, parent: i64, name: &str) -> Result<Option<NodeInfo>, MetaError> {
+        match self {
+            MetaStore::Sqlite(m) => MetaProvider::lookup_checked(m, parent, name),
+            MetaStore::Pg(p) => MetaProvider::lookup_checked(&**p, parent, name),
+            #[cfg(feature = "treedb")]
+            MetaStore::Treedb(t) => MetaProvider::lookup_checked(&**t, parent, name),
+        }
+    }
+    fn getattr_checked(&self, ino: i64) -> Result<Option<NodeInfo>, MetaError> {
+        match self {
+            MetaStore::Sqlite(m) => MetaProvider::getattr_checked(m, ino),
+            MetaStore::Pg(p) => MetaProvider::getattr_checked(&**p, ino),
+            #[cfg(feature = "treedb")]
+            MetaStore::Treedb(t) => MetaProvider::getattr_checked(&**t, ino),
+        }
+    }
+    fn readdir_checked(&self, parent: i64) -> Result<Vec<NodeInfo>, MetaError> {
+        match self {
+            MetaStore::Sqlite(m) => MetaProvider::readdir_checked(m, parent),
+            MetaStore::Pg(p) => MetaProvider::readdir_checked(&**p, parent),
+            #[cfg(feature = "treedb")]
+            MetaStore::Treedb(t) => MetaProvider::readdir_checked(&**t, parent),
+        }
+    }
+    fn readdir_page_checked(
+        &self,
+        parent: i64,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<NodeInfo>, MetaError> {
+        match self {
+            MetaStore::Sqlite(m) => MetaProvider::readdir_page_checked(m, parent, offset, limit),
+            MetaStore::Pg(p) => MetaProvider::readdir_page_checked(&**p, parent, offset, limit),
+            #[cfg(feature = "treedb")]
+            MetaStore::Treedb(t) => MetaProvider::readdir_page_checked(&**t, parent, offset, limit),
+        }
+    }
     fn create_nodes_batch(&self, items: &[NewNode<'_>]) -> Vec<Result<NodeInfo, MetaError>> {
         match self {
             MetaStore::Sqlite(m) => MetaProvider::create_nodes_batch(m, items),

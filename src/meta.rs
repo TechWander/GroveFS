@@ -245,8 +245,27 @@ pub struct NewNode<'a> {
 /// over the LAN, without knowing which — this is what makes the same view's
 /// folder tree consistent across machines.
 pub trait MetaProvider: Send + Sync {
+    /// Resolve `(parent, name)`.
+    ///
+    /// **This shape has no failure channel**: `None` means "no such entry" AND
+    /// "the store or the transport could not answer". Every caller that must
+    /// tell those apart (the FUSE read path, a meta-server request handler)
+    /// calls [`Self::lookup_checked`] instead; providers that DO have an error
+    /// source — a remote client, a treedb client — override it. This one stays
+    /// for the mutating paths, which only ever ask "does this name exist yet?",
+    /// and for provider implementations with genuinely one answer.
     fn lookup(&self, parent: i64, name: &str) -> Option<NodeInfo>;
+    /// Fetch a row by inode. Same missing-failure-channel caveat as
+    /// [`Self::lookup`]: `None` is both "gone" and "could not ask", which is
+    /// why the read path uses [`Self::getattr_checked`].
     fn getattr(&self, ino: i64) -> Option<NodeInfo>;
+    /// Every child of `parent`, in `ORDER BY name`.
+    ///
+    /// The failure case is the dangerous one, because an empty `Vec` here means
+    /// **end of directory** to every caller: the paged reply loops stop on
+    /// `got < want`, so a failed listing folded into `Vec::new()` truncates
+    /// `ls` silently (rc=0, fewer names). [`Self::readdir_checked`] is the same
+    /// read with the error kept; use it wherever the answer is user-visible.
     fn readdir(&self, parent: i64) -> Vec<NodeInfo>;
     /// Extra KERNEL-cache coordinates a change at the SOURCE coordinate
     /// `(src_parent, name)` implies for this provider's display namespace.
@@ -294,6 +313,49 @@ pub trait MetaProvider: Send + Sync {
             .skip(offset)
             .take(limit)
             .collect()
+    }
+
+    // ---- the same four reads, with a failure channel ----------------------
+    //
+    // These exist so the fix is ADDITIVE: every provider with no failure source
+    // (the SQLite and PostgreSQL engines today, a layout lens, a test double)
+    // keeps the default and behaves exactly as before, while the ones that DO
+    // have an error source override exactly these four. Changing the existing
+    // signatures instead would have touched all ~124 call sites at once — most
+    // of them inside the engines, where "absent" really is the whole answer —
+    // and made the interesting diff (the read path) unreadable.
+    //
+    // Why it matters, concretely: with `--meta-store treedb://` (or any
+    // `--meta-server`), killing the backend used to make every uncached read
+    // answer `ENOENT` — `ls` printed "No such file or directory" for a mount
+    // point that is still mounted, `cat` claimed the file was deleted, and a
+    // listing could even come back successful-but-short. `EIO` is the honest
+    // answer: the inode's existence is UNKNOWN, not negated. The write side has
+    // always drawn this line (its ops return `Result`); these four close the
+    // read side.
+    /// [`Self::lookup`] with the error kept. `Ok(None)` = "no such entry".
+    fn lookup_checked(&self, parent: i64, name: &str) -> Result<Option<NodeInfo>, MetaError> {
+        Ok(self.lookup(parent, name))
+    }
+    /// [`Self::getattr`] with the error kept. `Ok(None)` = "no such inode".
+    fn getattr_checked(&self, ino: i64) -> Result<Option<NodeInfo>, MetaError> {
+        Ok(self.getattr(ino))
+    }
+    /// [`Self::readdir`] with the error kept. `Ok(empty)` therefore means "no
+    /// children" — only a store that actually answered can say that.
+    fn readdir_checked(&self, parent: i64) -> Result<Vec<NodeInfo>, MetaError> {
+        Ok(self.readdir(parent))
+    }
+    /// [`Self::readdir_page`] with the error kept. A failed page must NEVER be
+    /// returned as an empty page: the reply loop reads `got < want` as "the
+    /// directory ended", so an empty page on failure is a silent truncation.
+    fn readdir_page_checked(
+        &self,
+        parent: i64,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<NodeInfo>, MetaError> {
+        Ok(self.readdir_page(parent, offset, limit))
     }
     /// Whether [`Self::readdir_page`] is a real sub-query (or, for a lens, a
     /// slice of a listing materialized once) rather than a full listing rebuilt

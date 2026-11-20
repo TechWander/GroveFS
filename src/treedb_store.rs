@@ -277,8 +277,9 @@ impl From<Fail> for io::Error {
 }
 
 /// 列目录失败绝不能静默退化成「这个目录是空的」：`ls` 会少条目、`du` 会少
-/// 用量、`gc check` 会把还在的树看成不存在。`MetaProvider` 的签名回的是
-/// `Vec`，没有失败通道，所以唯一能做的事是把这件事打到 stderr 上。
+/// 用量、`gc check` 会把还在的树看成不存在。带错误通道的读（
+/// [`MetaProvider::readdir_checked`]）不再需要这行日志：失败直接以 `Err`
+/// 上行成 EIO。仍走 `Vec` 签名的旧路径（`dump_tree`、写路径自检）只能靠它。
 ///
 /// `ENOENT`/`ENOTDIR` 除外 —— 那是并发 rename/rmdir 的正常竞态，天天都在发生，
 /// 一并打出来只会把真信号淹掉。
@@ -706,19 +707,38 @@ impl TreedbStore {
 
 impl MetaProvider for TreedbStore {
     fn lookup(&self, parent: i64, name: &str) -> Option<NodeInfo> {
+        self.lookup_checked(parent, name).ok().flatten()
+    }
+
+    /// 引擎的应答里 `ENOENT` 是「没这个条目」，其他任何 errno / 传输失败都是
+    /// 「问不到」——后者不能折成 `None`，否则 FUSE 只能报 ENOENT（看似整个
+    /// 目录被删了），而不是 EIO。
+    fn lookup_checked(&self, parent: i64, name: &str) -> Result<Option<NodeInfo>, MetaError> {
         let op = Op::Lookup { view: self.vid(), parent: parent as u64, name: name.as_bytes().to_vec() };
-        self.xcall(&op)
-            .ok()
-            .and_then(|r| Self::want_node(r).ok())
-            .map(|n| info_of(&n))
+        match self.xcall(&op) {
+            Ok(r) => match Self::want_node(r) {
+                Ok(n) => Ok(Some(info_of(&n))),
+                Err(f) if f.code == Some(errno::ENOENT) => Ok(None),
+                Err(f) => Err(f.to_meta()),
+            },
+            Err(f) => Err(f.to_meta()),
+        }
     }
 
     fn getattr(&self, ino: i64) -> Option<NodeInfo> {
+        self.getattr_checked(ino).ok().flatten()
+    }
+
+    fn getattr_checked(&self, ino: i64) -> Result<Option<NodeInfo>, MetaError> {
         let op = Op::Getattr { view: self.vid(), ino: ino as u64 };
-        self.xcall(&op)
-            .ok()
-            .and_then(|r| Self::want_node(r).ok())
-            .map(|n| info_of(&n))
+        match self.xcall(&op) {
+            Ok(r) => match Self::want_node(r) {
+                Ok(n) => Ok(Some(info_of(&n))),
+                Err(f) if f.code == Some(errno::ENOENT) => Ok(None),
+                Err(f) => Err(f.to_meta()),
+            },
+            Err(f) => Err(f.to_meta()),
+        }
     }
 
     fn readdir(&self, parent: i64) -> Vec<NodeInfo> {
@@ -728,6 +748,21 @@ impl MetaProvider for TreedbStore {
                 log_list_failure("readdir", parent, &f);
                 Vec::new()
             }
+        }
+    }
+
+    /// 这里不再把失败打成 stderr 就算完：调用方拿到 `Err` 会回 EIO，`ls` 会
+    /// **失败**而不是「成功但少了几条」。`ENOENT`/`ENOTDIR` 仍归 `Ok(空)` ——
+    /// 那是并发 rename/rmdir 的正常竞态，目录确实不在了，不是故障。
+    fn readdir_checked(&self, parent: i64) -> Result<Vec<NodeInfo>, MetaError> {
+        match self.page_all(parent) {
+            Ok(v) => Ok(v),
+            Err(f)
+                if matches!(f.code, Some(errno::ENOENT) | Some(errno::ENOTDIR)) =>
+            {
+                Ok(Vec::new())
+            }
+            Err(f) => Err(f.to_meta()),
         }
     }
 
@@ -742,6 +777,27 @@ impl MetaProvider for TreedbStore {
                 log_list_failure("readdir_page", parent, &f);
                 Vec::new()
             }
+        }
+    }
+
+    fn readdir_page_checked(
+        &self,
+        parent: i64,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<NodeInfo>, MetaError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let lim = limit.min(u32::MAX as usize) as u32;
+        match self.page(parent, offset as u64, lim) {
+            Ok(v) => Ok(v),
+            Err(f)
+                if matches!(f.code, Some(errno::ENOENT) | Some(errno::ENOTDIR)) =>
+            {
+                Ok(Vec::new())
+            }
+            Err(f) => Err(f.to_meta()),
         }
     }
 
