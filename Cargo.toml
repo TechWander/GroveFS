@@ -98,11 +98,31 @@ postgres = { version = "0.19", default-features = false, optional = true }
 # sibling clone. Anonymous https on purpose: an SSH URL would make `cargo fetch`
 # prompt for credentials on machines that only have a key for the private
 # remotes. The engine core needs only `libc` + `thiserror` + std, and the pinned
-# tag v0.3.2 keeps its PG migration shim behind an off-by-default
+# tag v0.3.6 keeps its PG migration shim behind an off-by-default
 # `postgres-compat` feature, so nothing else enters our graph (the earlier pin
 # v0.3.0 still carried `postgres`/`rusqlite(bundled)`/`sha2`/`uuid`/`chrono`/
 # `tracing` unconditionally; upstream gated it afterwards).
-treedb = { git = "https://github.com/TechWander/treedb.git", tag = "v0.3.2", optional = true }
+#
+# Why v0.3.2 -> v0.3.6 (protocol 2 -> 5, 51 ops / 30 replies, SNAP_VERSION 3):
+# the pin had fallen behind the engine by four releases, and the two things this
+# crate actually wants are in there — the generic table face (`Table*`/`Row*`,
+# the prerequisite for moving the control plane INTO the engine instead of
+# keeping keys/defs in a sidecar SQLite) and log shipping plus the read-only
+# replica (`treedb-standby` is the only tested backup point we can offer). The
+# wire contract held: `Client::connect(addr, timeout_ms)` kept its signature
+# (auth is the additive `connect_auth`), new ops are appended tag ranges, and
+# `EngineStats` only grew at the tail — so a v0.3.2 reader would silently drop
+# the trailing fields rather than fail (upstream DESIGN.md 4.1). What *did*
+# break is one Rust-level shape: since v0.3.3 `read_dir` hands the page's names
+# back in a flat `Names` buffer that only iterates by reference
+# (`impl<'a> IntoIterator for &'a Names`, `Item = &'a [u8]`), so the ino/name
+# pairing in `src/treedb_store.rs` has to be `zip(&names)` — one call site, no
+# behavior change (`test_treedb.sh` still 31/31).
+# One real constraint for operators, not for this build: SNAP_VERSION went 2 -> 3,
+# so an engine data dir written by the old pin needs `treedb-migrate` before the
+# new server binary will open it. The e2e suite cannot see that because it always
+# starts a fresh engine dir.
+treedb = { git = "https://github.com/TechWander/treedb.git", tag = "v0.3.6", optional = true }
 # Opt-in per-stage latency telemetry (src/stats.rs): high-dynamic-range histograms
 # for offline bottleneck diagnosis. Pure-Rust, zero deps. Only touched when
 # `--stats` / `GROVEFS_STATS=1` is on; the disabled path costs one atomic load.

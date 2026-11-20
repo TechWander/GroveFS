@@ -453,10 +453,13 @@ impl TreedbStore {
         // 名字」处理：跳过取不到属性的条目，但绝不返回半个条目。
         Ok(inos
             .iter()
-            .zip(names)
+            // `Names` 只有借用迭代（引擎侧把一页名字存在一份扁平 blob 里，逐条
+            // 交 `&[u8]`，不再拆成 N 个拥有块）：上游 v0.3.3 起按值的
+            // `zip(names)` 要写成 `zip(&names)`。
+            .zip(&names)
             .filter_map(|(ino, name)| {
                 let mut n = infos.get(&(*ino as i64))?.clone();
-                n.name = String::from_utf8_lossy(&name).into_owned();
+                n.name = String::from_utf8_lossy(name).into_owned();
                 Some(n)
             })
             .collect())
