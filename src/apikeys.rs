@@ -73,6 +73,13 @@ use std::path::Path;
 
 use crate::control::PgPool;
 
+/// The control plane in the `treedb` engine's generic tables (treedb DESIGN.md
+/// §10 C 4, milestone M1). A child module so it can reuse this module's private
+/// helpers (`now_iso`, `expiry_passed`, `StoredKey`, …) instead of copying them —
+/// two copies of the verification inputs are exactly how two backends drift.
+#[cfg(feature = "treedb")]
+mod treedb_ctl;
+
 /// A successfully authenticated key's identity (never the secret or hash).
 ///
 /// Beyond *who* connected, a mount key can now carry *which* view it is bound
@@ -452,9 +459,19 @@ const CALLS_DDL_PG: &str = "CREATE TABLE IF NOT EXISTS grovefs_control.mcp_calls
 )";
 
 /// Where this credential store physically lives.
+///
+/// The first two arms route **two SQL dialects** (`exec2(sqlite_sql, pg_sql)`), which
+/// is why the third backend is NOT a peer inside those helpers: treedb has no SQL,
+/// so it dispatches one level UP, at the method layer — every verb asks
+/// [`Self::treedb`] first and hands the semantics to [`treedb_ctl::TreedbKeys`].
+/// The `Treedb` arms in `exec2`/`query2` are therefore unreachable by construction
+/// and left as refusals rather than `unreachable!()` (the same rule the PG arm
+/// follows).
 enum Backend {
     Sqlite(parking_lot::Mutex<Connection>),
     Pg(PgPool),
+    #[cfg(feature = "treedb")]
+    Treedb(Box<treedb_ctl::TreedbKeys>),
 }
 
 /// One credential row as the VERIFICATION path reads it: the column subset
@@ -494,6 +511,29 @@ fn expiry_passed(expires_at: Option<&str>, now_ms: i64) -> bool {
         Ok(when) => when.timestamp_millis() <= now_ms,
         Err(_) => true,
     }
+}
+
+/// The two normalisations every "edit the bookkeeping fields" write shares: a
+/// blank remark is stored as `NULL` (not a zero-length string) and `Some(None)`
+/// means "never expires". Written once so the SQL and engine paths cannot drift
+/// about what an empty string means.
+fn note_and_deadline<'a>(
+    note: Option<&'a str>,
+    expires_at: Option<Option<&'a str>>,
+) -> (Option<&'a str>, Option<&'a str>) {
+    (
+        note.map(str::trim).filter(|t| !t.is_empty()),
+        expires_at.unwrap_or(None),
+    )
+}
+
+/// The engine arm a SQL-shaped `match` can never reach: every verb asks
+/// [`ApiKeyStore::treedb`] first and returns there. A refusal (not a panic) keeps
+/// the rule the PG arm already follows — a future verb that forgets the
+/// delegation answers an error instead of taking a server down.
+#[cfg(feature = "treedb")]
+fn missed_delegation<T>() -> Result<T, String> {
+    Err("treedb control: this verb has no engine path (a delegation was missed)".to_string())
 }
 
 /// One row reader for both backends: fetch column `i` as `Option<String>`.
@@ -558,6 +598,48 @@ impl ApiKeyStore {
         })
     }
 
+    /// 把控制面写进 treedb 引擎的通用表需要显式带上这个开关（见 [`Self::open_treedb`]）。
+    #[cfg(feature = "treedb")]
+    pub const TREEDB_CONTROL_ENV: &'static str = "GROVEFS_TREEDB_CONTROL";
+
+    /// Whether this process has been told to keep its control plane in the
+    /// treedb engine (`GROVEFS_TREEDB_CONTROL=engine`). One reader, so the route
+    /// decision (`open_treedb`) and the address the servers pass in
+    /// (`StoreKind::keys_uri`) cannot disagree about what the switch says.
+    #[cfg(feature = "treedb")]
+    pub fn treedb_control_enabled() -> bool {
+        std::env::var(Self::TREEDB_CONTROL_ENV)
+            .map(|v| v == "engine")
+            .unwrap_or(false)
+    }
+
+    /// The control plane in the treedb engine's generic tables
+    /// ([`treedb_ctl`]). Opt-in per process: `GROVEFS_TREEDB_CONTROL=engine`.
+    ///
+    /// Why a switch and not just "route on the URI": until the control tables have
+    /// been FILLED (the migration milestone), they are empty — routing there
+    /// unconditionally would report every key and account as unknown, which an
+    /// operator would read as "nobody can log in", not as "the migration was not
+    /// run". The switch is deleted once the migration lands.
+    #[cfg(feature = "treedb")]
+    pub fn open_treedb(uri: &str) -> Result<Self, String> {
+        let on = Self::treedb_control_enabled();
+        if !on {
+            return Err(format!(
+                "`{uri}` is a treedb tree store: its control plane lives in the engine's generic \
+                 tables, which are only read when `{}` is set to `engine` (and only after they have \
+                 been filled); without it, mint and check keys against the LOCAL SQLite beside the \
+                 meta-server's --meta-dir",
+                Self::TREEDB_CONTROL_ENV
+            ));
+        }
+        let addr = crate::treedb_store::parse_addr(uri)?;
+        let keys = treedb_ctl::TreedbKeys::open(&addr)?;
+        Ok(Self {
+            backend: Backend::Treedb(Box::new(keys)),
+        })
+    }
+
     /// The store for a metadata-backend selection: a `postgres[ql]://` URI
     /// routes to the PG control schema, anything else (including `None`) to the
     /// local file under `base` — the same routing rule the view definitions
@@ -569,8 +651,12 @@ impl ApiKeyStore {
             // ([`crate::pg_store::is_pg_store`]); the pool binds the registry's
             // FIRST entry, where the control schema lives.
             Some(u) if crate::pg_store::is_pg_store(u) => Self::open_pg(u),
+            // A `treedb://` tree store: the control plane moves into the engine's
+            // generic tables, behind [`Self::TREEDB_CONTROL_ENV`] (see `open_treedb`).
+            #[cfg(feature = "treedb")]
+            Some(u) if crate::treedb_store::is_treedb_store(u) => Self::open_treedb(u),
             Some(u) if u.contains("://") => Err(format!(
-                "`{u}` is not a --meta-store scheme GroveFS supports: credentials live in a local SQLite file or PostgreSQL (`postgres://…`); a `treedb://` tree store keeps its keys in the LOCAL SQLite beside its meta-server's --meta-dir, so mint them without --meta-store"
+                "`{u}` is not a --meta-store scheme GroveFS supports: credentials live in a local SQLite file or PostgreSQL (`postgres://…`)"
             )),
             _ => Self::open(base),
         }
@@ -580,6 +666,10 @@ impl ApiKeyStore {
     /// verification rules themselves live in [`Self::authenticate_for`] and
     /// [`Self::live_state`], so they cannot drift per backend.
     fn fetch_key(&self, id: &str) -> Result<Option<StoredKey>, String> {
+        #[cfg(feature = "treedb")]
+        if let Some(k) = self.treedb() {
+            return k.fetch_key(id);
+        }
         let mut rows = self.query2(
             "SELECT label, secret_hash, scope, revoked_at, view, ro, owner, expires_at FROM api_keys WHERE id = ?1",
             params![id],
@@ -628,6 +718,10 @@ impl ApiKeyStore {
     /// between the read and this stamp (the SQL UPDATE matches no row), which is
     /// the same behaviour a revoke racing an authentication has always had.
     fn stamp_used(&self, id: &str) -> Result<(), String> {
+        #[cfg(feature = "treedb")]
+        if let Some(k) = self.treedb() {
+            return k.stamp_used(id);
+        }
         let ts = now_iso();
         self.exec2(
             "UPDATE api_keys SET last_used_at = ?1 WHERE id = ?2",
@@ -635,6 +729,17 @@ impl ApiKeyStore {
             "UPDATE grovefs_control.api_keys SET last_used_at = $1 WHERE id = $2",
             &[&ts, &id],
         )
+    }
+
+    /// The engine backend's handle; `None` under SQLite/PG. Every verb's first
+    /// line is this question, which is what keeps the treedb arm out of the SQL
+    /// dispatchers (see [`Backend`]).
+    #[cfg(feature = "treedb")]
+    fn treedb(&self) -> Option<&treedb_ctl::TreedbKeys> {
+        match &self.backend {
+            Backend::Treedb(k) => Some(k),
+            _ => None,
+        }
     }
 
     /// One parameterized statement, backend-routed: the SQLite and PG spellings
@@ -658,6 +763,12 @@ impl ApiKeyStore {
             // cluster table before it reaches a SQL spelling. Reported instead of
             // `unreachable!()` so a future method that forgot the delegation is a
             // refusal rather than a panic inside a server.
+            #[cfg(feature = "treedb")]
+            Backend::Treedb(_) => Err(
+                "treedb control: this statement has no engine spelling (a verb missed its \
+                 delegation)"
+                    .to_string(),
+            ),
         }
     }
 
@@ -688,6 +799,12 @@ impl ApiKeyStore {
             }
             Backend::Pg(pool) => pool.query(sql_p, pp, mp),
             // See `exec2`: the public verbs route around this.
+            #[cfg(feature = "treedb")]
+            Backend::Treedb(_) => Err(
+                "treedb control: this SELECT has no engine spelling (a verb missed its \
+                 delegation)"
+                    .to_string(),
+            ),
         }
     }
 
@@ -749,8 +866,26 @@ impl ApiKeyStore {
         let hash = sha256_hex(&secret);
         let hint = secret_hint(&secret);
         let full_key = format!("{id}:{secret}");
-        let ts = now_iso();
         let sc = scope.as_str();
+        #[cfg(feature = "treedb")]
+        if let Some(k) = self.treedb() {
+            // 引擎档：一行就是整行，`PUT_IF_ABSENT` 把「id 撞了」变成报错而不是覆盖别人的凭据。
+            k.insert_key(
+                &id,
+                label,
+                &hash,
+                &hint,
+                sc,
+                view,
+                ro,
+                owner,
+                note,
+                expires_at,
+                created_by,
+            )?;
+            return Ok((id, full_key));
+        }
+        let ts = now_iso();
         self.exec2(
             "INSERT INTO api_keys (id, label, secret_hash, created_at, scope, view, ro, owner, note, expires_at, created_by, secret_hint) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![id, label, hash, ts, sc, view, ro as i64, owner, note, expires_at, created_by, hint],
@@ -959,6 +1094,11 @@ impl ApiKeyStore {
     /// ([`Self::live_state`]); a session established AFTER this call reads
     /// the flag at `authenticate_for` as usual.
     pub fn set_ro(&self, id: &str, ro: bool) -> Result<bool, String> {
+        #[cfg(feature = "treedb")]
+        if let Some(k) = self.treedb() {
+            // 引擎档：读 → 改 → 带「revoked_at 为空」的 CAS 写回（`RowPut` 整行覆盖）。
+            return k.set_ro(id, ro);
+        }
         // Same rows-affected path shape as `revoke`: one conditional UPDATE
         // whose count distinguishes "flipped now" from "no active row".
         let n = match &self.backend {
@@ -973,6 +1113,8 @@ impl ApiKeyStore {
                 "UPDATE grovefs_control.api_keys SET ro = $1 WHERE id = $2 AND revoked_at IS NULL",
                 &[&ro, &id],
             )? as usize,
+            #[cfg(feature = "treedb")]
+            Backend::Treedb(_) => return missed_delegation(),
         };
         Ok(n > 0)
     }
@@ -980,6 +1122,10 @@ impl ApiKeyStore {
     /// Every key, newest first. No secret material is in the row set: what
     /// `list` can show about a secret is the masked [`secret_hint`] fingerprint.
     pub fn list(&self) -> Result<Vec<KeyInfo>, String> {
+        #[cfg(feature = "treedb")]
+        if let Some(k) = self.treedb() {
+            return k.list();
+        }
         let rows = self.query2(
             "SELECT id, label, scope, view, ro, created_at, last_used_at, revoked_at, owner,
                     note, expires_at, created_by, secret_hint
@@ -1057,6 +1203,10 @@ impl ApiKeyStore {
         // no longer exists.
         let hint = secret_hint(&secret);
         let full_key = format!("{id}:{secret}");
+        #[cfg(feature = "treedb")]
+        if let Some(k) = self.treedb() {
+            return Ok(if k.rotate(id, &hash, &hint)? { Some(full_key) } else { None });
+        }
         let n = match &self.backend {
             Backend::Sqlite(m) => m
                 .lock()
@@ -1070,6 +1220,8 @@ impl ApiKeyStore {
                     "UPDATE grovefs_control.api_keys SET secret_hash = $1, secret_hint = $2 WHERE id = $3 AND revoked_at IS NULL",
                     &[&hash, &hint, &id],
                 )? as usize,
+            #[cfg(feature = "treedb")]
+            Backend::Treedb(_) => return missed_delegation(),
         };
         Ok(if n > 0 { Some(full_key) } else { None })
     }
@@ -1100,6 +1252,10 @@ impl ApiKeyStore {
         if sets.is_empty() {
             return Err("nothing to update: pass --note and/or --ttl".to_string());
         }
+        #[cfg(feature = "treedb")]
+        if let Some(k) = self.treedb() {
+            return k.update_fields(id, note, expires_at);
+        }
         // Built from the same column list for both dialects, so the two
         // parameter vectors stay aligned by position (`exec2`'s contract) and a
         // new field costs one `push`, not two hand-written statements.
@@ -1119,8 +1275,7 @@ impl ApiKeyStore {
         // An empty remark is stored as NULL — the shape `create_extended` writes
         // for a key without one — so a reader never has to tell "no note" apart
         // from "a note of zero length".
-        let note_text: Option<&str> = note.map(str::trim).filter(|t| !t.is_empty());
-        let deadline: Option<&str> = expires_at.unwrap_or(None);
+        let (note_text, deadline) = note_and_deadline(note, expires_at);
         let mut ps: Vec<&dyn rusqlite::ToSql> = Vec::new();
         let mut pp: Vec<&(dyn postgres::types::ToSql + Sync)> = Vec::new();
         if note.is_some() {
@@ -1142,6 +1297,8 @@ impl ApiKeyStore {
                 .execute(&sql_s, ps.as_slice())
                 .map_err(|e| e.to_string())?,
             Backend::Pg(pool) => pool.execute(&sql_p, pp.as_slice())? as usize,
+            #[cfg(feature = "treedb")]
+            Backend::Treedb(_) => return missed_delegation(),
         };
         Ok(rows > 0)
     }
@@ -1151,6 +1308,10 @@ impl ApiKeyStore {
     /// never existed"). Revoked keys fail authentication but stay in the table
     /// so historical `mcp_calls` rows keep their attribution.
     pub fn revoke(&self, id: &str) -> Result<bool, String> {
+        #[cfg(feature = "treedb")]
+        if let Some(k) = self.treedb() {
+            return k.revoke(id);
+        }
         let ts = now_iso();
         let n = match &self.backend {
             Backend::Sqlite(m) => m
@@ -1165,6 +1326,8 @@ impl ApiKeyStore {
                     "UPDATE grovefs_control.api_keys SET revoked_at = $1 WHERE id = $2 AND revoked_at IS NULL",
                     &[&ts, &id],
                 )? as usize,
+            #[cfg(feature = "treedb")]
+            Backend::Treedb(_) => return missed_delegation(),
         };
         Ok(n > 0)
     }
@@ -1186,6 +1349,17 @@ impl ApiKeyStore {
     ) -> Result<(), String> {
         let key_id = key.map(|k| k.id.clone());
         let key_label = key.map(|k| k.label.clone());
+        #[cfg(feature = "treedb")]
+        if let Some(k) = self.treedb() {
+            return k.log_call(
+                key_id.as_deref(),
+                key_label.as_deref(),
+                method,
+                tool,
+                ok,
+                detail,
+            );
+        }
         let ts = now_iso();
         self.exec2(
             "INSERT INTO mcp_calls (ts, key_id, key_label, method, tool, ok, detail)
@@ -1200,6 +1374,10 @@ impl ApiKeyStore {
     /// Most recent `limit` audit rows (newest first — insertion order, which
     /// is the storage identity on both backends: SQLite `rowid`, PG `seq`).
     pub fn recent_calls(&self, limit: usize) -> Result<Vec<CallLog>, String> {
+        #[cfg(feature = "treedb")]
+        if let Some(k) = self.treedb() {
+            return k.recent_calls(limit);
+        }
         let rows = self.query2(
             "SELECT ts, key_id, key_label, method, tool, ok, detail
              FROM mcp_calls ORDER BY rowid DESC LIMIT ?1",
@@ -1235,6 +1413,10 @@ impl ApiKeyStore {
     /// shape [`cutoff_from_age`] produces). This is the dry-run half of
     /// retention: an operator sees the size of the cut before taking it.
     pub fn count_calls_older_than(&self, cutoff: &str) -> Result<usize, String> {
+        #[cfg(feature = "treedb")]
+        if let Some(k) = self.treedb() {
+            return k.count_calls_older_than(cutoff);
+        }
         let mut rows = self.query2(
             "SELECT count(*) FROM mcp_calls WHERE ts < ?1",
             params![cutoff],
@@ -1259,6 +1441,10 @@ impl ApiKeyStore {
     /// The MCP/audit surface is shared by every tenant in the deployment, so
     /// this is a SUPERUSER verb — see the gate in the control plane.
     pub fn purge_calls_older_than(&self, cutoff: &str) -> Result<usize, String> {
+        #[cfg(feature = "treedb")]
+        if let Some(k) = self.treedb() {
+            return k.purge_calls_older_than(cutoff);
+        }
         match &self.backend {
             Backend::Sqlite(m) => m
                 .lock()
@@ -1270,6 +1456,8 @@ impl ApiKeyStore {
                     &[&cutoff],
                 )
                 .map(|n| n as usize),
+            #[cfg(feature = "treedb")]
+            Backend::Treedb(_) => missed_delegation(),
         }
     }
 }

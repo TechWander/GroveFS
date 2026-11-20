@@ -130,6 +130,26 @@ impl StoreKind {
         }
     }
 
+    /// Where the CREDENTIAL stores (`api_keys`, `api_key_usage`, `mcp_calls`)
+    /// live — the same answer as [`Self::control_uri`] under PG, but under treedb
+    /// it turns into the engine URI **once `GROVEFS_TREEDB_CONTROL=engine` says
+    /// the control plane has been moved there**.
+    ///
+    /// Deliberately a second accessor rather than a wider `control_uri`: the
+    /// view DEFINITIONS and the account table still live in local files (that is
+    /// the next milestone), so a treedb deployment can have its keys in the
+    /// engine while everything else stays on disk. With the switch off it answers
+    /// exactly what `control_uri` does, i.e. today's local-SQLite shape.
+    pub(crate) fn keys_uri(&self) -> Option<String> {
+        match self {
+            StoreKind::Pg(u) => Some(u.clone()),
+            StoreKind::Sqlite => None,
+            #[cfg(feature = "treedb")]
+            StoreKind::Treedb(addr) => crate::apikeys::ApiKeyStore::treedb_control_enabled()
+                .then(|| format!("{}{addr}", crate::treedb_store::SCHEME)),
+        }
+    }
+
     /// Backend name as the startup banner states it. Lower-case, stable, and
     /// argument-free on purpose: the URI is NEVER part of this, because a
     /// `postgres://user:pw@host/db` URI embeds a credential and the banner goes
@@ -792,11 +812,15 @@ impl MetaServer {
         let (ctl_keys, web_auth, admin_note) = match &self.control_listen {
             None => (None, None, None),
             Some(_) => {
-                let store_uri = self.store.control_uri();
+                // 凭据表可能已经比控制面先搬进引擎（`GROVEFS_TREEDB_CONTROL=engine`），
+                // 所以这里问的是 `keys_uri`：视图定义与账户表还在本地，用 `control_uri`
+                // 会让 meta-server 读一份刚被 `apikey create` 写空的本地库。
+                let keys_uri = self.store.keys_uri();
                 let keys = Arc::new(
-                    crate::apikeys::ApiKeyStore::open_for(&self.base, store_uri)
+                    crate::apikeys::ApiKeyStore::open_for(&self.base, keys_uri.as_deref())
                         .map_err(io::Error::other)?,
                 );
+                let store_uri = self.store.control_uri();
                 let web = Arc::new(
                     crate::webauth::WebAuthStore::open_for(&self.base, store_uri)
                         .map_err(io::Error::other)?,

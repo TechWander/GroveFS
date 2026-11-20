@@ -2028,18 +2028,18 @@ ps aux | grep grovefs                     # 查看在跑的 server / mount
 
 ## 10. 验证与回归
 
-全板一共 **41 段**:`build` → `unit` → **38 个套件** → `bench`。**前 40 段门控 GREEN,`bench` 只打吞吐参考值、永不门控**(只要纯功能回归就 `SKIP_BENCH=1`)。`pg`/`pg_parallel`/`evict`/`control`/`forksrv` 在无可达 PostgreSQL 的主机上整段自动 SKIP,`client` 在没有同级 `grovefs-client` 检出(或其二进制、`fusermount` 助手)的机器上整段 SKIP,`xfer`/`gcremote` 则跳过 PG 臂只跑 SQLite 臂,都不拉低 GREEN;`treedb` 段是实验性后端的自检,默认构建(未开 `--features treedb`)整段 SELF-SKIP,同样不拉低 GREEN。
+全板一共 **44 段**:`build` → `unit` → **41 个套件** → `bench`。**前 43 段门控 GREEN,`bench` 只打吞吐参考值、永不门控**(只要纯功能回归就 `SKIP_BENCH=1`)。`pg`/`pg_parallel`/`evict`/`control`/`forksrv` 在无可达 PostgreSQL 的主机上整段自动 SKIP,`client` 在没有同级 `grovefs-client` 检出(或其二进制、`fusermount` 助手)的机器上整段 SKIP,`xfer`/`gcremote` 则跳过 PG 臂只跑 SQLite 臂,都不拉低 GREEN;`treedb` 段是实验性后端的自检,`treedbmatrix` 把 posix/e2e 的整体断言矩阵在那个后端上重放(只认 `pass=39 fail=0 skip=10` 这个契约三元组),`treedbctl` 是控制面第三臂(`GROVEFS_TREEDB_CONTROL=engine` 时凭据与审计行落进引擎的通用表,默认关)——这三个都在默认构建(未开 `--features treedb`)整段 SELF-SKIP,同样不拉低 GREEN。
 
 ```bash
 export LC_ALL=C LANG=C                                 # 仓库根目录下执行(PKG_CONFIG 不必设:无 crate 查 pkg-config,§1)
-bash .build-bin/run_all.sh                # 全板 41 段(40 门控 + bench)
+bash .build-bin/run_all.sh                # 全板 44 段(43 门控 + bench)
                                           #   build unit
                                           #   posix edge e2e remote errors resilience concurrent
                                           #   metasrv ha striping locks freshness disp_fresh
                                           #   layout fork forksrv viewrm gc gcremote xfer
                                           #   bwlimit migrate import govcheck govtime
-                                          #   grovesci mcp apikey ctlplane web mountkey config
-                                          #   pg pg_parallel evict control client treedb
+                                          #   grovesci mcp apikey ctlplane web mountkey manager config
+                                          #   pg pg_parallel evict control client treedb treedbmatrix treedbctl
                                           #   bench(只打吞吐,不门控)
 SKIP_BENCH=1 bash .build-bin/run_all.sh   # 同上,去掉 bench
 bash .build-bin/run_all.sh fork mcp       # 只跑指定套件(build 自动前置)

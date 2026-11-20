@@ -1969,18 +1969,18 @@ ps aux | grep grovefs                     # 查看在跑的 server / mount
 
 ## 10. Verification and regression
 
-The full board is **41 stages** in all: `build` → `unit` → **38 suites** → `bench`. **The first 40 stages gate GREEN; `bench` only prints throughput reference numbers and never gates** (for pure functional regression only, use `SKIP_BENCH=1`). `pg`/`pg_parallel`/`evict`/`control`/`forksrv` auto-SKIP their whole stage on hosts with no reachable PostgreSQL, and `xfer`/`gcremote` skip just their PG arm and run the SQLite arm — and `client` skips its whole stage on a host without the sibling `grovefs-client` checkout, its binary, or the `fusermount` helper — none of them lower GREEN; the `treedb` stage — the self-check of the experimental backend — SELF-SKIPS on a default build (no `--features treedb`), also without lowering GREEN.
+The full board is **44 stages** in all: `build` → `unit` → **41 suites** → `bench`. **The first 43 stages gate GREEN; `bench` only prints throughput reference numbers and never gates** (for pure functional regression only, use `SKIP_BENCH=1`). `pg`/`pg_parallel`/`evict`/`control`/`forksrv` auto-SKIP their whole stage on hosts with no reachable PostgreSQL, and `xfer`/`gcremote` skip just their PG arm and run the SQLite arm — and `client` skips its whole stage on a host without the sibling `grovefs-client` checkout, its binary, or the `fusermount` helper — none of them lower GREEN; the `treedb` stage — the self-check of the experimental backend — SELF-SKIPS on a default build (no `--features treedb`), also without lowering GREEN. The same holds for `treedbmatrix` (the posix/e2e assertion matrix replayed on that backend, gated on the `pass=39 fail=0 skip=10` contract triple) and `treedbctl` (the control plane's third arm: with `GROVEFS_TREEDB_CONTROL=engine` keys and audit rows land in the engine's generic tables; off by default).
 
 ```bash
 export LC_ALL=C LANG=C                                 # 仓库根目录下执行(PKG_CONFIG 不必设:无 crate 查 pkg-config,§1)
-bash .build-bin/run_all.sh                # 全板 41 段(40 门控 + bench)
+bash .build-bin/run_all.sh                # 全板 44 段(43 门控 + bench)
                                           #   build unit
                                           #   posix edge e2e remote errors resilience concurrent
                                           #   metasrv ha striping locks freshness disp_fresh
                                           #   layout fork forksrv viewrm gc gcremote xfer
                                           #   bwlimit migrate import govcheck govtime
-                                          #   grovesci mcp apikey ctlplane web mountkey config
-                                          #   pg pg_parallel evict control client treedb
+                                          #   grovesci mcp apikey ctlplane web mountkey manager config
+                                          #   pg pg_parallel evict control client treedb treedbmatrix treedbctl
                                           #   bench(只打吞吐,不门控)
 SKIP_BENCH=1 bash .build-bin/run_all.sh   # 同上,去掉 bench
 bash .build-bin/run_all.sh fork mcp       # 只跑指定套件(build 自动前置)

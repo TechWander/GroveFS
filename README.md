@@ -884,7 +884,7 @@ grovefs mount --view alice --data-servers 10.0.0.5:50100 --meta-server 10.0.0.5:
 ```bash
 export LC_ALL=C LANG=C             # PKG_CONFIG 不必设：没有 crate 查 pkg-config（见「构建」一节）
 cargo test --release                 # 单元 + 集成测试
-bash .build-bin/run_all.sh           # 全板 41 段（40 门控 + bench：build/unit + 38 个功能套件）
+bash .build-bin/run_all.sh           # 全板 44 段（43 门控 + bench：build/unit + 41 个功能套件）
 SKIP_BENCH=1 bash .build-bin/run_all.sh   # 跳过吞吐基准（纯功能回归）
 # 扇出规模化基准（opt-in，默认 #[ignore] 不拖慢 CI）：批量建对象 + 随机读，
 # 断言 256 桶全用上·单目录条目数受控(≈N/256)·路径 O(1)。默认 30 万对象，秒级完成；

@@ -223,9 +223,9 @@ fn info_of(n: &Node) -> NodeInfo {
 ///   压成 [`MetaError`]。
 /// - [`Fail::Db`]：传输/协议/协议外应答。到 API 边界就是 `MetaError::Db`，
 ///   上层看到的是 EIO。
-struct Fail {
-    code: Option<u16>,
-    msg: String,
+pub(crate) struct Fail {
+    pub(crate) code: Option<u16>,
+    pub(crate) msg: String,
 }
 
 /// 一条「不该出现在这条路径上」的应答 → 操作者读得懂的串。
@@ -280,6 +280,16 @@ impl From<Fail> for io::Error {
     }
 }
 
+/// [`Reply::Err`] → [`Fail`]，其余原样交出。`ConnPool::xcall` 不替调用方判这个
+/// （有一部分调用点要自己匹配 `Reply::Err` 的 errno），所以转换留在这里一处，
+/// 树与控制面（`apikeys::treedb_ctl`）都用这同一个判据。
+pub(crate) fn reply_fail(r: Reply) -> Result<Reply, Fail> {
+    match r {
+        Reply::Err { code, msg } => Err(Fail::code(code, msg)),
+        other => Ok(other),
+    }
+}
+
 /// 列目录失败绝不能静默退化成「这个目录是空的」：`ls` 会少条目、`du` 会少
 /// 用量、`gc check` 会把还在的树看成不存在。带错误通道的读（
 /// [`MetaProvider::readdir_checked`]）不再需要这行日志：失败直接以 `Err`
@@ -297,7 +307,9 @@ fn log_list_failure(op: &str, parent: i64, f: &Fail) {
     );
 }
 
-/// 进程级的连接池，**按地址共享**，不按视图切分。
+/// 进程级的连接池，**按地址共享**，不按视图切分。也是控制面后端
+/// （`apikeys::treedb_ctl`）借道的地方：控制面和树共用同一条地址、同一个池，
+/// 所以「一个进程几条连接」不因为多了一个控制面而变大。
 ///
 /// treedb 的每条 op 自带 `view` 字段（[`TreedbStore::vid`]），连接上没有 per-view
 /// 状态 —— 只有握手密钥与 pipeline 顺序 —— 所以「一个 view 一个池」纯属记账，代价
@@ -307,7 +319,7 @@ fn log_list_failure(op: &str, parent: i64, f: &Fail) {
 ///
 /// 池只增不减：地址是配置项（一个进程就一个），数量有界；而「空闲视图归还连接」
 /// 这件事在没有 per-view 连接之后已经没有含义了。
-struct ConnPool {
+pub(crate) struct ConnPool {
     addr: String,
     /// 握手密钥。重连路径要靠它重建同一条连接，所以存在池上；`auth_key()` 本身
     /// 就是进程内解析一次（`OnceLock`），一个池里不可能混进两把密钥。
@@ -321,7 +333,7 @@ struct ConnPool {
 impl ConnPool {
     /// 取（或拨出）`addr` 的进程级池。第一次调用会 dial `GROVEFS_TREEDB_CONNS`
     /// 条；之后的视图直接复用同一个 `Arc`。
-    fn for_addr(addr: &str) -> io::Result<Arc<ConnPool>> {
+    pub(crate) fn for_addr(addr: &str) -> io::Result<Arc<ConnPool>> {
         static POOLS: OnceLock<Mutex<HashMap<String, Arc<ConnPool>>>> = OnceLock::new();
         let pools = POOLS.get_or_init(|| Mutex::new(HashMap::new()));
         let mut m = pools.lock();
@@ -361,7 +373,7 @@ impl ConnPool {
     /// 发一个 op、收它的应答。传输失败时**只对只读 op** 重连重试一次：
     /// 写 op 的失败可能发生在「引擎已提交、应答没读到」之后，重发就是二次生效
     /// （`Create` 变 `EEXIST`、`RefUp` 把计数加两遍）。写失败让调用方看到 EIO。
-    fn xcall(&self, op: &Op) -> Result<Reply, Fail> {
+    pub(crate) fn xcall(&self, op: &Op) -> Result<Reply, Fail> {
         let i = self.slot();
         let mut g = self.conns[i].lock();
         match g.call(op) {
@@ -491,10 +503,7 @@ impl TreedbStore {
 
     /// 把 [`Reply::Err`] 变成 [`Fail`]，其余原样交出。
     fn val(r: Reply) -> Result<Reply, Fail> {
-        match r {
-            Reply::Err { code, msg } => Err(Fail::code(code, msg)),
-            other => Ok(other),
-        }
+        reply_fail(r)
     }
 
     fn want_node(r: Reply) -> Result<Node, Fail> {
