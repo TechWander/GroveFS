@@ -73,6 +73,11 @@ pub const LIST_LIMIT_MAX: usize = 8192;
 /// member from ending the walk early. The cursor stays opaque to the caller
 /// and this function is the only place that gives it meaning, so both
 /// decorators share exactly one traversal rule instead of two that could drift.
+///
+/// Both callers are `native`-gated decorators, so the walker is too: a
+/// `remote-only` client build links neither and would otherwise carry a
+/// dead-code warning down the very leg the platform clients use.
+#[cfg(feature = "native")]
 pub(crate) fn list_across_members<F>(
     count: usize,
     member: F,
