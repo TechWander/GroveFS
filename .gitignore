@@ -129,3 +129,6 @@
 
 # VM  provisioning 脚本含 cloud-init 明文口令，绝不入库（改读环境变量后再纳入）。
 /.build-bin/gfs_provision.sh
+
+# 文档检查脚本跑出来的字节码（skills/grovefs-docs/scripts/*.py）
+/skills/grovefs-docs/scripts/__pycache__/
