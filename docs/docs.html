@@ -3278,14 +3278,15 @@ ps aux | grep grovefs                  <span class="cmt"># 查看在跑的 serve
 
     <h3>15.5 回归验证</h3>
     <pre><code>export LC_ALL=C LANG=C                                <span class="cmt"># 仓库根目录下执行；PKG_CONFIG 不必设（run_all.sh 里那行 shim 导出是历史遗留，无效也不影响）</span>
-bash .build-bin/run_all.sh                <span class="cmt"># 全板 41 段 = 40 门控 + bench</span>
+bash .build-bin/run_all.sh                <span class="cmt"># 全板 44 段 = 43 门控 + bench</span>
                                           <span class="cmt">#   build unit</span>
                                           <span class="cmt">#   posix edge e2e remote errors resilience concurrent</span>
                                           <span class="cmt">#   metasrv ha striping locks freshness disp_fresh</span>
                                           <span class="cmt">#   layout fork forksrv viewrm gc gcremote xfer</span>
                                           <span class="cmt">#   bwlimit migrate import govcheck govtime</span>
-                                          <span class="cmt">#   grovesci mcp apikey ctlplane web mountkey config</span>
-                                          <span class="cmt">#   pg pg_parallel evict control client treedb</span>
+                                          <span class="cmt">#   grovesci mcp apikey ctlplane web mountkey manager</span>
+                                          <span class="cmt">#   config pg pg_parallel evict control client</span>
+                                          <span class="cmt">#   treedb treedbmatrix xfertreedb</span>
                                           <span class="cmt">#   bench(只打吞吐,不门控)</span>
 SKIP_BENCH=1 bash .build-bin/run_all.sh   <span class="cmt"># 同上,去掉 bench</span></code></pre>
     <h4>两引擎完备性矩阵：同一串治理序列，两个后端各跑一遍</h4>

@@ -1977,7 +1977,7 @@ ps aux | grep grovefs                     # 查看在跑的 server / mount
 
 ## 10. Verification and regression
 
-The full board is **44 stages** in all: `build` → `unit` → **41 suites** → `bench`. **The first 43 stages gate GREEN; `bench` only prints throughput reference numbers and never gates** (for pure functional regression only, use `SKIP_BENCH=1`). `pg`/`pg_parallel`/`evict`/`control`/`forksrv` auto-SKIP their whole stage on hosts with no reachable PostgreSQL, and `xfer`/`gcremote` skip just their PG arm and run the SQLite arm — and `client` skips its whole stage on a host without the sibling `grovefs-client` checkout, its binary, or the `fusermount` helper — none of them lower GREEN; the `treedb`/`treedbmatrix`/`xfertreedb` stages — the self-checks of the experimental backend — SELF-SKIP on a default build (no `--features treedb`), also without lowering GREEN (`xfertreedb` additionally needs the sibling `../treedb` engine binary).
+The full board is **44 stages** in all: `build` → `unit` → **41 suites** → `bench`. **The first 43 stages are the gating ones; `bench` only prints throughput reference numbers and never gates** (for pure functional regression only, use `SKIP_BENCH=1`). `pg`/`pg_parallel`/`evict`/`control`/`forksrv` auto-SKIP their whole stage on hosts with no reachable PostgreSQL, and `xfer`/`gcremote` skip just their PG arm and run the SQLite arm — and `client` skips its whole stage on a host without the sibling `grovefs-client` checkout, its binary, or the `fusermount` helper — none of them lower GREEN; the `treedb`/`treedbmatrix`/`xfertreedb` stages — the self-checks of the experimental backend — SELF-SKIP on a default build (no `--features treedb`), also without lowering GREEN (`xfertreedb` additionally needs the sibling `../treedb` engine binary).
 
 ```bash
 export LC_ALL=C LANG=C                                 # 仓库根目录下执行(PKG_CONFIG 不必设:无 crate 查 pkg-config,§1)
@@ -2269,7 +2269,7 @@ sudo systemctl restart grove-data-server && cat /mnt/alice/from_a.txt
 sudo systemctl stop grove-mount@alice && findmnt -T /mnt/alice | grep -q grovefs && echo "残留!" || echo "已卸载"
 ```
 
-All passing means the deployment is complete. To run the full regression (40 gated stages) see §10 and §12.7.
+All passing means the deployment is complete. To run the full regression (43 gated stages) see §10 and §12.7.
 
 ### 11.8 HA primary/standby topology (modified from §11.4)
 
@@ -2475,7 +2475,7 @@ HA topology rolling upgrade (writes uninterrupted, except the instant of switcho
 
 ### 12.7 Regression verification after changes
 
-After any upgrade/config change, run the full board (40 gated stages) on a machine with a build environment, or only the planes you care about:
+After any upgrade/config change, run the full board (43 gated stages) on a machine with a build environment, or only the planes you care about:
 
 ```bash
 bash .build-bin/run_all.sh                    # 全板(build 自动前置)
