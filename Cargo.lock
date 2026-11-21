@@ -1461,7 +1461,7 @@ dependencies = [
 [[package]]
 name = "treedb"
 version = "0.5.0"
-source = "git+https://github.com/TechWander/treedb.git?tag=v0.5.0#f127250289ffc3c5cd0b22e5162b79de120f2a4a"
+source = "git+https://github.com/TechWander/treedb.git?tag=v0.5.1#e85e87bd194e2639f9ca5012336e2186cb2b70ed"
 dependencies = [
  "libc",
  "thiserror",

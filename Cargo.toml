@@ -142,8 +142,11 @@ postgres = { version = "0.19", default-features = false, optional = true }
 # answer EPERM for, and it is the reason 10 hardlink assertions in the matrix
 # were recorded as SKIP; the provider now issues it, so `ln` has real semantics
 # here and `nlink` is a real reference count (the GC clue is still released
-# only by the last name, same contract as the SQLite arm).
-treedb = { git = "https://github.com/TechWander/treedb.git", tag = "v0.5.0", optional = true }
+# only by the last name, same contract as the SQLite arm). v0.5.1 is a
+# behaviour-only bump on top: auto-checkpoint no longer stops the round (it
+# dispatches a background replay snapshot and trims the WAL prefix), which
+# matters here because the event loop is the only ack path.
+treedb = { git = "https://github.com/TechWander/treedb.git", tag = "v0.5.1", optional = true }
 # Opt-in per-stage latency telemetry (src/stats.rs): high-dynamic-range histograms
 # for offline bottleneck diagnosis. Pure-Rust, zero deps. Only touched when
 # `--stats` / `GROVEFS_STATS=1` is on; the disabled path costs one atomic load.
