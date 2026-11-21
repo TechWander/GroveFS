@@ -18,10 +18,10 @@
 //!
 //! ## 这一层实际动用的引擎面
 //!
-//! 引擎的 op 面是 51 条（treedb 仓 `DESIGN.md` §4.2，三档 22/22/7），本适配层只调其中
-//! **13 条**：视图面 `CreateView`/`DropView`/`ListViews`，树面 `Lookup`/`Getattr`/
-//! `Setattr`/`Create`/`Mkdir`/`Symlink`/`Unlink`/`Rmdir`/`Rename`/`ReadDirPlus`。条数与上一版
-//! 一样，但最后一项换过：目录列表走 `ReadDirPlus`，不再走 `ReadDir`。理由是 `ReadDir`
+//! 引擎的 op 面是 52 条（treedb 仓 `DESIGN.md` §4.2，三档 22/23/7），本适配层只调其中
+//! **14 条**：视图面 `CreateView`/`DropView`/`ListViews`，树面 `Lookup`/`Getattr`/
+//! `Setattr`/`Create`/`Mkdir`/`Symlink`/`Link`/`Unlink`/`Rmdir`/`Rename`/`ReadDirPlus`。比上一版
+//! 只多一条 `Link`（引擎 v0.5.0 补的，见下）。目录列表走 `ReadDirPlus`，不再走 `ReadDir`。理由是 `ReadDir`
 //! 一页只给名字，属性得逐条 `Getattr` 回头补 —— 一页 1000 条就是 1 次列表 + 16 次批量属性
 //! （一批 64 条）= 17 次往返。实测两臂对照（同一份 `du` 走完一棵 3000 条的树，
 //! 配方 `.build-bin/bench_treedb_readdir.sh`）：引擎应用的 op 数 **3006 → 6**；把引擎放到
@@ -29,19 +29,22 @@
 //! （28 ms vs 24 ms，在噪声里）。这项收益的单位是往返，本机测试恰好把它藏起来，所以
 //! 两个数都要写。
 //!
+//! 硬链接曾是这里最显眼的缺口：引擎补 `Link` 之前，一个 inode 只有一条目录项路径，
+//! `link_node` 只能回 `EPERM`。pin 到 v0.5.0 之后它真发 `Op::Link`，这条缺口在矩阵上
+//! 整个闭合——改 pin 前 `pass=39 fail=0 skip=10`（skip 的 10 条全是硬链接），改 pin 后
+//! `pass=51 fail=0 skip=0`；拒绝面也一并进了矩阵：名字已存在回 `EEXIST`、源缺失回
+//! `ENOENT`、两次被拒都不新增 dentry。重放范围是 `posix`+`e2e` 两套逐标签（36 条，
+//! 基线 37 条的例外是要 PTY 的 tty 默认日志）。配方 `.build-bin/test_treedb_matrix.sh`，
+//! 板上 `FEATURES_TREEDB=1` 走 `treedbmatrix` 那一行；引擎侧结论见 treedb 仓
+//! `DESIGN.md` §10 阶段 C 1。
+//!
 //! 本层不调用的那些不是白做的：`Key*`/`Audit*`/`Def*`/`Place*`/`Table*`/`Row*` 是给控制面
 //! 搬进来准备的（现在还在本地 SQLite，迁法见 treedb 仓 `DESIGN.md` §10 阶段 C 4）；`Lock*`
 //! 只有整 inode 形状，给不了 POSIX 记录锁；`WalFetch`/`SnapFetch` 是异步副本，不是
 //! 这里要的同步提升。
 //!
-//! ## 明确接不了的东西（spike 的诚实边界，见 treedb 仓 `DESIGN.md` §5.3 / §8）
+//! ## 边界：认证面的入口，以及明确接不了的东西（见 treedb 仓 `DESIGN.md` §5.3 / §8）
 //!
-//! - **硬链接**：引擎没有 `Link` op，一个 inode 只有一条目录项路径。`link_node` 回
-//!   `EPERM`，不是"假装成功"。这条缺口占多大**面积**已实测：`posix`+`e2e` 两套矩阵
-//!   逐标签重放过来的是 36 条（基线共 37 条，唯一没搬的是要 PTY 的 tty 默认日志），
-//!   加上硬链接正反两面与本夹具自检共 49 条 = 39 OK + 10 SKIP，那 10 条全部是
-//!   硬链接，其余每一格都过（配方 `.build-bin/test_treedb_matrix.sh`，板上
-//!   `FEATURES_TREEDB=1` 走 `treedbmatrix` 那一行；结论在 treedb 仓 `DESIGN.md` §10 阶段 C 1）。
 //! - **引擎的认证面已接，入口是环境变量**：`GROVEFS_TREEDB_KEY_FILE=/path` 给密钥
 //!   文件路径（与 `GROVEFS_JOIN_KEY_FILE` / `GROVEFS_ROSTER_KEY_FILE` 同规：密钥字节
 //!   永远不进 argv），设了就对每条连接跑 v5 双向握手（`Client::connect_auth`），
@@ -820,10 +823,23 @@ impl MetaProvider for TreedbStore {
         Ok(info_of(&n))
     }
 
-    /// 没有 `Link` op：一个 inode 只有一条路径。回 EPERM，与 `ln` 在只读名字空间
-    /// 上失败同样可见，绝不返回「成功了但其实又建了一条 dentry」。
-    fn link_node(&self, _src_ino: i64, _new_parent: i64, _new_name: &str) -> Result<i64, MetaError> {
-        Err(Fail::code(errno::EPERM, b"treedb has no hardlinks".to_vec()).to_meta())
+    /// `Op::Link`（引擎 v0.5.0）：给已有 inode 再加一条 dentry。引擎侧 `nlink` 是
+    /// 真实引用计数，所以 `nlink` 报表与「最后一个名字离开才释放字节」这两条都与
+    /// SQLite 档同一契约。拒绝面原样映射：`EEXIST` 名字已存在、`EPERM` 目录不可
+    /// 链接（`to_meta` 把它们翻成 `Exists` / `OpNotPermitted`，FUSE 那里仍是
+    /// EEXIST/EPERM）。
+    fn link_node(&self, src_ino: i64, new_parent: i64, new_name: &str) -> Result<i64, MetaError> {
+        self.gate_write().map_err(|f| f.to_meta())?;
+        let op = Op::Link {
+            view: self.vid(),
+            ino: src_ino as u64,
+            parent: new_parent as u64,
+            name: new_name.as_bytes().to_vec(),
+        };
+        self.xcall(&op)
+            .and_then(Self::want_node)
+            .map(|n| n.ino as i64)
+            .map_err(|f| f.to_meta())
     }
 
     fn unlink(&self, parent: i64, name: &str) -> Result<Option<String>, MetaError> {

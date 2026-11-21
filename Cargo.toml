@@ -98,7 +98,7 @@ postgres = { version = "0.19", default-features = false, optional = true }
 # sibling clone. Anonymous https on purpose: an SSH URL would make `cargo fetch`
 # prompt for credentials on machines that only have a key for the private
 # remotes. The engine core needs only `libc` + `thiserror` + std, and the pinned
-# tag v0.3.7 keeps its PG migration shim behind an off-by-default
+# tag we pin keeps its PG migration shim behind an off-by-default
 # `postgres-compat` feature, so nothing else enters our graph (the earlier pin
 # v0.3.0 still carried `postgres`/`rusqlite(bundled)`/`sha2`/`uuid`/`chrono`/
 # `tracing` unconditionally; upstream gated it afterwards).
@@ -135,7 +135,15 @@ postgres = { version = "0.19", default-features = false, optional = true }
 # checkpoint error during SIGTERM shutdown is reported (exit 1) rather than
 # swallowed, a backlogged worker drops EPOLLIN instead of spinning a core, and
 # unlink/rmdir on a non-dir parent answer ENOTDIR instead of ENOENT.
-treedb = { git = "https://github.com/TechWander/treedb.git", tag = "v0.3.7", optional = true }
+#
+# Why v0.3.7 -> v0.5.0: the engine grew `Op::Link` (a pure tag append —
+# PROTOCOL_VERSION stays 6, SNAP_VERSION stays 3, so an engine data dir written
+# by the old pin opens as-is). That is exactly the one op this adapter used to
+# answer EPERM for, and it is the reason 10 hardlink assertions in the matrix
+# were recorded as SKIP; the provider now issues it, so `ln` has real semantics
+# here and `nlink` is a real reference count (the GC clue is still released
+# only by the last name, same contract as the SQLite arm).
+treedb = { git = "https://github.com/TechWander/treedb.git", tag = "v0.5.0", optional = true }
 # Opt-in per-stage latency telemetry (src/stats.rs): high-dynamic-range histograms
 # for offline bottleneck diagnosis. Pure-Rust, zero deps. Only touched when
 # `--stats` / `GROVEFS_STATS=1` is on; the disabled path costs one atomic load.
