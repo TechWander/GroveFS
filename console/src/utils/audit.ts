@@ -43,3 +43,51 @@ export function withinWindow(ts: string, w: string): boolean {
   const span = WIN_MS[w]
   return span !== undefined && Number.isFinite(t0) && Date.now() - t0 <= span
 }
+
+/**
+ * Which credential a row was signed with, as the filter offers it.
+ *
+ * `key_id` is `api_keys.id` — the store's PRIMARY KEY, 16 hex on a key minted
+ * after the format was shortened and 32 hex on a legacy one, because
+ * `authenticate_for` splits on `:` and compares a digest, so it never looked at
+ * length. It is NOT the secret and NOT the `head4…tail4` fingerprint: that is
+ * `secret_hint`, a column of the keys table the audit row does not carry. A row
+ * with no `key_id` is one the server answered before it recognised a credential
+ * (a refused mount handshake, an anonymous probe), which is why the audit page
+ * must be able to say "no key on it" instead of showing a blank.
+ */
+export interface KeyChoice {
+  id: string
+  label: string | null
+}
+
+export function keyChoices(rows: AuditRow[]): KeyChoice[] {
+  const seen = new Map<string, string | null>()
+  for (const r of rows) if (r.key_id && !seen.has(r.key_id)) seen.set(r.key_id, r.key_label ?? null)
+  return [...seen]
+    .map(([id, label]) => ({ id, label }))
+    .sort((a, b) => (a.label ?? a.id).localeCompare(b.label ?? b.id) || a.id.localeCompare(b.id))
+}
+
+/** An id long enough to be unreadable in a column is shown head-first; the tail
+    is there because two legacy 32-hex ids can share a prefix and a filter that
+    offers two identical labels is a filter that lies. */
+export function shortId(id: string): string {
+  return id.length > 12 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id
+}
+
+/**
+ * The key an `apikey.create` row MINTED, read out of the server's own message.
+ *
+ * `api_keys.created_by` records which ACCOUNT minted a credential; the parent
+ * KEY was never recorded anywhere, so "what has this credential created?" had no
+ * answer. The server now appends ` key=<id>` to that row's detail, and this is
+ * the single place the link is parsed. Rows from before it returns null — an
+ * absent link, which the UI says out loud rather than presenting as "this key
+ * minted nothing".
+ */
+export function mintedKey(r: AuditRow): string | null {
+  if (r.tool !== 'apikey.create' || !r.ok) return null
+  const m = / key=([0-9a-f]{16,32})/.exec(String(r.detail ?? ''))
+  return m ? m[1] : null
+}

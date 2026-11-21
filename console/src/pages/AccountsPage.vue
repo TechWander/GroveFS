@@ -130,7 +130,11 @@ const grantHit = computed(() => {
 </script>
 
 <template>
-  <PageHead title="Accounts" desc="Who governs what — accounts, roles and base-view delegations.">
+  <PageHead
+    kicker="People"
+    title="Accounts"
+    desc="Who governs what — accounts, roles and base-view delegations."
+  >
     <template #actions>
       <StateBadge v-if="!session.isSuper" tone="off" :label="t('administrators act here')" />
       <ActionButton :action="refresh" :label="'refresh'" variant="link" />

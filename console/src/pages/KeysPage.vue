@@ -88,11 +88,15 @@ const PLANE_VALUES = ['mount', 'mcp', 'admin', 'any']
 const HELP: [string, string][] = [
   [
     'Create key',
-    'mints a 16-character id and a 64-hex-digit secret; the client uses `<id>:<secret>`. The secret exists once, in the dialog you are about to close.',
+    'mints a 16-character id and a 32-hex-digit secret; the client uses `<id>:<secret>`. The dialog that follows is the first display of it — whether the registry also keeps a copy an operator can read back is said there, and depends on the store.',
   ],
   [
     'the key column',
-    'shows the stored fingerprint: the first and last four hex digits of the secret. GroveFS keeps a SHA-256 digest, NOT the secret and NOT anything reversible, so no screen, API or database dump can show the middle — that is the price of a leaked database being harmless.',
+    'shows the stored fingerprint: the first and last four hex digits of the secret. The digest GroveFS authenticates against is one-way and gives no hint back, so no list or dump assembles the middle from this — the full string comes back only through Reveal.',
+  ],
+  [
+    'Reveal',
+    'reads the stored copy of a secret back and shows it, unwrapped under the store’s own key, to the key’s owner or a super administrator. The call is written to the audit trail naming the id it opened. Only offered where a copy exists: a row minted before the store had wrapping material has none, and Rotate is how a usable secret is obtained then.',
   ],
   [
     'Rotate',
@@ -100,7 +104,11 @@ const HELP: [string, string][] = [
   ],
   [
     'Revoke',
-    'retires the credential for good. Nothing can un-revoke it and a revoked row is not editable — create a new key instead. It takes effect on the key’s NEXT call, so a live mount keeps its open trees until then.',
+    'retires the credential for good. Nothing can un-revoke it and a revoked row is not editable — delete it if you also want it gone from the registry. It takes effect on the key’s NEXT call, so a live mount keeps its open trees until then.',
+  ],
+  [
+    'Delete',
+    'removes the credential row entirely; the id and secret stop authenticating at the next handshake. Only the key’s owner or a super administrator may delete it, and the console asks first. Audit rows the key wrote stay in the log with their original attribution — deleting a key never shortens the trail.',
   ],
   [
     'Make ro / Make rw',
@@ -135,8 +143,9 @@ const HELP: [string, string][] = [
        the same hook the hand-written page's `<section id="page-keys">` gave it. -->
   <div id="page-keys">
     <PageHead
+      kicker="Credentials"
       title="API keys"
-      desc="Mint, rotate and revoke the keys clients mount and agents call with."
+      desc="Mint, rotate, revoke and delete the keys clients mount and agents call with."
     >
       <template #actions>
         <ActionButton :action="refresh" :label="'refresh'" variant="link" />

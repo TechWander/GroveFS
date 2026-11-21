@@ -5,8 +5,9 @@
   Five questions, and every one of them is a decision the operator owns: what to
   call it, what it is for, which plane it authenticates, which view it may open
   and how long it lives. What this form deliberately does NOT ask is the secret —
-  GroveFS generates it, shows it once, and keeps only a digest, which is why the
-  dialog that follows is about writing something down rather than about typing.
+  GroveFS generates it, and only the store knows whether it also kept a
+  recoverable copy of what it hands back. That is why the dialog that follows
+  says which of the two happened instead of assuming either.
 
   A delegated account sees a shorter form: the two planes it may use, no "no view
   binding" choice (an unbound key reaches every tree, so it is an administrator's
@@ -67,9 +68,16 @@ async function create(): Promise<void> {
   // second key usually keeps, so they stay as set.
   label.value = ''
   note.value = ''
-  // The reply carries the plaintext `<id>:<secret>` once; `view` is what THIS
-  // request asked for, because the create reply reports the key, not the row.
-  ui.showSecret({ title: 'New api key', detailed: true, secret: r, view: args.view ?? null })
+  // The reply carries the plaintext `<id>:<secret>` and says whether the
+  // registry can hand it back later; `view` is what THIS request asked for,
+  // because the create reply reports the key, not the row.
+  ui.showSecret({
+    title: 'New api key',
+    detailed: true,
+    copy: r.stored ? 'stored' : 'once',
+    secret: r,
+    view: args.view ?? null,
+  })
   ui.reload()
 }
 </script>
@@ -120,15 +128,16 @@ async function create(): Promise<void> {
       </template>
     </FieldRow>
 
-    <label class="check" for="mint-ro">
-      <input id="mint-ro" v-model="ro" type="checkbox" />
-      {{ t('read-only') }}
-    </label>
-
-    <ActionButton :action="create" :label="'Create key'" variant="primary" />
-
     <span v-if="!session.isSuper" class="muted">
       {{ t('an unbound key reaches every tree, so a delegated account must name one') }}
     </span>
+
+    <div class="panel-foot">
+      <label class="check" for="mint-ro">
+        <input id="mint-ro" v-model="ro" type="checkbox" />
+        {{ t('read-only') }}
+      </label>
+      <ActionButton :action="create" :label="'Create key'" variant="primary" />
+    </div>
   </PanelBox>
 </template>

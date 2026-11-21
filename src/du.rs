@@ -369,7 +369,8 @@ fn split_addrs(list: &str) -> Vec<String> {
 /// `--data-servers` > `--data-dir` > the local store root the tree itself came from.
 ///
 /// The last step is what makes `grovefs du --home R --view V` self-contained:
-/// `grovefs init` puts `meta/<view>.db` and `blocks/` under the same root R.
+/// on a storage node `view create` puts `meta/<view>.db` and the `blocks/` the
+/// data-server serves under the same root R.
 /// A tree that came from a meta-server or a PostgreSQL store has no local
 /// counterpart to infer from, so the source stays unresolvable and this
 /// returns an error instead of measuring nothing.

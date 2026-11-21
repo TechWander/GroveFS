@@ -46,91 +46,13 @@
 //! `expiry = now + ttl` and the `data-server` rejects it once wall time passes
 //! `expiry` (a mount older than the TTL must remount to get a fresh capability).
 
-use sha2::{Digest, Sha256};
+use crate::crypto::{ct_eq, from_hex, hmac_sha256, to_hex};
 
-/// Current wall clock in whole seconds since the UNIX epoch. A clock before
-/// the epoch (a wildly misset host) clamps to 0 rather than panicking on the
-/// signed duration; the servers only ever add a TTL to or compare against this.
-pub fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// SHA-256 block size the HMAC construction folds the key into (RFC 2104).
-const BLOCK: usize = 64;
-
-/// Compute `HMAC-SHA256(key, msg)` over an arbitrary slice.
-fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
-    // RFC 2104: keys longer than the block are pre-hashed; shorter ones are
-    // zero-padded. Doing this once keeps `mac` a plain two-pass construction.
-    let mut k = [0u8; BLOCK];
-    if key.len() > BLOCK {
-        let d = Sha256::digest(key);
-        k[..32].copy_from_slice(&d[..]);
-    } else {
-        k[..key.len()].copy_from_slice(key);
-    }
-    let mut ipad = [0u8; BLOCK];
-    let mut opad = [0u8; BLOCK];
-    for i in 0..BLOCK {
-        ipad[i] = k[i] ^ 0x36;
-        opad[i] = k[i] ^ 0x5c;
-    }
-    let mut inner = Sha256::new();
-    inner.update(ipad);
-    inner.update(msg);
-    let inner = inner.finalize();
-    let mut outer = Sha256::new();
-    outer.update(opad);
-    outer.update(inner);
-    let out = outer.finalize();
-    let mut buf = [0u8; 32];
-    buf.copy_from_slice(&out[..]);
-    buf
-}
-
-/// Lowercase hex, no external crate (the only on-wire encoding the DAC needs).
-fn to_hex(b: &[u8]) -> String {
-    let mut s = String::with_capacity(b.len() * 2);
-    for x in b {
-        s.push_str(&format!("{x:02x}"));
-    }
-    s
-}
-
-/// Decode a lowercase/uppercase hex string; `None` on any non-hex or odd length.
-fn from_hex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
-        return None;
-    }
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len() / 2);
-    let mut i = 0;
-    while i < bytes.len() {
-        let hi = (bytes[i] as char).to_digit(16)?;
-        let lo = (bytes[i + 1] as char).to_digit(16)?;
-        out.push(((hi << 4) | lo) as u8);
-        i += 2;
-    }
-    Some(out)
-}
-
-/// Constant-time comparison of two equal-or-unequal-length byte slices. Length
-/// mismatch returns false early (length is not secret here: the signature is a
-/// fixed 32 bytes), but the content loop avoids leaking byte position of the
-/// first difference through timing.
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
+/// Re-export of the clock the capability's lifetime is judged against, so the
+/// two server-side call sites keep reading `dac::now_secs()` next to
+/// `dac::issue`/`dac::verify`. The arithmetic itself lives in
+/// [`crate::crypto`], shared by every HMAC consumer in the workspace.
+pub use crate::crypto::now_secs;
 
 /// Mint a capability string for `expiry` (UNIX seconds; `0` = never expires)
 /// under the shared signing key `key`. Format: `"<expiry>.<hex(hmac)>"`, the
@@ -208,7 +130,6 @@ mod tests {
     use super::*;
 
     const K: &[u8] = b"\x01\x02\x03\x04\x05\x06\x07\x08";
-    const DAY: u64 = 86_400;
 
     #[test]
     fn round_trip_valid() {
@@ -268,30 +189,10 @@ mod tests {
     }
 
     #[test]
-    fn hmac_matches_known_answer() {
-        // RFC 4231 test case 2: key="Jefe", data="what do ya want for nothing?"
-        let mac = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
-        assert_eq!(
-            to_hex(&mac),
-            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
-        );
-    }
-
-    #[test]
     fn decode_key_round_trips_and_rejects_junk() {
         assert_eq!(decode_key("0102ff").unwrap(), vec![0x01, 0x02, 0xff]);
         assert!(decode_key("010").is_err()); // odd length
         assert!(decode_key("zz").is_err()); // non-hex
         assert!(decode_key("").is_err()); // empty
-    }
-
-    #[test]
-    fn long_key_is_prehashed_not_truncated() {
-        // A key longer than the block size must still produce a stable MAC that
-        // verifies (guards the pre-hash path).
-        let big = vec![7u8; DAY as usize]; // 86400 bytes >> 64
-        let dac = issue(&big, 42);
-        assert_eq!(verify(&big, &dac, 0), Verdict::Valid);
-        assert_eq!(verify(&vec![7u8; DAY as usize], &dac, 0), Verdict::Valid);
     }
 }

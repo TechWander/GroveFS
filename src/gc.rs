@@ -12,8 +12,9 @@
 //! The scan is deliberately OFFLINE (or at least snapshot-sound): it reads
 //! every surviving `<meta>/*.db` and FAILS when one cannot be read, because a
 //! skipped tree would make every blob it names look orphaned. `--apply` is
-//! gated by the CLI on "no live local mount / no local grovefs process using
-//! this store", and never deletes an object younger than the grace window.
+//! gated by the CLI on "no live mount of this store on this machine / no local
+//! grovefs process using it", and never deletes an object younger than the
+//! grace window.
 //!
 //! Striped layouts: a tree names `s<N>:<stripe>:<base>` while the bytes live on
 //! data-server roots as `<base>#<i>` chunks. A chunk is KEPT when any tree names

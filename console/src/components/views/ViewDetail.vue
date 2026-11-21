@@ -214,7 +214,7 @@ function doExport(): void {
         <pre>{{ stats.definition }}</pre>
       </template>
 
-      <div class="row">
+      <div class="row toolbar">
         <button type="button" @click="doExport">{{ t('Export dump') }}</button>
         <button v-if="session.can('fork.create')" type="button" @click="forkOpen = true">
           {{ t('Fork…') }}

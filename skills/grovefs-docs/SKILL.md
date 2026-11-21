@@ -1,17 +1,19 @@
 ---
 name: grovefs-docs
-description: Keeps GroveFS documentation (README.md, README.en.md, USAGE.md, USAGE.en.md, docs/docs.html) stating only current-version behavior — no migration history, no removed flags/env vars, no before/after baselines, no "newly added / now supports / identical to the old / falls back to old behavior" change narration. Use when editing, rewriting, or reviewing these files, when auditing whether docs match `grovefs --help`, or when asked to "按最新版本写文档" / "排查文档里的历史叙述" / "参数对账".
+description: Keeps GroveFS documentation (README.md, README.en.md, USAGE.md, USAGE.en.md, docs/docs.html, docs/deploy.html) stating only current-version behavior — no migration history, no removed flags/env vars, no before/after baselines, no "newly added / now supports / identical to the old / falls back to old behavior" change narration. Use when editing, rewriting, or reviewing these files, when auditing whether docs match `grovefs --help`, or when asked to "按最新版本写文档" / "排查文档里的历史叙述" / "参数对账".
 ---
 
 # GroveFS 文档口径（只写当前版本）
 
-五份文档同一规矩：**手册只陈述当前版本的行为，演变史归 git 提交记录。**
+六份文档同一规矩：**手册只陈述当前版本的行为，演变史归 git 提交记录。**
 
 - `README.md` — 中文简介 + 「诚实标注的边界」清单（中文末段）
 - `README.en.md` — 英文简介（`README.md` 的对译，口径段在末段）
 - `USAGE.md` — 使用说明，§14.4 末尾写有口径原文
 - `USAGE.en.md` — 使用说明英文版（`USAGE.md` 的对译，§14.4 末尾同样写有口径原文；代码块与真实回显逐字保留）
 - `docs/docs.html` — 单文件手册，§21 末尾写有口径原文（两条 `.ok` div）
+- `docs/deploy.html` — 部署与命令实操（三套部署 × 全套命令的逐字回显）；这一份的硬约束是**示例必须真跑**：
+  改了命令形态就要重跑对应的取证脚本，回显逐字贴回来，不许按记忆补写
 
 口径原文本身在每份文档里各写了一次（README 与 USAGE 各有中英两份都要改），改口径要**各处同步**。
 
@@ -34,28 +36,41 @@ description: Keeps GroveFS documentation (README.md, README.en.md, USAGE.md, USA
 1. 先扫再改，不要凭印象。按这四族关键词分别定位（终端在 CJK 换行处会插假空格，**别把显示出来的空格抄进锚点**）：
 
    ```bash
-   cd grovefs && grep -nE '已从代码|已移除|不再提供|strict-view|ALLOW_LAZY_VIEW' README.md README.en.md USAGE.md USAGE.en.md docs/docs.html
-   grep -nE '改造前|旧版|旧行为|退回旧|与旧.*一致' README.md README.en.md USAGE.md USAGE.en.md docs/docs.html
-   grep -nE '新增了|新增的|现已|已落地|已经落地|now also|gained' README.md README.en.md USAGE.md USAGE.en.md docs/docs.html
-   grep -nE '[0-9]+(\.[0-9]+)?s? *(→|->|降到)|基线' README.md README.en.md USAGE.md USAGE.en.md docs/docs.html   # 历史基线数字
+   cd grovefs && grep -nE '已从代码|已移除|不再提供|strict-view|ALLOW_LAZY_VIEW' README.md README.en.md USAGE.md USAGE.en.md docs/docs.html docs/deploy.html
+   grep -nE '改造前|旧版|旧行为|退回旧|与旧.*一致' README.md README.en.md USAGE.md USAGE.en.md docs/docs.html docs/deploy.html
+   grep -nE '新增了|新增的|现已|已落地|已经落地|now also|gained' README.md README.en.md USAGE.md USAGE.en.md docs/docs.html docs/deploy.html
+   grep -nE '[0-9]+(\.[0-9]+)?s? *(→|->|降到)|基线' README.md README.en.md USAGE.md USAGE.en.md docs/docs.html docs/deploy.html   # 历史基线数字
    ```
 
 2. 改前先核实语义，别用印象填空。行为表述以源码为准（例：空账本的含义查 `src/meta.rs` 模块注释，分页能力查 `MetaProvider::supports_paged_readdir()`）。
-3. 分批 SearchReplace，**每批后读 diff**——上一轮的遗漏通常藏在 diff 的上下文行里（`<summary>`、小节标题、英文段落最常漏）。
+3. **中文密集的文档不要用编辑工具的字符串替换**：CJK 段落在传输环节会被改写（实测踩过的例子：`冒牌→冒牌牌`、`不谎报→不谎谢`、`排除→跳除`），
+   且它是「匹配失败就整批中断」，一次只能暴露一个错。改用一次性 python 脚本 + 锚点命中断言：
+   `rep(old,new)` 全串唯一、`repa(…, expect, …)` 指定命中数、`repline(前缀, 新行)` 整行换、
+   `rex(正则, …)` 一律用 `[^\n]*?` 限定单行（`.*?` + DOTALL 会跨行误吞）、`seg(首行前缀, 末行前缀, 新块)` 换行段。
+   **所有算子的失败只记进 `fails`，脚本末尾有失败就不写盘**——一次跑报全部锚点问题，改锚点不用来回试。
+   锚点从 `Read`/`sed -n` 取原文，别把终端在 CJK 换行处插的假空格抄进去。每批后照样读 diff，上一轮的遗漏藏在上下文行里。
 4. 跑收口检查：
 
    ```bash
    bash skills/grovefs-docs/scripts/doccheck.sh
    ```
 
-   四项：变更史扫描、参数对账（文档 `--xxx` ↔ `grovefs --help` 真实参数差集）、docs/docs.html 标签闭合、新增用字校验（抓自己打错的汉字）。退出码 0 才算收工。
+   六项：变更史扫描、参数对账（文档 `--xxx` ↔ `grovefs --help` 真实参数差集，六份文档全覆盖，
+   别家工具的命令行只截工具段不截整行——整行删会连带弄丢同一行里的真参数）、
+   `docs/*.html` 结构（`scripts/htmlcheck.py`：标签闭合 + 页内 `href="#x"`↔`id="x"` 悬空锚点 + 跨页断链 + 重复 id，
+   重写一节最容易改出「目录点下去没反应」，标签配平衡量不出来）、新增用字校验（抓自己打错的汉字）、
+   **mount 示例带坐标**（`scripts/mountcheck.py`：无坐标的挂载现在是硬失败，文档里少一个 `--meta-server` 就是一条跑不通的命令）、
+   **套件断言数对账**（`scripts/suitenumbers.py`：文档里每句「X 套件 N 条断言」的真值只取
+   `.build-bin/logs/<最近一次整板>/<stage>.log` 的 `SUMMARY: pass=` 行——改套件不会让文档变红，
+   这在本仓库反复发生过；没跑过整板这一项自己跳过并说明，绝不拿记忆里的数当真相；名字不挨着也算（README 那条超长清单里每个「(…; 42 assertions)」归给行内它前面最近的套件名）；而闸门自己也要证明拉得响——`--selftest` 把六份文档里每个复述的数字 +1 注入临时副本，三条归属规则必须都红）。
+   退出码 0 才算收工。
 
 ## Repo Wiki（`.qoder/repowiki/`）同步
 
-上面三份文档在仓库内、随代码走；Qoder 的 Repo Wiki 是 IDE 另生成的一棵中文站（正文 `.qoder/repowiki/zh/content/**.md`），**不在 git 仓库里**（仓库根是 `grovefs/`，Wiki 落在其上一级 `.qoder/`）。
+上面六份文档在仓库内、随代码走；Qoder 的 Repo Wiki 是 IDE 另生成的一棵中文站（正文 `.qoder/repowiki/zh/content/**.md`），**不在 git 仓库里**（仓库根是 `grovefs/`，Wiki 落在其上一级 `.qoder/`）。
 
 - **别指望 IDE 自动更新它。** 提交驱动的增量重绑「打开的工作区文件夹」：本工作区根 `/data/grovefs` 不是 git 仓库，IDE 据此把 Wiki 归到魔术分支 `Q0DeR-MaG1C-BrAnCh-Fo2-NoN-GiT-Or-No-C0MmIt`（非 git / 无提交），元数据基线 `last_commit_id` 恒为全零、增量任务表 0 行 —— 自动重扫从未武装。真要让自动更新生效：① 把 `grovefs/`（含 `.git` 那层）作为工作区打开；或 ② 在 IDE Wiki 面板手动「重新生成」以重置基线。二者都是 IDE 侧动作，改代码不触发。
-- **过渡期用检查器收口**（像 doccheck 之于三份文档）：
+- **过渡期用检查器收口**（像 doccheck 之于六份文档）：
 
   ```bash
   bash skills/grovefs-docs/scripts/wikicheck.sh   # 退出码 0 = wiki 与代码事实一致
@@ -68,3 +83,4 @@ description: Keeps GroveFS documentation (README.md, README.en.md, USAGE.md, USA
 - 只改文字与格式，**不改行为描述的事实**。拿不准某句是不是当前行为，去读源码或跑命令，不要靠猜补全。
 - 不为「读起来顺」删掉限制、拒因、单位、测量条件。
 - 不新增实测以外的数字，不给没跑过的命令贴「真实回显」。
+- **口径级删除/替换写进 `docs/adr/`，不写进正文**：六份文档只陈述当前行为；「以前有什么、为什么删、否决了什么、代价多大、现在哪条断言钉住它」进 ADR（现有 `0001-manager.md`、`0002-no-local-mount.md`），正文只在相关章节留一句指向它。这样文档永远不描述不存在的开关，而动因不会被改写历史洗掉。

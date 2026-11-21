@@ -26,6 +26,12 @@ export const ZH: Readonly<Record<string, string>> = {
   Keys: '密钥',
   Accounts: '账号',
   Audit: '审计',
+  // Page overlines: the small category printed above each page title.
+  Deployment: '部署',
+  Namespace: '命名空间',
+  Credentials: '凭据',
+  People: '成员',
+  Ledger: '账目',
   // The header's <nav> is labelled for a screen reader; the hand-written page
   // had no landmark at all here.
   'Sections of the console': '控制台分区',
@@ -183,8 +189,14 @@ export const ZH: Readonly<Record<string, string>> = {
   'key rotated': '密钥已轮换',
   'Create key': '创建密钥',
   'a delegated account mints client keys only': '委派账号只能铸造客户端密钥',
-  'This is the only time the secret is shown — GroveFS stores a digest.':
-    '秘钥仅此一次显示 — GroveFS 只保存摘要。',
+  'The registry kept a recoverable copy of this secret, wrapped under its store key — Reveal reads it back.':
+    '登记表已用其存储密钥封装了这份 secret 的可恢复副本 — “读出” 可随时取回。',
+  'This is the copy the registry keeps, opened under its store key. The call is written to the audit trail with this id.':
+    '这就是登记表保存的副本，已用其存储密钥解开。本次调用会连同该 id 一并写入审计记录。',
+  'This store keeps no recoverable copy of it, so this is the only time the secret is shown — Rotate is the way to get a new one.':
+    '本存储不保存它的可恢复副本，因此这是 secret 唯一一次显示 — 要获得新的请用 “轮换”。',
+  'Stored secret': '存储的 secret 副本',
+  'no recoverable copy of this secret': '此 secret 没有可恢复副本',
   'label ${l} · scope ${s} · owner ${o} · ${b}': '标签 ${l} · 范围 ${s} · 属主 ${o} · ${b}',
   'bound to ${v}': '绑定到 ${v}',
   'not bound to a view': '未绑定视图',
@@ -200,6 +212,7 @@ export const ZH: Readonly<Record<string, string>> = {
   'now read-only': '已改为只读',
   Revoke: '吊销',
   Rotate: '轮换',
+  Reveal: '读出',
   'Rotate this key?': '轮换这把密钥？',
   '${l} (${i}) · scope ${s}\n\nThe id, label, scope, view binding and audit history are kept; only the secret is replaced. The old secret stops working at its NEXT handshake — a live mount on it stays open until it reconnects; to kill a credential outright, Revoke it.':
     '${l}（${i}）· 范围 ${s}\n\n保留 id、标签、范围、视图绑定与审计历史，只替换 secret。旧 secret 在下一次握手时失效 — 基于它的活跃挂载在重连前仍保持打开；要彻底封杀请直接吊销。',
@@ -207,6 +220,10 @@ export const ZH: Readonly<Record<string, string>> = {
   'Revoke this key?': '吊销这把密钥？',
   '${l} (${i}) · scope ${s} · ${note}\n\nLive mounts keep working until their next operation.':
     '${l}（${i}）· 范围 ${s} · ${note}\n\n活跃挂载在其下一次操作前继续可用。',
+  'Delete this key?': '删除这把密钥？',
+  '${l} (${i}) · scope ${s}\n\nThis removes the credential from the store. A live mount stops at its next operation. The audit rows it wrote are kept. This cannot be undone — use Revoke instead if you only want to disable it.':
+    '${l}（${i}）· 范围 ${s}\n\n这会把凭据从存储中移除；活跃挂载会在下一次操作时停止。它写下的审计记录会保留。此操作不可撤销 — 若只想禁用，请改用「吊销」。',
+  'key deleted': '密钥已删除',
   'NOT bound to a view — it reaches every tree': '未绑定视图 — 可达所有树',
 
   /* accounts */
@@ -289,8 +306,8 @@ export const ZH: Readonly<Record<string, string>> = {
     '部署概要、你的权限范围与最近的治理动态。',
   'Base views, forks, aliases and lenses — select one to inspect.':
     '基视图、fork、别名与透镜 — 选择一个进行查看。',
-  'Mint, rotate and revoke the keys clients mount and agents call with.':
-    '铸造、轮换与吊销客户端挂载及智能体调用所用的密钥。',
+  'Mint, rotate, revoke and delete the keys clients mount and agents call with.':
+    '铸造、轮换、吊销与删除客户端挂载及智能体调用所用的密钥。',
   'Who governs what — accounts, roles and base-view delegations.':
     '谁治理什么 — 账号、角色与基视图委派。',
   'Every call the control plane answered — failures included.':
@@ -312,8 +329,8 @@ export const ZH: Readonly<Record<string, string>> = {
   'What the server said': '服务器的原话',
   'nothing recorded': '无记录',
   'no stored fingerprint': '无存储指纹',
-  'first and last 4 hex digits of the secret; only its digest is stored, so the middle can never be shown again':
-    'secret 的首尾各 4 位十六进制；库中只存它的摘要，因此中段永远无法再次显示',
+  'first and last 4 hex digits of the secret; a list never shows the middle, and only Reveal can — audited, from the store’s wrapped copy':
+    'secret 的首尾各 4 位十六进制；列表从不显示中段，只有 “读出” 能 — 从存储的封装副本取回，并计入审计',
   '${n} in total': '共 ${n} 条',
   '${n} of ${m} shown': '显示 ${n} / ${m} 条',
   'rows to load': '载入行数',
@@ -324,6 +341,15 @@ export const ZH: Readonly<Record<string, string>> = {
   'every plane': '所有面',
   'every view': '所有视图',
   'every op': '所有操作',
+  'every key': '所有密钥',
+  'key trail': '密钥谱系',
+  minted: '铸出',
+  '${n} minted by this key, in the rows loaded here': '本次载入的行里，这把密钥铸出 ${n} 把',
+  'nothing in these rows was minted by this key': '这些行里没有这把密钥铸出的密钥',
+  'show this key’s calls': '查看这把密钥的调用',
+  'no minted key recorded on this row': '此行未记录铸出的密钥',
+  'A row’s key is the credential that signed the call. From this console that is always the gateway’s own admin key, because the gateway holds one and forwards what you click: filtering by key finds the door, searching by account finds who walked through it.':
+    '行上的密钥是签署这次调用的凭据。从本控制台来的永远是网关自己那把 admin 密钥——它持有一把，并转发你的点击：按密钥筛出的是入口，按账号搜出的才是操作者。',
   'every result': '所有结果',
   'all time': '全部时间',
   'last hour': '最近 1 小时',
@@ -373,6 +399,12 @@ export const ZH: Readonly<Record<string, string>> = {
   'names that resolve through this base': '经由该基解析的名字',
   'names derived directly from it': '直接派生自它的名字',
   'nothing is derived from it yet': '尚无东西派生自它',
+  'derived names': '派生名字',
+  '${n} total': '共 ${n} 个',
+  'via ${v}': '经由 ${v}',
+  '${n} name(s) resolve through this base — listed side by side; “via” names the edge':
+    '${n} 个名字经由该基解析 — 同级并列展示；“经由”标注所在定义边',
+  '${n} name(s) hang below it — listed side by side': '其下有 ${n} 个名字 — 同级并列展示',
   '${n} name(s) hang below it': '其下有 ${n} 个名字',
   '${n} name(s) resolve through this base — ${d} directly below it':
     '${n} 个名字经由该基解析 — 其中 ${d} 个直接位于其下',
@@ -443,22 +475,32 @@ export const ZH: Readonly<Record<string, string>> = {
   'it can write': '它可写',
   'Save it now. From here on the list shows its fingerprint ${h}; Rotate is the only way to obtain a usable secret again.':
     '现在就保存。此后列表只显示它的指纹 ${h}；轮换是重新获得可用 secret 的唯一途径。',
-  'A client presents `<id>:<secret>` (`mount --api-key`, or the `GROVEFS_API_KEY` environment variable). GroveFS stores only a digest, so this screen cannot read the secret back — that is what makes a leaked database harmless.':
-    '客户端提交 `<id>:<secret>`（`mount --api-key`，或 `GROVEFS_API_KEY` 环境变量）。GroveFS 只保存摘要，因此本页面无法读回 secret — 这正是数据库泄露也无害的原因。',
+  'The list shows its fingerprint ${h}; Reveal reads this secret back for as long as the store holds its wrapping material.':
+    '列表只显示它的指纹 ${h}；只要存储还持有封装材料，“读出” 就能取回这份 secret。',
+  'A client presents `<id>:<secret>` (`mount --api-key`, or the `GROVEFS_API_KEY` environment variable).':
+    '客户端提交 `<id>:<secret>`（`mount --api-key`，或 `GROVEFS_API_KEY` 环境变量）。',
+  'A handshake reads only the stored digest; the secret itself lives wrapped under the store key, so Reveal can hand it back — and that read is audited with the id it opened.':
+    '握手只校验存储的摘要；secret 本身以存储密钥封装保存，因此 “读出” 可以把它交回 — 而这次读取会连同它解开的 id 一起计入审计。',
+  'No recoverable copy of this secret is stored, so nothing here can read it back: Rotate is the way to obtain a usable one.':
+    '此 secret 未存储可恢复副本，因此这里无法读回它：请用 “轮换” 获得可用的新 secret。',
   'A note and a deadline are bookkeeping: they change what the registry says about this key, never what it can open.':
     '备注与期限属于登记信息：它们只改变登记表对此密钥的记述，绝不改变它能打开的内容。',
   '`mount` authenticates a client mount, `mcp` an agent, `admin` the governance console, `any` everything. An `admin` key can change accounts and keys — treat it as a password.':
     '`mount` 认证客户端挂载，`mcp` 认证智能体，`admin` 认证治理控制台，`any` 覆盖全部。`admin` 密钥可改动账号与密钥 — 请把它当作口令对待。',
   'a bound key can only open that view (and what derives from it); an unbound one reaches every tree. Only an administrator may mint an unbound key.':
     '绑定的密钥只能打开该视图（及其派生）；未绑定的可达所有树。只有管理员能铸未绑定密钥。',
-  'mints a 16-character id and a 64-hex-digit secret; the client uses `<id>:<secret>`. The secret exists once, in the dialog you are about to close.':
-    '铸出一个 16 字符的 id 与一个 64 位十六进制的 secret；客户端使用 `<id>:<secret>`。secret 只存在一次，就在你即将关闭的这个对话框里。',
-  'shows the stored fingerprint: the first and last four hex digits of the secret. GroveFS keeps a SHA-256 digest, NOT the secret and NOT anything reversible, so no screen, API or database dump can show the middle — that is the price of a leaked database being harmless.':
-    '显示存储的指纹：secret 的首尾各四位十六进制。GroveFS 保存的是 SHA-256 摘要，不是 secret，也不可逆，因此任何界面、API 或数据库转储都拿不出中段 — 这正是数据库泄露无害所付的代价。',
+  'mints a 16-character id and a 32-hex-digit secret; the client uses `<id>:<secret>`. The dialog that follows is the first display of it — whether the registry also keeps a copy an operator can read back is said there, and depends on the store.':
+    '铸出一个 16 字符的 id 与一个 32 位十六进制的 secret；客户端使用 `<id>:<secret>`。随后的对话框是它第一次显示 — 登记表是否也留有运维可读回的副本，那里会说明，取决于存储。',
+  'shows the stored fingerprint: the first and last four hex digits of the secret. The digest GroveFS authenticates against is one-way and gives no hint back, so no list or dump assembles the middle from this — the full string comes back only through Reveal.':
+    '显示存储的指纹：secret 的首尾各四位十六进制。GroveFS 用于认证的摘要不可逆、也反推不出任何提示，因此任何列表或转储都无法由此拼出中段 — 完整字符串只能经 “读出” 取回。',
+  'reads the stored copy of a secret back and shows it, unwrapped under the store’s own key, to the key’s owner or a super administrator. The call is written to the audit trail naming the id it opened. Only offered where a copy exists: a row minted before the store had wrapping material has none, and Rotate is how a usable secret is obtained then.':
+    '把 secret 的存储副本读回并显示，用存储自身的密钥解开，仅对该密钥的属主或超级管理员可见。本次调用会连同它解开的 id 写入审计记录。只在存在副本时才提供：存储尚无封装材料时铸出的行没有副本，那时要用 “轮换” 获得可用 secret。',
   'replaces the secret for the SAME id: label, scope, view binding, note, deadline and audit history stay. The old secret stops working at its next handshake; a live mount on it stays open until it reconnects.':
     '为同一个 id 替换 secret：标签、范围、视图绑定、备注、期限与审计历史都保留。旧 secret 在下一次握手时失效；基于它的活跃挂载在重连前保持打开。',
-  'retires the credential for good. Nothing can un-revoke it and a revoked row is not editable — create a new key instead. It takes effect on the key’s NEXT call, so a live mount keeps its open trees until then.':
-    '彻底作废该凭据。吊销不可撤销，且已吊销的行不可编辑 — 请改为新建密钥。它在密钥的下一次调用生效，因此在那之前活跃挂载保持其已打开的树。',
+  'retires the credential for good. Nothing can un-revoke it and a revoked row is not editable — delete it if you also want it gone from the registry. It takes effect on the key’s NEXT call, so a live mount keeps its open trees until then.':
+    '彻底作废该凭据。吊销不可撤销，已吊销的行也不可编辑 — 若还想从登记簿中移除，请使用删除。它在密钥的下一次调用生效，因此在那之前活跃挂载保持其已打开的树。',
+  'removes the credential row entirely; the id and secret stop authenticating at the next handshake. Only the key’s owner or a super administrator may delete it, and the console asks first. Audit rows the key wrote stay in the log with their original attribution — deleting a key never shortens the trail.':
+    '彻底移除凭据行；id 与 secret 在下一次握手时不再通过认证。只有密钥所有者或超级管理员可以删除，且控制台会先确认。该密钥写下的审计记录仍以原归属保留在日志中 — 删除密钥绝不会缩短审计链。',
   'flips the write permission without touching the secret, so a mount can be made read-only without handing anyone a new credential.':
     '翻转写权限而不动 secret，因此可把一个挂载改为只读，而无需交给任何人新凭据。',
   'changes the bookkeeping only: the note and the deadline. Scope, view binding and id never change here, because a key an application is already holding would otherwise acquire a reach its owner did not ask for.':

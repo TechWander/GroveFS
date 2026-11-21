@@ -38,7 +38,11 @@ const { pending } = usePageLoad(async () => {
 </script>
 
 <template>
-  <PageHead title="Views" desc="Base views, forks, aliases and lenses — select one to inspect.">
+  <PageHead
+    kicker="Namespace"
+    title="Views"
+    desc="Base views, forks, aliases and lenses — select one to inspect."
+  >
     <template #actions>
       <ActionButton :action="refresh" :label="'refresh'" variant="link" />
     </template>

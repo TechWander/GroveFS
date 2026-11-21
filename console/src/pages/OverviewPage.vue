@@ -90,6 +90,7 @@ function openBase(name: string): void {
 
 <template>
   <PageHead
+    kicker="Deployment"
     title="Overview"
     desc="Deployment snapshot, your reach and the latest governance activity."
   />

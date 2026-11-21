@@ -36,13 +36,24 @@ export interface AuditFilter {
   plane: string
   op: string
   verdict: string
+  /** Which CREDENTIAL signed the calls being shown — the door, not the person:
+      a console click arrives on the gateway's own key and names its account in
+      the message. `all` means every key. */
+  key: string
 }
 
 const fresh = {
   views: (): KindFilter => ({ q: '', kind: 'all' }),
   keys: (): KeyFilter => ({ q: '', state: 'all', scope: 'all', view: 'all' }),
   accounts: (): AccountFilter => ({ q: '', role: 'all', state: 'all' }),
-  audit: (): AuditFilter => ({ q: '', window: 'all', plane: 'all', op: 'all', verdict: 'all' }),
+  audit: (): AuditFilter => ({
+    q: '',
+    window: 'all',
+    plane: 'all',
+    op: 'all',
+    verdict: 'all',
+    key: 'all',
+  }),
 }
 
 export const useFilterStore = defineStore('filters', () => {

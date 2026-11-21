@@ -67,33 +67,43 @@ async function run(): Promise<void> {
 <template>
   <BarRow :title="'Import a dump'" :level="3" />
 
-  <div class="row">
-    <FieldRow :label="'metadata dump'" for="import-file">
-      <input id="import-file" type="file" accept=".txt,.json,.ndjson,text/plain" @change="picked" />
-    </FieldRow>
-    <FieldRow label="as view" for="import-target">
-      <input id="import-target" v-model="target" :placeholder="`${props.stats.name}-copy`" />
-    </FieldRow>
-    <label class="check" for="import-replace">
-      <input id="import-replace" v-model="replace" type="checkbox" />
-      {{ t('replace an existing tree') }}
-    </label>
-    <label v-if="session.isSuper" class="check" for="import-as-base">
-      <input id="import-as-base" v-model="asBase" type="checkbox" />
-      {{ t('import as a BASE view') }}
-    </label>
-    <ActionButton :action="run" :label="'Import'" />
-  </div>
+  <div class="import-box">
+    <div class="import-grid">
+      <FieldRow :label="'metadata dump'" for="import-file">
+        <input
+          id="import-file"
+          type="file"
+          accept=".txt,.json,.ndjson,text/plain"
+          @change="picked"
+        />
+      </FieldRow>
+      <FieldRow label="as view" for="import-target">
+        <input id="import-target" v-model="target" :placeholder="`${props.stats.name}-copy`" />
+      </FieldRow>
+    </div>
 
-  <span class="muted">
-    {{
-      session.isSuper
-        ? t(
-            'a dump becomes a BASE view, or a fork of a view you govern — content bytes are never in a dump',
-          )
-        : t('imported as a FORK of ${name}; only an administrator can import a new base view', {
-            name: props.stats.base || props.stats.name,
-          })
-    }}
-  </span>
+    <div class="import-foot">
+      <label class="check" for="import-replace">
+        <input id="import-replace" v-model="replace" type="checkbox" />
+        {{ t('replace an existing tree') }}
+      </label>
+      <label v-if="session.isSuper" class="check" for="import-as-base">
+        <input id="import-as-base" v-model="asBase" type="checkbox" />
+        {{ t('import as a BASE view') }}
+      </label>
+      <ActionButton :action="run" :label="'Import'" />
+    </div>
+
+    <span class="muted">
+      {{
+        session.isSuper
+          ? t(
+              'a dump becomes a BASE view, or a fork of a view you govern — content bytes are never in a dump',
+            )
+          : t('imported as a FORK of ${name}; only an administrator can import a new base view', {
+              name: props.stats.base || props.stats.name,
+            })
+      }}
+    </span>
+  </div>
 </template>

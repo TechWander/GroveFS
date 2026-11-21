@@ -3,9 +3,12 @@
   The stored credential fingerprint: `a1b2…c3d4`.
 
   The elision is DRAWN, not typed, so it cannot be mistaken for part of the
-  value — and the title says WHY the middle is missing: GroveFS stores a
-  SHA-256 digest, so no view, no API and no database dump can produce it.
-  `apikey rotate` is the way to get a usable secret back.
+  value — and the title says what the middle actually is. It is cut out of the
+  secret, not out of its digest: the digest is what a handshake is checked
+  against, it gives no hint back, and a table of it would be a table of strings
+  nobody can use. The full secret reaches a screen in exactly one way — Reveal,
+  unwrapped from the copy the store keeps — and the audit trail gets a row for
+  every time that happens.
 */
 import { t } from '@/i18n'
 
@@ -13,7 +16,7 @@ const props = defineProps<{ hint?: string | null }>()
 
 const WHY = () =>
   t(
-    'first and last 4 hex digits of the secret; only its digest is stored, so the middle can never be shown again',
+    'first and last 4 hex digits of the secret; a list never shows the middle, and only Reveal can — audited, from the store’s wrapped copy',
   )
 
 function parts(hint: string): [string, string | null] {

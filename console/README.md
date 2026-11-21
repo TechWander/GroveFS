@@ -158,7 +158,7 @@ const { pending, error } = usePageLoad(load)
 
 ### 4.3 `api/ops.ts` 把白名单变成类型
 
-`Op` 就是 `web.rs` 的 `ALLOWED_OPS`（30 个），`OpResult` 逐 op 标注回包形状。于是：
+`Op` 就是 `web.rs` 的 `ALLOWED_OPS`（32 个），`OpResult` 逐 op 标注回包形状。于是：
 `gc.scan` / `gc.apply` / `refs.rebuild` / `view.rm_base` / `fork.graft` 这五个不过路由的动词
 **在类型层面就写不出来**，写出来也过不了 `vue-tsc`；调用前先查 `/api/session` 返回的放行清单，
 换了一个二进制时报“某个具名 op 不可用”，而不是一个说不清的 403。
@@ -248,21 +248,21 @@ const { pending, error } = usePageLoad(load)
 
 | 旧实现                                                           | 新实现                                           | 验证方式                                                               |
 | ---------------------------------------------------------------- | ------------------------------------------------ | ---------------------------------------------------------------------- |
-| 登录 / 登出 / 8h 空闲 / 失败限流提示                             | `LoginCard.vue` + `stores/session.ts`            | `test_web.sh` 178 条 + 真机走查                                        |
+| 登录 / 登出 / 8h 空闲 / 失败限流提示                             | `LoginCard.vue` + `stores/session.ts`            | `test_web.sh` 183 条 + 真机走查                                       |
 | 五页 `nav button[data-page]` 切类                                | `router/index.ts` 一张表 + 5 条 hash 路由        | 走查逐页有数据；`#/keys` 可书签、可前进后退                            |
-| `apikey` 七动词（list/create/revoke/rotate/set_ro/update/calls） | `api/ops.ts` 同名 `Op`                           | 走查含“铸一次密钥 → 一次性明文 → I have saved it 关闭”“轮换确认框取消” |
+| `apikey` 九动词（list/create/revoke/delete/rotate/secret/set_ro/update/calls） | `api/ops.ts` 同名 `Op` | 走查含“铸一次密钥 → 明文回显 → I have saved it 关闭”“轮换确认框取消”“密钥行把副本读回” |
 | `account` 建号/删号/改密/角色 + `grant add/rm`                   | `accounts/` 六组件 + `RoleDialog`/`PasswdDialog` | 走查账号抽屉 + 授权增删                                                |
 | 视图清单 / 详情 / 血缘 / define / fork / import                  | `views/` 八组件 + `ForkDialog`/`DefineDialog`    | 走查视图详情与血缘树                                                   |
 | 审计列表 + 搜索过滤 + 行抽屉                                     | `AuditPage.vue` + `AuditTable` + `AuditDrawer`   | 过滤用的 haystack 字段序与旧版 `app.js:2370-2371` **逐字一致**         |
 | 中英双语 + `documentElement.lang`/`title` 同步                   | `i18n/` + `App.vue` 的 watch                     | 走查切语言并回读两个属性                                               |
 | 行可点开抽屉、抽屉里再开对话框                                   | `DataTable` + `overlayStack`                     | 走查密钥/账号/审计三个抽屉                                             |
-| 一次性密钥只打印一次、库里只有摘要                               | `SecretDialog.vue`                               | 走查断言 + 178 条回归里的不落盘断言                                    |
+| 密钥明文只在铸造/轮换的回显与 `secret` 读回时上屏，盘上只有摘要与 `sbx1` 信封 | `SecretDialog.vue` + `keys/KeyRowActions.vue` | 走查断言 + 183 条回归里的“盘上没有可读明文”断言 |
 
-词典用 `npm run i18n:audit` 双向核对，本轮结果：`zh.ts` **397** 条 / 旧词典 392 条 /
-送进 `t()` 的串 341 个 / **缺 0**（该显示的句子全部有译）/ 旧条目未被继承 **0**。
-397 比 392 多的 5 条逐条核过都在页面上用得到：“Sections of the console”（帮助面板小标题）、
-两句会话读取失败的提示（`… could not read its own session` / `… could not reach the gateway`）、
-两个空态（“no base views delegated to you”、“no keys in its name”）。
+词典用 `npm run i18n:audit` 双向核对，当前结果：`zh.ts` **428** 条 / 旧词典 392 条 /
+送进 `t()` 的串 360 个 / **缺 0**（该显示的句子全部有译）/ 旧条目未被继承 **7**。
+那 7 条逐条核过，全是宣称“库里只有摘要、明文只显示一次”的旧句子——存储模型现在是
+摘要之外另存一份要 store key 才开得动的密文副本（`apikey secret` 读回），与它们直接矛盾，
+所以宁可让这几句从页面上消失，也不留一句假话；多出的条目都是页面真用得上的文案。
 参照物不再指向某个人的临时目录——缺省参数时脚本会走 git 历史，取“最后一次仍然内联着
 `const I18N_ZH = {` 的 `src/webui/app.js`”，因此这条核对在换版落地之后依然可复现。
 
@@ -311,7 +311,11 @@ const { pending, error } = usePageLoad(load)
 | 脚本执行 CPU           | 8.2 ms                 | 1.0 ms   | 框架启动成本（一屏的累计值）                    |
 | JS heap                | 6.75 MB                | 7.47 MB  | 常驻反而更省                                    |
 
-结论要分开说：**功能没有回退**（回归 178/178、逐页走查等价、词典 0 缺 0 丢、四机下发资源逐字节核对 49/49），
+表里的两份产物是内联旧版与 Vue 首版。此后前端又长过一些（密钥副本读回等），当前产物是
+`app.js` 233.0 kB（gzip 81.8）/ `app.css` 38.0 kB（gzip 8.0）——多出来的是文案与组件，不是运行时；
+表里的机读指标（first-paint / 脚本 CPU / heap）**没有在新产物上重测**，所以这份表只当那一轮的记录读。
+
+结论要分开说：**功能没有回退**（回归 183/183、逐页走查等价、词典 0 缺、四机下发资源逐字节核对 49/49），
 **呈现与交互有提升**（忙态/加载/错误/排版/Esc/无障碍，均有截图或断言），
 **冷启动的机读指标有一小幅后退**，代价来自框架运行时，收益是 DOM 规模与渲染复用；
 在真实网络与真实治理往返（sign→data 一百多毫秒）面前，这几毫秒的绘制差被网络时间吃掉。

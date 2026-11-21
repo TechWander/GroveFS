@@ -47,13 +47,14 @@ async function signOut(): Promise<void> {
     </span>
     <nav :aria-label="t('Sections of the console')">
       <button
-        v-for="p in PAGES"
+        v-for="(p, i) in PAGES"
         :key="p.name"
         type="button"
         :class="{ on: current === p.name }"
         :aria-current="current === p.name ? 'page' : undefined"
         @click="go(p.name)"
       >
+        <span class="idx" aria-hidden="true">{{ String(i + 1).padStart(2, '0') }}</span>
         <NavIcon :name="p.icon" />
         <span>{{ t(p.label) }}</span>
       </button>

@@ -20,11 +20,21 @@
 //! [`ApiKeyStore::is_live`]).
 //!
 //! Design:
-//! - **Keys are stored hashed.** `grovefs apikey create` mints a random secret,
-//!   persists only `SHA-256(secret)`, and prints the full plaintext key
-//!   (`<id>:<secret>`) exactly once. A leaked `api_keys.db` therefore hands out
-//!   nothing usable. The `id` half is only a lookup index (not a secret); the
-//!   `secret` half is the bearer capability.
+//! - **Authentication reads a digest; recovery reads a wrapped copy.**
+//!   `grovefs apikey create` mints a random secret, persists
+//!   `SHA-256(secret)` (the only thing the handshake ever consults) plus, since
+//!   the recoverable-copy change, `secret_enc` — the full `<id>:<secret>` under
+//!   [`crate::secretbox`], which is what [`ApiKeyStore::reveal`] opens so a lost
+//!   credential no longer forces a rotate. The `id` half is only a lookup index
+//!   (not a secret); the `secret` half is the bearer capability.
+//! - **A leaked credential table is still not a leaked cluster.** Opening a
+//!   wrapped copy needs the store's wrapping material as well as the row, so a
+//!   `pg_dump`, a replica or a database backup pasted into a ticket hands out no
+//!   usable credential. Losing that material costs recovery, never
+//!   authentication; recovery itself goes through one named path
+//!   ([`ApiKeyStore::reveal`], reached by `apikey secret` and the `apikey.secret`
+//!   control op, owner-or-superuser gated, and written to the server's audit
+//!   trail when a server is the one answering).
 //! - **Authentication is per-session.** The stdio transport has no header
 //!   channel, so the caller presents its key in the `initialize` params
 //!   (`{"apiKey": "<id>:<secret>"}`); an operator may also pre-authenticate a
@@ -64,9 +74,10 @@
 //! refuses or admits the op either way). Both access
 //! axes — WHICH single tree a key may open (`view` binding) and whether it may
 //! write at all (`ro`) — live in the credential itself; the self-reported uid
-//! stays advisory, and the key is the real gate against a malicious peer. The
-//! store holds only SHA-256 digests, so a leaked `api_keys.db` hands out
-//! nothing usable.
+//! stays advisory, and the key is the real gate against a malicious peer. What
+//! a database copy gives an attacker is digests and wrapped blobs, not
+//! credentials — see the two bullets above for what that costs and what it does
+//! not cover.
 
 use rusqlite::{params, Connection};
 use std::path::Path;
@@ -204,6 +215,11 @@ pub struct KeyInfo {
     /// credential in a list, far too little to be a credential. See
     /// [`secret_hint`] for what is actually revealed.
     pub secret_hint: Option<String>,
+    /// Does the row keep a recoverable copy of the credential? A flag, never the
+    /// secret: it exists so a console can offer Reveal on the rows that can
+    /// answer it and say why on the ones that cannot ([`ApiKeyStore::reveal`]).
+    /// False for every row minted before the wrapped copy existed.
+    pub secret_available: bool,
 }
 
 /// One recorded MCP tool invocation.
@@ -216,6 +232,61 @@ pub struct CallLog {
     pub tool: String,
     pub ok: bool,
     pub detail: String,
+}
+
+/// What one credential's stored copy can say (`apikey secret`,
+/// `apikey.secret`). Four answers because the operator's next action differs for
+/// each: hand the credential over, rotate it, fix the wrapping material on THIS
+/// node, or stop trusting the row. Collapsing them into one refusal string is
+/// how a support thread ends with someone rotating a key that was fine all
+/// along.
+#[derive(Debug, Clone)]
+pub enum StoredSecret {
+    /// The full `<id>:<secret>`, verified against the row's live digest.
+    Recoverable(String),
+    /// Nothing was kept: the row predates the wrapped copy, or this store had no
+    /// material when the key was minted. Rotate gets a recoverable secret for
+    /// the same id.
+    NeverStored,
+    /// A copy is in the row but THIS process cannot open it — no material, or a
+    /// different node's. The text names where it looked.
+    Unopenable(String),
+    /// The copy opens, but its secret no longer matches the row's digest: the
+    /// wrapped value and the live credential diverged (a restore from an older
+    /// backup, a store-key swap). What is in the row authenticates nothing, so
+    /// handing it out would be a worse answer than refusing.
+    Stale,
+}
+
+impl StoredSecret {
+    /// The credential, when that is the answer. A method rather than a field, so
+    /// a caller cannot read a string out of a row that refused it.
+    pub fn recoverable(&self) -> Option<&str> {
+        match self {
+            StoredSecret::Recoverable(key) => Some(key),
+            _ => None,
+        }
+    }
+
+    /// The sentence for the three no-answers, written ONCE: the control plane,
+    /// the CLI's remote arm and the CLI's local arm all have to say it, and a
+    /// refusal that reads differently per entrance is a refusal the operator has
+    /// to shop between.
+    pub fn refusal(&self) -> Option<&str> {
+        match self {
+            StoredSecret::Recoverable(_) => None,
+            StoredSecret::NeverStored => Some(
+                "this store kept no copy of the credential: it predates the recoverable copy, or \
+                 was minted while the store had no wrapping material. Rotate mints a secret that \
+                 later reads can recover.",
+            ),
+            StoredSecret::Unopenable(why) => Some(why),
+            StoredSecret::Stale => Some(
+                "the stored copy no longer matches this row's digest: it authenticates nothing, so \
+                 it is refused rather than printed. Rotate to get a credential both paths agree on.",
+            ),
+        }
+    }
 }
 
 fn now_iso() -> String {
@@ -246,12 +317,14 @@ fn gen_secret() -> String {
 /// The masked fingerprint stored beside the digest: FOUR hex chars from the
 /// front of the secret and four from the back, joined by an ellipsis
 /// (`a1b2…c3d4`). This is what the console's key list displays, so an operator
-/// can recognise a credential without the store holding anything reversible.
-/// What it gives away is 32 of the secret's 122 random bits — an attacker who
-/// already stole the database still faces 2^90 work per key, which is the same
-/// answer as facing 2^122: none. Revealing a CONTIGUOUS run would be worse
-/// (a prefix is what typo-brute-forcing and grep-adjacency exploit), hence the
-/// two short halves.
+/// can recognise a credential without a table of live secrets — the reversible
+/// copy, when the store has wrapping material, sits in its own column and is
+/// opened only by [`ApiKeyStore::reveal`], under an access rule and into the
+/// audit trail. What the hint gives away is 32 of the secret's 122 random bits
+/// — an attacker who already stole the database still faces 2^90 work per key,
+/// which is the same answer as facing 2^122: none. Revealing a CONTIGUOUS run
+/// would be worse (a prefix is what typo-brute-forcing and grep-adjacency
+/// exploit), hence the two short halves.
 fn secret_hint(secret: &str) -> String {
     let chars: Vec<char> = secret.chars().collect();
     if chars.len() < 12 {
@@ -359,6 +432,10 @@ where
 /// SQLite backend, the shared `grovefs_control` tables under PostgreSQL.
 pub struct ApiKeyStore {
     backend: Backend,
+    /// The material `secret_enc` is wrapped under ([`load_wrap`]). Held on the
+    /// store rather than re-read per call, so minting a row and revealing it
+    /// cannot disagree about which key was in force.
+    wrap: WrapMaterial,
 }
 
 /// The two backend spellings of the same key/audit schema. SQLite keeps the
@@ -378,7 +455,8 @@ const KEYS_DDL_SQLITE: &str = "CREATE TABLE IF NOT EXISTS api_keys (
                  note        TEXT,
                  expires_at  TEXT,
                  created_by  TEXT,
-                 secret_hint TEXT
+                 secret_hint TEXT,
+                 secret_enc  TEXT
              );";
 const CALLS_DDL_SQLITE: &str = "CREATE TABLE IF NOT EXISTS mcp_calls (
                  ts        TEXT NOT NULL,
@@ -405,7 +483,8 @@ const KEYS_DDL_PG: &str = "CREATE TABLE IF NOT EXISTS grovefs_control.api_keys (
     note         TEXT,
     expires_at   TEXT,
     created_by   TEXT,
-    secret_hint  TEXT
+    secret_hint  TEXT,
+    secret_enc   TEXT
 )";
 /// Column additions for stores minted before those columns existed. NOT a table
 /// upgrade (nothing is rewritten, no row is touched): they only make the extra
@@ -439,6 +518,11 @@ const KEY_MIGRATIONS: &[(&str, &str, &str)] = &[
         "ALTER TABLE api_keys ADD COLUMN secret_hint TEXT",
         "ALTER TABLE grovefs_control.api_keys ADD COLUMN IF NOT EXISTS secret_hint TEXT",
     ),
+    (
+        "secret_enc",
+        "ALTER TABLE api_keys ADD COLUMN secret_enc TEXT",
+        "ALTER TABLE grovefs_control.api_keys ADD COLUMN IF NOT EXISTS secret_enc TEXT",
+    ),
 ];
 const CALLS_DDL_PG: &str = "CREATE TABLE IF NOT EXISTS grovefs_control.mcp_calls (
     seq       BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -451,10 +535,132 @@ const CALLS_DDL_PG: &str = "CREATE TABLE IF NOT EXISTS grovefs_control.mcp_calls
     detail    TEXT NOT NULL
 )";
 
+/// The retention sweep runs `DELETE … WHERE ts < cutoff` on a timer; without
+/// this index every pass is a full scan of the audit table. Kept beside the
+/// DDL so an existing store gets it the next time it opens.
+const CALLS_TS_INDEX_SQLITE: &str =
+    "CREATE INDEX IF NOT EXISTS mcp_calls_ts ON mcp_calls(ts)";
+const CALLS_TS_INDEX_PG: &str =
+    "CREATE INDEX IF NOT EXISTS mcp_calls_ts ON grovefs_control.mcp_calls(ts)";
+
 /// Where this credential store physically lives.
 enum Backend {
     Sqlite(parking_lot::Mutex<Connection>),
     Pg(PgPool),
+}
+
+/// Environment override for the wrapping material: 64 hex characters, read once
+/// per process. The escape hatch for a deployment that would rather keep the
+/// material off the data directory than next to the table it protects.
+const STORE_KEY_ENV: &str = "GROVEFS_STORE_KEY";
+
+/// The file the wrapping material lives in when the env does not set it:
+/// `<base>/meta/store.key`, beside `api_keys.db` it wraps rows of.
+const STORE_KEY_FILE: &str = "store.key";
+
+/// The store's wrapping material, resolved once at open. Two states rather than
+/// an `Option`, because the refusals it produces have to name themselves: "this
+/// store never had material" and "your `GROVEFS_STORE_KEY` is 61 characters" are
+/// different things to fix, and an operator handed the first for the second
+/// wastes the afternoon.
+enum WrapMaterial {
+    Ready { key: [u8; crate::secretbox::KEY_BYTES], source: String },
+    Absent(String),
+}
+
+impl WrapMaterial {
+    /// Where the material came from (or why there is none), for a refusal that
+    /// an operator can act on without reading this file first.
+    fn source(&self) -> String {
+        match self {
+            WrapMaterial::Ready { source, .. } => source.clone(),
+            WrapMaterial::Absent(why) => why.clone(),
+        }
+    }
+}
+
+/// Resolve the wrapping material: [`STORE_KEY_ENV`], then
+/// `<base>/meta/`[`STORE_KEY_FILE`] (created `0600` on first use).
+///
+/// A store without material mints show-once keys, exactly as it did before the
+/// `secret_enc` column: `Absent` is a degraded mode and never a reason to write
+/// a plaintext. It is not a reason to fail the open either — the digest path
+/// authenticates without any of this, and refusing to start a meta-server
+/// because a recovery-only key is unwritable would take live mounts down with
+/// it. The cost is stated where it is paid: [`ApiKeyStore::reveal`] says so.
+fn load_wrap(base: &Path) -> WrapMaterial {
+    if let Some(raw) = std::env::var_os(STORE_KEY_ENV) {
+        let raw = raw.to_string_lossy();
+        return match crate::secretbox::key_from_hex(&raw) {
+            Some(key) => WrapMaterial::Ready {
+                key,
+                source: format!("environment {STORE_KEY_ENV}"),
+            },
+            None => WrapMaterial::Absent(format!(
+                "{STORE_KEY_ENV} is set but is not {} hex characters — refusing to wrap anything 
+                 under a key that is not what it declares",
+                crate::secretbox::KEY_BYTES * 2
+            )),
+        };
+    }
+    let path = base.join("meta").join(STORE_KEY_FILE);
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        return match crate::secretbox::key_from_hex(&existing) {
+            Some(key) => WrapMaterial::Ready {
+                key,
+                source: path.display().to_string(),
+            },
+            None => WrapMaterial::Absent(format!(
+                "{} exists but is not {} hex characters",
+                path.display(),
+                crate::secretbox::KEY_BYTES * 2
+            )),
+        };
+    }
+    match write_store_key(&path) {
+        Ok(key) => WrapMaterial::Ready {
+            key,
+            source: format!("{} (created)", path.display()),
+        },
+        Err(e) => WrapMaterial::Absent(format!(
+            "{} cannot be created or read: {e}",
+            path.display()
+        )),
+    }
+}
+
+/// Mint and persist a `0600` store key — or take the one a concurrent opener
+/// just wrote. `create_new` is the lock: two meta-servers starting against the
+/// same fresh directory must not each invent a key and then disagree about every
+/// row the other wrapped.
+fn write_store_key(
+    path: &Path,
+) -> Result<[u8; crate::secretbox::KEY_BYTES], std::io::Error> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let key = crate::secretbox::random_key();
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true).mode(0o600);
+    match opts.open(path) {
+        Ok(mut f) => {
+            f.write_all(crate::secretbox::key_to_hex(&key).as_bytes())?;
+            f.write_all(b"\n")?;
+            Ok(key)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let raw = std::fs::read_to_string(path)?;
+            crate::secretbox::key_from_hex(&raw).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "the file another process just wrote is not a hex key",
+                )
+            })
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// One credential row as the VERIFICATION path reads it: the column subset
@@ -514,7 +720,8 @@ impl ApiKeyStore {
             "PRAGMA busy_timeout=5000;
              PRAGMA journal_mode=WAL;
              {KEYS_DDL_SQLITE}
-             {CALLS_DDL_SQLITE}"
+             {CALLS_DDL_SQLITE}
+             {CALLS_TS_INDEX_SQLITE}"
         ))
         .map_err(|e| e.to_string())?;
         // A store from before the bookkeeping columns (`owner`, `note`,
@@ -538,6 +745,7 @@ impl ApiKeyStore {
         }
         Ok(Self {
             backend: Backend::Sqlite(parking_lot::Mutex::new(conn)),
+            wrap: load_wrap(base),
         })
     }
 
@@ -547,14 +755,22 @@ impl ApiKeyStore {
     /// system of record: every meta-server, MCP server and CLI aimed at the
     /// same URI authenticates against the same rows, and a revoke reaches all
     /// of them within the re-check window.
-    pub fn open_pg(uri: &str) -> Result<Self, String> {
+    ///
+    /// `base` is this process's metadata root (`meta-server --meta-dir`, which
+    /// under PG holds no authoritative record but is exactly the scratch
+    /// directory a wrapping key belongs in). Every meta-server in the deployment
+    /// must be given the SAME material — this file, or `GROVEFS_STORE_KEY` —
+    /// because they share one `api_keys` table: a reveal against a node holding
+    /// a different key says so rather than returning another node's secret.
+    pub fn open_pg(uri: &str, base: &Path) -> Result<Self, String> {
         // PG's ALTERs are idempotent, so the DDL and the migrations go in one
         // ordered batch (see [`PgPool::open`]).
-        let mut ddl: Vec<&str> = vec![KEYS_DDL_PG, CALLS_DDL_PG];
+        let mut ddl: Vec<&str> = vec![KEYS_DDL_PG, CALLS_DDL_PG, CALLS_TS_INDEX_PG];
         ddl.extend(KEY_MIGRATIONS.iter().map(|(_, _, pg)| *pg));
         let pool = PgPool::open(uri, &ddl)?;
         Ok(Self {
             backend: Backend::Pg(pool),
+            wrap: load_wrap(base),
         })
     }
 
@@ -568,7 +784,7 @@ impl ApiKeyStore {
             // `postgres://…` — or a `file:` instance registry listing them
             // ([`crate::pg_store::is_pg_store`]); the pool binds the registry's
             // FIRST entry, where the control schema lives.
-            Some(u) if crate::pg_store::is_pg_store(u) => Self::open_pg(u),
+            Some(u) if crate::pg_store::is_pg_store(u) => Self::open_pg(u, base),
             Some(u) if u.contains("://") => Err(format!(
                 "`{u}` is not a --meta-store scheme GroveFS supports: credentials live in a local SQLite file or PostgreSQL (`postgres://…`); a `treedb://` tree store keeps its keys in the LOCAL SQLite beside its meta-server's --meta-dir, so mint them without --meta-store"
             )),
@@ -727,8 +943,11 @@ impl ApiKeyStore {
     /// for the identity fields, plus): `note` (free-text remark), `expires_at`
     /// (an [`expires_from_ttl`] instant, `None` = never) and `created_by` — the
     /// ACCOUNT that minted it, which is NOT the same as `owner` (an admin
-    /// minting for a colleague). The plaintext secret still never reaches the
-    /// store: only its digest and the masked [`secret_hint`] do.
+    /// minting for a colleague). The plaintext goes to disk twice over: as the
+    /// digest authentication consults, and as the wrapped copy
+    /// [`Self::reveal`] opens. With no wrapping material in force the second
+    /// copy is simply NULL and the key is show-once, as it was before the
+    /// column — never a plaintext instead.
     pub fn create_extended(
         &self,
         label: &str,
@@ -749,12 +968,16 @@ impl ApiKeyStore {
         let hash = sha256_hex(&secret);
         let hint = secret_hint(&secret);
         let full_key = format!("{id}:{secret}");
+        let enc = match &self.wrap {
+            WrapMaterial::Ready { key, .. } => Some(crate::secretbox::seal(key, &full_key)),
+            WrapMaterial::Absent(_) => None,
+        };
         let ts = now_iso();
         let sc = scope.as_str();
         self.exec2(
-            "INSERT INTO api_keys (id, label, secret_hash, created_at, scope, view, ro, owner, note, expires_at, created_by, secret_hint) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![id, label, hash, ts, sc, view, ro as i64, owner, note, expires_at, created_by, hint],
-            "INSERT INTO grovefs_control.api_keys (id, label, secret_hash, created_at, scope, view_name, ro, owner, note, expires_at, created_by, secret_hint) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+            "INSERT INTO api_keys (id, label, secret_hash, created_at, scope, view, ro, owner, note, expires_at, created_by, secret_hint, secret_enc) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![id, label, hash, ts, sc, view, ro as i64, owner, note, expires_at, created_by, hint, enc],
+            "INSERT INTO grovefs_control.api_keys (id, label, secret_hash, created_at, scope, view_name, ro, owner, note, expires_at, created_by, secret_hint, secret_enc) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
             &[
                 &id,
                 &label,
@@ -768,6 +991,7 @@ impl ApiKeyStore {
                 &expires_at,
                 &created_by,
                 &hint,
+                &enc,
             ],
         )?;
         Ok((id, full_key))
@@ -977,12 +1201,17 @@ impl ApiKeyStore {
         Ok(n > 0)
     }
 
-    /// Every key, newest first. No secret material is in the row set: what
-    /// `list` can show about a secret is the masked [`secret_hint`] fingerprint.
+    /// Every key, newest first. No secret MATERIAL is in the row set: what
+    /// `list` can say about a secret is the masked [`secret_hint`] fingerprint
+    /// and the `secret_available` flag that a recoverable copy exists. The blob
+    /// itself is never selected here — a list is the one query that reaches
+    /// every screen in the console, and shipping 150 rows of wrapped credentials
+    /// through it would put the whole registry one response-log away from a
+    /// brute-force job.
     pub fn list(&self) -> Result<Vec<KeyInfo>, String> {
         let rows = self.query2(
             "SELECT id, label, scope, view, ro, created_at, last_used_at, revoked_at, owner,
-                    note, expires_at, created_by, secret_hint
+                    note, expires_at, created_by, secret_hint, (secret_enc IS NOT NULL)
              FROM api_keys ORDER BY created_at DESC",
             &[],
             |r| {
@@ -1000,11 +1229,12 @@ impl ApiKeyStore {
                     expires_at: cell(r, 10)?,
                     created_by: cell(r, 11)?,
                     secret_hint: cell(r, 12)?,
+                    secret_available: r.get::<_, i64>(13)? != 0,
                     expired: false,
                 })
             },
             "SELECT id, label, scope, view_name, ro, created_at, last_used_at, revoked_at, owner,
-                    note, expires_at, created_by, secret_hint
+                    note, expires_at, created_by, secret_hint, (secret_enc IS NOT NULL)
              FROM grovefs_control.api_keys ORDER BY created_at DESC, seq DESC",
             &[],
             |r| KeyInfo {
@@ -1021,6 +1251,7 @@ impl ApiKeyStore {
                 expires_at: cell_str(r, 10),
                 created_by: cell_str(r, 11),
                 secret_hint: cell_str(r, 12),
+                secret_available: r.get(13),
                 expired: false,
             },
         )?;
@@ -1039,8 +1270,8 @@ impl ApiKeyStore {
     }
 
     /// Rotate the secret of an ACTIVE key in place (`apikey rotate`): mint a
-    /// new secret, store only its digest and the new masked fingerprint, return
-    /// the new plaintext `"<id>:<secret>"` for one-time display — same contract
+    /// new secret, store its digest, its new masked fingerprint and its new
+    /// wrapped copy, return the new plaintext `"<id>:<secret>"` — same contract
     /// as [`Self::create_bound`]. Everything else (id, label, scope, view
     /// binding, ro, owner, `created_at`) survives untouched, so audit rows and
     /// view bindings keep their attribution. Returns `None` if no ACTIVE row
@@ -1049,6 +1280,11 @@ impl ApiKeyStore {
     /// matches); a session already established on it lives until its next
     /// reconnect — [`Self::live_state`] re-checks liveness and `ro`, not the
     /// secret. To kill a credential NOW rather than replace it, revoke.
+    ///
+    /// `secret_enc` is rewritten in the SAME statement as the digest, on
+    /// purpose: a row whose wrapped copy is the retired secret would open into a
+    /// credential that authenticates nowhere, and [`Self::reveal`] would have to
+    /// guess which of the two columns the operator meant.
     pub fn rotate(&self, id: &str) -> Result<Option<String>, String> {
         let secret = gen_secret();
         let hash = sha256_hex(&secret);
@@ -1057,21 +1293,83 @@ impl ApiKeyStore {
         // no longer exists.
         let hint = secret_hint(&secret);
         let full_key = format!("{id}:{secret}");
+        let enc = match &self.wrap {
+            WrapMaterial::Ready { key, .. } => Some(crate::secretbox::seal(key, &full_key)),
+            // A store without material keeps rotating show-once secrets; the row
+            // is set back to NULL rather than left holding the RETIRED
+            // credential's copy.
+            WrapMaterial::Absent(_) => None,
+        };
         let n = match &self.backend {
             Backend::Sqlite(m) => m
                 .lock()
                 .execute(
-                    "UPDATE api_keys SET secret_hash = ?1, secret_hint = ?2 WHERE id = ?3 AND revoked_at IS NULL",
-                    params![hash, hint, id],
+                    "UPDATE api_keys SET secret_hash = ?1, secret_hint = ?2, secret_enc = ?3 WHERE id = ?4 AND revoked_at IS NULL",
+                    params![hash, hint, enc, id],
                 )
                 .map_err(|e| e.to_string())?,
             Backend::Pg(pool) => pool
                 .execute(
-                    "UPDATE grovefs_control.api_keys SET secret_hash = $1, secret_hint = $2 WHERE id = $3 AND revoked_at IS NULL",
-                    &[&hash, &hint, &id],
+                    "UPDATE grovefs_control.api_keys SET secret_hash = $1, secret_hint = $2, secret_enc = $3 WHERE id = $4 AND revoked_at IS NULL",
+                    &[&hash, &hint, &enc, &id],
                 )? as usize,
         };
         Ok(if n > 0 { Some(full_key) } else { None })
+    }
+
+    /// Open one credential's recoverable copy. Authentication is untouched by
+    /// this: the digest at [`Self::authenticate_for`] remains the only thing a
+    /// handshake consults, and this path ENDS by checking the digest too, so it
+    /// can only ever return a string the store would actually accept.
+    pub fn reveal(&self, id: &str) -> Result<StoredSecret, String> {
+        let rows = self.query2(
+            "SELECT secret_hash, secret_enc FROM api_keys WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get::<_, String>(0)?, cell::<String>(r, 1)?)),
+            "SELECT secret_hash, secret_enc FROM grovefs_control.api_keys WHERE id = $1",
+            &[&id],
+            |r| (r.get::<_, String>(0), cell_str(r, 1)),
+        )?;
+        let Some((hash, blob)) = rows.into_iter().next() else {
+            return Err(format!("no api key with id '{id}'"));
+        };
+        let Some(blob) = blob else {
+            return Ok(StoredSecret::NeverStored);
+        };
+        let key = match &self.wrap {
+            WrapMaterial::Ready { key, .. } => *key,
+            WrapMaterial::Absent(why) => {
+                return Ok(StoredSecret::Unopenable(format!(
+                    "the row holds a wrapped copy but this process has no wrapping material to 
+                     open it: {why}"
+                )));
+            }
+        };
+        let Some(full) = crate::secretbox::unseal(&key, &blob) else {
+            return Ok(StoredSecret::Unopenable(format!(
+                "the wrapped copy does not open under this process's material ({}): it was 
+                 wrapped by a different store key",
+                self.wrap.source()
+            )));
+        };
+        let secret = full.split_once(':').map(|(_, s)| s).unwrap_or(&full);
+        if sha256_hex(secret) != hash {
+            return Ok(StoredSecret::Stale);
+        }
+        Ok(StoredSecret::Recoverable(full))
+    }
+
+    /// Does THIS process keep a recoverable copy of what it mints? Exactly
+    /// whether the wrapping material was found (see [`load_wrap`]), which
+    /// is the difference between the two sentences an operator needs before
+    /// they close a secret dialog: "shown once, `rotate` is the only way back"
+    /// and "the registry holds a copy, `apikey secret` reads it back". It is a
+    /// property of the deployment, not of a row, so the create/rotate replies
+    /// state it without a second query — and a store that answers `false` still
+    /// authenticates by digest, byte for byte the same as one that answers
+    /// `true`.
+    pub fn keeps_copies(&self) -> bool {
+        matches!(self.wrap, WrapMaterial::Ready { .. })
     }
 
     /// Edit the bookkeeping fields of an ACTIVE key in place (`apikey update`):
@@ -1164,6 +1462,29 @@ impl ApiKeyStore {
                 .execute(
                     "UPDATE grovefs_control.api_keys SET revoked_at = $1 WHERE id = $2 AND revoked_at IS NULL",
                     &[&ts, &id],
+                )? as usize,
+        };
+        Ok(n > 0)
+    }
+
+    /// Delete a key by id, permanently. Returns false when no row matched, so
+    /// the console can distinguish "deleted now" from "already gone".
+    ///
+    /// This is the hard cleanup verb; revoke is the reversible one and stays
+    /// the recommended way to disable a credential. `mcp_calls` has no foreign
+    /// key, so historical audit rows keep their `key_id`/`key_label`
+    /// attribution after the key itself is gone — the trail is not shortened by
+    /// deleting the key.
+    pub fn delete(&self, id: &str) -> Result<bool, String> {
+        let n = match &self.backend {
+            Backend::Sqlite(m) => m
+                .lock()
+                .execute("DELETE FROM api_keys WHERE id = ?1", params![id])
+                .map_err(|e| e.to_string())?,
+            Backend::Pg(pool) => pool
+                .execute(
+                    "DELETE FROM grovefs_control.api_keys WHERE id = $1",
+                    &[&id],
                 )? as usize,
         };
         Ok(n > 0)
@@ -1727,9 +2048,17 @@ mod tests {
         assert!(!hay.contains(&key), "nor the assembled key");
         assert!(
             hay.contains(&sha256_hex(secret)),
-            "the digest is what is stored — the test would be vacuous without this"
+            "the digest is what authentication reads"
+        );
+        // The recoverable copy IS in the file — as a wrapped blob, which is the
+        // whole point of checking the plaintext above against a store that now
+        // keeps a copy. `sbx1` is the format tag.
+        assert!(
+            hay.contains("sbx1."),
+            "the wrapped copy never reached the file, so reveal would find nothing"
         );
         let row = s.list().unwrap().into_iter().find(|k| k.id == id).unwrap();
+        assert!(row.secret_available, "a minted key is a recoverable one");
         let hint = row.secret_hint.clone().unwrap();
         assert_eq!(hint.chars().count(), 9, "4 hex, an ellipsis, 4 hex: {hint}");
         let head: String = hint.chars().take(4).collect();
@@ -1746,6 +2075,114 @@ mod tests {
             Some("alice"),
             "whose key it is and who minted it are different columns"
         );
+    }
+
+    /// The recovery path as an operator actually uses it: a SECOND process over
+    /// the same store directory (`apikey secret`, the console's Reveal) reads
+    /// back the credential the mint printed.
+    #[test]
+    fn a_minted_credential_is_recoverable_from_another_process() {
+        let (s, db) = store_on_disk();
+        let (id, key) = s.create("laptop").unwrap();
+        let again = ApiKeyStore::open(db.parent().unwrap().parent().unwrap()).unwrap();
+        match again.reveal(&id).unwrap() {
+            StoredSecret::Recoverable(full) => assert_eq!(full, key),
+            other => panic!("a minted credential should be recoverable, got {other:?}"),
+        }
+        // And what came back is a credential: the recovery path and the
+        // authentication path agree, which is the promise `Reveal` makes.
+        again.authenticate(&key).unwrap();
+    }
+
+    /// Rotating re-wraps in the same statement that replaces the digest, so the
+    /// copy a later reveal returns IS the credential that still authenticates —
+    /// and the one it replaced does not.
+    #[test]
+    fn rotate_rewraps_so_reveal_follows_the_current_secret() {
+        let (s, db) = store_on_disk();
+        let (id, old) = s.create("ci").unwrap();
+        let new = s.rotate(&id).unwrap().unwrap();
+        assert_ne!(new, old);
+        let again = ApiKeyStore::open(db.parent().unwrap().parent().unwrap()).unwrap();
+        match again.reveal(&id).unwrap() {
+            StoredSecret::Recoverable(full) => assert_eq!(full, new),
+            other => panic!("rotate left no recoverable copy: {other:?}"),
+        }
+        // The retired secret is dead where it always was decided: authentication,
+        // which never consulted the wrapped copy.
+        assert!(again.authenticate(&old).is_err());
+    }
+
+    /// The ways a reveal says no are not one sentence, because they are not one
+    /// repair: rotate the key, fix THIS node's material, distrust the row.
+    #[test]
+    fn each_no_answer_names_its_own_repair() {
+        let (s, db) = store_on_disk();
+        let meta = db.parent().unwrap();
+        let base = meta.parent().unwrap();
+        let key_file = meta.join("store.key");
+        // The material the row was wrapped under, kept so the test can put it
+        // back and tell "wrong key" apart from "wrong row".
+        let original = std::fs::read_to_string(&key_file).unwrap();
+        let (id, _) = s.create("worker").unwrap();
+
+        // (a) A process with no material in hand at all.
+        let mut blind = ApiKeyStore::open(base).unwrap();
+        blind.wrap = WrapMaterial::Absent("test: nothing on this node".to_string());
+        match blind.reveal(&id).unwrap() {
+            StoredSecret::Unopenable(why) => {
+                assert!(why.contains("nothing on this node"), "{why}");
+            }
+            other => panic!("a store without material must say so, got {other:?}"),
+        }
+
+        // (b) A process holding a DIFFERENT key: the row opens for whoever wrapped
+        // it and for no one else, and the refusal says that rather than blaming
+        // the operator's spelling.
+        std::fs::write(&key_file, format!("{}\n", "11".repeat(32))).unwrap();
+        let foreign = ApiKeyStore::open(base).unwrap();
+        match foreign.reveal(&id).unwrap() {
+            StoredSecret::Unopenable(why) => {
+                assert!(why.contains("different store key"), "{why}");
+            }
+            other => panic!("a foreign key must not open the row, got {other:?}"),
+        }
+
+        // (c) The right key, a row whose digest moved without its wrapped copy (a
+        // restore from an older backup, a repair that touched one column). The
+        // copy OPENS and is still refused: the string in the row authenticates
+        // nothing, and printing it would be the lie.
+        std::fs::write(&key_file, &original).unwrap();
+        let s2 = ApiKeyStore::open(base).unwrap();
+        assert!(
+            matches!(s2.reveal(&id).unwrap(), StoredSecret::Recoverable(_)),
+            "the material is back, so this is the same row that opened a moment ago"
+        );
+        s2.exec2(
+            "UPDATE api_keys SET secret_hash = ?1 WHERE id = ?2",
+            params!["not-the-current-digest", id],
+            "UPDATE grovefs_control.api_keys SET secret_hash = $1 WHERE id = $2",
+            &[&"not-the-current-digest", &id],
+        )
+        .unwrap();
+        assert!(
+            matches!(s2.reveal(&id).unwrap(), StoredSecret::Stale),
+            "a copy that no longer matches the digest is refused, not printed"
+        );
+
+        // (d) A row that never kept a copy: what every pre-change key is.
+        s2.exec2(
+            "UPDATE api_keys SET secret_enc = NULL WHERE id = ?1",
+            params![id],
+            "UPDATE grovefs_control.api_keys SET secret_enc = NULL WHERE id = $1",
+            &[&id],
+        )
+        .unwrap();
+        assert!(
+            matches!(s2.reveal(&id).unwrap(), StoredSecret::NeverStored),
+            "no copy is a different answer from an unopenable one"
+        );
+        assert!(!s2.list().unwrap()[0].secret_available, "and `list` says so");
     }
 
     /// A key with a deadline is refused AFTER it and the refusal says so —
@@ -1921,6 +2358,35 @@ mod tests {
         assert!(!s.update_fields("nosuchid", Some("x"), None).unwrap());
     }
 
+    /// Delete removes the credential — authentication stops, a second delete
+    /// says "nothing matched" — but the audit rows it wrote keep their
+    /// attribution, because `mcp_calls` is the record of what happened, not a
+    /// child of the key row.
+    #[test]
+    fn delete_removes_the_key_but_not_its_audit_trail() {
+        let s = store();
+        let (id, key) = s.create("cleanup").unwrap();
+        let authed = s.authenticate(&key).unwrap();
+        s.log_call(Some(&authed), "mcp", "tools/call", true, "read")
+            .unwrap();
+        assert!(s
+            .recent_calls(10)
+            .unwrap()
+            .iter()
+            .any(|c| c.key_id.as_deref() == Some(id.as_str())));
+
+        assert!(s.delete(&id).unwrap(), "the row was there");
+        assert!(!s.delete(&id).unwrap(), "a second delete matches nothing");
+        assert!(s.authenticate(&key).is_err(), "a deleted secret cannot authenticate");
+        let kept = s
+            .recent_calls(10)
+            .unwrap()
+            .into_iter()
+            .find(|c| c.key_id.as_deref() == Some(id.as_str()))
+            .expect("the audit row outlives the credential");
+        assert_eq!(kept.key_label.as_deref(), Some("cleanup"));
+    }
+
     /// A store written before the bookkeeping columns existed: opening it ADDS
     /// them in place and reads the old rows as unknown (`None`), rather than
     /// failing or inventing a value. This is the zero-migration promise the PG
@@ -1950,6 +2416,10 @@ mod tests {
         assert_eq!(row.note, None);
         assert_eq!(row.expires_at, None);
         assert_eq!(row.secret_hint, None);
+        assert!(
+            !row.secret_available,
+            "a row from before the wrapped copy existed has nothing to reveal"
+        );
         assert!(!row.expired, "a row with no deadline is not an expired one");
         // Opening it a second time is a no-op, not a duplicate-column failure.
         assert!(ApiKeyStore::open(dir.path()).is_ok());

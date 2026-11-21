@@ -501,9 +501,9 @@ impl ControlStore for FileControlStore {
         } else {
             // Name the concrete tree path the caller is missing rather than a
             // `<meta-dir>` placeholder, so the note is copy-paste actionable and
-            // tells the user exactly which file `init`/`create` must produce (§6-5).
+            // tells the user exactly which file `view create` must produce (§6-5).
             Some(format!(
-                "note: no local tree {} yet — create it with `grovefs --home {} init --view {view}` (or `view create`) first",
+                "note: no local tree {} yet — create it with `grovefs view --meta-dir {} create --view {view}` first",
                 self.db(view).display(),
                 self.base.display()
             ))
@@ -1085,7 +1085,7 @@ pub fn alias_view(
             .map(|n| format!(": {}", n.strip_prefix("note: ").unwrap_or(&n)))
             .unwrap_or_else(|| {
                 format!(
-                    ": create the physical view first (`grovefs view create --view {real}` against this store, or `grovefs --home <dir> init --view {real}`, or seed it with `grovefs view import`), then define the alias"
+                    ": create the physical view first (`grovefs view create --view {real}` against this store, or seed it with `grovefs view import`), then define the alias"
                 )
             });
         return Err(format!(
@@ -1124,7 +1124,7 @@ pub fn alias_view(
         )));
     }
     out.push(OutLine::Note(format!(
-        "note: '{real}' is no longer a mount entry point while this definition exists (mounts by its real name are refused, locally and via meta-server); alias mounts show the FULL tree and are WRITABLE"
+        "note: '{real}' is no longer a mount entry point while this definition exists (the meta-server refuses a mount of the real name); alias mounts show the FULL tree and are WRITABLE"
     )));
     if let Some(note) = store.base_tree_missing_note(real)? {
         out.push(OutLine::Note(note));
@@ -1244,6 +1244,9 @@ pub fn fork_view_seeded(
 /// Re-running the same manifest is incremental: a name that already exists is
 /// skipped (`mkdir` counts only directories it actually created), so a manifest
 /// is a declaration, not a destructive re-apply.
+///
+/// Manifest paths are view-root-RELATIVE by construction: `mkdir docs` and
+/// `mkdir /docs` name the same directory (see [`seed_path`]).
 pub fn seed_tree_from_text(
     meta: &dyn MetaProvider,
     backend: Option<&dyn crate::backend::StorageBackend>,
@@ -1266,21 +1269,23 @@ pub fn seed_tree_from_text(
                 let path = it
                     .next()
                     .ok_or_else(|| where_("mkdir needs a path".into()))?;
+                let path = seed_path(path);
                 let (_, made) =
-                    ensure_dir_generic(meta, path, &mut dirs, uid, gid).map_err(where_)?;
+                    ensure_dir_generic(meta, &path, &mut dirs, uid, gid).map_err(where_)?;
                 created_dirs += made;
             }
             Some("touch") => {
                 let path = it
                     .next()
                     .ok_or_else(|| where_("touch needs a path".into()))?;
+                let path = seed_path(path);
                 let be = backend.ok_or_else(|| {
                     "this store keeps its bytes on a data-server, so a manifest cannot create \
                      files here — create the view, then write the files through a mount \
                      (a manifest stays useful for mkdir-only layouts)"
                         .to_string()
                 })?;
-                let (parent, name) = split_parent_path(path);
+                let (parent, name) = split_parent_path(&path);
                 let (parent_ino, made) =
                     ensure_dir_generic(meta, &parent, &mut dirs, uid, gid).map_err(where_)?;
                 created_dirs += made;
@@ -1297,6 +1302,20 @@ pub fn seed_tree_from_text(
         }
     }
     Ok((created_dirs, created_files))
+}
+
+/// One manifest path, normalized to the view root: a manifest describes the
+/// tree a mount will SHOW, and its author has no reason to repeat the leading
+/// `/` (or to care that one view is mounted at `/mnt/x`). [`canon`] — the rule
+/// path helper this feeds — requires the absolute form, so the tolerance lives
+/// here and only here: layout rules still name absolute in-view paths.
+fn seed_path(raw: &str) -> String {
+    let trimmed = raw.trim_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{trimmed}")
+    }
 }
 
 /// Resolve `path` to an inode, creating missing directories.
@@ -2355,7 +2374,7 @@ pub fn tool_defs() -> Value {
             "name": "alias_view",
             "title": "Alias view",
             "annotations": annot("Alias view", false, true, false),
-            "description": "Create or replace a PURE ALIAS: a public writable name for a physical view (name governance, not shape). The alias mounts the FULL tree read-write, and while it exists the real name is refused as a mount entry point — locally and via meta-server. Pass `retire` to rotate a previous alias of the SAME real view gaplessly (write-before-delete: the real name never becomes mountable). Chaining aliases and aliasing a derived view are rejected.",
+            "description": "Create or replace a PURE ALIAS: a public writable name for a physical view (name governance, not shape). The alias mounts the FULL tree read-write, and while it exists the real name is refused as a mount entry point (the meta-server refuses it). Pass `retire` to rotate a previous alias of the SAME real view gaplessly (write-before-delete: the real name never becomes mountable). Chaining aliases and aliasing a derived view are rejected.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -4447,5 +4466,39 @@ mod tests {
         );
         assert_eq!(olds, vec!["pub".to_string()]);
         let _ = d;
+    }
+
+    fn child_ino(m: &MetaEngine, mut parent: i64, path: &str) -> Option<i64> {
+        for c in path.trim_matches('/').split('/').filter(|c| !c.is_empty()) {
+            parent = m.lookup(parent, c)?.id;
+        }
+        Some(parent)
+    }
+
+    /// A manifest names its paths from the VIEW ROOT, so `mkdir docs` and
+    /// `mkdir /docs` are the same directory. The seeder shares [`canon`] with
+    /// layout rules — which DO demand the absolute form — so this tolerance is
+    /// the manifest's own and lives in `seed_path` alone.
+    #[test]
+    fn seed_manifest_takes_relative_and_absolute_paths_alike() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = MetaEngine::open(&dir.path().join("t.db")).unwrap();
+        let be = crate::backend::open_local(dir.path()).unwrap();
+        let text = "mkdir docs\n# a comment\n\ntouch docs/a.md\nmkdir /photos\ntouch /photos/private/x.jpg\n";
+        let (dirs, files) = seed_tree_from_text(&m, Some(be.as_ref()), text, 0, 0).unwrap();
+        // docs, photos, photos/private — a `touch`'s parent is already counted.
+        assert_eq!((dirs, files), (3, 2));
+        let docs = child_ino(&m, ROOT_INO, "docs").expect("relative mkdir landed");
+        assert!(m.lookup(docs, "a.md").is_some(), "relative touch landed");
+        assert!(
+            child_ino(&m, ROOT_INO, "/photos/private/x.jpg").is_some(),
+            "absolute form landed on the same tree"
+        );
+        // Re-running is a no-op: a manifest is a declaration, not a re-apply.
+        let (dirs2, files2) = seed_tree_from_text(&m, Some(be.as_ref()), text, 0, 0).unwrap();
+        assert_eq!((dirs2, files2), (0, 0));
+        // The rule-path guards still hold inside a manifest.
+        assert!(seed_tree_from_text(&m, Some(be.as_ref()), "mkdir ../escape\n", 0, 0).is_err());
+        assert!(seed_tree_from_text(&m, Some(be.as_ref()), "chmod 700 docs\n", 0, 0).is_err());
     }
 }

@@ -12,6 +12,7 @@
 //! - [`remote`]       : TCP data transport (client backend + server), no NFS
 //! - [`apikeys`]      : API-key auth + call-audit log for the MCP governance server
 //! - [`layout`]       : per-mount presentation overlay (same tree, different lens)
+//! - [`manager`]      : mount bootstrap — the signed "who to call" roster
 //! - [`mcp`]          : MCP server exposing the view-governance tools to AI agents
 //! - [`webauth`]      : web-console accounts and the base views they are delegated
 //! - [`web`]          : the console itself — an HTTP gateway in front of the control plane
@@ -32,6 +33,12 @@ pub mod control;
 /// connection. Pairs with `meta-server --control-listen`.
 #[cfg(feature = "native")]
 pub mod control_remote;
+/// The workspace's dependency-free HMAC / hex / key-file primitives, shared by
+/// the Data-Access Capability, the credential wrapper and the mount roster.
+/// Unconditional: roster VERIFICATION belongs on the mount path, which a
+/// `remote-only` client build links, and one implementation of RFC 2104 is the
+/// point of having the file at all.
+pub mod crypto;
 #[cfg(feature = "native")]
 pub mod du;
 #[cfg(feature = "fuse-bridge")]
@@ -39,6 +46,13 @@ pub mod fs_impl;
 #[cfg(feature = "native")]
 pub mod gc;
 pub mod layout;
+/// The MOUNT BOOTSTRAP (`grovefs manager`): a deployment's declared meta/data
+/// addresses, handed to a client as a signed roster so `mount` needs one address
+/// instead of two lists. The types, the verification and the client calls are
+/// unconditional (a `remote-only` client mounts too); only the daemon submodule
+/// is server-side. See the module docs for what it does NOT do — it is a
+/// directory, never a data path.
+pub mod manager;
 #[cfg(feature = "native")]
 pub mod mcp;
 pub mod meta;
@@ -54,6 +68,11 @@ pub mod treedb_store;
 pub mod platform;
 pub mod remote;
 pub mod stats;
+/// Reversible at-rest wrapping for the recoverable copy of an API credential
+/// (`api_keys.secret_enc`). Server-side only, like the key store that uses it:
+/// a client build authenticates with a digest and never unwraps anything.
+#[cfg(feature = "native")]
+pub mod secretbox;
 /// Sign-in accounts for the governance web console and their delegation to
 /// base views. Server-side state: it lives in the control plane, so a
 /// `meta-server --control-listen` gates web logins against the same rows for

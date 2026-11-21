@@ -22,7 +22,16 @@ import { useFilterStore } from '@/stores/filters'
 import { useSessionStore } from '@/stores/session'
 import { useUiStore } from '@/stores/ui'
 import type { ChipItem } from '@/components/ui/chips'
-import { WINDOWS, auditActor, distinct, withinWindow } from '@/utils/audit'
+import {
+  WINDOWS,
+  auditActor,
+  distinct,
+  keyChoices,
+  mintedKey,
+  shortId,
+  withinWindow,
+} from '@/utils/audit'
+import type { KeyChoice } from '@/utils/audit'
 import { counted } from '@/utils/text'
 import { t } from '@/i18n'
 import PageHead from '@/components/layout/PageHead.vue'
@@ -55,6 +64,8 @@ async function load(): Promise<void> {
   // than showing an empty table under a dropdown that says nothing.
   const f = filters.auditFilter
   if (f.op !== 'all' && !distinct(rows.value, 'tool').includes(f.op)) f.op = 'all'
+  // Same for a credential whose calls have all aged out of the window.
+  if (f.key !== 'all' && !keyChoices(rows.value).some((k) => k.id === f.key)) f.key = 'all'
 }
 
 const { pending, error } = usePageLoad(load)
@@ -70,8 +81,41 @@ function setLimit(ev: Event): void {
 
 const planes = computed(() => distinct(rows.value, 'method'))
 const ops = computed(() => distinct(rows.value, 'tool'))
+const keys = computed(() => keyChoices(rows.value))
 
 const f = filters.auditFilter
+
+/** What the key dropdown offers. A key reached by following a mint link has
+    often made no call yet, so it is not in `keyChoices(rows)` — and a `<select>`
+    whose value matches no option renders BLANK, which is the exact failure this
+    page's reload guard refuses to leave on screen. Keep the chosen key in the
+    list: its calls being absent from the log is then stated by the empty table,
+    not by an unlabelled control. */
+const keyOptions = computed<KeyChoice[]>(() => {
+  const ks = keys.value
+  if (f.key !== 'all' && !ks.some((k) => k.id === f.key)) return [...ks, { id: f.key, label: null }]
+  return ks
+})
+
+/** What a row minted, by id — the parent→child link the store itself does not
+    keep (`api_keys.created_by` names an account, never a credential). */
+const mintedBy = computed(() => {
+  if (f.key === 'all') return []
+  const out: string[] = []
+  for (const r of rows.value) {
+    const child = mintedKey(r)
+    if (child && r.key_id === f.key && !out.includes(child)) out.push(child)
+  }
+  return out
+})
+
+const mintChips = computed<ChipItem[]>(() =>
+  mintedBy.value.map((id) => ({
+    v: id,
+    t: shortId(id),
+    n: rows.value.filter((r) => r.key_id === id).length || null,
+  })),
+)
 
 const windowChips = computed<ChipItem[]>(() =>
   WINDOWS.map(([v, label]) => ({
@@ -100,6 +144,7 @@ const hit = computed(() =>
     if (!withinWindow(r.ts, f.window)) return false
     if (f.plane !== 'all' && r.method !== f.plane) return false
     if (f.op !== 'all' && r.tool !== f.op) return false
+    if (f.key !== 'all' && r.key_id !== f.key) return false
     if (f.verdict === 'ok' && !r.ok) return false
     if (f.verdict === 'failed' && r.ok) return false
     const q = f.q.trim().toLowerCase()
@@ -125,7 +170,11 @@ const kept = computed(() => {
 </script>
 
 <template>
-  <PageHead title="Audit" desc="Every call the control plane answered — failures included.">
+  <PageHead
+    kicker="Ledger"
+    title="Audit"
+    desc="Every call the control plane answered — failures included."
+  >
     <template #actions>
       <ActionButton :action="refresh" :label="'refresh'" variant="link" />
     </template>
@@ -173,8 +222,27 @@ const kept = computed(() => {
             <option v-for="o in ops" :key="o" :value="o">{{ o }}</option>
           </select>
         </FldRow>
+        <FldRow :label="'key'" for="audit-key">
+          <select id="audit-key" v-model="f.key">
+            <option value="all">{{ t('every key') }}</option>
+            <option v-for="k in keyOptions" :key="k.id" :value="k.id">
+              {{ k.label ? `${k.label} · ${shortId(k.id)}` : shortId(k.id) }}
+            </option>
+          </select>
+        </FldRow>
       </template>
     </FilterBar>
+
+    <BarRow v-if="f.key !== 'all'" :title="'key trail'">
+      <ChipGroup v-if="mintChips.length" v-model="f.key" :items="mintChips" />
+      <span class="muted">
+        {{
+          mintChips.length
+            ? t('${n} minted by this key, in the rows loaded here', { n: mintedBy.length })
+            : t('nothing in these rows was minted by this key')
+        }}
+      </span>
+    </BarRow>
 
     <AuditTable
       :rows="hit"
@@ -190,6 +258,14 @@ const kept = computed(() => {
           : t(
               'Only your own activity and your views’ keys; the full log is an administrator’s view.',
             )
+      }}
+    </p>
+
+    <p class="muted">
+      {{
+        t(
+          'A row’s key is the credential that signed the call. From this console that is always the gateway’s own admin key, because the gateway holds one and forwards what you click: filtering by key finds the door, searching by account finds who walked through it.',
+        )
       }}
     </p>
   </template>

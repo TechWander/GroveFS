@@ -50,17 +50,27 @@ export type DrawerEntry =
       isSelf: boolean
     }
 
-/** The one-time secret. It lives at shell level, and not in the page or the
+/** The secret on screen. It lives at shell level, and not in the page or the
     drawer that minted it, for one reason: a reload closes the drawer it was
-    opened from, and a secret that vanishes because the list behind it refreshed
-    is a credential lost for good — `Rotate` is the only way to get one back.
+    opened from, and a credential that vanishes because the list behind it
+    refreshed is one the operator has to go and read back — or rotate.
 
     `detailed` is the create flow (the whole record, so there is nothing to
-    guess about what was minted); the rotate flow says less, because the row is
-    already on screen and only the secret changed. */
+    guess about what was minted); the rotate and reveal flows say less, because
+    the row is already on screen and only the secret is new.
+
+    `copy` is what the REGISTRY did with the string, and the dialog cannot say
+    anything honest at the bottom without it: `once` means this display is the
+    only one the store will ever give (no wrapping material on that server),
+    `stored` means a recoverable copy was written and `Reveal` can read it back,
+    `revealed` means the text on screen IS that copy — opened under the store
+    key, for a call the audit trail records. */
+export type SecretCopy = 'once' | 'stored' | 'revealed'
+
 export interface SecretState {
   title: string
   detailed: boolean
+  copy: SecretCopy
   secret: KeySecret
   /** The view the REQUEST asked for; the reply reports the key, not the row. */
   view: string | null

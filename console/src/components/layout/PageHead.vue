@@ -10,12 +10,13 @@
 */
 import { t } from '@/i18n'
 
-const props = defineProps<{ title: string; desc?: string }>()
+const props = defineProps<{ title: string; desc?: string; kicker?: string }>()
 </script>
 
 <template>
   <div class="page-head">
     <div class="ph-t">
+      <p v-if="props.kicker" class="ph-kicker">{{ t(props.kicker) }}</p>
       <h2>{{ t(props.title) }}</h2>
       <p v-if="props.desc" class="muted">{{ t(props.desc) }}</p>
     </div>

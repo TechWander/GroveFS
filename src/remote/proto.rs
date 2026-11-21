@@ -104,6 +104,31 @@ pub const OP_CONTROL: u8 = 12;
 /// [`is_data_write`], so an enumeration can never be mistaken for a mutation.
 pub const OP_LIST: u8 = 13;
 
+/// ---- MOUNT BOOTSTRAP (the `grovefs manager`) ----
+/// Served by its own listener, on the same framing. These three are the only
+/// ops that port understands, and the data/meta ports never see them: like
+/// [`OP_CONTROL`], a distinct service gets distinct codes rather than a
+/// overloaded namespace.
+///
+/// A `meta-server`/`data-server` started with `--register-with HOST:PORT` sends
+/// this first, then re-sends it as a heartbeat. The body is the node's
+/// announcement with a trailing HMAC signature block under the deployment's
+/// JOIN key — a key no mount client holds, so presenting it is what proves the
+/// sender is a cluster node. Registration is never a precondition for serving:
+/// a node that cannot reach the manager keeps running and says so.
+pub const OP_REGISTER: u8 = 14;
+/// A mounting client asks for a deployment's roster (`[key deployment]`,
+/// UNSIGNED — the answer is a list of addresses, not a secret). The response
+/// DATA is the signed roster: whatever the client holds is the ROSTER key, which
+/// verifies and cannot sign-as-a-client… under HMAC it can, and
+/// [`crate::manager`] states that limit instead of implying it away. A client
+/// that cannot verify the response refuses to mount.
+pub const OP_LOOKUP: u8 = 15;
+/// The operator's fleet view: declared sets per deployment plus who registered
+/// lately. Body is `[key deployment-or-empty]` signed under the JOIN key, since
+/// enumerating a cluster's addresses is not something to hand a passer-by.
+pub const OP_STATUS: u8 = 16;
+
 /// Data-plane ops that MUTATE stored object bytes/state. Since fencing, each
 /// carries a leading `[u64 epoch]` prefix on the request body — the fence token
 /// the client last learned from its (primary) meta-server. The data-server that

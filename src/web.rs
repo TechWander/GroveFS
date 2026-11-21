@@ -143,7 +143,12 @@ const ALLOWED_OPS: &[&str] = &[
     "apikey.list",
     "apikey.create",
     "apikey.revoke",
+    "apikey.delete",
     "apikey.rotate",
+    // Read a stored credential back. In the whitelist because the console offers
+    // the verb; gated by `Gate::Key` server-side (its owner or a super admin),
+    // and every call is audited with the target id.
+    "apikey.secret",
     "apikey.set_ro",
     "apikey.update",
     "apikey.calls",

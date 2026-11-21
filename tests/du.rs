@@ -34,8 +34,8 @@ fn populated(dir: &Path) -> std::path::PathBuf {
     fs::write(src.join("a.txt"), vec![b'a'; 1000]).unwrap();
     fs::write(src.join("sub/b.txt"), vec![b'b'; 2500]).unwrap();
     let h = home.to_str().unwrap();
-    let (ok, o, e) = gv(&["init", "--home", h, "--view", "v"]);
-    assert!(ok, "init: {o}{e}");
+    let (ok, o, e) = gv(&["view", "--home", h, "create", "--view", "v"]);
+    assert!(ok, "view create: {o}{e}");
     let (ok, o, e) = gv(&[
         "import",
         "--home",

@@ -64,10 +64,39 @@ export function mergeViews(phys: string[], defs: DefEntry[]): ViewRow[] {
 /** DIRECT children in the merged namespace: the parent reference written into
     the definition (`alias X`, `fork Y`, `base Z`). `view.stats.family` is the
     server's authoritative flat list of every name that RESOLVES through a base
-    — this is the EDGE list, which is what turns that pile of names into a tree
-    with a level per derivation. */
+    — this is the EDGE list, which is what turns that pile of names into the
+    flat sibling list the detail pane shows. */
 export function viewChildren(views: ViewRow[], name: string): ViewRow[] {
   return views.filter((v) => v.name !== name && v.base === name)
+}
+
+/** One name below the selected view, with the edge that reaches it. */
+export interface Descendant {
+  view: ViewRow
+  /** The IMMEDIATE parent when that is not the selected view (so a lens on a
+      lens says `via team1`); `null` for a direct child. This is an annotation,
+      not a nesting level: every descendant is rendered as one sibling row. */
+  via: string | null
+}
+
+/** Everything that derives from `name`, as a FLAT list of siblings.
+    Breadth-first with a shared `seen` set, so a namespace where two definitions
+    point at one name lists it once and a hand-written cycle cannot loop. */
+export function viewDescendants(views: ViewRow[], name: string): Descendant[] {
+  const out: Descendant[] = []
+  const seen = new Set<string>([name])
+  const queue: ViewRow[] = viewChildren(views, name)
+  for (const v of queue) seen.add(v.name)
+  while (queue.length) {
+    const v = queue.shift() as ViewRow
+    out.push({ view: v, via: v.base === name ? null : v.base })
+    for (const child of viewChildren(views, v.name)) {
+      if (seen.has(child.name)) continue
+      seen.add(child.name)
+      queue.push(child)
+    }
+  }
+  return out
 }
 
 /** The chain ABOVE `name` (a lens on a fork on a base). Cycle-guarded, because
@@ -87,10 +116,6 @@ export function viewAncestry(views: ViewRow[], name: string): string[] {
   }
   return chain
 }
-
-/** How deep the lineage tree descends before it says "expand it from its own
-    page" — a namespace with a thousand lenses must still open in one frame. */
-export const TREE_DEPTH = 6
 
 /** A stamp is a JSON object (`{seq, root, …}`) on the PG backend and a bare
     string on the file one; both are read as `k=v` pairs. */

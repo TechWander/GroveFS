@@ -68,6 +68,8 @@ async function grant(): Promise<void> {
       </select>
     </FieldRow>
 
-    <ActionButton :action="grant" :label="'Grant'" variant="primary" />
+    <div class="panel-foot">
+      <ActionButton :action="grant" :label="'Grant'" variant="primary" />
+    </div>
   </PanelBox>
 </template>

@@ -864,9 +864,9 @@ impl MetaServer {
             println!("meta-server: api-key auth REQUIRED (present `mount --api-key`, minted by `grovefs apikey create --for mount|any`); a revoke closes live mounts on their next op");
         }
         // State the gate explicitly: a new base view must be created first
-        // (`view create` / `init` / `view import`), and a typo is refused
+        // (`view create` / `view import`), and a typo is refused
         // instead of silently becoming an empty tree.
-        println!("meta-server: views are created explicitly — M_OPEN refuses a name with no existing tree or definition (`grovefs view create --view <name>`, or `--home <dir> init --view <name>`); no empty tree is ever auto-created");
+        println!("meta-server: views are created explicitly — M_OPEN refuses a name with no existing tree or definition (`grovefs view --meta-dir <dir> create --view <name>`); no empty tree is ever auto-created");
         // HA coordination is live only when a peer was configured or we start as
         // a standby; otherwise `ha = None` preserves single-node semantics.
         let ha = if self.peer.is_some() || self.role == Role::Standby {
@@ -953,31 +953,37 @@ impl MetaServer {
             );
             let crt = rt.clone();
             thread::spawn(move || gov_accept(cl, crt));
-            // Audit retention, when an operator asked for one. Without this the
-            // trail is append-only forever: every governance call, every MCP
-            // tool call and every mount handshake adds a row, so a deployment
-            // that lives on the console accumulates a table nobody can read.
-            // Sweeping at 1/24 of the window (bounded to 10min..12h) turns
-            // `--audit-retention 90d` into a daily trim, and sleeping FIRST
-            // keeps a boot from starting with a DELETE on the store.
+            // Audit retention. The console deployment has a default window
+            // (main.rs hands us `7d` when `--control-listen` is on), because an
+            // append-only table that only ever grows is not a usable audit
+            // trail. The pass runs ONCE AT START so a restart trims a backlog
+            // immediately, then every hour (bounded 5min..1h) so the table
+            // never holds much more than the window. The hourly cadence is
+            // indexed (`mcp_calls_ts`), so the DELETE is a range scan rather
+            // than a full-table sweep.
             if let Some(window) = rt.audit_retention.clone() {
                 let ar = rt.clone();
                 let nap = crate::apikeys::duration_secs(&window)
                     .ok()
                     .flatten()
-                    .map(|s| (s / 24).clamp(600, 43_200))
-                    .unwrap_or(86_400);
+                    .map(|s| (s / 24).clamp(300, 3_600))
+                    .unwrap_or(3_600);
                 let every = if nap >= 3600 {
                     format!("~{}h", nap / 3600)
                 } else {
                     format!("{}min", nap / 60)
                 };
                 println!(
-                    "meta-server: audit rows older than --audit-retention {window} are swept every {every} (`grovefs apikey purge --before {window}` runs the same cut on demand)",
+                    "meta-server: audit rows older than --audit-retention {window} are swept at start and every {every} (`grovefs apikey purge --before {window}` runs the same cut on demand)",
                 );
-                thread::spawn(move || loop {
-                    thread::sleep(std::time::Duration::from_secs(nap as u64));
+                thread::spawn(move || {
+                    // Trim a backlog before the first nap: an operator who
+                    // restarts with a shorter window expects it applied now.
                     reap_audit(&ar, &window);
+                    loop {
+                        thread::sleep(std::time::Duration::from_secs(nap as u64));
+                        reap_audit(&ar, &window);
+                    }
                 });
             }
         }
@@ -1593,12 +1599,37 @@ fn gov_one(
     let owner = authed.owner.as_deref().unwrap_or(&authed.label);
     match control_dispatch(rt, op, &args, &who) {
         Ok(v) => {
+            // A mint is the one control op that leaves a NEW credential behind.
+            // `api_keys.created_by` records the ACCOUNT that minted it, but
+            // nothing ever recorded which KEY did — so the question a reader
+            // asks of the audit log afterwards ("what has this key created?")
+            // had no source at all. Name the child in the row that already
+            // holds the parent; the id is the store's primary key, never the
+            // secret, so this adds no credential to the log.
+            //
+            // `apikey.secret` joins the list for the same reason and the
+            // opposite direction: reading a credential back is the one verb whose
+            // whole point is a secret leaving the store, and an operator
+            // investigating a leaked key needs to see which account asked for it
+            // and which key answered. Note the two ops read the SAME `id` field
+            // with DIFFERENT meaning — the child minted, the row opened — so the
+            // UI parses this link only off `apikey.create` (see
+            // `console/src/utils/audit.ts`), where guessing from an `id` alone
+            // would invent a mint that never happened.
+            let minted = if op == "apikey.create" || op == "apikey.secret" {
+                v.get("id")
+                    .and_then(|x| x.as_str())
+                    .map(|id| format!(" key={id}"))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
             let _ = keys.log_call(
                 Some(&authed),
                 "control",
                 op,
                 true,
-                &format!("account={}", actor(owner)),
+                &format!("account={}{}", actor(owner), minted),
             );
             gov_reply_pinned(sock, v, None, keep)?;
         }
@@ -1797,9 +1828,8 @@ fn gates(op: &str) -> Result<Vec<Gate>, String> {
         // its own views only (enforced in the arms, which is where the scope and
         // owner of a key are known).
         "apikey.create" | "apikey.list" | "apikey.calls" => vec![Gate::Self_],
-        "apikey.revoke" | "apikey.set_ro" | "apikey.rotate" | "apikey.update" => {
-            vec![Gate::Key("id")]
-        }
+        "apikey.revoke" | "apikey.delete" | "apikey.set_ro" | "apikey.rotate" | "apikey.update"
+        | "apikey.secret" => vec![Gate::Key("id")],
         // Trimming the audit trail is the one verb that destroys OTHER keys'
         // history, so it cannot be delegated to the account whose actions it
         // records. It is also deliberately absent from the console's whitelist:
@@ -1809,7 +1839,7 @@ fn gates(op: &str) -> Result<Vec<Gate>, String> {
         )],
         other => {
             return Err(format!(
-                "control op '{other}' has no access rule (unknown, or added to the dispatcher \n                     without one) — refusing. Known ops: info, whoami, login, def.list/get/put/remove, \n                     stamp, physical.list/has, fork.has/create/drop/graft, view.create/stats/export/import, \n                     view.rm_base, refs.rebuild, gc.scan/apply, apikey.create/list/revoke/rotate/set_ro/update/calls/purge, \n                     account.list/create/passwd/role/disable/delete, grant.list/add/remove"
+                "control op '{other}' has no access rule (unknown, or added to the dispatcher \n                     without one) — refusing. Known ops: info, whoami, login, def.list/get/put/remove, \n                     stamp, physical.list/has, fork.has/create/drop/graft, view.create/stats/export/import, \n                     view.rm_base, refs.rebuild, gc.scan/apply, apikey.create/list/revoke/delete/rotate/set_ro/update/secret/calls/purge, \n                     account.list/create/passwd/role/disable/delete, grant.list/add/remove"
             ));
         }
     };
@@ -2388,6 +2418,11 @@ fn control_dispatch(
                 "note": note,
                 "expires_at": expires_at,
                 "created_by": who.account,
+                // Whether the registry can hand this secret back later. The
+                // console needs it to say the truth when it closes the dialog:
+                // "shown once" and "Reveal reads it back" are different
+                // promises, and only the store knows which one it just made.
+                "stored": keys.keeps_copies(),
             }))
         }
         "apikey.list" => {
@@ -2423,6 +2458,10 @@ fn control_dispatch(
                         "expired": k.expired,
                         "created_by": k.created_by,
                         "secret_hint": k.secret_hint,
+                        // Whether Reveal has anything to return for this row. A
+                        // flag, never the blob: `list` reaches every screen, and
+                        // wrapped credentials do not belong in a table payload.
+                        "secret_available": k.secret_available,
                     })
                 })
                 .collect();
@@ -2434,6 +2473,16 @@ fn control_dispatch(
                 .as_ref()
                 .ok_or_else(|| "no control key store".to_string())?;
             Ok(json!(keys.revoke(&req_str(a, "id")?)?))
+        }
+        // Hard cleanup. The access rule is revoke's (`Gate::Key`): the owner or
+        // a super admin, never a mere viewer of the bound view. The audit rows
+        // the key wrote stay in `mcp_calls`; only the credential row is removed.
+        "apikey.delete" => {
+            let keys = rt
+                .ctl_keys
+                .as_ref()
+                .ok_or_else(|| "no control key store".to_string())?;
+            Ok(json!(keys.delete(&req_str(a, "id")?)?))
         }
         // Replace the secret of one VISIBLE active key (the `Gate::Key` rule
         // above is what enforces that; it is revoke's and set_ro's rule). The
@@ -2467,6 +2516,11 @@ fn control_dispatch(
                 "label": row.label,
                 "scope": row.scope,
                 "owner": row.owner,
+                // Same reason as in `apikey.create`: rotation rewrote the
+                // wrapped copy under this process's material, so the store is
+                // the one that can say whether the secret now on screen is
+                // recoverable.
+                "stored": keys.keeps_copies(),
             }))
         }
         "apikey.set_ro" => {
@@ -2476,6 +2530,51 @@ fn control_dispatch(
                 .ok_or_else(|| "no control key store".to_string())?;
             let ro = a.get("ro").and_then(|v| v.as_bool()).unwrap_or(false);
             Ok(json!(keys.set_ro(&req_str(a, "id")?, ro)?))
+        }
+        // Read back one VISIBLE credential's stored copy — the verb that exists
+        // because a show-once secret is an operational problem: a lost
+        // `<id>:<secret>` used to mean `apikey rotate`, which replaces a
+        // credential clients are still holding. `Gate::Key` is rotate's and
+        // revoke's rule (its owner, or a super admin), and the call is audited
+        // with the target id (` key=<id>`), so "who pulled this credential out
+        // of the store, and from which account" is answerable afterwards.
+        //
+        // A copy that cannot be opened is NOT an error: "the row predates the
+        // wrapped copy" is a fact about the row, and a console forced to render
+        // it as a failure would report a broken deployment where nothing is
+        // broken. The reply says which of the four states this row is in.
+        "apikey.secret" => {
+            let keys = rt
+                .ctl_keys
+                .as_ref()
+                .ok_or_else(|| "no control key store".to_string())?;
+            let id = req_str(a, "id")?;
+            let row = keys
+                .list()?
+                .into_iter()
+                .find(|k| k.id == id)
+                .ok_or_else(|| format!("no api key with id '{id}'"))?;
+            if !key_visible(rt, who, &row) {
+                return Err(format!(
+                    "account '{}' may not read back '{id}': the key belongs to another account \
+                     and is not bound to a view it governs",
+                    who.account
+                ));
+            }
+            let verdict = keys.reveal(&id)?;
+            Ok(json!({
+                "id": id,
+                "available": verdict.recoverable().is_some(),
+                // The credential, or null; and the sentence for why not, from
+                // the one place those sentences are written
+                // (`apikeys::StoredSecret`).
+                "key": verdict.recoverable(),
+                "why": verdict.refusal(),
+                "label": row.label,
+                "scope": row.scope,
+                "owner": row.owner,
+                "view": row.view,
+            }))
         }
         // Edit the BOOKKEEPING of one visible active key: its remark and/or its
         // deadline. Deliberately nothing else — `scope` and the view binding
@@ -2607,7 +2706,7 @@ fn control_dispatch(
         | "account.disable" | "account.delete" | "grant.list" | "grant.add" | "grant.remove"
         | "view.stats" => web_dispatch(rt, who, op, a),
         other => Err(format!(
-            "unknown control op '{other}' (known: info, store.info, whoami, def.list/get/put/remove, stamp, physical.list/has, fork.has/create/drop/graft, view.create/stats/export/import, view.rm_base, refs.rebuild, gc.scan/apply, apikey.create/list/revoke/rotate/set_ro/update/calls/purge, account.list/create/passwd/role/disable/delete, grant.list/add/remove)"
+            "unknown control op '{other}' (known: info, store.info, whoami, def.list/get/put/remove, stamp, physical.list/has, fork.has/create/drop/graft, view.create/stats/export/import, view.rm_base, refs.rebuild, gc.scan/apply, apikey.create/list/revoke/delete/rotate/set_ro/update/calls/purge, account.list/create/passwd/role/disable/delete, grant.list/add/remove)"
         )),
     }
 }
@@ -4473,7 +4572,7 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
                     "a PG base view is a schema: create it first with `grovefs view --meta-store postgres://… --meta-dir {root} create --view {view}`, or restore the schema from a dump"
                 ),
                 _ => format!(
-                    "create it first: `grovefs view --meta-dir {root} create --view {view}` (or `grovefs --home {root} init --view {view}`, or seed it with `grovefs view import`)"
+                    "create it first: `grovefs view --meta-dir {root} create --view {view}` (or seed a tree with `grovefs view import`)"
                 ),
             };
             // `view` is the POST-ALIAS real name; name the alias the caller
@@ -4561,15 +4660,40 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
     //       with the base view).
     let client_ro = rt.is_derived(&view) || authed.as_ref().map(|a| a.ro).unwrap_or(false);
     let content_ro = is_fork_def(&*rt.control, &view)?;
-    // The ack body: three flag bytes, then — only when this node mints
-    // Data-Access Capabilities (`--data-access-key`) — a u16-length-prefixed
-    // capability the client must replay to its data-server. Appending it AFTER
-    // the flags keeps old clients working (they read `..3` and ignore the tail);
-    // a data-server NOT in verify mode likewise ignores it. The capability
-    // proves this session passed a genuine meta `M_OPEN`, so a rogue meta that
-    // lacks the shared key cannot arm the honest data plane (see
-    // [`crate::remote::dac`]).
+    // The definition this mount resolved to, so the client can print its startup
+    // contract up front instead of discovering EROFS on its
+    // first write. Resolved against `presented_name` — the name the caller typed,
+    // since `view` is already the post-alias real name: `[3]` is the name to
+    // address the tree by (the presented name for a derived lens or a fork, each
+    // of which owns/renders under the name it was mounted by; the real view for
+    // an alias) and `[4]` the public entry name that alias stands behind — the
+    // BASE of a derived/fork definition otherwise, empty for a bare physical
+    // name. `[5]` says which kind it is: a DERIVED lens and a read-only API KEY
+    // both set flag byte [0], and only one of them means "write to the base
+    // view". All three are read unconditionally by the client, so a body without
+    // them is a build mismatch, not an optional tail.
+    let (resolved, def_base, kind) = match rt
+        .control
+        .get_def(&presented_name)
+        .map_err(io::Error::other)?
+    {
+        Some(ViewDef::Fork(b)) => (presented_name.clone(), b, "fork"),
+        Some(ViewDef::Derived(b, _)) => (presented_name.clone(), b, "derived"),
+        Some(ViewDef::Alias(_)) => (view.clone(), presented_name.clone(), "alias"),
+        None => (presented_name.clone(), String::new(), "physical"),
+    };
+    // The ack body: three flag bytes, the two definition names and the
+    // definition kind above, then — only when this node mints Data-Access
+    // Capabilities (`--data-access-key`), a u16-length-prefixed capability the
+    // client must replay to its data-server. The capability stays LAST so the
+    // client can keep reading it as "whatever bytes remain"; a data-server NOT
+    // in verify mode likewise ignores it. The capability proves this session
+    // passed a genuine meta `M_OPEN`, so a rogue meta that lacks the shared key
+    // cannot arm the honest data plane (see [`crate::remote::dac`]).
     let mut ack = vec![client_ro as u8, paged_cap, content_ro as u8];
+    proto::put_key(&mut ack, &resolved);
+    proto::put_key(&mut ack, &def_base);
+    proto::put_key(&mut ack, kind);
     if let Some(key) = &rt.data_access_key {
         let expiry = if rt.data_access_ttl == 0 {
             0

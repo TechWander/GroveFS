@@ -21,12 +21,12 @@ const props = withDefaults(defineProps<{ variant?: 'login' | 'header' }>(), { va
   >
     <defs>
       <linearGradient id="lglg" x1="0" y1="0" x2="0" y2="1">
-        <stop offset="0" stop-color="#2b82e0" />
-        <stop offset="1" stop-color="#1367c8" />
+        <stop offset="0" stop-color="#2f7f63" />
+        <stop offset="1" stop-color="#145c46" />
       </linearGradient>
     </defs>
-    <rect width="32" height="32" rx="8" fill="url(#lglg)" />
-    <g fill="#fff">
+    <rect width="32" height="32" rx="6" fill="url(#lglg)" />
+    <g fill="#fbf9f3">
       <rect x="11.5" y="4" width="9" height="8" rx="2" />
       <rect x="6.5" y="14" width="9" height="8" rx="2" />
       <rect x="16.5" y="14" width="9" height="8" rx="2" />
@@ -34,8 +34,8 @@ const props = withDefaults(defineProps<{ variant?: 'login' | 'header' }>(), { va
     </g>
   </svg>
   <svg v-else class="logo" viewBox="0 0 32 32" width="22" height="22" aria-hidden="true">
-    <rect width="32" height="32" rx="7" fill="#1367c8" />
-    <g fill="#fff">
+    <rect width="32" height="32" rx="5" fill="#145c46" />
+    <g fill="#fbf9f3">
       <rect x="11.5" y="4" width="9" height="8" rx="2" />
       <rect x="6.5" y="14" width="9" height="8" rx="2" />
       <rect x="16.5" y="14" width="9" height="8" rx="2" />

@@ -219,11 +219,13 @@ pub fn is_view_db(name: &str) -> bool {
     !stem.is_empty() && !CONTROL_DB_STEMS.contains(&stem)
 }
 
-/// One `CREATE` request in a batch (see [`MetaProvider::create_nodes_batch`]).
+/// One `CREATE` request in a batch (see
+/// [`MetaEngine::create_nodes_batch`](crate::meta::MetaEngine::create_nodes_batch)).
 ///
-/// Borrowed, because the caller keeps the owned names in its queue and only
-/// lends them to the store for the duration of one commit — no copies on the
-/// hot path.
+/// Borrowed, because the caller keeps the owned names and lends them to the
+/// engine for the duration of one commit — no copies on the hot path. This is
+/// an ENGINE api: a mount reaches its store through `RemoteMeta`, one request
+/// per transaction, and never batches here.
 #[derive(Clone, Copy)]
 pub struct NewNode<'a> {
     pub parent: i64,
@@ -281,12 +283,12 @@ pub trait MetaProvider: Send + Sync {
     fn flush_listing(&self, _parent: i64) {}
     /// Page `offset..offset+limit` of the same deterministic listing `readdir`
     /// returns. `GroveFS` streams directory replies through this so a big
-    /// directory costs one small query per kernel buffer. Engines that page
-    /// inside their store (SQLite, PostgreSQL, and a `RemoteMeta` client whose
-    /// server advertised `M_READDIRP`) override this, and so does a
-    /// derived/layout lens (which pages over one materialized listing instead of
-    /// SQL). Providers that cannot — a remote client against a server too old to
-    /// page — keep working through the default below, just without the O(page)
+    /// directory costs one small query per kernel buffer. Every engine in the
+    /// tree pages inside its own store — SQLite, PostgreSQL and treedb push the
+    /// limit down, a derived/layout lens pages over one materialized listing —
+    /// and a `RemoteMeta` client forwards the page as an `M_READDIRP` when its
+    /// server's `M_OPEN` ack advertised that capability. A provider that cannot
+    /// page keeps working through the default below, just without the O(page)
     /// win.
     fn readdir_page(&self, parent: i64, offset: usize, limit: usize) -> Vec<NodeInfo> {
         self.readdir(parent)
@@ -299,7 +301,7 @@ pub trait MetaProvider: Send + Sync {
     /// slice of a listing materialized once) rather than a full listing rebuilt
     /// per call. `GroveFS` uses this to decide its fetch chunking: a provider
     /// that cannot page is asked for one whole listing per kernel buffer
-    /// (exactly what it did before paging existed), and it is not offered
+    /// (the cost of slicing it falls on the provider), and it is not offered
     /// READDIRPLUS, whose fatter records would multiply that full fetch.
     fn supports_paged_readdir(&self) -> bool {
         false
@@ -347,46 +349,6 @@ pub trait MetaProvider: Send + Sync {
         // outcome (the caller reports ENOENT), not a provider failure.
         self.getattr(id).ok_or(MetaError::NotFound)
     }
-    /// Whether [`Self::create_nodes_batch`] really amortizes the commit.
-    ///
-    /// `GroveFS` groups concurrent `CREATE`s only when the store says yes: for a
-    /// store that would merely loop `create_node_with_attr`, grouping turns N
-    /// parallel commits into N *sequential* ones — strictly worse than letting
-    /// every FUSE worker pay its own.
-    fn supports_create_batch(&self) -> bool {
-        false
-    }
-    /// Create several nodes, returning one result per item in input order.
-    ///
-    /// The default keeps per-item semantics (one commit each). A store with a
-    /// local transaction overrides it so a burst of creates costs ONE commit
-    /// instead of one per file: with a single-writer + global-ledger-lock engine
-    /// that is the difference between a flat ~2k creates/s and a curve that
-    /// scales with the number of writers. A failed item must not fail its
-    /// siblings — the error stays in its own slot.
-    fn create_nodes_batch(&self, items: &[NewNode<'_>]) -> Vec<Result<NodeInfo, MetaError>> {
-        items
-            .iter()
-            .map(|it| {
-                self.create_node_with_attr(
-                    it.parent,
-                    it.name,
-                    it.is_dir,
-                    it.data_ref,
-                    it.mode,
-                    it.uid,
-                    it.gid,
-                )
-            })
-            .collect()
-    }
-    /// Size any warm read parallelism to `n` concurrent readers.
-    ///
-    /// Only the embedded SQLite engine has such a pool; remote/external stores
-    /// already fan out over their own connections, so the default is a no-op. A
-    /// mount calls this with its FUSE worker count, which is exactly the most
-    /// requests that can be in flight at once.
-    fn set_read_pool(&self, _n: usize) {}
     /// Same idea for symlinks: the reply needs the entry attributes and the
     /// remote provider can fetch them without a second trip.
     fn create_symlink_with_attr(
@@ -402,23 +364,6 @@ pub trait MetaProvider: Send + Sync {
     }
     fn link_node(&self, src_ino: i64, new_parent: i64, new_name: &str) -> Result<i64, MetaError>;
     fn unlink(&self, parent: i64, name: &str) -> Result<Option<String>, MetaError>;
-    /// Whether [`Self::unlink_nodes_batch`] really amortizes the commit. Same
-    /// reasoning as [`Self::supports_create_batch`]: for a store whose writes are
-    /// already parallel, grouping would turn N parallel deletes into N
-    /// *sequential* ones.
-    fn supports_unlink_batch(&self) -> bool {
-        false
-    }
-    /// Remove several names, returning one result per item in input order.
-    ///
-    /// The delete-side counterpart of [`Self::create_nodes_batch`]. The local
-    /// engine serializes every `unlink` behind one write lock and one commit, so
-    /// without grouping a burst of `rm` costs a full commit per name and the
-    /// rate stays flat however many FUSE workers join. A failing item stays in
-    /// its own slot (`ENOENT`, `ENOTEMPTY`) and never fails its siblings.
-    fn unlink_nodes_batch(&self, items: &[(i64, &str)]) -> Vec<Result<Option<String>, MetaError>> {
-        items.iter().map(|(p, n)| self.unlink(*p, n)).collect()
-    }
     fn rename(
         &self,
         parent: i64,

@@ -982,6 +982,124 @@ impl StorageBackend for ShardedBackend {
     }
 }
 
+/// A data path naming ONE address never stripes, so it must never be handed a
+/// ref that says otherwise.
+///
+/// `node.data_ref` is durable: an object laid out across N servers keeps its
+/// `s<N>:…` key forever. Ask a single-server mount to read it and that server
+/// simply has no such object — it answers `NotFound`, which the FUSE layer
+/// reports as an EMPTY file, because "absent object" is also the normal answer
+/// for a file created and never written ([`crate::GroveFS::read`]). So a
+/// server list that is too short, mistyped, or (with `--manager`) mis-declared
+/// used to turn a 40 MiB object into a zero-length one that `ls` shows as 0 and
+/// `cp` copies happily. This decorator refuses instead, on the same arithmetic
+/// [`crate::du`] applies to a whole tree.
+///
+/// Only keys that STATE a count are constrained: a bare uuid names one whole
+/// object and a single server is exactly where it lives, so wrapping a mount
+/// over an unstriped tree changes nothing — including the `s1` case, which no
+/// mount mints (one address never builds a [`ShardedBackend`]).
+///
+/// The sentence also reaches the MOUNT'S OWN log once (`errno` is all the kernel
+/// forwards, and `Input/output error` explains nothing to an operator), and
+/// exactly once: a healthy mount stays as quiet as it was.
+pub struct UnstripedGuard {
+    inner: Arc<dyn StorageBackend>,
+    reported: std::sync::atomic::AtomicBool,
+}
+
+impl UnstripedGuard {
+    pub fn new(inner: Arc<dyn StorageBackend>) -> Self {
+        Self {
+            inner,
+            reported: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn pinned(&self, key: &str) -> io::Result<()> {
+        let n = match layout_server_count(key) {
+            Some(n) if n > 1 => n,
+            _ => return Ok(()),
+        };
+        let msg = format!(
+            "this object was laid out across {n} data-servers but this mount names 1: the stripe \
+             map needs every address in the writer's order, so pass the full list \
+             (--data-servers host1:port,host2:port); resolved from a manager, this means the \
+             deployment declares fewer data-servers than the tree was written across — a roster \
+             is the DECLARED set, never a subset to work around an outage",
+        );
+        if !self.reported.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("grovefs: refusing to read a striped object through one data-server: {msg}");
+        }
+        Err(io::Error::other(msg))
+    }
+}
+
+impl StorageBackend for UnstripedGuard {
+    fn new_key(&self, uuid: &str) -> String {
+        // This side cannot stripe, so a new object is one whole object on the
+        // single member — the wrapped backend's own (unprefixed) answer.
+        self.inner.new_key(uuid)
+    }
+
+    fn placement_key(&self) -> Option<u64> {
+        self.inner.placement_key()
+    }
+
+    fn create(&self, key: &str) -> io::Result<()> {
+        self.pinned(key)?;
+        self.inner.create(key)
+    }
+
+    fn read(&self, key: &str, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        self.pinned(key)?;
+        self.inner.read(key, offset, len)
+    }
+
+    fn write(&self, key: &str, offset: u64, data: &[u8]) -> io::Result<usize> {
+        self.pinned(key)?;
+        self.inner.write(key, offset, data)
+    }
+
+    fn len(&self, key: &str) -> io::Result<u64> {
+        self.pinned(key)?;
+        self.inner.len(key)
+    }
+
+    fn fsync(&self, key: &str) -> io::Result<()> {
+        self.pinned(key)?;
+        self.inner.fsync(key)
+    }
+
+    fn truncate(&self, key: &str, new_len: u64) -> io::Result<()> {
+        self.pinned(key)?;
+        self.inner.truncate(key, new_len)
+    }
+
+    fn remove(&self, key: &str) -> io::Result<()> {
+        // Deleting a striped object through one member would free at most one
+        // of its chunks and report success; refuse rather than half-delete.
+        self.pinned(key)?;
+        self.inner.remove(key)
+    }
+
+    fn list_objects(&self, cursor: Option<&str>, limit: usize) -> io::Result<ObjectPage> {
+        // Enumeration is what it is: this member's own objects, keyed however
+        // they were written. `gc` decides ref counts against the metadata, not
+        // against a stripe map, so nothing here is a placement claim.
+        self.inner.list_objects(cursor, limit)
+    }
+
+    fn import_at(&self, key: &str, src: &std::path::Path) -> io::Result<super::Imported> {
+        self.pinned(key)?;
+        self.inner.import_at(key, src)
+    }
+
+    fn statvfs(&self) -> io::Result<FsStat> {
+        self.inner.statvfs()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1626,6 +1744,52 @@ mod tests {
             assert_eq!(back.len() as u64, size, "read must clamp at size {size}");
             sb.remove(&key).unwrap();
         }
+        for r in roots {
+            let _ = std::fs::remove_dir_all(r);
+        }
+    }
+
+    #[test]
+    fn a_single_address_mount_refuses_a_striped_ref_instead_of_answering_empty() {
+        let roots = tmp_root("guard", 2);
+        let sb = ShardedBackend::new(members(&roots), 1024);
+        let key = sb.new_key("big");
+        sb.create(&key).unwrap();
+        let data: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
+        sb.write(&key, 0, &data).unwrap();
+        assert!(key.starts_with("s2:"), "{key}");
+
+        // Asking ONE address for that ref used to return NotFound — which the
+        // FUSE read path renders as an EMPTY file and getattr as size 0, so the
+        // operator saw a zero-length copy instead of a wrong server list.
+        let one = UnstripedGuard::new(members(&roots)[0].clone());
+        let err = one
+            .len(&key)
+            .expect_err("a 2-server ref must not resolve on 1 server");
+        let msg = err.to_string();
+        assert!(msg.contains("laid out across 2 data-servers"), "{msg}");
+        assert!(msg.contains("DECLARED set"), "{msg}");
+        assert!(one.read(&key, 0, 100).is_err(), "read must refuse too");
+        assert!(
+            one.write(&key, 0, &data).is_err(),
+            "a write would strand chunks on one server"
+        );
+        assert!(
+            one.remove(&key).is_err(),
+            "a one-member delete is a half-delete that reports success"
+        );
+
+        // Keys that state no count are the point: an unstriped tree over one
+        // address is the ordinary single-data-server mount, guard inert.
+        let plain = one.new_key("abcd-uuid");
+        assert_eq!(plain, "abcd-uuid");
+        one.create(&plain).unwrap();
+        one.write(&plain, 0, b"hello").unwrap();
+        assert_eq!(one.len(&plain).unwrap(), 5);
+        assert_eq!(one.read(&plain, 0, 5).unwrap(), b"hello");
+        // And the same object is visible through a stripe over those servers:
+        // an unprefixed key lives on slot 0 by design, count checks aside.
+        assert_eq!(sb.read(&plain, 0, 5).unwrap(), b"hello");
         for r in roots {
             let _ = std::fs::remove_dir_all(r);
         }

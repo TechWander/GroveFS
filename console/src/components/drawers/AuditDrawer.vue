@@ -8,8 +8,10 @@
   paragraph the browser is allowed to flatten.
 */
 import type { AuditRow } from '@/types'
+import { computed } from 'vue'
 import { useUiStore } from '@/stores/ui'
-import { auditActor } from '@/utils/audit'
+import { useFilterStore } from '@/stores/filters'
+import { auditActor, mintedKey } from '@/utils/audit'
 import { t } from '@/i18n'
 import BaseDrawer from '@/components/overlay/BaseDrawer.vue'
 import DrawerSection from '@/components/overlay/DrawerSection.vue'
@@ -18,11 +20,24 @@ import KvRow from '@/components/layout/KvRow.vue'
 import MonoText from '@/components/ui/MonoText.vue'
 import TwoLineCell from '@/components/ui/TwoLineCell.vue'
 import StateBadge from '@/components/ui/StateBadge.vue'
+import ActionButton from '@/components/ui/ActionButton.vue'
 
 const props = defineProps<{ row: AuditRow }>()
 
 const ui = useUiStore()
+const filters = useFilterStore()
 const who = (): string | null => auditActor(props.row)
+
+/** The credential this row MINTED, when it minted one. The store keeps no
+    parent→child column, so the audit message is the only place the link lives —
+    and a row older than that link says so instead of pretending the key minted
+    nothing. */
+const child = computed(() => mintedKey(props.row))
+
+function showChild(): void {
+  filters.auditFilter.key = child.value ?? 'all'
+  ui.closeDrawer()
+}
 </script>
 
 <template>
@@ -55,6 +70,13 @@ const who = (): string | null => auditActor(props.row)
           />
           <MonoText v-else-if="props.row.key_id" :text="props.row.key_id" />
           <template v-else>—</template>
+        </KvRow>
+        <KvRow v-if="props.row.tool === 'apikey.create'" label="minted">
+          <template v-if="child">
+            <MonoText :text="child" />
+            <ActionButton :action="showChild" label="show this key’s calls" variant="link" />
+          </template>
+          <span v-else class="muted">{{ t('no minted key recorded on this row') }}</span>
         </KvRow>
       </KvList>
     </DrawerSection>

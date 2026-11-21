@@ -4,6 +4,7 @@ import type {
   GrantRow,
   ImportResult,
   InfoResult,
+  KeyReveal,
   KeyRow,
   KeySecret,
   MintKeyArgs,
@@ -41,7 +42,9 @@ export type Op =
   | 'apikey.list'
   | 'apikey.create'
   | 'apikey.revoke'
+  | 'apikey.delete'
   | 'apikey.rotate'
+  | 'apikey.secret'
   | 'apikey.set_ro'
   | 'apikey.update'
   | 'apikey.calls'
@@ -81,7 +84,9 @@ export interface OpResult {
   'apikey.list': KeyRow[]
   'apikey.create': KeySecret
   'apikey.revoke': unknown
+  'apikey.delete': boolean
   'apikey.rotate': KeySecret
+  'apikey.secret': KeyReveal
   'apikey.set_ro': unknown
   'apikey.update': unknown
   'apikey.calls': AuditRow[]

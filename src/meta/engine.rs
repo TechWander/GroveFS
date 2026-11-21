@@ -1538,12 +1538,14 @@ pub struct MetaEngine {
     /// SELECT) so concurrent metadata reads fan out instead of serializing
     /// behind the single writer's `conn` mutex.
     read_pool: parking_lot::Mutex<Vec<Connection>>,
-    /// How many connections [`Self::read_pool`] may hold. Starts at
-    /// [`read_pool_size`] and is raised by [`Self::set_read_pool_size`] so an
-    /// embedded mount can size the pool to its FUSE worker count: at most that
-    /// many requests are ever served at once, and a pool undersized against the
-    /// workers makes every surplus read OPEN A CONNECTION on the spot — which
-    /// measured as the dominant cost of parallel create (2 ms reads).
+    /// How many connections [`Self::read_pool`] may hold: [`read_pool_size`],
+    /// i.e. `GROVEFS_SQLITE_READ_POOL` or the default. A pool narrower than the
+    /// concurrent readers makes every surplus read OPEN A CONNECTION on the spot
+    /// (measured as the dominant cost of parallel create, ~2 ms reads) and
+    /// `ReadGuard` closes it again on return, so the knob trades warm fds against
+    /// cold-open latency - per process, because the store root's reader count is
+    /// a property of the process serving it (a `meta-server` with N mounted
+    /// sessions, an offline verb with one).
     pool_max: std::sync::atomic::AtomicUsize,
     /// DB path, kept so the pool can open extra read connections when drained.
     path: std::path::PathBuf,
@@ -1587,20 +1589,44 @@ impl CheckpointCtl {
 /// fires on the hot path — the stall moves off the user's metadata write.
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Default number of pooled read connections opened per view engine for
-/// concurrent metadata reads. Kept small on purpose: every open connection
-/// costs ~3 fds (db + `-wal` + `-shm`) on top of the writer's, so this is the
-/// dominant term in the "how many views fit in `LimitNOFILE`" budget quoted
-/// by the selection guide (~15 fds/view at the old default of 4). Draining the
-/// pool lazily opens a replacement, so 1 keeps one warm reader while a cold
-/// burst pays one open per concurrent read instead of pinning four forever.
+/// Warm read connections **pre-filled** per view engine.
+///
+/// Kept small on purpose: every open connection costs ~3 fds (db + `-wal` +
+/// `-shm`) plus its own page cache on top of the writer's, and a `meta-server`
+/// holds an engine per RECENTLY USED view (`--engine-idle-secs` retires the
+/// rest), so this floor is the term in the "how many views fit in
+/// `LimitNOFILE`" budget quoted by the selection guide. It is only the floor:
+/// [`READ_POOL_RETAIN`] is what a burst may converge on.
 pub const READ_POOL_SIZE: usize = 1;
 
+/// Retain **ceiling** of the same pool: how many read connections an engine
+/// keeps after a concurrent burst dialled them.
+///
+/// A read that finds the pool drained opens its own connection (counted as the
+/// `sqlite read-pool lazy-opens` counter); with the ceiling above the floor it
+/// is then *kept* for reuse instead of being closed on return, so an idle view
+/// pays one warm reader while a busy one converges on eight - and everything in
+/// between is retired with the engine. This matters now that every mount is
+/// served by a `meta-server`: SQLite serializes writes on one connection, so
+/// the readers are the only part of a metadata op that parallelizes at all, and
+/// an undersized ceiling makes every surplus `LOOKUP` (one per create, plus the
+/// nlink `COUNT`) pay a fresh open. Measured through a mount on a loopback
+/// meta-server, create-only, 2000 files per thread, files/s at T=1/2/4/8/16:
+/// ceiling 1 -> 3349, 2604, 3998, 1481, 1182 (concurrency HURTS past 4 readers);
+/// ceiling 8 -> 3211, 6331, 8765, 6379, 5233. Past ~8 the curve is flat because
+/// the single writer, not the readers, is then the wall.
+/// `GROVEFS_SQLITE_READ_POOL` raises the floor and the ceiling follows the
+/// larger of the two, so no deployment can end up retaining less than it warms
+/// - except `0`, the explicit opt-out that keeps pooling switched off entirely.
+pub const READ_POOL_RETAIN: usize = 8;
+
 /// Runtime knob for [`READ_POOL_SIZE`]: `GROVEFS_SQLITE_READ_POOL` (`0..=16`).
-/// `0` means fully lazy — every read opens, returns, and closes — which is the
-/// fd-cheapest shape for thousands of idle-but-mounted views; `8` restores the
-/// old warm-reader width. Internal tuning knob (like `GROVEFS_LOCK_LEASE_SECS`),
-/// cached on first read; the CLI surface is unchanged.
+/// `0` turns pooling off entirely — every read opens its own connection and
+/// closes it on return (pooling skipped, nothing retained), the fd-cheapest
+/// shape for thousands of idle-but-mounted views; `16` pins a wide warm pool.
+/// Any other value is the warm FLOOR, and [`read_pool_retain`] is the ceiling
+/// implied by it. Internal tuning knob (like `GROVEFS_LOCK_LEASE_SECS`), cached
+/// on first read; the CLI surface is unchanged.
 fn read_pool_size() -> usize {
     static SLOT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
     let cur = SLOT.load(std::sync::atomic::Ordering::Relaxed);
@@ -1614,6 +1640,21 @@ fn read_pool_size() -> usize {
         .unwrap_or(READ_POOL_SIZE);
     SLOT.store(v, std::sync::atomic::Ordering::Relaxed);
     v
+}
+
+/// Retain ceiling implied by a warm floor: [`READ_POOL_RETAIN`], or the floor
+/// itself when a deployment asks for a wider warm pool than we retain. `0` stays
+/// `0` - that value is the explicit opt-out of pooling, so it must not silently
+/// start retaining connections.
+fn retain_for(floor: usize) -> usize {
+    match floor {
+        0 => 0,
+        n => n.max(READ_POOL_RETAIN),
+    }
+}
+
+fn read_pool_retain() -> usize {
+    retain_for(read_pool_size())
 }
 
 /// Connection-level pragmas applied to every READ handle (pooled, lazily
@@ -1756,7 +1797,7 @@ impl MetaEngine {
             return Ok(Self {
                 conn: parking_lot::Mutex::new(conn),
                 read_pool: parking_lot::Mutex::new(Vec::new()),
-                pool_max: std::sync::atomic::AtomicUsize::new(read_pool_size()),
+                pool_max: std::sync::atomic::AtomicUsize::new(read_pool_retain()),
                 path: path.to_path_buf(),
                 ckpt: None,
                 cursors: parking_lot::Mutex::new(HashMap::new()),
@@ -1851,7 +1892,7 @@ impl MetaEngine {
         Ok(Self {
             conn: parking_lot::Mutex::new(conn),
             read_pool: parking_lot::Mutex::new(pool),
-            pool_max: std::sync::atomic::AtomicUsize::new(read_pool_size()),
+            pool_max: std::sync::atomic::AtomicUsize::new(read_pool_retain()),
             path: path.to_path_buf(),
             ckpt,
             cursors: parking_lot::Mutex::new(HashMap::new()),
@@ -1961,27 +2002,6 @@ impl MetaEngine {
 
     fn pool_max(&self) -> usize {
         self.pool_max.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Size the warm read pool to the caller's real concurrency (a FUSE mount
-    /// passes its worker count). Raising it warms the missing connections right
-    /// away so the first parallel burst does not pay an open per surplus read.
-    /// Lowering it only shrinks what [`ReadGuard`] will keep; surplus handles
-    /// are closed as they are returned. `n = 0` turns pooling off entirely.
-    pub fn set_read_pool_size(&self, n: usize) {
-        let n = n.min(64);
-        self.pool_max.store(n, std::sync::atomic::Ordering::Relaxed);
-        let mut pool = self.read_pool.lock();
-        while pool.len() < n {
-            match Connection::open(&self.path) {
-                Ok(rc) => {
-                    apply_read_pragmas(&rc);
-                    pool.push(rc);
-                }
-                Err(_) => break,
-            }
-        }
-        pool.truncate(n);
     }
 
     /// Resolve (parent, name) -> node. This is the FUSE `lookup` hot path.
@@ -2947,26 +2967,11 @@ impl MetaProvider for MetaEngine {
     ) -> Result<i64, MetaError> {
         MetaEngine::create_symlink(self, parent, name, target, uid, gid)
     }
-    fn supports_create_batch(&self) -> bool {
-        true
-    }
-    fn create_nodes_batch(&self, items: &[NewNode<'_>]) -> Vec<Result<NodeInfo, MetaError>> {
-        MetaEngine::create_nodes_batch(self, items)
-    }
-    fn set_read_pool(&self, n: usize) {
-        MetaEngine::set_read_pool_size(self, n)
-    }
     fn link_node(&self, src_ino: i64, new_parent: i64, new_name: &str) -> Result<i64, MetaError> {
         MetaEngine::link_node(self, src_ino, new_parent, new_name)
     }
     fn unlink(&self, parent: i64, name: &str) -> Result<Option<String>, MetaError> {
         MetaEngine::unlink(self, parent, name)
-    }
-    fn supports_unlink_batch(&self) -> bool {
-        true
-    }
-    fn unlink_nodes_batch(&self, items: &[(i64, &str)]) -> Vec<Result<Option<String>, MetaError>> {
-        MetaEngine::unlink_nodes_batch(self, items)
     }
     fn rename(
         &self,
@@ -3186,38 +3191,14 @@ impl MetaProvider for MetaStore {
             MetaStore::Treedb(t) => t.readdir_page(parent, offset, limit),
         }
     }
-    fn create_nodes_batch(&self, items: &[NewNode<'_>]) -> Vec<Result<NodeInfo, MetaError>> {
-        match self {
-            MetaStore::Sqlite(m) => MetaProvider::create_nodes_batch(m, items),
-            MetaStore::Pg(p) => MetaProvider::create_nodes_batch(&**p, items),
-            #[cfg(feature = "treedb")]
-            MetaStore::Treedb(t) => MetaProvider::create_nodes_batch(&**t, items),
-        }
-    }
-    fn supports_create_batch(&self) -> bool {
-        match self {
-            MetaStore::Sqlite(m) => MetaProvider::supports_create_batch(m),
-            MetaStore::Pg(p) => MetaProvider::supports_create_batch(&**p),
-            #[cfg(feature = "treedb")]
-            MetaStore::Treedb(t) => MetaProvider::supports_create_batch(&**t),
-        }
-    }
-    fn set_read_pool(&self, n: usize) {
-        match self {
-            MetaStore::Sqlite(m) => MetaProvider::set_read_pool(m, n),
-            MetaStore::Pg(p) => MetaProvider::set_read_pool(&**p, n),
-            #[cfg(feature = "treedb")]
-            MetaStore::Treedb(t) => MetaProvider::set_read_pool(&**t, n),
-        }
-    }
     fn supports_paged_readdir(&self) -> bool {
-        // Both concrete stores page inside their own store: SQLite and PG
-        // through LIMIT/OFFSET on their read pool. So a meta-server backed by
-        // either can
-        // serve M_READDIRP and offer READDIRPLUS to its clients. A derived view
-        // served through a [`crate::layout::LayoutMeta`] lens does NOT reach
-        // here — the lens keeps the trait default (false) because its
-        // hidden/mapped shape cannot be expressed as a single page.
+        // Every concrete store pages inside itself: SQLite and PG through
+        // LIMIT/OFFSET on their read pool, treedb through its engine's own
+        // offset/limit readdir. So a meta-server backed by any of them can
+        // serve M_READDIRP and offer READDIRPLUS to its clients. A derived
+        // view does not reach here — [`crate::layout::LayoutMeta`] overrides
+        // this with its own answer (materialize the shaped listing once, then
+        // slice the page).
         match self {
             MetaStore::Sqlite(m) => MetaProvider::supports_paged_readdir(m),
             MetaStore::Pg(p) => MetaProvider::supports_paged_readdir(&**p),
@@ -3272,22 +3253,6 @@ impl MetaProvider for MetaStore {
             MetaStore::Pg(p) => p.unlink(parent, name),
             #[cfg(feature = "treedb")]
             MetaStore::Treedb(t) => t.unlink(parent, name),
-        }
-    }
-    fn supports_unlink_batch(&self) -> bool {
-        match self {
-            MetaStore::Sqlite(m) => MetaProvider::supports_unlink_batch(m),
-            MetaStore::Pg(p) => MetaProvider::supports_unlink_batch(&**p),
-            #[cfg(feature = "treedb")]
-            MetaStore::Treedb(t) => MetaProvider::supports_unlink_batch(&**t),
-        }
-    }
-    fn unlink_nodes_batch(&self, items: &[(i64, &str)]) -> Vec<Result<Option<String>, MetaError>> {
-        match self {
-            MetaStore::Sqlite(m) => MetaProvider::unlink_nodes_batch(m, items),
-            MetaStore::Pg(p) => MetaProvider::unlink_nodes_batch(&**p, items),
-            #[cfg(feature = "treedb")]
-            MetaStore::Treedb(t) => MetaProvider::unlink_nodes_batch(&**t, items),
         }
     }
     fn rename(
@@ -3447,6 +3412,45 @@ impl From<rusqlite::Error> for MetaError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The SQLite read pool is a warm FLOOR plus a retain CEILING, and the two
+    /// numbers are load-bearing in opposite directions: the floor is the idle
+    /// per-view fd budget every `meta-server` carries, the ceiling is what lets
+    /// concurrent readers of a shared store stop re-opening a connection per
+    /// read (measured: 4x the create rate at 16 concurrent writers).
+    #[test]
+    fn read_pool_keeps_the_idle_floor_small_and_the_burst_ceiling_wide() {
+        assert_eq!(READ_POOL_SIZE, 1, "idle floor: ~3 fds per warm reader per view");
+        assert_eq!(READ_POOL_RETAIN, 8, "measured plateau: flat past ~8 readers");
+        assert_eq!(retain_for(0), 0, "`0` is the explicit opt-out, not a small pool");
+        assert_eq!(retain_for(1), READ_POOL_RETAIN);
+        assert_eq!(
+            retain_for(16),
+            16,
+            "a warm pool wider than the ceiling is never shrunk below it"
+        );
+    }
+
+    /// The behavior those constants promise: readers above the warm floor get
+    /// their own connection, and it is KEPT on return instead of being closed
+    /// and re-opened by the next read.
+    #[test]
+    fn a_burst_above_the_warm_floor_is_retained_not_churned() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = MetaEngine::open(&dir.path().join("view.db")).unwrap();
+        assert_eq!(e.read_pool.lock().len(), READ_POOL_SIZE);
+        assert_eq!(e.pool_max(), retain_for(READ_POOL_SIZE));
+        {
+            let guards: Vec<_> = (0..4).map(|_| e.read_conn()).collect();
+            assert_eq!(e.read_pool.lock().len(), 0, "all borrowed at once");
+            drop(guards);
+        }
+        assert_eq!(
+            e.read_pool.lock().len(),
+            4,
+            "the burst's connections stay in the pool (under the ceiling)"
+        );
+    }
 
     /// rename(a, a) — same directory entry — is a POSIX no-op and must NOT
     /// destroy the file. Guards the bug where the overwrite target lookup

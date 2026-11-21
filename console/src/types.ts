@@ -102,6 +102,9 @@ export interface KeyRow {
   created_by?: string | null
   note?: string | null
   secret_hint?: string | null
+  /** Whether `Reveal` has a wrapped copy to open for this row. A flag only —
+      the copy itself never travels in a list payload. */
+  secret_available?: boolean
   created_at?: string | null
   expires_at?: string | null
   expired?: boolean
@@ -120,6 +123,23 @@ export interface KeySecret {
   view?: string | null
   expires_at?: string | null
   note?: string | null
+  /** Does the registry now hold a recoverable copy of `key`, or was this the
+      only display it will ever give? The store answers, because wrapping
+      material is a property of the deployment, not of the form. */
+  stored?: boolean
+}
+
+/** `apikey.secret` — the read-back answer. `available` splits it: either the
+    credential or the sentence saying why there is none, never both. */
+export interface KeyReveal {
+  id: string
+  available: boolean
+  key?: string | null
+  why?: string | null
+  label: string
+  scope: string
+  owner?: string | null
+  view?: string | null
 }
 
 /** One row of `apikey.calls` — the governance audit trail. */

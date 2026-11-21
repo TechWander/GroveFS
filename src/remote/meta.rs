@@ -108,6 +108,31 @@ const M_READDIRP: u8 = 37;
 #[cfg(feature = "native")]
 const M_TREE_DUMP: u8 = 38;
 
+/// Which `--stats` row a metadata round trip belongs to, by opcode.
+///
+/// A `meta-server` books the engine's internals in ITS process (`db.sqlite_*`,
+/// and `meta.*` around each store call); a mount's report can only honestly
+/// name the client-perceived round trip. Without this mapping every metadata op
+/// collapses into the single `remeta.rpc` row, so a mount that spends its time
+/// in `LOOKUP` looks identical to one hammering `READDIR`. Ops with no row of
+/// their own (session setup, HA, locks, lease renewal, the tree dump) stay in
+/// `remeta.rpc` only.
+fn meta_stage(op: u8) -> Option<stats::Stage> {
+    Some(match op {
+        M_LOOKUP => stats::Stage::MetaLookup,
+        M_GETATTR => stats::Stage::MetaGetattr,
+        M_READDIR => stats::Stage::MetaReaddir,
+        M_READDIRP => stats::Stage::MetaReaddirPage,
+        // One row for every op that materialises a directory entry: the plain
+        // create, the symlink, the hard link, and the touch that re-creates.
+        M_CREATE | M_SYMLINK | M_LINK | M_TOUCH => stats::Stage::MetaCreate,
+        M_UNLINK => stats::Stage::MetaUnlink,
+        M_RENAME => stats::Stage::MetaRename,
+        M_SETMODE | M_SETUIDGID | M_SETTIMES => stats::Stage::MetaSetattr,
+        _ => return None,
+    })
+}
+
 // --- pushed invalidation event kinds (carried in a response frame's status) --
 // EV_ENTRY: val = parent inode, data = length-prefixed name -> kernel
 // inval_entry (drop the cached dentry so the next lookup re-fetches).
@@ -456,6 +481,18 @@ pub struct RemoteMeta {
     /// EROFS, because the bytes are shared with the base view. Refreshed on
     /// every (re)handshake.
     content_ro: AtomicU8,
+    /// What the mounted name resolved to on the server, and the other half of
+    /// its definition — the BASE for a derived lens or fork, the public entry
+    /// name for a pure alias (ack tail items [3] and [4]). A mount prints the
+    /// same startup contract from these that a node reading its own store
+    /// prints. Latched on the first accepted handshake like `dac`.
+    resolved: std::sync::OnceLock<String>,
+    def_base: std::sync::OnceLock<String>,
+    /// The kind the server resolved the mounted name to (`physical`, `derived`,
+    /// `alias`, `fork`) — ack tail item [5]. Kept separate from the `readonly`
+    /// flag because a read-only API KEY also sets that byte, and a key gate is
+    /// not a derived view.
+    def_kind: std::sync::OnceLock<&'static str>,
     /// Data-Access Capability minted by the meta-server on this mount's
     /// `M_OPEN` (see [`crate::remote::dac`]); the client replays it to each
     /// data-server `OP_OPEN`. `None` when the server runs without
@@ -526,6 +563,9 @@ impl RemoteMeta {
             readonly: AtomicU8::new(0),
             paged: AtomicU8::new(0),
             content_ro: AtomicU8::new(0),
+            resolved: std::sync::OnceLock::new(),
+            def_base: std::sync::OnceLock::new(),
+            def_kind: std::sync::OnceLock::new(),
             dac: std::sync::OnceLock::new(),
         };
         // Probe once (connect + handshake) so mount fails fast on a dead server.
@@ -550,6 +590,25 @@ impl RemoteMeta {
     /// physical/derived views.
     pub fn is_content_ro_view(&self) -> bool {
         self.content_ro.load(Ordering::SeqCst) != 0
+    }
+
+    /// The view name the server resolved the mount to: the mounted name itself,
+    /// or the real tree behind a pure alias.
+    pub fn resolved_view(&self) -> String {
+        self.resolved.get().cloned().unwrap_or_default()
+    }
+
+    /// The BASE view of a derived or fork definition; for a pure alias, the
+    /// public entry name the mount was addressed by. Empty for a bare physical
+    /// view.
+    pub fn def_base_view(&self) -> String {
+        self.def_base.get().cloned().unwrap_or_default()
+    }
+
+    /// `physical` / `derived` / `alias` / `fork` as the server resolved the
+    /// mounted name.
+    pub fn def_kind(&self) -> &'static str {
+        self.def_kind.get().copied().unwrap_or("physical")
     }
 
     /// The Data-Access Capability the meta-server minted for this mount's
@@ -604,12 +663,13 @@ impl RemoteMeta {
                                 // data-plane client stamps writes with the live
                                 // token (advances automatically on failover).
                                 self.fence.store(epoch, Ordering::SeqCst);
-                                // The ack body is exactly the three capability
-                                // flags below; a short body means the peer is
-                                // not this protocol. Refuse it instead of
-                                // guessing a default (a silently "writable"
-                                // mount of a read-only view is far worse than
-                                // a clear handshake error).
+                                // The ack body is the three capability flags
+                                // plus the definition tail the server just
+                                // assembled; a short body means the peer is not
+                                // this protocol. Refuse it instead of guessing a
+                                // default (a silently "writable" mount of a
+                                // read-only view is far worse than a clear
+                                // handshake error).
                                 let Some(&[ro, paged, content_ro]) = data.get(..3) else {
                                     return Err(io::Error::new(
                                         io::ErrorKind::InvalidData,
@@ -624,12 +684,43 @@ impl RemoteMeta {
                                 self.readonly.store(ro, Ordering::SeqCst);
                                 self.paged.store(paged, Ordering::SeqCst);
                                 self.content_ro.store(content_ro, Ordering::SeqCst);
-                                // Byte [3..] (optional): a Data-Access Capability
-                                // appended by a `--data-access-key` meta-server.
-                                // An absent tail means the server issues none (and
-                                // matches every pre-DAC server byte-for-byte).
-                                if data.len() > 3 {
-                                    let mut di = 3usize;
+                                // Bytes [3..5]: the name the server resolved the
+                                // mount to, the BASE of its definition, and the
+                                // definition kind — what lets the mount print its
+                                // startup contract at open instead of inferring the
+                                // shape from a first failing write. Mandatory: a peer
+                                // that stops after the flags is a build mismatch.
+                                let mut di = 3usize;
+                                let (resolved, base, kind) = match (
+                                    proto::get_key(&data, &mut di),
+                                    proto::get_key(&data, &mut di),
+                                    proto::get_key(&data, &mut di),
+                                ) {
+                                    (Ok(r), Ok(b), Ok(k)) => (r, b, k),
+                                    _ => {
+                                        return Err(io::Error::new(
+                                            io::ErrorKind::InvalidData,
+                                            "meta-server handshake ack is missing the view-definition tail — client and server builds must match",
+                                        ))
+                                    }
+                                };
+                                let kind = match kind.as_str() {
+                                    "fork" => "fork",
+                                    "derived" => "derived",
+                                    "alias" => "alias",
+                                    _ => "physical",
+                                };
+                                // Latched for the life of the mount (the view name
+                                // a connection re-handshakes for never changes),
+                                // like the capability below.
+                                let _ = self.resolved.set(resolved);
+                                let _ = self.def_base.set(base);
+                                let _ = self.def_kind.set(kind);
+                                // Whatever follows is (optional): a Data-Access
+                                // Capability appended by a `--data-access-key`
+                                // meta-server. An absent tail means the server
+                                // issues none.
+                                if data.len() > di {
                                     if let Ok(d) = proto::get_key(&data, &mut di) {
                                         if !d.is_empty() {
                                             let _ = self.dac.set(d);
@@ -710,6 +801,9 @@ impl RemoteMeta {
         // reconnect). Pairs with the data-plane io.remote.* RTTs so an operator
         // can separate meta-server round-trip cost from data-server cost.
         let _rpc = stats::start(stats::Stage::RemoteMetaRpc);
+        // ... and the same interval again under the row its opcode belongs to,
+        // so a mount's report still names WHICH metadata op is slow.
+        let _stage = meta_stage(op).map(stats::start);
         let (mut s, reused) = self.get_conn()?;
         match Self::call(&mut s, op, body) {
             Ok(r) => {
@@ -791,9 +885,10 @@ impl RemoteMeta {
     /// Like [`Self::call_id`], but keeps the node the reply carries.
     ///
     /// `M_CREATE`/`M_SYMLINK` replies append the created row, so the client can
-    /// fill the FUSE reply without a second `M_GETATTR` round trip. A server
-    /// built before that ships an empty payload; the caller then falls back to
-    /// the old `getattr`, which keeps new-client/old-server working.
+    /// fill the FUSE reply without a second `M_GETATTR` round trip. The row is a
+    /// best-effort read-back on the server (`node_reply`), so an empty tail is a
+    /// live outcome, not a protocol mismatch: the caller then does that `getattr`
+    /// itself, which is the same RPC the reply was meant to save.
     fn call_id_node(&self, op: u8, body: &[u8]) -> Result<(i64, Option<NodeInfo>), MetaError> {
         match self.round_trip(op, body) {
             Ok((0, val, data)) => {
@@ -874,7 +969,8 @@ impl MetaProvider for RemoteMeta {
 
     fn readdir_page(&self, parent: i64, offset: usize, limit: usize) -> Vec<NodeInfo> {
         // Only page over the wire when the handshake said the server's store can
-        // page. Otherwise slice a single full listing (the pre-paging behaviour).
+        // page. Otherwise slice a single full listing here and pay for it per
+        // kernel buffer.
         if self.paged.load(Ordering::SeqCst) == 0 {
             return self
                 .readdir(parent)

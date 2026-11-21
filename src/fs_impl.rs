@@ -11,9 +11,14 @@
 //! - The session dispatches callbacks concurrently across worker threads
 //!   (fuser 0.18 `Config::n_threads`), which the `&self` trait makes sound:
 //!   all per-inode state lives behind the locks below.
+//! - One `CREATE`/`UNLINK` is one metadata RPC, answered by the worker that
+//!   received it. There is no client-side group commit: the mount never holds
+//!   the authoritative tree, so it cannot turn N requests into one
+//!   transaction. Concurrent writers instead overlap their commits on the
+//!   server (see `probe_unlink_cluster.sh` for the measured curve).
 
 use crate::backend::StorageBackend;
-use crate::meta::{LockType, MetaError, MetaProvider, NewNode, NodeInfo, NodeKind};
+use crate::meta::{LockType, MetaError, MetaProvider, NodeInfo, NodeKind};
 use fuser::{
     AccessFlags, BsdFileFlags, Errno, FileAttr, FileHandle, FileType, FopenFlags, Generation,
     INodeNo, InitFlags, IoctlFlags, KernelConfig, LockOwner, OpenAccMode, OpenFlags, RenameFlags,
@@ -21,7 +26,7 @@ use fuser::{
     ReplyIoctl, ReplyLock, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
     WriteFlags,
 };
-use parking_lot::{Condvar, Mutex, RwLock};
+use parking_lot::RwLock;
 use std::ffi::OsStr;
 use std::io;
 use std::path::Path;
@@ -41,100 +46,6 @@ pub const STATS_INO: u64 = u64::MAX - 1;
 /// it stays inside `i64::MAX`; real per-entry offsets are tiny directory ranks
 /// and never reach it. A resume at this exact offset means "listing done" -> EOF.
 const STATS_COOKIE: u64 = i64::MAX as u64;
-
-/// How long a queued name operation (`CREATE`, `UNLINK`) waits for the group
-/// commit before answering EIO itself. Generous (a batch is one local commit)
-/// but bounded: a panicking leader or a mount torn down under a queued request
-/// must not wedge a FUSE worker forever.
-const GROUP_COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// A `CREATE` waiting for the group commit to carry it.
-struct PendingCreate {
-    parent: i64,
-    name: String,
-    mode: u32,
-    uid: u32,
-    gid: u32,
-    key: Arc<str>,
-    slot: Arc<CreateSlot>,
-}
-
-/// Hand-off between a queued `CREATE` and the worker that commits it.
-///
-/// The reply lives here so exactly one side sends it — normally the leader, or
-/// the waiter itself if the leader vanished — and `done` wakes the waiter once
-/// the answer is out.
-struct CreateSlot {
-    reply: Mutex<Option<ReplyCreate>>,
-    done: Mutex<bool>,
-    cv: Condvar,
-}
-
-impl CreateSlot {
-    fn finish(&self) {
-        *self.done.lock() = true;
-        self.cv.notify_all();
-    }
-
-    fn wait(&self) {
-        let deadline = std::time::Instant::now() + GROUP_COMMIT_TIMEOUT;
-        let mut done = self.done.lock();
-        while !*done {
-            let now = std::time::Instant::now();
-            if now >= deadline {
-                if let Some(reply) = self.reply.lock().take() {
-                    reply.error(Errno::EIO);
-                }
-                return;
-            }
-            self.cv.wait_for(&mut done, deadline - now);
-        }
-    }
-}
-
-/// An `UNLINK`/`RMDIR` waiting for the group commit to carry it.
-struct PendingUnlink {
-    parent: i64,
-    name: String,
-    slot: Arc<UnlinkSlot>,
-}
-
-/// Hand-off between a queued delete and the worker that commits it.
-///
-/// The OUTCOME travels back instead of the reply: the worker that received the
-/// request still calls `backend.remove` and answers, so only the metadata
-/// commit is shared and object removal keeps running in parallel across
-/// workers.
-struct UnlinkSlot {
-    reply: Mutex<Option<ReplyEmpty>>,
-    done: Mutex<Option<Result<Option<String>, Errno>>>,
-    cv: Condvar,
-}
-
-impl UnlinkSlot {
-    fn deliver(&self, out: Result<Option<String>, Errno>) {
-        *self.done.lock() = Some(out);
-        self.cv.notify_all();
-    }
-
-    /// The batch's answer, or `None` if the group commit missed the deadline
-    /// (the waiter already answered EIO for itself).
-    fn wait(&self) -> Option<Result<Option<String>, Errno>> {
-        let deadline = std::time::Instant::now() + GROUP_COMMIT_TIMEOUT;
-        let mut done = self.done.lock();
-        while done.is_none() {
-            let now = std::time::Instant::now();
-            if now >= deadline {
-                if let Some(reply) = self.reply.lock().take() {
-                    reply.error(Errno::EIO);
-                }
-                return None;
-            }
-            self.cv.wait_for(&mut done, deadline - now);
-        }
-        done.take()
-    }
-}
 
 pub struct GroveFS {
     meta: Arc<dyn MetaProvider>,
@@ -163,30 +74,6 @@ pub struct GroveFS {
     /// push at last-close makes the committed size visible; keyed by write
     /// activity (a read-only open never enters this set, so it costs no RPC).
     written_inos: RwLock<std::collections::HashSet<u64>>,
-    /// Group-commit queue for `CREATE` (see `drain_creates`): with the local
-    /// single-writer engine every create otherwise pays its own commit, so
-    /// concurrent creates would only queue behind the same serialized write and
-    /// the mount's create rate would stay flat as writers are added. Only used
-    /// when the store reports `supports_create_batch()`.
-    create_q: Mutex<Vec<PendingCreate>>,
-    /// True while one worker is draining `create_q`; late arrivals just queue
-    /// (and are carried by that drain, so they add no latency of their own).
-    create_leader: std::sync::atomic::AtomicBool,
-    /// Whether the store can commit a burst of creates as one transaction. A
-    /// per-op store (PG / remote) keeps the plain one-commit-per-create
-    /// path: grouping there would serialize what is already parallel.
-    batch_creates: bool,
-    /// Group-commit queue for `UNLINK`/`RMDIR` (see `drain_unlinks`), the delete
-    /// twin of `create_q`. Same reason: with the local single-writer engine every
-    /// delete otherwise pays its own commit, so a parallel `rm` only queues
-    /// behind the same serialized write and the rate stays flat as workers are
-    /// added (measured: 8 workers at 5.3k files/s, and the wall time was exactly
-    /// the serialized `meta.unlink` time).
-    unlink_q: Mutex<Vec<PendingUnlink>>,
-    /// True while one worker is draining `unlink_q`; late arrivals just queue.
-    unlink_leader: std::sync::atomic::AtomicBool,
-    /// Whether the store can commit a burst of deletes as one transaction.
-    batch_unlinks: bool,
     /// When set, every mutating operation is refused with EROFS. This is a
     /// filesystem-side safety net that mirrors the kernel `MS_RDONLY` mount flag
     /// (both are applied for `--ro`), so the view stays read-only even if the
@@ -292,20 +179,12 @@ impl GroveFS {
         bw_read_bps: u64,
         bw_write_bps: u64,
     ) -> Self {
-        let batch_creates = meta.supports_create_batch();
-        let batch_unlinks = meta.supports_unlink_batch();
         Self {
             meta,
             backend,
             ino_to_key: RwLock::new(std::collections::HashMap::new()),
             last_write_touch: RwLock::new(std::collections::HashMap::new()),
             written_inos: RwLock::new(std::collections::HashSet::new()),
-            create_q: Mutex::new(Vec::new()),
-            create_leader: std::sync::atomic::AtomicBool::new(false),
-            batch_creates,
-            unlink_q: Mutex::new(Vec::new()),
-            unlink_leader: std::sync::atomic::AtomicBool::new(false),
-            batch_unlinks,
             readonly,
             content_ro,
             strict,
@@ -558,188 +437,6 @@ impl GroveFS {
         b[off..end].to_vec()
     }
 
-    /// Hand a `CREATE` to the group commit: enqueue it, then either drain the
-    /// queue (this worker happened to win the leader flag) or wait for the
-    /// leader already draining to carry it.
-    ///
-    /// A lone create is its own leader and its batch has exactly one item, so a
-    /// single-threaded `cp -r` pays no extra latency: grouping only happens when
-    /// writers are actually concurrent — which is exactly where the serialized
-    /// commit hurts (the create rate is otherwise flat from 1 to 16 writers).
-    fn submit_create(
-        &self,
-        parent: i64,
-        name: String,
-        mode: u32,
-        uid: u32,
-        gid: u32,
-        key: String,
-        reply: ReplyCreate,
-    ) {
-        let slot = Arc::new(CreateSlot {
-            reply: Mutex::new(Some(reply)),
-            done: Mutex::new(false),
-            cv: Condvar::new(),
-        });
-        self.create_q.lock().push(PendingCreate {
-            parent,
-            name,
-            mode,
-            uid,
-            gid,
-            key: Arc::from(key.as_str()),
-            slot: slot.clone(),
-        });
-        if !self
-            .create_leader
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
-            self.drain_creates();
-        }
-        slot.wait();
-    }
-
-    /// Commit queued creates, one metadata transaction per round trip through the
-    /// queue, until it is empty (late arrivals join the next round).
-    fn drain_creates(&self) {
-        loop {
-            let batch = {
-                let mut q = self.create_q.lock();
-                if q.is_empty() {
-                    // Clear the flag while still holding the queue lock: a pusher
-                    // serialized after this point observes `false` and takes over,
-                    // so no item can sit in a queue that has no leader.
-                    self.create_leader
-                        .store(false, std::sync::atomic::Ordering::Release);
-                    return;
-                }
-                std::mem::take(&mut *q)
-            };
-            self.commit_creates(batch);
-        }
-    }
-
-    /// One transaction for the whole batch; every item gets its own reply (a
-    /// duplicate name costs only that request).
-    fn commit_creates(&self, batch: Vec<PendingCreate>) {
-        let specs: Vec<NewNode<'_>> = batch
-            .iter()
-            .map(|p| NewNode {
-                parent: p.parent,
-                name: &p.name,
-                is_dir: false,
-                data_ref: Some(p.key.as_ref()),
-                mode: p.mode,
-                uid: p.uid,
-                gid: p.gid,
-            })
-            .collect();
-        let results = self.meta.create_nodes_batch(&specs);
-        for (p, res) in batch.into_iter().zip(results) {
-            let Some(reply) = p.slot.reply.lock().take() else {
-                // The waiter gave up (see `CreateSlot::wait`) and already answered
-                // itself; never reply twice to one request.
-                continue;
-            };
-            match res {
-                Ok(node) => {
-                    self.cache_key(node.id as u64, &p.key);
-                    self.note_created_mtime(node.id as u64, node.mtime);
-                    let attr = self.build_attr(&node);
-                    // Echo the inode as the handle: IO resolves by inode, so fh is
-                    // opaque here. Returning it keeps the reply shape valid.
-                    reply.created(
-                        &self.short_ttl(),
-                        &attr,
-                        Generation(0),
-                        FileHandle(node.id as u64),
-                        FopenFlags::empty(),
-                    );
-                }
-                Err(e) => {
-                    let _ = self.backend.remove(&p.key);
-                    reply.error(Self::err_to_errno(e));
-                }
-            }
-            p.slot.finish();
-        }
-    }
-
-    /// Hand an `UNLINK`/`RMDIR` to the group commit: enqueue it, then either
-    /// drain the queue (this worker happened to win the leader flag) or wait for
-    /// the leader already draining to carry it.
-    ///
-    /// A lone delete is its own leader and its batch has exactly one item, so a
-    /// single-threaded `rm` pays no extra latency: grouping only happens when
-    /// deleters are actually concurrent — which is exactly where the serialized
-    /// commit hurts (see `unlink_q`).
-    fn submit_unlink(&self, parent: i64, name: String, reply: ReplyEmpty) {
-        let slot = Arc::new(UnlinkSlot {
-            reply: Mutex::new(Some(reply)),
-            done: Mutex::new(None),
-            cv: Condvar::new(),
-        });
-        self.unlink_q.lock().push(PendingUnlink {
-            parent,
-            name,
-            slot: slot.clone(),
-        });
-        if !self
-            .unlink_leader
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
-            self.drain_unlinks();
-        }
-        let Some(out) = slot.wait() else {
-            // Timed out: `wait` already answered EIO for this request.
-            return;
-        };
-        let Some(reply) = slot.reply.lock().take() else {
-            return;
-        };
-        match out {
-            Ok(Some(k)) => {
-                // Last name for the key: drop its bytes HERE, on the worker that
-                // received the request, so object removal stays parallel.
-                stats::count(stats::Counter::GcFreed, 1);
-                let _ = self.backend.remove(&k);
-                reply.ok();
-            }
-            Ok(None) => reply.ok(),
-            Err(e) => reply.error(e),
-        }
-    }
-
-    /// Commit queued deletes, one metadata transaction per round trip through the
-    /// queue, until it is empty (late arrivals join the next round).
-    fn drain_unlinks(&self) {
-        loop {
-            let batch = {
-                let mut q = self.unlink_q.lock();
-                if q.is_empty() {
-                    // Clear the flag while still holding the queue lock: a pusher
-                    // serialized after this point observes `false` and takes over,
-                    // so no item can sit in a queue that has no leader.
-                    self.unlink_leader
-                        .store(false, std::sync::atomic::Ordering::Release);
-                    return;
-                }
-                std::mem::take(&mut *q)
-            };
-            self.commit_unlinks(batch);
-        }
-    }
-
-    /// One transaction for the whole batch; every request keeps its own outcome
-    /// (a missing name or a non-empty directory costs only that request).
-    fn commit_unlinks(&self, batch: Vec<PendingUnlink>) {
-        let items: Vec<(i64, &str)> = batch.iter().map(|p| (p.parent, p.name.as_str())).collect();
-        let results = self.meta.unlink_nodes_batch(&items);
-        for (p, res) in batch.iter().zip(results) {
-            p.slot.deliver(res.map_err(Self::err_to_errno));
-        }
-    }
-
     fn err_to_errno(e: MetaError) -> Errno {
         match e {
             MetaError::Exists => Errno::EEXIST,
@@ -934,7 +631,9 @@ impl fuser::Filesystem for GroveFS {
             reply.error(Errno::EROFS);
             return;
         }
-        let _t = stats::start(stats::Stage::MetaSetattr);
+        // No `meta.setattr` span booked here: that row is the metadata RPC
+        // round trip (see `remote::meta::meta_stage`), and wrapping the whole
+        // handler in the same name would mix two granularities into one p50.
         // Any of these mutates the stored row, so a row read *before* it cannot
         // answer the reply. The close-time SETATTR the kernel sends under
         // WRITEBACK_CACHE carries none of them (only `size`, echoing what the
@@ -1237,18 +936,6 @@ impl fuser::Filesystem for GroveFS {
         // file still reads back as 0 bytes because an absent object IS an empty
         // one (see `read`).
         let perm = mode & !umask;
-        if self.batch_creates {
-            self.submit_create(
-                parent.0 as i64,
-                name_str,
-                perm,
-                req.uid(),
-                req.gid(),
-                key,
-                reply,
-            );
-            return;
-        }
         match self.meta.create_node_with_attr(
             parent.0 as i64,
             &name_str,
@@ -1769,10 +1456,6 @@ impl fuser::Filesystem for GroveFS {
             return;
         }
         let name_str = name.to_string_lossy().to_string();
-        if self.batch_unlinks {
-            self.submit_unlink(parent.0 as i64, name_str, reply);
-            return;
-        }
         match self.meta.unlink(parent.0 as i64, &name_str) {
             Ok(gced_key) => {
                 if let Some(k) = gced_key {

@@ -410,13 +410,24 @@ fn governance_invariants_hold_over_random_lens_compositions() {
         write_through_verified: 0,
         refusal_verified: 0,
     };
-    for seed in 1..=400u64 {
+    // Seed range is 1..=N with N=400 by default; `GOV_SEEDS=1000` widens the
+    // sweep (paper §7.2 reports the 1000-seed run). Reproducing any failure is
+    // just re-running with the printed seed in the range.
+    let n_seeds: u64 = std::env::var("GOV_SEEDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(400);
+    for seed in 1..=n_seeds {
         check_case(seed, &mut counters);
     }
 
     // The generator must actually have exercised every primitive and both I4
     // branches, else the property check would be vacuously true.
-    assert!(counters.seeds > 300, "expected broad seed coverage");
+    assert!(
+        counters.seeds > (n_seeds as usize) * 3 / 4,
+        "expected broad seed coverage"
+    );
     assert!(counters.only_seen > 0, "never exercised an `only` view");
     assert!(counters.hide_seen > 0, "never exercised a `hide` rule");
     assert!(counters.map_seen > 0, "never exercised a `map` rule");

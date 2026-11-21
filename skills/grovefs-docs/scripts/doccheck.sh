@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# GroveFS 文档口径检查 —— 改过 README.md / README.en.md / USAGE.md / USAGE.en.md / docs.html 后跑一遍。
+# GroveFS 文档口径检查 —— 改过 README.md / README.en.md / USAGE.md / USAGE.en.md / docs/*.html 后跑一遍。
 # 用法: bash skills/grovefs-docs/scripts/doccheck.sh [仓库根目录]
 #   GROVEFS_BIN=/path/to/grovefs  指定用来跑 --help 的二进制(默认 target/release/grovefs)
 # 退出码: 0=干净; 1=有需处理的命中或结构错误。
@@ -7,7 +7,7 @@ set -uo pipefail
 
 # 用 readlink -f 解链:.qoder/skills/ 下是符号链,不解会算错仓库根
 ROOT="${1:-$(cd "$(dirname "$(readlink -f "$0")")/../../.." && pwd)}"
-DOCS=("$ROOT/README.md" "$ROOT/README.en.md" "$ROOT/USAGE.md" "$ROOT/USAGE.en.md" "$ROOT/docs/docs.html")
+DOCS=("$ROOT/README.md" "$ROOT/README.en.md" "$ROOT/USAGE.md" "$ROOT/USAGE.en.md" "$ROOT/docs/docs.html" "$ROOT/docs/deploy.html")
 BIN="${GROVEFS_BIN:-$ROOT/target/release/grovefs}"
 rc=0
 say() { printf '\n== %s ==\n' "$1"; }
@@ -43,10 +43,14 @@ orph=/tmp/grovefs-doc-orphan-flags.txt
 : > "$seen"
 # 递归走 help 树:根 → 每个子命令 → 孙命令(view create 之类)。
 # 注意:子命令清单先读进数组再递归,否则递归会截断正在被循环读取的临时文件。
+# 抽参数名统一用带后顾的 -P:`--` 前不能贴字母/数字/连字符,否则日志文件名
+# `/tmp/grovefs-mount--mnt-a.log` 里的 `--mnt-a` 会被当成一个参数(它是挂载点名字)。
+# 结尾的裸 `-` 也不要:`--pg-*-pool[-max]` 这类前缀简写会截出 `pg-`,而它展开的两个真名
+# (--pg-write-pool/--pg-read-pool)本来就各自在文档里被单独核过。
 walk() {
   local path="$1" out c
   out=$("$BIN" $path --help 2>&1) || return 0
-  printf '%s\n' "$out" | grep -oE -- '--[a-z][a-z0-9-]*' | sed 's/^--//' | sort -u >> "$real"
+  printf '%s\n' "$out" | grep -oP -- '(?<![A-Za-z0-9_-])--[a-z][a-z0-9-]*' | sed 's/^--//' | grep -v -- '-$' | sort -u >> "$real"
   local -a subs=()
   while IFS= read -r c; do [ -n "$c" ] && subs+=("$c"); done < <(
     printf '%s\n' "$out" | sed -n '/^Commands:/,/^\(Options\|Arguments\):/p' \
@@ -81,15 +85,23 @@ if [ -x "$BIN" ]; then
   # 放行今后任何叫 `--test` 的臆造参数。所以这里也按行剥离:含 `cargo test` 的行整行不看。
   # 已知代价同配方行:与 cargo 命令同行书写的 grovefs 臆造参数不再被这条规则抓到。
   sed -i '/cargo test/d' "$dtxt"
-  grep -oE -- '--[a-z][a-z0-9-]*' "$dtxt" | sed 's/^--//' | sort -u > "$docf"
-  # 负空间清单(明说「未实现」的那几行)里点名的参数不算臆造
-  grep -hE '未实现|别在当前版本上期待' "${DOCS[@]}" 2>/dev/null \
-    | grep -oE -- '--[a-z][a-z0-9-]*' | sed 's/^--//' | sort -u > "$neg"
+  # 同一个道理适用于**数据库工具自己的命令行**(`pg_dump -Fc --format=…`、
+  # `pg_restore --clean`、`psql -c …`)。这里不能整行删——`pg_dump` 在散文里也大量出现,
+  # 那些行同时带着真的 grovefs 参数(实测整行删会一并弄丢 18 处 `--meta-store`)。所以只把
+  # 「工具名 + 它后面的那一段」截掉(要求工具名前是行首/;/&/|/$ 、名后紧跟空格,散文里的
+  # `pg_dump` 在反引号里不匹配)。代价实测:文档参数集只少 `clean`(pg_restore 的)与
+  # `format`(pg_dump 的),没有真的 grovefs 参数被连带截掉。
+  sed -i -E 's/(^|[;&|]|[$] )(sudo( -u [a-z]+)? +)?(pg_dump|pg_restore|psql) .*/\1ext-tool-cmd/' "$dtxt"
+  grep -oP -- '(?<![A-Za-z0-9_-])--[a-z][a-z0-9-]*' "$dtxt" | sed 's/^--//' | grep -v -- '-$' | sort -u > "$docf"
+  # 负空间清单(明说「未实现」的那几行)里点名的参数不算臆造。同一个道理适用于**当场否定**的写法
+  # ——「口令只走 --password-file，没有 `--password`」是在告诉读者这个 flag 不存在，不是臆造它。
+  grep -hE '未实现|别在当前版本上期待|没有.{0,3}--|never a.{0,3}--' "${DOCS[@]}" 2>/dev/null \
+    | grep -oP -- '(?<![A-Za-z0-9_-])--[a-z][a-z0-9-]*' | sed 's/^--//' | sort -u > "$neg"
   comm -23 "$docf" "$real" > "$orph"
   comm -23 "$orph" "$neg" > "${orph}.2" && mv "${orph}.2" "$orph"
   # 噪声两类:别家工具的参数(rsync/cargo/systemd/journalctl/firewalld/pg_dump…),
   # 以及文档里的占位与通配写法(--xxx、--bw-*)。运维配方的选项不在这里,见上面的按行剥离。
-  FOREIGN='delete-after|delete-before|delete-during|exclude|include|inplace|info|progress|partial|times|whole-file|verbose|release|nocapture|bench|features|ignored|now|since|until|no-pager|reload|enable|disable|status|full|state|format|permanent|add-rich-rule|zone|type|set-profile|daemon-reload|json-pretty|exec|xxx|bw-'
+  FOREIGN='delete-after|delete-before|delete-during|exclude|include|inplace|info|progress|partial|times|whole-file|verbose|release|nocapture|bench|features|ignored|now|since|until|no-pager|reload|enable|disable|status|full|state|format|permanent|add-rich-rule|zone|type|set-profile|daemon-reload|json-pretty|exec|xxx|bw-|no-default-features'
   nf=$(grep -cvE "^($FOREIGN)$" "$orph" || true)
   printf '  真实参数 %d 个,文档参数 %d 个,差集 %d 项(其中非外部工具/非负空间 %d 项)\n' \
     "$(wc -l < "$real")" "$(wc -l < "$docf")" "$(wc -l < "$orph")" "$nf"
@@ -103,29 +115,9 @@ else
   printf '  [跳过] 找不到可执行 %s(用 GROVEFS_BIN 指定)\n' "$BIN"
 fi
 
-# ---------- 3. docs.html 结构 ----------
-say "3. docs.html 标签闭合"
-python3 - "$ROOT/docs/docs.html" <<'PY' || rc=1
-import sys, html.parser
-VOID = {"area","base","br","col","embed","hr","img","input","link","meta","param","source","track","wbr"}
-class P(html.parser.HTMLParser):
-    def __init__(self): super().__init__(convert_charrefs=True); self.st=[]; self.err=[]
-    def handle_starttag(self, t, a):
-        if t not in VOID: self.st.append((t, self.getpos()))
-    def handle_endtag(self, t):
-        if t in VOID: return
-        if not self.st: self.err.append("多余 </%s> @%s" % (t, self.getpos())); return
-        if self.st[-1][0] == t: self.st.pop(); return
-        for i in range(len(self.st)-1, -1, -1):
-            if self.st[i][0] == t:
-                self.err.append("跨层闭合 </%s> @%s, 未闭: %s" % (t, self.getpos(),
-                    [x[0] for x in self.st[i+1:]])); del self.st[i:]; break
-        else: self.err.append("无开始标签 </%s> @%s" % (t, self.getpos()))
-p = P(); p.feed(open(sys.argv[1], encoding="utf-8").read())
-print("  unclosed:", [f"{t}@{pos}" for t, pos in p.st] or "[]")
-print("  errors:", p.err or "none")
-sys.exit(1 if p.st or p.err else 0)
-PY
+# ---------- 3. HTML 结构(两份页:标签闭合 + 页内锚点 + 跨页引用) ----------
+say "3. docs/*.html 结构(标签闭合 / 锚点 / 断链)"
+python3 "$(dirname "$(readlink -f "$0")")/htmlcheck.py" "${DOCS[@]: -2}" || rc=1
 
 # ---------- 4. 新增用字校验(抓自打错字) ----------
 say "4. 新增用字校验(文档历史上没出现过的汉字 = 逐个确认是否错字)"
@@ -133,7 +125,7 @@ if command -v git >/dev/null 2>&1 && git -C "$ROOT" rev-parse --git-dir >/dev/nu
   python3 - "$ROOT" <<'PY' || rc=1
 import subprocess, sys, re
 root = sys.argv[1]
-files = ["README.md", "README.en.md", "USAGE.md", "USAGE.en.md", "docs/docs.html"]
+files = ["README.md", "README.en.md", "USAGE.md", "USAGE.en.md", "docs/docs.html", "docs/deploy.html"]
 diff = subprocess.run(["git", "-C", root, "diff", "-U0", "--"] + files,
                       capture_output=True, text=True).stdout
 added = [l[1:] for l in diff.splitlines() if l.startswith("+") and not l.startswith("+++")]
@@ -157,6 +149,24 @@ else
   printf '  [跳过] 不在 git 仓库内\n'
 fi
 
+# ---------- 5. mount 示例必须带坐标 ----------
+# 没有坐标的挂载现在是硬失败，所以文档里少写一个 --meta-server 就等于写了一条跑不通的命令。
+say "5. 文档里的 mount 示例是否带坐标(应为 0 违反)"
+python3 "$(dirname "$(readlink -f "$0")")/mountcheck.py" "$ROOT" || rc=1
+
+# ---------- 6. 套件断言数与最近一次实跑对账 ----------
+# 「X 套件 N 条断言」这类复述在本仓库错过几次(改代码不会让文档变红)，所以真值只取
+# .build-bin/logs/<最近一次整板>/ 里的 SUMMARY 行；没跑过整板则跳过并说明。
+say "6. 套件断言数对账(真值 = 最近一次整板日志)"
+python3 "$(dirname "$(readlink -f "$0")")/suitenumbers.py" "$ROOT" || rc=1
+# 闸门得证明自己拉得响:把六份文档里每个复述的数字 +1 注入一份临时副本,
+# 三条归属规则(挨着名字 / 行内最近套件名 / 明细行)必须都红,否则这一项等于没检查。
+if python3 "$(dirname "$(readlink -f "$0")")/suitenumbers.py" "$ROOT" --selftest > /tmp/doccheck-selftest.out 2>&1; then
+  tail -1 /tmp/doccheck-selftest.out | sed 's/^/  /'
+else
+  rc=1; tail -3 /tmp/doccheck-selftest.out | sed 's/^/  [需处理]/'
+fi
+
 say "结论"
-if [ "$rc" = 0 ]; then printf '  OK\n'; else printf '  需处理(见上面 [需处理] / 结构错误 / 参数差集)\n'; fi
+if [ "$rc" = 0 ]; then printf '  OK\n'; else printf '  需处理(见上面 [需处理] / 结构错误 / 参数差集 / 示例缺坐标 / 计数漂移)\n'; fi
 exit "$rc"

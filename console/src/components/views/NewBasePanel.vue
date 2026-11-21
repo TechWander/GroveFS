@@ -57,9 +57,11 @@ async function create(): Promise<void> {
     <FieldRow for="new-base-pg" label="PG instance">
       <input id="new-base-pg" v-model="instance" placeholder="(least loaded)" />
     </FieldRow>
-    <ActionButton :action="create" :label="'Create'" variant="primary" />
     <p class="muted">
       {{ t('a base view owns physical deletion; lenses, aliases and forks reshape one') }}
     </p>
+    <div class="panel-foot">
+      <ActionButton :action="create" :label="'Create'" variant="primary" />
+    </div>
   </PanelBox>
 </template>

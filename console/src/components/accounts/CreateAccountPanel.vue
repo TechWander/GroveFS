@@ -74,6 +74,8 @@ async function create(): Promise<void> {
       </template>
     </FieldRow>
 
-    <ActionButton :action="create" :label="'Create'" variant="primary" />
+    <div class="panel-foot">
+      <ActionButton :action="create" :label="'Create'" variant="primary" />
+    </div>
   </PanelBox>
 </template>

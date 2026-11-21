@@ -48,11 +48,26 @@ const pending = ref(true)
   refuses to format the file at all, and Vue itself is happy either way. A
   computed, not a constant, so a language switch while the pane is open re-says
   it. The dictionary key is the same string the hand-written page used.
+
+  The second half depends on the ROW: whether this store ever wrote a recoverable
+  copy of this secret is what separates "Reveal hands it back" from "Rotate is
+  the only way to get a usable one", and a pane that says the first about a row
+  from before the copies would be sending the operator away with a promise it
+  cannot keep.
  */
 const credentialNote = computed(() =>
-  t(
-    'A client presents `<id>:<secret>` (`mount --api-key`, or the `GROVEFS_API_KEY` environment variable). GroveFS stores only a digest, so this screen cannot read the secret back — that is what makes a leaked database harmless.',
-  ),
+  [
+    t(
+      'A client presents `<id>:<secret>` (`mount --api-key`, or the `GROVEFS_API_KEY` environment variable).',
+    ),
+    props.row.secret_available
+      ? t(
+          'A handshake reads only the stored digest; the secret itself lives wrapped under the store key, so Reveal can hand it back — and that read is audited with the id it opened.',
+        )
+      : t(
+          'No recoverable copy of this secret is stored, so nothing here can read it back: Rotate is the way to obtain a usable one.',
+        ),
+  ].join(' '),
 )
 
 onMounted(async () => {
@@ -146,6 +161,8 @@ onMounted(async () => {
     <template #left>
       {{ t('a fingerprint identifies a key; it does not authorize anything') }}
     </template>
-    <template #footer><KeyRowActions :row="props.row" place="drawer" /></template>
+    <template #footer>
+      <KeyRowActions :row="props.row" place="drawer" @deleted="emit('close')" />
+    </template>
   </BaseDrawer>
 </template>
