@@ -66,8 +66,10 @@
 
 #![cfg(feature = "treedb")]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
+use std::io::{BufRead, Write};
+use std::path::Path;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -464,12 +466,9 @@ impl TreedbStore {
         }
     }
 
-    fn want_ok(r: Reply) -> Result<(), Fail> {
-        match Self::val(r)? {
-            Reply::Ok | Reply::Pong => Ok(()),
-            other => Err(Fail::db(unexpected("treedb: expected Ok", &other))),
-        }
-    }
+    // 曾经有一个 `want_ok` 辅助函数，就是它让这里的 bug 藏了那么久：引擎只
+    // 有 `Reply::Ok`/`Pong` 才该用，而树面上的写（`Setattr`/`Link`/`Create`…）
+    // 一律回 `Reply::Node`。留一个“期望 Ok”的入口只会鼓励下一次写错。
 
     // ---------------------------------------------------------------- 视图
 
@@ -703,7 +702,12 @@ impl TreedbStore {
         };
         // 与 SQLite/PG 档一致：这些方法在 trait 里就没有返回位，属性写失败
         // 只能靠上层下一次 getattr 自己发现。
-        let _ = self.xcall(&op).and_then(Self::want_ok);
+        //
+        // 应答必须是 `Node` 而不是 `Ok`：引擎的 `Setattr` 回的是改完的 inode
+        // （`apply.rs` 尾部 `Reply::Node(node)`）。这里曾经写的是 `want_ok`，于是
+        // **每一次 chmod/chown/utimes 都静默失败**——挂载侧看不出来，是因为内核
+        // 拿 setattr 应答里的属性更新了自己的缓存；重挂之后权限就回去了。
+        let _ = self.xcall(&op).and_then(Self::want_node);
     }
 }
 
@@ -1011,5 +1015,780 @@ impl TreedbStore {
             self.view_id,
             self.conns.len()
         )
+    }
+}
+
+// ------------------------------------------------- 单视图 dump（view export / import）
+//
+// 与 SQLite / PG 两档**同一份** `grovefs-view-metadata` v1 JSONL：一行表头 + 一行一个
+// 名字（根的名字是 `/`）。格式属于 grovefs，引擎不知道它的存在 —— 这一层不新增
+// 任何 treedb op，只把已有的树面 op 拼成「读一棵树」与「建一棵树」两件事：
+//
+// | 格式字段 | 本层的来源/去向 |
+// |---|---|
+// | `id` / `parent_id` | 导出时按 BFS 顺序现编（根恒为 `ROOT_INO`）。SQLite/PG 里它是存储行号，在这里只是「父子的指针」，因为引擎的 inode 号由引擎分配 |
+// | `ino` | 引擎 inode。硬链接在格式里是「同一 `ino`、不同 `id`」；导入时首个出现的 `ino` 建 inode，其余同名走 `Op::Link` |
+// | `ctime` | 引擎自己写，`Setattr` 没有这一位 —— 导入不还原，见下 |
+//
+// 两处与另两档**不同的保证**，都是引擎形状决定的，必须写在这里而不是藏进代码：
+//
+// - **导出不是快照**。SQLite/PG 各开一个只读快照事务，所以那份 dump 是点时刻；引擎
+//   没给客户端开快照的接口，这里是逐目录 `ReadDirPlus` 边走边读，与 `dump_tree`
+//   （`du` / `gc check` 的数据源）同一档语义。并发写会让 dump 不是点时刻 —— 要那个
+//   形状就停写，或者走 `treedb-dump`（treedb 仓 DESIGN §6.9 的离线整目录）。
+// - **导入不是原子的**。另两档能「旁边建好再 rename」/「单事务 DDL」，引擎只有
+//   「建 / 删 view」。这里的次序是：先整份读完并校验（坏文件在碰树之前就被拒），
+//   再 `DropView` + 重建。所以 `--replace` 的失败窗口是「旧树已经删了、新树没建完」，
+//   结局是这棵树不见了而不是回到旧的 —— 调用方必须在文案里说出来。
+
+/// 表头行与单行长度上限。dump 是不可信输入：先拦长度再谈解析，别让一个 4 GiB 的
+/// 单行把内存吃光。
+const DUMP_HEADER_MAX: usize = 1 << 20;
+const DUMP_LINE_MAX: usize = 4 << 20;
+
+/// `grovefs-view-metadata` 的一条 node 行。字段与两档 SQL 的 `node` 表一一对应，
+/// 三处可空（`parent_id` / `data_ref` / `link_target`）是格式里本来就允许空的。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DumpRow {
+    id: i64,
+    parent_id: Option<i64>,
+    name: String,
+    is_dir: bool,
+    data_ref: Option<String>,
+    link_target: Option<String>,
+    mode: i64,
+    uid: i64,
+    gid: i64,
+    mtime: i64,
+    atime: i64,
+    ctime: i64,
+    ino: i64,
+}
+
+impl DumpRow {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id,
+            "parent_id": self.parent_id,
+            "name": self.name,
+            "is_dir": if self.is_dir { 1 } else { 0 },
+            "data_ref": self.data_ref,
+            "link_target": self.link_target,
+            "mode": self.mode,
+            "uid": self.uid,
+            "gid": self.gid,
+            "mtime": self.mtime,
+            "atime": self.atime,
+            "ctime": self.ctime,
+            "ino": self.ino,
+        })
+    }
+}
+
+fn now_s() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 这个 treedb 实例里有没有这个 view（`ListViews`，与 `view list` 同一份权威）。
+fn has_view(addr: &str, view: &str) -> Result<bool, String> {
+    Ok(TreedbStore::list_views(addr)
+        .map_err(|e| format!("cannot list views at {addr}: {e}"))?
+        .iter()
+        .any(|v| v == view))
+}
+
+/// 把一棵 treedb 视图树写成 `view export` 的 JSONL。
+///
+/// 走的是 `ReadDirPlus` 分页：每目录一次往返拿回 ino/kind/name/属性四条平行数组，
+/// 符号链接再补一次 `Getattr`（`NodeAttr` 故意不带 `link`）。行数、blob 数与两档
+/// 同一套定义：行 = 名字数（含根），blob = 不同 `data_ref` 的个数。
+pub fn export_view(
+    addr: &str,
+    view: &str,
+    out: &Path,
+    force: bool,
+    definition: Option<String>,
+) -> Result<crate::meta::ViewExportStats, String> {
+    if !has_view(addr, view)? {
+        return Err(format!(
+            "no base tree '{view}' in treedb at {addr} — a name the engine never had is not \
+             exported, it is refused"
+        ));
+    }
+    if out.exists() && !force {
+        return Err(format!(
+            "output {} already exists — pass --force to overwrite it",
+            out.display()
+        ));
+    }
+    let kind = match definition.as_deref() {
+        Some(t) if t.lines().any(|l| l.trim_start().starts_with("fork ")) => "fork",
+        _ => "physical",
+    };
+    let st = TreedbStore::open(addr, view, true)
+        .map_err(|e| format!("cannot open view '{view}' at {addr}: {e}"))?;
+    let root = st.getattr(crate::meta::ROOT_INO).ok_or_else(|| {
+        format!(
+            "view '{view}' has no root inode {} in treedb — the tree is unusable",
+            crate::meta::ROOT_INO
+        )
+    })?;
+    let mut rows = Vec::new();
+    rows.push(DumpRow {
+        id: crate::meta::ROOT_INO,
+        parent_id: None,
+        name: "/".to_string(),
+        is_dir: true,
+        data_ref: None,
+        link_target: None,
+        mode: root.mode as i64,
+        uid: root.uid as i64,
+        gid: root.gid as i64,
+        mtime: root.mtime,
+        atime: root.atime,
+        ctime: root.ctime,
+        ino: crate::meta::ROOT_INO,
+    });
+    // BFS：父在子前；同一目录内保持引擎的键序（BTreeMap），所以导出是确定性的。
+    let mut next_id = crate::meta::ROOT_INO + 1;
+    let mut queue: VecDeque<(i64, i64)> =
+        VecDeque::from([(crate::meta::ROOT_INO, crate::meta::ROOT_INO)]);
+    while let Some((dir_ino, dir_row)) = queue.pop_front() {
+        let entries = st.page_all(dir_ino).map_err(|f| {
+            format!("cannot list ino {dir_ino} of view '{view}': {}", f.msg)
+        })?;
+        for e in entries {
+            let id = next_id;
+            next_id += 1;
+            let is_dir = e.kind == NodeKind::Dir;
+            if is_dir {
+                queue.push_back((e.id, id));
+            }
+            rows.push(DumpRow {
+                id,
+                parent_id: Some(dir_row),
+                name: e.name,
+                is_dir,
+                data_ref: e.data_ref,
+                link_target: if e.kind == NodeKind::Symlink {
+                    e.link_target
+                } else {
+                    None
+                },
+                mode: e.mode as i64,
+                uid: e.uid as i64,
+                gid: e.gid as i64,
+                mtime: e.mtime,
+                atime: e.atime,
+                ctime: e.ctime,
+                ino: e.id,
+            });
+        }
+    }
+    let blobs = rows
+        .iter()
+        .filter_map(|r| r.data_ref.as_deref())
+        .collect::<std::collections::HashSet<_>>()
+        .len() as i64;
+    // 与另两档同一条纪律：写在目的地旁边再 rename，中断不会在 --out 上留半个文件。
+    let mut tmp = out.to_path_buf();
+    let name = out.file_name().and_then(|n| n.to_str()).unwrap_or("export");
+    tmp.set_file_name(format!(".{name}.tmp-{}", std::process::id()));
+    let write = (|| -> Result<(), String> {
+        let f = std::fs::File::create(&tmp)
+            .map_err(|e| format!("cannot create {}: {e}", tmp.display()))?;
+        let mut w = std::io::BufWriter::new(f);
+        let header = serde_json::json!({
+            "format": crate::meta::VIEW_EXPORT_FORMAT,
+            "version": crate::meta::VIEW_EXPORT_VERSION,
+            "view": view,
+            "kind": kind,
+            "definition": definition,
+            "exported_at": now_s(),
+            "nodes": rows.len() as i64,
+            "blobs": blobs,
+        });
+        writeln!(w, "{header}").map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+        for r in &rows {
+            writeln!(w, "{}", r.to_json())
+                .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+        }
+        w.flush()
+            .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+        w.get_ref()
+            .sync_all()
+            .map_err(|e| format!("cannot flush {}: {e}", tmp.display()))
+    })();
+    if let Err(e) = write {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    std::fs::rename(&tmp, out).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("cannot move export into {}: {e}", out.display())
+    })?;
+    Ok(crate::meta::ViewExportStats {
+        nodes: rows.len() as i64,
+        blobs,
+        kind: kind.to_string(),
+    })
+}
+
+/// 一份读完并校验过的 dump。校验全部发生在碰树之前，这是本档能给出的
+/// 「坏文件不伤旧树」的全部（半成品保护见 `import_view` 的注释）。
+struct ParsedDump {
+    rows: Vec<DumpRow>,
+    kind: String,
+    blobs: i64,
+}
+
+/// 解析并校验 `grovefs-view-metadata` v1。规则与 SQLite/PG 两档的导入器逐条对齐：
+/// 表头 format/version、恰好一个根（`id == ROOT_INO` 且是目录）、父必须存在且是目录、
+/// 名字非空、`is_dir` ∈ {0,1}、表头声明的行数/blob 数与实际一致。多出来的一条是
+/// `ino`：缺失或 0 时按 `id` 当成各自的 inode（PG 档对无 `ino` 的行写的正是 0）。
+fn read_dump(input: &Path) -> Result<ParsedDump, String> {
+    let f = std::fs::File::open(input)
+        .map_err(|e| format!("cannot open {}: {e}", input.display()))?;
+    let mut rdr = std::io::BufReader::new(f);
+    let mut header_line = String::new();
+    if rdr
+        .read_line(&mut header_line)
+        .map_err(|e| format!("cannot read {}: {e}", input.display()))?
+        == 0
+    {
+        return Err(format!(
+            "{} is empty — not a grovefs view export",
+            input.display()
+        ));
+    }
+    if header_line.len() > DUMP_HEADER_MAX {
+        return Err(format!("{}:1: header line too long", input.display()));
+    }
+    let header: serde_json::Value = serde_json::from_str(header_line.trim_end()).map_err(|e| {
+        format!(
+            "{}:1: not a grovefs view export header ({e})",
+            input.display()
+        )
+    })?;
+    if header["format"] != crate::meta::VIEW_EXPORT_FORMAT {
+        return Err(format!(
+            "{}:1: unknown format '{}' (expected '{}')",
+            input.display(),
+            header["format"].as_str().unwrap_or("<missing>"),
+            crate::meta::VIEW_EXPORT_FORMAT
+        ));
+    }
+    let version = header["version"].as_u64().unwrap_or(0);
+    if version != crate::meta::VIEW_EXPORT_VERSION {
+        return Err(format!(
+            "{}:1: unsupported export version {version} (this build reads {})",
+            input.display(),
+            crate::meta::VIEW_EXPORT_VERSION
+        ));
+    }
+    let claimed_nodes = header["nodes"].as_i64();
+    let claimed_blobs = header["blobs"].as_i64();
+    let kind = header["kind"].as_str().unwrap_or("physical").to_string();
+    let mut rows: Vec<DumpRow> = Vec::new();
+    let mut line = String::new();
+    let mut lineno = 1usize;
+    loop {
+        line.clear();
+        let n = rdr
+            .read_line(&mut line)
+            .map_err(|e| format!("cannot read {}: {e}", input.display()))?;
+        if n == 0 {
+            break;
+        }
+        lineno += 1;
+        if line.len() > DUMP_LINE_MAX {
+            return Err(format!("{}:{lineno}: line too long", input.display()));
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = serde_json::from_str(line.trim_end())
+            .map_err(|e| format!("{}:{lineno}: invalid JSON: {e}", input.display()))?;
+        let id = v["id"]
+            .as_i64()
+            .ok_or_else(|| format!("{}:{lineno}: missing integer \"id\"", input.display()))?;
+        let parent_id = match v.get("parent_id") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(x) => Some(x.as_i64().ok_or_else(|| {
+                format!(
+                    "{}:{lineno}: \"parent_id\" must be an integer or null",
+                    input.display()
+                )
+            })?),
+        };
+        let name = v["name"]
+            .as_str()
+            .ok_or_else(|| format!("{}:{lineno}: missing string \"name\"", input.display()))?;
+        if name.is_empty() {
+            return Err(format!("{}:{lineno}: empty name", input.display()));
+        }
+        let is_dir = v["is_dir"]
+            .as_i64()
+            .ok_or_else(|| format!("{}:{lineno}: missing integer \"is_dir\"", input.display()))?;
+        if is_dir != 0 && is_dir != 1 {
+            return Err(format!(
+                "{}:{lineno}: \"is_dir\" must be 0 or 1, got {is_dir}",
+                input.display()
+            ));
+        }
+        let data_ref = v["data_ref"].as_str().map(str::to_string);
+        let link_target = v["link_target"].as_str().map(str::to_string);
+        if data_ref.is_some() && link_target.is_some() {
+            return Err(format!(
+                "{}:{lineno}: a row carries both \"data_ref\" and \"link_target\" — a symlink has no \
+                 content object, a file has no target",
+                input.display()
+            ));
+        }
+        let mode = v["mode"]
+            .as_i64()
+            .unwrap_or(if is_dir == 1 { 0o755 } else { 0o644 });
+        let uid = v["uid"].as_i64().unwrap_or(0);
+        let gid = v["gid"].as_i64().unwrap_or(0);
+        let t = now_s();
+        let mtime = v["mtime"].as_i64().unwrap_or(t);
+        let atime = v["atime"].as_i64().unwrap_or(mtime);
+        let ctime = v["ctime"].as_i64().unwrap_or(mtime);
+        let ino = match v["ino"].as_i64().unwrap_or(0) {
+            0 => id,
+            x => x,
+        };
+        rows.push(DumpRow {
+            id,
+            parent_id,
+            name: name.to_string(),
+            is_dir: is_dir == 1,
+            data_ref,
+            link_target,
+            mode,
+            uid,
+            gid,
+            mtime,
+            atime,
+            ctime,
+            ino,
+        });
+    }
+    // ---- 结构校验：与两档导入器同一条规则集 ----
+    let roots: Vec<&DumpRow> = rows.iter().filter(|r| r.parent_id.is_none()).collect();
+    if roots.len() != 1 {
+        return Err(format!(
+            "import rejected: expected exactly one root row (parent_id null), found {}",
+            roots.len()
+        ));
+    }
+    let root = roots[0];
+    if root.id != crate::meta::ROOT_INO || !root.is_dir {
+        return Err(format!(
+            "import rejected: root row must be id {} and a directory (got id {}, is_dir {})",
+            crate::meta::ROOT_INO,
+            root.id,
+            root.is_dir as i64
+        ));
+    }
+    let mut by_id: HashMap<i64, &DumpRow> = HashMap::with_capacity(rows.len());
+    for r in &rows {
+        if by_id.insert(r.id, r).is_some() {
+            return Err(format!("import rejected: duplicate row id {}", r.id));
+        }
+    }
+    for r in &rows {
+        let Some(pid) = r.parent_id else { continue };
+        match by_id.get(&pid) {
+            None => {
+                return Err(format!(
+                    "import rejected: row {} ('{}') points at missing parent id {pid}",
+                    r.id, r.name
+                ))
+            }
+            Some(p) if !p.is_dir => {
+                return Err(format!(
+                    "import rejected: row {} ('{}') points at non-directory parent id {pid}",
+                    r.id, r.name
+                ))
+            }
+            Some(_) => {}
+        }
+    }
+    let blobs = rows
+        .iter()
+        .filter_map(|r| r.data_ref.as_deref())
+        .collect::<std::collections::HashSet<_>>()
+        .len() as i64;
+    if let Some(c) = claimed_nodes {
+        if c != rows.len() as i64 {
+            return Err(format!(
+                "import rejected: header declares {c} node(s), file carries {}",
+                rows.len()
+            ));
+        }
+    }
+    if let Some(c) = claimed_blobs {
+        if c != blobs {
+            return Err(format!(
+                "import rejected: header declares {c} blob reference(s), file carries {blobs}"
+            ));
+        }
+    }
+    Ok(ParsedDump { rows, kind, blobs })
+}
+
+/// 把一行 dump 的属性写成**一条** `Setattr`（mode/uid/gid/atime/mtime，有内容就
+/// 连 `data_ref` 一起）。分五次发就是五倍往返；引擎的 `Setattr` 本来就是「valid 位
+/// 说改哪个就改哪个」。
+fn apply_attrs(st: &TreedbStore, ino: u64, row: &DumpRow) -> Result<(), String> {
+    let mut valid = SA_UID | SA_GID | SA_ATIME | SA_MTIME;
+    // 符号链接的 mode 位在 POSIX 里没有意义（恒 0777），别拿 dump 里的数去改它。
+    if row.link_target.is_none() {
+        valid |= SA_MODE;
+    }
+    let mut data_ref = Vec::new();
+    if let Some(dr) = row.data_ref.as_deref().filter(|d| !d.is_empty()) {
+        valid |= SA_DATA_REF;
+        data_ref = dr.as_bytes().to_vec();
+    }
+    let op = Op::Setattr {
+        view: st.vid(),
+        ino,
+        valid,
+        mode: row.mode as u32,
+        uid: row.uid as u32,
+        gid: row.gid as u32,
+        size: 0,
+        atime: s_to_ms(row.atime),
+        mtime: s_to_ms(row.mtime),
+        data_ref,
+        // 字节数权威在 data plane（模块头「字节数不变量」），引擎账本里恒 0。
+        ref_bytes: 0,
+    };
+    st.xcall(&op)
+        .and_then(TreedbStore::want_node)
+        .map(|_| ())
+        .map_err(|f| format!("row {} ('{}'): cannot set attributes: {}", row.id, row.name, f.msg))
+}
+
+/// 按 BFS 递归把 rows 建成树。调用方已经把整份文件校验过，这里只剩「引擎答不答」。
+///
+/// 三条硬顺序与 treedb 仓的整目录 dump 同源：目录先于子项（父 ino 得先存在）、
+/// 硬链接的首个名字先于其余名字（`Link` 要一个已存在的 ino）、属性在节点建好之后。
+fn build_tree(st: &TreedbStore, rows: &[DumpRow]) -> Result<(), String> {
+    let root = rows
+        .iter()
+        .find(|r| r.parent_id.is_none())
+        .expect("read_dump validated exactly one root");
+    // 根在建 view 时就有（ino 1），只需要把属性写上去。
+    let root_ino = crate::meta::ROOT_INO as u64;
+    apply_attrs(st, root_ino, root)?;
+    // 导出侧 ino → 引擎侧 ino。硬链接靠它变成 `Link`，而不是建第二个 inode。
+    let mut ino_of: HashMap<i64, u64> = HashMap::with_capacity(rows.len());
+    ino_of.insert(root.ino, root_ino);
+    let by_id: HashMap<i64, &DumpRow> = rows.iter().map(|r| (r.id, r)).collect();
+    // 子表按文件顺序，保证同一份 dump 两次导入走同一条路径（错误信息也可复现）。
+    let mut children: HashMap<i64, Vec<i64>> = HashMap::new();
+    for r in rows {
+        if let Some(pid) = r.parent_id {
+            children.entry(pid).or_default().push(r.id);
+        }
+    }
+    let mut queue: VecDeque<i64> = VecDeque::from([root.id]);
+    while let Some(id) = queue.pop_front() {
+        let dir = by_id[&id];
+        let parent_ino = *ino_of.get(&dir.ino).ok_or_else(|| {
+            format!(
+                "row {} ('{}'): parent inode {} was never created",
+                dir.id, dir.name, dir.ino
+            )
+        })?;
+        for cid in children.get(&id).into_iter().flatten() {
+            let row = by_id[cid];
+            if let Some(&ino) = ino_of.get(&row.ino) {
+                // 第二个名字 = 硬链接。目录不能硬链接，出现就是坏文件。
+                if row.is_dir {
+                    return Err(format!(
+                        "row {} ('{}'): directory inode {} has more than one name — a directory \
+                         cannot be hard-linked",
+                        row.id, row.name, row.ino
+                    ));
+                }
+                let op = Op::Link {
+                    view: st.vid(),
+                    ino,
+                    parent: parent_ino,
+                    name: row.name.as_bytes().to_vec(),
+                };
+                st.xcall(&op)
+                    .and_then(TreedbStore::want_node)
+                    .map_err(|f| format!("row {} ('{}'): cannot link: {}", row.id, row.name, f.msg))?;
+                continue; // 属性已经在第一个名字那里写过了
+            }
+            let n = if row.is_dir {
+                st.create(
+                    parent_ino as i64,
+                    &row.name,
+                    true,
+                    row.mode as u32,
+                    row.uid as u32,
+                    row.gid as u32,
+                )
+            } else if let Some(target) = row.link_target.as_deref() {
+                let op = Op::Symlink {
+                    view: st.vid(),
+                    parent: parent_ino,
+                    name: row.name.as_bytes().to_vec(),
+                    target: target.as_bytes().to_vec(),
+                    uid: row.uid as u32,
+                    gid: row.gid as u32,
+                };
+                st.xcall(&op).and_then(TreedbStore::want_node)
+            } else {
+                st.create(
+                    parent_ino as i64,
+                    &row.name,
+                    false,
+                    row.mode as u32,
+                    row.uid as u32,
+                    row.gid as u32,
+                )
+            }
+            .map_err(|f| format!("row {} ('{}'): cannot create: {}", row.id, row.name, f.msg))?;
+            ino_of.insert(row.ino, n.ino);
+            apply_attrs(st, n.ino, row)?;
+            if row.is_dir {
+                // 目录建好才能当父：入队，等它的子项按 BFS 继续。
+                queue.push_back(*cid);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 建完再走一遍数名字。引擎侧没有事务，「建的时候每条 op 都答了 Ok」不等于
+/// 「树真的长成了那样」；一次只读遍历是这里能给出的最便宜的核对。
+fn count_names(st: &TreedbStore) -> Result<i64, String> {
+    let mut n = 0i64;
+    let mut queue = VecDeque::from([crate::meta::ROOT_INO]);
+    while let Some(dir) = queue.pop_front() {
+        for e in st
+            .page_all(dir)
+            .map_err(|f| format!("cannot re-read ino {dir}: {}", f.msg))?
+        {
+            n += 1;
+            if e.kind == NodeKind::Dir {
+                queue.push_back(e.id);
+            }
+        }
+    }
+    Ok(n)
+}
+
+/// 把一份 dump 装成一棵 treedb 视图树（`view import`）。
+///
+/// 次序是「先整份校验 → 需要时 DropView → 建 → 走一遍核对」，每一步的失败都不是
+/// 静默的：
+/// - 文件坏：一行都不写，旧树原样（这是最强的一档，因为校验全在碰树之前）；
+/// - 建到一半失败：把这棵半成品删掉（宁可不留树，也不留一棵「看起来建成了」的）；
+/// - `--replace` 且中途失败：旧树已经删了，回不去 —— 错误文案里会说清楚。
+pub fn import_view(
+    addr: &str,
+    view: &str,
+    input: &Path,
+    replace: bool,
+) -> Result<crate::meta::ViewImportStats, String> {
+    let parsed = read_dump(input)?;
+    let existed = has_view(addr, view)?;
+    if existed && !replace {
+        return Err(format!(
+            "target metadata tree '{view}' already exists in treedb at {addr} — pass --replace to \
+             overwrite it (stop every mount/meta-server using this view first)"
+        ));
+    }
+    if existed {
+        TreedbStore::drop_view(addr, view)
+            .map_err(|e| format!("cannot drop the existing tree '{view}': {e}"))?;
+    }
+    let st = TreedbStore::open(addr, view, false)
+        .map_err(|e| format!("cannot create view '{view}' at {addr}: {e}"))?;
+    let built = build_tree(&st, &parsed.rows).and_then(|()| {
+        let want = parsed.rows.len() as i64 - 1; // 根没有目录项
+        let got = count_names(&st)?;
+        if got != want {
+            return Err(format!(
+                "the built tree walks to {got} name(s) but the dump carries {want} — the import is \
+                 INCOMPLETE"
+            ));
+        }
+        Ok(())
+    });
+    if let Err(e) = built {
+        let note = match TreedbStore::drop_view(addr, view) {
+            Ok(_) => "the half-built tree was removed again".to_string(),
+            Err(re) => format!(
+                "the half-built tree could NOT be removed ({re}) — drop view '{view}' in treedb at \
+                 {addr} by hand"
+            ),
+        };
+        let replaced = if existed {
+            " (--replace had already dropped the previous tree; it is gone, not restored)"
+        } else {
+            ""
+        };
+        return Err(format!("{e}; {note}{replaced}"));
+    }
+    Ok(crate::meta::ViewImportStats {
+        nodes: parsed.rows.len() as i64,
+        blobs: parsed.blobs,
+        kind: parsed.kind,
+        replaced: existed,
+    })
+}
+
+#[cfg(test)]
+mod dump_tests {
+    use super::*;
+
+    fn write_dump(dir: &Path, body: &str) -> std::path::PathBuf {
+        let p = dir.join("d.jsonl");
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "gfs-treedb-dump-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    const HEAD: &str = r#"{"format":"grovefs-view-metadata","version":1,"kind":"physical","nodes":3,"blobs":1}"#;
+
+    /// 一份最小 dump：根 + 目录 + 一个文件，外加硬链接的第二条名字。
+    fn good_body() -> String {
+        format!(
+            "{HEAD}\n\
+             {{\"id\":1,\"parent_id\":null,\"name\":\"/\",\"is_dir\":1,\"mode\":493,\"ino\":1}}\n\
+             {{\"id\":2,\"parent_id\":1,\"name\":\"d\",\"is_dir\":1,\"mode\":493,\"ino\":2}}\n\
+             {{\"id\":3,\"parent_id\":2,\"name\":\"f\",\"is_dir\":0,\"data_ref\":\"k\",\"mode\":420,\"ino\":3,\"mtime\":7}}\n"
+        )
+    }
+
+    #[test]
+    fn a_well_formed_dump_parses_and_keeps_ino_and_times() {
+        let d = tmpdir("ok");
+        let p = write_dump(&d, &good_body());
+        let parsed = read_dump(&p).unwrap();
+        assert_eq!(parsed.rows.len(), 3);
+        assert_eq!(parsed.blobs, 1);
+        assert_eq!(parsed.kind, "physical");
+        assert_eq!(parsed.rows[2].mtime, 7, "times travel verbatim");
+        assert_eq!(parsed.rows[2].ino, 3);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 硬链接在格式里是「同一个 ino」，`id` 仍然各不相同；缺 `ino` 的行退回用 `id`。
+    #[test]
+    fn a_missing_ino_falls_back_to_the_row_id() {
+        let d = tmpdir("ino");
+        let body = format!(
+            "{}\n\
+             {{\"id\":1,\"parent_id\":null,\"name\":\"/\",\"is_dir\":1}}\n\
+             {{\"id\":2,\"parent_id\":1,\"name\":\"a\",\"is_dir\":0}}\n\
+             {{\"id\":3,\"parent_id\":1,\"name\":\"b\",\"is_dir\":0}}\n",
+            HEAD.replace("\"nodes\":3,\"blobs\":1", "\"nodes\":3,\"blobs\":0")
+        );
+        let p = write_dump(&d, &body);
+        let parsed = read_dump(&p).unwrap();
+        assert_eq!(
+            (parsed.rows[1].ino, parsed.rows[2].ino),
+            (2, 3),
+            "no ino means each row is its own inode"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn every_structural_break_is_refused_before_any_tree_is_touched() {
+        let d = tmpdir("bad");
+        let cases: Vec<(&str, String, &str)> = vec![
+            (
+                "wrong format",
+                r#"{"format":"other","version":1}"#.to_string() + "\n",
+                "unknown format",
+            ),
+            (
+                "wrong version",
+                r#"{"format":"grovefs-view-metadata","version":9}"#.to_string() + "\n",
+                "unsupported export version",
+            ),
+            (
+                "no root",
+                format!(
+                    "{HEAD}\n{{\"id\":2,\"parent_id\":1,\"name\":\"x\",\"is_dir\":0}}\n"
+                ),
+                "exactly one root row",
+            ),
+            (
+                "root is not id 1",
+                format!(
+                    "{HEAD}\n{{\"id\":5,\"parent_id\":null,\"name\":\"/\",\"is_dir\":1}}\n"
+                ),
+                "root row must be id 1",
+            ),
+            (
+                "dangling parent",
+                format!(
+                    "{HEAD}\n\
+                     {{\"id\":1,\"parent_id\":null,\"name\":\"/\",\"is_dir\":1}}\n\
+                     {{\"id\":2,\"parent_id\":7,\"name\":\"x\",\"is_dir\":0}}\n"
+                ),
+                "missing parent id 7",
+            ),
+            (
+                "duplicate id",
+                format!(
+                    "{HEAD}\n\
+                     {{\"id\":1,\"parent_id\":null,\"name\":\"/\",\"is_dir\":1}}\n\
+                     {{\"id\":1,\"parent_id\":1,\"name\":\"x\",\"is_dir\":0}}\n"
+                ),
+                "duplicate row id 1",
+            ),
+            (
+                "header counts disagree",
+                good_body().replace("\"nodes\":3", "\"nodes\":9"),
+                "header declares 9 node(s)",
+            ),
+            (
+                "both data_ref and link_target",
+                format!(
+                    "{HEAD}\n\
+                     {{\"id\":1,\"parent_id\":null,\"name\":\"/\",\"is_dir\":1}}\n\
+                     {{\"id\":2,\"parent_id\":1,\"name\":\"x\",\"is_dir\":0,\"data_ref\":\"k\",\"link_target\":\"t\"}}\n"
+                ),
+                "both",
+            ),
+            ("empty file", String::new(), "is empty"),
+        ];
+        for (what, body, want) in cases {
+            let p = write_dump(&d, &body);
+            let err = match read_dump(&p) {
+                Ok(_) => panic!("'{what}' was accepted"),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains(want),
+                "'{what}': error '{err}' does not mention '{want}'"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -951,7 +951,15 @@ grovefs view --meta-dir $S import --view team_rolledback --in /tmp/team2.jsonl
 
 e2e:`migrate` 套件把这条链在两棵本地 SQLite 树之间逐条断言(74 条),`xfer` 套件在 SQLite/PG 两档各跑一遍本地与远程形态(96 条);跨档对拷(上面的 SQLite dump → PG schema → 再导出 → 落回 SQLite)按本节命令在本机跑过,两次 `diff` 都逐行相同。
 
-**导入的原子性**:先在 `D/meta/.V.import-<pid>-<时间>` 建临时树,全部行与校验通过、WAL 合并后才 `rename` 到 `D/meta/V.db`——坏文件/悬挂父节点/计数不符/失败的 `--replace` 都不会破坏旧树(旧树要么原样、要么完整换成新树,没有中间态)。
+**第三档:实验性 treedb 后端**(`meta-server --meta-store treedb://…`)同样通用,但**只能 经治理口**——`view --control-server <host:port> --api-key <admin-key> export/import`。本 机 `--meta-dir` 形态有意不驱动 treedb scheme(报 `does not drive --meta-store treedb`), 因为树在引擎里、不在本机那个目录里。dump 格式仍是同一份 `grovefs-view-metadata` v1 JSONL:GroveFS 用引擎已有的树面 op 把树读出来/建回去(`ReadDirPlus` 分页走树、 `Mkdir`/`Create`/`Symlink`/`Link`/`Setattr` 建树),所以引擎侧没有新增任何 op、线协议 字节未动(§15.9 末段)。三处与其他两档**不同的诚实保证**:
+
+- **导出不是点时刻快照**:引擎没给客户端开快照的接口,导出是逐目录 `ReadDirPlus` 边走边读(与离线 `du` 同档语义)。迁移窗口内照旧要求**源树停写**。
+- **导入不是原子的**:引擎只有“建/删视图”两个原子动作,没有事务。次序是「先整份校验 dump(坏文件一行都不写)→ 删旧树 → 建新树 → 走一遍核对条目数」;`--replace` 的失败窗口是“旧树已删、新树未建完”,报错里会明说这一点。非 `--replace` 的新名字最坏只留下“已删掉”的半成品,不会伤到别的树。
+- `ctime` 是**唯一不还原**的字段:引擎没有 `SA_CTIME`,导入的节点 ctime 是引擎写入时 刻;id/inode/硬链接/mode/属主/atime/mtime/symlink 文本逐行保真(往返 `diff` 相同)。
+
+treedb 档的 e2e 是 `xfertreedb` 套件(28 条断言):手写 dump(硬链接、符号链接、嵌 套目录、属主与时间)先经 SQLite 档渲染成参考导出,再经控制面导入 treedb 并导出,按 **path** 逐行比对 8 个字段与硬链接分组;另含四条拒绝路径(引擎里没有的名字/已有树未 `--replace`/坏表头且旧树完好/本机 `--meta-dir` 仍拒 treedb scheme)、`--replace` 换小树、 `--as-fork` 记 `fork` 定义并按 `kind=fork` 导出,以及 ctime 那条差异的显式断言。
+
+**导入的原子性(SQLite/PG 两档)**:先在 `D/meta/.V.import-<pid>-<时间>` 建临时树,全部行与校验通过、WAL 合并后才 `rename` 到 `D/meta/V.db`——坏文件/悬挂父节点/计数不符/失败的 `--replace` 都不会破坏旧树(旧树要么原样、要么完整换成新树,没有中间态)。treedb 档没有事务,给的是「整份校验 → 删旧 → 建新 → 核对」这套次序,不 足处已在上文点名。
 
 **守卫**:虚拟名(别名/派生)没有自己的树,`export` 直接拒绝并提示导出其物理基;输出文件已存在需 `--force`;导入目标已有定义槽先 `view rm`;表头 format/version 不符、根节点不是 `id=1` 的目录、悬挂父节点、表头计数与正文不符均整单拒绝;`--as-fork` 要求基视图在**目标机上**已存在、且基名本身没有定义。
 
@@ -2028,18 +2036,19 @@ ps aux | grep grovefs                     # 查看在跑的 server / mount
 
 ## 10. 验证与回归
 
-全板一共 **41 段**:`build` → `unit` → **38 个套件** → `bench`。**前 40 段门控 GREEN,`bench` 只打吞吐参考值、永不门控**(只要纯功能回归就 `SKIP_BENCH=1`)。`pg`/`pg_parallel`/`evict`/`control`/`forksrv` 在无可达 PostgreSQL 的主机上整段自动 SKIP,`client` 在没有同级 `grovefs-client` 检出(或其二进制、`fusermount` 助手)的机器上整段 SKIP,`xfer`/`gcremote` 则跳过 PG 臂只跑 SQLite 臂,都不拉低 GREEN;`treedb` 段是实验性后端的自检,默认构建(未开 `--features treedb`)整段 SELF-SKIP,同样不拉低 GREEN。
+全板一共 **44 段**:`build` → `unit` → **41 个套件** → `bench`。**前 43 段门控 GREEN,`bench` 只打吞吐参考值、永不门控**(只要纯功能回归就 `SKIP_BENCH=1`)。`pg`/`pg_parallel`/`evict`/`control`/`forksrv` 在无可达 PostgreSQL 的主机上整段自动 SKIP,`client` 在没有同级 `grovefs-client` 检出(或其二进制、`fusermount` 助手)的机器上整段 SKIP,`xfer`/`gcremote` 则跳过 PG 臂只跑 SQLite 臂,都不拉低 GREEN;`treedb`/`treedbmatrix`/`xfertreedb` 三段是实验性后端的自检,默认构建(未开 `--features treedb`)整段 SELF-SKIP,同样不拉 低 GREEN(`xfertreedb` 还要求同级 `../treedb` 的引擎二进制,没有也 SELF-SKIP)。
 
 ```bash
 export LC_ALL=C LANG=C                                 # 仓库根目录下执行(PKG_CONFIG 不必设:无 crate 查 pkg-config,§1)
-bash .build-bin/run_all.sh                # 全板 41 段(40 门控 + bench)
+bash .build-bin/run_all.sh                # 全板 44 段(43 门控 + bench)
                                           #   build unit
                                           #   posix edge e2e remote errors resilience concurrent
                                           #   metasrv ha striping locks freshness disp_fresh
                                           #   layout fork forksrv viewrm gc gcremote xfer
                                           #   bwlimit migrate import govcheck govtime
-                                          #   grovesci mcp apikey ctlplane web mountkey config
-                                          #   pg pg_parallel evict control client treedb
+                                          #   grovesci mcp apikey ctlplane web mountkey manager
+                                          #   config pg pg_parallel evict control client
+                                          #   treedb treedbmatrix xfertreedb
                                           #   bench(只打吞吐,不门控)
 SKIP_BENCH=1 bash .build-bin/run_all.sh   # 同上,去掉 bench
 bash .build-bin/run_all.sh fork mcp       # 只跑指定套件(build 自动前置)

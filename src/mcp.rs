@@ -1524,9 +1524,11 @@ pub fn list_views_text(store: &dyn ControlStore) -> Result<Vec<OutLine>, String>
         out.push(OutLine::Info(entry_line(e)));
     }
     for p in bare {
-        // The tree's home is backend-specific — a SQLite db file or a PG schema.
+        // The tree's home is backend-specific — a SQLite db file, a PG schema,
+        // or a tree inside a treedb engine.
         let home = match store.backend() {
             "postgres" => format!("own schema {}", schema_name_for(p)),
+            "treedb" => format!("its own tree inside the treedb engine (view '{p}')"),
             _ => format!("own tree meta/{p}.db"),
         };
         out.push(OutLine::Info(format!(

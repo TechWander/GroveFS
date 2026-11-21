@@ -949,7 +949,15 @@ The round trip rewrites no rows: a dump re-exported from the target store after 
 
 e2e: the `migrate` suite asserts this chain line by line between two local SQLite trees (74 checks), the `xfer` suite runs the local and remote shapes once per backend on SQLite/PG (96 checks); the cross-backend copy (the SQLite dump → PG schema → re-export → back into SQLite above) was run on this machine with the commands of this section and both `diff` passes were line-for-line identical.
 
-**Import atomicity**: a temporary tree is first built at `D/meta/.V.import-<pid>-<time>`, and only after all rows and checks pass and the WAL merges does it `rename` to `D/meta/V.db` — a corrupt file / dangling parent / count mismatch / failed `--replace` never damages the old tree (the old tree is either untouched or wholly the new tree, no intermediate state).
+**Third backend: the experimental treedb store** (`meta-server --meta-store treedb://…`) works too, but **only through the governance port** — `view --control-server <host:port> --api-key <admin-key> export/import`. The local `--meta-dir` form deliberately does not drive the treedb scheme (it answers `does not drive --meta-store treedb`), because the tree lives in the engine, not in that local directory. The dump is the same `grovefs-view-metadata` v1 JSONL: GroveFS reads and rebuilds the tree with the engine's existing tree-surface ops (`ReadDirPlus` pages to walk, `Mkdir`/`Create`/`Symlink`/`Link`/`Setattr` to rebuild), so the engine gained no new op and no wire-protocol byte changed (end of §15.9). Three honest differences from the other two backends:
+
+- **The export is not a point-in-time snapshot**: the engine exposes no client snapshot handle, so the walk is one `ReadDirPlus` per directory as it goes (the same semantics as the offline `du`). The migration window still requires the **source tree to be quiescent**.
+- **The import is not atomic**: the engine has two atomic moves (create/drop a view) and no transactions. The order is "validate the whole dump first (a corrupt file writes nothing) → drop the old tree → build the new one → walk it back and count entries"; the failure window of `--replace` is "old tree gone, new tree incomplete", and the error says so. Without `--replace` the worst case is an abandoned half-built name of its own, never another tree.
+- `ctime` is the **one field not restored**: the engine has no `SA_CTIME`, so an imported node's ctime is the engine's write time; id/inode/hardlink/mode/owner/atime/mtime/symlink text carry over line for line (the round-trip `diff` matches).
+
+The treedb tier's e2e is the `xfertreedb` suite (28 checks): a hand-written dump (hard link, symlink, nested dirs, ownership, times) is first rendered into a reference export by the SQLite tier, then imported into treedb through the control plane and exported back, compared **by path** on 8 fields plus hard-link grouping; it also covers four refusals (a name the engine never had / an existing tree without `--replace` / a corrupt header with the old tree intact / the local `--meta-dir` form still refusing the treedb scheme), `--replace` shrinking the tree, `--as-fork` recording the `fork` definition and exporting `kind=fork`, and the ctime difference asserted out loud.
+
+**Import atomicity (SQLite/PG tiers)**: a temporary tree is first built at `D/meta/.V.import-<pid>-<time>`, and only after all rows and checks pass and the WAL merges does it `rename` to `D/meta/V.db` — a corrupt file / dangling parent / count mismatch / failed `--replace` never damages the old tree (the old tree is either untouched or wholly the new tree, no intermediate state). The treedb tier has no transaction and gives the "validate → drop old → build new → count" sequence instead; its shortfall is named above.
 
 **Guards**: virtual names (alias/derived) own no tree, so `export` refuses outright and prompts exporting their physical base; an existing output file needs `--force`; if the import target already has a definition slot, `view rm` it first; a header format/version mismatch, a root that isn't an `id=1` directory, a dangling parent, or a header count disagreeing with the body are all whole-job refusals; `--as-fork` requires the base view to already exist **on the target machine** and the base name itself to have no definition.
 
@@ -1969,18 +1977,19 @@ ps aux | grep grovefs                     # 查看在跑的 server / mount
 
 ## 10. Verification and regression
 
-The full board is **41 stages** in all: `build` → `unit` → **38 suites** → `bench`. **The first 40 stages gate GREEN; `bench` only prints throughput reference numbers and never gates** (for pure functional regression only, use `SKIP_BENCH=1`). `pg`/`pg_parallel`/`evict`/`control`/`forksrv` auto-SKIP their whole stage on hosts with no reachable PostgreSQL, and `xfer`/`gcremote` skip just their PG arm and run the SQLite arm — and `client` skips its whole stage on a host without the sibling `grovefs-client` checkout, its binary, or the `fusermount` helper — none of them lower GREEN; the `treedb` stage — the self-check of the experimental backend — SELF-SKIPS on a default build (no `--features treedb`), also without lowering GREEN.
+The full board is **44 stages** in all: `build` → `unit` → **41 suites** → `bench`. **The first 43 stages gate GREEN; `bench` only prints throughput reference numbers and never gates** (for pure functional regression only, use `SKIP_BENCH=1`). `pg`/`pg_parallel`/`evict`/`control`/`forksrv` auto-SKIP their whole stage on hosts with no reachable PostgreSQL, and `xfer`/`gcremote` skip just their PG arm and run the SQLite arm — and `client` skips its whole stage on a host without the sibling `grovefs-client` checkout, its binary, or the `fusermount` helper — none of them lower GREEN; the `treedb`/`treedbmatrix`/`xfertreedb` stages — the self-checks of the experimental backend — SELF-SKIP on a default build (no `--features treedb`), also without lowering GREEN (`xfertreedb` additionally needs the sibling `../treedb` engine binary).
 
 ```bash
 export LC_ALL=C LANG=C                                 # 仓库根目录下执行(PKG_CONFIG 不必设:无 crate 查 pkg-config,§1)
-bash .build-bin/run_all.sh                # 全板 41 段(40 门控 + bench)
+bash .build-bin/run_all.sh                # all 44 stages (43 gating + bench)
                                           #   build unit
                                           #   posix edge e2e remote errors resilience concurrent
                                           #   metasrv ha striping locks freshness disp_fresh
                                           #   layout fork forksrv viewrm gc gcremote xfer
                                           #   bwlimit migrate import govcheck govtime
-                                          #   grovesci mcp apikey ctlplane web mountkey config
-                                          #   pg pg_parallel evict control client treedb
+                                          #   grovesci mcp apikey ctlplane web mountkey manager
+                                          #   config pg pg_parallel evict control client
+                                          #   treedb treedbmatrix xfertreedb
                                           #   bench(只打吞吐,不门控)
 SKIP_BENCH=1 bash .build-bin/run_all.sh   # 同上,去掉 bench
 bash .build-bin/run_all.sh fork mcp       # 只跑指定套件(build 自动前置)

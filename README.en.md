@@ -769,9 +769,11 @@ grovefs mount --view alice --data-servers 10.0.0.5:50100 --meta-server 10.0.0.5:
 ```bash
 export LC_ALL=C LANG=C            # no PKG_CONFIG needed: no crate queries pkg-config (see Build)
 cargo test --release
-bash .build-bin/run_all.sh                 # 41 stages (40 gated + bench: build/unit + 38 suites)
+bash .build-bin/run_all.sh                 # 44 stages (43 gated + bench: build/unit + 41 suites)
 SKIP_BENCH=1 bash .build-bin/run_all.sh    # skip throughput bench
 ```
+
+The `treedb`/`treedbmatrix`/`xfertreedb` stages cover the experimental `--meta-store treedb://` backend (self-check, the POSIX/e2e assertion matrix replayed on it, and the portable `view export`/`view import` dump end to end — 28 checks that compare a hand-written dump's SQLite-templated export against the engine's export by path, plus refusals, `--replace`, `--as-fork`, and the one field that backend does not restore, `ctime`). All three SELF-SKIP without `--features treedb`.
 
 ## Honest limitations
 

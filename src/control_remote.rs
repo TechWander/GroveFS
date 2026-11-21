@@ -592,6 +592,10 @@ impl RemoteControlStore {
         let backend: &'static str = match name {
             "postgres" => "postgres",
             "sqlite" => "sqlite",
+            // A treedb-backed server reports its own name; folding it into
+            // "remote" would make `view list` describe every tree as
+            // `meta/<name>.db`, a file this backend never writes.
+            "treedb" => "treedb",
             _ => "remote",
         };
         Ok(Self {

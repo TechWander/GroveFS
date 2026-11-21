@@ -1845,7 +1845,7 @@ fn may_govern(
         // An unresolvable name that does not exist yet is free to claim. One that
         // resolves to a base the caller does not hold is NOT, and neither is a
         // broken chain: `manages` already refused it.
-        if !(rt.control.has_def(name)? || rt.control.has_physical(name)?) {
+        if !(rt.control.has_def(name)? || has_tree(rt, name)?) {
             return Ok(());
         }
     }
@@ -2073,7 +2073,10 @@ fn control_dispatch(
                 "describe": rt.control.describe(),
                 "base": rt.base.display().to_string(),
                 "role": format!("{:?}", rt.role()),
-                "views": rt.control.list_physical()?.len(),
+                "views": match trees_in_engine(rt)? {
+                    Some(v) => v.len(),
+                    None => rt.control.list_physical()?.len(),
+                },
                 "definitions": rt.control.list_defs()?.len(),
                 "accounts": accounts,
                 "liveKeys": keys,
@@ -2119,11 +2122,13 @@ fn control_dispatch(
         }
         "stamp" => Ok(json!(rt.control.stamp(&req_str(a, "name")?))),
         "physical.list" => {
-            let v = rt.control.list_physical()?;
+            let v = match trees_in_engine(rt)? {
+                Some(v) => v,
+                None => rt.control.list_physical()?,
+            };
             Ok(json!(visible(rt, who, v)))
         }
-        "physical.has" => Ok(json!(rt.control.has_physical(&req_str(a, "name")?)?)),
-        "fork.has" => Ok(json!(rt.control.has_fork_tree(&req_str(a, "name")?)?)),
+        "physical.has" | "fork.has" => Ok(json!(has_tree(rt, &req_str(a, "name")?)?)),
         // The tree-copy verbs. They are served HERE — by the process that owns
         // the store — instead of being refused, because the copy reads and
         // writes nothing but the metadata store this server is already the only
@@ -2236,7 +2241,7 @@ fn control_dispatch(
                     "view '{view}' already has a derived/alias/fork definition — choose a different base name (`view list` shows it)"
                 ));
             }
-            if rt.control.has_physical(&view)? {
+            if has_tree(rt, &view)? {
                 return Err(format!(
                     "view '{view}' already exists — remove it first (`view rm --name {view} --base`)"
                 ));
@@ -2272,18 +2277,6 @@ fn control_dispatch(
                 }
                 #[cfg(feature = "treedb")]
                 StoreKind::Treedb(addr) => {
-                    // `has_physical` above enumerates local db files, so it
-                    // cannot see a treedb view: the duplicate check belongs here,
-                    // against the engine's own list.
-                    if crate::treedb_store::TreedbStore::list_views(addr)
-                        .map_err(|e| format!("view create: {e}"))?
-                        .iter()
-                        .any(|v| v == &view)
-                    {
-                        return Err(format!(
-                            "view '{view}' already exists in treedb at {addr} — remove it first (`view rm --view {view} --base`)"
-                        ));
-                    }
                     let eng = crate::meta::MetaStore::open_treedb(addr, &view, false)
                         .map_err(|e| format!("view create: {e}"))?;
                     // Like PG: the bytes belong to the data servers, so there is
@@ -2878,7 +2871,7 @@ fn web_dispatch(
                         crate::layout::ViewDef::Alias(_) => "alias",
                     }
                 }
-                None if rt.control.has_physical(&view)? => "base",
+                None if has_tree(rt, &view)? => "base",
                 None => "none",
             };
             let base = webauth::resolve_base(rt.control.as_ref(), &view).ok();
@@ -2887,7 +2880,10 @@ fn web_dispatch(
             // small, and this is one resolve per name).
             let mut family: Vec<String> = Vec::new();
             if base.as_deref() == Some(view.as_str()) {
-                let mut names: Vec<String> = rt.control.list_physical()?;
+                let mut names: Vec<String> = match trees_in_engine(rt)? {
+                    Some(v) => v,
+                    None => rt.control.list_physical()?,
+                };
                 names.extend(rt.control.list_defs()?.into_iter().map(|(n, _)| n));
                 // The two listings OVERLAP by design: a fork has a definition
                 // (`fork <base>`) and a tree of its own, so it appears on both
@@ -2924,8 +2920,8 @@ fn web_dispatch(
                 "base": base,
                 "definition": def,
                 "stamp": rt.control.stamp(&view),
-                "tree": rt.control.has_physical(&view)?,
-                "forkTree": rt.control.has_fork_tree(&view)?,
+                "tree": has_tree(rt, &view)?,
+                "forkTree": has_tree(rt, &view)?,
                 "family": family,
                 "keys": keys,
                 "sessions": sessions,
@@ -3033,16 +3029,6 @@ fn view_export_stage(
     }
     let definition = rt.control.get_def_raw(view)?;
     refuse_virtual_for_export(view, definition.as_deref())?;
-    // Refused BEFORE any staging file or handle exists: the dump readers below
-    // are SQLite/PG-shaped SQL, and a treedb tree has no equivalent yet.
-    #[cfg(feature = "treedb")]
-    if matches!(rt.store, StoreKind::Treedb(_)) {
-        return Err(
-            "view export/import is not implemented for a treedb store — treedb snapshots its \
-             own directory (`treedb snapshot`), which is the durable dump of these trees"
-                .to_string(),
-        );
-    }
     let dir = xfer_dir(rt);
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     sweep_xfer(&dir);
@@ -3058,10 +3044,16 @@ fn view_export_stage(
             crate::pg_store::export_view(uri, view, &path, true, definition.clone())?
         }
         #[cfg(feature = "treedb")]
-        // The guard above already refused treedb, and naming the variant here
-        // instead of with a catch-all is what keeps a future backend from
-        // quietly reusing SQLite's dump reader.
-        StoreKind::Treedb(_) => unreachable!("export is refused for a treedb store above"),
+        // The third arm walks the tree instead of reading a SQL snapshot: same
+        // JSONL, same header, one `ReadDirPlus` page per directory (`treedb_store`
+        // owns the translation). No wire-protocol or engine change is involved.
+        StoreKind::Treedb(addr) => crate::treedb_store::export_view(
+            addr,
+            view,
+            &path,
+            true,
+            definition.clone(),
+        )?,
     };
     let size = std::fs::metadata(&path)
         .map_err(|e| format!("cannot stat staged export {handle}: {e}"))?
@@ -3222,7 +3214,7 @@ fn view_import_commit(
                  physical base tree instead"
             ));
         }
-        if !rt.control.has_physical(base)? {
+        if !has_tree(rt, base)? {
             return Err(format!(
                 "no physical base tree '{base}' — import the base first, or omit --as-fork"
             ));
@@ -3232,14 +3224,12 @@ fn view_import_commit(
         StoreKind::Sqlite => crate::meta::import_view(&rt.base, &view, &path, replace)?,
         StoreKind::Pg(uri) => crate::pg_store::import_view(uri, &view, &path, replace)?,
         #[cfg(feature = "treedb")]
-        // No dump reader for treedb (see `view_export_stage`): the tree can only
-        // be created empty and written through a mount.
-        StoreKind::Treedb(_) => {
-            return Err(
-                "view export/import is not implemented for a treedb store — create the base with \
-                 `view create` and write it through a mount".to_string(),
-            )
-        }
+        // Builds the tree through the same ops a mount uses (`Mkdir`/`Create`/
+        // `Symlink`/`Link` + one `Setattr` per node). The engine has no
+        // transaction, so this arm's atomicity story is "validate the whole file
+        // first, then build, then walk it back and count" — see `import_view` in
+        // `treedb_store`.
+        StoreKind::Treedb(addr) => crate::treedb_store::import_view(addr, &view, &path, replace)?,
     };
     if let Some(base) = &as_fork {
         if let Err(e) = rt.control.put_def(&view, &format!("fork {base}\n")) {
@@ -3863,6 +3853,43 @@ fn load_aliases(store: &dyn crate::mcp::ControlStore) -> io::Result<HashMap<Stri
         .map_err(|e| io::Error::other(format!("cannot read view definitions: {e}")))
 }
 
+/// The trees a treedb-backed server actually holds, or `None` when the backend
+/// is not treedb and the control store's own catalogue is authoritative.
+///
+/// The control store under treedb is the LOCAL SQLite one (definitions,
+/// aliases) and its physical enumeration lists `meta/*.db` files — which this
+/// backend never writes, because every tree lives inside the engine. Without
+/// this arm `view list` on a treedb store would print an empty store while
+/// `view export` happily reads the same trees (§6-1: two answers, one store).
+///
+/// NOTE for whoever lands the control-plane migration (`TreedbControlStore`) on
+/// top of this branch: that store answers the same two questions by unioning
+/// local files with the engine's `Op::ListViews`, which is the better home —
+/// these two helpers are the minimal version of the same union (the branch that
+/// carries this file has no control store that speaks treedb). At merge time
+/// delete `trees_in_engine`/`has_tree` and let every call site ask
+/// `rt.control` again; the call sites are all "does this tree exist".
+fn trees_in_engine(rt: &MetaRuntime) -> Result<Option<Vec<String>>, String> {
+    let _ = rt;
+    #[cfg(feature = "treedb")]
+    if let StoreKind::Treedb(addr) = &rt.store {
+        return crate::treedb_store::TreedbStore::list_views(addr)
+            .map(Some)
+            .map_err(|e| format!("treedb list views at {addr}: {e}"));
+    }
+    Ok(None)
+}
+
+/// Does a TREE exist under `name` (a tree, not merely a definition)? Same
+/// split as [`trees_in_engine`]: under treedb the engine answers, under the
+/// file/PG stores the control catalogue does.
+fn has_tree(rt: &MetaRuntime, name: &str) -> Result<bool, String> {
+    if let Some(v) = trees_in_engine(rt)? {
+        return Ok(v.iter().any(|n| n == name));
+    }
+    rt.control.has_physical(name)
+}
+
 /// Does `view` already exist here — as a governed definition (derived / fork /
 /// alias) or as a physical tree — WITHOUT creating anything? This is the probe
 /// `M_OPEN` gates with, and it must stay non-creating: calling
@@ -3884,17 +3911,11 @@ fn view_exists(rt: &MetaRuntime, view: &str) -> io::Result<bool> {
     if control.has_def(view).map_err(io::Error::other)? {
         return Ok(true);
     }
-    // A treedb tree is invisible to the control store's physical enumeration
-    // (that lists local db files), so under this backend the ENGINE is asked —
-    // the same source `store_for` gates on, so the two can never disagree about
-    // what exists.
-    #[cfg(feature = "treedb")]
-    if let StoreKind::Treedb(addr) = &rt.store {
-        return crate::treedb_store::TreedbStore::list_views(addr)
-            .map(|vs| vs.iter().any(|v| v == view))
-            .map_err(io::Error::other);
-    }
-    control.has_physical(view).map_err(io::Error::other)
+    // A physical tree is enumerated by the control catalogue under SQLite/PG and
+    // by the ENGINE under treedb — [`has_tree`] is the one place that split is
+    // made, so this probe and `physical.has` can never disagree about what
+    // exists.
+    has_tree(rt, view).map_err(io::Error::other)
 }
 
 /// Resolve the provider a client-visible `view` name is served from. Two
@@ -3971,7 +3992,7 @@ fn view_provider(rt: &MetaRuntime, view: &str) -> io::Result<Arc<dyn MetaProvide
             // deliberately NOT recorded in `defs`: `is_derived` stays false, so
             // structure writes are admitted while the client-side ack flag
             // (below) keeps content writes out.
-            if !control.has_physical(view).map_err(io::Error::other)? {
+            if !has_tree(rt, view).map_err(io::Error::other)? {
                 return Err(io::Error::other(format!(
                     "fork view '{view}' has no tree in {} — removed out-of-band?",
                     control.describe()
@@ -4003,13 +4024,13 @@ fn view_provider(rt: &MetaRuntime, view: &str) -> io::Result<Arc<dyn MetaProvide
             // published definition whose base was never created is a
             // provisioning mistake, and `store_for` below would otherwise leave
             // an empty `meta/<base>.db` (or PG schema) behind.
-            if !control.has_physical(&b).map_err(io::Error::other)? {
+            if !has_tree(rt, &b).map_err(io::Error::other)? {
                 return Err(io::Error::other(format!(
                     "derived view '{view}': its base '{b}' has no physical tree in {} — create the base first (`grovefs view create --view {b}`), then mount `{view}` again",
                     control.describe()
                 )));
             }
-            if control.has_physical(view).map_err(io::Error::other)? {
+            if has_tree(rt, view).map_err(io::Error::other)? {
                 // a physical tree named `view` exists — the name would be ambiguous
                 return Err(io::Error::other("view name shadows a physical db"));
             }
