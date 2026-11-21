@@ -98,7 +98,7 @@ postgres = { version = "0.19", default-features = false, optional = true }
 # sibling clone. Anonymous https on purpose: an SSH URL would make `cargo fetch`
 # prompt for credentials on machines that only have a key for the private
 # remotes. The engine core needs only `libc` + `thiserror` + std, and the pinned
-# tag v0.3.6 keeps its PG migration shim behind an off-by-default
+# tag v0.3.7 keeps its PG migration shim behind an off-by-default
 # `postgres-compat` feature, so nothing else enters our graph (the earlier pin
 # v0.3.0 still carried `postgres`/`rusqlite(bundled)`/`sha2`/`uuid`/`chrono`/
 # `tracing` unconditionally; upstream gated it afterwards).
@@ -122,7 +122,20 @@ postgres = { version = "0.19", default-features = false, optional = true }
 # so an engine data dir written by the old pin needs `treedb-migrate` before the
 # new server binary will open it. The e2e suite cannot see that because it always
 # starts a fresh engine dir.
-treedb = { git = "https://github.com/TechWander/treedb.git", tag = "v0.3.6", optional = true }
+#
+# Why v0.3.6 -> v0.3.7: pure robustness, no wire and no Rust-level API change
+# (PROTOCOL_VERSION stays 5, 51 ops / 30 replies, SNAP_VERSION stays 3, the
+# `Client` surface is untouched) — so this pin bump needs no adapter edit. What
+# it buys is the failure modes that used to be silent: snapshots now carry a
+# crc32 over body+seq (a flipped bit is refused instead of replayed, and old
+# 8-byte-trailer files still load because the shape is self-describing), the
+# data directory takes an exclusive flock (two engines on one dir is exit 1
+# instead of duelling replays; `treedb-migrate` takes the same lock), bad
+# `--durability`/`--workers` values are rejected at startup with exit 2, a
+# checkpoint error during SIGTERM shutdown is reported (exit 1) rather than
+# swallowed, a backlogged worker drops EPOLLIN instead of spinning a core, and
+# unlink/rmdir on a non-dir parent answer ENOTDIR instead of ENOENT.
+treedb = { git = "https://github.com/TechWander/treedb.git", tag = "v0.3.7", optional = true }
 # Opt-in per-stage latency telemetry (src/stats.rs): high-dynamic-range histograms
 # for offline bottleneck diagnosis. Pure-Rust, zero deps. Only touched when
 # `--stats` / `GROVEFS_STATS=1` is on; the disabled path costs one atomic load.
