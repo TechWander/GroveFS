@@ -353,7 +353,7 @@ impl DataServer {
 
     /// Blocks forever serving connections.
     pub fn serve(&self) -> io::Result<()> {
-        let listener = TcpListener::bind(&self.listen)?;
+        let listener = crate::platform::bind_listener(&self.listen)?;
         println!(
             "data-server listening on {} (host {}, {} data root(s): {})",
             self.listen,

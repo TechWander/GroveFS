@@ -30,7 +30,7 @@ use libc::{EACCES, EAGAIN, ENOENT, ENOSYS};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -400,7 +400,7 @@ impl Manager {
 
     /// Blocks forever serving registrations, lookups and status.
     pub fn serve(self) -> io::Result<()> {
-        let listener = TcpListener::bind(&self.listen)?;
+        let listener = crate::platform::bind_listener(&self.listen)?;
         let this = Arc::new(self);
         println!(
             "manager listening on {} (host-readable state {})",

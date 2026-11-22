@@ -825,7 +825,7 @@ impl MetaServer {
                 (Some(keys), Some(web), note)
             }
         };
-        let listener = TcpListener::bind(&self.listen)?;
+        let listener = crate::platform::bind_listener(&self.listen)?;
         println!(
             "meta-server listening on {} (base {}, role {:?}{})",
             self.listen,
@@ -925,7 +925,7 @@ impl MetaServer {
         // separable by firewall/netns from the mount plane, and a mount
         // session must never be able to reach a governance op.
         if let Some(addr) = &self.control_listen {
-            let cl = TcpListener::bind(addr).map_err(|e| {
+            let cl = crate::platform::bind_listener(addr).map_err(|e| {
                 io::Error::new(
                     e.kind(),
                     format!(

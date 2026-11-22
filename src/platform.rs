@@ -180,3 +180,174 @@ pub fn enable_tcp_keepalive(s: &std::net::TcpStream) {
         let _ = s;
     }
 }
+
+// ==================== listening sockets ====================================
+
+/// Bind a LISTENING socket that a server can take its port back on.
+///
+/// Why: a socket that closes while a client was still connected leaves a
+/// TIME_WAIT entry on its port, and Linux then REFUSES a new bind on that
+/// port — even one that sets `SO_REUSEADDR` itself, because the TIME_WAIT
+/// entry was created without the flag. The window is the kernel's 60 s
+/// TIME_WAIT, so a node that restarts right after its last client disconnected
+/// cannot come up: "Address already in use" on a port that is visibly empty.
+/// Every server in this crate (meta, data, manager, control) comes back on the
+/// SAME port in normal operation — that is what a redeploy is — so the failure
+/// window sits exactly on top of the restart window.
+///
+/// The flag has to be on the LISTENER and set BEFORE the bind: the bind is the
+/// moment the kernel checks it, and the listener's flag is inherited by every
+/// accepted socket, so the TIME_WAIT entries the server itself creates are
+/// reusable and the NEXT instance binds the port at once.
+///
+/// Best-effort by design, like [`enable_tcp_keepalive`]: a socket whose
+/// options cannot be set still works, it just degrades to the pre-fix
+/// behaviour.
+///
+/// The `fuse-bridge` layer is the one keepalive uses, and for the same reason:
+/// `libc` is an optional dependency, so the WinFsp client build (`remote-only`
+/// alone) must not see a `libc` call. It runs no server, so the plain bind is
+/// the right degradation there. The raw socket path is Linux-only because that
+/// is where the servers run.
+#[cfg(all(feature = "fuse-bridge", target_os = "linux"))]
+pub fn bind_listener(addr: &str) -> std::io::Result<std::net::TcpListener> {
+    use std::net::{SocketAddr, ToSocketAddrs};
+    use std::os::unix::io::FromRawFd;
+
+    let mut resolved = addr.to_socket_addrs()?;
+    let sa: SocketAddr = resolved.next().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("cannot resolve {addr}"),
+        )
+    })?;
+
+    // A RAW socket, because `std::net::TcpListener::bind` leaves no room to
+    // set an option before the bind — and SO_REUSEADDR is only consulted there.
+    let fd = unsafe {
+        let domain = match sa {
+            SocketAddr::V4(_) => libc::AF_INET,
+            SocketAddr::V6(_) => libc::AF_INET6,
+        };
+        libc::socket(domain, libc::SOCK_STREAM, 0)
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    unsafe {
+        // Close-on-exec, so a server that spawns a helper does not hand its
+        // listening socket down to the child.
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+        }
+        // The one option this whole helper exists for.
+        let one: libc::c_int = 1;
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            &one as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+    let rc = unsafe {
+        match sa {
+            SocketAddr::V4(v4) => {
+                let s = libc::sockaddr_in {
+                    sin_family: libc::AF_INET as libc::sa_family_t,
+                    sin_port: v4.port().to_be(),
+                    sin_addr: libc::in_addr {
+                        s_addr: u32::from_ne_bytes(v4.ip().octets()),
+                    },
+                    sin_zero: [0; 8],
+                };
+                libc::bind(
+                    fd,
+                    &s as *const libc::sockaddr_in as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            }
+            SocketAddr::V6(v6) => {
+                let s = libc::sockaddr_in6 {
+                    sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                    sin6_port: v6.port().to_be(),
+                    sin6_flowinfo: 0,
+                    sin6_addr: libc::in6_addr {
+                        s6_addr: v6.ip().octets(),
+                    },
+                    sin6_scope_id: v6.scope_id(),
+                };
+                libc::bind(
+                    fd,
+                    &s as *const libc::sockaddr_in6 as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
+            }
+        }
+    };
+    if rc != 0 {
+        let e = std::io::Error::last_os_error();
+        unsafe { libc::close(fd); }
+        return Err(e);
+    }
+    if unsafe { libc::listen(fd, 128) } != 0 {
+        let e = std::io::Error::last_os_error();
+        unsafe { libc::close(fd); }
+        return Err(e);
+    }
+    Ok(unsafe { std::net::TcpListener::from_raw_fd(fd) })
+}
+
+/// The plain bind, for the builds that run no server (see the doc comment).
+#[cfg(not(all(feature = "fuse-bridge", target_os = "linux")))]
+pub fn bind_listener(addr: &str) -> std::io::Result<std::net::TcpListener> {
+    std::net::TcpListener::bind(addr)
+}
+
+#[cfg(test)]
+mod tests {
+    /// A server that restarts on the SAME port must get the port back at once:
+    /// the TIME_WAIT entry the previous instance left behind refuses the bind
+    /// for up to a minute unless the listener carried SO_REUSEADDR.
+    #[test]
+    #[cfg(all(feature = "fuse-bridge", target_os = "linux"))]
+    fn a_listener_takes_its_port_back_after_a_client_left() {
+        use std::os::unix::io::AsRawFd;
+
+        let l = super::bind_listener("127.0.0.1:0").expect("first bind");
+        let addr = l.local_addr().expect("local addr");
+
+        // The flag itself, read back off the socket: the behaviour below
+        // depends on it, and a regression would silently drop it.
+        let mut val: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                l.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_REUSEADDR,
+                &mut val as *mut libc::c_int as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0, "getsockopt(SO_REUSEADDR) failed");
+        assert_eq!(val, 1, "a listening socket must carry SO_REUSEADDR");
+
+        let c = std::net::TcpStream::connect(addr).expect("connect");
+        let (a, _) = l.accept().expect("accept");
+        // The SERVER closes first: that is the side that ends up in TIME_WAIT
+        // holding the listening port.
+        drop(a);
+        drop(c);
+        drop(l);
+
+        // The next instance takes the same port at once.
+        let again = super::bind_listener(&addr.to_string());
+        assert!(
+            again.is_ok(),
+            "rebind after a client left must work: {:?}",
+            again.err()
+        );
+    }
+}
