@@ -409,17 +409,18 @@ impl TreedbStore {
         match g.call(op) {
             Ok(r) => Ok(r),
             Err(e) if op.is_readonly() => {
-                let last: String;
-                match Client::connect_auth(&self.addr, CONNECT_TIMEOUT_MS, self.key.as_deref()) {
+                let again =
+                    Client::connect_auth(&self.addr, CONNECT_TIMEOUT_MS, self.key.as_deref());
+                let last = match again {
                     Ok(c) => {
                         *g = c;
-                        last = match g.call(op) {
+                        match g.call(op) {
                             Ok(r) => return Ok(r),
                             Err(e2) => e2.to_string(),
-                        };
+                        }
                     }
-                    Err(re) => last = format!("{e}; reconnect: {re}"),
-                }
+                    Err(re) => format!("{e}; reconnect: {re}"),
+                };
                 Err(Fail::db(format!("treedb transport: {last}")))
             }
             Err(e) => Err(Fail::db(format!("treedb transport: {e}"))),
@@ -681,6 +682,9 @@ impl TreedbStore {
     }
 
     /// 属性类写入的公共部分：`Setattr` 只带自己那一位 valid。
+    /// 参数就是 FUSE setattr 掩码的形状（同 `engine.rs`/`pg_store.rs` 的对应方法），
+    /// 不为过 clippy 的 arity 线而拆散它。
+    #[allow(clippy::too_many_arguments)]
     fn setattr(&self, ino: i64, valid: u32, mode: u32, uid: u32, gid: u32, atime: i64, mtime: i64) {
         if self.readonly {
             return;
