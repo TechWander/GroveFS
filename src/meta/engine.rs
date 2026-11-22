@@ -1302,6 +1302,15 @@ pub fn rebuild_ledger(base: &Path) -> rusqlite::Result<usize> {
     if let Err(msg) = layout_guard(base) {
         return Err(rusqlite::Error::InvalidParameterName(msg));
     }
+    // The same rule for a MISSING root: there is nothing to recount, and a
+    // recount over a path that is not a store books ZERO holders — which is
+    // what makes the NEXT `gc --apply` free every object in the store the
+    // operator meant to point at. Refusing here also keeps a typo'd path from
+    // becoming a store: without this, the rebuild would CREATE the metadata
+    // root it just found missing.
+    if let Err(msg) = require_meta_dir(base) {
+        return Err(rusqlite::Error::InvalidParameterName(msg));
+    }
     let views: Vec<std::path::PathBuf> = list_view_trees(base)
         .into_iter()
         .map(|name| view_db_path(base, &name))

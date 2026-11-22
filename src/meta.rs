@@ -462,6 +462,27 @@ pub fn layout_guard(base: &Path) -> Result<(), String> {
     ))
 }
 
+/// The metadata root must EXIST before a reader turns its tree list into a
+/// decision.
+///
+/// [`layout_guard`] refuses the flat v1 shape, but a MISSING `<base>/meta` is a
+/// different thing — and the flat enumerator refused it too, because its
+/// `read_dir` failed. Under layout v2 the enumerator answers "no trees" for a
+/// missing directory, and that empty list IS a decision: `gc --apply` then
+/// judges every object in the data root an orphan and reclaims the whole store,
+/// silently, off a typo in `--meta-dir`.
+///
+/// So the read paths whose tree list feeds a destructive decision call this
+/// first. The write paths (create/import/open) do not: they are what MAKES the
+/// directory.
+pub fn require_meta_dir(base: &Path) -> Result<PathBuf, String> {
+    let meta = meta_dir(base);
+    if !meta.is_dir() {
+        return Err(format!("no metadata directory {}", meta.display()));
+    }
+    Ok(meta)
+}
+
 /// Create the tree's home and return its db path. Every "open, creating if
 /// absent" site funnels through here so the directory never has to be
 /// remembered separately.

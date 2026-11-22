@@ -158,6 +158,77 @@ fn a_flat_store_is_refused_by_every_reader_that_needs_the_trees() {
     );
 }
 
+/// Every object file under a data root, by path: the thing a reclaim would
+/// take away.
+fn objects(root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for ent in fs::read_dir(&d).unwrap().flatten() {
+            let p = ent.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                out.push(p.display().to_string());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// A path that is not a store must be REFUSED by the readers whose tree list
+/// becomes a delete decision — never answered as "no trees".
+///
+/// The flat-layout sibling above refuses a store of the WRONG shape. This one
+/// refuses a path of the right shape that does not exist at all (a typo in
+/// `--meta-dir`). Under layout v2 the tree enumerator reports "no trees" for a
+/// missing directory, and that empty list is exactly what `gc --apply` deletes
+/// on: with no tree naming them, every object in the data root reads as an
+/// orphan.
+#[test]
+fn a_missing_metadata_root_is_refused_before_it_can_decide_anything() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = populated(dir.path());
+    let h = home.to_str().unwrap();
+    let before = objects(&home.join("blocks"));
+    assert!(!before.is_empty(), "the store must really hold objects");
+
+    // The typo: a sibling path that was never a store.
+    let typo = home.join("typo");
+    let t = typo.to_str().unwrap();
+
+    // The audit refuses instead of reporting an empty store.
+    let (ok, _o, e) = gv(&["gc", "--meta-dir", t, "--data-dir", h, "--older-than", "0"]);
+    assert!(!ok, "a missing metadata root must not read as an empty store");
+    assert!(e.contains("no metadata directory"), "{e}");
+
+    // And the apply that would have reclaimed the whole data root refuses too,
+    // with the bytes still there.
+    let (ok, _o, e) = gv(&[
+        "gc",
+        "--meta-dir",
+        t,
+        "--data-dir",
+        h,
+        "--older-than",
+        "0",
+        "--apply",
+    ]);
+    assert!(!ok, "a missing metadata root must not reclaim anything: {e}");
+    assert_eq!(before, objects(&home.join("blocks")), "the bytes must be untouched");
+
+    // The ledger recount refuses as well — and does not TURN the typo into a
+    // store by creating the metadata root it just found missing.
+    let (ok, _o, e) = gv(&["refs", "--meta-dir", t, "rebuild"]);
+    assert!(!ok, "a recount over a path that is not a store must refuse: {e}");
+    assert!(e.contains("no metadata directory"), "{e}");
+    assert!(
+        !typo.join("meta").exists(),
+        "the refusal must not leave a store behind"
+    );
+}
+
 #[test]
 fn migrate_completes_in_one_pass_even_with_sidecars_it_folds_away() {
     let dir = tempfile::tempdir().unwrap();

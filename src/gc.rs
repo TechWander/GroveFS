@@ -213,6 +213,7 @@ fn layout_base(key: &str) -> Option<String> {
 /// look orphaned, and `--apply` would reclaim the store.
 pub fn physical_views(meta_root: &Path) -> Result<Vec<String>, String> {
     crate::meta::layout_guard(meta_root)?;
+    crate::meta::require_meta_dir(meta_root)?;
     Ok(crate::meta::list_view_trees(meta_root))
 }
 
@@ -251,6 +252,10 @@ impl Refs {
 /// orphans, and this module's whole contract is "never guess when deleting".
 fn collect_refs(meta_root: &Path) -> Result<Refs, String> {
     crate::meta::layout_guard(meta_root)?;
+    // A MISSING metadata root enumerates as "no trees", and that empty list is
+    // the delete decision: every object in the data root would read as an
+    // orphan. Refuse the path instead of reclaiming a store over a typo.
+    crate::meta::require_meta_dir(meta_root)?;
     let mut views = Vec::new();
     let mut keys = HashSet::new();
     let mut striped = HashSet::new();
