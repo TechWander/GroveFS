@@ -340,6 +340,7 @@ fn mount_of_unknown_view_is_refused_without_creating_it() {
 ///   * a mount that passed a ROGUE meta — an attacker's meta signing with a
 ///     different key K' — holds a capability the honest data plane refuses,
 ///     even though the attacker knows the shared cluster token.
+///
 /// This proves the two-plane admission binding, not just the isolated data gate
 /// [`remote_roundtrip`]'s `data_server_dac_gate_*` covers.
 #[test]

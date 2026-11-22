@@ -872,10 +872,7 @@ mod tests {
                     c2.fetch_add(1, Ordering::SeqCst);
                     // One thread per accepted socket, requests served in order:
                     // the shape the real handler has for a pinned caller.
-                    loop {
-                        let Ok((_op, body)) = proto::recv_request(&mut sock) else {
-                            break;
-                        };
+                    while let Ok((_op, body)) = proto::recv_request(&mut sock) {
                         let req: Value =
                             serde_json::from_slice(&body).unwrap_or(Value::Null);
                         if req.get("pin").and_then(Value::as_bool) == Some(true)

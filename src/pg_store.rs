@@ -311,10 +311,10 @@ pub fn redact_uri(uri: &str) -> String {
 ///    overwhelmingly common deployment pays zero extra queries;
 /// 1. a placement row in `grovefs_control.view_placement` (written by
 ///    `view create` / fork seeding / import);
-/// 1b. MIGRATION BOOTSTRAP: no row, but the schema exists on the control
-///     instance — a view created before the store grew a second instance is
-///     pinned to the control instance once (that was its only home), so a
-///     single-instance → registry upgrade never re-routes old views;
+///    1b. MIGRATION BOOTSTRAP: no row, but the schema exists on the control
+///    instance — a view created before the store grew a second instance is
+///    pinned to the control instance once (that was its only home), so a
+///    single-instance → registry upgrade never re-routes old views;
 /// 2. the pure name hash (the same FNV-1a as [`route_store`], over the
 ///    expanded book) — views of a legacy multi-instance hash deployment keep
 ///    their historical mapping.
@@ -1368,7 +1368,7 @@ pub fn view_pool_set(
     want: PgPoolSettings,
     inherit: bool,
 ) -> Result<PgPoolSettings, String> {
-    let (home, uri) = resolve_view_home(spec, view)?;
+    let (_home, uri) = resolve_view_home(spec, view)?;
     let schema = schema_for(view)
         .ok_or_else(|| format!("view name '{view}' incompatible with PG schema naming"))?;
     let mut c = Client::connect(&uri, NoTls).map_err(|e| format!("postgres connect: {e}"))?;
@@ -1425,10 +1425,7 @@ pub fn view_pool_set(
         ));
     }
     // The placement the view already has is untouched; only the bounds moved.
-    read_pool_rows(&mut c, &schema).map(|s| {
-        let _ = home;
-        s
-    })
+    read_pool_rows(&mut c, &schema)
 }
 
 /// The declared rows of one view's `ctrl` table, as settings. Refuses plainly
@@ -3120,7 +3117,7 @@ impl PgEngine {
     ///
     /// Mutable state of one graft transaction: see the module-level
     /// [`GraftCtx`].
-
+    ///
     /// Graft a curated subset of `src`'s tree into the tree of `dst`: for every
     /// [`crate::meta::GraftItem`], copy that entry (a directory brings its
     /// subtree) to `dest/<dst>`, renaming it to the destination basename.
@@ -4548,11 +4545,10 @@ pub fn move_view(spec: &str, view: &str, target: &str, keep_source: bool) -> Res
         to: target.to_string(),
         source_dropped,
     })
-    .map(|r| {
+    .inspect(|_| {
         if !source_note.is_empty() {
             eprintln!("note: {source_note}");
         }
-        r
     })
 }
 

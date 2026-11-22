@@ -7,6 +7,18 @@
 
 use super::*;
 use crate::meta::{MetaEngine, MetaStore};
+
+/// One cached physical tree: the engine plus the stamp of its last resolve.
+type CachedTree = (Arc<MetaStore>, Arc<AtomicU64>);
+
+/// The physical-tree cache: base view → engine + last-resolve stamp.
+type TreeCache = Arc<Mutex<HashMap<String, CachedTree>>>;
+
+/// One cached provider: what a derived view name resolves to, plus its stamp.
+type CachedProvider = (Arc<dyn MetaProvider>, Arc<AtomicU64>);
+
+/// The derived-view cache: client-visible name → provider + last-resolve stamp.
+type ProviderCache = Arc<Mutex<HashMap<String, CachedProvider>>>;
 /// HA role of a meta-server node. `Primary` serves reads + writes and ships
 /// snapshots to its `peer`; `Standby` serves reads + event subscriptions from
 /// the replicated copy and rejects write-intent ops with [`E_ROFS`]. The
@@ -191,7 +203,7 @@ struct MetaRuntime {
     /// ([`evict_idle`]) once neither a mounted session nor recent traffic
     /// pins them; under the PG backend eviction is what releases the
     /// per-view pooled connections back to `max_connections`.
-    cache: Arc<Mutex<HashMap<String, (Arc<MetaStore>, Arc<AtomicU64>)>>>,
+    cache: TreeCache,
     subs: Subscribers,
     ha: Option<Arc<HaState>>,
     peer: Option<String>,
@@ -256,7 +268,7 @@ struct MetaRuntime {
     /// last-resolve stamp as [`MetaRuntime::cache`]: a busy lens over a base
     /// keeps the WHOLE base group resident, so eviction only fires when the
     /// physical tree and every derived name on it have gone idle together.
-    views: Arc<Mutex<HashMap<String, (Arc<dyn MetaProvider>, Arc<AtomicU64>)>>>,
+    views: ProviderCache,
     /// Derived view name → physical base view name. Physical views map to
     /// themselves, so subscribers and snapshot pushes can always resolve the
     /// tree a name actually reads. Populated by [`view_provider`].

@@ -97,7 +97,7 @@ const MAX_BLOCK: Duration = Duration::from_secs(30 * 60);
 /// How long `fails` failures should block an IP. Pure, so the growth curve is
 /// testable without a clock and a socket.
 fn block_for(fails: u32) -> Duration {
-    let over = fails.saturating_sub(MAX_FAILS).min(10) as u32;
+    let over = fails.saturating_sub(MAX_FAILS).min(10);
     let secs = BASE_BLOCK
         .as_secs()
         .saturating_mul(1u64 << over)

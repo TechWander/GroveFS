@@ -949,6 +949,7 @@ impl ApiKeyStore {
     /// [`Self::reveal`] opens. With no wrapping material in force the second
     /// copy is simply NULL and the key is show-once, as it was before the
     /// column — never a plaintext instead.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_extended(
         &self,
         label: &str,

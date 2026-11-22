@@ -2373,6 +2373,7 @@ fn meta_path(base: &Path, view: &str) -> PathBuf {
 /// is not: [`grovefs::manager::spawn_registrar`] retries with backoff while the
 /// server serves, because a directory service outage must not become a storage
 /// outage.
+#[allow(clippy::too_many_arguments)]
 fn register_with_manager(
     role: grovefs::manager::Role,
     listen: &str,
@@ -2700,8 +2701,8 @@ fn web_govern(
                 return Ok(());
             }
             println!(
-                "{:<20} {:<6} {:<22} {:<22} {:<22} {}",
-                "account", "role", "created", "last sign-in", "disabled", "base views governed"
+                "{:<20} {:<6} {:<22} {:<22} {:<22} base views governed",
+                "account", "role", "created", "last sign-in", "disabled"
             );
             for r in &rows {
                 let mut bases = jlist(r, "bases");
@@ -2811,8 +2812,8 @@ An account with role `user` governs nothing until it is granted a base view:
                 return Ok(());
             }
             println!(
-                "{:<20} {:<24} {:<8} {:<22} {}",
-                "account", "base view", "perm", "granted", "by"
+                "{:<20} {:<24} {:<8} {:<22} by",
+                "account", "base view", "perm", "granted"
             );
             for r in &rows {
                 println!(
@@ -2940,6 +2941,7 @@ impl KeyAdmin {
     /// remote arm lets the server stamp it from the AUTHENTICATED account (a
     /// client naming its own minter is a claim, not a record), and the local arm
     /// has no identity to record — it is the store itself.
+    #[allow(clippy::too_many_arguments)]
     fn create(
         &self,
         label: &str,
@@ -3923,10 +3925,10 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 (Some(account), Some(path)) => {
                     if control_listen.is_none() {
-                        return Err(format!(
+                        return Err(
                             "--admin-user needs --control-listen HOST:PORT: the web accounts live \n                             beside the control plane, and without that port nothing can verify a sign-in"
+                                .into(),
                         )
-                        .into())
                     }
                     let text = std::fs::read_to_string(path)
                         .map_err(|e| format!("cannot read --admin-password-file {}: {e}", path.display()))?;
@@ -5102,7 +5104,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         return Ok(());
                     }
                     println!(
-                        "{:<3} {:<18} {:<12} {:<16} {:<16} {:<7} {:<12} {:<4} {:<25} {:<25} {}",
+                        "{:<3} {:<18} {:<12} {:<16} {:<16} {:<7} {:<12} {:<4} {:<25} {:<25} expires / revoked / note",
                         "#",
                         "id",
                         "key",
@@ -5112,8 +5114,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         "view",
                         "rw",
                         "created",
-                        "last_used",
-                        "expires / revoked / note"
+                        "last_used"
                     );
                     for (i, r) in rows.iter().enumerate() {
                         // The three tail fields share one trailing column: each is
