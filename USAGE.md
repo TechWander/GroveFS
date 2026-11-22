@@ -654,6 +654,7 @@ $ grovefs view --meta-dir $BASE list
 view 'docsonly' -> base 'team': 0 hide, 1 only, 0 reloc rule(s)
 
 $ grovefs mount --view docsonly --manager 10.0.0.5:50055 --roster-key-file /etc/grovefs/roster.key -m /mnt/lens &   # 只给派生名,客户端不带任何规则文件
+manager 10.0.0.5:50055: deployment 'default' epoch 1 resolved meta [10.0.0.5:50110] data [10.0.0.5:50100] (signature verified, valid for 300s more)
 using remote metadata service at 10.0.0.5:50110
 derived view 'docsonly' over base 'team': read-only lens
 note: derived (virtual) views mount read-only — write to base view 'team'
@@ -1332,6 +1333,7 @@ apikey: revoked id='18c4bb4091764ad6' (label 'laptop-alice'); it can no longer a
 $ printf 'late' > /mnt/a/new.txt
 bash: /mnt/a/new.txt: 输入/输出错误        # EIO:后台复验 tick 先落地,daemon 正在自卸载
 $ cat /tmp/grovefs-mount--mnt-a.log        # 分离挂载的日志默认落 $TMPDIR,按挂载点命名(`--log-file` 可指定)
+manager 127.0.0.1:50055: deployment 'default' epoch 1 resolved meta [127.0.0.1:15310] data [127.0.0.1:15311] (signature verified, valid for 300s more)
 using remote metadata service at 127.0.0.1:15310
 using remote data service at 127.0.0.1:15311
 grovefs: access refused by the server (authentication failed: this api key has been revoked) — unmounting this view
@@ -3180,6 +3182,7 @@ created BASE view 'share' at /tmp/grove_case/data/meta/share/share.db
 
 ```console
 $ ./grovefs mount --view share --manager 127.0.0.1:50055 --roster-key-file ~/roster.key --token "$TOK" -m /tmp/grove_case/mnt_da
+manager 127.0.0.1:50055: deployment 'default' epoch 1 resolved meta [127.0.0.1:50110] data [127.0.0.1:50100] (signature verified, valid for 300s more)
 using remote metadata service at 127.0.0.1:50110
 using remote data service at 127.0.0.1:50100
 mounting view 'share' at /tmp/grove_case/mnt_da (fully remote: no local store)   # 远程挂载不需要 --home
@@ -3215,6 +3218,7 @@ share.db  share.db-shm  share.db-wal
 
 ```console
 $ ./grovefs mount --view share --manager 127.0.0.1:50055 --roster-key-file ~/roster.key --token "$TOK" --ro -m /tmp/grove_case/mnt_db
+manager 127.0.0.1:50055: deployment 'default' epoch 1 resolved meta [127.0.0.1:50110] data [127.0.0.1:50100] (signature verified, valid for 300s more)
 using remote metadata service at 127.0.0.1:50110
 using remote data service at 127.0.0.1:50100
 mounting view 'share' at /tmp/grove_case/mnt_db (fully remote: no local store, read-only)

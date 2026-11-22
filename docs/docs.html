@@ -1176,7 +1176,8 @@ meta</i>
 
     <h4>② 客户端 A:读写挂载 + 写文件</h4>
     <pre class="term"><b>$</b> ./grovefs mount --view share --manager 127.0.0.1:50055 --roster-key-file ~/roster.key --token "$TOK" -m /tmp/grove_case/mnt_da   <i># 远程挂载不需要 --home</i>
-<i>using remote metadata service at 127.0.0.1:50110
+<i>manager 127.0.0.1:50055: deployment 'default' epoch 1 resolved meta [127.0.0.1:50110] data [127.0.0.1:50100] (signature verified, valid for 300s more)
+using remote metadata service at 127.0.0.1:50110
 using remote data service at 127.0.0.1:50100
 mounting view 'share' at /tmp/grove_case/mnt_da (fully remote: no local store)</i>
 <b>$</b> findmnt -T /tmp/grove_case/mnt_da
@@ -1205,7 +1206,8 @@ fa513481-830f-4719-b5a7-156e1ace1c96</i>
 
     <h4>③ 客户端 B:只读挂载,读得到、写不进</h4>
     <pre class="term"><b>$</b> ./grovefs mount --view share --manager 127.0.0.1:50055 --roster-key-file ~/roster.key --token "$TOK" --ro -m /tmp/grove_case/mnt_db
-<i>using remote metadata service at 127.0.0.1:50110
+<i>manager 127.0.0.1:50055: deployment 'default' epoch 1 resolved meta [127.0.0.1:50110] data [127.0.0.1:50100] (signature verified, valid for 300s more)
+using remote metadata service at 127.0.0.1:50110
 using remote data service at 127.0.0.1:50100
 mounting view 'share' at /tmp/grove_case/mnt_db (fully remote: no local store, read-only)</i>
 <b>$</b> findmnt -T /tmp/grove_case/mnt_db   <i># 注意 OPTIONS 里是 ro</i>
