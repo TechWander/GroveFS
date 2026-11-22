@@ -2208,7 +2208,7 @@ ps aux | grep grovefs                     # 查看在跑的 server / mount
 
 ## 10. 验证与回归
 
-全板一共 **43 段**:`build` → `unit` → **40 个套件** → `bench`。**前 42 段门控 GREEN,`bench` 只打吞吐参考值、永不门控**(只要纯功能回归就 `SKIP_BENCH=1`)。`pg`/`pg_parallel`/`evict`/`control`/`forksrv` 在无可达 PostgreSQL 的主机上整段自动 SKIP,`client` 在没有同级 `grovefs-client` 检出(或其二进制、`fusermount` 助手)的机器上整段 SKIP,`xfer`/`gcremote` 则跳过 PG 臂只跑 SQLite 臂,都不拉低 GREEN;实验性后端占两段 —— `treedb` 是形状自检(31 条),`treedbmatrix` 把 `posix`+`e2e` 那两套断言矩阵在 `--meta-store treedb://` 上逐标签重放(49 条 = 39 OK + 10 SKIP + 0 FAIL,那 10 条 SKIP 全部是硬链接 —— 引擎没有 `Link` op 的定价代价),故**按实测三元组门控**:`pass=39 fail=0 skip=10` 记 PASS,三元组只要动一下(多一条 FAIL、少一条断言、缺口自己合上了)都记红。两者要真跑得上带 feature 的构建 —— `FEATURES_TREEDB=1 bash .build-bin/run_all.sh …` 让板子的 `build` 步骤加 `--features treedb`;默认构建(未开 feature)整段 SELF-SKIP 落 INFO,同样不拉低 GREEN。
+全板一共 **43 段**:`build` → `unit` → **40 个套件** → `bench`。**前 42 段门控 GREEN,`bench` 只打吞吐参考值、永不门控**(只要纯功能回归就 `SKIP_BENCH=1`)。`pg`/`pg_parallel`/`evict`/`control`/`forksrv` 在无可达 PostgreSQL 的主机上整段自动 SKIP,`client` 在没有同级 `grovefs-client` 检出(或其二进制、`fusermount` 助手)的机器上整段 SKIP,`xfer`/`gcremote` 则跳过 PG 臂只跑 SQLite 臂,都不拉低 GREEN;实验性后端占两段 —— `treedb` 是形状自检(53 条),`treedbmatrix` 把 `posix`+`e2e` 那两套断言矩阵在 `--meta-store treedb://` 上逐标签重放(49 条 = 39 OK + 10 SKIP + 0 FAIL,那 10 条 SKIP 全部是硬链接 —— 引擎没有 `Link` op 的定价代价),故**按实测三元组门控**:`pass=39 fail=0 skip=10` 记 PASS,三元组只要动一下(多一条 FAIL、少一条断言、缺口自己合上了)都记红。两者要真跑得上带 feature 的构建 —— `FEATURES_TREEDB=1 bash .build-bin/run_all.sh …` 让板子的 `build` 步骤加 `--features treedb`;默认构建(未开 feature)整段 SELF-SKIP 落 INFO,同样不拉低 GREEN。
 
 ```bash
 export LC_ALL=C LANG=C                                 # 仓库根目录下执行(PKG_CONFIG 不必设:无 crate 查 pkg-config,§1)
