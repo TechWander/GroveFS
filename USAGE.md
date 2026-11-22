@@ -1862,7 +1862,7 @@ HMAC 是对称的——能验签的客户端也能签,这条强度上限、被 D
 
 ### 5.1 物理布局
 
-- **单对象**:`blocks/<2hex>/<key>`,一个文件 = 一个对象文件。对象按 key 哈希自动扇出进 256 个桶子目录(桶名是 key 哈希的前两位 hex),单层即止、不建深层树——单目录条目数不随总量增长,千万级对象下每个桶仅数万条,`ls`/`rsync`/备份工具不退化。桶名是 key 的纯函数,启动时预建 256 个,热路径不做 mkdir。
+- **单对象**:`blocks/<2hex>/<key>`,一个文件 = 一个对象文件。对象按 key 哈希自动扇出进 256 个桶子目录(桶名是 `FNV-1a(key) % 256` 的两位小写 hex,不是 key 的前缀),单层即止、不建深层树——单目录条目数不随总量增长,千万级对象下每个桶仅数万条,`ls`/`rsync`/备份工具不退化。桶名是 key 的纯函数,启动时预建 256 个,热路径不做 mkdir。
 - **key 命名**:视图写入时生成 UUID 作为对象 key,存进视图 `data_ref` 字段。
 - **条带化(大文件跨多 data-server)**:`data_ref` 编码为 `s<N>:<stripe>[:<fp>]:<uuid>`(`<fp>` 是成员 id 集合的指纹,只在身份模式下出现;位置模式保持三字段),
   第 i 块 key = `{uuid}#{i}`,落在 `servers[i % N]`——启用了 `--member-id` 时槽位按成员 id 排序后的**身份**确定(列表顺序无关),未启用时是**列表下标**,不是地址。**无 `s` 前缀的 key = 单对象**(未启用条带的存储形态)。
@@ -2769,6 +2769,7 @@ GREEN 判定:所有套件 PASS(`pg` 在无 PG 主机上自动 SKIP,不拉低 GRE
 >         │ data-server :50100   字节存 /data/blocks/       │
 >         │ meta-server :50110   权威树存 /data/meta/<view>/   │
 >         │          (默认 embedded SQLite3,无需安装任何数据库)    │
+>         │ manager   :50055   挂载坐标只从它签发的 roster 解析    │
 >         └─────────┬─────────────────┬────────┘
 >             ▲ 读写                   ▲ 只读
 >  客户端A 192.168.1.11            客户端B 192.168.1.12
@@ -2873,7 +2874,7 @@ ss -lntp | grep -E '50100|50110'      # 两行都在,进程名 grovefs
 
 两个前台窗口应分别打出一行 banner——`data-server listening on 0.0.0.0:50100 (host <存储机主机名>, 1 data root(s): /data)` 和 `meta-server listening on 0.0.0.0:50110 (base /data, role Primary)`;data 行回显主机名与根列表,是因为各节点根路径常常同名——翻日志时先认准 host 再认路径。长什么样的完整终端见 §13.11 实录①。
 
-要接挂载引导,再加第三个单元(§4.2;只在挂载那一刻被问一次,不在 IO 路径上,宕机不动活挂载只让新挂载 fail-closed。`join.key`/`roster.key` 首次 `serve` 时铸在 `<state-dir>/manager/` 下,0600):
+第三个单元是 manager——**必需**:`mount` 已不接受手敲的 `--meta-server`/`--data-servers`,坐标只能从 manager 签发的 roster 解析(§4.2)。它只在挂载那一刻被问一次,不在 IO 路径上;宕机不动活挂载,只让**新**挂载 fail-closed。`join.key`/`roster.key` 首次 `serve` 时铸在 `<state-dir>/manager/` 下,0600:
 
 ```ini
 # /etc/systemd/system/grove-manager.service
@@ -2888,7 +2889,15 @@ RestartSec=2
 WantedBy=multi-user.target
 ```
 
-若本案例做挂载引导:上面两个 ExecStart 各在行尾补 `--member-id N --register-with 192.168.1.10:50055 --advertise-addr <本机对外 IP:端口> --join-key-file /etc/grovefs/join.key --deployment prod`(连不上 manager 照常服务,§4.2);防火墙多开一个 50055,让节点与要挂载的客户机都达 it——meta/data 面本身不依赖它。
+拓扑要在 manager 那里声明一次(写在 `<state-dir>/manager/deployments.json`,`serve` 按 mtime 热重载,改拓扑不必重启 daemon):
+
+```bash
+sudo grovefs manager --state-dir /srv/mgr define --meta 192.168.1.10:50110 --data 192.168.1.10:50100
+```
+
+一个 deployment 就用默认的 `default`(客户端 `--deployment` 不给即指它);同时管多套集群才需要 `--name prod` 分开声明。声明里的 meta 列表是**有序故障转移列表**,data 列表是**完整成员集**(不是候选池)。
+
+至于注册:上面两个 ExecStart 各在行尾补 `--member-id N --register-with 192.168.1.10:50055 --advertise-addr <本机对外 IP:端口> --join-key-file /etc/grovefs/join.key`(连不上 manager 照常服务,§4.2)。注册只决定 `manager status` 能不能报出"谁真的活着",不改变 roster 内容——roster 永远按声明原样返回,这也正是"声明了却没起来的 data-server 会把挂载拖失败"的原因。防火墙多开一个 50055,让节点与要挂载的客户机都达它——meta/data 面本身不依赖它。
 
 ### 13.4 第四步:存储机 systemd 常驻 + 防火墙
 
@@ -2922,7 +2931,7 @@ WantedBy=multi-user.target
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now grove-data-server grove-meta-server   # enable=开机 自起,now=立刻起
+sudo systemctl enable --now grove-data-server grove-meta-server grove-manager   # enable=开机自起,now=立刻起
 
 # 建应用要挂的视图:视图只能显式创建,名字不存在就挂会被 M_OPEN 拒
 sudo grovefs view --meta-dir /data create --view share
@@ -2930,23 +2939,29 @@ sudo grovefs view --meta-dir /data create --view share
 
 **unit 里每个设置的意义**:`EnvironmentFile` 让 token 不进 unit 文件也不进 ps 命令行(命令行传口令会被 `ps aux` 同机任何用户看到);`Type` 不写即 simple——两个 server 本就是前台阻塞式,systemd 直接盯进程存活;`Restart=on-failure` 崩溃自动拉起(OOM/段错误等非零退出),配合 §12.1 的日志巡检看有没有反复拉起;`After=local-fs.target` 保证 /data 所在盘挂载完成后才起服务。
 
-防火墙(存储机执行,只对内网段开两个服务端口):
+防火墙(存储机执行,只对内网段开两个服务端口与一个引导端口):
 
 ```bash
 sudo ufw allow from 192.168.1.0/24 to any port 50100 proto tcp
 sudo ufw allow from 192.168.1.0/24 to any port 50110 proto tcp
+sudo ufw allow from 192.168.1.0/24 to any port 50055 proto tcp   # manager:客户机要能问到 roster
 # firewalld 等价:
 # sudo firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address=192.168.1.0/24 port port=50100 protocol=tcp accept"
-# sudo firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address=192.168.1.0/24 port port=50110 protocol=tcp accept" && sudo firewall-cmd --reload
+# sudo firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address=192.168.1.0/24 port port=50110 protocol=tcp accept"
+# sudo firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address=192.168.1.0/24 port port=50055 protocol=tcp accept" && sudo firewall-cmd --reload
 ```
 
 ### 13.5 第五步:客户端 A(192.168.1.11)读写挂载
 
-先预检 + 挂载点目录:
+先预检 + 挂载点目录,并从存储机取回验签用的 roster key:
 
 ```bash
 ls -l /dev/fuse && which fusermount fusermount3   # §11.0 三件套
 sudo mkdir -p /mnt/da
+# 存储机首次 `manager serve` 会把 roster.key 铸在 /srv/mgr/manager/ 下(0600、root 所有):
+ssh 192.168.1.10 'sudo cat /srv/mgr/manager/roster.key' | sudo tee /etc/grovefs/roster.key >/dev/null && sudo chmod 600 /etc/grovefs/roster.key
+# 不必为了 scp 把存储机那份改成 644——管道里的 sudo cat 已经够了
+# 它是 HMAC 对称密钥:客户端拿它**验签**、不能拿它签发,所以只下发这一份,存储机那份仍保密
 ```
 
 手工挂一把(`mount` 默认转后台,等挂载点就绪才返回;失败时后台的错误明细会回打到终端):
@@ -3104,32 +3119,33 @@ ssh 192.168.1.10 'find /data/blocks -type f | head; sqlite3 --version 2>/dev/nul
 ssh 192.168.1.10 'sudo systemctl restart grove-data-server'   # 之后回 A 继续读写,自动重连
 # ⑤ 干净卸载与重挂(A 机同理)
 ssh 192.168.1.12 'sudo systemctl stop grove-mount && findmnt -T /mnt/db | grep -q grovefs && echo 残留 || echo 已卸载'
-# ⑥ 若做了挂载引导:grove-manager active,`grovefs manager status --server 192.168.1.10:50055 --deployment prod --join-key-file /etc/grovefs/join.key`
-#    应列出 define 声明的**全部**成员(roster 是声明集不是健康子集);此后可把两个手抄坐标换成 --manager(§13.5 注释行)。manager 宕机只挡新挂载,活挂载照旧。
+# ⑥ 挂载引导(必需):grove-manager active,`grovefs manager status --server 192.168.1.10:50055 --join-key-file /srv/mgr/manager/join.key`
+#    应列出 define 声明的**全部**成员(roster 是声明集不是健康子集)。manager 宕机只挡新挂载,活挂载照旧。
 ```
 
-全绿即部署完成。回退也简单:两台客户端 `systemctl stop grove-mount` → 存储机 `systemctl disable --now grove-data-server grove-meta-server`;磁盘上 `/data` 里的东西不删就是完整备份(§12.3),想彻底重来直接格式化数据盘(确认已备份后)。
+全绿即部署完成。回退也简单:两台客户端 `systemctl stop grove-mount` → 存储机 `systemctl disable --now grove-manager grove-data-server grove-meta-server`(先停 manager:它不在,新挂载本来就起不来,先停它可以分清“引导掉了”与“服务掉了”);磁盘上 `/data` 里的东西不删就是完整备份(§12.3),想彻底重来直接格式化数据盘(确认已备份后)。
 
 日常维护(巡检关键字/备份/升级/故障表)全部适用 **§12**,IP 对应关系:存储机=192.168.1.10,写端=192.168.1.11,只读端=192.168.1.12。
 
 ### 13.9 每台机器的文件与命令总表(跟着这张表做,零回头)
 
-**存储机 192.168.1.10 要建的文件(共 3 个;做挂载引导则 4 个):**
+**存储机 192.168.1.10 要建的文件(共 4 个):**
 
 | 文件 | 内容在哪节 |
 | --- | --- |
 | `/etc/grovefs/grovefs.env` | §13.2 第三条命令生成 |
 | `/etc/systemd/system/grove-data-server.service` | §13.4 第一个 ini 块全文 |
 | `/etc/systemd/system/grove-meta-server.service` | §13.4 第二个 ini 块全文 |
-| `/etc/systemd/system/grove-manager.service` | (可选)§13.4 挂载引导块全文 |
+| `/etc/systemd/system/grove-manager.service` | §13.3 挂载引导块全文(必需:挂载坐标只从它解析) |
 
-执行顺序(存储机):`mkdir`(§13.2)→ 手工起两服务验证(§13.3)→ Ctrl-C → 写两个 unit(做挂载引导再加 grove-manager 一个)→ `daemon-reload` + `enable --now`(§13.4)→ 防火墙两条(§13.4;做挂载引导加 50055 一条)。可选加固再加一步:视图绑定 / 只读 key 两条(§13.7)。
+执行顺序(存储机):`mkdir`(§13.2)→ 手工起两服务验证(§13.3)→ Ctrl-C → 写三个 unit 并 `manager define` 声明一次拓扑(§13.3)→ `daemon-reload` + `enable --now`(§13.4)→ 防火墙三条:50100/50110/50055(§13.4)。可选加固再加一步:视图绑定 / 只读 key 两条(§13.7)。
 
-**客户端 A 192.168.1.11 / 客户端 B 192.168.1.12 各要建的文件(共 2 个,两台同构):**
+**客户端 A 192.168.1.11 / 客户端 B 192.168.1.12 各要建的文件(共 3 个,两台同构):**
 
 | 文件 | 内容在哪节 |
 | --- | --- |
 | `/etc/grovefs/grovefs.env` | §13.2 末尾 scp 分发(不用重建,和存储机同一份) |
+| `/etc/grovefs/roster.key` | 存储机首次 `manager serve` 铸在 `/srv/mgr/manager/roster.key`,scp 下来即可(§13.5 预检块) |
 | `/etc/systemd/system/grove-mount.service` | A 用 §13.5 的 ini 全文;B 用 §13.6 的 ini 全文 |
 
 执行顺序(每台客户端):预检三件套 + `mkdir /mnt/xx`(§13.5/13.6)→ 手工挂一把验证(§13.5/13.6)→ Ctrl-C → 写 unit → `daemon-reload` + `enable --now` → `findmnt` 确认。若做了 §13.7:ExecStart 换成 §13.7 的对应行后再次 `daemon-reload + restart`。
@@ -3144,35 +3160,52 @@ ssh 192.168.1.12 'sudo systemctl stop grove-mount && findmnt -T /mnt/db | grep -
 | 客户端A | `grovefs mount --view share --manager 192.168.1.10:50055 --roster-key-file /etc/grovefs/roster.key --token $TOK --run-as-uid 1001 -m /mnt/da` | 读写挂载:`--view` 选树、`-m` 必填不可当位置参数、不写 `--no-cache` 靠默认推送保新鲜 |
 | 客户端B | 同 A 改 `--ro --run-as-uid 1002 -m /mnt/db` | 只读挂载:`--ro` 拦本机正常写路径;配合中心对该客户端的 `--ro` key = 服务端硬只读 |
 | 存储机 | `grovefs apikey --meta-dir /data create --for mount --view share [--ro]` | 视图绑定 / 只读 key:key 只能开 `share` 视图(开别的 `M_OPEN` 处 `E_AUTH` 拒);`--ro` 令每个写意图 op 服务端拒(`E_NOTPERM`→`EPERM`)、`revoke` 即时生效 |
-| 存储机 | `grovefs manager --state-dir /srv/mgr define --name prod --meta 192.168.1.10:50110 --data 192.168.1.10:50100`(再 `serve --listen 0.0.0.0:50055`) | 挂载引导(§4.2):define 声明权威拓扑(mtime 热重载),serve 铸 join/roster 两 key 并回答查询——roster 按声明原样返回,不收缩成健康子集 |
-| 客户端A/B | `grovefs mount --view share --manager 192.168.1.10:50055 --roster-key-file /etc/grovefs/roster.key --token $TOK -m /mnt/da` | 用签名 roster 替掉两个手抄坐标:一次查询拿回坐标、挂载不代理任何流量,manager 之后宕机只让**新**挂载 fail-closed | 视图绑定 / 只读 key:key 只能开 `share` 视图(开别的 `M_OPEN` 处 `E_AUTH` 拒);`--ro` 令每个写意图 op 服务端拒(`E_NOTPERM`→`EPERM`)、`revoke` 即时生效 |
+| 存储机 | `grovefs manager --state-dir /srv/mgr define --meta 192.168.1.10:50110 --data 192.168.1.10:50100`(再 `serve --listen 0.0.0.0:50055`) | 挂载引导(§4.2):define 声明权威拓扑(mtime 热重载),serve 铸 join/roster 两 key 并回答查询——roster 按声明原样返回,不收缩成健康子集 |
+| 客户端A/B | `grovefs mount --view share --manager 192.168.1.10:50055 --roster-key-file /etc/grovefs/roster.key --token $TOK -m /mnt/da` | 用签名 roster 替掉两个手抄坐标:一次查询拿回坐标、挂载不代理任何流量,manager 之后宕机只让**新**挂载 fail-closed |
 
 ### 13.11 全程终端实录(真实实测输出,逐字未改)
 
-拍摄条件:grovefs 0.1.0 @ Ubuntu 20.04,**本机三进程等价拓扑**(一个存储根 + `data-server` + `meta-server` + 客户端挂载)——命令里的 `127.0.0.1:5010x` 对应三机案例的 `192.168.1.10:5010x`,`/tmp/grove_case/data` 对应 `/data`,`/tmp/grove_case/mnt_da|mnt_db` 对应 `/mnt/da|/mnt/db`。每段都是真实终端回显(含中文报错);token 是一次性随机值已作废。重跑脚本:仓库 `.build-bin/run_case_demo.sh`。
+拍摄条件:grovefs 0.1.0 @ Ubuntu 20.04,**本机四进程等价拓扑**——manager、两个服务与两个客户端挂载全在一台机器上、只走 `127.0.0.1`。实录里的端口 `15055/15100/15110` 是本机沙箱的真实端口,对应三机案例的 `192.168.1.10:50055/50100/50110`;`/tmp/grove_case/…` 对应存储机的 `/data` 与客户端的 `/mnt/da|/mnt/db`。以下每一段都是真实终端回显(含中文报错);token 与 apikey 是一次性随机值、已作废,key 明文在实录里写作 `<id>:<secret>`。重跑脚本:仓库 `.build-bin/run_case_demo.sh`,回显逐字一致——只有 token、key id/secret 与时间戳每次是新值。
 
-**① 存储机:取 token、前台起两服务、确认监听**
+**① 存储机:声明拓扑、起 manager、起两服务、显式建视图**
 
 ```console
 $ grep -o '=.*' /etc/grovefs/grovefs.env | cut -d= -f2
-690987478d9cb1a4fee062db6a3d04c4
-$ ./grovefs data-server --listen 127.0.0.1:50100 --data-dir /tmp/grove_case/data --token "$TOK"
-data-server listening on 127.0.0.1:50100 (host <本机主机名>, 1 data root(s): /tmp/grove_case/data)        # 三机上用 0.0.0.0:50100,这行会显示 0.0.0.0 与存储机主机名
-$ ./grovefs meta-server --meta-dir /tmp/grove_case/data --listen 127.0.0.1:50110 --token "$TOK"
-meta-server listening on 127.0.0.1:50110 (base /tmp/grove_case/data, role Primary)
-$ ss -lntp | grep -E "5010|5011"
-LISTEN    0         128              127.0.0.1:50110            0.0.0.0:*        users:(("grovefs",pid=1733230,fd=4))
-LISTEN    0         128              127.0.0.1:50100            0.0.0.0:*        users:(("grovefs",pid=1733225,fd=3))
-$ ls /tmp/grove_case/data                        # 两服务启动时自动把骨架建好
+ed68c256d28e807312f77515aee6699b
+$ grovefs --home /data manager define --meta 127.0.0.1:15110 --data 127.0.0.1:15100   # 拓扑只在这里声明一次
+deployment 'default' declared in /tmp/grove_case/gm/manager/deployments.json
+  meta (failover order): 127.0.0.1:15110
+  data (complete member set): 127.0.0.1:15100
+  declaration epoch 1
+  next: every address above must be a RUNNING server started with --register-with — a roster ships the full declared set (a stripe's members are not a candidate pool), so one declared-but-down data-server fails mounts instead of being skipped. `manager status` shows who has actually registered.
+$ grovefs --home /data manager serve --listen 127.0.0.1:15055   # 前台
+manager: join key   /tmp/grove_case/gm/manager/join.key — copy to every node started with --register-with (authorizes a registration; a client never holds it)
+manager: roster key /tmp/grove_case/gm/manager/roster.key — copy to every client as `mount --roster-key-file` (signs the answer; symmetric, so keep the manager's copy secret)
+manager listening on 127.0.0.1:15055 (host-readable state /tmp/grove_case/gm/manager/deployments.json)
+manager: deployment 'default' (epoch 1) — meta [127.0.0.1:15110] data [127.0.0.1:15100]
+manager: rosters valid 300s after issue; registrations lapse after 90s of silence; lookups answer from the declaration, live or not
+manager: neither key leaves this process — a node proves itself with the JOIN key, a client checks the ROSTER key; heartbeat is ~30s, and a node that cannot reach this service keeps serving its own mounts
+$ grovefs data-server --listen 127.0.0.1:15100 --data-dir /tmp/grove_case/data --token "$TOK"   # 前台
+data-server listening on 127.0.0.1:15100 (host <本机主机名>, 1 data root(s): /tmp/grove_case/data)   # 三机上用 0.0.0.0:50100,这行还会回显主机名与根列表——各节点根路径常同名,先认 host 再认路径
+$ grovefs meta-server --meta-dir /tmp/grove_case/data --listen 127.0.0.1:15110 --token "$TOK"   # 前台
+meta-server listening on 127.0.0.1:15110 (base /tmp/grove_case/data, role Primary)
+meta-server: metadata backend sqlite — one db file per view under <base>/meta/
+meta-server: views are created explicitly — M_OPEN refuses a name with no existing tree or definition (`grovefs view --meta-dir <dir> create --view <name>`); no empty tree is ever auto-created
+$ ss -lntp | grep -E "15100|15110|15055"
+LISTEN    0         128              127.0.0.1:15100            0.0.0.0:*        users:(("grovefs",pid=3573218,fd=3))
+LISTEN    0         128              127.0.0.1:15110            0.0.0.0:*        users:(("grovefs",pid=3573234,fd=3))
+LISTEN    0         128              127.0.0.1:15055            0.0.0.0:*        users:(("grovefs",pid=3573207,fd=3))
+$ ls /tmp/grove_case/data                        # 两个服务启动时自动把骨架建好了
 blocks
 meta
-$ ls /tmp/grove_case/data/blocks | head -3     # 启动时已建好 256 个桶(两位哈希名)
+$ ls /tmp/grove_case/data/blocks | wc -l         # 256 个桶是启动时预建的,不等第一个文件
+256
+$ ls /tmp/grove_case/data/blocks | head -3 ; find /tmp/grove_case/data/blocks -type f | wc -l
 00
 01
 02
-$ find /tmp/grove_case/data/blocks -type f | wc -l
-0                                                # 还没写文件,桶里没对象是对的
-$ ./grovefs view --meta-dir /tmp/grove_case/data create --view share
+0                                                # 还没写文件,桶里一个对象都没有是对的
+$ grovefs view --meta-dir /tmp/grove_case/data create --view share   # 视图是显式创建的:M_OPEN 拒绝没有树的名字
 created BASE view 'share' at /tmp/grove_case/data/meta/share/share.db
   deletes in a base view free the underlying object once no other view references it;
   reshape it with `view define` or publish it under a name with `view alias`.
@@ -3181,11 +3214,12 @@ created BASE view 'share' at /tmp/grove_case/data/meta/share/share.db
 **② 客户端 A:读写挂载 + 写文件**
 
 ```console
-$ ./grovefs mount --view share --manager 127.0.0.1:50055 --roster-key-file ~/roster.key --token "$TOK" -m /tmp/grove_case/mnt_da
-manager 127.0.0.1:50055: deployment 'default' epoch 1 resolved meta [127.0.0.1:50110] data [127.0.0.1:50100] (signature verified, valid for 300s more)
-using remote metadata service at 127.0.0.1:50110
-using remote data service at 127.0.0.1:50100
-mounting view 'share' at /tmp/grove_case/mnt_da (fully remote: no local store)   # 远程挂载不需要 --home
+$ grovefs mount --view share --manager 127.0.0.1:15055 --roster-key-file /data/manager/roster.key --token "$TOK" -m /tmp/grove_case/mnt_da   # 远程挂载不需要 --home
+manager 127.0.0.1:15055: deployment 'default' epoch 1 resolved meta [127.0.0.1:15110] data [127.0.0.1:15100] (signature verified, valid for 300s more)
+using remote metadata service at 127.0.0.1:15110
+using remote data service at 127.0.0.1:15100
+mounting view 'share' at /tmp/grove_case/mnt_da (fully remote: no local store)
+grovefs FUSE caps granted: ASYNC_READ=true BIG_WRITES=true PARALLEL_DIROPS=true POSIX_LOCKS=true FLOCK=true WRITEBACK=true ATOMIC_O_TRUNC=true AUTO_INVAL_DATA=true READDIRPLUS=true MAX_PAGES=true; max_write req 4 MiB   # 命令行里一个坐标都没给:manager 回答的是签过名的 roster,验不过签就不挂载
 $ findmnt -T /tmp/grove_case/mnt_da
 TARGET                 SOURCE        FSTYPE OPTIONS
 /tmp/grove_case/mnt_da grovefs:share fuse   rw,nosuid,nodev,relatime,user_id=1005,group_id=1005
@@ -3196,32 +3230,36 @@ $ mkdir /tmp/grove_case/mnt_da/docs && echo ok > /tmp/grove_case/mnt_da/docs/n1.
 $ ls -lR /tmp/grove_case/mnt_da
 /tmp/grove_case/mnt_da:
 总用量 5
-drwx------ 2 fs fs 4096 10月 17 11:12 docs
--rw------- 1 fs fs   14 10月 17 11:12 from_a.txt
+drwx------ 2 fs fs 4096 11月 22 11:02 docs
+-rw------- 1 fs fs   14 11月 22 11:02 from_a.txt
 
 /tmp/grove_case/mnt_da/docs:
 总用量 1
--rw------- 1 fs fs 3 10月 17 11:12 n1.md
+-rw------- 1 fs fs 3 11月 22 11:02 n1.md
 ```
 
-写完后回**存储机**看副作用——两个文件恰好两个 UUID 对象,元数据全在 share.db(+WAL 伴生文件):
+写完后回到**存储机**看副作用——两个文件就恰好两个对象(对象按 key 的 FNV-1a 哈希落进 256 个桶目录之一,桶名两位 hex),元数据在 `meta/<视图>/<视图>.db`(一棵物理树一个目录,见 §13.1.1):
 
 ```console
-$ ls /tmp/grove_case/data/blocks
-b85d5e05-722d-4980-a0e0-e15b9e094de0
-fa513481-830f-4719-b5a7-156e1ace1c96
+$ find /tmp/grove_case/data/blocks -type f
+/tmp/grove_case/data/blocks/40/9ee71f59-bf58-489a-b957-387f7ac04201
+/tmp/grove_case/data/blocks/53/06c14bea-56c7-4f27-a64f-a00fea4ed0f7
 $ ls /tmp/grove_case/data/meta
-share.db  share.db-shm  share.db-wal
+_control
+share
 ```
+
+`share/share.db`(+WAL 伴生文件)是这棵树的元数据;`_control/` 存钥匙/定义/账本等控制面库。
 
 **③ 客户端 B:只读挂载,读得到、写不进**
 
 ```console
-$ ./grovefs mount --view share --manager 127.0.0.1:50055 --roster-key-file ~/roster.key --token "$TOK" --ro -m /tmp/grove_case/mnt_db
-manager 127.0.0.1:50055: deployment 'default' epoch 1 resolved meta [127.0.0.1:50110] data [127.0.0.1:50100] (signature verified, valid for 300s more)
-using remote metadata service at 127.0.0.1:50110
-using remote data service at 127.0.0.1:50100
+$ grovefs mount --view share --manager 127.0.0.1:15055 --roster-key-file /data/manager/roster.key --token "$TOK" --ro -m /tmp/grove_case/mnt_db
+manager 127.0.0.1:15055: deployment 'default' epoch 1 resolved meta [127.0.0.1:15110] data [127.0.0.1:15100] (signature verified, valid for 300s more)
+using remote metadata service at 127.0.0.1:15110
+using remote data service at 127.0.0.1:15100
 mounting view 'share' at /tmp/grove_case/mnt_db (fully remote: no local store, read-only)
+grovefs FUSE caps granted: ASYNC_READ=true BIG_WRITES=true PARALLEL_DIROPS=true POSIX_LOCKS=true FLOCK=true WRITEBACK=true ATOMIC_O_TRUNC=true AUTO_INVAL_DATA=true READDIRPLUS=true MAX_PAGES=true; max_write req 4 MiB
 $ findmnt -T /tmp/grove_case/mnt_db                # 注意 OPTIONS 里是 ro
 TARGET                 SOURCE        FSTYPE OPTIONS
 /tmp/grove_case/mnt_db grovefs:share fuse   ro,nosuid,nodev,relatime,user_id=1005,group_id=1005
@@ -3245,29 +3283,46 @@ mkdir: 无法创建目录 “/tmp/grove_case/mnt_db/zz”: 只读文件系统
 $ echo "round2-$(date +%s)" > /tmp/grove_case/mnt_da/round2.txt
 # 客户端 B 上立即 cat，没刷任何东西：
 $ cat /tmp/grove_case/mnt_db/round2.txt
-round2-1792235543
+round2-1795345375
 ```
 
 **⑤ 存储机:视图绑定 / 只读 key 加固 + 干净收尾**
 
-把只读从"客户端自觉带 `--ro`"升级为"服务端逐 op 强制":给 A、B 各铸一把绑定 `share` 视图的 key(`--meta-dir` 与 meta-server 同名,指同一个元数据根;B 的那把再加 `--ro`)。命令与 §13.7 同一套,只是把元数据根指向本案例的 `/tmp/grove_case/data`:
-
-```bash
-# A:读写 key(只能开 share)
-./grovefs apikey --meta-dir /tmp/grove_case/data create --label A-rw --for mount --view share
-# B:只读 key(只能开 share,且写一律被服务端拒)
-./grovefs apikey --meta-dir /tmp/grove_case/data create --label B-ro --for mount --view share --ro
-# 确认两行(view=share,一份 rw 一份 ro;secret 由 `apikey secret` 从库里的可逆副本读回,list 只出头尾指纹)
-./grovefs apikey --meta-dir /tmp/grove_case/data list
-# 撤销即时生效:被撤销 key 的存活挂载在下一次服务端往返即被拒并自卸载
-./grovefs apikey --meta-dir /tmp/grove_case/data revoke --id <A-rw 的 id>
-```
-
-客户端用 `--api-key '<id>:<secret>'`（或 `export GROVEFS_API_KEY`）呈递这把 key 后重挂;B 换成 `--ro` key 后,即使去掉客户端 `--ro` 重挂,写仍被服务端拒（`E_NOTPERM`→`EPERM`）。服务端需给 meta-server / data-server 加 `--require-api-key`（见 §13.7）。收尾卸载：
+把只读从"客户端自觉带 `--ro`"升级为"服务端逐 op 强制":给读写端与只读端各铸一把绑定 `share` 视图的 key(`--meta-dir` 与 meta-server 同名,指同一个元数据根;只读那把再加 `--ro`)。命令与 §13.7 同一套,只是把元数据根指向本案例的 `/tmp/grove_case/data`:
 
 ```console
-$ fusermount -u /tmp/grove_case/mnt_da; fusermount -u /tmp/grove_case/mnt_db
+$ grovefs apikey --meta-dir /tmp/grove_case/data create --label reader --for mount --view share --ro
+apikey created (a recoverable copy is now stored — `grovefs apikey secret --id <id>` reads it back):
+  id:    <id>
+  owner: <none>
+  label: reader
+  scope: mount
+  view:  share
+  rw:    ro (read-only)
+  expires: never (set one with --ttl, or `apikey update --ttl`)
+  key:   <id>:<secret>
+
+Present it to a `--require-api-key` server as
+  grovefs mount --manager ... --roster-key-file ... --api-key '<id>:<secret>' -m /mnt/x
+(or export GROVEFS_API_KEY='<id>:<secret>' so it stays out of the command line).
+Revoke later with: grovefs apikey --meta-dir /tmp/grove_case/data revoke --id <id>
+$ grovefs apikey --meta-dir /tmp/grove_case/data create --label writer --for mount --view share
+…  label: writer  scope: mount  view: share  rw: rw (read-write)  key: <id>:<secret>
+$ grovefs apikey --meta-dir /tmp/grove_case/data list
+#   id                 key          owner            label            scope   view         rw   created                   last_used                 expires / revoked / note
+1   <id>               1be1…25bb    -                writer           mount   share        rw   2026-11-22T11:02:55.400045375+00:00 -                         never
+2   <id>               49bf…91db    -                reader           mount   share        ro   2026-11-22T11:02:55.394175699+00:00 -                         never
+```
+
+> 本文注(非命令回显):绑定到某一视图的 key 只能开那一个视图;`--ro` 在服务端带 `--require-api-key` 时逐 op 强制——凭据才是逐调用方的门。key 列印的是入库的头尾指纹,不是 secret(明文不落盘,见 §19)。
+
+客户端用 `--api-key '<id>:<secret>'`（或 `export GROVEFS_API_KEY`）呈递这把 key 后重挂;B 换成 `--ro` key 后,即使去掉客户端 `--ro` 重挂,写仍被服务端拒（`E_NOTPERM`→`EPERM`）。服务端需给 meta-server / data-server 加 `--require-api-key`（见 §13.7）。收尾卸载（实录;`grovefs umount -m` 会同时收掉后台挂载进程,不必用系统 `umount`）:
+
+```console
+$ grovefs umount -m /tmp/grove_case/mnt_da; grovefs umount -m /tmp/grove_case/mnt_db
+unmounted /tmp/grove_case/mnt_da
 A umount ok
+unmounted /tmp/grove_case/mnt_db
 B umount ok
 ```
 

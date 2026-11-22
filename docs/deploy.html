@@ -83,7 +83,7 @@ footer{border-top:1px solid var(--line);margin-top:80px;padding-top:20px;color:v
   <div class="sub">三套部署 · 三套按功能划分的命令演示</div>
   <h2>第一部分 · 部署方法</h2>
   <ol>
-    <li><a href="#s11">1.1 本机部署（三进程同机）</a></li>
+    <li><a href="#s11">1.1 本机部署（四进程同机）</a></li>
     <li><a href="#s12">1.2 SQLite 分布式部署</a></li>
     <li><a href="#s13">1.3 PostgreSQL 分布式部署</a></li>
     <li><a href="#s14">1.4 存量存储根升级到 v2 布局</a></li>
@@ -129,17 +129,17 @@ footer{border-top:1px solid var(--line);margin-top:80px;padding-top:20px;color:v
     <span>PG 分布式 = 元数据进 PostgreSQL</span>
     <span>示例环境均为虚构内网 10.0.0.x</span>
   </div>
-  <p class="lead">约定：下文 <code>$G</code> 指 GroveFS 可执行文件（<code>./target/release/grovefs</code> 或安装后的 <code>grovefs</code>）。三套部署使用<b>同一个二进制</b>，差别只在「元数据存哪、谁起服务」。端口约定：数据服务 <code>50100</code>、元数据服务 <code>50110</code>。所有示例 IP 为虚构内网地址，照抄时替换为自己的。</p>
+  <p class="lead">约定：下文 <code>$G</code> 指 GroveFS 可执行文件（<code>./target/release/grovefs</code> 或安装后的 <code>grovefs</code>）。三套部署使用<b>同一个二进制</b>，差别只在「元数据存哪、谁起服务」。端口约定：引导服务 <code>50055</code>、数据服务 <code>50100</code>、元数据服务 <code>50110</code>。所有示例 IP 为虚构内网地址，照抄时替换为自己的。</p>
 </header>
 
 <!-- ============================================================ 第一部分 -->
 <section id="p1">
 <h2 class="part">第一部分 · 三套部署方法</h2>
-<p>三套部署的差别，一句话说清：<b>本机部署</b>把两个服务与挂载放在同一台机器上（地址写 <code>127.0.0.1</code>），三进程起步；<b>SQLite 分布式</b>把存储与元数据拆到一台存储机的两个中心服务（data-server + meta-server），客户机远程挂载、本地什么都不落；<b>PG 分布式</b>只改 meta-server 一处——把元数据从本地 SQLite 文件换成 PostgreSQL 库，客户机挂载命令一字不差。三套共用<b>同一个挂载命令形态</b>：挂载只把 <code>--manager</code> 指向部署的引导服务，元数据/数据两个坐标都由它签发的 roster 解析——手敲 <code>--meta-server</code>/<code>--data-servers</code> 直连已从 <code>mount</code> 移除，没有 manager 引导就非零退出，「只给一个目录就挂上」的形态更不存在。</p>
+<p>三套部署的差别，一句话说清：<b>本机部署</b>把引导服务与两个服务、挂载都放在同一台机器上（地址写 <code>127.0.0.1</code>），四进程起步；<b>SQLite 分布式</b>把存储与元数据拆到一台存储机的两个中心服务（data-server + meta-server），客户机远程挂载、本地什么都不落；<b>PG 分布式</b>只改 meta-server 一处——把元数据从本地 SQLite 文件换成 PostgreSQL 库，客户机挂载命令一字不差。三套共用<b>同一个挂载命令形态</b>：挂载只把 <code>--manager</code> 指向部署的引导服务，元数据/数据两个坐标都由它签发的 roster 解析——手敲 <code>--meta-server</code>/<code>--data-servers</code> 直连已从 <code>mount</code> 移除，没有 manager 引导就非零退出，「只给一个目录就挂上」的形态更不存在。</p>
 
-<h3 id="s11">1.1 本机部署（三进程同机，最小集群）</h3>
+<h3 id="s11">1.1 本机部署（四进程同机，最小集群）</h3>
 <div class="scene">
-  <b>示例环境</b>：一台开发机（8 核 / 32GB / 1TB NVMe），操作系统 Linux，已安装 GroveFS 二进制。数据与元数据全部落在同一块盘的 <code>/data/gfs</code> 目录下。<b>三个进程都要起来</b>——data-server 管字节、meta-server 管权威树、mount 是第三个进程；<code>127.0.0.1</code> 上的两个端口就是它的「集群网络」。<b>不需要安装数据库</b>：元数据是内嵌 SQLite（编译进二进制，零外部依赖），字节直接写本地对象目录。
+  <b>示例环境</b>：一台开发机（8 核 / 32GB / 1TB NVMe），操作系统 Linux，已安装 GroveFS 二进制。数据与元数据全部落在同一块盘的 <code>/data/gfs</code> 目录下。<b>四个进程都要起来</b>——manager 管挂载引导、data-server 管字节、meta-server 管权威树、mount 是第四个进程；<code>127.0.0.1</code> 上的三个端口（50055/50100/50110）就是它的「集群网络」。<b>不需要安装数据库</b>：元数据是内嵌 SQLite（编译进二进制，零外部依赖），字节直接写本地对象目录。
 </div>
 <p>存储根（起步时让 <code>meta-server --meta-dir</code> 与 <code>data-server --data-dir</code> 指向同一个目录）的内部结构由 GroveFS 自动维护，无需预建：</p>
 <pre><code>/data/gfs/
@@ -176,7 +176,7 @@ $G mount --view team -m /mnt/team --manager 127.0.0.1:50055 --roster-key-file /d
 
 <div class="ok">验收：挂载先打印一行 roster 解析 <code>manager 127.0.0.1:50055: deployment 'default' epoch 1 resolved meta [127.0.0.1:50110] data [127.0.0.1:50100] (signature verified, valid for …s more)</code>，再打印 <code>using remote metadata service at 127.0.0.1:50110</code>、<code>using remote data service at 127.0.0.1:50100</code>、<code>mounting view 'team' at /mnt/team (fully remote: no local store)</code>，最后一行带后台进程号 <code>grovefs: mounted view 'team' at /mnt/team (background pid …)</code>。然后 <code>mkdir -p /mnt/team/docs && echo hello > /mnt/team/docs/a.txt && cat /mnt/team/docs/a.txt</code> 输出 <code>hello</code>；<code>ls /data/gfs/blocks | head</code> 能看到哈希桶目录（<code>00 01 02 …</code>）——字节确实落在存储根，不在挂载点。卸载用 <code>$G umount -m /mnt/team</code>（打印 <code>unmounted /mnt/team</code>，同时收掉后台挂载进程，别用系统 <code>umount</code> 命令）。</div>
 
-<p>本机部署（三进程同机）的特点：</p>
+<p>本机部署（四进程同机）的特点：</p>
 <table>
   <tr><th>维度</th><th>本机部署的行为</th></tr>
   <tr><td>元数据</td><td>内嵌 SQLite，一视图一棵独立树目录 <code>meta/&lt;名&gt;/&lt;名&gt;.db</code>，无需安装任何数据库；打开它的<b>只有 meta-server 进程</b>，客户端一个字节都不持有</td></tr>
@@ -531,7 +531,7 @@ $G view --meta-dir /data/gfs graft --name picks --src team --map plan.tsv
 
 <div class="ok">验收：<code>$G view --meta-dir /data/gfs list</code> 一次列出全部形态——派生（base + 规则计数）、别名（→ 真实视图）、fork（→ 基视图）与未定义的裸基视图（逐字输出见 2.1.6）；<code>ls /data/gfs/meta/views/</code> 里是四份纯文本 <code>.layout</code>（<code>docsonly.layout</code>、<code>lab.layout</code>、<code>picks.layout</code>、<code>pub2.layout</code>——别名轮换掉的名字不留残档），而 <code>lab.db</code>/<code>picks.db</code> 是 fork 各自的树。</div>
 
-<h4 id="s21-auth">2.1.4 授权边界（三进程同机）</h4>
+<h4 id="s21-auth">2.1.4 授权边界（四进程同机）</h4>
 <p>准入由<b>服务端</b>把关，不再是「挂载点权限就是全部」：<code>mount</code> 得先过 meta-server 与 data-server 两道门。同机起步常什么门都不开——这时任何能连上 <code>127.0.0.1:50110</code> / <code>127.0.0.1:50100</code> 的本地进程都能挂上任何视图，所以最小自觉是把 <code>--listen</code> 绑在回环地址上。OS 层还有一层：</p>
 <pre><code>chmod 750 /mnt/team                     <span class="cmt"># 用目录权限控制谁能进挂载点</span>
 sudo -u alice ls /mnt/team              <span class="cmt"># 以另一 OS 用户验证</span></code></pre>
@@ -713,7 +713,7 @@ ls /mnt/lens        <span class="out"># docs            ← 服务端渲染的�
 printf 'only /docs\nhide /docs/internal\n' | tee /data/cluster/meta/views/docsonly.layout
 <span class="cmt"># （或重新跑一条 view define 同名覆盖）</span>
 
-<span class="cmt"># 分发面差异一览（对照 2.1.3 的三进程同机形态）：</span>
+<span class="cmt"># 分发面差异一览（对照 2.1.3 的四进程同机形态）：</span>
 <span class="cmt"># ① docsonly → 客户机只给名；② pub → 全树可写，真名 team 同时不可直挂（服务端同拒）</span>
 <span class="cmt"># ③ lab → 结构可写/内容 EROFS；删名只影响 fork 自己；④ graft 接枝字节零复制</span></code></pre>
 <p>SQLite 档 <code>view</code> 操作的是服务端本地文件，所以要在 meta-server 所在机器执行；HA 部署下 <code>meta/views/</code> 与整个 <code>meta/_control/</code> 要手工同步到备机（PG 档无此负担，定义在共享库里——见 2.3.5）。</p>

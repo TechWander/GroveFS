@@ -1870,7 +1870,7 @@ What exactly is stored in one storage root (`<meta-dir>` or a local `--home`), a
 
 ### 5.1 Physical layout
 
-- **Single object**: `blocks/<2hex>/<key>`, one file = one object file. Objects fan out by key hash automatically into 256 bucket subdirectories (the bucket name is the first two hex of the key hash), one level deep, no deeper tree — the per-directory entry count doesn't grow with the total, at tens of millions of objects each bucket holds only tens of thousands, `ls`/`rsync`/backup tools don't degrade. The bucket name is a pure function of the key, the 256 are pre-built at startup, no mkdir on the hot path.
+- **Single object**: `blocks/<2hex>/<key>`, one file = one object file. Objects fan out by key hash automatically into 256 bucket subdirectories (the bucket name is the two lowercase hex digits of `FNV-1a(key) % 256`, not a prefix of the key), one level deep, no deeper tree — the per-directory entry count doesn't grow with the total, at tens of millions of objects each bucket holds only tens of thousands, `ls`/`rsync`/backup tools don't degrade. The bucket name is a pure function of the key, the 256 are pre-built at startup, no mkdir on the hot path.
 - **Key naming**: on a view write a UUID is generated as the object key, stored in the view's `data_ref` field.
 - **Striping (a big file across multiple data-servers)**: `data_ref` is encoded as `s<N>:<stripe>[:<fp>]:<uuid>` (`<fp>` is the fingerprint of the member-id set, appearing only in identity mode; the positional mode keeps three fields),
   the i-th chunk key = `{uuid}#{i}`, landing at `servers[i % N]` — when `--member-id` is enabled the slot is determined by the **identity** after sorting member ids (the list order is irrelevant), when not enabled it is the **list index**, not the address. **A key without the `s` prefix = a single object** (the storage form when striping is not enabled).
@@ -2764,6 +2764,7 @@ GREEN verdict: all suites PASS (`pg` auto-SKIPs on a host without PG, not loweri
 >         │ data-server :50100   字节存 /data/blocks/       │
 >         │ meta-server :50110   权威树存 /data/meta/<view>/   │
 >         │          (默认 embedded SQLite3,无需安装任何数据库)    │
+>         │ manager   :50055   挂载坐标只从它签发的 roster 解析    │
 >         └─────────┬─────────────────┬────────┘
 >             ▲ 读写                   ▲ 只读
 >  客户端A 192.168.1.11            客户端B 192.168.1.12
@@ -2869,7 +2870,7 @@ ss -lntp | grep -E '50100|50110'      # 两行都在,进程名 grovefs
 The two foreground windows should each print a banner line — `data-server listening on 0.0.0.0:50100 (host <storage-hostname>, 1 data root(s): /data)` and `meta-server listening on 0.0.0.0:50110 (base /data, role Primary)`; the data line echoes the hostname and root list because nodes often share the same root path names — when reading logs, first confirm the host, then the path. For what the full terminal looks like, see §13.11 record ①.
 
 
-With mount bootstrap, add a third unit (§4.2; consulted once at mount time, never on the IO path — its outage leaves live mounts untouched and only makes new mounts fail-closed; `join.key`/`roster.key` are minted on first `serve` under `<state-dir>/manager/`, 0600):
+The third unit is the manager — **required**: `mount` no longer accepts hand-typed `--meta-server`/`--data-servers`, so a mount's coordinates resolve only from the manager's signed roster (§4.2). It is asked once, at the moment of mounting, and never sits on the IO path; an outage leaves live mounts untouched and only makes **new** mounts fail-closed. `join.key`/`roster.key` are minted on the first `serve` under `<state-dir>/manager/`, 0600:
 
 ```ini
 # /etc/systemd/system/grove-manager.service
@@ -2885,7 +2886,15 @@ WantedBy=multi-user.target
 ```
 
 
-With mount bootstrap for this case: append `--member-id N --register-with 192.168.1.10:50055 --advertise-addr <this host IP:port> --join-key-file /etc/grovefs/join.key --deployment prod` to each of the two ExecStart lines above (servers keep serving when the manager is unreachable, §4.2); open one more firewall port 50055 reachable by the servers and any client that will mount — the meta/data planes themselves never depend on it.
+Declare the topology once at the manager (it lands in `<state-dir>/manager/deployments.json`, which `serve` hot-reloads by mtime — changing the topology needs no daemon restart):
+
+```bash
+sudo grovefs manager --state-dir /srv/mgr define --meta 192.168.1.10:50110 --data 192.168.1.10:50100
+```
+
+A single deployment stays on the default `default` (a client that omits `--deployment` points at it); only managing several clusters at once needs separate `--name prod` declarations. Inside a declaration the meta list is an **ORDERED failover list** and the data list is the **complete member set** (not a candidate pool).
+
+As for registration: append `--member-id N --register-with 192.168.1.10:50055 --advertise-addr <this host IP:port> --join-key-file /etc/grovefs/join.key` to the end of each of the two ExecStart lines above (servers keep serving when the manager is unreachable, §4.2). Registration only decides whether `manager status` can report who is actually alive; it never changes the roster content — the roster always answers exactly as declared, which is precisely why a declared-but-not-running data-server drags a mount down rather than being skipped. Open one more firewall port 50055 reachable by the nodes and by every client that will mount — the meta/data planes themselves never depend on it.
 
 ### 13.4 Step four: make the storage services systemd-resident + firewall
 
@@ -2919,7 +2928,7 @@ WantedBy=multi-user.target
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now grove-data-server grove-meta-server   # enable=开机 自起,now=立刻起
+sudo systemctl enable --now grove-data-server grove-meta-server grove-manager   # enable=开机 自起,now=立刻起
 
 # 建应用要挂的视图:视图只能显式创建,名字不存在就挂会被 M_OPEN 拒
 sudo grovefs view --meta-dir /data create --view share
@@ -2927,23 +2936,29 @@ sudo grovefs view --meta-dir /data create --view share
 
 **Meaning of every setting in the unit**: `EnvironmentFile` keeps the token out of both the unit file and the ps command line (a passphrase on the command line is visible to any same-machine user via `ps aux`); not writing `Type` means simple — the two servers are foreground blocking processes anyway, systemd just watches process liveness; `Restart=on-failure` respawns on crash (OOM/segfault etc. nonzero exits), watch §12.1's log inspection for repeated respawns; `After=local-fs.target` ensures the service starts only after the disk holding /data is mounted.
 
-Firewall (run on the storage machine, open the two service ports only to the intranet subnet):
+Firewall (run on the storage machine, opening the two service ports plus the one bootstrap port only to the intranet subnet):
 
 ```bash
 sudo ufw allow from 192.168.1.0/24 to any port 50100 proto tcp
 sudo ufw allow from 192.168.1.0/24 to any port 50110 proto tcp
+sudo ufw allow from 192.168.1.0/24 to any port 50055 proto tcp   # manager: clients must be able to ask for a roster
 # firewalld 等价:
 # sudo firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address=192.168.1.0/24 port port=50100 protocol=tcp accept"
-# sudo firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address=192.168.1.0/24 port port=50110 protocol=tcp accept" && sudo firewall-cmd --reload
+# sudo firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address=192.168.1.0/24 port port=50110 protocol=tcp accept"
+# sudo firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address=192.168.1.0/24 port port=50055 protocol=tcp accept" && sudo firewall-cmd --reload
 ```
 
 ### 13.5 Step five: client A (192.168.1.11) read-write mount
 
-First the pre-check + mountpoint directory:
+First the pre-check + mountpoint directory, then fetch the roster verification key from the storage machine:
 
 ```bash
 ls -l /dev/fuse && which fusermount fusermount3   # §11.0 三件套
 sudo mkdir -p /mnt/da
+# 存储机首次 `manager serve` 会把 roster.key 铸在 /srv/mgr/manager/ 下(0600、root 所有):
+ssh 192.168.1.10 'sudo cat /srv/mgr/manager/roster.key' | sudo tee /etc/grovefs/roster.key >/dev/null && sudo chmod 600 /etc/grovefs/roster.key
+# no need to loosen the storage machine's copy to 644 just for scp — sudo cat inside the pipe is enough
+# it is a symmetric HMAC key: the client uses it to VERIFY, never to sign, so only this one copy is distributed and the manager's stays secret
 ```
 
 Mount once by hand (`mount` backgrounds by default, returning only when the mountpoint is ready; on failure the background's error detail is echoed back to the terminal):
@@ -3101,32 +3116,33 @@ ssh 192.168.1.10 'find /data/blocks -type f | head; sqlite3 --version 2>/dev/nul
 ssh 192.168.1.10 'sudo systemctl restart grove-data-server'   # 之后回 A 继续读写,自动重连
 # ⑤ 干净卸载与重挂(A 机同理)
 ssh 192.168.1.12 'sudo systemctl stop grove-mount && findmnt -T /mnt/db | grep -q grovefs && echo 残留 || echo 已卸载'
-# ⑥ With mount bootstrap: grove-manager is active, and `grovefs manager status --server 192.168.1.10:50055 --deployment prod --join-key-file /etc/grovefs/join.key`
-#    lists EVERY member `define` declared (a roster is the declared set, not the healthy subset); from then on the two hand-typed coordinates can be replaced by --manager (see the §13.5 comment line). A manager outage only blocks NEW mounts; live mounts keep running.
+# ⑥ Mount bootstrap (required): grove-manager is active, and `grovefs manager status --server 192.168.1.10:50055 --join-key-file /srv/mgr/manager/join.key`
+#    lists EVERY member `define` declared (a roster is the declared set, not the healthy subset). A manager outage only blocks NEW mounts; live mounts keep running.
 ```
 
-All green means the deployment is complete. Rollback is simple too: on both clients `systemctl stop grove-mount` → on the storage machine `systemctl disable --now grove-data-server grove-meta-server`; whatever is on the disk under `/data`, if not deleted, is a complete backup (§12.3), and to truly start over, just format the data disk (after confirming it's backed up).
+All green means the deployment is complete. Rollback is simple too: on both clients `systemctl stop grove-mount` → on the storage machine `systemctl disable --now grove-manager grove-data-server grove-meta-server` (stop the manager first: without it new mounts cannot come up anyway, so stopping it first separates "bootstrap down" from "service down"); whatever is on the disk under `/data`, if not deleted, is a complete backup (§12.3), and to truly start over, just format the data disk (after confirming it's backed up).
 
 Daily maintenance (inspection keywords/backup/upgrade/failure tables) all applies from **§12**, IP mapping: storage machine = 192.168.1.10, write end = 192.168.1.11, read-only end = 192.168.1.12.
 
 ### 13.9 Files and commands per machine, in one table (follow it, never flip back)
 
-**Files to create on the storage machine 192.168.1.10 (3 total; 4 with mount bootstrap):**
+**Files to create on the storage machine 192.168.1.10 (4 total):**
 
 | File | Which section has the content |
 | --- | --- |
 | `/etc/grovefs/grovefs.env` | generated by the third command in §13.2 |
 | `/etc/systemd/system/grove-data-server.service` | the full first ini block in §13.4 |
 | `/etc/systemd/system/grove-meta-server.service` | the full second ini block in §13.4 |
-| `/etc/systemd/system/grove-manager.service` | (optional) the mount-bootstrap block in §13.4 |
+| `/etc/systemd/system/grove-manager.service` | the mount-bootstrap block in §13.3 (required: a mount's coordinates resolve only from it) |
 
-Execution order (storage machine): `mkdir` (§13.2) → start both services by hand to verify (§13.3) → Ctrl-C → write the two units (plus grove-manager if you run mount bootstrap) → `daemon-reload` + `enable --now` (§13.4) → the two firewall rules (§13.4; one more for 50055 with bootstrap). Optional hardening adds one step: the view-bound / read-only key, two commands (§13.7).
+Execution order (storage machine): `mkdir` (§13.2) → start both services by hand to verify (§13.3) → Ctrl-C → write the three units and declare the topology once with `manager define` (§13.3) → `daemon-reload` + `enable --now` (§13.4) → three firewall rules: 50100/50110/50055 (§13.4). Optional hardening adds one step: the view-bound / read-only key, two commands (§13.7).
 
-**Files each of client A 192.168.1.11 / client B 192.168.1.12 must create (2 each, both machines isomorphic):**
+**Files each of client A 192.168.1.11 / client B 192.168.1.12 must create (3 each, both machines isomorphic):**
 
 | File | Which section has the content |
 | --- | --- |
 | `/etc/grovefs/grovefs.env` | distributed by scp at the end of §13.2 (no need to rebuild, the same one as the storage machine) |
+| `/etc/grovefs/roster.key` | minted by the storage machine's first `manager serve` at `/srv/mgr/manager/roster.key`; scp it down (the §13.5 pre-check block) |
 | `/etc/systemd/system/grove-mount.service` | A uses §13.5's full ini; B uses §13.6's full ini |
 
 Execution order (each client): the three-piece pre-check + `mkdir /mnt/xx` (§13.5/13.6) → mount once by hand to verify (§13.5/13.6) → Ctrl-C → write the unit → `daemon-reload` + `enable --now` → confirm with `findmnt`. If you did §13.7: swap ExecStart to the corresponding line in §13.7, then `daemon-reload + restart` again.
@@ -3141,35 +3157,52 @@ Execution order (each client): the three-piece pre-check + `mkdir /mnt/xx` (§13
 | client A | `grovefs mount --view share --manager 192.168.1.10:50055 --roster-key-file /etc/grovefs/roster.key --token $TOK --run-as-uid 1001 -m /mnt/da` | Read-write mount: `--view` selects the tree, `-m` is required and can't be a positional argument, not writing `--no-cache` keeps freshness via the default push |
 | client B | same as A, changed to `--ro --run-as-uid 1002 -m /mnt/db` | Read-only mount: `--ro` blocks the local normal write path; combined with a center `--ro` key for this client = server-side hard read-only |
 | storage | `grovefs apikey --meta-dir /data create --for mount --view share [--ro]` | View-bound / read-only key: the key can only open the `share` view (opening others is refused with `E_AUTH` at `M_OPEN`); `--ro` makes each write-intent op refused server-side (`E_NOTPERM`→`EPERM`), `revoke` takes effect immediately |
-| storage | `grovefs manager --state-dir /srv/mgr define --name prod --meta 192.168.1.10:50110 --data 192.168.1.10:50100` (then `serve --listen 0.0.0.0:50055`) | Mount bootstrap (§4.2): `define` declares the authoritative topology (hot-reloaded by mtime), `serve` mints the join/roster keys and answers lookups — a roster comes back exactly as declared, never narrowed to a healthy subset |
-| client A/B | `grovefs mount --view share --manager 192.168.1.10:50055 --roster-key-file /etc/grovefs/roster.key --token $TOK -m /mnt/da` | A signed roster replaces the two hand-typed coordinates: one lookup at mount time, the manager proxies no traffic afterwards, so its later outage only makes NEW mounts fail-closed | View-bound / read-only key: the key can only open the `share` view (opening others is refused with `E_AUTH` at `M_OPEN`); `--ro` makes each write-intent op refused server-side (`E_NOTPERM`→`EPERM`), `revoke` immediate |
+| storage | `grovefs manager --state-dir /srv/mgr define --meta 192.168.1.10:50110 --data 192.168.1.10:50100` (then `serve --listen 0.0.0.0:50055`) | Mount bootstrap (§4.2): `define` declares the authoritative topology (hot-reloaded by mtime), `serve` mints the join/roster keys and answers lookups — a roster comes back exactly as declared, never narrowed to a healthy subset |
+| client A/B | `grovefs mount --view share --manager 192.168.1.10:50055 --roster-key-file /etc/grovefs/roster.key --token $TOK -m /mnt/da` | A signed roster replaces the two hand-typed coordinates: one lookup at mount time, the manager proxies no traffic afterwards, so its later outage only makes NEW mounts fail-closed |
 
 ### 13.11 Full terminal transcript (real measured output, unchanged verbatim)
 
-Capture conditions: grovefs 0.1.0 @ Ubuntu 20.04, a **one-host three-process equivalent topology** (one storage root + `data-server` + `meta-server` + a client mount) — the `127.0.0.1:5010x` in the commands corresponds to the three-machine case's `192.168.1.10:5010x`, `/tmp/grove_case/data` to `/data`, `/tmp/grove_case/mnt_da|mnt_db` to `/mnt/da|/mnt/db`. Every segment is real terminal output (incl. Chinese error messages); the token was a one-time random value already voided. Rerun script: the repo's `.build-bin/run_case_demo.sh`.
+Capture conditions: grovefs 0.1.0 @ Ubuntu 20.04, a **one-host four-process equivalent topology** — the manager, the two services and both client mounts all live on one machine and only ever talk over `127.0.0.1`. The ports `15055/15100/15110` in the transcript are the sandbox's real ports, corresponding to the three-machine case's `192.168.1.10:50055/50100/50110`; `/tmp/grove_case/…` corresponds to the storage machine's `/data` and the clients' `/mnt/da|/mnt/db`. Every segment below is real terminal output (incl. Chinese error messages); the token and the apikeys are one-time random values, already voided, and a key's plaintext is written `<id>:<secret>` in the transcript. Rerun script: the repo's `.build-bin/run_case_demo.sh` — the output matches verbatim, only the token, the key ids/secrets and the timestamps take new values each run.
 
-**① Storage machine: get the token, start both services in foreground, confirm listening**
+**① Storage machine: declare the topology, start the manager, start both services, create the view explicitly**
 
 ```console
 $ grep -o '=.*' /etc/grovefs/grovefs.env | cut -d= -f2
-690987478d9cb1a4fee062db6a3d04c4
-$ ./grovefs data-server --listen 127.0.0.1:50100 --data-dir /tmp/grove_case/data --token "$TOK"
-data-server listening on 127.0.0.1:50100 (host <本机主机名>, 1 data root(s): /tmp/grove_case/data)        # 三机上用 0.0.0.0:50100,这行会显示 0.0.0.0 与存储机主机名
-$ ./grovefs meta-server --meta-dir /tmp/grove_case/data --listen 127.0.0.1:50110 --token "$TOK"
-meta-server listening on 127.0.0.1:50110 (base /tmp/grove_case/data, role Primary)
-$ ss -lntp | grep -E "5010|5011"
-LISTEN    0         128              127.0.0.1:50110            0.0.0.0:*        users:(("grovefs",pid=1733230,fd=4))
-LISTEN    0         128              127.0.0.1:50100            0.0.0.0:*        users:(("grovefs",pid=1733225,fd=3))
-$ ls /tmp/grove_case/data                        # 两服务启动时自动把骨架建好
+ed68c256d28e807312f77515aee6699b
+$ grovefs --home /data manager define --meta 127.0.0.1:15110 --data 127.0.0.1:15100   # 拓扑只在这里声明一次
+deployment 'default' declared in /tmp/grove_case/gm/manager/deployments.json
+  meta (failover order): 127.0.0.1:15110
+  data (complete member set): 127.0.0.1:15100
+  declaration epoch 1
+  next: every address above must be a RUNNING server started with --register-with — a roster ships the full declared set (a stripe's members are not a candidate pool), so one declared-but-down data-server fails mounts instead of being skipped. `manager status` shows who has actually registered.
+$ grovefs --home /data manager serve --listen 127.0.0.1:15055   # 前台
+manager: join key   /tmp/grove_case/gm/manager/join.key — copy to every node started with --register-with (authorizes a registration; a client never holds it)
+manager: roster key /tmp/grove_case/gm/manager/roster.key — copy to every client as `mount --roster-key-file` (signs the answer; symmetric, so keep the manager's copy secret)
+manager listening on 127.0.0.1:15055 (host-readable state /tmp/grove_case/gm/manager/deployments.json)
+manager: deployment 'default' (epoch 1) — meta [127.0.0.1:15110] data [127.0.0.1:15100]
+manager: rosters valid 300s after issue; registrations lapse after 90s of silence; lookups answer from the declaration, live or not
+manager: neither key leaves this process — a node proves itself with the JOIN key, a client checks the ROSTER key; heartbeat is ~30s, and a node that cannot reach this service keeps serving its own mounts
+$ grovefs data-server --listen 127.0.0.1:15100 --data-dir /tmp/grove_case/data --token "$TOK"   # 前台
+data-server listening on 127.0.0.1:15100 (host <本机主机名>, 1 data root(s): /tmp/grove_case/data)   # on three machines use 0.0.0.0:50100; this line also echoes the hostname and the root list — root paths are usually named identically on every node, so read the host first, then the path
+$ grovefs meta-server --meta-dir /tmp/grove_case/data --listen 127.0.0.1:15110 --token "$TOK"   # 前台
+meta-server listening on 127.0.0.1:15110 (base /tmp/grove_case/data, role Primary)
+meta-server: metadata backend sqlite — one db file per view under <base>/meta/
+meta-server: views are created explicitly — M_OPEN refuses a name with no existing tree or definition (`grovefs view --meta-dir <dir> create --view <name>`); no empty tree is ever auto-created
+$ ss -lntp | grep -E "15100|15110|15055"
+LISTEN    0         128              127.0.0.1:15100            0.0.0.0:*        users:(("grovefs",pid=3573218,fd=3))
+LISTEN    0         128              127.0.0.1:15110            0.0.0.0:*        users:(("grovefs",pid=3573234,fd=3))
+LISTEN    0         128              127.0.0.1:15055            0.0.0.0:*        users:(("grovefs",pid=3573207,fd=3))
+$ ls /tmp/grove_case/data                        # 两个服务启动时自动把骨架建好了
 blocks
 meta
-$ ls /tmp/grove_case/data/blocks | head -3     # 启动时已建好 256 个桶(两位哈希名)
+$ ls /tmp/grove_case/data/blocks | wc -l         # the 256 buckets are pre-built at startup, not waited for until the first file
+256
+$ ls /tmp/grove_case/data/blocks | head -3 ; find /tmp/grove_case/data/blocks -type f | wc -l
 00
 01
 02
-$ find /tmp/grove_case/data/blocks -type f | wc -l
-0                                                # 还没写文件,桶里没对象是对的
-$ ./grovefs view --meta-dir /tmp/grove_case/data create --view share
+0                                                # no file written yet, so zero objects in the buckets is correct
+$ grovefs view --meta-dir /tmp/grove_case/data create --view share   # views are created explicitly: M_OPEN refuses a name with no tree
 created BASE view 'share' at /tmp/grove_case/data/meta/share/share.db
   deletes in a base view free the underlying object once no other view references it;
   reshape it with `view define` or publish it under a name with `view alias`.
@@ -3178,11 +3211,12 @@ created BASE view 'share' at /tmp/grove_case/data/meta/share/share.db
 **② Client A: read-write mount + write files**
 
 ```console
-$ ./grovefs mount --view share --manager 127.0.0.1:50055 --roster-key-file ~/roster.key --token "$TOK" -m /tmp/grove_case/mnt_da
-manager 127.0.0.1:50055: deployment 'default' epoch 1 resolved meta [127.0.0.1:50110] data [127.0.0.1:50100] (signature verified, valid for 300s more)
-using remote metadata service at 127.0.0.1:50110
-using remote data service at 127.0.0.1:50100
-mounting view 'share' at /tmp/grove_case/mnt_da (fully remote: no local store)   # 远程挂载不需要 --home
+$ grovefs mount --view share --manager 127.0.0.1:15055 --roster-key-file /data/manager/roster.key --token "$TOK" -m /tmp/grove_case/mnt_da   # a remote mount needs no --home
+manager 127.0.0.1:15055: deployment 'default' epoch 1 resolved meta [127.0.0.1:15110] data [127.0.0.1:15100] (signature verified, valid for 300s more)
+using remote metadata service at 127.0.0.1:15110
+using remote data service at 127.0.0.1:15100
+mounting view 'share' at /tmp/grove_case/mnt_da (fully remote: no local store)
+grovefs FUSE caps granted: ASYNC_READ=true BIG_WRITES=true PARALLEL_DIROPS=true POSIX_LOCKS=true FLOCK=true WRITEBACK=true ATOMIC_O_TRUNC=true AUTO_INVAL_DATA=true READDIRPLUS=true MAX_PAGES=true; max_write req 4 MiB   # the command line gives not a single coordinate: what the manager answers is a SIGNED roster, and a roster whose signature fails is never mounted
 $ findmnt -T /tmp/grove_case/mnt_da
 TARGET                 SOURCE        FSTYPE OPTIONS
 /tmp/grove_case/mnt_da grovefs:share fuse   rw,nosuid,nodev,relatime,user_id=1005,group_id=1005
@@ -3193,32 +3227,36 @@ $ mkdir /tmp/grove_case/mnt_da/docs && echo ok > /tmp/grove_case/mnt_da/docs/n1.
 $ ls -lR /tmp/grove_case/mnt_da
 /tmp/grove_case/mnt_da:
 总用量 5
-drwx------ 2 fs fs 4096 10月 17 11:12 docs
--rw------- 1 fs fs   14 10月 17 11:12 from_a.txt
+drwx------ 2 fs fs 4096 11月 22 11:02 docs
+-rw------- 1 fs fs   14 11月 22 11:02 from_a.txt
 
 /tmp/grove_case/mnt_da/docs:
 总用量 1
--rw------- 1 fs fs 3 10月 17 11:12 n1.md
+-rw------- 1 fs fs 3 11月 22 11:02 n1.md
 ```
 
-After writing, look at the side effects back on the **storage machine** — two files, exactly two UUID objects, all metadata in share.db (+ WAL companion files):
+After writing, look at the side effects back on the **storage machine** — two files means exactly two objects (each lands in one of the 256 bucket directories by the FNV-1a hash of its key, the bucket name being two hex digits), and the metadata lives at `meta/<view>/<view>.db` (one directory per physical tree, see §13.1.1):
 
 ```console
-$ ls /tmp/grove_case/data/blocks
-b85d5e05-722d-4980-a0e0-e15b9e094de0
-fa513481-830f-4719-b5a7-156e1ace1c96
+$ find /tmp/grove_case/data/blocks -type f
+/tmp/grove_case/data/blocks/40/9ee71f59-bf58-489a-b957-387f7ac04201
+/tmp/grove_case/data/blocks/53/06c14bea-56c7-4f27-a64f-a00fea4ed0f7
 $ ls /tmp/grove_case/data/meta
-share.db  share.db-shm  share.db-wal
+_control
+share
 ```
+
+`share/share.db` (plus its WAL companion files) is this tree's metadata; `_control/` holds the control-plane databases — keys, definitions, the ledger.
 
 **③ Client B: read-only mount, can read, can't write**
 
 ```console
-$ ./grovefs mount --view share --manager 127.0.0.1:50055 --roster-key-file ~/roster.key --token "$TOK" --ro -m /tmp/grove_case/mnt_db
-manager 127.0.0.1:50055: deployment 'default' epoch 1 resolved meta [127.0.0.1:50110] data [127.0.0.1:50100] (signature verified, valid for 300s more)
-using remote metadata service at 127.0.0.1:50110
-using remote data service at 127.0.0.1:50100
+$ grovefs mount --view share --manager 127.0.0.1:15055 --roster-key-file /data/manager/roster.key --token "$TOK" --ro -m /tmp/grove_case/mnt_db
+manager 127.0.0.1:15055: deployment 'default' epoch 1 resolved meta [127.0.0.1:15110] data [127.0.0.1:15100] (signature verified, valid for 300s more)
+using remote metadata service at 127.0.0.1:15110
+using remote data service at 127.0.0.1:15100
 mounting view 'share' at /tmp/grove_case/mnt_db (fully remote: no local store, read-only)
+grovefs FUSE caps granted: ASYNC_READ=true BIG_WRITES=true PARALLEL_DIROPS=true POSIX_LOCKS=true FLOCK=true WRITEBACK=true ATOMIC_O_TRUNC=true AUTO_INVAL_DATA=true READDIRPLUS=true MAX_PAGES=true; max_write req 4 MiB
 $ findmnt -T /tmp/grove_case/mnt_db                # 注意 OPTIONS 里是 ro
 TARGET                 SOURCE        FSTYPE OPTIONS
 /tmp/grove_case/mnt_db grovefs:share fuse   ro,nosuid,nodev,relatime,user_id=1005,group_id=1005
@@ -3242,29 +3280,46 @@ mkdir: 无法创建目录 “/tmp/grove_case/mnt_db/zz”: 只读文件系统
 $ echo "round2-$(date +%s)" > /tmp/grove_case/mnt_da/round2.txt
 # 客户端 B 上立即 cat,没刷任何东西:
 $ cat /tmp/grove_case/mnt_db/round2.txt
-round2-1792235543
+round2-1795345375
 ```
 
 **⑤ Storage machine: view-bound / read-only key hardening + clean wrap-up**
 
-Upgrading read-only from "the client carries `--ro` voluntarily" to "the server enforces per op": mint each of A and B a key bound to the `share` view (`--meta-dir` named the same as meta-server, pointing at the same metadata root; B's additionally carries `--ro`). The commands are the same set as §13.7, only pointing the metadata root at this case's `/tmp/grove_case/data`:
-
-```bash
-# A:读写 key(只能开 share)
-./grovefs apikey --meta-dir /tmp/grove_case/data create --label A-rw --for mount --view share
-# B:只读 key(只能开 share,且写一律被服务端拒)
-./grovefs apikey --meta-dir /tmp/grove_case/data create --label B-ro --for mount --view share --ro
-# 确认两行(view=share,一份 rw 一份 ro;secret 由 `apikey secret` 从库里的可逆副本读回,list 只出头尾指纹)
-./grovefs apikey --meta-dir /tmp/grove_case/data list
-# 撤销即时生效:被撤销 key 的存活挂载在下一次服务端往返即被拒并自卸载
-./grovefs apikey --meta-dir /tmp/grove_case/data revoke --id <A-rw 的 id>
-```
-
-Clients present the key with `--api-key '<id>:<secret>'` (or `export GROVEFS_API_KEY`) then remount; after B switches to the `--ro` key, even remounting without the client `--ro`, writes are still refused by the server (`E_NOTPERM`→`EPERM`). The server must add `--require-api-key` to meta-server / data-server (see §13.7). Wrap-up unmount:
+Upgrading read-only from "the client carries `--ro` voluntarily" to "the server enforces per op": mint one key bound to the `share` view for the write end and one for the read end (`--meta-dir` is named exactly like meta-server's, pointing at the same metadata root; the read-only one additionally carries `--ro`). The commands are the same set as §13.7, only pointing the metadata root at this case's `/tmp/grove_case/data`:
 
 ```console
-$ fusermount -u /tmp/grove_case/mnt_da; fusermount -u /tmp/grove_case/mnt_db
+$ grovefs apikey --meta-dir /tmp/grove_case/data create --label reader --for mount --view share --ro
+apikey created (a recoverable copy is now stored — `grovefs apikey secret --id <id>` reads it back):
+  id:    <id>
+  owner: <none>
+  label: reader
+  scope: mount
+  view:  share
+  rw:    ro (read-only)
+  expires: never (set one with --ttl, or `apikey update --ttl`)
+  key:   <id>:<secret>
+
+Present it to a `--require-api-key` server as
+  grovefs mount --manager ... --roster-key-file ... --api-key '<id>:<secret>' -m /mnt/x
+(or export GROVEFS_API_KEY='<id>:<secret>' so it stays out of the command line).
+Revoke later with: grovefs apikey --meta-dir /tmp/grove_case/data revoke --id <id>
+$ grovefs apikey --meta-dir /tmp/grove_case/data create --label writer --for mount --view share
+…  label: writer  scope: mount  view: share  rw: rw (read-write)  key: <id>:<secret>
+$ grovefs apikey --meta-dir /tmp/grove_case/data list
+#   id                 key          owner            label            scope   view         rw   created                   last_used                 expires / revoked / note
+1   <id>               1be1…25bb    -                writer           mount   share        rw   2026-11-22T11:02:55.400045375+00:00 -                         never
+2   <id>               49bf…91db    -                reader           mount   share        ro   2026-11-22T11:02:55.394175699+00:00 -                         never
+```
+
+> Note in this document (not command output): a key bound to one view can only open that view; `--ro` is enforced per op server-side once the server runs with `--require-api-key` — the credential is the per-caller gate. What `list` prints is the head-and-tail fingerprint stored with the key, never the secret (the plaintext is not persisted, see §19).
+
+Clients present the key with `--api-key '<id>:<secret>'` (or `export GROVEFS_API_KEY`) then remount; after B switches to the `--ro` key, even remounting without the client `--ro`, writes are still refused by the server (`E_NOTPERM`→`EPERM`). The server must add `--require-api-key` to meta-server / data-server (see §13.7). Wrap-up unmount (real transcript; `grovefs umount -m` also reaps the backgrounded mount process, so the system `umount` is not needed):
+
+```console
+$ grovefs umount -m /tmp/grove_case/mnt_da; grovefs umount -m /tmp/grove_case/mnt_db
+unmounted /tmp/grove_case/mnt_da
 A umount ok
+unmounted /tmp/grove_case/mnt_db
 B umount ok
 ```
 
