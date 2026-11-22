@@ -50,9 +50,9 @@ One table covers every capability. The left column is **what you want to accompl
 
 | Concept | Description |
 |------|------|
-| **View** | Each user gets an independent directory tree (with custom nesting), stored in one SQLite DB **on the `meta-server` machine**: `<meta-dir>/meta/<view>.db` (under the PG backend, a `grovefs_v_<hex>` schema). Users cannot see each other's files. |
+| **View** | Each user gets an independent directory tree (with custom nesting), stored in one SQLite DB **on the `meta-server` machine**: `<meta-dir>/meta/<view>/<view>.db` (under the PG backend, a `grovefs_v_<hex>` schema). Users cannot see each other's files. |
 | **Object** | The real bytes of a file. One file = one object file under `blocks/`, named by UUID (or several chunks when striped); objects are auto-distributed over 256 bucket subdirectories by a hash of their key. The view's directory entries point at object keys. |
-| **Base dir (storage root)** | The two services' own roots: `meta-server --meta-dir` holds `meta/<view>.db` (the trees), `meta/views/*.layout` (the definitions) and `api_keys.db`/`refs.db`; `data-server --data-dir` holds `blocks/` (the content objects). The global `--home` is the **default for both** — one `--home` is enough when both services share a host, `--meta-dir`/`--data-dir` name them separately when meta and data are split. Defaults to `$GROVEFS_HOME` or `~/.grovefs`. **A mount never reads or writes any storage root**: the client keeps nothing on its own disk, tree and bytes both live server-side. |
+| **Base dir (storage root)** | The two services' own roots: `meta-server --meta-dir` holds `meta/<view>/<view>.db` (the trees), `meta/views/*.layout` (the definitions) and `meta/_control/` (the control plane: ledger, keys, accounts); `data-server --data-dir` holds `blocks/` (the content objects). The global `--home` is the **default for both** — one `--home` is enough when both services share a host, `--meta-dir`/`--data-dir` name them separately when meta and data are split. Defaults to `$GROVEFS_HOME` or `~/.grovefs`. **A mount never reads or writes any storage root**: the client keeps nothing on its own disk, tree and bytes both live server-side. |
 
 Data and views are **separate by nature**: a view is just "a directory tree + pointers", the bytes always live in `blocks/`.
 
@@ -60,8 +60,8 @@ Data and views are **separate by nature**: a view is just "a directory tree + po
 
 | Term in the docs | Meaning |
 | --- | --- |
-| `--home` | The global default **storage root**, read only by the node-side verbs (`view create`/`gc`/`import`/`apikey`/`du`) and by the two servers themselves (it is where a call lands when it names no `--meta-dir`/`--data-dir`). It has nothing to do with a mount — a mount's coordinates are always `--meta-server` + `--data-servers` (or the two values a manager resolves from a signed roster) |
-| data-server / meta-server | The two central service processes: the former manages bytes (object storage), the latter manages the directory tree (metadata); clients point `--data-servers`/`--meta-server` at them respectively |
+| `--home` | The global default **storage root**, read only by the node-side verbs (`view create`/`gc`/`import`/`apikey`/`du`) and by the two servers themselves (it is where a call lands when it names no `--meta-dir`/`--data-dir`). It has nothing to do with a mount — a mount's two coordinates are resolved ONLY from the deployment's signed roster (§4.2); hand-typed addresses were removed from `mount` |
+| data-server / meta-server | The two central service processes: the former manages bytes (object storage), the latter manages the directory tree (metadata); a client never points at these addresses — it points `mount --manager` at the bootstrap service, which resolves them |
 | base view / derived view / alias / fork | The four view forms: an independent storage tree (writable) / a read-only display lens defined by rules on the server / a renamed full-tree-writable entry / an independent tree that copies the directory but not the bytes (beginners: see the analogy and comparison table in §3.0 first; operational detail in §3.4–§3.4.1) |
 | token / API key | A token is the cluster admission gate (one shared passphrase); an API key is a per-caller, revocable credential that can be bound to a view / marked read-only (§3.5.1) |
 | control plane / mount plane | Control plane = `grovefs mcp`'s view-definition management interface; mount plane = the FUSE client's connections to meta/data — the two gates are independent and their scopes never cross (§6) |
@@ -79,8 +79,7 @@ Data and views are **separate by nature**: a view is just "a directory tree + po
 | **Where bytes land on disk** — the storage root `data-server` actually writes bytes to (defaults to the metadata root) | `--data-dir <dir>` |
 | **The existing directory to be managed** — that batch of data already sitting on disk that you want to turn into a view | `--source <dir>` |
 | **Mount point** — the local directory used to reach this tree | `-m <dir>` (i.e. `--mountpoint`) |
-| **Central service addresses** — the metadata / data service a client connects to (host:port). **BOTH are required**; a comma list makes `--meta-server` fail over and `--data-servers` stripe | `--meta-server <addr>` / `--data-servers <addr>` |
-| **Bootstrap endpoint** — resolve both coordinates from one signed roster instead of typing them (mutually exclusive with the two flags above) | `--manager <host:port>` + `--roster-key-file <path>` (`[--deployment NAME]`, §4.2) |
+| **Mount bootstrap address** — the one service coordinate a client types by hand (host:port); both service addresses are resolved from its signed roster | `mount --manager <addr>` + `--roster-key-file <file>` |
 | **View name** — an arbitrary label for a logical tree (unrelated to any Linux username) | `--view <name>` |
 | **Cluster admission passphrase** — the shared secret the server sets, presented by the client on mount (one for the data plane, one for the metadata plane) | server `--token <str>` + client `--token <str>` |
 | **Revocable access credential** — the server admits per-caller API keys instead (`grovefs apikey create --for mount`); listable, auditable per caller, revocable, and a revoke closes **already-established** mounts; `--view V` **binds a key to a single view** (opening another view is refused at the handshake), `--ro` is read-only enforced server-side (per write-intent op refused) | server `--require-api-key` + client `mount --api-key <ID:SECRET>` (or env `GROVEFS_API_KEY`) |
@@ -94,7 +93,7 @@ Data and views are **separate by nature**: a view is just "a directory tree + po
 
 ### About `--view` and path capacity
 
-- **`--view` is unrelated to Linux usernames** — it is only an **arbitrary label** in the view namespace. The binary never calls `getpwnam`, never checks uid, never requires `useradd`. `alice`, `team-a`, `u42`, `研究组` all work as a view name — as long as it is a legal filename on the target filesystem. It serves exactly two purposes: ① it lets the server locate the tree `meta/<view>.db`; ② it stamps a `grovefs:<view>` label on the FUSE mount for `mount`/`findmnt` to display. **All authentication is server-side** — the `--token` / `--require-api-key` gates — unrelated to a Linux user and to "who can read the storage root".
+- **`--view` is unrelated to Linux usernames** — it is only an **arbitrary label** in the view namespace. The binary never calls `getpwnam`, never checks uid, never requires `useradd`. `alice`, `team-a`, `u42`, `研究组` all work as a view name — as long as it is a legal filename on the target filesystem. It serves exactly two purposes: ① it lets the server locate the tree `meta/<view>/<view>.db`; ② it stamps a `grovefs:<view>` label on the FUSE mount for `mount`/`findmnt` to display. **All authentication is server-side** — the `--token` / `--require-api-key` gates — unrelated to a Linux user and to "who can read the storage root".
 - **One tree per user, fully autonomous paths inside the tree** — once mounted, under that mountpoint you can `mkdir`/`touch` **any number** of files and directories, to **any depth**, with any nesting, no different from working in your own home. The granularity of isolation between users is "the whole view tree", not a single path. A manifest is only a convenient entry point for pre-building a skeleton, not a cap on the number of paths; after mounting you can `mkdir -p a/b/c/d/...` at any time.
 
 ---
@@ -119,14 +118,14 @@ The long commands you type over and over can be slimmed down wholesale. The prec
 | Knob (env) | Parameter it stands in for | Description |
 | --- | --- | --- |
 | `GROVEFS_HOME` | `--home` | Local storage root |
-| `GROVEFS_META_SERVER` | `mount --meta-server` | Metadata service address (incl. failover list) |
-| `GROVEFS_DATA_SERVERS` | `mount --data-servers` | Data service address (incl. stripe list) |
-| `GROVEFS_MANAGER` | `mount --manager` | Address of the mount-bootstrap service; stands in for the `--meta-server`/`--data-servers` coordinates (§4.2) |
+| `GROVEFS_META_SERVER` | `du --meta-server` (node-side verb) | Metadata service address; **no longer drives `mount`** — a mount's two coordinates come only from the deployment's signed roster (§4.2) |
+| `GROVEFS_DATA_SERVERS` | `du`/`gc --control-server`'s `--data-servers` (node-side verbs) | Data service address; **likewise no longer drives `mount`** (same as above) |
+| `GROVEFS_MANAGER` | `mount --manager` | Address of the mount-bootstrap service; the **only** coordinate source for `mount` — it resolves both the meta- and the data service (§4.2); hand-typed `--meta-server`/`--data-servers` were removed from `mount` |
 | `GROVEFS_ROSTER_KEY_FILE` | `mount --roster-key-file` | Key (64-hex file) that verifies the roster signature; `--manager` refuses the mount without it |
 | `GROVEFS_REGISTER_WITH` | `meta-server/data-server --register-with` | Which manager a node registers with (§4.2) |
 | `GROVEFS_JOIN_KEY_FILE` | `meta-server/data-server --join-key-file` | File holding the JOIN key that authorizes a registration (a client never holds it) |
 | `GROVEFS_DEPLOYMENT` | `mount --deployment`, server-side `--deployment` | Which deployment this belongs to (`manager define --name`; default `default`) |
-| `GROVEFS_STRIPE_BYTES` | `mount --stripe-bytes` | Stripe chunk size for cross-server striping (default 16 MiB; only takes effect alongside a multi-address `--data-servers` list; an illegal value refuses to start) |
+| `GROVEFS_STRIPE_BYTES` | `mount --stripe-bytes` | Stripe chunk size for cross-server striping (default 16 MiB; only takes effect when the data list resolved from the roster has multiple addresses; an illegal value refuses to start) |
 | `GROVEFS_MEMBER_ID` | `data-server --member-id` | This data-server's stable identity id within a striped cluster (a 64-bit integer unique per member; an illegal value refuses to start; if not given, the node participates in stripes in the historical positional mode) |
 | `GROVEFS_TOKEN` | `mount --token`, `meta-server/data-server --token` | Cluster admission passphrase |
 | `GROVEFS_DATA_ACCESS_KEY` | `meta-server --data-access-key`, `data-server --data-access-key` | Shared HMAC key (hex, `openssl rand -hex 32`) for the Data-Access Capability that binds the data plane to a genuine meta admission; both servers must use the SAME value, `mount` needs none (the capability is minted by the meta-server in the `M_OPEN` ack and auto-replayed to the data plane); §6.1.1 |
@@ -136,7 +135,7 @@ The long commands you type over and over can be slimmed down wholesale. The prec
 | `GROVEFS_MCP_API_KEY` | MCP `initialize` handshake | Whole-server pre-authentication |
 | `GROVEFS_CONTROL_KEY` | `--api-key` (with `--control-server`) | The governance port's admin key (`<id>:<secret>`); if unset it falls back to `GROVEFS_API_KEY`, and either way the secret stays out of argv |
 | `GROVEFS_STATS` | `--stats` | `1/true` enables telemetry |
-| `GROVEFS_SQLITE_READ_POOL` | — (internal tuning) | Per-view SQLite warm read-connection count, range 0–16; when unset, **local mounts follow `--threads`** (default 4), embedded/`meta-server` default to 1; `0` is fully lazy (open/close per read). Raising it trades read concurrency for about 1.3 extra fds/connections per view (the concurrent-small-file-creation curve in §8 is sized by this: at 16 workers, a read pool of 1 gives ~1.2k, a read pool of 16 gives ~5.5–6.6k files/s) |
+| `GROVEFS_SQLITE_READ_POOL` | — (internal tuning) | Per-view SQLite **warm read-connection floor**, range 0–16; default `READ_POOL_SIZE = 1` (one idle read connection ≈ 3 fds), bursts retained up to `max(floor, READ_POOL_RETAIN = 8)` — the env raises the floor and the ceiling follows; `0` is fully lazy (open/close per read). It lives on the **server-side** per-view engines and on callers that embed the library: a mount process holds no engine, clients get frames like `M_READDIRP` that push `offset/limit` down to the server. Measured account in §8 "where a create actually goes": raising the server-side warm read floor from 1 to 8 does not change the shape of the concurrent file-creation curve — the bottleneck is on the write side |
 | `GROVEFS_PG_WRITE_POOL` | — (internal tuning) | Per-view PG write-connection warm pool, default 8, range 0–64; when the pool is empty a connection is opened ad hoc, the hard ceiling is PG `max_connections` |
 | `GROVEFS_PG_READ_POOL` | — (internal tuning) | Per-view PG read-connection warm pool, default 4, range 0–64 |
 | `GROVEFS_PG_SYNC_COMMIT` | — (internal tuning) | Session-level `SET synchronous_commit` on PG write connections; default `on` (PG's own default); with `off`/`false`/`0`/`async` a COMMIT return no longer waits for the local WAL to hit disk. On the same test rig (with the write-statement cache already in place) the N=4 write path goes 5,225 → 6,142 ops/s (+18%), N=1/N=8 within run-to-run jitter, at the cost that a crash may lose the last several committed transactions and, with a synchronous standby configured, it also stops waiting for its ack (RPO=0 must keep it `on`) |
@@ -148,15 +147,15 @@ On top of the env vars above, grovefs also **auto-loads a `KEY=VALUE` config fil
 # 查找顺序: $GROVEFS_CONFIG 指定路径 > $HOME/.config/grovefs/grovefs.conf
 # (只认 GROVEFS_* 键,其余行提示后忽略)
 cat > ~/.config/grovefs/grovefs.conf <<'EOF'
-GROVEFS_META_SERVER=192.168.1.10:50110
-GROVEFS_DATA_SERVERS=192.168.1.10:50100
+GROVEFS_MANAGER=192.168.1.10:50055
+GROVEFS_ROSTER_KEY_FILE=/etc/grovefs/roster.key
 GROVEFS_TOKEN=s3cret            # 文件里有口令就 chmod 600(与 env 里放口令同一契约)
 EOF
 chmod 600 ~/.config/grovefs/grovefs.conf
 
 # 之前: grovefs mount --view alice -m /mnt/alice \
-#         --meta-server 192.168.1.10:50110 --data-servers 192.168.1.10:50100 --token s3cret
-# 之后: 只剩"这次挂哪个视图到哪儿"
+#         --manager 192.168.1.10:50055 --roster-key-file /etc/grovefs/roster.key --token s3cret
+# 之后: 只剩"这次挂哪个视图到哪儿"(coordinates come from GROVEFS_MANAGER's signed roster)
 grovefs mount --view alice -m /mnt/alice
 ```
 
@@ -171,54 +170,64 @@ Regression coverage: `bash .build-bin/run_all.sh config` (37 assertions: the pre
 ## 2. Quick start: the smallest cluster on one host
 
 A view is **always served by two processes**: `meta-server` owns the tree, `data-server` owns
-the bytes. The smallest cluster runs both on this host's loopback over one storage root —
-`meta/` holding one tree per view, `blocks/` holding the content objects. Move them to two
-machines and the commands are word-for-word identical, only the addresses differ.
+the bytes — but a mount gets those two coordinates ONLY from the `manager`'s signed roster,
+never from a hand-typed IP:PORT. The smallest cluster runs `manager` plus those two services
+on this host's loopback over one storage root — `meta/` holding one tree per view, `blocks/`
+holding the content objects. Move them to two machines and the commands are word-for-word
+identical, only the addresses differ. Why a mount has no single-disk fallback, and why the
+coordinates can only be bootstrapped through the manager, is `docs/adr/0001-manager.md` and
+`docs/adr/0002-no-local-mount.md`.
 
 ```bash
 Y=./target/release/grovefs
 BASE=/data/myfs                       # the storage root both services share
 
-# 1) the two services (one storage root = the minimal cluster)
-$Y meta-server --meta-dir $BASE --listen 127.0.0.1:50053 &
-$Y data-server --data-dir $BASE --listen 127.0.0.1:50100 &
+# 1) declare the topology and start the manager (the first `serve` mints join.key / roster.key under $BASE/manager/)
+$Y --home $BASE manager define --meta 127.0.0.1:50053 --data 127.0.0.1:50100
+$Y --home $BASE manager serve --listen 127.0.0.1:50055 &
 
-# 2) create the two views explicitly (the only entry point that builds a view)
+# 2) the two services report they are alive to the manager (one storage root = the minimal cluster)
+$Y meta-server --meta-dir $BASE --listen 127.0.0.1:50053 --advertise-addr 127.0.0.1:50053 --register-with 127.0.0.1:50055 --join-key-file $BASE/manager/join.key &
+$Y data-server --data-dir $BASE --listen 127.0.0.1:50100 --advertise-addr 127.0.0.1:50100 --member-id 0 --register-with 127.0.0.1:50055 --join-key-file $BASE/manager/join.key &
+
+# 3) create the two views explicitly (the only entry point that builds a view)
 $Y view --meta-dir $BASE create --view alice
 $Y view --meta-dir $BASE create --view bob
 
-# 3) mount (detaches by default: it returns once the mountpoint is live;
+# 4) mount: both coordinates resolve from the manager's signed roster (detaches by default: it returns once the mountpoint is live;
 #    --foreground stays attached, Ctrl-C unmounts)
-$Y mount --view alice --mountpoint /mnt/alice --meta-server 127.0.0.1:50053 --data-servers 127.0.0.1:50100
-$Y mount --view bob   --mountpoint /mnt/bob   --meta-server 127.0.0.1:50053 --data-servers 127.0.0.1:50100
+$Y mount --view alice --mountpoint /mnt/alice --manager 127.0.0.1:50055 --roster-key-file $BASE/manager/roster.key
+$Y mount --view bob   --mountpoint /mnt/bob   --manager 127.0.0.1:50055 --roster-key-file $BASE/manager/roster.key
 
-# 4) read and write it like an ordinary directory
+# 5) read and write it like an ordinary directory
 mkdir -p /mnt/alice/projects/2026
 echo "report" > /mnt/alice/projects/2026/report.txt
 ls /mnt/bob                               # bob cannot see alice's files
 
-# 5) unmount
+# 6) unmount
 $Y umount --mountpoint /mnt/alice
 fusermount -u /mnt/alice                  # equivalent
 ```
 
 **View isolation**: `/mnt/alice` and `/mnt/bob` are two independent trees, invisible to each other. The hierarchy (nested directories you `mkdir`) is fully custom.
 
-**Skipping the two coordinates**: a client that would rather not retype the addresses lets a
-`manager` sign a roster once — `mount --manager HOST:PORT --roster-key-file F` resolves exactly
-those two values (§4.2). A roster is read once, at mount time, and never sits on the IO path —
-the two routes **stack**, one does not replace the other.
+**No hand-typed coordinates**: a client never writes down a service address; a mount passes only
+`--manager HOST:PORT --roster-key-file F`, and the signed roster resolves the two coordinates (§4.2).
+The roster is read once, at mount time, and never sits on the IO path — `mount` no longer accepts a
+hand-typed `--meta-server`/`--data-servers`. This is a **replacement**, not an addition.
 
-**What happens with a missing coordinate**: a `mount` given either service alone exits on the
-spot, with no "settle for less" fallback. Verbatim:
+**What happens without the bootstrap**: a `mount` given neither `--manager` (nor `GROVEFS_MANAGER`)
+exits on the spot, with no "settle for less" fallback. Verbatim:
 
 ```text
 $ grovefs mount --view team -m /mnt/team
-error: a mount needs BOTH services: a metadata service (--meta-server) and a data service (--data-servers). There is no single-machine mode: one --home holding a view's tree AND its bytes would make every client an authoritative store, so two mounts of one view diverge and a laptop can end up holding the only copy. Pass the two addresses, each optionally a comma list (failover for the first, striping for the second), or --manager HOST:PORT --roster-key-file PATH to have both resolved from a signed roster. GROVEFS_META_SERVER / GROVEFS_DATA_SERVERS satisfy this too. --home stays the store root of the node-side verbs (view create, gc, import, apikey, du) and of the servers themselves, never of a mount.
+error: a mount resolves its cluster coordinates from the deployment's manager: there is no longer a way to name a metadata or data service by hand. Pass --manager HOST:PORT --roster-key-file PATH (or the GROVEFS_MANAGER / GROVEFS_ROSTER_KEY_FILE env knobs) to fetch the deployment's SIGNED roster and dial the meta- and data-servers it declares. Directly naming the addresses was removed on purpose: one --home holding a view's tree AND its bytes would make every client an authoritative store, and hand-typed lists let two mounts of one view dial different (or half a) cluster; a manager declaring the topology once and every client verifying the same signature is what keeps them consistent. Start the services with --register-with the manager, then `grovefs manager define`/`serve` it. --home stays the store root of the node-side verbs (view create, gc, import, apikey, du) and of the servers themselves, never of a mount.
 ```
 
-`GROVEFS_META_SERVER` / `GROVEFS_DATA_SERVERS` (or the same keys in §1.1's config file) satisfy the
-requirement too; a comma list makes `--meta-server` fail over and `--data-servers` stripe (§4, §5.5). Why a mount has no local fallback at all - the motivation, the rejected alternatives and the price paid - is `docs/adr/0002-no-local-mount.md`.
+`GROVEFS_MANAGER` / `GROVEFS_ROSTER_KEY_FILE` (or the same keys in §1.1's config file) satisfy the
+requirement too; the roster's meta list may be an ORDERED failover list and its data list the COMPLETE
+stripe member set (§4, §5.5). Why a mount has no local fallback at all - the motivation, the rejected
+alternatives and the price paid - is `docs/adr/0002-no-local-mount.md`.
 
 ---
 
@@ -235,7 +244,7 @@ touch projects/2026/README.txt
 
 ```bash
 $Y view --meta-dir $BASE create --view alice --manifest ./seed.txt
-created BASE view 'alice' at /data/myfs/meta/alice.db
+created BASE view 'alice' at /data/myfs/meta/alice/alice.db
 applied seed manifest ./seed.txt
   deletes in a base view free the underlying object once no other view references it;
   reshape it with `view define` or publish it under a name with `view alias`.
@@ -260,7 +269,7 @@ Once mounted you see the pre-built hierarchy.
 > This section answers just three things: **what each of the four views is, which files/tables each command produces, and how to fill in the parameters**.
 > §3.1–§3.4.1 are the operational detail; on first contact, read this section fully, then follow the examples in §3.2/§3.4.
 
-> **Explicit creation (must read)**: `meta-server` has exactly one rule at `M_OPEN` — when `meta/<name>.db` (under PG, a `grovefs_v_<hex>` schema) does not exist it is refused outright with a readable reason, and an empty DB is **never** created at mount time; this rule has no switch. The server prints the contract in its startup log (several `.build-bin/test_*.sh` suites assert this line verbatim):
+> **Explicit creation (must read)**: `meta-server` has exactly one rule at `M_OPEN` — when `meta/<name>/<name>.db` (under PG, a `grovefs_v_<hex>` schema) does not exist it is refused outright with a readable reason, and an empty DB is **never** created at mount time; this rule has no switch. The server prints the contract in its startup log (several `.build-bin/test_*.sh` suites assert this line verbatim):
 >
 > ```text
 > meta-server: views are created explicitly — M_OPEN refuses a name with no existing tree or definition (`grovefs view --meta-dir <dir> create --view <name>`); no empty tree is ever auto-created
@@ -269,7 +278,7 @@ Once mounted you see the pre-built hierarchy.
 **First, correct the most common misconception: writing data is not creating a base view.** A `mkdir`/`echo` into a mountpoint only adds nodes to an **already existing** tree; when `mount --view <name>` hits a tree the server does not have, the handshake is refused and the server writes nothing:
 
 ```text
-$ grovefs mount --view nosuch -m /mnt/nosuch --meta-server 127.0.0.1:15190 --data-servers 127.0.0.1:15191
+$ grovefs mount --view nosuch -m /mnt/nosuch --manager 127.0.0.1:50055 --roster-key-file ~/roster.key
 error: view 'nosuch' does not exist on this meta-server (sqlite): no tree and no definition — views are created explicitly, so unknown names are refused instead of becoming an empty tree; create it first: `grovefs view --meta-dir <meta-dir> create --view nosuch` (or seed a tree with `grovefs view import`)
 ```
 
@@ -290,7 +299,7 @@ The only entry point for creating a base view is `view create --view` (which fir
 | --- | --- | --- | --- | --- |
 | **Essence** | A real physical tree | base tree + rules (builds no tree) | name → real view (builds no tree) | An independent physical tree (dir entries copied from the base tree) |
 | **Create command** | `view create --view V` | `view define --name D --base B --rules F` | `view alias --name A --real R` | `view fork --name F --base B` |
-| **New files** | `meta/V.db` | `meta/views/D.layout` | `meta/views/A.layout` | `meta/F.db` + `meta/views/F.layout` |
+| **New files** | `meta/V/V.db` | `meta/views/D.layout` | `meta/views/A.layout` | `meta/F/F.db` + `meta/views/F.layout` |
 | **Can change dirs after mount** | Yes | No (read-only) | Yes | Yes |
 | **Can write content after mount** | Yes | No (`EROFS`) | Yes | No (`EROFS`) |
 | **When deleting one name** | Removes the base tree's name; bytes freed only when the ledger hits zero | Derived mount is read-only, can't delete (goes through base) | Equivalent to deleting on the real view; bytes freed only when the ledger hits zero | Removes only the fork's own name; base tree untouched; bytes freed only when the ledger hits zero |
@@ -317,9 +326,9 @@ The only entry point for creating a base view is `view create --view` (which fir
 
 | Follow-up | Answer | Where you can see it |
 | --- | --- | --- |
-| Does a derived view **copy** the base view, just read-only for the user? | **It's not a copy.** A derived view lands only one `.layout` text (`base B` + rules), copying no dir entries, copying no bytes. Each time a directory is read, the server/local computes the display shape **on the fly** on the base tree per the rules. | `view define` builds no `meta/D.db`; the directory has only `meta/views/D.layout`; `view list` prints `view 'D' -> base 'B': 1 hide, 1 only, 1 reloc rule(s) (read-only)` rather than "a tree"; after editing a rule it reshapes via the server within ≤2s. The cost is that the directory can't be changed either and content writes return `EROFS` — because it never had its own dir entries to change. |
-| Is an alias just the base view with a different name? | **Yes.** An alias has no metadata of its own; at resolution the name is swapped to the real view `R`, and thereafter reading dirs, making dirs, writing files, deleting files all land on `R`'s **same tree, same bytes**. | An alias occupies only one line `alias R` in `meta/views/A.layout`, with no `meta/A.db`; after `view alias`, a file written into `A/` is immediately visible in `R/` (the same inode). The only difference is **name governance**: while the alias exists `mount --view R` is refused, and one real view can have only one alias at a time (rotate with `--retire`). |
-| Is a fork a full metadata copy, where you can change dirs but can't delete the underlying data? | **First half correct; second half needs to separate "delete the name" from "delete the bytes".** A fork copies the base tree's `node` rows (dir entries, incl. inode/hardlink relations), so it has its own complete, modifiable directory tree; content writes return `EROFS`. Deleting a name in the fork removes only the fork's own dir entry, the base tree is untouched; whether bytes are reclaimed depends on the `refs.db` ledger — the object is really deleted only when no view holds it anymore. | `view fork` creates `meta/F.db` and records in `refs.db`; `rm --name F` deletes the fork's own tree + definition, the base tree and still-held bytes are untouched; files added to the base tree later do not automatically appear in the fork. |
+| Does a derived view **copy** the base view, just read-only for the user? | **It's not a copy.** A derived view lands only one `.layout` text (`base B` + rules), copying no dir entries, copying no bytes. Each time a directory is read, the server/local computes the display shape **on the fly** on the base tree per the rules. | `view define` builds no `meta/D/D.db`; the directory has only `meta/views/D.layout`; `view list` prints `view 'D' -> base 'B': 1 hide, 1 only, 1 reloc rule(s) (read-only)` rather than "a tree"; after editing a rule it reshapes via the server within ≤2s. The cost is that the directory can't be changed either and content writes return `EROFS` — because it never had its own dir entries to change. |
+| Is an alias just the base view with a different name? | **Yes.** An alias has no metadata of its own; at resolution the name is swapped to the real view `R`, and thereafter reading dirs, making dirs, writing files, deleting files all land on `R`'s **same tree, same bytes**. | An alias occupies only one line `alias R` in `meta/views/A.layout`, with no `meta/A/A.db`; after `view alias`, a file written into `A/` is immediately visible in `R/` (the same inode). The only difference is **name governance**: while the alias exists `mount --view R` is refused, and one real view can have only one alias at a time (rotate with `--retire`). |
+| Is a fork a full metadata copy, where you can change dirs but can't delete the underlying data? | **First half correct; second half needs to separate "delete the name" from "delete the bytes".** A fork copies the base tree's `node` rows (dir entries, incl. inode/hardlink relations), so it has its own complete, modifiable directory tree; content writes return `EROFS`. Deleting a name in the fork removes only the fork's own dir entry, the base tree is untouched; whether bytes are reclaimed depends on the `refs.db` ledger — the object is really deleted only when no view holds it anymore. | `view fork` creates `meta/F/F.db` and records in `refs.db`; `rm --name F` deletes the fork's own tree + definition, the base tree and still-held bytes are untouched; files added to the base tree later do not automatically appear in the fork. |
 
 #### 2.2 Is a derived view necessary? Can "alias + read-only API key" replace it
 
@@ -361,10 +370,10 @@ Two easily-missed points: a fork's "writable" reaches only the structural layer 
 
 | | fork + delete rows | derived (`.layout`) |
 | --- | --- | --- |
-| Visible shape | delete a row = hide, materialized in `meta/F.db` | computed by rules, no rows landed |
+| Visible shape | delete a row = hide, materialized in `meta/F/F.db` | computed by rules, no rows landed |
 | Base tree add/rename/reattr | **does not follow** (the copy happened in an instant, must re-fork) | **follows immediately** (computed fresh on each readdir) |
 | Cost (20,201 entries measured) | `fork` 0.61s, **20,201 rows / 3.5 MB** | `define` 0.00s, **47 bytes** |
-| Cost (100,002 entries measured) | `fork` **0.65s**, `meta/F.db` **12 MB** + 13-byte definition | `define` 0.00s, 100 rules **2.9 KB** |
+| Cost (100,002 entries measured) | `fork` **0.65s**, `meta/F/F.db` **12 MB** + 13-byte definition | `define` 0.00s, 100 rules **2.9 KB** |
 | To change "what's hidden" once | re-fork, or hand-edit rows (after editing they drift from the rules) | change one line, effective within ≤2s via the server |
 | Read-only guarantee | structure is writable by default, needs an extra flag to be read-only | read-only by nature (still `EROFS` with an rw key) |
 | Can you tell "what was hidden" | can't tell — the rows are gone, an audit can't distinguish "hidden" from "never existed" | `view list` reports `1 hide, 1 only, …` directly |
@@ -388,19 +397,19 @@ Extrapolating from measurements (100,002 entries → 12 MB, 0.65s, ~125 B/row): 
 
 | Command | Produces/changes | What it doesn't touch |
 | --- | --- | --- |
-| `grovefs view --meta-dir D create --view V [--manifest F]` | creates `D/meta/V.db` (with `node`/`ctrl`/`locks` tables); `--manifest` additionally writes dir/empty-file nodes into the tree | doesn't change other views |
-| `grovefs mount --view V --meta-server A --data-servers B` (the only mount form) | the server resolves `V`: a hit on `D/meta/views/V.layout` follows the definition (an alias swaps the name, a derived view applies its read-only lens, a fork opens its own tree), otherwise it opens `D/meta/V.db`; neither present → **refused outright** with a prompt to `view create` first. The client keeps nothing on disk | doesn't change an existing tree |
+| `grovefs view --meta-dir D create --view V [--manifest F]` | creates `D/meta/V/V.db` (with `node`/`ctrl`/`locks` tables); `--manifest` additionally writes dir/empty-file nodes into the tree | doesn't change other views |
+| `grovefs mount --view V --manager MGR --roster-key-file KEY` (the only mount form) | the server resolves `V`: a hit on `D/meta/views/V.layout` follows the definition (an alias swaps the name, a derived view applies its read-only lens, a fork opens its own tree), otherwise it opens `D/meta/V/V.db`; neither present → **refused outright** with a prompt to `view create` first. The client keeps nothing on disk | doesn't change an existing tree |
 | `grovefs view --meta-dir D define --name X --base B --rules F` | writes/overwrites `D/meta/views/X.layout`, body containing a `base B` line, the rest being rules | builds no `X.db`, copies/moves no content |
 | `grovefs view --meta-dir D alias --name A --real R [--retire OLD]` | writes/overwrites `D/meta/views/A.layout` (a single line `alias R`); `--retire` also deletes the old alias definition | builds no `A.db`; `R`'s data untouched |
-| `grovefs view --meta-dir D fork --name X --base B` | creates `D/meta/X.db` (copying B's `node` rows, preserving inode/hardlink relations); writes `D/meta/views/X.layout` (a single line `fork B`); records the shared bytes in `D/meta/refs.db` | copies no bytes; doesn't change B's tree |
-| `grovefs view --meta-dir D rm --name X` | deletes `D/meta/views/X.layout`; if X is a fork, also deletes `D/meta/X.db` (+WAL/SHM) and rebuilds `refs.db` | derived/alias touch no data; fork doesn't touch the base tree or still-held bytes |
-| `grovefs view --meta-dir D rm --name V --base` | deletes `D/meta/V.db` (+WAL/SHM), rebuilds `refs.db`, and reclaims objects **no one holds anymore** from `--data-dir` (default `D`) | bytes still held by other views are kept |
+| `grovefs view --meta-dir D fork --name X --base B` | creates `D/meta/X/X.db` (copying B's `node` rows, preserving inode/hardlink relations); writes `D/meta/views/X.layout` (a single line `fork B`); records the shared bytes in `D/meta/_control/refs.db` | copies no bytes; doesn't change B's tree |
+| `grovefs view --meta-dir D rm --name X` | deletes `D/meta/views/X.layout`; if X is a fork, also deletes `D/meta/X/X.db` (+WAL/SHM) and rebuilds `refs.db` | derived/alias touch no data; fork doesn't touch the base tree or still-held bytes |
+| `grovefs view --meta-dir D rm --name V --base` | deletes `D/meta/V/V.db` (+WAL/SHM), rebuilds `refs.db`, and reclaims objects **no one holds anymore** from `--data-dir` (default `D`) | bytes still held by other views are kept |
 | `grovefs mount … --layout F` | the rules file itself is never landed; the client wraps `F` around the **already resolved** provider, **stacking** with the published derived definition (measured in §3.0 pitfall 5) | doesn't change server state; affects only this mount |
-| `grovefs view --meta-dir D export/import --view V` | export: one JSONL file; import: creates `D/meta/V.db` (under `--meta-store postgres://…` the import opens that view's schema in the database, §15.9) | doesn't move bytes (bytes must be copied separately into `blocks/` or handed to the data-server's data root) |
+| `grovefs view --meta-dir D export/import --view V` | export: one JSONL file; import: creates `D/meta/V/V.db` (under `--meta-store postgres://…` the import opens that view's schema in the database, §15.9) | doesn't move bytes (bytes must be copied separately into `blocks/` or handed to the data-server's data root) |
 
 A few easily-missed rules:
 
-- **A definition is just a text slot**: `view define/alias/fork` write `meta/views/<name>.layout`; only fork additionally creates a `meta/<name>.db` tree.
+- **A definition is just a text slot**: `view define/alias/fork` write `meta/views/<name>.layout`; only fork additionally creates a `meta/<name>/<name>.db` tree.
 - **A definition may precede the base tree**: `view define` allows the base to not be built yet (it warns), but **at mount time** both server and local enforce that the base must already be created, otherwise the derived name is refused mounting. Recommended order remains "`view create` the base view first, then define".
 - **Deleting a definition is not hot-effective**: after `view rm --name`, new mounts immediately don't see the definition; already-mounted derived/alias connections keep the old resolution until remount (or until the server cache is cleared by an HA/snapshot event).
 - **Deleting a base view has four guards**: the name itself must not still be governed by a definition; no other derived/alias/fork may point at it; it must not still be mounted on this machine; and the tree in PG must be deleted **with the same command** (`view --meta-store postgres://… rm --base`) — the ledger decrement and `DROP SCHEMA` finish in one transaction (§15.8); hand-`DROP SCHEMA` past the CLI leaves ledger rows that forever over-count.
@@ -413,15 +422,21 @@ After one `view create` + `view define` + `view alias` + `view fork`, the storag
 D/
 ├─ blocks/<2hex>/<key>         # 所有视图共享的文件字节(key 是 UUID,不是内容哈希)
 └─ meta/
-   ├─ team.db                  # 基视图 team: node + ctrl + locks
-   ├─ lab.db                   # fork lab: 自己的 node + ctrl + locks
-   ├─ refs.db                  # 跨视图持有账本:谁还在引用哪个 key
-   ├─ views/
-   │  ├─ docsonly.layout       # base team + only /docs
-   │  ├─ public.layout         # alias team
-   │  └─ lab.layout            # fork team
-   └─ api_keys.db              # 可选:API key/审计(SQLite 控制面)
+   ├─ team/                    # 基视图 team:一棵树一个目录
+   │  └─ team.db               # node + ctrl + locks(+ -wal/-shm 随 checkpoint 出没)
+   ├─ lab/                     # fork lab:独立元数据树
+   │  └─ lab.db                # 自己的 node + ctrl + locks
+   ├─ _control/                # 控制面:不是树(目录名是保留视图名,永不被当树枚举)
+   │  ├─ refs.db               # 跨视图持有账本:谁还在引用哪个 key
+   │  ├─ api_keys.db           # 可选:API key/审计
+   │  └─ store.key             # 开 api_keys.db 那份密文副本的密钥(0600)
+   └─ views/
+      ├─ docsonly.layout       # base team + only /docs
+      ├─ public.layout         # alias team
+      └─ lab.layout            # fork team
 ```
+
+`ls meta/` lists trees and nothing else: `_control/`, `views/` and the dot-prefixed `.xfer/` (the server-side export/import spool, present once those verbs have run) are not trees and can never be a view name.
 
 The three `.layout` bodies look like this respectively (plain text, not SQLite DBs):
 
@@ -439,11 +454,11 @@ fork team
 
 | On-disk artifact | What it is | Who produces/maintains it |
 | --- | --- | --- |
-| `meta/<view>.db` | a SQLite DB; the `node` table is the directory tree (one row per name), `ctrl` a key-value table (today only the HA `epoch`), `locks` the lock leases | `view create`/`view fork`/`view import` |
+| `meta/<view>/<view>.db` | a SQLite DB; the `node` table is the directory tree (one row per name), `ctrl` a key-value table (today only the HA `epoch`), `locks` the lock leases | `view create`/`view fork`/`view import` |
 | `meta/views/<name>.layout` | **plain text** definition, not a database; three mutually exclusive forms: `base B`+rules / `alias R` / `fork B` | `view define`/`alias`/`fork`; deleted by `view rm` |
-| `meta/refs.db` | the shared-bytes ledger; when a name is deleted it decides "whether any other view still holds it" | auto-booked on every add/delete; `refs rebuild` recomputes |
+| `meta/_control/refs.db` | the shared-bytes ledger; when a name is deleted it decides "whether any other view still holds it" | auto-booked on every add/delete; `refs rebuild` recomputes |
 | `blocks/<2hex>/<key>` | the file's real bytes; all views store only the key | produced on write/import; deleted on reclaim |
-| `meta/api_keys.db` | optional control plane: key digests and call audit | the `apikey` command / `mcp --require-api-key` |
+| `meta/_control/api_keys.db` | optional control plane: key digests and call audit | the `apikey` command / `mcp --require-api-key` |
 
 A row of the `node` table contains: `id`, `ino`, `parent_id`, `name`, `is_dir`, `data_ref` (the key pointing into blocks), `link_target`, `mode/uid/gid`, `mtime/atime/ctime`, with a uniqueness constraint on `(parent_id, name)`. `ctrl` is a `(k, v)` key-value table holding today only the HA `epoch` (**not an inode counter** — new inodes aren't allocated from a cursor, they equal their own row's `id`); `locks` are POSIX/BSD lock leases. `refs.db` has a single `holders(data_ref TEXT PRIMARY KEY, holders INTEGER)` table recording how many views hold each object. `api_keys.db` (optional) has two tables `api_keys` and `mcp_calls`: the former carries `id, label, secret_hash, created_at, last_used_at, revoked_at, scope, view, ro, owner, note, expires_at, created_by, secret_hint, secret_enc` — beyond the digest, three bookkeeping fields (remark / deadline / minter), one head+tail fingerprint, and one **reversible ciphertext copy** `secret_enc` (NULL while no wrap material exists); the store still holds **no plaintext** anywhere — the latter is the call audit. The PG tier uses the same column names (`view_name`/`ro BOOLEAN`, plus an extra `seq` identity column). Old stores upgrade in place: opening the registry adds the missing columns with `ALTER TABLE … ADD COLUMN` and rewrites no row. **The difference between views is not the table structure, but "whether this name has its own `.db`"**.
 
@@ -451,10 +466,10 @@ A row of the `node` table contains: `id`, `ino`, `parent_id`, `name`, `is_dir`, 
 
 | SQLite on-disk artifact | PG counterpart |
 | --- | --- |
-| `meta/<view>.db` | a schema `grovefs_v_<hex(view)>` (with the same-shape `node`/`ctrl`/`locks`) |
+| `meta/<view>/<view>.db` | a schema `grovefs_v_<hex(view)>` (with the same-shape `node`/`ctrl`/`locks`) |
 | `meta/views/<name>.layout` | a row in the `grovefs_control.view_defs` table |
-| `meta/refs.db` | the shared table `grovefs_refs.holders` |
-| `meta/api_keys.db` | `grovefs_control.api_keys` + `mcp_calls` |
+| `meta/_control/refs.db` | the shared table `grovefs_refs.holders` |
+| `meta/_control/api_keys.db` | `grovefs_control.api_keys` + `mcp_calls` |
 
 Under PG, `view define/alias/rm --name` works as usual (writing `view_defs`); `view --meta-store postgres://… create` explicitly builds that view's schema (`grovefs_v_<hex>`); `view --meta-store postgres://… rm --base` decrements the ledger (per-key `grovefs_refs.holders`) and runs `DROP SCHEMA … CASCADE` in one transaction, then reclaims `blocks/` bytes by the `data_ref` read before deletion (§15.8); `view fork` is likewise available on both backends (copying the `grovefs_v_<hex>` schema in a single transaction); zero-copy `import` is still based on the local file tree and refuses.
 
@@ -498,10 +513,10 @@ Under PG, `view define/alias/rm --name` works as usual (writing `view_defs`); `v
 Judged in order, stop at the first hit:
 
 1. `meta/views/X.layout` is a single `alias R` line → swap to the real view `R`, resolve by `R` thereafter; `X` is not an independent tree, and `R` can no longer be mounted by its real name.
-2. It is a single `fork B` line → open `X`'s own `meta/X.db` (the tree copied when the fork was built), unrelated to `B`'s later changes.
-3. It is `base B` + rule lines → open `meta/B.db` and apply the following rules as a read-only lens.
-4. No `X.layout` → `X` itself is a base view, open `meta/X.db` directly.
-5. `meta/X.db` absent too → **refuse outright** (exit=1), never falling back to an empty tree:
+2. It is a single `fork B` line → open `X`'s own `meta/X/X.db` (the tree copied when the fork was built), unrelated to `B`'s later changes.
+3. It is `base B` + rule lines → open `meta/B/B.db` and apply the following rules as a read-only lens.
+4. No `X.layout` → `X` itself is a base view, open `meta/X/X.db` directly.
+5. `meta/X/X.db` absent too → **refuse outright** (exit=1), never falling back to an empty tree:
    `error: view 'X' does not exist on this meta-server (sqlite): no tree and no definition — views are created explicitly, so unknown names are refused instead of becoming an empty tree; create it first: `grovefs view --meta-dir <dir> create --view X` (or seed a tree with `grovefs view import`)`
 
 > Resolution happens **only on the server**: it reads `<meta-dir>/meta/views/` (the PG backend reads `grovefs_control.view_defs`), and the client has no view namespace of its own. Both single-hop rules hold: an alias can't point at another alias, and a name that has a definition can't be a fork's base; the server additionally refuses "derived over derived", and a derived mount requires the base to already exist.
@@ -525,16 +540,18 @@ Every line of output below is a real artifact of this release build (`.bneck/pro
 
 ```bash
 Y=./target/release/grovefs
-D=/data/myfs                     # the storage root shared by meta-server and data-server
-GFS=(--meta-server 127.0.0.1:50053 --data-servers 127.0.0.1:50100)
+D=/data/myfs                     # the storage root shared by manager, meta-server and data-server
+GFS=(--manager 127.0.0.1:50055 --roster-key-file $D/manager/roster.key)   # mount coordinates resolve ONLY from the manager
 
-# ⓪ start the two services (once is enough; cross-machine layout in §11)
-$Y meta-server --meta-dir $D --listen 127.0.0.1:50053 &
-$Y data-server --data-dir $D --listen 127.0.0.1:50100 &
+# ⓪ start the three services (once is enough; cross-machine layout in §11): declare the topology, then register
+$Y --home $D manager define --meta 127.0.0.1:50053 --data 127.0.0.1:50100
+$Y --home $D manager serve --listen 127.0.0.1:50055 &
+$Y meta-server --meta-dir $D --listen 127.0.0.1:50053 --register-with 127.0.0.1:50055 --join-key-file $D/manager/join.key &
+$Y data-server --data-dir $D --listen 127.0.0.1:50100 --register-with 127.0.0.1:50055 --join-key-file $D/manager/join.key &
 
 # ① create the base view (the tree that really stores data), mount it, write data
 $Y view --meta-dir $D create --view team
-created BASE view 'team' at /data/myfs/meta/team.db
+created BASE view 'team' at /data/myfs/meta/team/team.db
   deletes in a base view free the underlying object once no other view references it;
   reshape it with `view define` or publish it under a name with `view alias`.
 $Y mount --view team -m /mnt/team "${GFS[@]}" &
@@ -582,10 +599,10 @@ $Y view --meta-dir $D list
 view 'docsonly' -> base 'team': 0 hide, 1 only, 0 reloc rule(s) (read-only)
 fork 'lab' of base 'team' (independent tree: structure writable, content refused EROFS; deletes touch only this view)
 alias 'public' -> real view 'team' (full tree, writable; 'team' not mountable by its own name)
-base view 'team' -> own tree meta/team.db (read-write; deletes free a shared object only when no view holds it)
+base view 'team' -> own tree meta/team/team.db (read-write; deletes free a shared object only when no view holds it)
 view keys: `grovefs apikey --meta-dir /data/myfs list [--view NAME]` (add --view to see only that view's keys)
 ls $D/meta $D/meta/views
-  meta: lab.db lab.db-shm lab.db-wal refs.db refs.db-shm refs.db-wal team.db team.db-shm team.db-wal views
+  meta: _control lab team views
   views: docsonly.layout lab.layout public.layout
 ```
 
@@ -615,7 +632,7 @@ A manifest fixes the shape of the **storage tree**; `--layout` fixes the shape *
 $ cat lens.txt
 hide /photos/private
 map /data/raw /team/raw
-$Y mount --view alice -m /mnt/alice --meta-server 10.0.0.5:50110 --data-servers 10.0.0.5:50100 --layout lens.txt
+$Y mount --view alice -m /mnt/alice --manager 10.0.0.5:50055 --roster-key-file /etc/grovefs/roster.key --layout lens.txt
 layout overlay lens.txt: 1 hide, 0 only, 1 reloc rule(s)
 mounting view 'alice' at /mnt/alice (fully remote: no local store)
 
@@ -636,10 +653,10 @@ The lens rules in §3.1 are carried by each client; to give one set of shapes a 
 
 | Command | Parameter meaning | Effect |
 | --- | --- | --- |
-| `grovefs view --meta-dir D create --view V [--manifest F]` | V = the new **base view** (physical tree) name, F = optional seed manifest | explicitly creates a **physical tree** `D/meta/V.db` (the only entry point that builds a tree); **only a base view's deletion truly reclaims the underlying bytes** (cross-view reference ledger hits zero before physical GC, §5.3); derived views/aliases only reshape/rename, never participate in physical deletion |
+| `grovefs view --meta-dir D create --view V [--manifest F]` | V = the new **base view** (physical tree) name, F = optional seed manifest | explicitly creates a **physical tree** `D/meta/V/V.db` (the only entry point that builds a tree); **only a base view's deletion truly reclaims the underlying bytes** (cross-view reference ledger hits zero before physical GC, §5.3); derived views/aliases only reshape/rename, never participate in physical deletion |
 | `grovefs view --meta-dir D define --name V --base B --rules F` | D = meta root (same as meta-server's `--meta-dir`), V = derived name, B = physical view name, F = rules file | writes/replaces `D/meta/views/V.layout` (under the PG backend `--meta-store`: edits a `grovefs_control.view_defs` row); `V`'s mount is **read-only** (writes go to `B`); for `meta-server`, every mount goes through the server, so established connections **reshape hot** within ≤2s (no remount) — for every mount |
-| `grovefs view --meta-dir D list` | — | lists all view definitions: derived views (base/rule counts), pure aliases (→ real view) and forks (→ base view), plus **undefined bare base views** (→ their own `meta/<name>.db`), §3.4/§3.4.1 |
-| `grovefs view --meta-dir D rm --name V` | V = derived, alias, or fork name | deletes only the definition, **touches no data**; exception: `rm --name <fork>` also deletes that fork's own `meta/<name>.db` (+WAL/SHM) and runs `refs rebuild` to recompute the ledger (base view and bytes unaffected); after deleting an alias the base name becomes mountable again (new mounts only) |
+| `grovefs view --meta-dir D list` | — | lists all view definitions: derived views (base/rule counts), pure aliases (→ real view) and forks (→ base view), plus **undefined bare base views** (→ their own `meta/<name>/<name>.db`), §3.4/§3.4.1 |
+| `grovefs view --meta-dir D rm --name V` | V = derived, alias, or fork name | deletes only the definition, **touches no data**; exception: `rm --name <fork>` also deletes that fork's own `meta/<name>/<name>.db` (+WAL/SHM) and runs `refs rebuild` to recompute the ledger (base view and bytes unaffected); after deleting an alias the base name becomes mountable again (new mounts only) |
 
 ```bash
 $ cat docsonly.rules
@@ -653,7 +670,7 @@ error: derived view name must differ from its base
 $ grovefs view --meta-dir $BASE list
 view 'docsonly' -> base 'team': 0 hide, 1 only, 0 reloc rule(s)
 
-$ grovefs mount --view docsonly --meta-server 10.0.0.5:50110 --data-servers 10.0.0.5:50100 -m /mnt/lens &   # only the derived name; the client carries no rules file
+$ grovefs mount --view docsonly --manager 10.0.0.5:50055 --roster-key-file /etc/grovefs/roster.key -m /mnt/lens &   # only the derived name; the client carries no rules file
 using remote metadata service at 10.0.0.5:50110
 derived view 'docsonly' over base 'team': read-only lens
 note: derived (virtual) views mount read-only — write to base view 'team'
@@ -664,7 +681,7 @@ docs
 $ echo x > /mnt/lens/docs/new.md     # every write through a virtual view is refused (EROFS)
 ```
 
-Semantics and guards (verified by the section-9 e2e): define rejects `name == base`, rejects the base itself being a derived view (no nesting), rejects shadowing a physical `<name>.db`, and fail-fasts on illegal rules; **virtual views always mount read-only (hard contract)** — writes belong only to the original (base-name) view, enforced at three layers: `meta-server` carries the derived flag in its `M_OPEN` handshake reply so the client lands a kernel-level read-only mount directly (write/`flock` write-lock returns `EROFS` immediately, zero round-trips); the server adds a separate authoritative gate on write-intent ops against derived names (returns `E_NOTPERM`→`EPERM`, deliberately not `E_ROFS` to avoid being misread as an HA failover signal), so old/spoofed clients can't bypass it; the client's read-only flag comes from the `M_OPEN` ack, not from its command line. **Editing a definition is hot-effective** — `meta-server` checks the definition version before dispatching each op (SQLite reads file mtime, PG reads `xmin`), so after a replacement an established mount auto-switches to the new shape within the client TTL (≤2s), no remount needed (verified ≤5s assertion, see section 9; the read-only contract is unchanged after reshaping), whereas `view rm` is not hot-effective (established mounts keep the old shape until remount, to avoid yanking a tree in use); multiple clients of the same name are rendered by the server's **same definition**, virtual inodes consistent across machines; under a shared meta-server a derived subscriber registers into both its own-name and base-name buckets and writes are double-broadcast, so base-side writes are immediately visible to derived mounts even without `--no-cache`; to limit a caller by name to reading only this derived view, mint a `--view docsonly --ro` key (writes always go to the base name, derived mounts are read-only anyway). Resolution happens only on the server: `mount --view <derived-name>` learns the shape from the `M_OPEN` ack and the client has no local `meta/views/` to read; adding `--layout` **stacks a client lens on top of it** (§3.0 pitfall 5), it is not either/or. Note: the SQLite tier's `grovefs view` operates server-local files and must run on the meta-server machine; under an HA deployment `meta/views/` must be synced to the standby manually along with the control-plane DBs (`api_keys.db`/`refs.db`); the PG tier keeps definitions in shared storage (`grovefs_control`), governed from any reachable node with the same `--meta-store`, no local files to sync (§6.2); it too is **not a security boundary**, mounting the base name directly still shows the whole tree (what can be blocked is the token / key, not the shape).
+Semantics and guards (verified by the section-9 e2e): define rejects `name == base`, rejects the base itself being a derived view (no nesting), rejects shadowing a physical `<name>.db`, and fail-fasts on illegal rules; **virtual views always mount read-only (hard contract)** — writes belong only to the original (base-name) view, enforced at three layers: `meta-server` carries the derived flag in its `M_OPEN` handshake reply so the client lands a kernel-level read-only mount directly (write/`flock` write-lock returns `EROFS` immediately, zero round-trips); the server adds a separate authoritative gate on write-intent ops against derived names (returns `E_NOTPERM`→`EPERM`, deliberately not `E_ROFS` to avoid being misread as an HA failover signal), so old/spoofed clients can't bypass it; the client's read-only flag comes from the `M_OPEN` ack, not from its command line. **Editing a definition is hot-effective** — `meta-server` checks the definition version before dispatching each op (SQLite reads file mtime, PG reads `xmin`), so after a replacement an established mount auto-switches to the new shape within the client TTL (≤2s), no remount needed (verified ≤5s assertion, see section 9; the read-only contract is unchanged after reshaping), whereas `view rm` is not hot-effective (established mounts keep the old shape until remount, to avoid yanking a tree in use); multiple clients of the same name are rendered by the server's **same definition**, virtual inodes consistent across machines; under a shared meta-server a derived subscriber registers into both its own-name and base-name buckets and writes are double-broadcast, so base-side writes are immediately visible to derived mounts even without `--no-cache`; to limit a caller by name to reading only this derived view, mint a `--view docsonly --ro` key (writes always go to the base name, derived mounts are read-only anyway). Resolution happens only on the server: `mount --view <derived-name>` learns the shape from the `M_OPEN` ack and the client has no local `meta/views/` to read; adding `--layout` **stacks a client lens on top of it** (§3.0 pitfall 5), it is not either/or. Note: the SQLite tier's `grovefs view` operates server-local files and must run on the meta-server machine; under an HA deployment `meta/views/` must be synced to the standby manually along with the control-plane directory (`meta/_control/`); the PG tier keeps definitions in shared storage (`grovefs_control`), governed from any reachable node with the same `--meta-store`, no local files to sync (§6.2); it too is **not a security boundary**, mounting the base name directly still shows the whole tree (what can be blocked is the token / key, not the shape).
 
 ### 3.3 Zero-copy import of existing data (`grovefs import`): directories stay put, clients get it by connecting
 
@@ -674,7 +691,7 @@ When the server already has a batch of ready data (e.g. `/data/legacy`) that cli
 | --- | --- | --- |
 | `grovefs import --view V --source DIR` | V = target view (created if absent), DIR = existing source dir | mirrors the whole tree into the view (default prefix `/<DIR name>`): dirs become nodes, files are hardlinked into `blocks/` and registered; mtime/atime/permissions/owner preserved |
 | `grovefs import ... --prefix P` | P = target dir in the view (e.g. `/legacy`) | mirrors under the given prefix, `P` created automatically if absent |
-| `grovefs import ... --meta-dir D [--data-dir R]` | D = meta root, R = storage root (default D) | under a meta-server deployment, run on the **storage machine**, writing directly into that deployment's authoritative SQLite tree `meta/V.db` and `R/blocks/`; already-mounted clients converge via TTL (≤2s) |
+| `grovefs import ... --meta-dir D [--data-dir R]` | D = meta root, R = storage root (default D) | under a meta-server deployment, run on the **storage machine**, writing directly into that deployment's authoritative SQLite tree `meta/V/V.db` and `R/blocks/`; already-mounted clients converge via TTL (≤2s) |
 | `grovefs import ... --meta-store URI` (or `GROVEFS_META_STORE`) | URI = `postgres://…` | **refused**: an import can only produce a local SQLite tree, so writing under a PG deployment would be a shadow tree the server can't read; feed bytes through the mountpoint instead (§14.2), the error text names this alternative path |
 | `grovefs import ... --dry-run` | — | reports only how many dirs/files would be imported, **not even creating the view db** |
 
@@ -684,14 +701,14 @@ dry run: view 'legacy' under /legacy would mirror 3 dir(s) and 2 file(s) (symlin
 $ grovefs --home /data/cluster import --view legacy --source /data/legacy
 created BASE view 'legacy' (target was absent); imported 2 object(s)
 imported into view 'legacy' under /legacy: 3 dir(s), 2 object(s) (2 hardlinked zero-copy, 0 copied), 0 skipped, 0 failed
-$ grovefs mount --view legacy --meta-server 10.0.0.5:50110 --data-servers 10.0.0.5:50100 -m /mnt/da &   # 客户端连接即得
+$ grovefs mount --view legacy --manager 10.0.0.5:50055 --roster-key-file /etc/grovefs/roster.key -m /mnt/da &   # 客户端连接即得
 $ echo "new" > /mnt/da/legacy/docs/quarter.txt   # 经挂载写 → 源路径同 inode 同步可见
 $ cat /data/legacy/docs/quarter.txt
 new
 $ rm /mnt/da/legacy/photos/2026/y.jpg            # 视图里删名字 → 只摘 blocks/ 链接,源文件毫发无损
 ```
 
-Key semantics (the `import` suite: 35 assertions): **a re-run is incremental** (existing names skipped, new files registered); **GC removes only the link** (the source path is never deleted by view operations); entries after import have exactly the same rights as native writes (read/write/lock/snapshot/invalidation-push all apply), and can be composed by §3.2 derived views' `map`/`link` into any virtual directory shape — that shape mounts **read-only** (writes go to the imported original view and reach the virtual shape through double-broadcast push); `grovefs import` also refuses a derived name as its target (otherwise it writes a shadow `<view>.db` no one can read). Three implementation facts to note: hardlinking requires the source and `blocks/` to be on the same disk (across disks it auto-emits a copy and counts it honestly); when an external tool updates a source file via **rename/replace write** (vim's default), the view side sees the old inode's last content, so import must be re-run for the new content; symlinks/special files are deliberately skipped. Under a non-SQLite backend (`--meta-store postgres://…`, incl. the `GROVEFS_META_STORE` fallback) `import` **refuses outright** and gives the alternative path (mount the view, then feed bytes through the mountpoint, §14.2) — it can only produce a local `meta/<view>.db`+`blocks/`, and writing them down would be a shadow tree the server can't see (proven by the `import`/`govcheck` suites; `view fork` is not in this category — it can already copy inside each backend's authoritative store).
+Key semantics (the `import` suite: 35 assertions): **a re-run is incremental** (existing names skipped, new files registered); **GC removes only the link** (the source path is never deleted by view operations); entries after import have exactly the same rights as native writes (read/write/lock/snapshot/invalidation-push all apply), and can be composed by §3.2 derived views' `map`/`link` into any virtual directory shape — that shape mounts **read-only** (writes go to the imported original view and reach the virtual shape through double-broadcast push); `grovefs import` also refuses a derived name as its target (otherwise it writes a shadow `<view>.db` no one can read). Three implementation facts to note: hardlinking requires the source and `blocks/` to be on the same disk (across disks it auto-emits a copy and counts it honestly); when an external tool updates a source file via **rename/replace write** (vim's default), the view side sees the old inode's last content, so import must be re-run for the new content; symlinks/special files are deliberately skipped. Under a non-SQLite backend (`--meta-store postgres://…`, incl. the `GROVEFS_META_STORE` fallback) `import` **refuses outright** and gives the alternative path (mount the view, then feed bytes through the mountpoint, §14.2) — it can only produce a local `meta/<view>/<view>.db`+`blocks/`, and writing them down would be a shadow tree the server can't see (proven by the `import`/`govcheck` suites; `view fork` is not in this category — it can already copy inside each backend's authoritative store).
 
 ---
 
@@ -713,14 +730,14 @@ note: 'team' is no longer a mount entry point while this definition exists (moun
 $ grovefs view --meta-dir $BASE list
 view 'docsonly' -> base 'team': 0 hide, 1 only, 0 reloc rule(s) (read-only)
 alias 'teamwork' -> real view 'team' (full tree, writable; 'team' not mountable by its own name)
-$ grovefs mount --view teamwork -m /mnt/work --meta-server 10.0.0.5:50241 --data-servers 10.0.0.5:50240
+$ grovefs mount --view teamwork -m /mnt/work --manager 10.0.0.5:50055 --roster-key-file /etc/grovefs/roster.key
 mounting view 'teamwork' at /mnt/work (fully remote: no local store)
 $ ls /mnt/work
 docs photos
 $ echo hello > /mnt/work/docs/2026/new.md   # 别名挂载可写,写入即真实树
 $ ls /mnt_docs/docs/2026                    # 同一写经另一路派生名(docsonly)挂载穿透可见
 a.md new.md
-$ grovefs mount --view team -m /mnt/t --meta-server 10.0.0.5:50241 --data-servers 10.0.0.5:50240
+$ grovefs mount --view team -m /mnt/t --manager 10.0.0.5:50055 --roster-key-file /etc/grovefs/roster.key
 error: view 'team' is governed by an alias — mount the alias name instead (`grovefs view list` shows it)   # 直挂被治理的真实名:服务端拒挂(exit=1)
 $ findmnt /mnt/work | tail -1
 /mnt/work grovefs:teamwork fuse rw,nosuid,nodev,relatime   # 别名可写;派生名的挂载行是 ro
@@ -735,21 +752,21 @@ note: legitimate users just remount under 'teamwork2'
 note: 'team' is no longer a mount entry point while this definition exists (mounts by its real name are refused, locally and via meta-server); alias mounts show the FULL tree and are WRITABLE
 $ grovefs view --meta-dir $BASE list
 alias 'teamwork2' -> real view 'team' (full tree, writable; 'team' not mountable by its own name)
-$ grovefs mount --view teamwork -m /mnt/leak --meta-server 10.0.0.5:50241 --data-servers 10.0.0.5:50240   # 拿旧泄露名再挂
+$ grovefs mount --view teamwork -m /mnt/leak --manager 10.0.0.5:50055 --roster-key-file /etc/grovefs/roster.key   # 拿旧泄露名再挂
 $ ls /mnt/leak          # 空:旧名不再解析到真实树(命名空间按需新建,数据不外泄)
-$ grovefs mount --view team -m /mnt/probe --meta-server 10.0.0.5:50241 --data-servers 10.0.0.5:50240        # 猜真实名同样被拒(全程治理)
+$ grovefs mount --view team -m /mnt/probe --manager 10.0.0.5:50055 --roster-key-file /etc/grovefs/roster.key        # 猜真实名同样被拒(全程治理)
 error: view 'team' is governed by an alias — mount the alias name instead (`grovefs view list` shows it)
 ```
 
-Guards (fail-fast at the `alias` command, 26 assertions in the layout suite sections 10/11): refuses `name == real`, refuses shadowing a physical `<name>.db`, refuses the target being a derived view (an alias only maps physical views), refuses an **alias chain** (`--real` pointing at another alias), allows only one outward name per real view at a time (the `--retire` rotation writes-then-deletes within the same command and is not blocked by this constraint); `--retire` additionally refuses pointing at a derived view or a nonexistent alias (it won't mis-delete a shape definition). The local (`--home`) case follows the same contract: a mount first resolves `views/<name>.layout`, and after an alias renames it mounts as usual and prints `alias view 'A' resolves to real view 'R' (full tree, writable)`; directly mounting a governed real name returns `error: view 'R' is governed by an alias — mount the alias name instead`; `grovefs import --view A` refuses an alias as target (an alias is not a storage identity, writing it out would be a shadow db no one can read). Implementation facts: alias resolution is a single hop, re-reading the definition on every `M_OPEN` (SQLite fully scans the `views/` directory — mounting is a rare event, reading a small directory fully is cheaper than maintaining an invalidation protocol; PG reads the same alias table in shared storage); rotation/`rm` affect only **new** mounts (established old-name connections persist until the old connection drops, the same semantics as the read-only gate); a rotated-away old name lands in an on-demand-created empty namespace, never reaching the real tree, so a leak is harmless; the SQLite tier's `meta/views/` are ordinary files, synced to the HA standby manually along with the control-plane DBs (`api_keys.db`/`refs.db`), `grovefs view`/`import` run on the storage machine (operating server-local files); the PG tier keeps aliases in shared storage (`grovefs_control`), governed from any reachable node with the same `--meta-store`, no local files to sync (§6.2). The refusal reason is **carried byte-for-byte into the protocol** (the `M_OPEN` response's data segment carries the server's verbatim text), so a remote refusal to mount the real name echoes exactly like a local one — the two `view 'team' is governed by an alias …` above are real runtime output; equally precise are the refusal reasons for token mismatch, api key missing/invalid/out-of-scope/revoked, and a view-bound key refusing another view (when talking to an **old server** the data segment is empty, and only then does the client fall back to generic wording). **Rotation is name governance (leak damage-control), not a security boundary**: hard isolation still rests on token+key — rotation only stops the old public name from reaching the real tree, it cannot revoke an existing holder's access.
+Guards (fail-fast at the `alias` command, 26 assertions in the layout suite sections 10/11): refuses `name == real`, refuses shadowing a physical `<name>.db`, refuses the target being a derived view (an alias only maps physical views), refuses an **alias chain** (`--real` pointing at another alias), allows only one outward name per real view at a time (the `--retire` rotation writes-then-deletes within the same command and is not blocked by this constraint); `--retire` additionally refuses pointing at a derived view or a nonexistent alias (it won't mis-delete a shape definition). The local (`--home`) case follows the same contract: a mount first resolves `views/<name>.layout`, and after an alias renames it mounts as usual and prints `alias view 'A' resolves to real view 'R' (full tree, writable)`; directly mounting a governed real name returns `error: view 'R' is governed by an alias — mount the alias name instead`; `grovefs import --view A` refuses an alias as target (an alias is not a storage identity, writing it out would be a shadow db no one can read). Implementation facts: alias resolution is a single hop, re-reading the definition on every `M_OPEN` (SQLite fully scans the `views/` directory — mounting is a rare event, reading a small directory fully is cheaper than maintaining an invalidation protocol; PG reads the same alias table in shared storage); rotation/`rm` affect only **new** mounts (established old-name connections persist until the old connection drops, the same semantics as the read-only gate); a rotated-away old name lands in an on-demand-created empty namespace, never reaching the real tree, so a leak is harmless; the SQLite tier's `meta/views/` are ordinary files, synced to the HA standby manually along with the control-plane directory (`meta/_control/`), `grovefs view`/`import` run on the storage machine (operating server-local files); the PG tier keeps aliases in shared storage (`grovefs_control`), governed from any reachable node with the same `--meta-store`, no local files to sync (§6.2). The refusal reason is **carried byte-for-byte into the protocol** (the `M_OPEN` response's data segment carries the server's verbatim text), so a remote refusal to mount the real name echoes exactly like a local one — the two `view 'team' is governed by an alias …` above are real runtime output; equally precise are the refusal reasons for token mismatch, api key missing/invalid/out-of-scope/revoked, and a view-bound key refusing another view (when talking to an **old server** the data segment is empty, and only then does the client fall back to generic wording). **Rotation is name governance (leak damage-control), not a security boundary**: hard isolation still rests on token+key — rotation only stops the old public name from reaching the real tree, it cannot revoke an existing holder's access.
 
 ### 3.4.1 fork view: an independent metadata tree, structure writable, content read-only (`grovefs view fork`)
 
-A derived view is a read-only "display lens", an alias is a whole-tree-writable "public name"; between the two there is a real need still missing: **able to tidy the directory tree, but unable to upload content, and deleting your own name never harms the base view**. `grovefs view fork` is exactly this tier — **copying** the base view's dir entries into an independent metadata tree (SQLite: `<meta-dir>/meta/<name>.db`; PG: a new `grovefs_v_<hex>` schema), preserving inode and hardlinks, copying not a single content byte, sharing them via the cross-view ledger; the definition is only one line `fork <base view>`:
+A derived view is a read-only "display lens", an alias is a whole-tree-writable "public name"; between the two there is a real need still missing: **able to tidy the directory tree, but unable to upload content, and deleting your own name never harms the base view**. `grovefs view fork` is exactly this tier — **copying** the base view's dir entries into an independent metadata tree (SQLite: `<meta-dir>/meta/<name>/<name>.db`; PG: a new `grovefs_v_<hex>` schema), preserving inode and hardlinks, copying not a single content byte, sharing them via the cross-view ledger; the definition is only one line `fork <base view>`:
 
 | Command | Parameter meaning | Effect |
 | --- | --- | --- |
-| `grovefs view --meta-dir D fork --name V --base B` | V = new fork name, B = local SQLite physical base view name | creates `D/meta/V.db` (copying B's dir entries) and writes `D/meta/views/V.layout` (body only `fork B`); thereafter the two evolve independently, names added to the base view later are not injected into an already-built fork |
+| `grovefs view --meta-dir D fork --name V --base B` | V = new fork name, B = local SQLite physical base view name | creates `D/meta/V/V.db` (copying B's dir entries) and writes `D/meta/views/V.layout` (body only `fork B`); thereafter the two evolve independently, names added to the base view later are not injected into an already-built fork |
 | `… fork --name V --base B --empty` (MCP: `fork_view` with `seed:false`) | `--empty` = build only the root, copy no dir entries | still writes a `fork B` definition, mount semantics identical, but the tree has only the root row; then use "graft" (`graft`, next subsection) to load a curated subset on demand — bytes still zero-copied |
 
 ```bash
@@ -759,9 +776,9 @@ note: 'lab' is an independent metadata tree — mkdir/rename/unlink are writable
 note: content bytes are SHARED with 'team' (cross-view ledger): the object is freed only when no view holds a name for it anymore
 $ grovefs view --meta-dir $BASE list
 fork 'lab' of base 'team' (independent tree: structure writable, content refused EROFS; deletes touch only this view)
-base view 'team' -> own tree meta/team.db (read-write; deletes free a shared object only when no view holds it)
+base view 'team' -> own tree meta/team/team.db (read-write; deletes free a shared object only when no view holds it)
 view keys: `grovefs apikey --meta-dir $BASE list [--view NAME]` (add --view to see only that view's keys)
-$ grovefs mount --view lab -m /mnt/lab --meta-server 10.0.0.5:50083 --data-servers 10.0.0.5:50084 &
+$ grovefs mount --view lab -m /mnt/lab --manager 10.0.0.5:50055 --roster-key-file /etc/grovefs/roster.key &
 fork view 'lab' of base 'team': independent tree — structure writable, content read-only (EROFS)
 mounting view 'lab' at /mnt/lab (fully remote: no local store)
 $ mkdir /mnt/lab/docs/2026/review      # organize the tree: allowed
@@ -774,7 +791,7 @@ removed fork view 'lab' of base 'team' (its own metadata tree is gone; content b
 note: a live mount of a removed fork keeps its already-resolved names until it remounts; new mounts are refused
 ```
 
-Semantics and guards: `view fork` refuses `name == base`, refuses a target name that already has a definition or a physical db, refuses a base name that itself has a definition (derived/alias/fork can't be a base), refuses a base name with no physical tree in that store (one sentence across both tiers: SQLite looks for `meta/<base>.db`, PG for `grovefs_v_<hex>`); `alias` refuses pointing at a fork (a fork is a tree identity, not a public name — mint a key for it with `apikey create --view lab`), `import` refuses a fork target. **The structural face is writable, the content face read-only**: `mkdir`/`rename`/`unlink`/`symlink`/`link`/`chmod`/empty-object `create` are allowed, `write`/`truncate` always `EROFS`; the fork identity is carried to the client in the 3rd flag byte of the `M_OPEN` reply and the content gate sits in the client's FUSE layer — since every mount goes through the server, this judgement is identical for every mount. Deletion removes only the fork's own `node` rows: a shared object is judged by the cross-view ledger and reclaimed only after the **last holding view** removes its name; `view rm --name <fork>` deletes the definition + its own `<name>.db` (+WAL/SHM) and runs `refs rebuild` to recompute the ledger, the base view and bytes untouched by a hair. Honest boundary: the content-write gate is a **client gate**, a raw-protocol client bypassing FUSE to connect directly to the data-server can still write bytes — the hard boundary remains the server's token+API key (§6). Visibility: `view list` lists both definition slots (derived/alias/fork) and **bare base views** (physical trees with no definition); `apikey list --view V` lists only keys that can open V (a pure alias also matches a key bound to the real name), and tallies the count of unbound keys. e2e in the `fork` suite (76 assertions, incl. the `--empty` empty seed and `view graft` grafting) and the `forksrv` suite (43, the same contract on the PG backend).
+Semantics and guards: `view fork` refuses `name == base`, refuses a target name that already has a definition or a physical db, refuses a base name that itself has a definition (derived/alias/fork can't be a base), refuses a base name with no physical tree in that store (one sentence across both tiers: SQLite looks for `meta/<base>/<base>.db`, PG for `grovefs_v_<hex>`); `alias` refuses pointing at a fork (a fork is a tree identity, not a public name — mint a key for it with `apikey create --view lab`), `import` refuses a fork target. **The structural face is writable, the content face read-only**: `mkdir`/`rename`/`unlink`/`symlink`/`link`/`chmod`/empty-object `create` are allowed, `write`/`truncate` always `EROFS`; the fork identity is carried to the client in the 3rd flag byte of the `M_OPEN` reply and the content gate sits in the client's FUSE layer — since every mount goes through the server, this judgement is identical for every mount. Deletion removes only the fork's own `node` rows: a shared object is judged by the cross-view ledger and reclaimed only after the **last holding view** removes its name; `view rm --name <fork>` deletes the definition + its own `<name>.db` (+WAL/SHM) and runs `refs rebuild` to recompute the ledger, the base view and bytes untouched by a hair. Honest boundary: the content-write gate is a **client gate**, a raw-protocol client bypassing FUSE to connect directly to the data-server can still write bytes — the hard boundary remains the server's token+API key (§6). Visibility: `view list` lists both definition slots (derived/alias/fork) and **bare base views** (physical trees with no definition); `apikey list --view V` lists only keys that can open V (a pure alias also matches a key bound to the real name), and tallies the count of unbound keys. e2e in the `fork` suite (76 assertions, incl. the `--empty` empty seed and `view graft` grafting) and the `forksrv` suite (43, the same contract on the PG backend).
 
 #### Customizing a fork view: seven actions from creation to deletion
 
@@ -783,9 +800,9 @@ A fork can customize only two things: the **tree** (the copied dir entries, tidi
 | # | Action | Command | Result / criterion |
 | --- | --- | --- | --- |
 | 1 | Pick the base and name it | `view list` to confirm the base is a **bare base view** (no derived/alias/fork definition) | a fork copies the **physical tree in that store** (SQLite file rows / PG schema); a derived name, alias, or another fork is refused; the name can't equal the base name nor clash with an existing db |
-| 2 | Build the tree | `grovefs view --meta-dir D fork --name F --base B` | 100,002-entry measurement **0.65s**; produces `meta/F.db` (**12 MB**) + `meta/views/F.layout` (13 B, body only `fork B`) |
-| 3 | Mount | `grovefs mount --view F -m /mnt/F --meta-server A --data-servers B` |
-| 4 | Tidy the skeleton | `mkdir`/`mv`/`ln -s`/`rm`/`chmod`/`chown`/`touch` (empty file) | changes only `meta/F.db`; `B`'s dir entries and bytes untouched by a hair |
+| 2 | Build the tree | `grovefs view --meta-dir D fork --name F --base B` | 100,002-entry measurement **0.65s**; produces `meta/F/F.db` (**12 MB**) + `meta/views/F.layout` (13 B, body only `fork B`) |
+| 3 | Mount | `grovefs mount --view F -m /mnt/F --manager MGR --roster-key-file KEY` |
+| 4 | Tidy the skeleton | `mkdir`/`mv`/`ln -s`/`rm`/`chmod`/`chown`/`touch` (empty file) | changes only `meta/F/F.db`; `B`'s dir entries and bytes untouched by a hair |
 | 5 | Decide how to "hide" | `rm` inside the fork (permanent, changes the tree) or overlay `--layout` at mount (affects only this mount, doesn't change the tree) | after deleting rows, an audit can't tell anything was "hidden"; `--layout` lets the same fork show different shapes to different clients |
 | 6 | Issue the credential | `grovefs apikey --meta-dir D create --label team-a --view F [--ro]` | the key is valid only for F; even rw, content writes still `EROFS` (only structure writable) |
 | 7 | Rotate / delete | fork a new snapshot to `F2` → switch the mount → `view rm --name F` | `rm` deletes F's own tree + definition and `refs rebuild`; shared bytes reclaimed per the ledger (§2.3) |
@@ -800,7 +817,7 @@ ln -s archive/2025 /mnt/F/latest             # 符号链接:放行(目标文本�
 rm -rf /mnt/F/tmp                            # 删名字:只影响 F,基树照旧
 # 5) 只想改「这次挂载看到什么」而不动 fork 的树:叠一层客户端规则
 printf 'hide /tmp\nonly /archive\n' > hide-tmp.layout
-grovefs mount --view F -m /mnt/F2 --meta-server A --data-servers B --layout hide-tmp.layout
+grovefs mount --view F -m /mnt/F2 --manager MGR --roster-key-file KEY --layout hide-tmp.layout
 ```
 
 **Can do / can't do (one table to draw the line)**:
@@ -817,12 +834,12 @@ grovefs mount --view F -m /mnt/F2 --meta-server A --data-servers B --layout hide
 | Move to another machine | `view export --view F` + `import --as-fork B` | bytes `rsync blocks/` separately (§3.4.2) |
 | Delete the fork and also reclaim bytes | `view rm --name F` | only bytes whose ledger hit zero are truly reclaimed; `--base` on a fork is refused |
 
-**Four common pitfalls**: ① `view rm --name F --base` is refused by the "name governed by a definition" guard — a fork is not a base view, deleting it **may only** omit `--base`; ② rebuilding a snapshot loses all fork-side tidying, so for rotation use a new name `F2` and switch the mountpoint, don't `rm` in place and rebuild; ③ every fork is a full catalog (100k entries 12 MB), N perspectives means N × 12 MB, not tens of bytes; ④ don't hand-edit `meta/F.db` — the ledger `refs.db` is updated as a set only at `fork`/`rm`/`import`, a hand-made `data_ref` has no holder record, and both the reclaim decision and `view export`'s reference count would disagree with reality.
+**Four common pitfalls**: ① `view rm --name F --base` is refused by the "name governed by a definition" guard — a fork is not a base view, deleting it **may only** omit `--base`; ② rebuilding a snapshot loses all fork-side tidying, so for rotation use a new name `F2` and switch the mountpoint, don't `rm` in place and rebuild; ③ every fork is a full catalog (100k entries 12 MB), N perspectives means N × 12 MB, not tens of bytes; ④ don't hand-edit `meta/F/F.db` — the ledger `refs.db` is updated as a set only at `fork`/`rm`/`import`, a hand-made `data_ref` has no holder record, and both the reclaim decision and `view export`'s reference count would disagree with reality.
 
-**On "the base view's identity": a view's identity is its name** (for SQLite the `meta/<name>.db` filename, for PG the schema name), **there is no separate UUID**. The `fork B` in `views/F.layout` is just a name reference, used for `view list` display, `view rm --base`'s dependency guard, and mount prompts; mounting a fork reads **only its own `meta/F.db`**, never re-checking the base tree at runtime. Hence:
+**On "the base view's identity": a view's identity is its name** (for SQLite the `meta/<name>/<name>.db` filename, for PG the schema name), **there is no separate UUID**. The `fork B` in `views/F.layout` is just a name reference, used for `view list` display, `view rm --base`'s dependency guard, and mount prompts; mounting a fork reads **only its own `meta/F/F.db`**, never re-checking the base tree at runtime. Hence:
 
 - If the base tree is renamed/moved at the file layer, an already-built fork **mounts as usual, content unchanged** (it's a self-contained snapshot); what changes is that the `fork B` line points at a nonexistent name, and `view list` no longer lists B's tree.
-- The supported way to "change the outward name" is **alias rotation** (`view alias --retire <old-name>`): the real name stays, fork/derived/alias proceed as usual; don't hand-`mv meta/<base>.db`.
+- The supported way to "change the outward name" is **alias rotation** (`view alias --retire <old-name>`): the real name stays, fork/derived/alias proceed as usual; don't hand-`mv meta/<base>/<base>.db`.
 - The dependency guard works by name: as long as some `fork B`/`base B`/`alias B` still references B, `view rm --name B --base` refuses to delete.
 - The cross-view ledger `refs.db` counts **per object** (`holders(data_ref, holders)`) and is independent of view names, so a rename won't mis-count references; if a real drift appears, recompute with `grovefs refs --meta-dir D rebuild`.
 
@@ -830,7 +847,7 @@ grovefs mount --view F -m /mnt/F2 --meta-server A --data-servers B --layout hide
 
 A full fork is a "whole snapshot"; but when actually delivering a tidied view, the common case is **wanting only a small part of the base view, and renaming it** (`data/4f2c-9a10.fits` → `M31_2025.fits`). Two actions combine, still **copying no bytes**:
 
-1. **Empty fork**: `fork_view` with `seed:false` (CLI form `view fork --empty`) — builds only the root of `meta/F.db`, moving no 100k dir-entry rows.
+1. **Empty fork**: `fork_view` with `seed:false` (CLI form `view fork --empty`) — builds only the root of `meta/F/F.db`, moving no 100k dir-entry rows.
 2. **Graft**: feed a **plan** (plain text, one entry per line) to `graft_view` (CLI form `view graft --map PLAN`, file or `-` reads stdin), grafting base-view entries into any directory of F on demand, renaming line by line.
 
 **The target may be a fork or a bare base view** — the only criterion is: **it must own its `node` table**. A derived lens and a pure alias are just someone else's display layer and are refused by role (refusal verbatim below).
@@ -994,7 +1011,7 @@ Note the last note **changes by target type**: a `fork` target says content read
 | Graft one object into multiple names | **yes** | hardlink semantics: same `data_ref`, ledger records one more holder |
 | Upload/modify bytes via grafting | **no** | if the target is a fork, content is still `EROFS`; grafting straight into a base view keeps it writable as usual |
 | Use a derived/alias as source or target | **no** | they own no `node` table, refused by role (verbatim above) |
-| PG backend | **no** (same reason as fork) | the authoritative tree is in PG, there's no readable `meta/<name>.db` |
+| PG backend | **no** (same reason as fork) | the authoritative tree is in PG, there's no readable `meta/<name>/<name>.db` |
 
 The CLI (`grovefs view graft --name F --map PLAN|-`) and MCP (`graft_view`) share one implementation: parameter semantics and refusal wording byte-for-byte identical, only the entrance differs.
 
@@ -1005,7 +1022,7 @@ GroveFS's metadata is **not hardware-bound**: a `node` row stores only `data_ref
 | Command | Parameter meaning | Effect |
 | --- | --- | --- |
 | `grovefs view --meta-dir D export --view V --out F [--force]` | D = source storage root, V = **physical base view or fork** name, F = output file | writes a header (format/version/kind/definition verbatim/node and blob counts) + one node per line (id/inode/name/is_dir/data_ref/link_target/mode/uid/gid/three timestamps); **contains no bytes**; `--force` needed to overwrite an existing F; can export while mounted (a read-only snapshot) |
-| `grovefs view --meta-dir D import --view V --in F [--replace] [--as-fork B]` | D = target storage root, V = new base view name, F = the file exported above, B = an existing bare base view on the target machine | rebuilds the whole tree in `D/meta/V.db` (preserving id/inode/hardlink/permissions/owner/symlink), then rebuilds the `refs.db` ledger; an existing tree requires `--replace`; `--as-fork B` additionally writes a `fork B` definition (restoring "structure writable, content EROFS") |
+| `grovefs view --meta-dir D import --view V --in F [--replace] [--as-fork B]` | D = target storage root, V = new base view name, F = the file exported above, B = an existing bare base view on the target machine | rebuilds the whole tree in `D/meta/V/V.db` (preserving id/inode/hardlink/permissions/owner/symlink), then rebuilds the `refs.db` ledger; an existing tree requires `--replace`; `--as-fork B` additionally writes a `fork B` definition (restoring "structure writable, content EROFS") |
 
 ```bash
 # 源机(挂载中也可;停写后更稳)
@@ -1032,11 +1049,11 @@ grovefs view --meta-store $PG export --view team --out /tmp/team2.jsonl
 grovefs view --meta-dir $S import --view team_rolledback --in /tmp/team2.jsonl
 ```
 
-The round trip rewrites no rows: a dump re-exported from the target store after import is **line-for-line identical** to the source dump (the `diff` criterion), so id/ino/hardlink/mode/owner/the three timestamps/symlink text all carry over as original values rather than being reassigned; at import the allocator watermark is raised to the export's maximum (SQLite's two auto-increment watermarks, PG's `setval`), so node ids created after migration are strictly greater than the imported side's max id, never colliding. The shared-bytes ledger (SQLite's `meta/refs.db`, PG's `grovefs_refs.holders`) is updated in the same transaction with the import/`--replace`, and a failure rolls it all back — a tree is either untouched or wholly the new tree (single-transaction semantics). During the migration window the **source store is not written**, the original tree remains, and a rollback is the same pair of commands run in reverse. Whole-DB backup has its own routes: SQLite copies the file tree, PG goes through `pg_dump`/logical replication (§15.7).
+The round trip rewrites no rows: a dump re-exported from the target store after import is **line-for-line identical** to the source dump (the `diff` criterion), so id/ino/hardlink/mode/owner/the three timestamps/symlink text all carry over as original values rather than being reassigned; at import the allocator watermark is raised to the export's maximum (SQLite's two auto-increment watermarks, PG's `setval`), so node ids created after migration are strictly greater than the imported side's max id, never colliding. The shared-bytes ledger (SQLite's `meta/_control/refs.db`, PG's `grovefs_refs.holders`) is updated in the same transaction with the import/`--replace`, and a failure rolls it all back — a tree is either untouched or wholly the new tree (single-transaction semantics). During the migration window the **source store is not written**, the original tree remains, and a rollback is the same pair of commands run in reverse. Whole-DB backup has its own routes: SQLite copies the file tree, PG goes through `pg_dump`/logical replication (§15.7).
 
 e2e: the `migrate` suite asserts this chain line by line between two local SQLite trees (74 checks), the `xfer` suite runs the local and remote shapes once per backend on SQLite/PG (96 checks); the cross-backend copy (the SQLite dump → PG schema → re-export → back into SQLite above) was run on this machine with the commands of this section and both `diff` passes were line-for-line identical.
 
-**Import atomicity**: a temporary tree is first built at `D/meta/.V.import-<pid>-<time>`, and only after all rows and checks pass and the WAL merges does it `rename` to `D/meta/V.db` — a corrupt file / dangling parent / count mismatch / failed `--replace` never damages the old tree (the old tree is either untouched or wholly the new tree, no intermediate state).
+**Import atomicity**: a temporary tree is first built at `D/meta/.V.import-<pid>-<time>`, and only after all rows and checks pass and the WAL merges does it `rename` to `D/meta/V/V.db` — a corrupt file / dangling parent / count mismatch / failed `--replace` never damages the old tree (the old tree is either untouched or wholly the new tree, no intermediate state).
 
 **Guards**: virtual names (alias/derived) own no tree, so `export` refuses outright and prompts exporting their physical base; an existing output file needs `--force`; if the import target already has a definition slot, `view rm` it first; a header format/version mismatch, a root that isn't an `id=1` directory, a dangling parent, or a header count disagreeing with the body are all whole-job refusals; `--as-fork` requires the base view to already exist **on the target machine** and the base name itself to have no definition.
 
@@ -1049,9 +1066,9 @@ e2e: the `migrate` suite asserts this chain line by line between two local SQLit
 - `uid/gid` is numeric metadata (advisory), kept by number; symlink target text is user data, kept verbatim.
 - For a whole-directory cold copy, first stop all mounts and the `meta-server`; if you can't stop, use `sqlite3 <db> ".backup"` / `VACUUM INTO`, **don't raw-copy a running DB** (WAL).
 - **`st_ino` travels with the DB and is unchanged across machines** (`node.ino` is GroveFS's own numbering), but **`st_dev` is freshly assigned by FUSE on each mount**: a backup/sync tool that dedups by the `(dev, ino)` tuple must rebuild its mapping after a remount or DB move; lookup by ino alone (`find -inum`, `stat -c %i`) is unaffected.
-- **How to confirm nothing is missing after copying**: object names are UUIDs, not content hashes, the read side has no verification step, so a missed copy can only be actively compared — the number of keys referenced by the tree (`sqlite3 D/meta/V.db 'SELECT COUNT(DISTINCT data_ref) FROM node WHERE data_ref IS NOT NULL;'`) against the `matched` in `grovefs gc --meta-dir D --data-dir R`'s output; `matched < refs` means there are keys with no object. Use `rsync -a` to preserve mtime (`gc --older-than` relies on it for the new-object grace), and a store that has used `import` must carry `-H` (imported objects and source files are hardlinks).
+- **How to confirm nothing is missing after copying**: object names are UUIDs, not content hashes, the read side has no verification step, so a missed copy can only be actively compared — the number of keys referenced by the tree (`sqlite3 D/meta/V/V.db 'SELECT COUNT(DISTINCT data_ref) FROM node WHERE data_ref IS NOT NULL;'`) against the `matched` in `grovefs gc --meta-dir D --data-dir R`'s output; `matched < refs` means there are keys with no object. Use `rsync -a` to preserve mtime (`gc --older-than` relies on it for the new-object grace), and a store that has used `import` must carry `-H` (imported objects and source files are hardlinks).
 
-**Multiple base views**: create any number of base views (`view create --view A`, the only entry point that builds a tree), each its own `meta/A.db`, trees/bytes/permissions/deletions not affecting each other; `view list` lists all bare base views. `view export/import` works per view, so at migration you may move just one of them, and different base views may bind different keys (`apikey create --view A`).
+**Multiple base views**: create any number of base views (`view create --view A`, the only entry point that builds a tree), each its own `meta/A/A.db`, trees/bytes/permissions/deletions not affecting each other; `view list` lists all bare base views. `view export/import` works per view, so at migration you may move just one of them, and different base views may bind different keys (`apikey create --view A`).
 
 e2e in the `migrate` suite (74 assertions). Coverage: export while mounted / host-agnosticism / virtual-name and overwrite guards / import across absolute paths / hardlink and permission fidelity / atomic replace / corrupt-input refusal / `--as-fork` ledger sharing / multi-base-view independence `fork`/`--as-fork` share the same contract on both backends, see §15.9).
 
@@ -1063,7 +1080,7 @@ A `view rm` without `--base` deletes only a **definition slot** (derived/alias/f
 
 | Command | Effect |
 | --- | --- |
-| `grovefs view --meta-dir D rm --name V --base [--data-dir R]` | deletes `D/meta/V.db` (+WAL/SHM) → `refs rebuild` recomputes holders over the surviving trees → for each blob in V's tree **held by no other view** calls `backend.remove`; `--data-dir` points at the root actually storing `blocks/` (default the metadata root `D`, same convention as `import --data-dir`, for meta-server/data-server split deployments); the echo honestly reports the freed/held/not-found/failed counts |
+| `grovefs view --meta-dir D rm --name V --base [--data-dir R]` | deletes `D/meta/V/V.db` (+WAL/SHM) → `refs rebuild` recomputes holders over the surviving trees → for each blob in V's tree **held by no other view** calls `backend.remove`; `--data-dir` points at the root actually storing `blocks/` (default the metadata root `D`, same convention as `import --data-dir`, for meta-server/data-server split deployments); the echo honestly reports the freed/held/not-found/failed counts |
 
 ```
 $ grovefs view --meta-dir .home rm --name alice --base
@@ -1078,12 +1095,12 @@ e2e in the `viewrm` suite (42 assertions: seeding the tree / mount guard / multi
 
 ### 3.5 Agents customizing data listings: the MCP interface (`grovefs mcp`)
 
-View governance (§3.2/§3.4/§3.4.1) is simultaneously a set of **MCP (Model Context Protocol) tools**. `grovefs mcp` speaks newline-delimited JSON-RPC 2.0 on stdio (implementing the common method surface of the 2025-06-18 protocol: lifecycle `initialize`/`ping`, tools `tools/list`/`tools/call`, resources `resources/list`/`resources/templates/list`/`resources/read`, prompts `prompts/list`/`prompts/get`, completion `completion/complete`, logging `logging/setLevel` and server-side `notifications/message`; client notifications are always silently unanswered), any MCP client (Claude Desktop, an IDE agent, etc.) spawns it as a subprocess, and the agent can then **customize data listings automatically through the interface**: query views, **list the directory a view actually renders** (a derived view via its lens, and preview without landing what a to-be-published rule would grow into), publish a read-only derived lens with inline rule text (the four verbs same as `--layout`, rules ride as text lines, landing no file), rotate the public name, delete a definition, **dry-run a whole definition through all governance guards before publishing (writing nothing)**. It shares the same library functions (`grovefs::mcp`) with the `grovefs view` subcommands — validation, refusal wording, on-disk actions byte-for-byte identical, one contract two entrances, an agent can do nothing the CLI can't and bypass no guard. **Probe is read-only**: `list_view_tree`/`get_view` open the local `<meta-dir>/meta/<view>.db` read-only, render the listing through the same `LayoutMeta` lens a mount uses (no mount, no object bytes read; remote/PG-backend trees are not walked here); the `size` in the reply is a metadata field not a byte count (directory `4096`, file `0`, symlink the target length), for real bytes mount and `stat`. **Control-plane only**: no mount, no data writes. By default it trusts whoever can spawn this process (= already holds the storage root's OS-level permission), cross-network auth is still the server's token / API key's job; when it is fronted to several different callers, `grovefs mcp --require-api-key` **optionally** puts an API-key gate on the interface (see §3.5.1). All echoes below are from real runs:
+View governance (§3.2/§3.4/§3.4.1) is simultaneously a set of **MCP (Model Context Protocol) tools**. `grovefs mcp` speaks newline-delimited JSON-RPC 2.0 on stdio (implementing the common method surface of the 2025-06-18 protocol: lifecycle `initialize`/`ping`, tools `tools/list`/`tools/call`, resources `resources/list`/`resources/templates/list`/`resources/read`, prompts `prompts/list`/`prompts/get`, completion `completion/complete`, logging `logging/setLevel` and server-side `notifications/message`; client notifications are always silently unanswered), any MCP client (Claude Desktop, an IDE agent, etc.) spawns it as a subprocess, and the agent can then **customize data listings automatically through the interface**: query views, **list the directory a view actually renders** (a derived view via its lens, and preview without landing what a to-be-published rule would grow into), publish a read-only derived lens with inline rule text (the four verbs same as `--layout`, rules ride as text lines, landing no file), rotate the public name, delete a definition, **dry-run a whole definition through all governance guards before publishing (writing nothing)**. It shares the same library functions (`grovefs::mcp`) with the `grovefs view` subcommands — validation, refusal wording, on-disk actions byte-for-byte identical, one contract two entrances, an agent can do nothing the CLI can't and bypass no guard. **Probe is read-only**: `list_view_tree`/`get_view` open the local `<meta-dir>/meta/<view>/<view>.db` read-only, render the listing through the same `LayoutMeta` lens a mount uses (no mount, no object bytes read; remote/PG-backend trees are not walked here); the `size` in the reply is a metadata field not a byte count (directory `4096`, file `0`, symlink the target length), for real bytes mount and `stat`. **Control-plane only**: no mount, no data writes. By default it trusts whoever can spawn this process (= already holds the storage root's OS-level permission), cross-network auth is still the server's token / API key's job; when it is fronted to several different callers, `grovefs mcp --require-api-key` **optionally** puts an API-key gate on the interface (see §3.5.1). All echoes below are from real runs:
 
 ```
 # 1) 存储机:建一个物理视图(智能体稍后要在它的树上定制列表)
 $ grovefs view --meta-dir $HOME_DIR create --view team --manifest team.manifest
-created BASE view 'team' at /data/xy/grovefs/.demomcp/home/meta/team.db
+created BASE view 'team' at /data/xy/grovefs/.demomcp/home/meta/team/team.db
 applied seed manifest team.manifest
 
 # 2) MCP 客户端配置里登记 stdio 服务器(以通用 mcpServers 写法为例):
@@ -1110,7 +1127,7 @@ isError → derived view name must differ from its base      # 与 CLI 逐字节
 view 'release' -> base 'team': 1 hide, 0 only, 0 reloc rule(s) (read-only)   # CLI 对照:`grovefs view list` 同文案
 
 # 4) 用户侧:直接挂智能体定的名(无 --layout、无本地规则文件)
-$ grovefs mount --view release -m /mnt/release --meta-server 10.0.0.5:50110 --data-servers 10.0.0.5:50100 &
+$ grovefs mount --view release -m /mnt/release --manager 10.0.0.5:50055 --roster-key-file /etc/grovefs/roster.key &
 derived view 'release' over base 'team': read-only lens
 note: derived (virtual) views mount read-only — write to base view 'team'
 mounting view 'release' at /mnt/release (fully remote: no local store, read-only)
@@ -1131,11 +1148,11 @@ docs  photos
 {"kind":"derived","base":"team","hide":1,"only":0,"reloc":0,"definition":"base team\nhide /photos/private","mount":"read-only (virtual shape; writes go to the base view)"}
 ```
 
-Ten tools and their parameters: eight governance ones — `list_views` (optional `db_path`), `define_derived_view` (`name`/`base`/`rules`, the latter inline rule text), `alias_view` (`name`/`real`/optional `retire` atomic rotation), `fork_view` (`name`/`base`, optional `seed` — `false` builds only an empty root, leaving "whether to copy dir entries" to the caller; copying the base view's dir entries into an independent metadata tree — structure writable, content EROFS), `graft_view` (`name`/`map` plan text, optional `src` (defaults to the fork definition's base name)/`dest`/`skip_existing` — grafting named entries from another view (a directory source brings its whole subtree) into any position of the target view, renaming line by line, zero byte copy, the whole plan in one transaction), `remove_view` (`name`, deleting a fork also deletes its own tree), `preview_rules` (`rules`, dry-run checking verb syntax without landing), `validate_definition` (`name`/`base`/`rules`, running a whole definition through define's full governance guards before publishing — illegal name, name equals base, shadowing a physical db, overwriting a pure alias, rule syntax — on refusal returning text byte-for-byte identical to a real publish, on acceptance returning a JSON verdict, never landing to disk); two read-only probes — `list_view_tree` (`view` or `base`+`rules` simulation, optional `path`/`depth`/`max`/`db_path`; renders the path listing a mount actually sees, either via a published lens or by simulating a rule set without landing), `get_view` (`name`, returning one definition's raw `definition` text and counts). The same governance is secondarily exposed via MCP's other common method surfaces, reusing the **exact same renderers**, so resources/prompts/completion match tool results byte-for-byte: **resources** `resources/list`/`resources/templates/list`/`resources/read` expose views and the manual as attachable context — `grovefs://guide` returns the sectioned ops manual verbatim, `grovefs://views` the same snapshot as `list_views`, `grovefs://view/<name>/definition` (governance text verbatim) and `/tree` (the listing a mount actually sees, the template carrying `{?path,depth,max}`, synonyms of `list_view_tree`'s parameters — a big tree can attach one subtree at a time, `truncated:true` when bounded off); **prompts** `prompts/list`/`prompts/get` offer two parameterized governance playbooks (`reshape-view` taking `base`/`goal`, `rotate-alias` taking `real`/`new`/`old`); **completion** `completion/complete` is role-aware per `ref` (`reshape-view.base` / `rotate-alias.real` give only physical views, `rotate-alias.new`/`old` give only aliases, the rest give all view names); **logging** after `logging/setLevel` sets a session threshold, the server pushes `notifications/message` by severity (success `info`, failure `warning`) after each dispatched call, `data` carrying the method and the object operated on (e.g. `tools/call list_views ok`). Runtime-facing metadata: each tool carries a `title` and `annotations` (`readOnlyHint` marking `list_views`/`preview_rules`/`validate_definition`/`list_view_tree`/`get_view`, `destructiveHint` only `alias_view`/`remove_view`); the four JSON-returning tools carry an `outputSchema` and results also give `structuredContent`; `initialize`'s `instructions` span seven sections (Discover/Reshape/Curate/Validate before publishing/Golden order/Beyond tools/Mechanics), a client injecting context can follow them. One more protocol detail: negotiated per `2025-06-18`/`2025-03-26`/`2024-11-05`, an unrecognized version returns `2025-06-18`; `arguments` also accepts a JSON string; a missing parameter appends `(tool 'x' requires: …)`, a misspelled tool name appends `did you mean '…'?` and an `available:` list. Semantics: all governance guards apply as usual (derived mounts read-only, the real name refused while an alias exists, `--retire` writes-then-deletes, fork structure writes allowed / content EROFS; hot reshape still only at the `meta-server` entrance, a local mount resolves once at mount). Protocol details: notifications (no id) are never answered; an illegal frame returns `-32700` and continues serving; a missing parameter and an unknown tool return `isError` per MCP convention rather than a protocol error. `db_path` defaults to `grovefs mcp --meta-dir` (falling back to `--home`), also overridable per call. e2e in the `mcp` suite (77 assertions: handshake capability declaration and protocol negotiation / discovery (`instructions` naming all ten tools one by one with sections, `title`+`annotations`+`outputSchema`) / inline-rule reshaping / path probe and shape preview / dry-run validation before publish / alias rotation / empty fork `seed:false` + `graft_view` grafting / graft-guard surface 11 refusal verbatim (self-graft · empty plan · `..` · root path · base view missing `src` · target or source is derived/alias · nameless tree · illegal name · duplicate-name whole-batch rollback · `skip_existing` skipping) / CLI same text / resource enumeration and read (incl. `grovefs://guide`, `grovefs://views`, tree query-parameter drill-down and `max` truncation) / prompt instantiation / role-aware view-name completion per `ref` / `structuredContent` consistent with text / unknown-tool suggestion and missing-parameter prompt / log threshold→notification with `data` carrying the tool name / protocol-error paths). The agent-side wiring manual (in English, for internationalized deployment) is already distilled into the repo as a project skill (`skills/grovefs-mcp/`): `SKILL.md` (how to spawn, the ten-tool parameter table, the golden workflow, an exact refusal-text table per case, hard boundaries), `reference.md` (the full method surface / auth-gate matrix / error codes / on-disk effects / CLI cross-reference), `examples.md` (real echoes), plus two scripts: `scripts/mcp_call.py` (a zero-dependency stdio JSON-RPC client, splitting the reply into stdout/stderr, exit code 0 success / 2 protocol error / 3 tool refusal / 4 transport problem) and `scripts/smoke.sh` (running the full chain on a `mktemp -d` temporary storage root with per-line assertions, never touching real data).
+Ten tools and their parameters: eight governance ones — `list_views` (optional `db_path`), `define_derived_view` (`name`/`base`/`rules`, the latter inline rule text), `alias_view` (`name`/`real`/optional `retire` atomic rotation), `fork_view` (`name`/`base`, optional `seed` — `false` builds only an empty root, leaving "whether to copy dir entries" to the caller; copying the base view's dir entries into an independent metadata tree — structure writable, content EROFS), `graft_view` (`name`/`map` plan text, optional `src` (defaults to the fork definition's base name)/`dest`/`skip_existing` — grafting named entries from another view (a directory source brings its whole subtree) into any position of the target view, renaming line by line, zero byte copy, the whole plan in one transaction), `remove_view` (`name`, deleting a fork also deletes its own tree), `preview_rules` (`rules`, dry-run checking verb syntax without landing), `validate_definition` (`name`/`base`/`rules`, running a whole definition through define's full governance guards before publishing — illegal name, name equals base, shadowing a physical db, overwriting a pure alias, rule syntax — on refusal returning text byte-for-byte identical to a real publish, on acceptance returning a JSON verdict, never landing to disk); two read-only probes — `list_view_tree` (`view` or `base`+`rules` simulation, optional `path`/`depth`/`max`/`db_path`; renders the path listing a mount actually sees, either via a published lens or by simulating a rule set without landing), `get_view` (`name`, returning one definition's raw `definition` text and counts). The same governance is secondarily exposed via MCP's other common method surfaces, reusing the **exact same renderers**, so resources/prompts/completion match tool results byte-for-byte: **resources** `resources/list`/`resources/templates/list`/`resources/read` expose views and the manual as attachable context — `grovefs://guide` returns the sectioned ops manual verbatim, `grovefs://views` the same snapshot as `list_views`, `grovefs://view/<name>/definition` (governance text verbatim) and `/tree` (the listing a mount actually sees, the template carrying `{?path,depth,max}`, synonyms of `list_view_tree`'s parameters — a big tree can attach one subtree at a time, `truncated:true` when bounded off); **prompts** `prompts/list`/`prompts/get` offer two parameterized governance playbooks (`reshape-view` taking `base`/`goal`, `rotate-alias` taking `real`/`new`/`old`); **completion** `completion/complete` is role-aware per `ref` (`reshape-view.base` / `rotate-alias.real` give only physical views, `rotate-alias.new`/`old` give only aliases, the rest give all view names); **logging** after `logging/setLevel` sets a session threshold, the server pushes `notifications/message` by severity (success `info`, failure `warning`) after each dispatched call, `data` carrying the method and the object operated on (e.g. `tools/call list_views ok`). Runtime-facing metadata: each tool carries a `title` and `annotations` (`readOnlyHint` marking `list_views`/`preview_rules`/`validate_definition`/`list_view_tree`/`get_view`, `destructiveHint` only `alias_view`/`remove_view`); the four JSON-returning tools carry an `outputSchema` and results also give `structuredContent`; `initialize`'s `instructions` span seven sections (Discover/Reshape/Curate/Validate before publishing/Golden order/Beyond tools/Mechanics), a client injecting context can follow them. One more protocol detail: negotiated per `2025-06-18`/`2025-03-26`/`2024-11-05`, an unrecognized version returns `2025-06-18`; `arguments` also accepts a JSON string; a missing parameter appends `(tool 'x' requires: …)`, a misspelled tool name appends `did you mean '…'?` and an `available:` list. Semantics: all governance guards apply as usual (derived mounts read-only, the real name refused while an alias exists, `--retire` writes-then-deletes, fork structure writes allowed / content EROFS; hot reshape still only at the `meta-server` entrance, a mount resolves its definition once, at `M_OPEN`). Protocol details: notifications (no id) are never answered; an illegal frame returns `-32700` and continues serving; a missing parameter and an unknown tool return `isError` per MCP convention rather than a protocol error. `db_path` defaults to `grovefs mcp --meta-dir` (falling back to `--home`), also overridable per call. e2e in the `mcp` suite (77 assertions: handshake capability declaration and protocol negotiation / discovery (`instructions` naming all ten tools one by one with sections, `title`+`annotations`+`outputSchema`) / inline-rule reshaping / path probe and shape preview / dry-run validation before publish / alias rotation / empty fork `seed:false` + `graft_view` grafting / graft-guard surface 11 refusal verbatim (self-graft · empty plan · `..` · root path · base view missing `src` · target or source is derived/alias · nameless tree · illegal name · duplicate-name whole-batch rollback · `skip_existing` skipping) / CLI same text / resource enumeration and read (incl. `grovefs://guide`, `grovefs://views`, tree query-parameter drill-down and `max` truncation) / prompt instantiation / role-aware view-name completion per `ref` / `structuredContent` consistent with text / unknown-tool suggestion and missing-parameter prompt / log threshold→notification with `data` carrying the tool name / protocol-error paths). The agent-side wiring manual (in English, for internationalized deployment) is already distilled into the repo as a project skill (`skills/grovefs-mcp/`): `SKILL.md` (how to spawn, the ten-tool parameter table, the golden workflow, an exact refusal-text table per case, hard boundaries), `reference.md` (the full method surface / auth-gate matrix / error codes / on-disk effects / CLI cross-reference), `examples.md` (real echoes), plus two scripts: `scripts/mcp_call.py` (a zero-dependency stdio JSON-RPC client, splitting the reply into stdout/stderr, exit code 0 success / 2 protocol error / 3 tool refusal / 4 transport problem) and `scripts/smoke.sh` (running the full chain on a `mktemp -d` temporary storage root with per-line assertions, never touching real data).
 
 ### 3.5.1 Locking the interface and the mountpoints: API-key authentication, scope partitioning and call audit (`grovefs apikey`)
 
-One server often faces **multiple different callers** — an agent runtime fronting one `grovefs mcp` service out, several client machines mounting the same `meta-server` over LAN — when you need revocable credentials and attribution audit. `grovefs apikey` mints API keys (**authentication consults only the stored SHA-256 digest**, the plaintext is echoed by `create`/`rotate` and the store also keeps a reversible ciphertext copy of it that needs the store key to open, so `api_keys.db` alone still can't be turned into a usable credential), and tags each key with a **scope** (`--for admin` is the credential for the governance port that stands in for the DB password, see §3.5.2) and an **owner** (`--owner <account>`, required for `--for admin`): `--for mcp` (opens only the governance interface), `--for mount` (opens only a `--require-api-key` meta/data server), `--for admin` (opens only the governance port `meta-server --control-listen`, and also admits mount+mcp), `--for any` (**default**, mount+mcp only — `any` never upgrades to `admin`; a row whose scope is absent or unparseable authenticates as this tier). The two entrances share one registry (`<meta-dir>/meta/api_keys.db`), isolated by scope: a mount credential can't be replayed to the governance API, and an agent key can't open the data plane either. A mount key may also carry **two access-control dimensions**: `--view V` **binds the credential to a single physical view** V — using it to `M_OPEN` another view is refused with `E_AUTH` at the handshake (one without `--view` is a system-level key, able to open any view); `--ro` marks it **read-only** — the server refuses write-intent ops per-op with `E_NOTPERM` on the meta plane and content writes with `EROFS` on the data plane, and hints the client a read-only mount in the `M_OPEN` reply ("read-only" is enforced server-side, not relying on the client's `-o ro` self-discipline); read-only/read-write **can be flipped in place** — `apikey set-ro --id <ID> --rw` flips a read-only key back to read-write, without `--rw` (or with `--ro`) back to read-only, a live mount adopts the new verdict on its next second-level revalidation tick, no remint, no reconnect (the one exception: a mount whose read-only already landed in the kernel at handshake still needs a remount to lift the OS-level cap, see set-ro's paragraph in 3.5.1; and the switch holds only for server-routed mounts, a local `--home` mount has no server credential gate and is unaffected). **Governance-plane gate**: `grovefs mcp --require-api-key` gates all **state-reading/writing methods** accordingly — `tools/list`, `tools/call`, `resources/list`, `resources/templates/list`, `resources/read`, `completion/complete` (`initialize` / `ping` / `prompts/*` / `logging/*` are always open so a client can complete the handshake, fetch static playbooks, and control how verbose the server is). **Mount-plane gate**: `meta-server --require-api-key` gates `M_OPEN`, `data-server --require-api-key` gates `OP_OPEN`, the client presents via `mount --api-key <ID:SECRET>` (if you'd rather not put it on the command line, export `GROVEFS_API_KEY='<ID:SECRET>'`, the secret then stays out of argv); **the enabling order matters**: a server **without** `--require-api-key` does **no** key verification at all (a client presenting a made-up key still mounts, verified `MOUNTED`); with it, it is **fail-closed** — when `api_keys.db` has no usable key **no one (including you) gets in**, so mint the keys first, then restart with the flag; **audit surface**: every `tools/call`, every `resources/read`, and every mount connection (incl. refused ones) appends to the same audit table (time, key, plane method, tool tool, success, detail), read back by `grovefs apikey calls`. A revoke only marks the row revoked (past calls keep attribution), a revoked key authenticates against nothing immediately, **and already-established mounts are closed too** (see below). Storage is one separate local SQLite (`<meta-dir>/meta/api_keys.db`): the control-plane state. Keys minted now use the short format `<16-hex id>:<32-hex secret>` — 49 characters total, the secret carrying 122 random bits (offline brute force and online replay remain out of reach); long-form keys still verify — the check compares digests, never lengths — and `apikey rotate` mints a fresh secret for the SAME id when one is lost (label/scope/view binding/audit history all survive; the new plaintext is echoed too, and the stored copy is replaced with the new one — for a row the store holds no copy of (nothing was wrapped when it was minted), `rotate` remains the only way back). **Each key also carries its bookkeeping into the same row**: a `--note TEXT` remark, an absolute `expires_at` the server computed from `--ttl DUR` (units `s`/`m`/`h`/`d` only — a misspelt duration is refused rather than silently minting a key that never expires), and the `created_by` account that minted it, plus a `secret_hint` column holding an irreversible head-4 + `…` + tail-4 fingerprint. The `list` key column prints exactly that stored fingerprint, so "seeing the key in the list" and "holding a usable credential" remain two different things (to get the plaintext again use `apikey secret --id`; a row the store holds no copy of can only be `rotate`d). The echoes below are from real runs:
+One server often faces **multiple different callers** — an agent runtime fronting one `grovefs mcp` service out, several client machines mounting the same `meta-server` over LAN — when you need revocable credentials and attribution audit. `grovefs apikey` mints API keys (**authentication consults only the stored SHA-256 digest**, the plaintext is echoed by `create`/`rotate` and the store also keeps a reversible ciphertext copy of it that needs the store key to open, so `api_keys.db` alone still can't be turned into a usable credential), and tags each key with a **scope** (`--for admin` is the credential for the governance port that stands in for the DB password, see §3.5.2) and an **owner** (`--owner <account>`, required for `--for admin`): `--for mcp` (opens only the governance interface), `--for mount` (opens only a `--require-api-key` meta/data server), `--for admin` (opens only the governance port `meta-server --control-listen`, and also admits mount+mcp), `--for any` (**default**, mount+mcp only — `any` never upgrades to `admin`; a row whose scope is absent or unparseable authenticates as this tier). The two entrances share one registry (`<meta-dir>/meta/_control/api_keys.db`), isolated by scope: a mount credential can't be replayed to the governance API, and an agent key can't open the data plane either. A mount key may also carry **two access-control dimensions**: `--view V` **binds the credential to a single physical view** V — using it to `M_OPEN` another view is refused with `E_AUTH` at the handshake (one without `--view` is a system-level key, able to open any view); `--ro` marks it **read-only** — the server refuses write-intent ops per-op with `E_NOTPERM` on the meta plane and content writes with `EROFS` on the data plane, and hints the client a read-only mount in the `M_OPEN` reply ("read-only" is enforced server-side, not relying on the client's `-o ro` self-discipline); read-only/read-write **can be flipped in place** — `apikey set-ro --id <ID> --rw` flips a read-only key back to read-write, without `--rw` (or with `--ro`) back to read-only, a live mount adopts the new verdict on its next second-level revalidation tick, no remint, no reconnect (the one exception: a mount whose read-only already landed in the kernel at handshake still needs a remount to lift the OS-level cap, see set-ro's paragraph in 3.5.1; and the switch holds only for server-routed mounts, a local `--home` mount has no server credential gate and is unaffected). **Governance-plane gate**: `grovefs mcp --require-api-key` gates all **state-reading/writing methods** accordingly — `tools/list`, `tools/call`, `resources/list`, `resources/templates/list`, `resources/read`, `completion/complete` (`initialize` / `ping` / `prompts/*` / `logging/*` are always open so a client can complete the handshake, fetch static playbooks, and control how verbose the server is). **Mount-plane gate**: `meta-server --require-api-key` gates `M_OPEN`, `data-server --require-api-key` gates `OP_OPEN`, the client presents via `mount --api-key <ID:SECRET>` (if you'd rather not put it on the command line, export `GROVEFS_API_KEY='<ID:SECRET>'`, the secret then stays out of argv); **the enabling order matters**: a server **without** `--require-api-key` does **no** key verification at all (a client presenting a made-up key still mounts, verified `MOUNTED`); with it, it is **fail-closed** — when `api_keys.db` has no usable key **no one (including you) gets in**, so mint the keys first, then restart with the flag; **audit surface**: every `tools/call`, every `resources/read`, and every mount connection (incl. refused ones) appends to the same audit table (time, key, plane method, tool tool, success, detail), read back by `grovefs apikey calls`. A revoke only marks the row revoked (past calls keep attribution), a revoked key authenticates against nothing immediately, **and already-established mounts are closed too** (see below). Storage is one separate local SQLite (`<meta-dir>/meta/_control/api_keys.db`): the control-plane state. Keys minted now use the short format `<16-hex id>:<32-hex secret>` — 49 characters total, the secret carrying 122 random bits (offline brute force and online replay remain out of reach); long-form keys still verify — the check compares digests, never lengths — and `apikey rotate` mints a fresh secret for the SAME id when one is lost (label/scope/view binding/audit history all survive; the new plaintext is echoed too, and the stored copy is replaced with the new one — for a row the store holds no copy of (nothing was wrapped when it was minted), `rotate` remains the only way back). **Each key also carries its bookkeeping into the same row**: a `--note TEXT` remark, an absolute `expires_at` the server computed from `--ttl DUR` (units `s`/`m`/`h`/`d` only — a misspelt duration is refused rather than silently minting a key that never expires), and the `created_by` account that minted it, plus a `secret_hint` column holding an irreversible head-4 + `…` + tail-4 fingerprint. The `list` key column prints exactly that stored fingerprint, so "seeing the key in the list" and "holding a usable credential" remain two different things (to get the plaintext again use `apikey secret --id`; a row the store holds no copy of can only be `rotate`d). The echoes below are from real runs:
 
 ```
 # 1) 铸造一个 key(回显全文并在库里落一份可逆副本;scope 默认 any)
@@ -1151,7 +1168,7 @@ apikey created (a recoverable copy is now stored — `grovefs apikey secret --id
   key:   01fcf6bb65a742c4:49d5f536592d49c090ddb10624f05c7e
 
 Present it to a `--require-api-key` server as
-  grovefs mount --meta-server ... --data-servers ... --api-key '01fcf6bb65a742c4:49d5f536592d49c090ddb10624f05c7e' -m /mnt/x
+  grovefs mount --manager HOST:PORT --roster-key-file F --api-key '01fcf6bb65a742c4:49d5f536592d49c090ddb10624f05c7e' -m /mnt/x
 (or export GROVEFS_API_KEY='01fcf6bb65a742c4:49d5f536592d49c090ddb10624f05c7e' so it stays out of the command line).
 Scope it to one entrance with `--for mount` / `--for mcp` to keep a mount
 credential out of the governance API (and vice versa); `--for admin` is the
@@ -1196,7 +1213,7 @@ apikey created (a recoverable copy is now stored — `grovefs apikey secret --id
   rw:    ro (read-only)
   expires: never (set one with --ttl, or `apikey update --ttl`)
   key:   a026316b216946dc:4611085b2d714a519af0a762acad76c6
-$ grovefs mount --view bob -m /mnt/b --meta-server ... --data-servers ... --api-key "$READER_KEY"   # 拿它去挂别的视图
+$ grovefs mount --view bob -m /mnt/b --manager HOST:PORT --roster-key-file F --api-key "$READER_KEY"   # 拿它去挂别的视图
 error: permission denied: this api key is bound to view 'alice', not 'bob'    # M_OPEN 处 E_AUTH
 $ mkdir /mnt/a/should_fail                                                          # alice 的只读 key 挂载
 mkdir: 无法创建目录 “/mnt/a/should_fail”: 只读文件系统                        # 据握手标志落内核只读;服务端另逐写拒 E_NOTPERM/EROFS
@@ -1293,15 +1310,15 @@ $ grovefs data-server --listen 127.0.0.1:15311 --data-dir /data/cluster --requir
 data-server: api-key auth REQUIRED (present `mount --api-key`, minted by `grovefs apikey create --for mount|any`); a revoke closes live connections on the next op
 
 # 5) 客户端拿各种坏凭据去挂:拒因逐字节的原文回到本地 stderr(退出码 1,不留脏挂载)
-$ grovefs mount --view alice -m /mnt/a --meta-server ... --data-servers ...                      # 不带 key
+$ grovefs mount --view alice -m /mnt/a --manager HOST:PORT --roster-key-file F                      # without a key
 error: no api key presented: this server requires one (pass `mount --api-key ID:SECRET` or export GROVEFS_API_KEY; mint with `grovefs apikey create --for mount`)
-$ grovefs mount --view alice -m /mnt/a --meta-server ... --data-servers ... --api-key "18c4bb40...:deadbeef"
+$ grovefs mount --view alice -m /mnt/a --manager HOST:PORT --roster-key-file F --api-key "18c4bb40...:deadbeef"
 error: authentication failed: invalid api key secret
-$ grovefs mount --view alice -m /mnt/a --meta-server ... --data-servers ... --api-key "0000000000000000:whatever"
+$ grovefs mount --view alice -m /mnt/a --manager HOST:PORT --roster-key-file F --api-key "0000000000000000:whatever"
 error: authentication failed: unknown api key id
-$ grovefs mount --view alice -m /mnt/a --meta-server ... --data-servers ... --api-key "no-colon-here"
+$ grovefs mount --view alice -m /mnt/a --manager HOST:PORT --roster-key-file F --api-key "no-colon-here"
 error: malformed api key (expected '<id>:<secret>')
-$ grovefs mount --view alice -m /mnt/a --meta-server ... --data-servers ... --api-key "$MCP_KEY"   # 拿治理 key 来挂
+$ grovefs mount --view alice -m /mnt/a --manager HOST:PORT --roster-key-file F --api-key "$MCP_KEY"   # a governance key presented to a mount
 error: authentication failed: this api key is scoped to 'mcp', not 'mount'
 #   反方向同样被拒:把 mount key 塞进 MCP initialize 的 apiKey,tools/list 回 -32001,
 #   且这条跨入口尝试同样被审计成 scope 拒因。
@@ -1350,11 +1367,11 @@ $ grovefs mcp --meta-dir $HOME_DIR --require-api-key      # 客户端 initialize
 defined derived view 'release' over base 'team': 1 hide, 0 only, 0 reloc rule(s)
 ```
 
-Nine subcommands: `create --label L [--for any|mcp|mount|admin] [--owner ACCOUNT] [--view V] [--ro] [--note TEXT] [--ttl DUR]` (mints `<id>:<secret>` and echoes it — the short 49-char format; the row keeps the SHA-256 digest authentication consults plus a wrapped copy that `secret` reads back; `--view`/`--ro` are meaningful only for mount/any scope, `--owner` required for admin; `--note` is a remark stored with the row, `--ttl` is turned into an absolute `expires_at` by the server — units `s`/`m`/`h`/`d` only, a misspelling is refused), `list [--view V] [--label S] [--owner S] [--scope P] [--note S]` (columns id/key/owner/label/scope/view/rw/created/last_used plus one combined `expires / revoked / note` column, a past-deadline row marked `EXPIRED` — still listed, refused at auth; the key column prints the stored head-4…tail-4 fingerprint, neither plaintext nor ciphertext; with `--view` lists only keys that can open that view, a pure alias also matching a key bound to the real name, and adds how many system-level keys stay unbound; `--label`/`--owner`/`--note` are case-insensitive substrings, `--scope` is exact), `revoke --id ID` (accepts an exact id or a unique prefix), `rotate --id ID` (exact id or unique prefix; mints a fresh secret for an active key's SAME id and echoes the new key — the stored copy is rewritten by the same statement, so a row that held none gains one; the old secret fails its next handshake, an established session lives until it reconnects, a revoked id refuses rotation — rotate replaces a credential, revoke kills one; the fingerprint the list prints follows the new secret), `secret --id ID` (exact id or unique prefix; reads the stored copy back as the full `<id>:<secret>`. That column holds an `sbx1.<nonce>.<ct>.<mac>` envelope (HMAC-CTR keystream + encrypt-then-MAC, no new dependency) and opening it needs the wrapping material: env `GROVEFS_STORE_KEY` (64 hex) first, else `<meta-dir>/meta/store.key` (created 0600 with `create_new` at the first mint, a racer reads the winner's copy). Four answers, four sentences: copy + material → the credential; no copy stored → *never stored* (rotate is the way back); copy under different material → *unopenable* (a failed MAC refuses, it does not guess); copy disagreeing with the digest → *stale*, refused — it never hands out a string the authentication path would not accept. With no material in force a mint simply stores no copy; it never degrades to plaintext. A read through a meta-server or the console writes an `apikey.secret` audit row carrying the id it read; **a direct local read records nothing** — whoever can open that file already sees the whole file), `set-ro --id ID [--rw|--ro]` (flips an active key's read-only flag in place: default and `--ro` set read-only, `--rw` restores read-write; moves only the write permission, not liveness/auth, a server-established mount becomes hot-effective within ≤1s no reconnect — a local `--home` mount has no server credential gate and is unaffected by the switch; a revoked id refuses to flip), `update --id ID [--note TEXT] [--ttl DUR]` (edits only those two bookkeeping fields — identity, bindings and audit history are untouched: `--note ""` clears a remark, `--ttl never` drops a deadline; passing neither flag is refused instead of no-oping; **it is also the only recovery path for an expired key** — give an `EXPIRED` key a new `--ttl` and the same key authenticates again; a revoked id refuses the edit, revocation stays final), `calls --limit N` (default 20, read back in reverse order), `purge --before DUR [--dry-run]` (deletes the audit rows older than that window and reports how many went, reporting the count the table held when the cut began; `--dry-run` counts without touching anything, which is the question to ask before destroying history). That table does not grow towards forever: a server holding a `--control-listen` port always carries a window, silence means 7d, `meta-server --audit-retention 90d` sets another one and only `never` keeps everything; purge is a SUPERUSER verb on the governance port, and the console deliberately has **no** button for it (§3.5.2). An MCP client that can't customize the handshake may have the operator export `GROVEFS_MCP_API_KEY='<id>:<secret>'` to **pre-authenticate the whole service process** (`grovefs mcp` establishes its identity with that key at startup, the client's initialize need not carry one again); the mount-side counterpart env is `GROVEFS_API_KEY` (takes effect when `--api-key` isn't passed, keeping the secret off the command line). The `data-server`'s key-DB path is given by `--meta-dir <metadata root>`, **defaulting to the node's first `--data-dir`** — no extra parameter for a same-machine deployment, but a data-disk/metadata-root split deployment must point it right (pointing at a directory with no key ever minted is fail-closed, admitting none). Honest boundary: this key authenticates **the caller at the entrance** — it lets a caller (or not) issue governance write commands, let it (or not) open a view tree, and attributes each admission to a specific key, but does not change the governance semantics itself; the view-binding/read-only dimensions are enforced server-side; live-connection revalidation is **op-driven** (checked only with traffic), so the revoke's closure boundary is "that mount's first server round-trip after the revoke" — a read answered entirely by the kernel cache needs no round-trip and is thus not interrupted (closed on the next round-trip); `--token` and `--require-api-key` may coexist, both must pass. Without `--require-api-key`, server behavior is exactly as with no gate (only the audit still lands as usual). e2e in the `apikey` suite (61 assertions: mint / list / the plaintext never reaching the disk — only an `sbx1` envelope — with a 0600 `store.key` / `secret` reading back byte-for-byte what `create` printed · an unknown id refused / no-key-refused · wrong-secret-refused · right-key-admitted / call attribution / revoke-instant-and-row-kept / short-id-prefix revoke / env pre-auth / `list --view` filter / default-no-gate regression / `set-ro` in-place ro↔rw flip · still-authentic-after-flip / short 16+32-hex format / `rotate` prefix-rotation-keeps-id · old-secret-refused · new-secret-admitted · digest-only-on-disk · revoked-refuses-rotation / `list --label·--scope·--note` filters / `create --note·--ttl` echoing the remark and the server-computed deadline · `list` carrying both for the row · the key column being the stored head+tail fingerprint while the plaintext never reaches the disk · the fingerprint itself stored (derived from no secret at read time) · `update` clearing a remark and `--ttl never` dropping a deadline · refusing when neither flag is given · a past-deadline row listed as `EXPIRED` and refused at every gate · a new `--ttl` letting the SAME key authenticate again · `update` refusing a revoked id) and the `mountkey` suite (76 assertions: scope minting and typo refusal / six refusal-reason classes carried into the protocol / admission and env fallback (argv doesn't leak the secret) / connection audit down to a specific key and view / scope two-way isolation / revoke closes live mounts with no dirty endpoint / other keys unaffected / token-and-key double-gate AND / the data plane's independent gate / failover carrying the credential / no-gate default path no regression / view-bound key refusing across views with audit attribution / read-only key's server-enforced write refusal / `set-ro` on the same live mount rw→ro refuses write · ro→rw admits · no reconnect).
+Nine subcommands: `create --label L [--for any|mcp|mount|admin] [--owner ACCOUNT] [--view V] [--ro] [--note TEXT] [--ttl DUR]` (mints `<id>:<secret>` and echoes it — the short 49-char format; the row keeps the SHA-256 digest authentication consults plus a wrapped copy that `secret` reads back; `--view`/`--ro` are meaningful only for mount/any scope, `--owner` required for admin; `--note` is a remark stored with the row, `--ttl` is turned into an absolute `expires_at` by the server — units `s`/`m`/`h`/`d` only, a misspelling is refused), `list [--view V] [--label S] [--owner S] [--scope P] [--note S]` (columns id/key/owner/label/scope/view/rw/created/last_used plus one combined `expires / revoked / note` column, a past-deadline row marked `EXPIRED` — still listed, refused at auth; the key column prints the stored head-4…tail-4 fingerprint, neither plaintext nor ciphertext; with `--view` lists only keys that can open that view, a pure alias also matching a key bound to the real name, and adds how many system-level keys stay unbound; `--label`/`--owner`/`--note` are case-insensitive substrings, `--scope` is exact), `revoke --id ID` (accepts an exact id or a unique prefix), `rotate --id ID` (exact id or unique prefix; mints a fresh secret for an active key's SAME id and echoes the new key — the stored copy is rewritten by the same statement, so a row that held none gains one; the old secret fails its next handshake, an established session lives until it reconnects, a revoked id refuses rotation — rotate replaces a credential, revoke kills one; the fingerprint the list prints follows the new secret), `secret --id ID` (exact id or unique prefix; reads the stored copy back as the full `<id>:<secret>`. That column holds an `sbx1.<nonce>.<ct>.<mac>` envelope (HMAC-CTR keystream + encrypt-then-MAC, no new dependency) and opening it needs the wrapping material: env `GROVEFS_STORE_KEY` (64 hex) first, else `<meta-dir>/meta/_control/store.key` (created 0600 with `create_new` at the first mint, a racer reads the winner's copy). Four answers, four sentences: copy + material → the credential; no copy stored → *never stored* (rotate is the way back); copy under different material → *unopenable* (a failed MAC refuses, it does not guess); copy disagreeing with the digest → *stale*, refused — it never hands out a string the authentication path would not accept. With no material in force a mint simply stores no copy; it never degrades to plaintext. A read through a meta-server or the console writes an `apikey.secret` audit row carrying the id it read; **a direct local read records nothing** — whoever can open that file already sees the whole file), `set-ro --id ID [--rw|--ro]` (flips an active key's read-only flag in place: default and `--ro` set read-only, `--rw` restores read-write; moves only the write permission, not liveness/auth, a server-established mount becomes hot-effective within ≤1s no reconnect — a local `--home` mount has no server credential gate and is unaffected by the switch; a revoked id refuses to flip), `update --id ID [--note TEXT] [--ttl DUR]` (edits only those two bookkeeping fields — identity, bindings and audit history are untouched: `--note ""` clears a remark, `--ttl never` drops a deadline; passing neither flag is refused instead of no-oping; **it is also the only recovery path for an expired key** — give an `EXPIRED` key a new `--ttl` and the same key authenticates again; a revoked id refuses the edit, revocation stays final), `calls --limit N` (default 20, read back in reverse order), `purge --before DUR [--dry-run]` (deletes the audit rows older than that window and reports how many went, reporting the count the table held when the cut began; `--dry-run` counts without touching anything, which is the question to ask before destroying history). That table does not grow towards forever: a server holding a `--control-listen` port always carries a window, silence means 7d, `meta-server --audit-retention 90d` sets another one and only `never` keeps everything; purge is a SUPERUSER verb on the governance port, and the console deliberately has **no** button for it (§3.5.2). An MCP client that can't customize the handshake may have the operator export `GROVEFS_MCP_API_KEY='<id>:<secret>'` to **pre-authenticate the whole service process** (`grovefs mcp` establishes its identity with that key at startup, the client's initialize need not carry one again); the mount-side counterpart env is `GROVEFS_API_KEY` (takes effect when `--api-key` isn't passed, keeping the secret off the command line). The `data-server`'s key-DB path is given by `--meta-dir <metadata root>`, **defaulting to the node's first `--data-dir`** — no extra parameter for a same-machine deployment, but a data-disk/metadata-root split deployment must point it right (pointing at a directory with no key ever minted is fail-closed, admitting none). Honest boundary: this key authenticates **the caller at the entrance** — it lets a caller (or not) issue governance write commands, let it (or not) open a view tree, and attributes each admission to a specific key, but does not change the governance semantics itself; the view-binding/read-only dimensions are enforced server-side; live-connection revalidation is **op-driven** (checked only with traffic), so the revoke's closure boundary is "that mount's first server round-trip after the revoke" — a read answered entirely by the kernel cache needs no round-trip and is thus not interrupted (closed on the next round-trip); `--token` and `--require-api-key` may coexist, both must pass. Without `--require-api-key`, server behavior is exactly as with no gate (only the audit still lands as usual). e2e in the `apikey` suite (61 assertions: mint / list / the plaintext never reaching the disk — only an `sbx1` envelope — with a 0600 `store.key` / `secret` reading back byte-for-byte what `create` printed · an unknown id refused / no-key-refused · wrong-secret-refused · right-key-admitted / call attribution / revoke-instant-and-row-kept / short-id-prefix revoke / env pre-auth / `list --view` filter / default-no-gate regression / `set-ro` in-place ro↔rw flip · still-authentic-after-flip / short 16+32-hex format / `rotate` prefix-rotation-keeps-id · old-secret-refused · new-secret-admitted · digest-only-on-disk · revoked-refuses-rotation / `list --label·--scope·--note` filters / `create --note·--ttl` echoing the remark and the server-computed deadline · `list` carrying both for the row · the key column being the stored head+tail fingerprint while the plaintext never reaches the disk · the fingerprint itself stored (derived from no secret at read time) · `update` clearing a remark and `--ttl never` dropping a deadline · refusing when neither flag is given · a past-deadline row listed as `EXPIRED` and refused at every gate · a new `--ttl` letting the SAME key authenticate again · `update` refusing a revoked id) and the `mountkey` suite (76 assertions: scope minting and typo refusal / six refusal-reason classes carried into the protocol / admission and env fallback (argv doesn't leak the secret) / connection audit down to a specific key and view / scope two-way isolation / revoke closes live mounts with no dirty endpoint / other keys unaffected / token-and-key double-gate AND / the data plane's independent gate / failover carrying the credential / no-gate default path no regression / view-bound key refusing across views with audit attribution / read-only key's server-enforced write refusal / `set-ro` on the same live mount rw→ro refuses write · ro→rw admits · no reconnect).
 
 ### 3.5.2 Governing the same metadata from any machine: the remote control plane (`--control-listen` / `--control-server`)
 
-Governance commands (`view create/define/alias/list/rm`, `fork`/`graft`, `export`/`import`, `apikey`, `refs rebuild`, `gc`) must be able to read and write **the metadata store itself**. On the SQLite backend a tree is `<meta-dir>/meta/<view>.db`, reachable only by a process on the disk-holding host; on the PG backend any machine that can connect to the DB can govern it, but at the cost of handing `postgres://user:pw@…` to every management machine — one shared password that neither says who's editing nor can revoke just one person.
+Governance commands (`view create/define/alias/list/rm`, `fork`/`graft`, `export`/`import`, `apikey`, `refs rebuild`, `gc`) must be able to read and write **the metadata store itself**. On the SQLite backend a tree is `<meta-dir>/meta/<view>/<view>.db`, reachable only by a process on the disk-holding host; on the PG backend any machine that can connect to the DB can govern it, but at the cost of handing `postgres://user:pw@…` to every management machine — one shared password that neither says who's editing nor can revoke just one person.
 
 The remote control plane splits these two: `meta-server --control-listen HOST:PORT` opens one more listener that **runs only governance verbs**, and governance commands point at it with `--control-server HOST:PORT --api-key '<id>:<secret>'`, the real operations done on behalf by that already-store-holding process. A management machine has no DB URI, needn't reach `<meta-dir>`, and SQLite and PG take the same road. The credential is an **account key** (§3.5.1's `--for admin --owner <account>`): one account may hold many keys, each minted and revoked individually, each call landing in the audit.
 
@@ -1392,11 +1409,11 @@ Any management machine (the secret into env, not into argv):
 $ export GROVEFS_CONTROL_KEY='6e0f9e874f3c4bdc:8516e6eaf85045178490e81d995d92e6'
 $ grovefs view --control-server 10.0.0.5:50111 list
 no alias/fork/lens definitions in remote control plane at 10.0.0.5:50111 (backend sqlite) — the 1 base view(s) below each map to their own tree
-base view 'alice' -> own tree meta/alice.db (read-write; deletes free a shared object only when no view holds it)
+base view 'alice' -> own tree meta/alice/alice.db (read-write; deletes free a shared object only when no view holds it)
 view keys: `grovefs apikey --control-server 10.0.0.5:50111 --api-key <admin-key> list [--view NAME]` (add --view to see only that view's keys)
 
 $ grovefs view --control-server 10.0.0.5:50111 create --view bob
-created BASE view 'bob' at /srv/gfs/meta/bob.db (via 10.0.0.5:50111)
+created BASE view 'bob' at /srv/gfs/meta/bob/bob.db (via 10.0.0.5:50111)
   deletes in a base view free the underlying object once no other view references it;
   reshape it with `view define` or publish it under a name with `view alias`.
 
@@ -1404,7 +1421,7 @@ $ grovefs view --control-server 10.0.0.5:50111 rm --name bob --base
 removed base view 'bob': 1 node(s) gone, 0 blob reference(s) dropped, 0 still held by other views; 0 object(s) freed from /srv/gfs/blocks, 0 not found under that data root (they live on another store?), 0 could not be freed (striped keys move through a data-server)
 
 $ grovefs refs --control-server 10.0.0.5:50111 rebuild
-refs ledger rebuilt at /srv/gfs/meta/refs.db: 0 holder entries across the surviving views
+refs ledger rebuilt at /srv/gfs/meta/_control/refs.db: 0 holder entries across the surviving views
   run it QUIESCED: a booking committed between the server's read pass and write pass would be overwritten with the pre-booking count
 ```
 
@@ -1464,7 +1481,7 @@ e2e in the `ctlplane` suite (startup banner / the first admin key must be minted
 
 §3.5.2 let any machine govern the same metadata, but the door is still a terminal: verbs to remember, a key to carry, refusal reasons to read. The three highest-frequency things — look at the views, hand out a key, give a colleague a patch of ground — are cheaper to click. And "**this** account governs **this** patch, including the forks and aliases derived from it and the keys bound to it" is a claim about ownership that one shared admin key cannot express and the terminal has no shape for.
 
-The console adds exactly that, and it **does not add a second body of governance logic**. `grovefs web` is an HTTP gateway in front of `meta-server --control-listen`: an embedded single-page app (Overview / Views / Keys / Accounts / Audit — `include_str!`'d into the binary at build time, so no CDN, no node_modules, and it opens on an air-gapped host), which turns a browser session into an **account** and every click into one governance op forwarded onward. "Who may touch which tree" is still decided in exactly one place, server-side `gates()`/`authorize()`; the gateway only **subtracts** — the verbs it does not route (`gc.scan`/`gc.apply`/`refs.rebuild`/`view.rm_base`/`fork.graft`) can never reach the server from a browser, even where the server itself would have allowed them. Accounts, grants and password digests live on the **server** (SQLite: `<meta-dir>/meta/web_accounts.db`; PG: tables in the control DB; PBKDF2-HMAC-SHA256, 210,000 rounds), and sign-ins are verified by the process that holds the store — the gateway never sees the password library, which is exactly why it can afford to be only a translation layer.
+The console adds exactly that, and it **does not add a second body of governance logic**. `grovefs web` is an HTTP gateway in front of `meta-server --control-listen`: an embedded single-page app (Overview / Views / Keys / Accounts / Audit — `include_str!`'d into the binary at build time, so no CDN, no node_modules, and it opens on an air-gapped host), which turns a browser session into an **account** and every click into one governance op forwarded onward. "Who may touch which tree" is still decided in exactly one place, server-side `gates()`/`authorize()`; the gateway only **subtracts** — the verbs it does not route (`gc.scan`/`gc.apply`/`refs.rebuild`/`view.rm_base`/`fork.graft`) can never reach the server from a browser, even where the server itself would have allowed them. Accounts, grants and password digests live on the **server** (SQLite: `<meta-dir>/meta/_control/web_accounts.db`; PG: tables in the control DB; PBKDF2-HMAC-SHA256, 210,000 rounds), and sign-ins are verified by the process that holds the store — the gateway never sees the password library, which is exactly why it can afford to be only a translation layer.
 
 **Install time: the first administrator can only be placed by the process that holds the store.** If the governance entry point could mint its own administrators, the gate would be decorative — so bootstrap hangs off `meta-server`, not off `web`. Both flags apply only while the accounts table is **empty**; a restart that re-reads the same unit file is idempotent, while a different `--admin-user` refuses to start rather than quietly adding a second administrator. The password comes only from `--admin-password-file`, never `--admin-password` — argv is visible to every process on the machine and lands in the shell history.
 
@@ -1476,7 +1493,7 @@ meta-server: metadata backend sqlite — one db file per view under <base>/meta/
 meta-server: views are created explicitly — M_OPEN refuses a name with no existing tree or definition (`grovefs view --meta-dir <dir> create --view <name>`); no empty tree is ever auto-created
 meta-server: CONTROL plane listening on 127.0.0.1:15699 (admin-scope api keys only; every call is audited as method=control — mint with `grovefs apikey create --for admin --owner <account>` on this host)
 meta-server: web accounts — created the first web account 'rootops' (role admin) from the install-time flags — sign in with it, then delegate base views
-meta-server: web console sign-ins are verified HERE (`grovefs web --control-server 127.0.0.1:15699`); accounts and their base-view delegation live in meta/web_accounts.db
+meta-server: web console sign-ins are verified HERE (`grovefs web --control-server 127.0.0.1:15699`); accounts and their base-view delegation live in meta/_control/web_accounts.db
 ```
 
 **Start the gateway.** The credential is the same `--for admin` account key from §3.5.2, and `--api-key-file` is the recommended shape (the file itself `0600`, mounted as a secret under systemd):
@@ -1497,7 +1514,7 @@ Open that address in a browser; for a remote host use an SSH tunnel (`ssh -L 878
 
 ```bash
 $ grovefs view --control-server 127.0.0.1:15699 create --view main
-created BASE view 'main' at .webdoc/srv/meta/main.db (via 127.0.0.1:15699)
+created BASE view 'main' at .webdoc/srv/meta/main/main.db (via 127.0.0.1:15699)
   deletes in a base view free the underlying object once no other view references it;
   reshape it with `view define` or publish it under a name with `view alias`.
 
@@ -1608,7 +1625,7 @@ Semantics and boundaries:
 - **The gateway subtracts capabilities, it never adds them**: the admin key it holds outranks any signed-in account, so the whitelist of verbs a page may press is **hard-coded at 32** (an op not on it answers `… is not available from the console`), and the five destructive/cross-tenant governance verbs plus `login` are not routed at all; `/api/call` matches exactly, so a prefix trick like `apikey.list/../gc.apply` gets nowhere. Those two lists (the gateway's 32 and the server's ACL table) are maintained in two files, so one unit test, `every_routed_op_has_an_access_rule`, checks that every name in the whitelist has a server-side rule, and another, `destructive_ops_are_not_routable`, pins the verbs that are deliberately not routed — drift is caught by `cargo test --lib` rather than by someone clicking a button.
 - **Identity comes from the server, not from the cookie**: the cookie only says "this browser signed in"; every request is re-authorized as its own account, so revoking a grant or `account disable` takes effect on the **next call**, while `account passwd` does not kick out sessions that are already open (that is the gateway's session table; to stop someone immediately, use `disable`).
 - **Anti-enumeration and throttling**: "no such account" and "wrong password" return byte-identical wording and status codes, with timing padded out; the same client IP that fails 5 times within 15 minutes starts receiving 429 (30s baseline, doubling for each further failure), **even if that attempt's password was correct** — the 429 body carries `retryAfter`.
-- **The control store is not a view**: view trees coexist with `refs.db`, `api_keys.db` and `web_accounts.db` under `meta/`, and which files are not view trees is decided by exactly **one** predicate (`meta::is_view_db`) — otherwise a console account library would appear in `view list` as a mountable fake view and drag `refs rebuild`/`gc`/`fork drop` down with it.
+- **The control store is not a view**: under `meta/` the **directory name is the type** — `_control/` is the control plane (ledger, keys, accounts), `views/` holds the derived/alias definitions, and every other directory is one physical view tree (carrying its own `<name>.db` inside). The judgement lives in exactly **one** place (`meta::list_view_trees`) — otherwise a console account library would appear in `view list` as a mountable fake view and drag `refs rebuild`/`gc`/`fork drop` down with it.
 - **Export and import are two dedicated routes** (`/api/export`, `/api/import`), not generic ops: they ship a file body and take session + CSRF the same way. Importing a **new base view** remains admin-only (`view.create` is a deployment decision); a `user` importing a tree they govern uses `as_fork=<their own base view>`.
 - **A routable bind address must be admitted explicitly**: over plain HTTP, `--listen 0.0.0.0` puts every sign-in and every governance call on the wire unencrypted, so the gateway refuses to start by default. Either terminate TLS in a reverse proxy in front (and pass `--use-x-forwarded-for`, otherwise the throttling and the audit will show the proxy's address for everyone), or pass `--allow-insecure-http` to state that the network is trusted end to end. With `--use-x-forwarded-for` on, make sure only that proxy can reach the port — otherwise the client address in the header is whatever the caller chose.
 - **The last lock cannot be destroyed**: demoting or deleting the **only enabled administrator** is refused (`'rootops' is the only enabled administrator — create a second admin and verify you can sign in as it before demoting this one`); create the second admin and verify you can sign in as it before touching the first.
@@ -1626,22 +1643,25 @@ This requires splitting the two services:
 ```bash
 # ===== 中心节点 =====
 # 数据服务:把物理对象存到本节点的硬盘目录
-$Y data-server --listen 0.0.0.0:50100 --data-dir /data/cluster
+$Y data-server --listen 0.0.0.0:50100 --data-dir /data/cluster --advertise-addr 10.0.0.5:50100 --member-id 0 --register-with 10.0.0.5:50055 --join-key-file /srv/mgr/manager/join.key
 
 # 元数据服务:托管每用户权威视图(多客户机共享同一棵,不再各存各的副本)
-$Y meta-server --meta-dir /data/cluster --listen 0.0.0.0:50110
+# 引导服务 manager + 元数据服务：拓扑在服务端声明一次、签名分发，客户机只指 manager 一个地址
+$Y --home /srv/mgr manager define --meta 10.0.0.5:50110 --data 10.0.0.5:50100
+$Y --home /srv/mgr manager serve --listen 0.0.0.0:50055 &
+$Y meta-server --meta-dir /data/cluster --listen 0.0.0.0:50110 --advertise-addr 10.0.0.5:50110 --register-with 10.0.0.5:50055 --join-key-file /srv/mgr/manager/join.key
 #   --meta-dir 就是元数据根:视图库在其 meta/ 下。视图名必须显式创建——先建树再挂:
 $Y view --meta-dir /data/cluster create --view alice
 #   (不建就挂会被 M_OPEN 拒:view 'alice' does not exist on this meta-server …)
 
 # ===== 每台客户机(远程挂载不需要 --home,本地什么都不落) =====
 $Y mount --view alice \
-     --data-servers 10.0.0.5:50100 --meta-server 10.0.0.5:50110 -m /mnt/alice
+     --manager 10.0.0.5:50055 --roster-key-file /etc/grovefs/roster.key -m /mnt/alice
 ```
 
-- `--data-servers <host:port>`: file IO goes over the network to the data-server, never touching the client's local disk.
-- `--meta-server <host:port>`: the view tree is served by the central meta-server, **multiple clients mounting the same user = sharing one authoritative tree**.
-- The client keeps **no view copy locally and writes nothing locally**: a remote mount given `--data-servers`/`--meta-server` **needs no `--home`** (passing one writes nothing) — the authoritative data is on the meta-server, the bytes on the data-server, access control all happens server-side at `M_OPEN`/per-op, the client doesn't consult a local DB.
+- `--manager HOST:PORT` + `--roster-key-file F`: the client's ONLY source of coordinates — the resolved data list sends file IO over the network to the data-server (never touching the client's local disk), the resolved meta list has the view tree served by the central meta-server (**multiple clients mounting the same user = sharing one authoritative tree**). Hand-typed `--meta-server`/`--data-servers` were removed from `mount`.
+- The roster's meta list may be a failover list and its data list the complete stripe member set — this topology is declared once server-side by `manager define` instead of being retyped on every client machine (§4.2).
+- The client keeps **no view copy locally and writes nothing locally**: a remote mount **needs no `--home`** (passing one writes nothing) — the authoritative data is on the meta-server, the bytes on the data-server, access control all happens server-side at `M_OPEN`/per-op, the client doesn't consult a local DB.
 
 > **A nonexistent view name is refused outright — this is the only behavior, no switch.**
 >
@@ -1649,7 +1669,7 @@ $Y mount --view alice \
 >
 > ```text
 > meta-server: views are created explicitly — M_OPEN refuses a name with no existing tree or definition …; no empty tree is ever auto-created
-> $ grovefs mount --view typo1 --meta-server 10.0.0.5:50110 --data-servers 10.0.0.5:50100 -m /mnt/t
+> $ grovefs mount --view typo1 --manager 10.0.0.5:50055 --roster-key-file /etc/grovefs/roster.key -m /mnt/t
 > error: view 'typo1' does not exist on this meta-server (sqlite): no tree and no definition —
 >   views are created explicitly, so unknown names are refused instead of becoming an empty tree;
 >   create it first: `grovefs view --meta-dir /data/cluster create --view typo1` …
@@ -1665,16 +1685,16 @@ $Y mount --view alice \
 >
 > **The orthogonal other lock is binding a key to a view**: a key from `apikey create --view team` mounting a different name is refused at the **binding check** (earlier than the existence check), verified `permission denied: this api key is bound to view 'team', not 'ghost3'`, likewise building no tree. Division of labor: the existence check governs "does this name exist", the bound key governs "which tree may this caller open".
 >
-> Cleaning up a mistakenly created empty tree (first `umount` all mounts of that name): for a bare base view (a physical tree with no definition) use `grovefs view --meta-dir D rm --name <base> --base` in one command — it deletes `meta/<base>.db` (+WAL/SHM), runs `refs rebuild` to recompute the ledger, and reclaims bytes no other view holds (§3.4.3). The manual equivalent: `rm -f meta/<name>.db meta/<name>.db-wal meta/<name>.db-shm` then `grovefs refs --meta-dir D rebuild`; the PG backend is the **same command** with `--meta-store` (`view --meta-store postgres://… rm --name <base> --base`) — the booking-off (per-key decrement of `grovefs_refs.holders`) and `DROP SCHEMA … CASCADE` complete in one transaction, and after commit bytes are reclaimed per the `data_ref` read before deletion (§15.8). A hand `DROP SCHEMA` past the CLI does not count as deletion: the ref list vanishes with the schema, the ledger rows thereafter can be reclaimed by no one (`refs --meta-store postgres://… rebuild` only deletes the over-counted rows, the bytes are already unlocatable).
+> Cleaning up a mistakenly created empty tree (first `umount` all mounts of that name): for a bare base view (a physical tree with no definition) use `grovefs view --meta-dir D rm --name <base> --base` in one command — it deletes `meta/<base>/<base>.db` (+WAL/SHM), runs `refs rebuild` to recompute the ledger, and reclaims bytes no other view holds (§3.4.3). The manual equivalent: `rm -f meta/<name>/<name>.db meta/<name>/<name>.db-wal meta/<name>/<name>.db-shm` then `grovefs refs --meta-dir D rebuild`; the PG backend is the **same command** with `--meta-store` (`view --meta-store postgres://… rm --name <base> --base`) — the booking-off (per-key decrement of `grovefs_refs.holders`) and `DROP SCHEMA … CASCADE` complete in one transaction, and after commit bytes are reclaimed per the `data_ref` read before deletion (§15.8). A hand `DROP SCHEMA` past the CLI does not count as deletion: the ref list vanishes with the schema, the ledger rows thereafter can be reclaimed by no one (`refs --meta-store postgres://… rebuild` only deletes the over-counted rows, the bytes are already unlocatable).
 
 ### 4.1 Does multi-machine sharing really need PG? — getting-started selection
 
-> **Direct answer: no.** The ability to share one tree across machines over LAN comes from "the same `meta-server` + the same `--view`", unrelated to whether the backend stores SQLite or PG. The default embedded SQLite (compiled into the binary as `rusqlite bundled`, zero external dependencies) already suffices for multi-client mounts, write serialization, and real-time invalidation push. PG is only an **optional backend** for meta-server, a pure server-side config (`--meta-store postgres://…` given at meta-server startup, clients have no such option and are unaware). The two are a **pick-one** replacement relation, not stacked: the same authoritative tree lands on one backend only — with SQLite you needn't install PG; after switching to PG the view tree goes only into a PG schema, the server no longer creates/reads/writes any `<meta-dir>/meta/<view>.db` (what stays in the directory is the old pre-switch copy); the control plane follows the backend too — `grovefs view`/`apikey`/`mcp`/`data-server` also accept `--meta-store postgres://…` (or env `GROVEFS_META_STORE`), keys and audit go into `grovefs_control.api_keys`/`mcp_calls`, view definitions into `grovefs_control.view_defs`, and a PG deployment lands no control-plane file locally (proven by the `control` suite). Go to PG only if you want to hand the authoritative tree's persistence/HA/operations **to a mature database**.
+> **Direct answer: no.** The ability to share one tree across machines over LAN comes from "the same `meta-server` + the same `--view`", unrelated to whether the backend stores SQLite or PG. The default embedded SQLite (compiled into the binary as `rusqlite bundled`, zero external dependencies) already suffices for multi-client mounts, write serialization, and real-time invalidation push. PG is only an **optional backend** for meta-server, a pure server-side config (`--meta-store postgres://…` given at meta-server startup, clients have no such option and are unaware). The two are a **pick-one** replacement relation, not stacked: the same authoritative tree lands on one backend only — with SQLite you needn't install PG; after switching to PG the view tree goes only into a PG schema, the server no longer creates/reads/writes any `<meta-dir>/meta/<view>/<view>.db` (what stays in the directory is the old pre-switch copy); the control plane follows the backend too — `grovefs view`/`apikey`/`mcp`/`data-server` also accept `--meta-store postgres://…` (or env `GROVEFS_META_STORE`), keys and audit go into `grovefs_control.api_keys`/`mcp_calls`, view definitions into `grovefs_control.view_defs`, and a PG deployment lands no control-plane file locally (proven by the `control` suite). Go to PG only if you want to hand the authoritative tree's persistence/HA/operations **to a mature database**.
 
 | Topology | Backend | Applicable scenario | Command |
 | --- | --- | --- | --- |
-| Single machine local | SQLite (embedded) | development, testing, single user | `mount --view alice --mountpoint /mnt/alice` |
-| **Central node + multi-client LAN** | **SQLite (default)** | **small/medium team sharing, zero external-service dependency** | `meta-server --listen 0.0.0.0:50110` + client `mount --meta-server ip:port --view alice` |
+| Single machine local | SQLite (embedded) | development, testing, single user | start `data-server` + `meta-server` locally, then `mount --manager 127.0.0.1:50055 --roster-key-file ~/roster.key` (§15.1) |
+| **Central node + multi-client LAN** | **SQLite (default)** | **small/medium team sharing, zero external-service dependency** | `meta-server --listen 0.0.0.0:50110` + client `mount --manager MGR:50055 --roster-key-file F --view alice` |
 | Central + multi-client LAN | SQLite + HA (`--role`+`--peer`+`--witness`) | auto failover after a single meta-server dies, double-write protection | add `--role primary --peer …` etc. |
 | Central + multi-client LAN | **PostgreSQL** (`--meta-store postgres://…`) | want to hand HA/backup/PITR/million-node index tuning **to PG**, and already have PG ops capability | `meta-server --meta-store postgres://user:pw@host:5432/db` (can't add `--peer`/`--witness` at once) |
 
@@ -1687,7 +1707,7 @@ $Y mount --view alice \
 
 | Mode | Command | Behavior |
 |------|------|------|
-| **Real-time invalidation push (default, recommended)** | just `--meta-server` | after one client writes successfully, the meta-server broadcasts invalidation (`inval_entry`+`inval_inode`) over an event bus to the same user's other subscribers, the peer's next access is **immediately visible**, no polling. |
+| **Real-time invalidation push (default, recommended)** | every remote mount (meta coordinates resolved from the manager) | after one client writes successfully, the meta-server broadcasts invalidation (`inval_entry`+`inval_inode`) over an event bus to the same user's other subscribers, the peer's next access is **immediately visible**, no polling. |
 | **`--no-cache` strong-consistency backstop** | add `--no-cache` | disables kernel attr/dentry caching and reads directly via `FOPEN_DIRECT_IO`, writes immediately visible. Cost: zero client cache, more metadata/data round-trips. For scenarios with extremely strict freshness demands. |
 
 > **Default is fresh**: the non-`--no-cache` push-invalidation model already guarantees "A writes successfully → B sees it on next access immediately", no polling, no `--no-cache`. Proven end-to-end by `.build-bin/test_freshness.sh` (sequential append of 100 lines, truncate, reverse read all become peer-visible within <500ms). `--no-cache` is **not** the only channel to keep fresh; it merely fully bypasses the kernel cache as a more conservative backstop in the extreme race window where writeback dirty-page flush and remote invalidation interleave.
@@ -1702,7 +1722,7 @@ $Y mount --view alice \
 | Write throughput (this repo measured) | **767–1,109 ops/s** (N=1 1,109 / N=4 811 / N=8 767; concurrent writes still single-writer serialized, and dip slightly with mount count) | single-view plateau **~4.6k–5.2k ops/s** (N=4 peak 5,235; N≥8 dips with SSI retries; after the write-statement cache N=1/4/8 are 3,048–3,118 / 4,784–5,202 / 4,518–4,680, §6.2) |
 | Single-transaction cap | no hard gate (bounded only by memory/disk) | no hard gate |
 | Availability | native HA: `--role primary/standby` + `--peer` + `--witness`, snapshot forwarding; single writer, switching has a window | left to PG itself (streaming replication / PITR), GroveFS does not manage it |
-| View scale | one `meta/<view>.db` + one engine instance per view, about 10 + (read-pool−1)×~1.3 fds/view (a local mount's read pool = `--threads`, default 4 → about 14; tunable via `GROVEFS_SQLITE_READ_POOL`), under 65536 about four thousand views | 12 connections per view (default 8 write + 4 read, tunable via `GROVEFS_PG_*_POOL`); after `--engine-idle-secs` eviction counted by "active views in the last N minutes" |
+| View scale | one `meta/<view>/<view>.db` + one engine instance per view, about 10 + (read-pool−1)×~1.3 fds/view (server side: default **warm 1** read connection, bursts retained up to 8 as needed; `GROVEFS_SQLITE_READ_POOL` raises the warm floor), under 65536 about four thousand views | 12 connections per view (default 8 write + 4 read, tunable via `GROVEFS_PG_*_POOL`); after `--engine-idle-secs` eviction counted by "active views in the last N minutes" |
 
 The conclusion is clear: **the gap between SQLite and PG is the single-writer model itself (one write transaction at a time), measured about 4–6×**.
 
@@ -1733,7 +1753,7 @@ Under a remote mount (`meta-server`), `M_CREATE` / `M_SYMLINK` inline the just-c
 | `gc --meta-dir D --data-dir R [--apply]` | available | refused | offline orphan scanning must see both the DB and the object directory; a remote deployment uses `gc --control-server … --data-servers …` instead |
 | `meta-server --role primary/standby --peer … [--witness …]` | available | refused | native HA is SQLite-only; PG uses streaming replication / PITR |
 | `view define / alias / list` | definition lands `meta/views/*.layout` | definition lands `grovefs_control.view_defs` | each tier lands its own control-plane store, same one discipline |
-| `apikey … / calls` | `meta/api_keys.db` | `grovefs_control` | capability OK on both tiers, only the landing spot differs |
+| `apikey … / calls` | `meta/_control/api_keys.db` | `grovefs_control` | capability OK on both tiers, only the landing spot differs |
 | `refs rebuild` / `rm --base` / `du` | `--meta-dir` | `--meta-store postgres://…` | same name different shell; `du` on a nonexistent view name gives the same `no tree for view …` on both tiers |
 
 #### 4.1.4 How to choose: two lines, don't pick by "does a feature exist"
@@ -1749,7 +1769,7 @@ Under a remote mount (`meta-server`), `M_CREATE` / `M_SYMLINK` inline the just-c
 
 ### 4.2 Mount bootstrap: the manager — declare the coordinates once, point clients at one address
 
-A `mount` needs two cluster coordinates: `--meta-server` (an ORDERED failover list) and `--data-servers` (the COMPLETE stripe member set). The second is not a candidate pool — a striped object is pinned to its member-id set, so an object is unreadable through a shorter list. Both coordinates are therefore **provisioning facts**: an operator decides them, they do not emerge at runtime. Constants like these do not have to be typed on every client machine: `manager` declares them once server-side and distributes them signed, and a client points at the manager alone.
+A `mount` resolves two cluster coordinates: a metadata service (possibly an ORDERED failover list) and a data service (possibly the COMPLETE stripe member set). The second is not a candidate pool — a striped object is pinned to its member-id set, so an object is unreadable through a shorter list. Both coordinates are therefore **provisioning facts**: an operator decides them, they do not emerge at runtime. Constants like these do not have to be typed on every client machine: `manager` declares them once server-side and distributes them signed, and a client points at the manager alone — hand-typed `--meta-server`/`--data-servers` were removed from `mount`.
 
 The manager is a **bootstrap service and never a data path**: a mount consults it once, resolves the two address lists, then connects to the meta- and data-servers directly and never asks again.
 
@@ -1805,7 +1825,7 @@ The JSON carries, for every **declared** address, `registered` / `seen_secs_ago`
 - **A roster is the DECLARED set, never "the ones alive right now".** Heartbeats influence exactly two things: one column in `status`, and whether `manager serve --require-registered` refuses the lookup outright (it is a **precheck gate, not a filter** — with it on, the roster is still the full declared set, because handing a client half of a stripe's members hands it objects it cannot read). `--require-registered` is off by default; use it where a half-started cluster should fail mounts loudly instead of letting them discover the gap by timing out.
 - **Two keys, two questions.** `--join-key-file` (64 hex, `0600`) authorizes a REGISTRATION and is held only by meta-/data-servers — a client never holds it. `--roster-key-file` signs the ANSWER: the manager signs with it, the client verifies with it. **Registration is not admission**: a node that cannot reach the manager keeps serving, retrying with backoff (one log line per state change, not per attempt).
 - **An undeclared address cannot get in.** A registration is accepted only for an address the operator DECLARED for that role and deployment (`Denial::NotDeclared`), so a leaked join key still **cannot steer clients to an attacker's machine** — the refusal, verbatim from a real run: `manager: registration with 10.0.0.9:50055 failed (data address 10.0.0.7:50100 is not declared for deployment 'prod'; a registration can never ADD an address to a roster — correct --advertise-addr or declare it (declared for this role: [10.0.0.5:50100, 10.0.0.6:50100])); the node serves regardless, retrying (next note only on a change)`.
-- **Fail-closed on verification.** A missing `--roster-key-file`, a bad signature, an expired roster or an unknown roster version exits `mount --manager` non-zero and leaves no mountpoint behind; it never "mounts then warns". `--manager` is **mutually exclusive** with `--meta-server`/`--data-servers` (one mount, one source of truth), and the resolved lists feed the very same pair of values, so the backend is built by exactly the code path a hand-typed mount takes — **additive, not a replacement**.
+- **Fail-closed on verification.** A missing `--roster-key-file`, a bad signature, an expired roster or an unknown roster version exits `mount --manager` non-zero and leaves no mountpoint behind; it never "mounts then warns". `--manager` is the **only** coordinate source for `mount`: the hand-typed `--meta-server`/`--data-servers` flags were removed outright (there is no "mutually exclusive" question left, only one road remains), and the two resolved address lists feed the very same backend-construction path — **a replacement, not an addition**.
 
 **Failure boundary**: kill the manager and existing mounts keep reading and writing (the data plane never goes through it); what is affected is NEW mounts, which fail closed. Declarations live in `<state-dir>/manager/deployments.json`, and `serve` stats its mtime before every request and re-reads only on change — which is why `define` can be a standalone short command (no daemon-side credential, no restart) and why a restarted manager needs no re-define. **Topology cost**: one more listening port reachable from every node AND every client (a separate port from the meta/data planes, so a cross-machine deployment opens it explicitly), carrying roughly one request/response per node per ~30s plus one per mount; **latency cost** = one extra TCP round-trip per mount plus one local HMAC-SHA256 verify; **IO-path delta = 0**.
 
@@ -1823,25 +1843,27 @@ What exactly is stored in one storage root (`<meta-dir>` or a local `--home`), a
 <meta-dir>/
 ├─ blocks/<2hex>/<key>      内容字节,一文件一对象(key=UUID,按哈希扇出 256 桶)
 └─ meta/
-   ├─ <view>.db             每个物理视图一棵权威树(SQLite WAL)
+   ├─ <view>/                每个物理视图一棵权威树,自成一个目录
+   │  └─ <view>.db           (SQLite WAL;-wal/-shm 同目录,随 checkpoint 出没)
    │     node(id INTEGER PRIMARY KEY, ino, parent_id, name, is_dir, data_ref,
    │          link_target, mode, uid, gid, mtime, atime, ctime,
    │          UNIQUE(parent_id, name))   ← 树的全部:名字、类型、指向 blocks 的 key、POSIX 属性
    │     ctrl               (k,v) 键值表:今天只有 HA 的 epoch(0/缺行=没启用 HA)
    │     locks              POSIX/BSD 锁表(租约到期自动回收,release 是持有者终止信号)
-   ├─ refs.db               跨视图共享对象持有者账本(GC 判「最后一个名字」的唯一依据)
-   ├─ views/*.layout        派生/别名/fork 定义(派生=`base <B>` 行+规则行;别名=单行 `alias <R>`;fork=单行 `fork <B>`(三种行可写在文件任意位置,注释/空行跳过))
-   └─ api_keys.db           API key SHA-256 摘要 + 调用审计(SQLite 后端的控制面;PG 后端进 grovefs_control)
+   ├─ _control/              控制面:不是树(目录名是保留视图名,永不被当树枚举)
+   │  ├─ refs.db             跨视图共享对象持有者账本(GC 判「最后一个名字」的唯一依据)
+   │  └─ api_keys.db         API key SHA-256 摘要 + 调用审计(SQLite 后端的控制面;PG 后端进 grovefs_control)
+   └─ views/*.layout        派生/别名/fork 定义(派生=`base <B>` 行+规则行;别名=单行 `alias <R>`;fork=单行 `fork <B>`(三种行可写在文件任意位置,注释/空行跳过))
 ```
 
 - **Field-by-field glossary**: `node`'s 13 fields (incl. the division between `ino` and `id`, `mode` storing only permission bits, times in seconds), `ctrl.epoch`, `locks`' 9 fields (the lease and `sid` renewal), `refs.holders`' counting semantics, and the read path each of the 4 indexes supports, see the web manual `docs.html` §8.1.1 (with real `sqlite3` query echoes); this section gives only a one-screen reference.
 - **The name-resolution chain**: `mount --view X` → `M_OPEN(X)` → the server looks up `meta/views/X.layout`:
-  contains a `base <B>` line (derived) → opens the physical tree `meta/<B>.db`, applies the rule lines as a `LayoutMeta` lens, mounts read-only;
-  contains an `alias <R>` line → applies no rules, the name lands directly on the real tree `meta/<R>.db`, whole tree writable, the real name refused to mount;
-  contains a `fork <B>` line → opens its own `meta/X.db` directly (an independent tree);
-  no definition → X is a physical view, opens `meta/X.db` directly. The client needs no rules file locally.
-- **Two backends of the same tree**: SQLite (default, one `.db` per view) and PG (`meta-server --meta-store postgres://…`, one schema `grovefs_v_<hex(view)>` per view, the ledger a shared table `grovefs_refs.holders`) are a **pick-one** replacement relation; the control plane follows the backend too: under `--meta-store postgres://…` keys/audit/view definitions all go into the `grovefs_control` schema (`api_keys`/`mcp_calls`/`view_defs`), nothing lands as a local control-plane file; the CLI `view`/`apikey`/`mcp`/`data-server` use `--meta-store` (or env `GROVEFS_META_STORE`) to reach the same system record.
-- **The backup closed loop**: `blocks/` + `meta/*.db` + `meta/refs.db` (recomputable with `grovefs refs --meta-dir D rebuild`) + `meta/views/*.layout` + (as needed) `meta/api_keys.db` — under the PG backend one `pg_dump` covers both `grovefs_v_*` and `grovefs_control`, leaving only `blocks/` + env to back up locally — §5.4 gives the full list and both the stop-service and hot-backup approaches.
+  contains a `base <B>` line (derived) → opens the physical tree `meta/<B>/<B>.db`, applies the rule lines as a `LayoutMeta` lens, mounts read-only;
+  contains an `alias <R>` line → applies no rules, the name lands directly on the real tree `meta/<R>/<R>.db`, whole tree writable, the real name refused to mount;
+  contains a `fork <B>` line → opens its own `meta/X/X.db` directly (an independent tree);
+  no definition → X is a physical view, opens `meta/X/X.db` directly. The client needs no rules file locally.
+- **Two backends of the same tree**: SQLite (default, one directory and one `.db` per view) and PG (`meta-server --meta-store postgres://…`, one schema `grovefs_v_<hex(view)>` per view, the ledger a shared table `grovefs_refs.holders`) are a **pick-one** replacement relation; the control plane follows the backend too: under `--meta-store postgres://…` keys/audit/view definitions all go into the `grovefs_control` schema (`api_keys`/`mcp_calls`/`view_defs`), nothing lands as a local control-plane file; the CLI `view`/`apikey`/`mcp`/`data-server` use `--meta-store` (or env `GROVEFS_META_STORE`) to reach the same system record.
+- **The backup closed loop**: `blocks/` + one `meta/<view>/<view>.db` per tree + `meta/_control/refs.db` (recomputable with `grovefs refs --meta-dir D rebuild`) + `meta/views/*.layout` + (as needed) `meta/_control/api_keys.db` — under the PG backend one `pg_dump` covers both `grovefs_v_*` and `grovefs_control`, leaving only `blocks/` + env to back up locally — §5.4 gives the full list and both the stop-service and hot-backup approaches.
 - **The customization↔storage mapping**: the full cross-reference of the four forms (command→files/tables produced, parameters, common pitfalls) is in §3.0; §5.0's `.layout` is the on-disk form of "how to customize a view" (the rule's four verbs in README "the three view questions" and §3.1/§3.2); fork is the only customization that creates a physical tree (`view fork` copies `node` rows, bytes shared and booked into the ledger).
 
 ### 5.1 Physical layout
@@ -1854,29 +1876,29 @@ What exactly is stored in one storage root (`<meta-dir>` or a local `--home`), a
 ### 5.2 Multi-data-server striping (aggregating capacity/bandwidth)
 
 ```bash
-# 挂载时给逗号分隔的多个 data-server 地址 → 自动启用确定性条带
-$Y mount --view alice \
-     --data-servers 10.0.0.5:50100,10.0.0.6:50100 --meta-server 10.0.0.5:50110 -m /mnt/alice
+# Declare the topology once server-side: comma-separated data-server addresses → the roster resolves a multi-address list, deterministic striping turns on
+$Y --home /srv/mgr manager define --meta 10.0.0.5:50110 --data 10.0.0.5:50100,10.0.0.6:50100
+$Y mount --view alice --manager 10.0.0.5:50055 --roster-key-file /etc/grovefs/roster.key -m /mnt/alice
 ```
 
 - A file is split into chunks only if it's ≥ the chunk size; the chunk size is configured by `--stripe-bytes` (env `GROVEFS_STRIPE_BYTES`), default 16 MiB — it's booked per-object into `data_ref`, so changing the config affects only objects created afterward, old objects remain readable at their own recorded sizes, and a cluster can mix different values. Small files naturally land only in chunk0 (a single node).
 - **Value**: spreading a large file over multiple nodes' **aggregate capacity**. Note: on a single already-saturated link (loopback/single NIC) there is no throughput gain, real gains require genuinely independent links.
-- A single-address `--data-servers host:port` is striping-not-enabled: the whole object lands on that one machine, the key has no `s` prefix (giving `--stripe-bytes` here is honestly warned as ineffective).
-- **Member identity `--member-id` (eliminating the order hazard)**: once each data-server starts with a unique `--member-id N` (or `GROVEFS_MEMBER_ID`), the client's stripe placement is by **sorted member identity** rather than `--data-servers` list order — the list in any order over the same machines reads/writes correctly, machine/IP changes replace in place. Keeping the count but **changing the set** (swapping one machine with a new id) is caught by the member-set fingerprint in `data_ref` and the mount is refused, rather than silently reading the wrong chunk. Either all members configure ids or none do: mixing the two modes in the same key space is refused at mount. Without ids it stays in the historical positional mode by list index, where reordering `--data-servers` silently mis-routes existing objects (see §3.4.2 migration constraints).
+- A data list that resolves to a single `host:port` is striping-not-enabled: the whole object lands on that one machine, the key has no `s` prefix (giving `--stripe-bytes` here is honestly warned as ineffective).
+- **Member identity `--member-id` (eliminating the order hazard)**: once each data-server starts with a unique `--member-id N` (or `GROVEFS_MEMBER_ID`), stripe placement is by **sorted member identity** rather than list order — `manager define --data` listing the same machines in any order reads/writes correctly, machine/IP changes replace in place and get re-`define`d. Keeping the count but **changing the set** (swapping one machine with a new id) is caught by the member-set fingerprint in `data_ref` and the mount is refused, rather than silently reading the wrong chunk. Either all members configure ids or none do: mixing the two modes in the same key space is refused at mount. Without ids it stays in the historical positional mode by list index, where reordering `manager define --data` silently mis-routes existing objects (see §3.4.2 migration constraints).
 
 ### 5.3 Deletion / GC
 
 - After `unlink` (deleting a file), the view drops the reference, the backend best-effort deletes all chunks by key, a striped remove expands to delete all chunks, **idempotent** (leftover chunks can be cleared by GC).
-- **The reference ledger `refs` for cross-view shared objects**: one `data_ref` names exactly one underlying object yet may be simultaneously named by multiple physical views (`view fork` and `view export/import --as-fork` copy the same batch of `data_ref`, derived views/aliases share the base view's bytes; whereas `grovefs import` bringing the same source file into two views gives each an **independent key** — both `blocks/` entries are hardlinks to the source file, bytes still the same inode, zero extra usage, but the ledger counts per key separately). A view's internal reference count can't see other views, so taken alone it would mis-delete objects another view still references. Hence the booking lands in `<base>/meta/refs.db` (PG backend a shared table `grovefs_refs.holders`): each view ATTACHes this ledger, the holder count and node add/delete go into the **same IMMEDIATE transaction**, atomically committed across files. The precise physical-deletion rule is "**the last name for this key within the view is removed, and the global ledger has no other view holding it**" — only then `backend.remove`. An out-of-band deletion of a view db (`rm meta/x.db`, a new `--home`) only makes the ledger **over-count**, objects linger and are never mis-deleted; both tiers have this command, all doing "read the tree, recompute, don't read the ledger": `grovefs refs --meta-dir D rebuild` (rewrites `meta/refs.db`), `refs --meta-store postgres://… rebuild` (rewrites `grovefs_refs.holders`); the direction is always "linger bytes" rather than under-count, see §15.8. A key with no row in the ledger is that view's private (an empty ledger needs no initialization step).
+- **The reference ledger `refs` for cross-view shared objects**: one `data_ref` names exactly one underlying object yet may be simultaneously named by multiple physical views (`view fork` and `view export/import --as-fork` copy the same batch of `data_ref`, derived views/aliases share the base view's bytes; whereas `grovefs import` bringing the same source file into two views gives each an **independent key** — both `blocks/` entries are hardlinks to the source file, bytes still the same inode, zero extra usage, but the ledger counts per key separately). A view's internal reference count can't see other views, so taken alone it would mis-delete objects another view still references. Hence the booking lands in `<base>/meta/_control/refs.db` (PG backend a shared table `grovefs_refs.holders`): each view ATTACHes this ledger, the holder count and node add/delete go into the **same IMMEDIATE transaction**, atomically committed across files. The precise physical-deletion rule is "**the last name for this key within the view is removed, and the global ledger has no other view holding it**" — only then `backend.remove`. An out-of-band deletion of a view db (`rm meta/x/x.db`, a new `--home`) only makes the ledger **over-count**, objects linger and are never mis-deleted; both tiers have this command, all doing "read the tree, recompute, don't read the ledger": `grovefs refs --meta-dir D rebuild` (rewrites `meta/_control/refs.db`), `refs --meta-store postgres://… rebuild` (rewrites `grovefs_refs.holders`); the direction is always "linger bytes" rather than under-count, see §15.8. A key with no row in the ledger is that view's private (an empty ledger needs no initialization step).
 
 ### 5.4 Backup and migration
 
 - **Metadata is not hardware-bound**: object location = `blocks/<two hex of FNV1a(key)%256>/<key>`, derived as a pure function of `data_ref`; a `node` row stores no absolute path/device number/hostname, and `ino` is GroveFS's own numbering. It works directly across machines/OSes, as long as metadata and bytes go together.
-- **The list to migrate**: `blocks/` (bytes), `meta/<view>.db` (each view tree), `meta/refs.db` (cross-view ledger, recomputable with `grovefs refs rebuild`), `meta/views/*.layout` (derived/alias/fork definitions), `meta/api_keys.db` (needed only if keys were used). That's the SQLite-backend list; under the PG backend trees, ledger, definitions, keys, audit are all inside the DB and migrate with `pg_dump`/`pg_restore`, locally you need only move `blocks/` + env.
+- **The list to migrate**: `blocks/` (bytes), `meta/<view>/<view>.db` (each view tree), `meta/_control/refs.db` (cross-view ledger, recomputable with `grovefs refs rebuild`), `meta/views/*.layout` (derived/alias/fork definitions), `meta/_control/api_keys.db` (needed only if keys were used). That's the SQLite-backend list; under the PG backend trees, ledger, definitions, keys, audit are all inside the DB and migrate with `pg_dump`/`pg_restore`, locally you need only move `blocks/` + env.
 - **Whole-directory cold copy**: after stopping all mounts and the `meta-server`, `rsync -a -H` the whole storage root; **don't raw-copy a running SQLite** (WAL), if you can't stop use `sqlite3 <db> ".backup"` / `VACUUM INTO`.
 - **Single-view export/import**: `grovefs view --meta-dir D export --view V --out F` → on the target after copying `blocks/`, `grovefs view --meta-dir D2 import --view V --in F`; preserves id/inode/hardlink/permissions/owner/symlink, atomic replace (a failure doesn't harm the old tree), `--as-fork B` restores fork semantics. Details in §3.4.2.
 - **Topology boundary**: multi-disk `--data-dir` count and order must match (an equal-disk clone replacing in place doesn't affect location, only adding/removing/reordering remaps; or merge into a single root); cross-server striping `s<N>:` must keep N members; with `--member-id` the order is irrelevant but the set must not change, without it the order is also part of the layout (§5.2); a whole-directory copy carries the HA `epoch` over, the old primary must be stopped first; the PG backend uses `pg_dump`/logical replication.
-- **Multiple base views**: any number of base views each their own `meta/<name>.db`, you may migrate just one, and keys may bind per view.
+- **Multiple base views**: any number of base views each their own `meta/<name>/<name>.db`, you may migrate just one, and keys may bind per view.
 - **Under HA** the meta-server can additionally replicate via the backup API (see 5.5).
 
 ### 5.5 HA primary/standby (meta-server)
@@ -1894,7 +1916,7 @@ $Y meta-server --meta-dir /data/nodeB --listen 10.0.0.6:50111 --role standby --p
 ```
 
 - The two nodes must use **their own separate `--meta-dir`** (each keeps a copy of the views, replicated between nodes via snapshots).
-- The client's `--meta-server` supports a failover list: `--meta-server 10.0.0.5:50110,10.0.0.6:50111` — when the primary dies it auto-switches to the standby to continue reads/writes.
+- The roster's meta list may be a failover list — declare it once with `manager define --meta 10.0.0.5:50110,10.0.0.6:50111`; when the primary dies the client auto-switches to the standby to continue reads/writes (§4.2).
 - **`--sync-repl` (optional, opt-in, default off)**: once enabled, each write op, before returning to the client, synchronously pushes the snapshot and waits for the standby's fsync + atomic-rename ACK, dropping **RPO from ~500ms to 0**. Cost: write latency adds one control-channel RTT + one `VACUUM INTO` fsync. When the standby is unreachable/times out it **honestly degrades to async and logs a warn** (that op's RPO falls back to REPL_INTERVAL, not falsely reported as 0). Proven by `.build-bin/test_ha.sh` segment 7 (RPO=0) / segment 8 (partition degradation).
 - **`--witness` (optional, opt-in, default off)**: designates one or more `data-server`s (`host:port`, a comma-separated list, an odd N recommended; N=1 requires only 1 arbitrator) reachable by both primary and standby as an **independent arbitrator set**. Authority needs a **strict majority** `quorum_size(N)=N/2+1` arbitrators granting at once (the meta side fans out concurrently to the whole list and judges by majority `witness_quorum`; two majorities must intersect at ≥ one arbitrator, so an equal-value collision naturally leaves one primary). Each data-server maintains a monotonic `fence` token (`OP_FENCE` folds in via a `fetch_max` CAS and returns **the pre-fold value `prev`**): a claim succeeds iff `prev < my epoch` (I raised the token); `prev >= my epoch` means an equal or higher epoch already exists (the peer won, or an equal-value collision) → fenced. Using `prev` rather than the post-max is exactly to **distinguish an equal-value collision** — when arbitrators recover and both halves claim as candidate, the first wins, the second sees `prev == candidate` and is blocked, never dual-primary. The incumbent primary renews a **bounded lease (default 3s)** with the majority each tick (if a majority reports `prev > me` it self-demotes); each arbitrator **refuses overlapping leases** — at any instant at most one live lease, so **a live lease itself is proof of exclusive authority**, write requests are admitted directly by the primary's **local lease validity** (no per-write arbitrator RTT, only one per renewal, amortized across the window), a fenced stale primary is refused at the next revalidation after its lease expires; a would-be-promote standby is also **non-overlapping** — it must wait for the predecessor's lease to expire before it can seize (`prev >= candidate` collision / a higher peer, or the predecessor's lease still live → refuse/defer). The metadata-plane revalidation can't stop content bytes (`write()` hits the backend first, then a debounced meta touch), so **the data plane is gated too**: the client stamps the live epoch on every write-intent data frame (create/write/truncate/remove/fsync), a data-server that is a witness directly returns `EROFS` for frames with `epoch < token`, so a stale primary cannot silently write content bypassing the metadata plane (a blocked frame re-fetches the epoch from the authority and auto-retries once); and the data-server linearizes the epoch check and the disk write against the arbitrator claim (a claim takes an exclusive lock that drains in-flight writes, and witness and storage are the same node), so stale-write bytes cannot overlap with the new primary's writes — content tearing-write is truly closed on the arbitrator node (note: the data-plane gating applies only to data-servers inside the --witness list, i.e. those whose tokens the quorum raises; so deploy witnesses co-located with the content disks clients actually write to, content disks outside the list keep token 0 and their data-plane gate is inactive, leaving only the metadata-plane fence as backstop). **FAIL-SAFE**: once witnesses are configured but a **lease majority can't be reached and it exceeds the grace continuously (=PROMOTE_TIMEOUT 3s)**, a node can't prove exclusive authority and **gives up write permission** — the primary self-demotes to standby, the standby refuses to promote (**writes freeze**, sacrificing availability rather than risking dual-write). Each data-server persists its token independently to `<root>/.fence_token`, **a restart never zeroes the epoch**, letting a stale primary stay out. **The availability dividend over a single arbitrator**: downing **few** arbitrators still forms a majority and renews, not freezing writes; losing a few disks also doesn't revive a stale primary (the majority still keeps a monotonic token); only **losing the majority** fails-safe freezes. This bounds the dual-write window to **within the lease safety margin** (rather than the unbounded peer-only case): non-overlapping leases mean the peer can only take the token after our lease expires, and we stop trusting the cached lease ahead by the margin; a transient arbitrator error doesn't harm single-write, sustained unreachability is still backstopped by the grace (=PROMOTE_TIMEOUT 3s). Proven by `test_ha.sh` segment 9 (a stale primary restart blocked into standby by the witness + token persistence), segment 10 (kill one witness→primary self-demotes & standby refuses to blind-promote→restore witness→exactly one primary), segment 11 (3 arbitrators, down 1 still renews without freezing, down 2 breaks the majority before fail-safe).
 - **Honest annotations**:
@@ -1930,7 +1952,7 @@ $Y meta-server --meta-dir /data/cluster --listen 0.0.0.0:50110 --token s3cr3t
 
 # 客户端挂载带同一 token(同时覆盖数据面 OP_OPEN 与元数据面 M_OPEN)
 $Y mount --view alice \
-     --data-servers 10.0.0.5:50100 --meta-server 10.0.0.5:50110 --token s3cr3t -m /mnt/alice
+     --manager 10.0.0.5:50055 --roster-key-file /etc/grovefs/roster.key --token s3cr3t -m /mnt/alice
 ```
 
 - token mismatch → permission denied directly at connect, no retry.
@@ -1943,7 +1965,7 @@ $Y mount --view alice \
 $Y meta-server --meta-dir /data/cluster --listen 0.0.0.0:50110 --require-api-key
 $Y data-server --listen 0.0.0.0:50100 --data-dir /data/cluster --require-api-key --meta-dir /data/cluster
 # 客户端:呈递一个 `--for mount`(或 `--for any`)的 key
-$Y mount --view alice --data-servers 10.0.0.5:50100 --meta-server 10.0.0.5:50110 \
+$Y mount --view alice --manager 10.0.0.5:50055 --roster-key-file /etc/grovefs/roster.key \
      --api-key '<id>:<secret>' -m /mnt/alice          # 或 export GROVEFS_API_KEY 不进 argv
 ```
 
@@ -1951,7 +1973,7 @@ The two key differences from token: ① **revocable per caller and closes live c
 
 ### 6.1 Sharing a view and per-caller differentiated permissions (view-bound / read-only key)
 
-**By default `--view` does not isolate uid**: any uid that does `mount --meta-server <addr> --view alice` lands on alice's same authoritative tree, seeing each other's writes. That is the out-of-the-box "many people share one view" form — metadata central, content central, real-time invalidation push guarantees convergence.
+**By default `--view` does not isolate uid**: any uid that does `mount --manager <mgr> --roster-key-file F --view alice` lands on alice's same authoritative tree, seeing each other's writes. That is the out-of-the-box "many people share one view" form — metadata central, content central, real-time invalidation push guarantees convergence.
 
 > To distinguish roles within the same shared tree (e.g. a read-only reviewer, or restricting a caller to only touching a certain view), mint each role a **view-bound / read-only API key**: `grovefs apikey create --for mount --view V [--ro]` — revocable, attributable, `--view` lets the key open only that one physical view (opening another is refused with `E_AUTH` at `M_OPEN`), `--ro` makes the server refuse per write-intent op (details §3.5.1).
 
@@ -1973,7 +1995,7 @@ The overall logic flow (the isolation unit = the view name, not the client):
 └──┬──────────────────────────────────
    ▼ view=alice                        ▼ view=bob
   alice 权威树（A、B 共享，写串行化）    bob 权威树（仅 C，与 alice 互不可见）
-   ├─ SQLite（默认）：       一 view = 一个独立 db 文件  <meta-dir>/meta/alice.db · bob.db
+   ├─ SQLite（默认）：       一 view = 一棵独立树目录  <meta-dir>/meta/alice/alice.db · bob/bob.db
    └─ PostgreSQL（--meta-store）：一 view = 一个独立 schema   grovefs_v_616c696365 · grovefs_v_626f62
 ```
 
@@ -1991,7 +2013,7 @@ The uid a client reports defaults to `geteuid()`, overridable explicitly with `m
 # Both servers use the SAME K; the client mounts normally, the capability flows between the handshakes
 $Y meta-server --meta-dir /data/cluster --listen 0.0.0.0:50110 --token s3cr3t --data-access-key "$K"
 $Y data-server --listen 0.0.0.0:50100 --data-dir /data/cluster --token s3cr3t --data-access-key "$K"
-$Y mount --view alice --data-servers 10.0.0.5:50100 --meta-server 10.0.0.5:50110 --token s3cr3t -m /mnt/alice
+$Y mount --view alice --manager 10.0.0.5:50055 --roster-key-file /etc/grovefs/roster.key --token s3cr3t -m /mnt/alice
 ```
 
 Flow: every time `meta-server` accepts an `M_OPEN`, it signs a capability string with K (`<expiry>.<hex(HMAC-SHA256_K(expiry))>`) into the tail of the ack; the client (`RemoteMeta`) stores it, `mount` forwards it to the data plane, and the client (`RemoteBackend`) replays it on every `OP_OPEN` to `data-server`; a `data-server` with `--data-access-key` verifies it under the same K and refuses an `OP_OPEN` without a valid capability with `EACCES`. A **rogue meta does not have K**, so it cannot sign a valid capability — its mounts, even holding the correct token, cannot open the honest data-server. That is the link that gets closed.
@@ -2004,13 +2026,13 @@ Flow: every time `meta-server` accepts an `M_OPEN`, it signs a capability string
 
 ### 6.2 PostgreSQL metadata backend (optional)
 
-`meta-server` stores the authoritative view tree in embedded SQLite by default (one `<meta-dir>/meta/<view>.db` per view); you can switch it to PostgreSQL:
+`meta-server` stores the authoritative view tree in embedded SQLite by default (one `<meta-dir>/meta/<view>/<view>.db` per view); you can switch it to PostgreSQL:
 
 ```bash
 $Y meta-server --meta-store postgres://user:pw@10.0.0.9:5432/grovefs --listen 0.0.0.0:50110   # under PG no --meta-dir is needed: trees and control plane live in the database
 ```
 
-The client mount command is exactly the same (`--meta-server host:port --view alice`), the wire protocol unchanged. Internally the server maps each view to a `grovefs_v_<hex(view)>` schema (hex guarantees identifier safety, injection-agnostic), the root node fixed at id=1, `ROOT_INO` consistent with SQLite behavior. Table creation is idempotent `CREATE ... IF NOT EXISTS`, no pre-migration script needed. Ops needing multi-statement atomicity (rename/unlink/lock) go through explicit transactions.
+The client mount command only swaps its bootstrap (`--manager host:port --roster-key-file F`), the wire protocol unchanged. Internally the server maps each view to a `grovefs_v_<hex(view)>` schema (hex guarantees identifier safety, injection-agnostic), the root node fixed at id=1, `ROOT_INO` consistent with SQLite behavior. Table creation is idempotent `CREATE ... IF NOT EXISTS`, no pre-migration script needed. Ops needing multi-statement atomicity (rename/unlink/lock) go through explicit transactions.
 
 **Notes**:
 - **Incompatible with the in-house HA**: `--meta-store postgres://…` + any `--role standby` / `--peer` / `--witness` fail-fast at startup (the `VACUUM INTO` snapshot mechanism applies only to SQLite). Leave PG high availability to **PostgreSQL's own streaming replication / logical replication / PITR** — stronger than file snapshots anyway.
@@ -2077,7 +2099,7 @@ The client mount command is exactly the same (`--meta-server host:port --view al
 ## 7. Read-only mount
 
 ```bash
-$Y mount --view alice --mountpoint /mnt/alice_ro --meta-server 127.0.0.1:50053 --data-servers 127.0.0.1:50100 --ro
+$Y mount --view alice --mountpoint /mnt/alice_ro --manager 127.0.0.1:50055 --roster-key-file ~/roster.key --ro
 ```
 Every write operation (create/write/mkdir/unlink/rename/chmod/truncate, etc.) returns `EROFS` (a double guard of kernel `MS_RDONLY` plus a filesystem-side check). Suited to distribution/archive views.
 
@@ -2110,11 +2132,11 @@ Adding `--stats` at mount time enables **per-stage latency telemetry**: it recor
 
 ```bash
 # 卸载时把汇总报告打到 stderr(挂载进程 stderr)
-$Y mount --view alice -m /mnt/alice --meta-server 127.0.0.1:50053 --data-servers 127.0.0.1:50100 --stats
+$Y mount --view alice -m /mnt/alice --manager 127.0.0.1:50055 --roster-key-file ~/roster.key --stats
 # 额外周期性 + 退出时原子落盘到文件(CI/长时间采样)
-$Y mount --view alice -m /mnt/alice --meta-server 127.0.0.1:50053 --data-servers 127.0.0.1:50100 --stats --stats-file /var/log/grovefs.stats --stats-interval 10
+$Y mount --view alice -m /mnt/alice --manager 127.0.0.1:50055 --roster-key-file ~/roster.key --stats --stats-file /var/log/grovefs.stats --stats-interval 10
 # 或不改命令行,用环境开关(GROVEFS_STATS=1)
-GROVEFS_STATS=1 $Y mount --view alice -m /mnt/alice --meta-server 127.0.0.1:50053 --data-servers 127.0.0.1:50100
+GROVEFS_STATS=1 $Y mount --view alice -m /mnt/alice --manager 127.0.0.1:50055 --roster-key-file ~/roster.key
 ```
 
 - `--stats`: enable telemetry (prints the report on exit; also writes a copy to disk if `--stats-file` is given).
@@ -2164,10 +2186,10 @@ Find the bottleneck first, then turn a knob; **turn only one knob at a time**, c
 | --- | --- | --- |
 | Application layer (the mount process itself) | `--threads N` (default 4, each worker a separate `/dev/fuse` fd), `--stats`/`--stats-interval` (pure observation, zero overhead), `--log-file` | Changes GroveFS's own concurrency and observability |
 | FUSE negotiation layer (clamped by the kernel) | `max_write`/`readahead`, `--cache-ttl`, `--no-cache` | The cap is set by the kernel's `FUSE_MAX_MAX_PAGES`: an old kernel (e.g. 5.4) requesting 4MiB naturally degrades, not a bug |
-| Backend capability layer (server config) | `--data-servers A1,A2[,A3…]` node distribution, ≥`--stripe-bytes` (default 16MiB) auto-striping, `--meta-store postgres://…` | Changes capacity and parallelism (§5.2, §6.2) |
+| Backend capability layer (server config) | `manager define --data A1,A2[,A3…]` declares the full stripe-member set, ≥`--stripe-bytes` (default 16MiB) auto-striping, `--meta-store postgres://…` | Changes capacity and parallelism (§5.2, §6.2) |
 | Structural (code change) | swap the `MetaProvider`/`StorageBackend` implementation (§16.1) | Only reach here when the layers above aren't enough |
 
-**Minimum loop**: ① locate the symptom — mount with `--stats`, run a real workload, read the report: `[io]` for the backend_total/pool_wait share, `[meta]` for each op's p50/p99 and ops/s, `[counters]` for parallel-slice and readdir-prefetch counts; ② judge the bottleneck — backend_total/pool_wait dominating = network RTT or the backend; `meta.create` p50 high and ops/s not rising = SQLite single-writer serialization; a high `dup>0` share = kernel cache not being hit (consider `--cache-ttl`); ③ turn only one knob, restart the mount to take effect (remote mount: systemd `daemon-reload` + restart; local mount: just change env/config); ④ compare two windows, gain claims based on same-machine same-workload measurement — everything given in the manual is a floor line, not a gain number.
+**Minimum loop**: ① locate the symptom — mount with `--stats`, run a real workload, read the report: `[io]` for the backend_total/pool_wait share, `[meta]` for each op's p50/p99 and ops/s, `[counters]` for parallel-slice and readdir-prefetch counts; ② judge the bottleneck — backend_total/pool_wait dominating = network RTT or the backend; `meta.create` p50 high and ops/s not rising = SQLite single-writer serialization; a high `dup>0` share = kernel cache not being hit (consider `--cache-ttl`); ③ turn only one knob, restart to take effect (for a systemd unit: `daemon-reload` + restart the mount's or the server's own unit; a client-side env only needs a remount); ④ compare two windows, gain claims based on same-machine same-workload measurement — everything given in the manual is a floor line, not a gain number.
 
 **Existing measured floors (local loopback; must re-measure across machines)**: large-block read/write adds only ~50–70µs per op from FUSE itself (§8.2); under background WAL checkpoint, `lookup` p50 17µs, `getattr` p50 36µs (§10); the remote-link bottleneck is network RTT and must be measured separately with `bench_remote.sh`. A number below the floor means you're not measuring the mechanism itself — before cross-machine comparison, first run `dd` on an ext4 baseline to subtract the disk's own floor.
 
@@ -2246,7 +2268,7 @@ The matrix's conclusion (also the answer to "is completeness met") — 20 rows, 
 | native HA (`--role standby`) | OK | REFUSED |
 | `view rm --base` (tear down the tree with its bytes) | OK | OK |
 
-The two `apikey`/`audit` rows' "OK" are **the same two commands, two destinations**: SQLite writes `<meta-dir>/meta/api_keys.db`, PG writes the `grovefs_control` schema; the `du`/`dumiss` trees likewise come from these two places (bytes uniformly asked of the data-server).
+The two `apikey`/`audit` rows' "OK" are **the same two commands, two destinations**: SQLite writes `<meta-dir>/meta/_control/api_keys.db`, PG writes the `grovefs_control` schema; the `du`/`dumiss` trees likewise come from these two places (bytes uniformly asked of the data-server).
 
 > **This table answers "can it run", not "how to write it"**: the command shapes for the same task across the two tiers, and the three things only one tier can do, see §4.1.3; why to pick a given tier (write throughput / availability / scale) see §4.1.1.
 
@@ -2302,7 +2324,7 @@ This tutorial's topology (the most common form: a single center node + multiple 
 | Node | Role | Directory/port |
 | --- | --- | --- |
 | center `10.0.0.5` | `data-server` | data root `/data/cluster/blocks`, listening `0.0.0.0:50100` |
-| center `10.0.0.5` | `meta-server` | `--meta-dir /data/cluster` (authoritative views at `/data/cluster/meta/<view>.db`), listening `0.0.0.0:50110` |
+| center `10.0.0.5` | `meta-server` | `--meta-dir /data/cluster` (authoritative views at `/data/cluster/meta/<view>/<view>.db`), listening `0.0.0.0:50110` |
 | client `10.0.0.21…` | `mount` | a remote mount **needs no `--home`** (writes nothing locally), mountpoint `/mnt/<view>` |
 
 The two servers' `--listen` defaults are `127.0.0.1` (data 50052 / meta 50053); **production must explicitly give `0.0.0.0:<port>`**, otherwise clients can't connect.
@@ -2395,6 +2417,32 @@ ssh -L 8787:127.0.0.1:8787 10.0.0.5          # then open http://127.0.0.1:8787/ 
 
 Both secrets are root-owned 0600: `web-owner.pw` is read once and only while the accounts table is **empty** (editing that file afterwards changes no password — `grovefs web account passwd` is the verb that changes one), and `control.key` is the gateway's governance credential (revoking it takes the whole console dark, while mounts and every other CLI path keep working). Open the governance port to the **intranet** only per §11.6 — or keep it on `127.0.0.1` and run the proxy and the gateway on the same host; the full reverse-proxy + TLS units and nginx config are in `docs/deploy.html`.
 
+
+The topology can also carry a third resident daemon, the **mount-bootstrap manager** (§4.2): consulted once at mount time, never on any IO path; `join.key` and `roster.key` are minted on first `serve` under `<state-dir>/manager/` (0600) — the former is handed to servers' `--register-with`, the latter to clients' `mount --manager` to verify the roster. Its outage never moves a live mount; it only makes NEW mounts fail-closed:
+
+```ini
+# /etc/systemd/system/grove-manager.service
+[Unit]
+Description=GroveFS manager (mount bootstrap)
+After=local-fs.target
+[Service]
+ExecStart=/usr/local/bin/grovefs manager --state-dir /srv/mgr serve --listen 0.0.0.0:50055
+Restart=on-failure
+RestartSec=2
+[Install]
+WantedBy=multi-user.target
+```
+To attach the bootstrap, append a stanza to each of the two ExecStart lines above — registration is a status report only; a server that cannot reach the manager keeps serving and retries with backoff (§4.2):
+
+```text
+# appended to the data-server ExecStart:
+  --member-id 0 --register-with 10.0.0.9:50055 --advertise-addr 10.0.0.5:50100 \
+  --join-key-file /etc/grovefs/join.key --deployment prod
+# appended to the meta-server ExecStart:
+  --member-id 1 --register-with 10.0.0.9:50055 --advertise-addr 10.0.0.5:50110 \
+  --join-key-file /etc/grovefs/join.key --deployment prod
+```
+
 ### 11.5 Clients: hand mounting to systemd too (template instance, one per view)
 
 The mount unit carries `--foreground` to keep the process attached (`Type=exec` must watch the service process itself, so it can't be allowed to background-and-exit); a built-in SIGTERM handler means `systemctl stop` automatically does a clean `fusermount -u`, leaving no dead mount.
@@ -2410,7 +2458,8 @@ Wants=network-online.target
 EnvironmentFile=/etc/grovefs/grovefs.env
 # 上次异常退出可能留个死挂载,先清掉(- 表示失败也继续)
 ExecStartPre=-/usr/bin/fusermount -u /mnt/%i
-ExecStart=/usr/local/bin/grovefs mount --view %i --foreground --data-servers 10.0.0.5:50100 --meta-server 10.0.0.5:50110 --token ${GROVE_TOKEN} -m /mnt/%i
+# Mount coordinates resolve ONLY from the manager (§4.2); there are no hand-typed --meta-server/--data-servers on the ExecStart below:
+ExecStart=/usr/local/bin/grovefs mount --view %i --foreground --manager 10.0.0.5:50055 --roster-key-file /etc/grovefs/roster.key --token ${GROVE_TOKEN} -m /mnt/%i
 Restart=on-failure
 RestartSec=2
 
@@ -2485,15 +2534,16 @@ All passing means the deployment is complete. To run the full regression see §1
 
 ### 11.8 HA primary/standby topology (modified from §11.4)
 
-Key point: the two meta-servers use **their own separate `--meta-dir`s** (snapshot replication, not a shared disk! It's `blocks/` that's shared, clients' `--data-servers` always points at the same set of data-servers):
+Key point: the two meta-servers use **their own separate `--meta-dir`s** (snapshot replication, not a shared disk! It's `blocks/` that's shared — the data address resolved from the roster never changes during failover, it always points at the same set of data-servers):
 
 ```bash
 # nodeA(10.0.0.5):primary
 $Y meta-server --meta-dir /data/nodeA --listen 10.0.0.5:50110 --role primary --peer 10.0.0.6:50111 --token $TOK
 # nodeB(10.0.0.6):standby(同样写成 systemd unit,只改 --meta-dir/--listen/--role/--peer)
 $Y meta-server --meta-dir /data/nodeB --listen 10.0.0.6:50111 --role standby --peer 10.0.0.5:50110 --token $TOK
-# 客户端把故障转移列表写进 --meta-server:
-$Y mount --view alice --meta-server 10.0.0.5:50110,10.0.0.6:50111 --data-servers 10.0.0.5:50100 --token $TOK -m /mnt/alice
+# the manager declares the ORDERED failover list (§4.2); a client points only at the manager:
+$Y --home /srv/mgr manager define --meta 10.0.0.5:50110,10.0.0.6:50111 --data 10.0.0.5:50100
+$Y mount --view alice --manager 10.0.0.5:50055 --roster-key-file /etc/grovefs/roster.key --token $TOK -m /mnt/alice
 ```
 
 Preventing double-writes needs a third-party arbitrator: write **3 (odd number) data-servers** into the `--witness` list, and these data-servers should be deployed **on the same nodes** as the content disks clients actually write to (the data-plane gate only takes effect on data-servers in the list, see §5.5). Acceptance:
@@ -2556,7 +2606,7 @@ Log keyword → meaning → action (strings per the source print statements):
 | `meta-server: evicted N idle engine(s) (>Xs idle, no sessions)` | idle-engine reclamation (`--engine-idle-secs`, §6.2): N views with no mount session and quiet past the threshold released their engines (PG connections / file handles) | Normal reclamation noise, no action; to keep a view hot, shorten the threshold or confirm sessions are gone; `0` disables eviction (resident model) |
 | `meta HA: promotion refused/deferred` | promotion denied (peer holds a higher token or the predecessor lease is still alive) | Normal: never two primaries; if both nodes refuse to promote, check the witness majority |
 | `invalidation listener stopped: token rejected` | the client invalidation-push channel was rejected by token (the center token changed) | Restart the affected grove-mount@ instance with the new token |
-| `meta-server: metadata backend sqlite — one db file per view under <base>/meta/` | the server reads local SQLite trees: one `<meta-dir>/meta/<view>.db` per view, `--meta-dir` is both the config directory and the trees' landing spot | Normal. When hunting "where did my tree go", read this line first: it says `one db file per view`, so the `.db` files belong under the local `meta/` |
+| `meta-server: metadata backend sqlite — one db file per view under <base>/meta/` | the server reads local SQLite trees: one `<meta-dir>/meta/<view>/<view>.db` per view, `--meta-dir` is both the config directory and the trees' landing spot | Normal. When hunting "where did my tree go", read this line first: it says `one db file per view`, so the `.db` files belong under the local `meta/` |
 | `meta-server: metadata backend postgres — one schema per view in PostgreSQL; <base> holds no trees` | tree and control plane are both in the database (`grovefs_v_<hex>` schemas + `grovefs_control`), `--meta-dir` keeps only logs and scratch (§6.2) | Normal. If this line appears yet you are still looking for `.db` under `meta/`, what you are reading is a pre-migration copy (§4.1); confirm the in-database landing spot with the inspection SQL of §15.6 |
 
 ### 12.2 Logs and observability
@@ -2577,12 +2627,12 @@ What to back up (each item complements the others):
 | Item | Location | Method |
 | --- | --- | --- |
 | Data objects | `blocks/` under the data-server `--data-dir` | A plain directory, back up directly with `rsync -a`/filesystem snapshot; if you ever used `grovefs import` (§3.3), some objects are hardlinks shared with the source directory — use `rsync -a -H` or `cp -a` to preserve the links and avoid doubling content, and the source directory itself should be in the same backup |
-| Authoritative views | `<meta-dir>/meta/<view>.db` (incl. WAL) | See the three flows below; **don't bare-copy under write activity** |
-| Cross-view ledger | `<meta-dir>/meta/refs.db` | Copy with `meta/`; after loss/replacement recompute from the existing views via `grovefs refs --meta-dir D rebuild` (only ever overestimates, never wrongly deletes) |
-| API key registry | SQLite: `<meta-dir>/meta/api_keys.db` (incl. WAL); PG: `grovefs_control.api_keys`/`mcp_calls` | SQLite as above, cold copy; PG goes into the DB with `pg_dump`; none has a separate file to back up |
+| Authoritative views | `<meta-dir>/meta/<view>/<view>.db` (incl. WAL) | See the three flows below; **don't bare-copy under write activity** |
+| Cross-view ledger | `<meta-dir>/meta/_control/refs.db` | Copy with `meta/`; after loss/replacement recompute from the existing views via `grovefs refs --meta-dir D rebuild` (only ever overestimates, never wrongly deletes) |
+| API key registry | SQLite: `<meta-dir>/meta/_control/api_keys.db` (incl. WAL); PG: `grovefs_control.api_keys`/`mcp_calls` | SQLite as above, cold copy; PG goes into the DB with `pg_dump`; none has a separate file to back up |
 | View definitions (derived/alias) | SQLite: `<meta-dir>/meta/views/*.layout`; PG: `grovefs_control.view_defs` | SQLite plain text files, must be copied along (HA standbys also need manual sync, §3.2/§3.4); PG replicates with the DB, no manual sync needed |
 | token | `/etc/grovefs/grovefs.env` | Store separately, encrypted (lost = no client can mount) |
-| API key registry and audit | SQLite: `<meta-dir>/meta/api_keys.db` (incl. `-wal`; exists only after `apikey create`) / PG: `grovefs_control.api_keys`+`mcp_calls` (via `pg_dump`) | SQLite **cold-copy** with `meta/` (stop writes first); with `--require-api-key` enabled it is the sole admission basis — losing it = no key authenticates, historical audit gaps. **Never delete `-wal` alone** (it also deletes not-yet-checkpointed key rows and audit rows); in a split-disk deployment `data-server --meta-dir` must point at the metadata root holding this DB (it doesn't copy, only reads that one), a wrong target fails closed; on PG deployments just give `data-server` the same `--meta-store` URI, no local DB to point at |
+| API key registry and audit | SQLite: `<meta-dir>/meta/_control/api_keys.db` (incl. `-wal`; exists only after `apikey create`) / PG: `grovefs_control.api_keys`+`mcp_calls` (via `pg_dump`) | SQLite **cold-copy** with `meta/` (stop writes first); with `--require-api-key` enabled it is the sole admission basis — losing it = no key authenticates, historical audit gaps. **Never delete `-wal` alone** (it also deletes not-yet-checkpointed key rows and audit rows); in a split-disk deployment `data-server --meta-dir` must point at the metadata root holding this DB (it doesn't copy, only reads that one), a wrong target fails closed; on PG deployments just give `data-server` the same `--meta-store` URI, no local DB to point at |
 
 **One storage machine (the metadata root and the data root are the same directory)**: first `umount` to stop writes, stop `meta-server` and `data-server`, then `cp -a`/`rsync` the whole storage root. Restore: copy back into place → start the two services → clients remount → `ls`/`cat` spot-check. The binary itself isn't in the backup scope — just reinstall `grovefs`, the data and the metadata are all inside that one root. **A split deployment must be copied twice**: the two roots are the products of two independent commands (`meta-server --meta-dir` and `data-server --data-dir`), and copying only one of them cannot be restored — `meta/` holds no bytes, `blocks/` holds no names.
 
@@ -2597,6 +2647,8 @@ What to back up (each item complements the others):
 **Migrating to a new machine / switching OS**: metadata isn't bound to hardware (stores only object keys, paths are a pure function of keys), a whole-directory cold copy works as-is; for selective per-view migration use `view export/import` (details in §3.4.2). Three topology boundaries: the multi-disk `--data-dir` count/order must match (an equal-size clone swapped in place is fine, add/remove/reorder remaps; or merge into a single root); striping `s<N>:` must keep the N data-servers and their order; a whole-directory copy carries the HA `epoch` over, the old primary must be stopped first. PG backend uses `pg_dump`/logical replication.
 
 ### 12.4 Upgrade and rolling changes
+
+**First, check whether the metadata layout changed generation**: while a storage root is still in the v1 flat shape (`team.db`/`refs.db` lying flat under `meta/`), every command that has to read a view tree refuses and names the migration verb — **there is deliberately no dual-read transition** (the reason lives in §4's "the directory name is the type": under the v2 enumerator a v1 store looks like an empty shop, so the ledger books zero holders and `gc --apply` reclaims the whole store's bytes). Inspect the shape with `grovefs layout --meta-dir D show`, the plan with `grovefs layout --meta-dir D migrate --dry-run`, and migrate with `grovefs layout --meta-dir D migrate`. Migration requires no live mount on that storage root and no grovefs process on this machine (two silent gates); it checkpoints each file's WAL first, then moves it into `meta/<view>/<view>.db` and `meta/_control/`; the ledger books content keys, not paths, so it is **not** rewritten. Verify with `show` afterwards (v2), then start the meta-server. The HA standby — and every host that receives `meta/views/` by hand — must migrate **on its own**.
 
 Client binary upgrade (interrupt-free on one machine): `systemctl stop grove-mount@alice` → replace `/usr/local/bin/grovefs` → `start`. (stop unmounts cleanly; directly killing the binary won't do — a dead mount must be cleared by hand with `fusermount -u`.)
 
@@ -2628,8 +2680,9 @@ HA topology rolling upgrade (writes uninterrupted, except the instant of switcho
 | After a data-server restart, client IO stalls a moment then recovers | No action needed | Reconnect with bounded backoff after the connection pool is wholly dropped (resilience proves it) |
 | A non-root user can't see the mountpoint / `allow_other` doesn't take effect | Check `user_allow_other` in `/etc/fuse.conf`; check the fusermount SUID bit | A FUSE convention limit, unrelated to GroveFS |
 | `--meta-store postgres://…` plus `--peer` exits immediately on startup | Remove the HA parameters | PG being mutually exclusive with in-house snapshot HA is a design decision (§6.2); use PG streaming replication for HA |
-| No stripe chunks seen for large files | Confirm the file is ≥16MiB and `--data-servers` gave a comma-separated multi-address list | Small files naturally land only in chunk0, by design not a bug |
+| No stripe chunks seen for large files | Confirm the file is ≥16MiB and the manager declared a multi-address data list (`manager define --data A,A2`) | Small files naturally land only in chunk0, by design not a bug |
 | Mountpoint disk full | First enlarge the disk holding `blocks/`; afterward use §12.6's three criteria to check "workload volume or unreclaimed bytes" | Capacity governance has no magic: objects only add/delete without compression, long-term rely on `du` slope + physical/logical ratio |
+| Any command that has to read a view tree reports `still uses the flat pre-v2 metadata layout` | `grovefs layout --meta-dir D show` for the shape, `grovefs layout --meta-dir D migrate` to migrate | The old storage root is still v1 flat and no command reads it (§12.4); stop the mounts on that storage and the grovefs processes on this machine before migrating |
 
 ### 12.6 Honest words on capacity and reclamation
 
@@ -2665,7 +2718,7 @@ HA topology rolling upgrade (writes uninterrupted, except the instant of switcho
   When the byte source can't be determined, `du` refuses to output a number rather than emitting a version of 0: `--data-servers` > `--data-dir` > metadata root; if the tree comes from meta/PG and neither address is given it errors; when the address-list count doesn't match the object `s<N>` layout's number of servers (incl. a tree with both pre- and post-expansion generations) it reports by direction which addresses to give, and a matching count but **reversed order** also errors without a number (otherwise the whole tree would be measured as a pile of 0s). **Only confirmed-missing objects** count into `warning: N of M object(s) are not in the data source and count as 0 bytes`; timeouts, refused connections, read failures all error without a number, because bytes with no answer aren't 0 bytes.
 
   ③ **a ratio > 1 has only two causes**: something that should have been deleted wasn't (go confirm in the view that the file was truly unlinked), or bytes shared by import/fork are still held by another view (`grovefs view --meta-dir D list` to see who else references it, only physical reclamation when it reaches zero, §5.3).
-- The most common third case is actually an accident: **bypassing the mount to `rm meta/<view>.db` directly doesn't trigger a backend delete**, objects stay forever in `blocks/` (the reference ledger only overestimates, never wrongly deletes, so it only takes space, loses no data); the reclaim ledger can be reset with `grovefs refs --meta-dir D rebuild`. After resetting, run `grovefs gc --meta-dir D` again and these pages change from `ledger-held` to orphans, only then does `--apply` reclaim them; without rebuilding, `gc` conservatively never deletes.
+- The most common third case is actually an accident: **bypassing the mount to `rm meta/<view>/<view>.db` directly doesn't trigger a backend delete**, objects stay forever in `blocks/` (the reference ledger only overestimates, never wrongly deletes, so it only takes space, loses no data); the reclaim ledger can be reset with `grovefs refs --meta-dir D rebuild`. After resetting, run `grovefs gc --meta-dir D` again and these pages change from `ledger-held` to orphans, only then does `--apply` reclaim them; without rebuilding, `gc` conservatively never deletes.
 - SQLite view-DB reclamation is handled inside the engine (lock-table transaction reclamation, hardlink refcount GC); in PG mode it's handed to VACUUM.
 
 **When objects are lost / the data source is wrong, which commands speak up** (ops quick reference; full output and causes in docs.html §11.5):
@@ -2707,7 +2760,7 @@ GREEN verdict: all suites PASS (`pg` auto-SKIPs on a host without PG, not loweri
 >                      存储服务器 192.168.1.10
 >         ┌───────────────────────────────────┐
 >         │ data-server :50100   字节存 /data/blocks/       │
->         │ meta-server :50110   权威树存 /data/meta/*.db  │
+>         │ meta-server :50110   权威树存 /data/meta/<view>/   │
 >         │          (默认 embedded SQLite3,无需安装任何数据库)    │
 >         └─────────┬─────────────────┬────────┘
 >             ▲ 读写                   ▲ 只读
@@ -2724,7 +2777,7 @@ GroveFS's metadata engine **is SQLite by default**, and it **compiles SQLite's s
 
 - You **don't need** to install the `sqlite3` command-line tool or any database software on 192.168.1.10;
 - **Don't** pass `--meta-store postgres://…` to `meta-server` (only then does it switch to PG) — not passing it = the SQLite this case wants;
-- The authoritative tree's physical form is just a plain file `/data/meta/share.db` (+ same-named `-wal`/`-shm` companion files, normal for WAL mode);
+- The authoritative tree's physical form is just a plain file `/data/meta/share/share.db` (+ same-named `-wal`/`-shm` companion files, normal for WAL mode);
 - **Don't** use the sqlite3 CLI to open/copy this file under write activity (it collides with a WAL checkpoint); to inspect content, stop writes first, backup flow in §12.3.
 
 ### 13.1 Step one: install the same binary on all three machines
@@ -2758,11 +2811,12 @@ cat /etc/grovefs/grovefs.env                    # 记下这串 token,下一步 s
 ```
 /data/
 ├─ blocks/            ← 文件的真实字节,一个文件=一个 UUID 命名的对象(或条带分块),按 key 哈希扇出在 256 个桶子目录里
-└─ meta/              ← 每个视图一个 SQLite 库
-   └─ share.db        ← 视图 share 的权威目录树(目录项、权限、data_ref 指针)
+└─ meta/              ← 一个视图一个目录
+   └─ share/          ← 视图 share 的树目录
+      └─ share.db     ← 它的权威目录树(目录项、权限、data_ref 指针)
 ```
 
-"Views (tree directories) separated from objects (bytes)" is GroveFS's fundamental design: the hierarchical tree applications see is stored in `meta/*.db`, the bytes are always in `blocks/`, the two linked by the `data_ref` pointers in directory entries. The token is the cluster admission passphrase: all three machines must carry the same one, and every later `--token` is taken from it.
+"Views (tree directories) separated from objects (bytes)" is GroveFS's fundamental design: the hierarchical tree applications see is stored in one `meta/<view>/<view>.db` per tree, the bytes are always in `blocks/`, the two linked by the `data_ref` pointers in directory entries. The token is the cluster admission passphrase: all three machines must carry the same one, and every later `--token` is taken from it.
 
 ```bash
 # 把同一份 env 分发到两台客户端(也可手工重复 13.2 生成后三处一致——用 scp 最保)
@@ -2785,7 +2839,7 @@ Per-parameter explanation — `data-server`:
 
 | Parameter | This case's value | Meaning |
 | --- | --- | --- |
-| `--listen` | `0.0.0.0:50100` | Listen address. **The default is `127.0.0.1:50052` (accepts only the local machine)** — to serve the two clients you must explicitly write `0.0.0.0`; the port number itself is your choice, clients just need `--data-servers` pointed correctly (50100/50110 are this document's conventional values) |
+| `--listen` | `0.0.0.0:50100` | Listen address. **The default is `127.0.0.1:50052` (accepts only the local machine)** — to serve the two clients you must explicitly write `0.0.0.0`; the port number itself is your choice, the manager just has to declare it and the client picks it up from the roster (50100/50110 are this document's conventional values) |
 | `--data-dir` | `/data` | Data base directory: the service auto-creates `blocks/` and 256 buckets under it, file bytes stored by UUID as key in `blocks/<2hex>/<key>`. **A comma-separated multi-path list is allowed (`/data,/mnt/d2,...`) = automatic placement across several in-machine disks**: each whole object picks one disk by a hash of its key (the client and `data_ref` are entirely unaware, statfs auto-aggregates capacity). But the root list must be **fixed** for a given store — placement is hash mod number-of-roots, neither the list nor the object records a disk ordinal, so a failed disk is **swapped in place** by an equal-size clone (same path, same position, same root count) and still locates; adding/removing disks or reordering `--data-dir` remaps every key and makes old objects unreachable under the new layout (the placement layer doesn't error, it silently ENOENTs); for expansion, provision multiple roots at once, or merge disks at the OS layer with LVM/mdadm and mount a single-path `--data-dir`. The server only knows this layout, a wrong base directory = data "lost" (really just not looked for) |
 | `--token` | the string in grovefs.env | The data-plane handshake (`OP_OPEN`) passphrase. A client not carrying the same string → the connection gets `PermissionDenied`, no retry. Not giving it = LAN-trusted, no auth, only for a fully trusted intranet |
 | (optionally `--require-api-key`) | — | Turns data-plane admission into **revocable per-caller API keys** (client `mount --api-key`): only accepts live keys minted by `grovefs apikey create --for mount` (or `any`), logs each connect (incl. refusals) to audit, and revalidates live connections each second — a revoke breaks established connections and makes them self-unmount. Given alongside `--token`, both gates must pass; not given = behavior as before (just still auditing). The key-DB path is set by `--meta-dir <metadata root>`, **defaulting to the first `--data-dir`** (in a split-disk deployment you must point it right; pointing at a directory where no key was minted = admits none) |
@@ -2795,10 +2849,10 @@ Per-parameter explanation — `meta-server`:
 
 | Parameter | This case's value | Meaning |
 | --- | --- | --- |
-| `--meta-dir` | `/data` | **Metadata root** (subcommand parameter): view DBs land in `<meta-dir>/meta/` (i.e. `/data/meta/share.db`). Takes precedence over the global `--home` — the latter is the default root; when both are given `--meta-dir` wins |
+| `--meta-dir` | `/data` | **Metadata root** (subcommand parameter): view DBs land in `<meta-dir>/meta/` (i.e. `/data/meta/share/share.db`). Takes precedence over the global `--home` — the latter is the default root; when both are given `--meta-dir` wins |
 | `--listen` | `0.0.0.0:50110` | As above, the default `127.0.0.1:50053` accepts only the local machine; the metadata plane takes its own port, not crossing the data plane's 50100 |
 | `--token` | the same string | The metadata-plane handshake (`M_OPEN`) passphrase, validated independently of the data plane; recommended to use the same one for easier management |
-| (optionally `--require-api-key`) | — | The metadata plane admits by the API key in `M_OPEN` (`mount --api-key ID:SECRET`, or client env `GROVEFS_API_KEY`): it reads the same registry (SQLite: `<meta-dir>/meta/api_keys.db`; PG: `grovefs_control.api_keys`) — **the same registry** as `grovefs mcp --require-api-key` / `grovefs apikey --meta-dir`, separated into entrances by scope; a revoke closes established mounts within the first round-trip (the refusal reason is returned with the frame, the mount self-unmounts). Details in §6 / §3.5.1 |
+| (optionally `--require-api-key`) | — | The metadata plane admits by the API key in `M_OPEN` (`mount --api-key ID:SECRET`, or client env `GROVEFS_API_KEY`): it reads the same registry (SQLite: `<meta-dir>/meta/_control/api_keys.db`; PG: `grovefs_control.api_keys`) — **the same registry** as `grovefs mcp --require-api-key` / `grovefs apikey --meta-dir`, separated into entrances by scope; a revoke closes established mounts within the first round-trip (the refusal reason is returned with the frame, the mount self-unmounts). Details in §6 / §3.5.1 |
 | (optionally `--data-access-key HEX`) | — | On every accepted `M_OPEN`, mints a Data-Access Capability with this shared HMAC key (hex) into the tail of the ack for the client to replay on each `OP_OPEN` to `data-server`. **Must match the SAME value every `data-server --data-access-key` verifies with** — a client that mounted through THIS meta can therefore open the honest data-server; a rogue/foreign meta without the key cannot sign a valid capability, so its clients are refused. Not given = no capability minted, data admission gated by token/api-key only (unchanged behavior). See §6.1.1 |
 | (optionally `--data-access-ttl SECS`) | `0` | Lifetime (seconds) of the capability minted above; only meaningful with `--data-access-key`. `0` (default) = non-expiring, so a long-lived mount is not cut off mid-session across a data-server restart/reconnect; nonzero = each `M_OPEN` stamps `now+TTL`, tightening the replay window at the cost of a remount once it lapses |
 | (not passing `--meta-store`) | — | **This is "the database is sqlite3"** — not passing it means embedded SQLite, one `.db` per view; passing `postgres://…` is what switches to PG (and mutually exclusive with HA, see §11.9) |
@@ -2811,6 +2865,25 @@ ss -lntp | grep -E '50100|50110'      # 两行都在,进程名 grovefs
 ```
 
 The two foreground windows should each print a banner line — `data-server listening on 0.0.0.0:50100 (host <storage-hostname>, 1 data root(s): /data)` and `meta-server listening on 0.0.0.0:50110 (base /data, role Primary)`; the data line echoes the hostname and root list because nodes often share the same root path names — when reading logs, first confirm the host, then the path. For what the full terminal looks like, see §13.11 record ①.
+
+
+With mount bootstrap, add a third unit (§4.2; consulted once at mount time, never on the IO path — its outage leaves live mounts untouched and only makes new mounts fail-closed; `join.key`/`roster.key` are minted on first `serve` under `<state-dir>/manager/`, 0600):
+
+```ini
+# /etc/systemd/system/grove-manager.service
+[Unit]
+Description=GroveFS manager (mount bootstrap)
+After=local-fs.target
+[Service]
+ExecStart=/usr/local/bin/grovefs manager --state-dir /srv/mgr serve --listen 0.0.0.0:50055
+Restart=on-failure
+RestartSec=2
+[Install]
+WantedBy=multi-user.target
+```
+
+
+With mount bootstrap for this case: append `--member-id N --register-with 192.168.1.10:50055 --advertise-addr <this host IP:port> --join-key-file /etc/grovefs/join.key --deployment prod` to each of the two ExecStart lines above (servers keep serving when the manager is unreachable, §4.2); open one more firewall port 50055 reachable by the servers and any client that will mount — the meta/data planes themselves never depend on it.
 
 ### 13.4 Step four: make the storage services systemd-resident + firewall
 
@@ -2876,7 +2949,8 @@ Mount once by hand (`mount` backgrounds by default, returning only when the moun
 ```bash
 TOK=$(grep -o '=.*' /etc/grovefs/grovefs.env | cut -d= -f2)
 sudo grovefs mount --view share \
-     --data-servers 192.168.1.10:50100 --meta-server 192.168.1.10:50110 --token "$TOK" -m /mnt/da
+     --manager 192.168.1.10:50055 --roster-key-file /etc/grovefs/roster.key --token "$TOK" -m /mnt/da
+# Neither service coordinate is typed on the client — resolving the roster echoes the pair the manager declared (§4.2);
 # 看到 "grovefs: mounted view 'share' at /mnt/da (background pid …)" 即成功;另开窗口:
 echo hello-$(date +%s) | sudo tee /mnt/da/probe.txt && sudo ls -l /mnt/da
 # 验证完 sudo grovefs umount -m /mnt/da 卸载(后台进程随之退出),下一步换 systemd
@@ -2886,10 +2960,12 @@ Per-parameter explanation — `mount`:
 
 | Parameter | This case's value | Meaning |
 | --- | --- | --- |
-| `--home` (clients **need not pass it**) | — | A mount always needs both service coordinates (`--meta-server` + `--data-servers`, or the signed roster behind `--manager`) and lands no data locally, so this parameter is unrelated to both the data plane and the metadata plane; `--home` is only the default storage root of the node-side verbs (`view create`/`gc`/`import`/`apikey`/`du`) and of the two services themselves — commands that reach the metadata root each name it with `--meta-dir`, `--home` serving only as the fallback |
+| `--home` (clients **need not pass it**) | — | A mount lands no data locally, so this parameter is unrelated to both the data plane and the metadata plane — the two coordinates resolve ONLY from `--manager`'s signed roster (§4.2); `--home` is only the default storage root of the node-side verbs (`view create`/`gc`/`import`/`apikey`/`du`) and of the two services themselves — commands that reach the metadata root each name it with `--meta-dir`, `--home` serving only as the fallback |
 | `--view` | `share` | The tree-selection label: which authoritative view to mount. Unrelated to Linux usernames (§2); only A/B using the same name shares the same tree. `share` must first be created at the center via `grovefs view --meta-dir /data create --view share` (mounting without creating is refused) |
-| `--data-servers` | `192.168.1.10:50100` | Data-plane address: file bytes go over a custom TCP frame to this `data-server`, never touching the local disk (not NFS). Only a comma-separated multi-address list enables cross-machine striping; a single address means no striping |
-| `--meta-server` | `192.168.1.10:50110` | Metadata-plane address: the directory tree is served by the center `meta-server` — this is the root of "multiple machines sharing one tree"; it also subscribes to invalidation pushes (who wrote what, this machine re-fetches on next access immediately). A comma-separated list = a failover list (§11.8) |
+| `--manager` | `192.168.1.10:50055` | The mount-bootstrap address: the client's **only** hand-typed service coordinate, `mount` resolves the two planes below from its signed roster (§4.2); the hand-typed `--meta-server`/`--data-servers` flags were removed from `mount` |
+| `--roster-key-file` | `/etc/grovefs/roster.key` | The key (64-hex) that verifies the roster signature; without it the mount is refused — an unverified roster is "whoever answers wins" |
+| data address resolved from the roster | `192.168.1.10:50100` (declared by the manager) | Data-plane address: file bytes go over a custom TCP frame to this `data-server`, never touching the local disk (not NFS). Only a multi-address list in the roster enables cross-machine striping; a single address means no striping |
+| meta address resolved from the roster | `192.168.1.10:50110` (declared by the manager) | Metadata-plane address: the directory tree is served by the center `meta-server` — this is the root of "multiple machines sharing one tree"; it also subscribes to invalidation pushes (who wrote what, this machine re-fetches on next access immediately). The roster may carry an ORDERED failover list (§11.8) |
 | `--token` | the string in grovefs.env | Fed to both the data-plane `OP_OPEN` and metadata-plane `M_OPEN` handshakes; a mismatch = the mount command reports a permission error directly, fail-fast |
 | (optionally `--api-key`) | — | The per-caller credential `<id>:<secret>` presented when the server enabled `--require-api-key` (minted by `grovefs apikey create --for mount`); can also be exported as `GROVEFS_API_KEY` so the secret never enters argv. Missing/invalid/revoked/mcp-scope-only = the mount fails fast and prints the specific refusal reason; a revoked key closes the **in-use** mount (§6) |
 | `-m` / `--mountpoint` | `/mnt/da` | Mountpoint. **Note it's an option, must carry `-m`/`--mountpoint`, not written as a trailing positional argument** (measured: writing it bare errors `unexpected argument`). The directory is auto-created if it doesn't exist |
@@ -2908,7 +2984,7 @@ Wants=network-online.target
 [Service]
 EnvironmentFile=/etc/grovefs/grovefs.env
 ExecStartPre=-/usr/bin/fusermount -u /mnt/da      # 清掉上次异常退出可能留的死挂载;- 表示失败也继续
-ExecStart=/usr/local/bin/grovefs mount --view share --foreground --data-servers 192.168.1.10:50100 --meta-server 192.168.1.10:50110 --token ${GROVE_TOKEN} -m /mnt/da
+ExecStart=/usr/local/bin/grovefs mount --view share --foreground --manager 192.168.1.10:50055 --roster-key-file /etc/grovefs/roster.key --token ${GROVE_TOKEN} -m /mnt/da
 Restart=on-failure
 RestartSec=2
 [Install]
@@ -2930,7 +3006,7 @@ Nearly the same command as A, only two changes: `-m /mnt/db` and adding `--ro`:
 sudo mkdir -p /mnt/db
 TOK=$(grep -o '=.*' /etc/grovefs/grovefs.env | cut -d= -f2)
 sudo grovefs mount --view share \
-     --data-servers 192.168.1.10:50100 --meta-server 192.168.1.10:50110 --token "$TOK" --ro -m /mnt/db
+     --manager 192.168.1.10:50055 --roster-key-file /etc/grovefs/roster.key --token "$TOK" --ro -m /mnt/db
 ```
 
 | Parameter | This case's value | Meaning |
@@ -2949,7 +3025,7 @@ Wants=network-online.target
 [Service]
 EnvironmentFile=/etc/grovefs/grovefs.env
 ExecStartPre=-/usr/bin/fusermount -u /mnt/db
-ExecStart=/usr/local/bin/grovefs mount --view share --foreground --data-servers 192.168.1.10:50100 --meta-server 192.168.1.10:50110 --token ${GROVE_TOKEN} --ro -m /mnt/db
+ExecStart=/usr/local/bin/grovefs mount --view share --foreground --manager 192.168.1.10:50055 --roster-key-file /etc/grovefs/roster.key --token ${GROVE_TOKEN} --ro -m /mnt/db
 Restart=on-failure
 RestartSec=2
 
@@ -2991,10 +3067,10 @@ Then add `--require-api-key` to both meta-server and data-server, both clients' 
 # 服务端(存储机)两服务都开门:meta-server ... --require-api-key;data-server ... --require-api-key --meta-dir /data
 
 # 客户端 A 的 /etc/systemd/system/grove-mount.service 改成:
-ExecStart=/usr/local/bin/grovefs mount --view share --foreground --data-servers 192.168.1.10:50100 --meta-server 192.168.1.10:50110 --api-key ${GROVE_A_KEY} -m /mnt/da
+ExecStart=/usr/local/bin/grovefs mount --view share --foreground --manager 192.168.1.10:50055 --roster-key-file /etc/grovefs/roster.key --api-key ${GROVE_A_KEY} -m /mnt/da
 
 # 客户端 B 的改成(--ro key 已由服务端强制,客户端 --ro 可留作双保险):
-ExecStart=/usr/local/bin/grovefs mount --view share --foreground --data-servers 192.168.1.10:50100 --meta-server 192.168.1.10:50110 --api-key ${GROVE_B_KEY} --ro -m /mnt/db
+ExecStart=/usr/local/bin/grovefs mount --view share --foreground --manager 192.168.1.10:50055 --roster-key-file /etc/grovefs/roster.key --api-key ${GROVE_B_KEY} --ro -m /mnt/db
 ```
 
 ```bash
@@ -3023,6 +3099,8 @@ ssh 192.168.1.10 'find /data/blocks -type f | head; sqlite3 --version 2>/dev/nul
 ssh 192.168.1.10 'sudo systemctl restart grove-data-server'   # 之后回 A 继续读写,自动重连
 # ⑤ 干净卸载与重挂(A 机同理)
 ssh 192.168.1.12 'sudo systemctl stop grove-mount && findmnt -T /mnt/db | grep -q grovefs && echo 残留 || echo 已卸载'
+# ⑥ With mount bootstrap: grove-manager is active, and `grovefs manager status --server 192.168.1.10:50055 --deployment prod --join-key-file /etc/grovefs/join.key`
+#    lists EVERY member `define` declared (a roster is the declared set, not the healthy subset); from then on the two hand-typed coordinates can be replaced by --manager (see the §13.5 comment line). A manager outage only blocks NEW mounts; live mounts keep running.
 ```
 
 All green means the deployment is complete. Rollback is simple too: on both clients `systemctl stop grove-mount` → on the storage machine `systemctl disable --now grove-data-server grove-meta-server`; whatever is on the disk under `/data`, if not deleted, is a complete backup (§12.3), and to truly start over, just format the data disk (after confirming it's backed up).
@@ -3031,15 +3109,16 @@ Daily maintenance (inspection keywords/backup/upgrade/failure tables) all applie
 
 ### 13.9 Files and commands per machine, in one table (follow it, never flip back)
 
-**Files to create on the storage machine 192.168.1.10 (3 total):**
+**Files to create on the storage machine 192.168.1.10 (3 total; 4 with mount bootstrap):**
 
 | File | Which section has the content |
 | --- | --- |
 | `/etc/grovefs/grovefs.env` | generated by the third command in §13.2 |
 | `/etc/systemd/system/grove-data-server.service` | the full first ini block in §13.4 |
 | `/etc/systemd/system/grove-meta-server.service` | the full second ini block in §13.4 |
+| `/etc/systemd/system/grove-manager.service` | (optional) the mount-bootstrap block in §13.4 |
 
-Execution order (storage machine): `mkdir` (§13.2) → start both services by hand to verify (§13.3) → Ctrl-C → write the two units → `daemon-reload` + `enable --now` (§13.4) → the two firewall rules (§13.4). Optional hardening adds one step: the view-bound / read-only key, two commands (§13.7).
+Execution order (storage machine): `mkdir` (§13.2) → start both services by hand to verify (§13.3) → Ctrl-C → write the two units (plus grove-manager if you run mount bootstrap) → `daemon-reload` + `enable --now` (§13.4) → the two firewall rules (§13.4; one more for 50055 with bootstrap). Optional hardening adds one step: the view-bound / read-only key, two commands (§13.7).
 
 **Files each of client A 192.168.1.11 / client B 192.168.1.12 must create (2 each, both machines isomorphic):**
 
@@ -3056,10 +3135,12 @@ Execution order (each client): the three-piece pre-check + `mkdir /mnt/xx` (§13
 | --- | --- | --- |
 | storage | `grovefs data-server --listen 0.0.0.0:50100 --data-dir /data --token $TOK` | Byte-storage plane: `--listen` binds all interfaces, `--data-dir` base dir (auto-creates `blocks/` under it), `--token` the data-plane passphrase |
 | storage | `grovefs meta-server --meta-dir /data --listen 0.0.0.0:50110 --token $TOK` | Metadata plane (default SQLite): `--meta-dir` points at the metadata root (view DBs under its `meta/`), not passing `--meta-store` = SQLite, not passing `--role/--peer` = single node |
-| storage | `grovefs view --meta-dir /data create --view share` | Explicitly build the base view: `share` mounted without being created is refused at `M_OPEN`; the DB lands at `/data/meta/share.db` |
-| client A | `grovefs mount --view share --data-servers 192.168.1.10:50100 --meta-server 192.168.1.10:50110 --token $TOK --run-as-uid 1001 -m /mnt/da` | Read-write mount: `--view` selects the tree, `-m` is required and can't be a positional argument, not writing `--no-cache` keeps freshness via the default push |
+| storage | `grovefs view --meta-dir /data create --view share` | Explicitly build the base view: `share` mounted without being created is refused at `M_OPEN`; the DB lands at `/data/meta/share/share.db` |
+| client A | `grovefs mount --view share --manager 192.168.1.10:50055 --roster-key-file /etc/grovefs/roster.key --token $TOK --run-as-uid 1001 -m /mnt/da` | Read-write mount: `--view` selects the tree, `-m` is required and can't be a positional argument, not writing `--no-cache` keeps freshness via the default push |
 | client B | same as A, changed to `--ro --run-as-uid 1002 -m /mnt/db` | Read-only mount: `--ro` blocks the local normal write path; combined with a center `--ro` key for this client = server-side hard read-only |
-| storage | `grovefs apikey --meta-dir /data create --for mount --view share [--ro]` | View-bound / read-only key: the key can only open the `share` view (opening others is refused with `E_AUTH` at `M_OPEN`); `--ro` makes each write-intent op refused server-side (`E_NOTPERM`→`EPERM`), `revoke` immediate |
+| storage | `grovefs apikey --meta-dir /data create --for mount --view share [--ro]` | View-bound / read-only key: the key can only open the `share` view (opening others is refused with `E_AUTH` at `M_OPEN`); `--ro` makes each write-intent op refused server-side (`E_NOTPERM`→`EPERM`), `revoke` takes effect immediately |
+| storage | `grovefs manager --state-dir /srv/mgr define --name prod --meta 192.168.1.10:50110 --data 192.168.1.10:50100` (then `serve --listen 0.0.0.0:50055`) | Mount bootstrap (§4.2): `define` declares the authoritative topology (hot-reloaded by mtime), `serve` mints the join/roster keys and answers lookups — a roster comes back exactly as declared, never narrowed to a healthy subset |
+| client A/B | `grovefs mount --view share --manager 192.168.1.10:50055 --roster-key-file /etc/grovefs/roster.key --token $TOK -m /mnt/da` | A signed roster replaces the two hand-typed coordinates: one lookup at mount time, the manager proxies no traffic afterwards, so its later outage only makes NEW mounts fail-closed | View-bound / read-only key: the key can only open the `share` view (opening others is refused with `E_AUTH` at `M_OPEN`); `--ro` makes each write-intent op refused server-side (`E_NOTPERM`→`EPERM`), `revoke` immediate |
 
 ### 13.11 Full terminal transcript (real measured output, unchanged verbatim)
 
@@ -3087,7 +3168,7 @@ $ ls /tmp/grove_case/data/blocks | head -3     # 启动时已建好 256 个桶(�
 $ find /tmp/grove_case/data/blocks -type f | wc -l
 0                                                # 还没写文件,桶里没对象是对的
 $ ./grovefs view --meta-dir /tmp/grove_case/data create --view share
-created BASE view 'share' at /tmp/grove_case/data/meta/share.db
+created BASE view 'share' at /tmp/grove_case/data/meta/share/share.db
   deletes in a base view free the underlying object once no other view references it;
   reshape it with `view define` or publish it under a name with `view alias`.
 ```
@@ -3095,7 +3176,7 @@ created BASE view 'share' at /tmp/grove_case/data/meta/share.db
 **② Client A: read-write mount + write files**
 
 ```console
-$ ./grovefs mount --view share --data-servers 127.0.0.1:50100 --meta-server 127.0.0.1:50110 --token "$TOK" -m /tmp/grove_case/mnt_da
+$ ./grovefs mount --view share --manager 127.0.0.1:50055 --roster-key-file ~/roster.key --token "$TOK" -m /tmp/grove_case/mnt_da
 using remote metadata service at 127.0.0.1:50110
 using remote data service at 127.0.0.1:50100
 mounting view 'share' at /tmp/grove_case/mnt_da (fully remote: no local store)   # 远程挂载不需要 --home
@@ -3130,7 +3211,7 @@ share.db  share.db-shm  share.db-wal
 **③ Client B: read-only mount, can read, can't write**
 
 ```console
-$ ./grovefs mount --view share --data-servers 127.0.0.1:50100 --meta-server 127.0.0.1:50110 --token "$TOK" --ro -m /tmp/grove_case/mnt_db
+$ ./grovefs mount --view share --manager 127.0.0.1:50055 --roster-key-file ~/roster.key --token "$TOK" --ro -m /tmp/grove_case/mnt_db
 using remote metadata service at 127.0.0.1:50110
 using remote data service at 127.0.0.1:50100
 mounting view 'share' at /tmp/grove_case/mnt_db (fully remote: no local store, read-only)
@@ -3196,7 +3277,7 @@ B umount ok
 | Knob | What it stores | Where it can go |
 | --- | --- | --- |
 | `data-server --data-dir DIR` | Data base directory: on startup auto-creates `<root>/blocks/` and 256 buckets, bytes stored by key hash in `blocks/<2hex>/<key>`; a comma-separated multi-path list gives multi-disk automatic placement (each whole object picks a disk by key hash; the root list must be fixed, add/remove disks remaps every key) | Any path / any mountpoint, created if it doesn't exist |
-| `meta-server --meta-dir DIR` | Authoritative view tree `<meta-dir>/meta/<view>.db` (the control plane additionally has `api_keys.db`/`refs.db`; the SQLite-backend form, on the PG backend both go entirely into `grovefs_control`) | Any path, may be a different disk from the object disk |
+| `meta-server --meta-dir DIR` | Authoritative view tree `<meta-dir>/meta/<view>/<view>.db` (the control plane additionally has `meta/_control/`; the SQLite-backend form, on the PG backend both go entirely into `grovefs_control`) | Any path, may be a different disk from the object disk |
 
 Example of putting large data on a separate big disk (on 192.168.1.10 /data is only a small system disk, the object disk is separately mounted at /mnt/bigdisk):
 
@@ -3216,11 +3297,11 @@ sudo systemctl daemon-reload && sudo systemctl restart grove-data-server
 rsync -a /data/blocks/ /mnt/bigdisk/blocks/
 ```
 
-> **Exception — relocating striped files**: the stripe layout is self-describing in `data_ref` (`s<N>:<stripe>[:<fp>]:<uuid>`) — with `--member-id` configured, which machine chunk i lands on is decided by member **identity**, the list order can be anything, already-written striped files are still found; without it, it's decided by the **order** of the client `--data-servers` list (`servers[i%N]`), so if a multi-address list's order changes during migration, already-written striped files lose their chunks. In both modes the **server count** must stay consistent. A single-address `--data-dir` relocation has no such issue.
+> **Exception — relocating striped files**: the stripe layout is self-describing in `data_ref` (`s<N>:<stripe>[:<fp>]:<uuid>`) — with `--member-id` configured, which machine chunk i lands on is decided by member **identity**, the list order can be anything, already-written striped files are still found; without it, it's decided by the **order** of the data list resolved from the roster (i.e. the order listed in `manager define --data`, `servers[i%N]`), so if a multi-address list's order changes during migration, already-written striped files lose their chunks. In both modes the **server count** must stay consistent. A single-address `--data-dir` relocation has no such issue.
 
 **Multiple disks / capacity expansion**: two legitimate paths ① one data-server mounts several disks: `--data-dir /data,/mnt/d2,...` a comma-separated list of storage roots, whole objects auto-placed onto one of them by key hash, `df` (statfs) auto-aggregates total capacity — but the root list must be **fixed** for a given store (placement is hash mod number-of-roots, add/remove disks remaps every key and makes old objects unreachable under the new layout), so provision multiple roots at once; ② start several data-servers + client `--data-servers a,b,c` striping (only ≥16MiB is chunked, small files land on one server; only a bandwidth gain when the link is unsaturated, see the honest note in §5.2). You can also merge several disks into one filesystem at the OS layer with LVM/mdadm and mount a single-path `--data-dir`. There is no per-directory quota or storage tiering (unimplemented).
 
-> **Swapping a disk doesn't affect locating; only add/remove/reorder does**: the landing position is recomputed on the spot as a pure function of the key (hash mod number-of-roots), neither the `--data-dir` list nor the object records "which disk number". So a failed disk **swapped in place** by an equal-size clone (same path, same position in `--data-dir`, same root count) still locates data normally — the disk's content and its internal 256-bucket fan-out are all whole-object key-addressed copies, no index to rebuild. Conversely, once you **add, remove, or reorder `--data-dir`**, the modulus changes, every key remaps, old objects addressed under the new layout become unreachable; the placement layer does no remap guard, it only silently ENOENTs (cross-server striping refuses the mount outright and reports `refusing to remap` when the `--data-servers` count/order doesn't match). Operationally treat the `--data-dir` list as immutable config: equal-clone in-place swap is fine, in-place expansion/reorder is not, expansion goes via "full reload onto a new fixed layout".
+> **Swapping a disk doesn't affect locating; only add/remove/reorder does**: the landing position is recomputed on the spot as a pure function of the key (hash mod number-of-roots), neither the `--data-dir` list nor the object records "which disk number". So a failed disk **swapped in place** by an equal-size clone (same path, same position in `--data-dir`, same root count) still locates data normally — the disk's content and its internal 256-bucket fan-out are all whole-object key-addressed copies, no index to rebuild. Conversely, once you **add, remove, or reorder `--data-dir`**, the modulus changes, every key remaps, old objects addressed under the new layout become unreachable; the placement layer does no remap guard, it only silently ENOENTs (cross-server striping refuses the mount outright and reports `refusing to remap` when the resolved data list's count/order doesn't match). Operationally treat the `--data-dir` list as immutable config: equal-clone in-place swap is fine, in-place expansion/reorder is not, expansion goes via "full reload onto a new fixed layout".
 
 ### 14.2 How existing bulk data gets in: two legitimate paths, prefer zero-copy `grovefs import`
 
@@ -3237,12 +3318,12 @@ grovefs import --meta-dir /data/cluster --view legacy --source /data/legacy --pr
 ```bash
 # 在任一台已挂载的客户端(或存储机自己也挂一份)分批灌入
 rsync -a /srv/legacy/ /mnt/da/imported/           # 目录层级、权限随写自动成型
-# 单文件 ≥4MiB 自动分片并发写;配了多地址 --data-servers 且 ≥16MiB 自动条带,导入无需特殊调优
+# 单文件 ≥4MiB 自动分片并发写; the roster-resolved data list being multi-address plus ≥16MiB auto-stripes, import needs no special tuning
 # 导完抽验:中心对象目录在增长,视图树里能看到层级
 ls /data/blocks | head && find /mnt/da/imported -maxdepth 2 | head
 ```
 
-The trade-off between the two paths: import is zero-copy but imported objects are **single-file objects** (no striping), and it converges toward online mounts via TTL rather than event push; rsync pouring keeps an extra copy of bytes but newly-written large files can stripe, new files are immediately visible via push. Note (both are implementation facts, not boasting import speed): the throughput ceiling for FUSE writes is the frame link and the center disk; for TB-level bulk data, batch during off-peak; every million files grows `meta/<view>.db` correspondingly (one node row + directory entry per row), which is normal.
+The trade-off between the two paths: import is zero-copy but imported objects are **single-file objects** (no striping), and it converges toward online mounts via TTL rather than event push; rsync pouring keeps an extra copy of bytes but newly-written large files can stripe, new files are immediately visible via push. Note (both are implementation facts, not boasting import speed): the throughput ceiling for FUSE writes is the frame link and the center disk; for TB-level bulk data, batch during off-peak; every million files grows `meta/<view>/<view>.db` correspondingly (one node row + directory entry per row), which is normal.
 
 ### 14.3 Which mechanisms decide a client's "display method"
 
@@ -3253,7 +3334,7 @@ The trade-off between the two paths: import is zero-copy but imported objects ar
 | **`mount --layout` display lens (§3.1)** | One tree, each mountpoint does its own hide/only/map/link — partial display, path reorganization, bytes untouched, other mounts unaware | Customize the display shape without needing two copies of data |
 | **Server-side derived view (§3.2)** | The same lens rules **named and stored centrally on the server** (`meta/views/`), clients just `mount --view <derived name>`, same name same shape across machines, a read-only key can be assigned by name (§13.7); **a derived (virtual) view mount is always read-only** (write via the base name) | Team-shared display contract, no rule-file distribution; distribute a read-only shape |
 | **Server-side pure alias (§3.4)** | A public name maps 1:1 to a physical view (`alias <real name>`, no rules): the alias mount is **whole-tree writable**, the real name thereafter **is not a mount entry** (guessing it still can't mount in) | Name governance: public names rotate freely, storage identity not exposed (on leak, `--retire` rotates atomically in one command: old name retired, real name refused for mounting throughout); orthogonal and complementary to shape governance (derived) |
-| **Server-side fork view (§3.4.1)** | `view fork` copies a base view's directory entries into an **independent metadata tree** (preserving ino/hardlinks, zero byte copy): structure writable (mkdir/rename/mv/rm), content read-only (`EROFS`); deletion only removes this view's `meta/<name>.db`, the base view and bytes unaffected | An "organizational sandbox" free to reshape without hurting the base view; content still shares one copy, bytes not copied |
+| **Server-side fork view (§3.4.1)** | `view fork` copies a base view's directory entries into an **independent metadata tree** (preserving ino/hardlinks, zero byte copy): structure writable (mkdir/rename/mv/rm), content read-only (`EROFS`); deletion only removes this view's `meta/<name>/<name>.db`, the base view and bytes unaffected | An "organizational sandbox" free to reshape without hurting the base view; content still shares one copy, bytes not copied |
 | **Multiple in-tree entries: hardlink + symlink** | One copy of bytes arranged into several organizations in the same tree (by year / by type / shortcut entries) | A "multi-view directory" within one view |
 
 **Hardlink = one copy of bytes, multiple names** (the most useful trick in this case):
@@ -3283,7 +3364,7 @@ Four landable approaches exist:
 - Subtree mount (`--subpath`/`--prefix`): limiting the mountpoint to a directory inside the view — none (`--layout only/hide` is display pruning, not a path chroot);
 - Cross-view **writable** hardlinks / sharing the same object — none, `ln` is in-tree only, writing data across views means two copies of bytes; cross-view byte sharing is only via the **content-read-only** fork view (§3.4.1, structure organizable, uploading/changing content `EROFS`);
 - **Continuous automatic sync** of the source directory after import (watcher / periodic rescan) — none, `grovefs import` is a manual idempotent incremental command, rerunning adds new files; rename/replace-write external updates are also followed up by rerunning (§3.3);
-- **Remote direct import** — `grovefs import` only takes `--meta-dir`/`--data-dir` (local paths), **not `--meta-server`/`--data-servers` remote addresses**, there's no "pour a directory into a remote cluster from another machine" entry. Reason: import writes the authoritative `meta/<view>.db` and `blocks/` directly (zero-copy = source and blocks hardlinked on the same disk), and the remote protocol has no corresponding "batch-commit a whole tree" operation. Cross-machine bulk ingest of existing data goes the §14.2 alternative path (an already-mounted point's `rsync -a` pouring via the FUSE write path, large files can still stripe), or run import on the storage machine;
+- **Remote direct import** — `grovefs import` only takes `--meta-dir`/`--data-dir` (local paths), **not `--meta-server`/`--data-servers` remote addresses**, there's no "pour a directory into a remote cluster from another machine" entry. Reason: import writes the authoritative `meta/<view>/<view>.db` and `blocks/` directly (zero-copy = source and blocks hardlinked on the same disk), and the remote protocol has no corresponding "batch-commit a whole tree" operation. Cross-machine bulk ingest of existing data goes the §14.2 alternative path (an already-mounted point's `rsync -a` pouring via the FUSE write path, large files can still stripe), or run import on the storage machine;
 - **splice/zero-copy read-back** — the local `LocalBackend`'s large-block read-back has no zero-copy channel. Reason: the fuser 0.18 currently depended on has only `writev` on the reply side (copying a userspace buffer into `/dev/fuse`), `ReplyData` only takes `&[u8]`, no `splice`/`sendfile`/`vmsplice` entry — to do it would require forking fuser to take over the pipe ourselves. The measured gain ceiling doesn't cover this complexity and risk: warm 64MiB read 1318MB/s vs same-disk native ext4 1402MB/s (a ~6% gap), cold 1GiB read 2.02s ≈ ext4 2.00s (a ~1% gap, disk-speed dominated), and remote/striped backends gain nothing; compounded by page-cache consistency and `--no-cache` strong-consistency mount correctness risks. So not done, kept as negative space.
 - per-directory enforced permissions — directory-level permissions unimplemented (`--layout` can do directory-level display pruning, but as noted it doesn't constitute enforced isolation).
 
@@ -3296,7 +3377,7 @@ Four landable approaches exist:
 Earlier sections are organized by **mechanism**, this section by **what you want to do**, giving the shortest executable sequence. Conventions:
 
 - `G=grovefs` (swap for your binary path, e.g. `/usr/local/bin/grovefs`); addresses uniformly written as `10.0.0.10`, ports `50100` (data) / `50110` (metadata) / `5432` (PG) — swap for yours;
-- The PG sections were **run command-by-command** on a local PostgreSQL 12 (creating the DB, starting services, mounting, inspection SQL, `pg_dump` + restore to a new DB, `view rm --base`'s transactional ledger teardown + `DROP SCHEMA` + byte reclamation, `refs rebuild`'s two directions (the whole chain run through by `.bneck/pg_view_teardown.sh`'s 44 assertions on a real FUSE mount), and every refusal wording quoted below), and cross-mount `rsync -aH` was also verified for hardlinks and increments between two local mounts; the measured port was 5433, the text writes the standard 5432, the only difference being the port;
+- The PG sections were **run command-by-command** on a local PostgreSQL 12 (creating the DB, starting services, mounting, inspection SQL, `pg_dump` + restore to a new DB, `view rm --base`'s transactional ledger teardown + `DROP SCHEMA` + byte reclamation, `refs rebuild`'s two directions (the whole chain run through by `.bneck/pg_view_teardown.sh`'s 44 assertions on a real FUSE mount), and every refusal wording quoted below), and cross-mount `rsync -aH` was also verified for hardlinks and increments between two mounts on the same host; the measured port was 5433, the text writes the standard 5432, the only difference being the port;
 - Each scenario ends with an **acceptance command**, get the expected result before moving on, don't pile them all up to check at the end;
 - Mechanism detail isn't repeated here, the tables give cross-references.
 
@@ -3321,15 +3402,17 @@ Earlier sections are organized by **mechanism**, this section by **what you want
 | Slim down long commands: config file + environment variables | §15.15 | No |
 | Error symptom table | §15.16 | — |
 
-### 15.1 Scenario: see the effect in 5 minutes (two services on this host + one mount)
+### 15.1 Scenario: see the effect in 5 minutes (three services on this host + one mount)
 
 ```bash
 G=grovefs
-$G view --meta-dir /data/demo create --view team   # build one physical view tree (/data/demo/meta/team.db)
-$G data-server --listen 127.0.0.1:50100 --data-dir /data/demo &
-$G meta-server --meta-dir /data/demo --listen 127.0.0.1:50110 &
+$G view --meta-dir /data/demo create --view team   # build one physical view tree (/data/demo/meta/team/team.db)
+$G --home /data/demo manager define --meta 127.0.0.1:50110 --data 127.0.0.1:50100   # declare the topology (§4.2)
+$G --home /data/demo manager serve --listen 127.0.0.1:50055 &
+$G data-server --listen 127.0.0.1:50100 --data-dir /data/demo --register-with 127.0.0.1:50055 --join-key-file /data/demo/manager/join.key &
+$G meta-server --meta-dir /data/demo --listen 127.0.0.1:50110 --register-with 127.0.0.1:50055 --join-key-file /data/demo/manager/join.key &
 $G mount --view team -m /mnt/team \
-   --meta-server 127.0.0.1:50110 --data-servers 127.0.0.1:50100   # backgrounds by default; add --foreground to debug
+   --manager 127.0.0.1:50055 --roster-key-file /data/demo/manager/roster.key   # backgrounds by default; add --foreground to debug
 mkdir -p /mnt/team/docs && echo hello > /mnt/team/docs/a.txt
 cat /mnt/team/docs/a.txt                   # hello
 find /data/demo/blocks -type f | head -1   # the bytes really land here: blocks/<2hex>/<uuid>
@@ -3339,9 +3422,10 @@ $G umount -m /mnt/team                     # finish up (don't use the umount com
 The echo of every step comes from a real run on this machine (`.bneck/probe_151.sh`, unedited; only paths and the pid vary with the environment):
 
 ```console
-created BASE view 'team' at /data/demo/meta/team.db
+created BASE view 'team' at /data/demo/meta/team/team.db
 data-server listening on 127.0.0.1:50100 (host lc, 1 data root(s): /data/demo)
 meta-server listening on 127.0.0.1:50110 (base /data/demo, role Primary)
+manager 127.0.0.1:50055: deployment 'default' epoch 1 resolved meta [127.0.0.1:50110] data [127.0.0.1:50100] (signature verified, valid for 3599s more)
 using remote metadata service at 127.0.0.1:50110
 using remote data service at 127.0.0.1:50100
 mounting view 'team' at /mnt/team (fully remote: no local store)
@@ -3350,11 +3434,11 @@ grovefs: mounted view 'team' at /mnt/team (background pid 1162973)
 
 Acceptance: `cat` outputs `hello`, at least one object file appears under `blocks/`. This tier enables no token and no API-key gate (both gates are optional server-side settings, §6); the FUSE mountpoint permissions are just OS permissions.
 
-Two services plus one mount = three processes, and that is the **minimal** shape to get started; dropping either coordinate has no degraded path:
+Three services plus one mount = four processes, and that is the **minimal** shape to get started; without manager bootstrap there is no fallback path:
 
 ```console
 $ grovefs mount --view team -m /mnt/team
-error: a mount needs BOTH services: a metadata service (--meta-server) and a data service (--data-servers). There is no single-machine mode: one --home holding a view's tree AND its bytes would make every client an authoritative store, so two mounts of one view diverge and a laptop can end up holding the only copy. Pass the two addresses, each optionally a comma list (failover for the first, striping for the second), or --manager HOST:PORT --roster-key-file PATH to have both resolved from a signed roster. GROVEFS_META_SERVER / GROVEFS_DATA_SERVERS satisfy this too. --home stays the store root of the node-side verbs (view create, gc, import, apikey, du) and of the servers themselves, never of a mount.
+error: a mount resolves its cluster coordinates from the deployment's manager: there is no longer a way to name a metadata or data service by hand. Pass --manager HOST:PORT --roster-key-file PATH (or the GROVEFS_MANAGER / GROVEFS_ROSTER_KEY_FILE env knobs) to fetch the deployment's SIGNED roster and dial the meta- and data-servers it declares. Directly naming the addresses was removed on purpose: one --home holding a view's tree AND its bytes would make every client an authoritative store, and hand-typed lists let two mounts of one view dial different (or half a) cluster; a manager declaring the topology once and every client verifying the same signature is what keeps them consistent. Start the services with --register-with the manager, then `grovefs manager define`/`serve` it. --home stays the store root of the node-side verbs (view create, gc, import, apikey, du) and of the servers themselves, never of a mount.
 ```
 
 (exit code 1, nothing mounted.) A misspelled view name is hard-refused the same way — it never silently grows an empty tree; the server answers with a readable refusal plus one line saying how to create it (§4):
@@ -3363,7 +3447,7 @@ error: a mount needs BOTH services: a metadata service (--meta-server) and a dat
 error: view 'nope' does not exist on this meta-server (sqlite): no tree and no definition — views are created explicitly, so unknown names are refused instead of becoming an empty tree; create it first: `grovefs view --meta-dir /data/demo create --view nope` (or seed a tree with `grovefs view import`)
 ```
 
-To write two fewer addresses, see `--manager` in §4.2: the coordinates are declared once on the server side and a client points at a single bootstrap address.
+Mount coordinates have a single source, see `--manager` in §4.2: they are declared once on the server side and a client points at a single bootstrap address.
 
 ### 15.2 Scenario: one storage machine + several clients (SQLite center, minimally usable)
 
@@ -3373,19 +3457,21 @@ Storage machine `10.0.0.10` (data and metadata on the same disk, `blocks/` and `
 G=grovefs; TOK=$(head -c 24 /dev/urandom | base64)   # 两端用同一个值
 export GROVEFS_TOKEN=$TOK                           # 服务端/客户端都读它,省掉 --token
 $G view --meta-dir /data/cluster create --view team   # 1) create the base view first, then start the services
-$G data-server --listen 0.0.0.0:50100 --data-dir /data/cluster &
-$G meta-server --meta-dir /data/cluster --listen 0.0.0.0:50110 &
+$G --home /data/cluster manager define --meta 10.0.0.10:50110 --data 10.0.0.10:50100   # declare the topology (§4.2)
+$G --home /data/cluster manager serve --listen 0.0.0.0:50055 &
+$G data-server --listen 0.0.0.0:50100 --data-dir /data/cluster --register-with 10.0.0.10:50055 --join-key-file /data/cluster/manager/join.key &
+$G meta-server --meta-dir /data/cluster --listen 0.0.0.0:50110 --register-with 10.0.0.10:50055 --join-key-file /data/cluster/manager/join.key &
 ```
 
-Any client (clients **don't install a database, don't land metadata**):
+Any client (clients **don't install a database, don't land metadata** — both coordinates resolve from the manager):
 
 ```bash
 export GROVEFS_TOKEN=<同一串>
 G=grovefs
 $G mount --view team -m /mnt/team \
-   --data-servers 10.0.0.10:50100 --meta-server 10.0.0.10:50110        # 读写
+   --manager 10.0.0.10:50055 --roster-key-file /etc/grovefs/roster.key        # 读写
 $G mount --view team -m /mnt/team_ro \
-   --data-servers 10.0.0.10:50100 --meta-server 10.0.0.10:50110 --ro   # 本机只读
+   --manager 10.0.0.10:50055 --roster-key-file /etc/grovefs/roster.key --ro   # 本机只读
 ```
 
 Acceptance: on machine A `echo x > /mnt/team/t.txt`, on machine B `ls /mnt/team_ro` sees it within 2 seconds (TTL default ≤2s, no remount). For **server-side hard read-only** rather than just the local `--ro`, see §15.11.
@@ -3413,7 +3499,7 @@ $G meta-server --listen 0.0.0.0:50110 \
 $G view --meta-store postgres://grove:grovepw@127.0.0.1:5432/grovefs create --view demo
 
 # 3) 客户端:挂载命令与 SQLite 后端一字不差(线协议不变)
-$G mount --view demo --data-servers 10.0.0.10:50100 --meta-server 10.0.0.10:50110 -m /mnt/demo
+$G mount --view demo --manager 10.0.0.10:50055 --roster-key-file /etc/grovefs/roster.key -m /mnt/demo
 mkdir -p /mnt/demo/docs && echo hi > /mnt/demo/docs/a.txt
 ```
 
@@ -3474,7 +3560,7 @@ Acceptance: `journalctl` shows the listening line with no `connect`/`auth` error
 
 ### 15.5 Scenario: have a SQLite center, want to switch it to PG (**read the warning first**)
 
-> **Switching over shows an empty tree.** PG and SQLite are two metadata stores that don't read each other: once `meta-server --meta-store postgres://…` starts, the first time a view is opened it builds an **empty schema** (only the root node). `meta/*.db` and `blocks/` are both still in place, but the new center doesn't recognize them. This isn't a bug, it's a backend boundary; the current version has **no** tool to import SQLite metadata into PG (`view export` only reads from a local `.db`, PG has no corresponding import command; `import` only writes local SQLite).
+> **Switching over shows an empty tree.** PG and SQLite are two metadata stores that don't read each other: once `meta-server --meta-store postgres://…` starts, the first time a view is opened it builds an **empty schema** (only the root node). The tree directories under `meta/` and `blocks/` are both still in place, but the new center doesn't recognize them. This isn't a bug, it's a backend boundary; the current version has **no** tool to import SQLite metadata into PG (`view export` only reads from a local `.db`, PG has no corresponding import command; `import` only writes local SQLite).
 
 So there are only three paths, in order of cost:
 
@@ -3485,8 +3571,8 @@ So there are only three paths, in order of cost:
 ```bash
 # 旧中心(SQLite)与新中心(PG)同时在线,视图名可以相同
 G=grovefs
-$G mount --view team -m /mnt/old --data-servers 10.0.0.10:50100 --meta-server 10.0.0.10:50110 --token $OLD_TOK
-$G mount --view team -m /mnt/new --data-servers 10.0.0.20:50100 --meta-server 10.0.0.20:50110 --token $NEW_TOK
+$G mount --view team -m /mnt/old --manager 10.0.0.10:50055 --roster-key-file /etc/grovefs/roster.key --token $OLD_TOK
+$G mount --view team -m /mnt/new --manager 10.0.0.20:50055 --roster-key-file /etc/grovefs/roster.key --token $NEW_TOK
 rsync -aH --info=progress2 /mnt/old/ /mnt/new/        # 目录项与内容都按新 key 重新登记
 rsync -aH --info=progress2 /mnt/old/ /mnt/new/        # 再跑一遍是增量的(只补新文件)
 ```
@@ -3496,7 +3582,7 @@ rsync -aH --info=progress2 /mnt/old/ /mnt/new/        # 再跑一遍是增量的
 - The bytes in the old `blocks/` have **no reference** on the new center, won't be auto-reclaimed (GC is reference-driven), to reclaim space follow §12.6's trade-offs manually;
 - Walk path B fully on a small view first before going to production, don't test on the main view.
 
-**Path C: cold-database surgery (not provided, not committed).** Hand-inject the `node` rows of `meta/<view>.db` into `grovefs_v_<hex>` — the table structure matches (`id/parent_id/name/is_dir/data_ref/…`), but the `ctrl` epoch, `locks`, sequences, and ledger consistency are all on you to guarantee. No official script, no support if it breaks, **not recommended**.
+**Path C: cold-database surgery (not provided, not committed).** Hand-inject the `node` rows of `meta/<view>/<view>.db` into `grovefs_v_<hex>` — the table structure matches (`id/parent_id/name/is_dir/data_ref/…`), but the `ctrl` epoch, `locks`, sequences, and ledger consistency are all on you to guarantee. No official script, no support if it breaks, **not recommended**.
 
 ### 15.6 Scenario: PG daily inspection (use psql, not sqlite3)
 
@@ -3536,7 +3622,7 @@ from pg_statio_user_tables order by pg_total_relation_size(relid) desc limit 10;
 
 Acceptance: the row count of query 2 equals the current view count, `nodes` is same-order-of-magnitude as the client's `find /mnt/<view> | wc -l` (the client counts the mountpoint itself one extra).
 
-> The difference from SQLite inspection (§12.1): under PG there's **no** `meta/<view>.db` to query, `grovefs view list` also can't see the trees in PG (§15.9); when `pg_stat_database`'s `rollback_pct` is long-term > 10% and writes slow down, first check whether it's the same directory being high-frequency `rename`/`unlink`'d by multiple clients (row-lock hotspot), rather than tuning GroveFS.
+> The difference from SQLite inspection (§12.1): under PG there's **no** `meta/<view>/<view>.db` to query, `grovefs view list` also can't see the trees in PG (§15.9); when `pg_stat_database`'s `rollback_pct` is long-term > 10% and writes slow down, first check whether it's the same directory being high-frequency `rename`/`unlink`'d by multiple clients (row-lock hotspot), rather than tuning GroveFS.
 
 ### 15.7 Scenario: PG backup / restore / drill
 
@@ -3568,7 +3654,7 @@ export GROVEFS_TOKEN=$TOK
 $G meta-server --meta-dir /tmp/restore-meta --listen 127.0.0.1:50210 \
    --meta-store postgres://grove:grovepw@127.0.0.1:5432/grovefs_restore &
 $G data-server --data-dir /tmp/restore-blocks --listen 127.0.0.1:50200 &   # 先把 $BK/blocks 拷成 /tmp/restore-blocks/blocks
-$G mount --view team -m /mnt/restore --data-servers 127.0.0.1:50200 --meta-server 127.0.0.1:50210 --ro
+$G mount --view team -m /mnt/restore --manager 127.0.0.1:50055 --roster-key-file ~/roster.key --ro
 find /mnt/restore -type f | wc -l        # 与生产侧同量级即可
 $G umount -m /mnt/restore
 ```
@@ -3622,13 +3708,13 @@ The table below gives the capability boundaries under the non-SQLite backend (i.
 
 | Operation | Under the PG backend | Failure wording / actual behavior | Alternative |
 | --- | --- | --- | --- |
-| `view create` (without `--meta-store`) | builds no PG tree | only creates an unused local `meta/<view>.db` | add `--meta-store postgres://…`: `view --meta-store … create --view V` explicitly builds the schema; a mount never builds a tree |
+| `view create` (without `--meta-store`) | builds no PG tree | only creates an unused local `meta/<view>/<view>.db` | add `--meta-store postgres://…`: `view --meta-store … create --view V` explicitly builds the schema; a mount never builds a tree |
 | `view fork` / `view graft` | **usable** | one `INSERT … SELECT` copies all rows of the source schema into a newly created `grovefs_v_<hex>` target (same transaction, id/ino/hardlink/mode/owner/timestamps all preserved), `graft` selects a subset and reissues ids in the same transaction; echoes `forked view 'lab' from base 'alice': 6 entries, 3 shared object(s)`, zero byte copy, the shared ledger gains one holder per named object (proven by the `forksrv` suite on the PG tier) | no alternative needed; to still see a pruned tree use a derived view (§15.13) or an alias (§3.4) |
 | `view export` / `view import` | **usable** | export uses a REPEATABLE READ read-only snapshot: writes the schema as host-agnostic JSONL row-for-row identical to the SQLite tier (header + one row per node); import in a single transaction DELETEs → INSERTs row by row → structure/count validation → `setval` raises the sequences → corrects the ledger old→new, rolling back wholly on failure (the newly created schema is `DROP`ped too). An existing target tree needs `--replace`, `--as-fork` writes a `fork <base>` definition, a bad dump leaves no half-product (proven by the `xfer` suite on the PG tier) | whole-DB backup still uses `pg_dump -n grovefs_v_<hex>` (§15.7); the two don't conflict |
 | `view list` | usable (add `--meta-store`) | `view --meta-store postgres://… list` reads `grovefs_control.view_defs` + `grovefs_v_*` schemas; without `--meta-store` only shows local files (outputs `no view definitions under …/meta/views`) | same left, or the §15.6 inspection SQL |
-| `view rm --base` (delete a whole base view with its bytes) | **usable** (`view --meta-store postgres://… rm --name V --base --data-dir R`) | in one transaction decrements `grovefs_refs.holders` per key (DELETE at zero) then `DROP SCHEMA grovefs_v_<hex> CASCADE`, and after commit takes the `DISTINCT data_ref` read before deletion and `backend.remove`s them one by one. The echo states the two facts on separate lines, not summed into one number: `schema dropped with 6 name(s), 4 object(s) no longer held by any view` / `4 object(s) freed from …/blocks, 0 not found …, 0 could not be freed`. A second deletion reports `no schema grovefs_v_<hex> in the database — 'V' has no base tree here …` and exits nonzero | the same guards as SQLite (governed name / dependent definition / live local mount); `--data-dir` points at the root really storing `blocks/`; §15.8 |
+| `view rm --base` (delete a whole base view with its bytes) | **usable** (`view --meta-store postgres://… rm --name V --base --data-dir R`) | in one transaction decrements `grovefs_refs.holders` per key (DELETE at zero) then `DROP SCHEMA grovefs_v_<hex> CASCADE`, and after commit takes the `DISTINCT data_ref` read before deletion and `backend.remove`s them one by one. The echo states the two facts on separate lines, not summed into one number: `schema dropped with 6 name(s), 4 object(s) no longer held by any view` / `4 object(s) freed from …/blocks, 0 not found …, 0 could not be freed`. A second deletion reports `no schema grovefs_v_<hex> in the database — 'V' has no base tree here …` and exits nonzero | the same guards as SQLite (governed name / dependent definition / a live mount of that view on this host); `--data-dir` points at the root really storing `blocks/`; §15.8 |
 | `import` (zero-copy) | not applicable | creates a local `<view>.db`, metadata doesn't go into PG | mount + `rsync` (same as §15.5 path B) |
-| `refs rebuild` | **usable** (`refs --meta-store postgres://… rebuild`) | recomputes the **in-database** shared ledger (not a local `meta/refs.db`): enumerates all `grovefs_v_*` schemas → per tree `SELECT DISTINCT data_ref` → rewrites `grovefs_refs.holders` by "how many trees still name it", deleting rows no tree claims. A no-op on a healthy DB (`0 row(s) corrected, 0 row(s) deleted`); removes over-counted rows when a schema was dropped out-of-band (measured `0 tree(s) … 3 row(s) deleted`), recovers from the trees when `holders` rows were wrongly deleted (measured `2 row(s) corrected`). **A single tree read failure aborts the whole thing** (undercounting leads to wrong deletion) | run only when **quiescent**; normally maintained by server transactions, no periodic run needed. The verbatim recipe is in §15.8 |
+| `refs rebuild` | **usable** (`refs --meta-store postgres://… rebuild`) | recomputes the **in-database** shared ledger (not a local `meta/_control/refs.db`): enumerates all `grovefs_v_*` schemas → per tree `SELECT DISTINCT data_ref` → rewrites `grovefs_refs.holders` by "how many trees still name it", deleting rows no tree claims. A no-op on a healthy DB (`0 row(s) corrected, 0 row(s) deleted`); removes over-counted rows when a schema was dropped out-of-band (measured `0 tree(s) … 3 row(s) deleted`), recovers from the trees when `holders` rows were wrongly deleted (measured `2 row(s) corrected`). **A single tree read failure aborts the whole thing** (undercounting leads to wrong deletion) | run only when **quiescent**; normally maintained by server transactions, no periodic run needed. The verbatim recipe is in §15.8 |
 | `du` (byte total) | **usable** (`du --meta-store postgres://… --view V --data-servers HOST:PORT,…`) | first checks `information_schema` that `grovefs_v_<hex>` exists, then `SELECT … FROM <schema>.node` to read the tree, bytes batch-statted toward the data-server (the striped storage's address-list length must match the write time, otherwise it refuses rather than zeroing); a nonexistent name gets the same sentence on both tiers `no tree for view 'V' in postgres://… — \`grovefs view create --view V\` makes one …`, never reporting a "misspelled name" as 0 B | same as SQLite (§8.4) |
 | `apikey` | usable (add `--meta-store`) | keys and audit go into `grovefs_control.api_keys`/`mcp_calls`, no local `api_keys.db` (proven by the `control` suite) | same as SQLite (§15.11) |
 | `mcp` | usable (add `--meta-store`) | all ten governance and read-only probe tools go through `grovefs_control` (`list_view_tree` can also walk a PG tree); `fork_view`/`graft_view` are the same implementation as the CLI, a cross-schema copy on PG | same left; inspection can also use psql (§15.6) |
@@ -3667,7 +3753,7 @@ $G apikey --meta-dir /data/cluster create --label agent    --for mcp
 
 # 3) 客户端:key 走环境变量,不进 argv(ps 可见)
 export GROVEFS_API_KEY='<id>:<secret>'
-$G mount --view team -m /mnt/team --data-servers 10.0.0.10:50100 --meta-server 10.0.0.10:50110
+$G mount --view team -m /mnt/team --manager 10.0.0.10:50055 --roster-key-file /etc/grovefs/roster.key
 
 # 4) 看谁在用、用在哪儿、随时撤销
 $G apikey --meta-dir /data/cluster list --view team
@@ -3685,14 +3771,14 @@ $G apikey --meta-dir /data/cluster revoke --id <id 或其唯一前缀>
 ```bash
 G=grovefs
 export GROVEFS_TOKEN=$TOK
-# 每台存储机各自起 data-server --data-dir 自己的盘(端口可同)
+# 每台存储机各自起 data-server --data-dir 自己的盘(端口可同),向 manager 注册
 for h in 10.0.0.11 10.0.0.12 10.0.0.13; do
-  ssh $h "grovefs data-server --listen 0.0.0.0:50100 --data-dir /data/blocks &"
+  ssh $h "grovefs data-server --listen 0.0.0.0:50100 --data-dir /data/blocks --register-with 10.0.0.10:50055 --join-key-file /etc/grovefs/join.key &"
 done
-# 客户端一条逗号列表启用确定性条带
+# Declare the whole stripe-member set once on the manager; a client points only at the manager (§4.2)
+$G --home /data/cluster manager define --meta 10.0.0.10:50110 --data 10.0.0.11:50100,10.0.0.12:50100,10.0.0.13:50100
 $G mount --view big -m /mnt/big \
-  --data-servers 10.0.0.11:50100,10.0.0.12:50100,10.0.0.13:50100 \
-  --meta-server 10.0.0.10:50110
+  --manager 10.0.0.10:50055 --roster-key-file /etc/grovefs/roster.key
 ```
 
 - Only files ≥ 16MiB are chunked; small files naturally land only on chunk0; a single already-saturated link does not get faster from striping — you need independent NICs/links to measure any gain;
@@ -3708,14 +3794,14 @@ Acceptance: after `dd if=/dev/urandom of=/mnt/big/big.bin bs=1M count=64`, all t
 | Same tree, different clients see different shapes, **and read-only distribution** | derived view `view define` | `$G view --meta-dir D define --name docs-only --base team --rules docs.rules` |
 | Just a public rename of the same tree, **read-write unchanged** | pure alias `view alias` | `$G view --meta-dir D alias --name public --real team` |
 | An independent directory tree you can freely `mkdir`/`mv`/`rm`, **content read-only** | fork (**SQLite only**) | `$G view --meta-dir D fork --name lab --base team` |
-| The client tunes its own shape ad hoc, and needs to write | `mount --layout F` | `$G mount --view team --layout rules.txt -m /mnt/team --meta-server M:50110 --data-servers A:50100` |
+| The client tunes its own shape ad hoc, and needs to write | `mount --layout F` | `$G mount --view team --layout rules.txt -m /mnt/team --manager MGR:50055 --roster-key-file F` |
 
 ```bash
 G=grovefs; D=/data/cluster
 printf 'only /docs\n' > docs.rules
 $G view --meta-dir $D define --name docs-only --base team --rules docs.rules
 $G view --meta-dir $D list                      # 定义槽 + 裸基视图都会列出
-$G mount --view docs-only -m /mnt/docs --data-servers 10.0.0.10:50100 --meta-server 10.0.0.10:50110
+$G mount --view docs-only -m /mnt/docs --manager 10.0.0.10:50055 --roster-key-file /etc/grovefs/roster.key
 ```
 
 - Derived-view mounts are always **read-only** (shape governed centrally server-side, writes go through the base name `team`); already-mounted clients hot-swap the shape within ≤2s after the server changes rules, no remount needed;
@@ -3751,8 +3837,8 @@ cat > ~/.config/grovefs/grovefs.conf <<'EOF'
 GROVEFS_HOME=/data/demo
 GROVEFS_TOKEN=s3cr3t
 GROVEFS_META_DIR=/data/cluster
-GROVEFS_META_SERVER=10.0.0.10:50110
-GROVEFS_DATA_SERVERS=10.0.0.10:50100
+GROVEFS_MANAGER=10.0.0.10:50055
+GROVEFS_ROSTER_KEY_FILE=/etc/grovefs/roster.key
 EOF
 chmod 600 ~/.config/grovefs/grovefs.conf
 
@@ -3780,7 +3866,7 @@ $G meta-server --listen 0.0.0.0:50110
 | `no metadata tree … lives in Postgres` | Ran `view export` under PG | Use `pg_dump -n` (§15.7) |
 | `--meta-store postgres://… cannot be combined with --role standby / --peer / --witness` | PG and GroveFS native HA cannot be stacked | §15.9: route high availability through PG streaming replication instead |
 | `serialization retry exhausted after 12 attempts (view 'x')` | One op hit 12 consecutive collisions without committing (SERIALIZABLE abort, backoff 200µs→25ms exhausted; `SERIALIZATION_MAX_ATTEMPTS`, `src/pg_store.rs`). This line means the retry budget truly ran out, not lock waiting | Investigate the contention surface, not the database: high-frequency `rename`/same-name `create` storms within one directory; this string is measured in the server log by the `pg_parallel` suite |
-| `refs … rebuilt: 0 holder entries` | You ran the **local-file** ledger rebuild (without `--meta-store`): it recomputes `meta/refs.db` from `<meta-dir>/meta/*.db`, and in a PG deployment those files don't exist, hence 0 rows | A PG deployment needs `--meta-store`: it reports `refs ledger rebuilt in postgres://…: N tree(s), M content key(s), K holder unit(s); X row(s) corrected, Y row(s) deleted`; the ledger content is in `grovefs_refs.holders` (§15.6/§15.9) |
+| `refs … rebuilt: 0 holder entries` | You ran the **local-file** ledger rebuild (without `--meta-store`): it recomputes `meta/_control/refs.db` from the view-tree directories under `<meta-dir>/meta/`, and in a PG deployment those directories don't exist, hence 0 rows | A PG deployment needs `--meta-store`: it reports `refs ledger rebuilt in postgres://…: N tree(s), M content key(s), K holder unit(s); X row(s) corrected, Y row(s) deleted`; the ledger content is in `grovefs_refs.holders` (§15.6/§15.9) |
 | A write returns `EPERM` | A read-only key (including the `flock` class) or a derived view | §15.11 / §15.13 |
 | Writing fork content returns `EROFS` | The fork's content plane is read-only | Write the base view; keep doing structural rearrangement inside the fork |
 | Within 2 seconds after a mount, other clients don't see the change | Not a bug: TTL ≤2s; if it never syncs, check whether both places connect to the **same** meta | §4's "two consistency modes" |
@@ -3803,7 +3889,7 @@ grovefs view --meta-dir /data create --view share                               
 **Usage** (client mount; permission tiers §15.11, the view trio choice §15.13; remote mount needs no `--home`):
 
 ```bash
-grovefs mount --view share --data-servers 192.168.1.10:50100 --meta-server 192.168.1.10:50110 --token "$TOK" -m /mnt/da
+grovefs mount --view share --manager 192.168.1.10:50055 --roster-key-file /etc/grovefs/roster.key --token "$TOK" -m /mnt/da
 ```
 
 **Operations** (full criteria §12):
@@ -3812,7 +3898,7 @@ grovefs mount --view share --data-servers 192.168.1.10:50100 --meta-server 192.1
 grovefs du   --view share --meta-dir /data --total                       # usage: subtree byte total
 grovefs refs --meta-dir /data rebuild                                    # recompute the ledger after an out-of-band rm (run when quiescent)
 grovefs gc   --meta-dir /data --data-dir /data --older-than 24h --apply  # reclaim orphan objects in place (SQLite only)
-# backup: stop and cold-copy meta/*.db(+WAL) + rsync -a -H blocks/; native primary/standby HA adds --role/--peer/--witness (§11)
+# backup: stop and cold-copy the whole meta/ (one directory per tree + _control/) + rsync -a -H blocks/; native primary/standby HA adds --role/--peer/--witness (§11)
 ```
 
 **Acceptance**: both ports LISTEN + `findmnt` shows `grovefs:share` + A writes, B reads instantly + B write returns `EROFS` + after restarting data-server the client reconnects on its own.
@@ -3899,20 +3985,20 @@ Development reference: `src/` (10 main modules + `remote/` + `backend/`), protoc
 | Purpose | Command |
 |------|------|
 | Create a view | `grovefs view --meta-dir D create --view U [--manifest M]` |
-| Remote mount | `grovefs mount --view U -m MP --data-servers A[,A2] --meta-server M[,M_bak] [--token T] [--api-key ID:SECRET] [--run-as-uid N] [--layout F] [--foreground\|--log-file F]` |
-| Same, but pointing at one bootstrap address | `grovefs mount --view U -m MP --manager H:PORT --roster-key-file F [--deployment NAME] [--token T] [--api-key ID:SECRET]` (the coordinates come from a signed roster; mutually exclusive with `--meta-server`/`--data-servers`, §4.2) |
+| Mount (the ONLY mount form) | `grovefs mount --view U -m MP --manager M:PORT --roster-key-file F [--deployment NAME] [--token T] [--api-key ID:SECRET] [--ro] [--no-cache] [--threads N] [--run-as-uid N] [--layout F] [--foreground\|--log-file F]` (both coordinates resolve from the manager's signed roster; the hand-typed `--meta-server`/`--data-servers` were removed, §4.2) |
 | Declare the topology / run the bootstrap service / see who registered | `grovefs manager --state-dir D define --name N --meta M[,M2] --data A[,A2]` ; `grovefs manager --state-dir D serve --listen H:PORT [--roster-ttl S] [--register-ttl S] [--require-registered]` ; `grovefs manager status --server H:PORT [--deployment N] --join-key-file F`; on the node side `meta-server`/`data-server --register-with H:PORT --join-key-file F [--advertise-addr A] [--deployment N] [--register-ttl S]` registers (§4.2) |
 | Define a derived view | `grovefs view --meta-dir D define --name V --base B --rules F` (stored at `D/meta/views/V.layout`, `mount --view V` gets the shape; virtual-view mounts are read-only, writes go through the base name `B`) |
 | Define a pure alias | `grovefs view --meta-dir D alias --name A --real R` (public name maps 1:1 to the real view: `A` is full-tree writable, `R` can't be mounted directly, §3.4) |
-| Create a fork view | `grovefs view --meta-dir D fork --name L --base R` (copies directory entries into an independent `meta/L.db`, bytes shared; structure writable, content `EROFS`, §3.4.1) |
+| Create a fork view | `grovefs view --meta-dir D fork --name L --base R` (copies directory entries into an independent `meta/L/L.db`, bytes shared; structure writable, content `EROFS`, §3.4.1) |
 | Export/import a single view's metadata | `grovefs view --meta-dir D export --view V --out F [--force]` (host-agnostic JSONL, no bytes) / `grovefs view --meta-dir D import --view V --in F [--replace] [--as-fork B]` (atomic replace, bytes copied separately to `blocks/`, §3.4.2) |
 | Rotate a public name after a leak | `grovefs view --meta-dir D alias --name A2 --real R --retire A` (write-before-delete, zero window: `A` invalidated, `R` never directly mountable throughout, §3.4) |
-| List/delete view definitions | `grovefs view --meta-dir D list` (definition slots + bare base views) / `grovefs view --meta-dir D rm --name V` (derived/alias delete only the definition, leaving data; fork deletes its own `meta/V.db` too and rebuilds the ledger) |
-| Delete a whole base view (with byte reclamation) | `grovefs view --meta-dir D rm --name V --base [--data-dir R]` (deletes `meta/V.db`+WAL/SHM, `refs rebuild` rebuilds the ledger, reclaims bytes no other view still holds; refuses governed names / dependent definitions / live local mounts; on the PG tier add `--meta-store postgres://…`, with unbooking + `DROP SCHEMA` in the same transaction, §3.4.3) |
+| List/delete view definitions | `grovefs view --meta-dir D list` (definition slots + bare base views) / `grovefs view --meta-dir D rm --name V` (derived/alias delete only the definition, leaving data; fork deletes its own `meta/V/V.db` too and rebuilds the ledger) |
+| Delete a whole base view (with byte reclamation) | `grovefs view --meta-dir D rm --name V --base [--data-dir R]` (deletes `meta/V/V.db`+WAL/SHM, `refs rebuild` rebuilds the ledger, reclaims bytes no other view still holds; refuses governed names / dependent definitions / live mounts of that view on this host; on the PG tier add `--meta-store postgres://…`, with unbooking + `DROP SCHEMA` in the same transaction, §3.4.3) |
 | Investigate/reclaim orphan objects (offline) | `grovefs gc --meta-dir D [--data-dir R] [--apply] [--older-than 24h] [--json]` (scan-only by default; `--apply` requires no live mount on this storage and no grovefs process on this machine, never deletes keys the ledger still holds, refuses PG deployments, §12.6) |
 | Import an existing directory | `grovefs import --view V --source DIR [--prefix P] [--data-dir R] [--dry-run]` (same-disk hardlink zero-copy, rerun incremental; run on the storage machine, §3.3) |
 | Server-side usage statistics | `grovefs du --home H --view V [--data-servers A[,A2]\|--data-dir R] [--path P] [-d N] [-b] [--total]` (batch-fetches and sums object bytes, not per-file stat; byte source `--data-servers` > `--data-dir` > metadata root, refuses outright if the source can't be determined, counting a warning only on a confirmed miss, §12.6) |
 | Unmount | `grovefs umount -m MP` |
+| Inspect/migrate the metadata layout | `grovefs layout --meta-dir D show` (reports v1 flat or v2, lists the view trees) / `grovefs layout --meta-dir D migrate [--dry-run]` (v1→v2: moves into `meta/<view>/<view>.db` and `meta/_control/`; offline, requires no live mount and no grovefs process on this machine, §12.4) |
 | Data service | `grovefs data-server --listen IP:PORT --data-dir DIR [--token T] [--require-api-key [--meta-dir D]]` |
 | Govern the same metadata from any machine (using an account key instead of the db password) | `grovefs view --control-server H --api-key K create\|define\|alias\|list\|rm` (with `--meta-store` replaced by `--control-server`, same as above) |
 | Account key (governance port) | `grovefs --home H apikey create --label L --for admin --owner ACCT` (the first key minted on the disk-holding host) / `apikey --control-server H --api-key K list\|create\|revoke\|rotate\|set-ro\|calls\|update\|purge` |

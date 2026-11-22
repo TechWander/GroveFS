@@ -59,7 +59,7 @@ description: Keeps GroveFS documentation (README.md, README.en.md, USAGE.md, USA
    别家工具的命令行只截工具段不截整行——整行删会连带弄丢同一行里的真参数）、
    `docs/*.html` 结构（`scripts/htmlcheck.py`：标签闭合 + 页内 `href="#x"`↔`id="x"` 悬空锚点 + 跨页断链 + 重复 id，
    重写一节最容易改出「目录点下去没反应」，标签配平衡量不出来）、新增用字校验（抓自己打错的汉字）、
-   **mount 示例带坐标**（`scripts/mountcheck.py`：无坐标的挂载现在是硬失败，文档里少一个 `--meta-server` 就是一条跑不通的命令）、
+   **mount 示例经 manager 引导**（`scripts/mountcheck.py`：挂载坐标只能来自 `--manager`（或 `GROVEFS_MANAGER` env、续行/变量间接），手敲的 `--meta-server`/`--data-servers` 已从 mount 移除——示例里少一个 `--manager` 就是一条被 clap 拒绝或 fail-closed 拒挂的命令）、
    **套件断言数对账**（`scripts/suitenumbers.py`：文档里每句「X 套件 N 条断言」的真值只取
    `.build-bin/logs/<最近一次整板>/<stage>.log` 的 `SUMMARY: pass=` 行——改套件不会让文档变红，
    这在本仓库反复发生过；没跑过整板这一项自己跳过并说明，绝不拿记忆里的数当真相；名字不挨着也算（README 那条超长清单里每个「(…; 42 assertions)」归给行内它前面最近的套件名）；而闸门自己也要证明拉得响——`--selftest` 把六份文档里每个复述的数字 +1 注入临时副本，三条归属规则必须都红）。

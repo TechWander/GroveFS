@@ -2,7 +2,7 @@
 //! REAL TRANSPORT: two `DataServer`s advertise distinct member ids in their
 //! `OP_OPEN` acks, a `RemoteBackend` surfaces each as `placement_key()`, and a
 //! `ShardedBackend` sorted by that identity reads back a striped object
-//! correctly no matter the order its `--data-servers` list is fed in — the
+//! correctly no matter the order its data-server list is fed in — the
 //! hazard a positional stripe silently corrupts. Also pins that the fingerprint
 //! refuses a genuine member-set change and that an un-`--member-id` server
 //! advertises no identity. No FUSE involved.

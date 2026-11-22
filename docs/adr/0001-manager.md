@@ -2,25 +2,25 @@
 
 | 项 | 内容 |
 | --- | --- |
-| 状态 | 已实施（范围＝M1 全量 + HMAC 防伪档） |
+| 状态 | 已实施（范围＝M1 全量 + HMAC 防伪档）；**后续修订**：手敲的 `--meta-server`/`--data-servers` 挂载坐标已整体移除，`mount` 只能经 `--manager` 引导（见下 Q2 与 ADR-0002） |
 | 日期 | 2026-11-19 |
 | 实现 | `src/manager.rs`（roster/announcement 类型、帧编解码、签发/验签、客户端调用、心跳节拍）、`src/manager/server.rs`（daemon、声明存储、注册策略、fleet view）、`src/remote/proto.rs`（`OP_REGISTER=14`/`OP_LOOKUP=15`/`OP_STATUS=16`）、`src/main.rs`（CLI 接线） |
 | 验收 | `cargo test --lib manager::` → 24 passed；`.build-bin/test_manager.sh` → `SUMMARY: pass=41 fail=0`（§0–§10，含真实挂载与 40 MiB 读写）；`cargo test --lib` → 267 passed（本文写作时 264，移除单机模式后复跑为 267） |
 
 ## 1. 结论与角色边界
 
-manager 是**挂载引导（bootstrap）服务**：它回答「这个 deployment 的元数据与数据服务在哪」，除此之外什么都不做。它**不在 IO 路径上**——客户端解析出坐标后就与 meta-/data-server 直连，挂载生命周期内不再联系 manager。
+manager 是**挂载引导（bootstrap）服务**：它回答「这个 deployment 的元数据与数据服务在哪」，除此之外什么都不做。它是挂载**唯一**的坐标来源。它**不在 IO 路径上**——客户端解析出坐标后就与 meta-/data-server 直接建连（不再经过 manager），挂载生命周期内不再联系 manager。
 
 两条边界是设计的前提，不是实现细节：
 
-1. **roster 的内容是「operator 声明过的那一套」，不是「此刻活着的那一组」**。GroveFS 把分条对象钉死在其 member-id 集合上（`ShardedBackend::check_layout`），也在 `--meta-server` 的**顺序**上做故障转移优先级，所以 manager 没有「挑一个健康子集返回」这种能力可给——返回子集等于返回一个读不出自己数据的客户端。心跳只决定 `manager status` 上的一列，以及 `--require-registered` 是否整刀拒绝这次 lookup（门，不是滤镜）。
+1. **roster 的内容是「operator 声明过的那一套」，不是「此刻活着的那一组」**。GroveFS 把分条对象钉死在其 member-id 集合上（`ShardedBackend::check_layout`），也在 roster 解析出的 meta 列表的**顺序**上做故障转移优先级，所以 manager 没有「挑一个健康子集返回」这种能力可给——返回子集等于返回一个读不出自己数据的客户端。心跳只决定 `manager status` 上的一列，以及 `--require-registered` 是否整刀拒绝这次 lookup（门，不是滤镜）。
 2. **manager 唯一的权力是不给 roster**，它不能停掉任何已有挂载，也不该被用来停：节点连不上 manager 时照常起服务（见 §6 R7）。
 
 ## 2. 可行性判断（四个问题逐一回答）
 
-**Q1 这个方案可行吗？** 可行，且代价局限在挂载引导期。可行性来自一个既有事实：客户端本来就需要两个坐标（`--meta-server` 有序故障转移全列表 + `--data-servers` 分条成员全集），而这两个坐标都是 **provisioning 事实**——由 operator 决定，不由运行时涌现。既然它们本来就是「一次定、到处抄」的常量，把它们收到服务端一处声明、用签名分发，就是纯减少客户端负担的变换，不引入新的运行时依赖。
+**Q1 这个方案可行吗？** 可行，且代价局限在挂载引导期。可行性来自一个既有事实：客户端本来就需要两个坐标（有序故障转移全列表 + 分条成员全集），而这两个坐标都是 **provisioning 事实**——由 operator 决定，不由运行时涌现。既然它们本来就是「一次定、到处抄」的常量，把它们收到服务端一处声明、用签名分发，就是纯减少客户端负担的变换，不引入新的运行时依赖。
 
-**Q2 与现有 `--meta-server` / `--data-servers` 逗号列表 + 故障转移是替代还是叠加？** **叠加**。两列表仍是唯一的运行时真值：manager 只是把「在每台客户机上抄一遍」换成「在服务端声明一次」，解析结果直接喂进同一对值（`Roster::meta_list()` / `Roster::data_list()` 就是那两个 flag 的字符串形态），后端的构造路径与手抄坐标是同一条（不改代码分支，也不新增后端类型）。故障转移与分条语义完全由既有的 `RemoteMeta`/`ShardedBackend` 承担，manager 不解释也不改写它们。`--manager` 与显式坐标**互斥**（clap `conflicts_with_all` + env 兜底后的代码检查），一次挂载只有一个真值来源。
+**Q2 与原来的 `--meta-server` / `--data-servers` 逗号列表 + 故障转移是替代还是叠加？** 本 ADR 落地的**当时是叠加**（两种入口并存、`--manager` 与显式坐标互斥）；**随后已被取代为替代**：手敲的 `--meta-server`/`--data-servers` 从 `mount` 上整体移除，`--manager`（env `GROVEFS_MANAGER`）+ `--roster-key-file` 成为挂载唯一的坐标来源，一次挂载再没有第二个真值入口。不变的是**语义**：两个列表仍是唯一的运行时真值——roster 解析结果喂进同一对值（`Roster::meta_list()` / `Roster::data_list()`），后端构造路径与当初手抄坐标是同一条（不改代码分支，也不新增后端类型）；故障转移与分条语义完全由既有的 `RemoteMeta`/`ShardedBackend` 承担，manager 不解释也不改写它们。被改变的只是**入口**：把「抄坐标」这条口子关掉，让引导成为唯一路径。
 
 **Q3 manager 挂了之后已有挂载是否受影响？** 不受影响，这是 §1 的直接推论，且被实测钉住（`test_manager.sh` §8）：杀掉 manager 后，一个挂载写的文件经**另一个挂载进程**读回（真实数据面往返，不是同一进程的 page cache 自洽），40 MiB 分条对象仍按原 md5 读回。受影响的是**新挂载**：`mount --manager` 在解析失败时直接退出，不猜地址、不退回本地——fail-closed。manager 重启即恢复：声明存在文件里（`<state-dir>/manager/deployments.json`），进程起来重读即可，无需重新 define。
 
@@ -109,7 +109,7 @@ manager 是**挂载引导（bootstrap）服务**：它回答「这个 deployment
 
 ### 7.1 顺带闭合的一个既有数据面缺陷（成员数不符）
 
-单地址数据路径（`--data-servers` 只有一项，或 manager 解析成一项）以前会这样回答一个分条 ref：那台机器上没有这个对象 → `NotFound` → 而 FUSE 读路径把「对象不存在」当作「建了从没写过的空文件」（`fs_impl::read`），于是 40 MiB 的对象在 `ls` 里是 0 字节、`md5sum` 是空串哈希且 **退出码 0**，`cp` 高高兴兴拷走一个空文件。`du` 早就有整树口径的拒绝（"this tree was written across 2 data-servers but --data-servers names 1"），挂载路径没有等价物。
+单地址数据路径（roster 解析出的 data 列表只有一项）以前会这样回答一个分条 ref：那台机器上没有这个对象 → `NotFound` → 而 FUSE 读路径把「对象不存在」当作「建了从没写过的空文件」（`fs_impl::read`），于是 40 MiB 的对象在 `ls` 里是 0 字节、`md5sum` 是空串哈希且 **退出码 0**，`cp` 高高兴兴拷走一个空文件。`du` 早就有整树口径的拒绝（"this tree was written across 2 data-servers but --data-servers names 1"，`du` 仍保留它自己的 `--data-servers`），挂载路径没有等价物。
 
 `backend::UnstripedGuard` 就是这条等价物：**只约束「自己声明了服务器数」的 key**（`s<N>:`，N>1），裸 uuid 照原样通过（单服务器挂载读非分条树是完全正常的路径）。命中时返回显式错误，并把同一句话打进挂载自己的日志一次（内核只传 errno，`Input/output error` 本身不解释任何事）。修复前后同一套件的实测对比：修复前 `md5sum` rc=0/空哈希；修复后 `md5sum` rc≠0 + `Input/output error`，且 `manager define` 改回全集后第二个挂载读到同一份字节（`test_manager.sh` §7 断言这三件事，另有 `a_single_address_mount_refuses_a_striped_ref_instead_of_answering_empty` 一条单测钉住「分条 ref 拒、裸 uuid 通、`remove` 也不许半删」）。
 

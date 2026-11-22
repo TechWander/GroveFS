@@ -192,31 +192,285 @@ impl NodeInfo {
 // that actually exist. A key with no ledger row is simply private to one view
 // (no other view known -> free on last name).
 
-/// The shared ledger file beside the view trees (`<meta dir>/refs.db`).
+/// The shared ledger's stem; its home is [`control_db_path`] (`refs.db`).
 pub const REFS_DB: &str = "refs.db";
 /// The schema name every engine connection ATTACHes the ledger under.
 pub const REFS_SCHEMA: &str = "refs";
 
-/// The stems of the `meta/*.db` files that are CONTROL-PLANE stores rather than
-/// view trees: the api-key/audit store, the web console's account/grant store,
-/// and the holder ledger itself.
-///
-/// Every enumerator that walks `meta/` looking for views has to skip these, and
-/// it must ask THIS question rather than keep its own pair of names: five call
-/// sites each carried a hand-written `!= "api_keys" && != "refs"`, and adding a
-/// third store to that directory would otherwise have made `web_accounts` look
-/// like a mountable view to `view list`, to `gc`, to `refs rebuild` and to the
-/// server's own epoch scan — with `gc`/`refs` then failing on its missing `node`
-/// table. A new store is now invisible to the view listing by construction.
+/// The stems of the CONTROL-PLANE stores rather than view trees: the
+/// api-key/audit store, the web console's account/grant store, and the holder
+/// ledger itself. Since layout v2 they live in their OWN slot
+/// ([`CONTROL_SUBDIR`]) instead of beside the trees, so no enumerator has to
+/// know this list to tell a tree from a store — the question is answered by
+/// node kind ([`is_view_tree_dir`]). The list stays because the migrator must
+/// still recognize these stems when it meets the flat v1 layout, and because
+/// [`is_view_db`] is the v1-side twin of that check.
 pub const CONTROL_DB_STEMS: &[&str] = &["api_keys", "refs", "web_accounts"];
 
-/// Is `name` (a `meta/` directory entry) a view tree's database? Anything that
-/// is not a `.db`, or is one of [`CONTROL_DB_STEMS`], is not.
+/// Is `name` a FLAT (layout v1) `meta/*.db` entry holding a view tree? Anything
+/// that is not a `.db`, or is one of [`CONTROL_DB_STEMS`], is not. Only the
+/// migrator and the layout guard need this now; live code paths ask
+/// [`is_view_tree_dir`] about a directory instead.
 pub fn is_view_db(name: &str) -> bool {
     let Some(stem) = name.strip_suffix(".db") else {
         return false;
     };
     !stem.is_empty() && !CONTROL_DB_STEMS.contains(&stem)
+}
+
+// ================== on-disk layout v2: one dir per view tree =================
+//
+// Layout v1 put every object of a store side by side in `<base>/meta/`: one
+// `<view>.db` per physical tree, the three control-plane stores as three more
+// `.db` files, and the definition slots under `views/`. That made "is this
+// entry a view?" unanswerable from the structure, so the question lived in a
+// name whitelist ([`CONTROL_DB_STEMS`]) that all five enumerators had to
+// remember independently — and a store added without editing every one of them
+// shows up as a MOUNTABLE VIEW and makes `refs rebuild` and `gc` fail on its
+// missing `node` table (that is exactly what happened when `web_accounts`
+// landed). One more store, or one more enumerator, was one more such bug.
+//
+// Layout v2 separates the kinds by NODE KIND instead of by name:
+//
+// ```text
+// <base>/meta/
+//   <view>/            one directory per PHYSICAL TREE, so the tree and its
+//     <view>.db        WAL/SHM sidecars and its import scratch are one unit
+//   _control/          the control-plane stores (refs/api_keys/web_accounts)
+//   views/             view definitions, `<name>.layout` (unchanged)
+//   .xfer/             server-side export/import spool (dot-prefixed)
+// ```
+//
+// The tree's db keeps its OWN name inside its directory, so the path stays
+// `f(name)`: computable from the name alone, with no definition read first.
+// That is the deliberate boundary of this change. Grouping by GENEALOGY (a
+// base view's folder holding its forks) would instead make the path depend on
+// the definition, and the definition (a) is not replicated to an HA standby,
+// which has to resolve a snapshot target from a name alone, (b) can be removed
+// while the tree it names still exists, and (c) is already readable from
+// `view list`. Family placement would encode a relationship a second time, in
+// the one place that cannot be re-derived once it drifts.
+//
+// What v2 buys: whole-tree operations (archive, move, delete, `chmod`, quota,
+// "which files belong to this view") become directory operations; a listing of
+// `meta/` is a listing of trees; and a control store can never masquerade as a
+// view again. It buys nothing for the CONTENT bytes, which are
+// content-addressed and shared across views in `<data-dir>/blocks/` — a tree
+// directory is a metadata unit, not a restorable data unit.
+
+/// The metadata half of a store root. Naming it (rather than only spelling it in
+/// [`meta_dir`]) is what [`control_dir_for_db`] needs to recognize a `meta/`.
+pub const META_SUBDIR: &str = "meta";
+/// The definition slot inside `<base>/meta/`.
+pub const DEFS_SUBDIR: &str = "views";
+/// The control-plane slot inside `<base>/meta/`. Leading underscore keeps it
+/// lexicographically apart from tree names; the reserved-name check makes the
+/// separation structural rather than cosmetic.
+pub const CONTROL_SUBDIR: &str = "_control";
+/// The export/import spool (dot-prefixed, so it is never a tree).
+pub const XFER_SUBDIR: &str = ".xfer";
+/// Names that address a layout slot and can therefore never be a view name.
+/// [`crate::layout::valid_view_name`] refuses these, which is what lets
+/// [`is_view_tree_dir`] answer by node kind alone.
+pub const RESERVED_VIEW_NAMES: &[&str] = &[DEFS_SUBDIR, CONTROL_SUBDIR];
+/// The files one tree owns: main db, WAL, shared-memory sidecar.
+pub const TREE_DB_EXTS: &[&str] = &["", "-wal", "-shm"];
+
+use std::path::{Path, PathBuf};
+
+/// `<base>/meta` — the metadata half of a store root.
+pub fn meta_dir(base: &Path) -> PathBuf {
+    base.join(META_SUBDIR)
+}
+
+/// `<base>/meta/views` — the view-definition slots.
+pub fn defs_dir(base: &Path) -> PathBuf {
+    meta_dir(base).join(DEFS_SUBDIR)
+}
+
+/// `<base>/meta/_control` — where the control-plane stores live.
+pub fn control_dir(base: &Path) -> PathBuf {
+    meta_dir(base).join(CONTROL_SUBDIR)
+}
+
+/// One control-plane store, e.g. `<base>/meta/_control/refs.db`.
+pub fn control_db_path(base: &Path, stem: &str) -> PathBuf {
+    control_dir(base).join(format!("{stem}.db"))
+}
+
+/// The control plane that OWNS a given metadata db, found by walking up to the
+/// store's `meta/` directory instead of by counting parents.
+///
+/// Counting parents looks identical and is not. The layout puts exactly one file
+/// inside a tree home that is deliberately not the tree — the `import` scratch
+/// db — and for that file "two levels up" is the tree directory itself, which
+/// would hand the scratch its OWN ledger. Holder bookkeeping that two processes
+/// believe they share has to be one file, so the store is identified by name,
+/// not by depth.
+///
+/// A db that is under no `meta/` at all is not part of a store: `MetaEngine`
+/// tests and any caller that opens a standalone file get their ledger beside it,
+/// which is what such a file had before this layout existed.
+pub fn control_dir_for_db(db: &Path) -> PathBuf {
+    let mut up = db.parent();
+    while let Some(dir) = up {
+        if dir.file_name().and_then(|n| n.to_str()) == Some(META_SUBDIR) {
+            return dir.join(CONTROL_SUBDIR);
+        }
+        up = dir.parent();
+    }
+    db.parent().unwrap_or(Path::new(".")).join(CONTROL_SUBDIR)
+}
+
+/// The store-wide holder ledger a given metadata db belongs to — the single
+/// place that answers "which refs.db does this tree write bookkeeping into?".
+pub fn refs_ledger_for_db(db: &Path) -> PathBuf {
+    control_dir_for_db(db).join(REFS_DB)
+}
+
+/// `<base>/meta/.xfer` — the spool for staged exports/imports.
+pub fn xfer_dir(base: &Path) -> PathBuf {
+    meta_dir(base).join(XFER_SUBDIR)
+}
+
+/// The home of ONE physical view tree: `<base>/meta/<view>`.
+pub fn view_dir(base: &Path, view: &str) -> PathBuf {
+    meta_dir(base).join(view)
+}
+
+/// The same location spelled the way an operator reads it in a message or a
+/// JSON field: `meta/<view>/<view>.db`, relative to the store root. Built from
+/// the same constants as [`view_db_path`], and a test asserts the two agree —
+/// a pretty string that quietly drifts from the real path is how documentation
+/// starts lying.
+pub fn tree_home_rel(view: &str) -> String {
+    format!("{META_SUBDIR}/{view}/{view}.db")
+}
+
+/// The tree's SQLite db: `<base>/meta/<view>/<view>.db`. The stem repeats the
+/// directory name on purpose — an enumerator that finds `lab/lab.db` learns the
+/// view name from the FILE as well as the directory, so a half-moved or
+/// hand-planted tree cannot silently change identity.
+pub fn view_db_path(base: &Path, view: &str) -> PathBuf {
+    view_dir(base, view).join(format!("{view}.db"))
+}
+
+/// The same tree db with a SQLite sidecar suffix (`""`, `"-wal"`, `"-shm"`).
+pub fn view_db_with_ext(base: &Path, view: &str, ext: &str) -> PathBuf {
+    view_dir(base, view).join(format!("{view}.db{ext}"))
+}
+
+/// The FLAT (v1) location of the same tree, `<base>/meta/<view>.db` — only the
+/// guard and the migrator speak this.
+pub fn legacy_db_path(base: &Path, view: &str) -> PathBuf {
+    meta_dir(base).join(format!("{view}.db"))
+}
+
+/// Is a `<base>/meta/` entry name the home of a physical view tree? Structural:
+/// a name that is a legal view name and not a reserved slot. Dot-prefixed
+/// entries (the spool, scratch files) are never trees.
+pub fn is_view_tree_dir(name: &str) -> bool {
+    !name.starts_with('.')
+        && !RESERVED_VIEW_NAMES.contains(&name)
+        && crate::layout::valid_view_name(name)
+}
+
+/// THE enumerator: names of the physical trees this SQLite store holds,
+/// sorted. Everything that asks "which views exist on disk" goes through here
+/// (the ledger rebuild, both GC passes, `view list`, the server's epoch scan),
+/// so a fourth control store, a spool directory or a stray sidecar cannot be
+/// mistaken for a tree by one call site and not another.
+///
+/// A directory counts as a tree only when it actually holds `<name>.db`; an
+/// empty or half-created directory is reported as absent rather than as a
+/// corrupt view, which is what makes a failed `view create` or an interrupted
+/// migration visible as "no such view" instead of as a mountable garbage name.
+pub fn list_view_trees(base: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(meta_dir(base)) {
+        for ent in rd.flatten() {
+            let name = match ent.path().file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            if !is_view_tree_dir(&name) {
+                continue;
+            }
+            if view_db_path(base, &name).is_file() {
+                out.push(name);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The api-key store's wrap-key file, beside the store itself (`store.key`).
+pub const STORE_KEY_FILE: &str = "store.key";
+
+/// Which flat (v1) artifacts still sit directly in `<base>/meta/`? Non-empty
+/// means the store predates layout v2: view dbs, their sidecars, or a control
+/// file that has not been moved into `_control/` yet. Definitions and the
+/// spool are not evidence — `views/` and `.xfer/` exist in both layouts.
+pub fn legacy_flat_entries(base: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(meta_dir(base)) {
+        for ent in rd.flatten() {
+            let name = match ent.path().file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            if !ent.path().is_file() || name.starts_with('.') {
+                continue;
+            }
+            if name.ends_with(".db")
+                || name.ends_with(".db-wal")
+                || name.ends_with(".db-shm")
+                || name.ends_with(".db.push.tmp")
+                || name == STORE_KEY_FILE
+            {
+                out.push(name);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The guard every SQLite-store entrance runs before touching a tree: a flat
+/// v1 store is refused with the one command that fixes it, rather than being
+/// read as an empty store (which would offer `view create` over live data and,
+/// far worse, hand `gc --apply` an EMPTY view list — every live blob would then
+/// look orphaned and the ledger would be rebuilt to zero holds).
+///
+/// The entrances are deliberately the DESTRUCTIVE and the OPENING ones, not
+/// every reader: [`crate::gc`], [`MetaEngine::rebuild_ledger`],
+/// [`crate::mcp::ControlStore`]'s physical-view methods, the CLI's own
+/// create/import arms and `MetaStore::open_sqlite` (which a `meta-server`
+/// reaches at startup, so a replica cannot serve an unmigrated directory).
+pub fn layout_guard(base: &Path) -> Result<(), String> {
+    let flat = legacy_flat_entries(base);
+    if flat.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{} still uses the flat pre-v2 metadata layout ({} top-level db file(s), e.g. {}); no grovefs command reads that layout any more — stop every meta-server and mount on this store, then run `grovefs layout --meta-dir {} migrate`",
+        meta_dir(base).display(),
+        flat.len(),
+        meta_dir(base).join(&flat[0]).display(),
+        base.display(),
+    ))
+}
+
+/// Create the tree's home and return its db path. Every "open, creating if
+/// absent" site funnels through here so the directory never has to be
+/// remembered separately.
+pub fn ensure_view_db_path(base: &Path, view: &str) -> std::io::Result<PathBuf> {
+    let path = view_db_path(base, view);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    Ok(path)
 }
 
 /// One `CREATE` request in a batch (see
@@ -472,6 +726,116 @@ pub use engine::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pretty spelling a message or a JSON field shows must be the layout's
+    /// own path, not a string someone typed alongside it.
+    #[test]
+    fn the_operator_facing_tree_home_matches_the_real_path() {
+        let base = Path::new("/srv/grovefs");
+        for view in ["team", "a-b_c1"] {
+            let rel = tree_home_rel(view);
+            let real = view_db_path(base, view);
+            assert_eq!(
+                real,
+                base.join(&rel),
+                "`{rel}` in a message has to resolve to the file the code opens"
+            );
+        }
+        assert_eq!(tree_home_rel("team"), "meta/team/team.db");
+    }
+
+    /// Which ledger a given db writes bookkeeping into. The import scratch file
+    /// is the case that a positional rule gets wrong, and getting it wrong means
+    /// a private ledger — so this is asserted, not trusted.
+    #[test]
+    fn a_tree_and_its_scratch_share_one_store_ledger() {
+        let base = Path::new("/srv/grovefs");
+        let tree = view_db_path(base, "team");
+        assert_eq!(
+            refs_ledger_for_db(&tree),
+            control_db_path(base, "refs"),
+            "a tree's ledger is the store's, not one inside its own directory"
+        );
+        // The scratch db `import` builds inside the tree home: same store.
+        let scratch = view_dir(base, "team").join(".team.import-7-9");
+        assert_eq!(refs_ledger_for_db(&scratch), refs_ledger_for_db(&tree));
+        // A standalone db belongs to no store and keeps its ledger beside it.
+        let lone = Path::new("/tmp/whatever.db");
+        assert_eq!(
+            refs_ledger_for_db(lone),
+            Path::new("/tmp/_control/refs.db"),
+            "and must not reach out to a store it was never told about"
+        );
+    }
+
+    /// A directory name is a tree only if the layout can name it one. Reserved
+    /// slots and dot-prefixed scratch both live in `meta/` beside the trees.
+    #[test]
+    fn only_real_tree_directories_are_enumerated() {
+        assert!(is_view_tree_dir("team"));
+        assert!(is_view_tree_dir("a-b_c1"));
+        for n in [
+            DEFS_SUBDIR,
+            CONTROL_SUBDIR,
+            ".xfer",
+            ".team.import-4-5",
+            "", // .
+            "..",
+            "a b",
+            "a/b",
+        ] {
+            assert!(!is_view_tree_dir(n), "'{n}' must not read as a view tree");
+        }
+    }
+
+    /// What counts as "still flat" — the one signal that decides whether the
+    /// whole toolchain refuses a store.
+    #[test]
+    fn the_flat_test_sees_every_legacy_shape_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let meta = meta_dir(base);
+        std::fs::create_dir_all(&meta).unwrap();
+        assert!(layout_guard(base).is_ok(), "an empty or absent meta/ is v2");
+        for name in [
+            "team.db",
+            "refs.db-wal",
+            "api_keys.db-shm",
+            "team.db.push.tmp",
+            STORE_KEY_FILE,
+        ] {
+            std::fs::write(meta.join(name), b"x").unwrap();
+            let flat = legacy_flat_entries(base);
+            assert!(flat.contains(&name.to_string()), "'{name}' must look flat");
+            assert!(layout_guard(base).is_err());
+            std::fs::remove_file(meta.join(name)).unwrap();
+        }
+        // The v2 shapes a real store has: tree dirs, the control slot, the
+        // definition slot, the spool, and a log file. None of them is flat.
+        std::fs::create_dir_all(meta.join("team")).unwrap();
+        std::fs::write(view_db_path(base, "team"), b"x").unwrap();
+        std::fs::create_dir_all(control_dir(base)).unwrap();
+        std::fs::write(control_db_path(base, "refs"), b"x").unwrap();
+        std::fs::create_dir_all(defs_dir(base)).unwrap();
+        std::fs::write(defs_dir(base).join("team.layout"), b"base team\n").unwrap();
+        std::fs::create_dir_all(xfer_dir(base)).unwrap();
+        std::fs::write(meta_dir(base).join("notes.txt"), b"ignored").unwrap();
+        assert_eq!(legacy_flat_entries(base), Vec::<String>::new());
+        assert!(layout_guard(base).is_ok());
+        assert_eq!(list_view_trees(base), vec!["team".to_string()]);
+    }
+
+    /// A half-created tree directory (a `view create` that died before the db
+    /// landed) is not a view: listing it would promise a tree nothing can open.
+    #[test]
+    fn a_tree_directory_without_its_db_is_not_a_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        std::fs::create_dir_all(view_dir(base, "ghost")).unwrap();
+        std::fs::create_dir_all(view_dir(base, "real")).unwrap();
+        std::fs::write(view_db_path(base, "real"), b"").unwrap();
+        assert_eq!(list_view_trees(base), vec!["real".to_string()]);
+    }
 
     #[test]
     fn control_stores_are_never_view_trees() {

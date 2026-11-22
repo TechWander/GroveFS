@@ -12,7 +12,7 @@ forks).
 
 **This entrance is the control plane**, and its home follows the metadata
 backend: on embedded SQLite it writes `<meta-dir>/meta/views/*.layout` (a fork
-additionally writes `meta/<name>.db` and rebuilds the `refs.db` ledger); when
+additionally writes `meta/<name>/<name>.db` and rebuilds the `refs.db` ledger); when
 the server runs with `--meta-store postgres://…` definitions write to the PG table
 `grovefs_control.view_defs` instead and nothing control-plane lands on local
 disk — a fork there copies the `grovefs_v_<hex>` schema itself (one transaction,
@@ -141,14 +141,14 @@ bash scripts/smoke.sh
 
 Neither read-only probe touches data bytes: `list_view_tree` opens the view's
 tree read-only **through the backend the server is bound to** — the local
-`<meta-dir>/meta/<view>.db` under `--meta-dir`, or the `grovefs_v_<hex>` PG
+`<meta-dir>/meta/<view>/<view>.db` under `--meta-dir`, or the `grovefs_v_<hex>` PG
 schema under `--meta-store postgres://…` — and renders it through the same
 `LayoutMeta` lens a mount uses; `get_view` only reads the definition's text.
 A tree the served store cannot reach is refused with the exact wording
 (verified against the current build):
 
 ```
-no metadata tree for view 'X' (<db>/meta/X.db) — list_view_tree walks this
+no metadata tree for view 'X' (<db>/meta/X/X.db) — list_view_tree walks this
 store's own backend; a remote tree not reachable from here is not
 ```
 

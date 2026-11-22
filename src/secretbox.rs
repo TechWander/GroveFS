@@ -23,7 +23,7 @@
 //! What it does NOT do, stated because a security claim that overstates itself
 //! is worse than no claim: this is not per-row secrecy. Everything wrapped by
 //! one store key opens with that one store key, so whoever reads
-//! `<meta-dir>/meta/store.key` AND the `api_keys` table has every credential in
+//! `<meta-dir>/meta/_control/store.key` AND the `api_keys` table has every credential in
 //! the deployment. What the wrapping buys is narrower and real:
 //! - a `pg_dump`, a replica, a file backup, a support bundle or a `SELECT *`
 //!   pasted into a ticket no longer contains usable credentials;

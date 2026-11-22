@@ -1,5 +1,5 @@
 //! `grovefs du` against a local store. The store root holds BOTH halves of a
-//! deployment (`meta/<view>.db` and `blocks/`), so naming it once has to be
+//! deployment (`meta/<view>/<view>.db` and `blocks/`), so naming it once has to be
 //! enough — and where the bytes demonstrably are not, the command has to say
 //! so instead of handing back a tree of zeros.
 

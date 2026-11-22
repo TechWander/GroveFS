@@ -167,8 +167,9 @@ pub struct ViewEntry {
 /// Everything a store exposes: physical view DBs plus governed definitions.
 #[derive(Debug, Default)]
 pub struct StoreViews {
-    /// Physical view trees (the storage identities): `<meta-dir>/meta/<view>.db`
-    /// files under SQLite, `grovefs_v_<hex>` schemas under PostgreSQL.
+    /// Physical view trees (the storage identities): each in its own
+    /// `<meta-dir>/meta/<view>/<view>.db` file under SQLite, `grovefs_v_<hex>`
+    /// schemas under PostgreSQL.
     pub physical: Vec<String>,
     /// The governed definitions (derived / alias / fork), sorted by name:
     /// `meta/views/*.layout` slots under SQLite, `grovefs_control.view_defs`
@@ -184,7 +185,7 @@ pub struct StoreViews {
 /// the API-key/audit store) actually live. The rule is simple: the control
 /// plane follows the metadata backend —
 /// - **SQLite** (default): definitions are plain-text slots under
-///   `<meta-dir>/meta/views/<name>.layout`, keys stay in `<meta-dir>/meta/api_keys.db`;
+///   `<meta-dir>/meta/views/<name>.layout`, keys stay in `<meta-dir>/meta/_control/api_keys.db`;
 /// - **PostgreSQL** (`--meta-store postgres://…`): definitions are rows of
 ///   `grovefs_control.view_defs`, keys and audit rows land in
 ///   `grovefs_control.api_keys` / `grovefs_control.mcp_calls` — a single
@@ -294,8 +295,9 @@ pub trait ControlStore: Send + Sync {
 }
 
 /// The local-file control plane: `<base>/meta/views/<name>.layout` slots plus
-/// the physical `<base>/meta/<view>.db` trees (the SQLite system of record,
-/// unchanged from before this abstraction existed).
+/// the physical `<base>/meta/<view>/<view>.db` trees (the SQLite system of
+/// record, unchanged in meaning since layout v2 moved each tree into a directory
+/// of its own).
 pub struct FileControlStore {
     base: PathBuf,
 }
@@ -308,7 +310,7 @@ impl FileControlStore {
     }
 
     fn def_dir(&self) -> PathBuf {
-        self.base.join("meta").join("views")
+        crate::meta::defs_dir(&self.base)
     }
 
     fn slot(&self, name: &str) -> PathBuf {
@@ -316,7 +318,14 @@ impl FileControlStore {
     }
 
     fn db(&self, name: &str) -> PathBuf {
-        self.base.join("meta").join(format!("{name}.db"))
+        crate::meta::view_db_path(&self.base, name)
+    }
+
+    /// A flat v1 directory has no trees at all as far as this store is
+    /// concerned, so every method that answers "what is on disk" refuses with
+    /// the repair command instead of answering "nothing".
+    fn guard(&self) -> Result<(), String> {
+        crate::meta::layout_guard(&self.base)
     }
 }
 
@@ -387,37 +396,21 @@ impl ControlStore for FileControlStore {
     }
 
     fn list_physical(&self) -> Result<Vec<String>, String> {
-        let mut out = Vec::new();
-        if let Ok(rd) = std::fs::read_dir(self.base.join("meta")) {
-            for ent in rd.flatten() {
-                let p = ent.path();
-                let Some(file) = p.file_name().and_then(|n| n.to_str()) else {
-                    continue;
-                };
-                // `api_keys.db` (the key/audit store), `web_accounts.db` (the web
-                // console's accounts) and `refs.db` (the cross-view holder ledger)
-                // are control-plane stores, not view trees — never surface them as
-                // mountable names. One predicate for every lister, so adding a
-                // fourth store cannot make it look like a view.
-                if crate::meta::is_view_db(file) {
-                    if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                        out.push(stem.to_string());
-                    }
-                }
-            }
-        }
-        out.sort();
-        out.dedup();
-        Ok(out)
+        self.guard()?;
+        // One enumerator for the whole product: a `meta/` entry is a tree when it
+        // is a DIRECTORY named like a view and holds `<name>.db` inside it. The
+        // control-plane stores cannot appear here any more because they live in
+        // `_control/`, not because a list of their names is remembered — which is
+        // the bug class this replaced (a fourth store used to become a mountable
+        // view for every lister that did not know its name).
+        Ok(crate::meta::list_view_trees(&self.base))
     }
 
     fn has_physical(&self, name: &str) -> Result<bool, String> {
-        // A local db file always counts (an operator can run a hybrid store, and
-        // `view rm`'s file bookkeeping still has to see it).
-        if self.db(name).is_file() {
-            return Ok(true);
-        }
-        Ok(false)
+        self.guard()?;
+        // A tree directory always counts (an operator can run a hybrid store,
+        // and `view rm`'s file bookkeeping still has to see it).
+        Ok(self.db(name).is_file())
     }
 
     fn store_for_db_path(&self, db: &Path) -> Arc<dyn ControlStore> {
@@ -453,18 +446,19 @@ impl ControlStore for FileControlStore {
         // Nothing to roll back is not an error: this door only runs when a
         // creation failed part-way, so the tree is either absent (a no-op) or
         // already correct.
-        let meta_dir = self.base.join("meta");
-        for ext in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(meta_dir.join(format!("{name}.db{ext}")));
+        for ext in crate::meta::TREE_DB_EXTS {
+            let _ = std::fs::remove_file(crate::meta::view_db_with_ext(&self.base, name, ext));
         }
+        // The directory the failed attempt made goes with its db, but only while
+        // it is empty.
+        let _ = std::fs::remove_dir(crate::meta::view_dir(&self.base, name));
     }
 
     fn drop_fork_tree(&self, name: &str) -> Result<(), String> {
-        let meta_dir = self.base.join("meta");
         // Definition is gone first: the name stops resolving even if a db file
         // lingers (e.g. a live meta-server still holds its handle open).
-        for ext in ["", "-wal", "-shm"] {
-            let db = meta_dir.join(format!("{name}.db{ext}"));
+        for ext in crate::meta::TREE_DB_EXTS {
+            let db = crate::meta::view_db_with_ext(&self.base, name, ext);
             if db.exists() {
                 std::fs::remove_file(&db).map_err(|e| {
                     format!(
@@ -478,6 +472,9 @@ impl ControlStore for FileControlStore {
         // survives so the baseline can actually free its own bytes again.
         crate::meta::rebuild_ledger(&self.base)
             .map_err(|e| format!("fork tree removed, but the ledger rebuild failed: {e}"))?;
+        // Best effort: an empty tree directory is noise in `view list`-adjacent
+        // tooling, but a non-empty one (an interrupted import scratch) is kept.
+        let _ = std::fs::remove_dir(crate::meta::view_dir(&self.base, name));
         Ok(())
     }
 
@@ -1546,7 +1543,7 @@ pub fn list_views_text(store: &dyn ControlStore) -> Result<Vec<OutLine>, String>
         // The tree's home is backend-specific — a SQLite db file or a PG schema.
         let home = match store.backend() {
             "postgres" => format!("own schema {}", schema_name_for(p)),
-            _ => format!("own tree meta/{p}.db"),
+            _ => format!("own tree {}", crate::meta::tree_home_rel(p)),
         };
         out.push(OutLine::Info(format!(
             "base view '{p}' -> {home} (read-write; deletes free a shared object only when no view holds it)"
@@ -1559,7 +1556,7 @@ pub fn list_views_text(store: &dyn ControlStore) -> Result<Vec<OutLine>, String>
 /// shared). For a derived view or an alias the underlying data is untouched;
 /// already-mounted clients keep their resolved lens until they remount (or the
 /// server cache evicts it). For a FORK the definition owns an independent
-/// metadata tree, so removing it also deletes `meta/<name>.db` (+ WAL/SHM) and
+/// metadata tree, so removing it also deletes `meta/<name>/<name>.db` (+ WAL/SHM) and
 /// rebuilds the cross-view ledger from the surviving trees — content bytes the
 /// base still holds stay, bytes no view holds anymore become freeable.
 pub fn remove_view(store: &dyn ControlStore, name: &str) -> Result<Vec<OutLine>, String> {
@@ -1833,7 +1830,7 @@ pub fn describe_view(store: &dyn ControlStore, name: &str) -> Result<Value, Stri
                 "name": name, "kind": "fork", "base": base,
                 "backend": store.backend(),
                 "mount": "structure read-write / content read-only (independent tree; deletes touch only this view)",
-                "own_tree": format!("meta/{name}.db"),
+                "own_tree": crate::meta::tree_home_rel(name),
                 "definition": text,
             }),
             None => {
@@ -2349,7 +2346,7 @@ pub fn tool_defs() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "db_path": str_prop("Metadata root holding meta/*.db and meta/views/*.layout; defaults to the server's --meta-dir/--home. Ignored when the server is bound to a `--meta-store postgres://…` URI — the control plane is URI-bound there")
+                    "db_path": str_prop("Metadata root holding meta/<view>/<view>.db, meta/views/*.layout and meta/_control/*.db; defaults to the server's --meta-dir/--home. Ignored when the server is bound to a `--meta-store postgres://…` URI — the control plane is URI-bound there")
                 }
             },
             "outputSchema": views_output_schema()
@@ -2468,7 +2465,7 @@ pub fn tool_defs() -> Value {
             "name": "list_view_tree",
             "title": "List view tree",
             "annotations": annot("List view tree", true, false, true),
-            "description": "DISCOVERY + SHAPE PREVIEW: render the directory listing a mount would actually show, read from the bound store's metadata (no mount, no data IO). Give `view` (physical, derived — rendered through its real lens including synthesized dirs, alias — the full real tree, or fork — the fork's OWN tree) to inspect an existing listing, OR `base` + inline `rules` to preview an UNPUBLISHED lens before committing it. Returns JSON {kind, rendered_from, root_path, dir_count, file_count, truncated, entries:[{path,kind,size}]} where each `path` is an absolute DISPLAY path — exactly the string to reuse in a hide/only/map rule. Use this to learn which paths exist instead of guessing. `size` is the metadata field, NOT a byte count: dirs report 4096, files 0, symlinks their target length (the walk never asks the data backend) — stat through a mount for real sizes. Trees are walked through the bound control store's own backend: a file store needs a local meta/<view>.db (a remote tree is not walked), while a PG-bound store reads the view's Postgres schema directly.",
+            "description": "DISCOVERY + SHAPE PREVIEW: render the directory listing a mount would actually show, read from the bound store's metadata (no mount, no data IO). Give `view` (physical, derived — rendered through its real lens including synthesized dirs, alias — the full real tree, or fork — the fork's OWN tree) to inspect an existing listing, OR `base` + inline `rules` to preview an UNPUBLISHED lens before committing it. Returns JSON {kind, rendered_from, root_path, dir_count, file_count, truncated, entries:[{path,kind,size}]} where each `path` is an absolute DISPLAY path — exactly the string to reuse in a hide/only/map rule. Use this to learn which paths exist instead of guessing. `size` is the metadata field, NOT a byte count: dirs report 4096, files 0, symlinks their target length (the walk never asks the data backend) — stat through a mount for real sizes. Trees are walked through the bound control store's own backend: a file store needs a local meta/<view>/<view>.db (a remote tree is not walked), while a PG-bound store reads the view's Postgres schema directly.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3211,7 +3208,7 @@ impl Session {
 /// client closes the pipe. Log/diagnostic noise goes to stderr only, keeping
 /// the stdout channel a clean protocol stream. With `require_key`, `tools/list`
 /// and `tools/call` are refused until an API key authenticates; every tool call
-/// is appended to the audit log either way — `<db>/meta/api_keys.db` under
+/// is appended to the audit log either way — `<db>/meta/_control/api_keys.db` under
 /// SQLite, `grovefs_control.mcp_calls` under a `postgres://` `--meta-store` URI.
 pub fn serve(
     default_db: PathBuf,
@@ -3282,13 +3279,28 @@ mod tests {
         Arc::new(FileControlStore::new(p))
     }
 
-    /// Seed `<home>/meta/team.db` with `/docs/a.md` and `/photos/private/x.jpg`
-    /// (the fixture the introspection tests walk). The writer is dropped before
-    /// returning so a read-only probe opens a clean handle.
+    /// Seed a physical view the way layout v2 stores it: an EMPTY tree db in its
+    /// own directory. Empty is enough for `has_physical` and enough to make an
+    /// actual open fail, which is exactly the split several tests below assert.
+    fn seed_tree(home: &Path, view: &str) {
+        let p = crate::meta::ensure_view_db_path(home, view).unwrap();
+        std::fs::write(&p, b"").unwrap();
+    }
+
+    /// Open a tree by VIEW NAME — never by re-spelling its path. Creates the
+    /// tree's own directory, so a fixture can call it on a fresh store.
+    fn open_tree(home: &Path, view: &str) -> MetaEngine {
+        let p = crate::meta::ensure_view_db_path(home, view).unwrap();
+        MetaEngine::open(&p).unwrap()
+    }
+
+    /// Seed `<home>/meta/team/team.db` with `/docs/a.md` and
+    /// `/photos/private/x.jpg` (the fixture the introspection tests walk). The
+    /// writer is dropped before returning so a read-only probe opens a clean
+    /// handle.
     fn seed_team_tree(home: &Path) {
-        std::fs::create_dir_all(home.join("meta")).unwrap();
         {
-            let m = MetaEngine::open(&home.join("meta/team.db")).unwrap();
+            let m = open_tree(home, "team");
             let docs = m
                 .create_node(ROOT_INO, "docs", true, None, 0o0755, 0, 0)
                 .unwrap();
@@ -3507,8 +3519,7 @@ mod tests {
     fn alias_refuses_a_dangling_physical_target() {
         let home = db();
         let store = fstore(&home);
-        std::fs::create_dir_all(home.join("meta")).unwrap();
-        std::fs::write(home.join("meta/team.db"), b"").unwrap();
+        seed_tree(&home, "team");
         let call = |id, name: &str, args: Value| {
             ask(
                 &json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
@@ -3556,8 +3567,7 @@ mod tests {
         let home = db();
         let store = fstore(&home);
         // Seed one physical view db so define/alias see a realistic store.
-        std::fs::create_dir_all(home.join("meta")).unwrap();
-        std::fs::write(home.join("meta/team.db"), b"").unwrap();
+        seed_tree(&home, "team");
         let call = |id, name: &str, args: Value| {
             ask(
                 &json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
@@ -3642,7 +3652,7 @@ mod tests {
             let r = call(i, "remove_view", json!({"name": n}));
             assert!(text(&r).contains("removed view definition"));
         }
-        assert!(home.join("meta/team.db").is_file());
+        assert!(crate::meta::view_db_path(&home, "team").is_file());
         let gone = call(18, "remove_view", json!({"name": "docsonly"}));
         assert_eq!(gone["result"]["isError"], true);
         assert!(text(&gone).starts_with("no view definition 'docsonly' in"));
@@ -3657,7 +3667,7 @@ mod tests {
         let store = fstore(&home);
         std::fs::create_dir_all(home.join("meta")).unwrap();
         {
-            let e = crate::meta::MetaEngine::open(&home.join("meta/base.db")).unwrap();
+            let e = open_tree(&home, "base");
             let docs = e
                 .create_node(crate::meta::ROOT_INO, "docs", true, None, 0o755, 1000, 1000)
                 .unwrap();
@@ -3703,7 +3713,7 @@ mod tests {
             "{t}"
         );
         assert!(t.contains("1 shared object(s)"), "{t}");
-        let lab = crate::meta::MetaEngine::open(&home.join("meta/lab.db")).unwrap();
+        let lab = open_tree(&home, "lab");
         let by = lab.lookup(crate::meta::ROOT_INO, "by_target").unwrap();
         let f = lab
             .lookup(by.id, "M31_2025.fits")
@@ -3754,7 +3764,7 @@ mod tests {
         let store = fstore(&home);
         std::fs::create_dir_all(home.join("meta")).unwrap();
         {
-            let m = MetaEngine::open(&home.join("meta/base.db")).unwrap();
+            let m = open_tree(&home, "base");
             let d = m
                 .create_node(ROOT_INO, "docs", true, None, 0o0755, 0, 0)
                 .unwrap();
@@ -3795,7 +3805,7 @@ mod tests {
             std::fs::read_to_string(home.join("meta/views/lab.layout")).unwrap(),
             "fork base\n"
         );
-        assert!(home.join("meta/lab.db").is_file());
+        assert!(crate::meta::view_db_path(&home, "lab").is_file());
         // list_views reports the fork beside the physical trees (incl. its own).
         let l = call(32, "list_views", json!({}));
         let parsed: Value = serde_json::from_str(&text(&l)).unwrap();
@@ -3807,7 +3817,7 @@ mod tests {
         let d = call(33, "get_view", json!({"name": "lab"}));
         let dv: Value = serde_json::from_str(&text(&d)).unwrap();
         assert_eq!(dv["kind"], "fork");
-        assert_eq!(dv["own_tree"], "meta/lab.db");
+        assert_eq!(dv["own_tree"], "meta/lab/lab.db");
         assert!(dv["mount"].as_str().unwrap().contains("content read-only"));
         // A fork is a tree identity, not a public name: aliasing it is refused.
         let a = call(34, "alias_view", json!({"name": "pub", "real": "lab"}));
@@ -3831,8 +3841,8 @@ mod tests {
         // Removing the fork deletes its tree; the base tree stays.
         let r = call(38, "remove_view", json!({"name": "lab"}));
         assert!(text(&r).contains("removed fork view 'lab' of base 'base'"));
-        assert!(!home.join("meta/lab.db").exists());
-        assert!(home.join("meta/base.db").is_file());
+        assert!(!crate::meta::view_db_path(&home, "lab").exists());
+        assert!(crate::meta::view_db_path(&home, "base").is_file());
     }
 
     #[test]
@@ -3861,7 +3871,7 @@ mod tests {
         // read-only walk below opens a clean handle: /docs/a.md and
         // /photos/private/x.jpg.
         {
-            let m = MetaEngine::open(&home.join("meta/team.db")).unwrap();
+            let m = open_tree(&home, "team");
             let docs = m
                 .create_node(ROOT_INO, "docs", true, None, 0o0755, 0, 0)
                 .unwrap();
@@ -3976,7 +3986,8 @@ mod tests {
         let home = db();
         let store = fstore(&home);
         std::fs::create_dir_all(home.join("meta")).unwrap();
-        // No meta/ghost.db exists → an honest control-plane refusal, not a crash
+        // No tree for `ghost` exists → an honest control-plane refusal, not
+        // a crash
         // (the store names its own backend — files here, `grovefs_control` on PG).
         let r = ask(
             &json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
@@ -3994,8 +4005,7 @@ mod tests {
     #[test]
     fn api_key_gate_refuses_then_admits_and_logs() {
         let home = db();
-        std::fs::create_dir_all(home.join("meta")).unwrap();
-        std::fs::write(home.join("meta/team.db"), b"").unwrap();
+        seed_tree(&home, "team");
         // Mint a key out-of-band, exactly as `grovefs apikey create` would.
         let store = ApiKeyStore::open(&home).unwrap();
         let (_id, key) = store.create("agent-a").unwrap();
@@ -4084,7 +4094,7 @@ mod tests {
         std::fs::create_dir_all(home.join("meta/views")).unwrap();
         // A physical view backed by a real engine tree, plus a derived definition.
         {
-            let m = MetaEngine::open(&home.join("meta/team.db")).unwrap();
+            let m = open_tree(&home, "team");
             let docs = m
                 .create_node(ROOT_INO, "docs", true, None, 0o0755, 0, 0)
                 .unwrap();
@@ -4092,7 +4102,7 @@ mod tests {
                 .unwrap();
         }
         std::fs::write(
-            home.join("meta/views/release.layout"),
+            crate::meta::defs_dir(&home).join("release.layout"),
             b"base team\nhide /photos/private\n",
         )
         .unwrap();
@@ -4170,10 +4180,10 @@ mod tests {
     fn prompts_are_instantiated_and_completion_lists_view_names() {
         let home = db();
         let store = fstore(&home);
-        std::fs::create_dir_all(home.join("meta/views")).unwrap();
-        std::fs::write(home.join("meta/team.db"), b"").unwrap();
+        seed_tree(&home, "team");
+        std::fs::create_dir_all(crate::meta::defs_dir(&home)).unwrap();
         std::fs::write(
-            home.join("meta/views/release.layout"),
+            crate::meta::defs_dir(&home).join("release.layout"),
             b"base team\nhide /x\n",
         )
         .unwrap();
@@ -4251,8 +4261,7 @@ mod tests {
     #[test]
     fn logging_setlevel_emits_notifications_above_threshold() {
         let home = db();
-        std::fs::create_dir_all(home.join("meta")).unwrap();
-        std::fs::write(home.join("meta/team.db"), b"").unwrap();
+        seed_tree(&home, "team");
         let mut sess = Session::new(home.clone(), None, false).unwrap();
         // No threshold yet: a call queues nothing.
         sess.handle(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call",

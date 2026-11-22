@@ -118,7 +118,7 @@ fn probe_of_existing_pg_view_walks_it_without_mutating_the_view_set() {
     // `grovefs_refs.holders` is a global table with no view column, so the
     // cascade deletes the tree and leaves this view's bookings behind, one row
     // per object it named (a zero-byte file books too). The rule lives in
-    // `rebuild_ledger` for the SQLite store (src/meta/engine.rs:1174) and in
+    // `rebuild_ledger` for the SQLite store (`src/meta/engine.rs`) and in
     // `.bneck/pg_drop_views.sh` for PG; here it is the same two statements.
     let schema = schema_name_for(&view);
     Client::connect(&uri, NoTls)

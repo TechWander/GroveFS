@@ -13,7 +13,7 @@
 //!
 //! Where it lives: the same control plane as the keys and the view
 //! definitions, because that is the deployment's one system of record. Under
-//! SQLite the two tables sit in `<base>/meta/web_accounts.db` beside
+//! SQLite the two tables sit in `<base>/meta/_control/web_accounts.db` beside
 //! `api_keys.db`; under PostgreSQL they are `grovefs_control.web_accounts` /
 //! `web_grants`, so a secondary meta-server (or a second web gateway aimed at
 //! the same URI) sees the same accounts with nothing to colocate.
@@ -363,9 +363,9 @@ pub struct WebAuthStore {
 
 impl WebAuthStore {
     /// Open (creating the schema on first use) the LOCAL store at
-    /// `<base>/meta/web_accounts.db`.
+    /// `<base>/meta/_control/web_accounts.db`.
     pub fn open(base: &std::path::Path) -> Result<Self, String> {
-        let path = base.join("meta").join("web_accounts.db");
+        let path = crate::meta::control_db_path(base, "web_accounts");
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }

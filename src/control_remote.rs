@@ -758,7 +758,7 @@ impl ControlStore for RemoteControlStore {
     fn open_ro_view(&self, _view: &str) -> Result<Arc<dyn MetaProvider>, String> {
         Err(
             "opening a view tree on the operator machine is not a control-plane operation — \
-             use `grovefs mount --meta-server …` or `grovefs du --meta-server …`"
+             use `grovefs mount --manager …` or `grovefs du --meta-server …`"
                 .into(),
         )
     }

@@ -33,10 +33,12 @@ pub fn with_ledger_serial<T>(f: impl FnOnce() -> T) -> T {
 /// best-effort when the file already exists (a standby never writes, and a
 /// count query against an unattached schema simply reads "no other view").
 fn attach_refs_ledger(conn: &Connection, path: &Path) -> rusqlite::Result<()> {
-    let ledger = path
-        .parent()
-        .map(|d| d.join(REFS_DB))
-        .ok_or_else(|| rusqlite::Error::InvalidParameterName("view db has no parent dir".into()))?;
+    // The ledger is no longer the db's SIBLING: since layout v2 a tree lives in
+    // its own directory, so the store-wide control file is reached through the
+    // `meta/` ancestor of the path. One rule owns the question, so a tree
+    // directory can never grow its own ledger copy — and neither can the
+    // scratch db `import` builds inside one.
+    let ledger = crate::meta::refs_ledger_for_db(path);
     if let Some(dir) = ledger.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -206,7 +208,7 @@ pub struct ForkStats {
 }
 
 /// Seed an INDEPENDENT metadata tree `name` as a point-in-time copy of the
-/// physical view `base_view`'s tree (`<base>/meta/<name>.db`). Content bytes
+/// physical view `base_view`'s tree (`<base>/meta/<name>/<name>.db`). Content bytes
 /// are SHARED, not copied: every distinct `data_ref` in the copy is booked once
 /// against the new view in the cross-view ledger, so a delete in either tree
 /// frees a blob only when its last name in the last holding view disappears.
@@ -226,9 +228,9 @@ pub fn fork_view(base: &Path, base_view: &str, name: &str) -> Result<ForkStats, 
 }
 
 /// [`fork_view`] with an explicit seeding choice. `seed == false` creates the
-/// fork's OWN tree at `meta/<name>.db` (schema + root only) and copies no rows,
-/// so the caller can place a curated subset later with [`ForkGraft`]. The
-/// definition still says `fork <base>`, so mount semantics are identical
+/// fork's OWN tree at `meta/<name>/<name>.db` (schema + root only) and copies
+/// no rows, so the caller can place a curated subset later with [`ForkGraft`].
+/// The definition still says `fork <base>`, so mount semantics are identical
 /// (structure writable, content EROFS) and deletes stay local to the fork.
 pub fn fork_view_with(
     base: &Path,
@@ -236,17 +238,20 @@ pub fn fork_view_with(
     name: &str,
     seed: bool,
 ) -> Result<ForkStats, String> {
-    let meta_dir = base.join("meta");
-    let src_path = meta_dir.join(format!("{base_view}.db"));
-    let dst_path = meta_dir.join(format!("{name}.db"));
+    layout_guard(base)?;
+    let src_path = view_db_path(base, base_view);
+    let dst_path = ensure_view_db_path(base, name)
+        .map_err(|e| format!("cannot create tree home for fork '{name}': {e}"))?;
+    // A fresh fork must not be handed a directory an earlier interrupted
+    // attempt left a db in — `MetaEngine::open` would silently adopt it.
+    if dst_path.exists() {
+        return Err(format!("fork target {} already exists", dst_path.display()));
+    }
     if !src_path.is_file() {
         return Err(format!(
             "no physical base tree {} — a fork copies a local SQLite tree",
             src_path.display()
         ));
-    }
-    if dst_path.exists() {
-        return Err(format!("fork target {} already exists", dst_path.display()));
     }
     if !seed {
         // Nothing to copy: opening the engine seeds the schema and the root row
@@ -707,9 +712,9 @@ pub fn graft_view(
     if items.is_empty() {
         return Err("empty graft plan — nothing to copy".to_string());
     }
-    let meta_dir = base.join("meta");
-    let src_path = meta_dir.join(format!("{src_view}.db"));
-    let dst_path = meta_dir.join(format!("{dst_view}.db"));
+    layout_guard(base)?;
+    let src_path = view_db_path(base, src_view);
+    let dst_path = view_db_path(base, dst_view);
     if !src_path.is_file() {
         return Err(format!(
             "no source tree {} — a graft copies names out of a LOCAL SQLite view",
@@ -890,7 +895,8 @@ pub fn export_view(
     out: &Path,
     force: bool,
 ) -> Result<ViewExportStats, String> {
-    let src_path = base.join("meta").join(format!("{view}.db"));
+    layout_guard(base)?;
+    let src_path = view_db_path(base, view);
     if !src_path.is_file() {
         return Err(format!(
             "no metadata tree {} — '{view}' is not a physical tree (an alias or derived view has only a definition file under meta/views/; a PostgreSQL-backed view lives in Postgres)",
@@ -903,10 +909,7 @@ pub fn export_view(
             out.display()
         ));
     }
-    let def_path = base
-        .join("meta")
-        .join("views")
-        .join(format!("{view}.layout"));
+    let def_path = defs_dir(base).join(format!("{view}.layout"));
     let definition = std::fs::read_to_string(&def_path).ok();
     let kind = match definition.as_deref() {
         Some(t) if t.lines().any(|l| l.trim_start().starts_with("fork ")) => "fork",
@@ -992,7 +995,8 @@ pub struct ViewImportStats {
     pub replaced: bool,
 }
 
-/// Import a metadata tree written by [`export_view`] as `<base>/meta/<view>.db`.
+/// Import a metadata tree written by [`export_view`] as
+/// `<base>/meta/<view>/<view>.db`.
 /// The target must not be governed by a definition; an existing tree is only
 /// overwritten with `replace` (and every mount/meta-server using the store must
 /// be stopped first). Rows are inserted in ONE transaction with their original
@@ -1005,10 +1009,11 @@ pub fn import_view(
     input: &Path,
     replace: bool,
 ) -> Result<ViewImportStats, String> {
-    let meta_dir = base.join("meta");
-    std::fs::create_dir_all(&meta_dir)
-        .map_err(|e| format!("cannot create {}: {e}", meta_dir.display()))?;
-    let dst = meta_dir.join(format!("{view}.db"));
+    layout_guard(base)?;
+    let home = view_dir(base, view);
+    std::fs::create_dir_all(&home)
+        .map_err(|e| format!("cannot create {}: {e}", home.display()))?;
+    let dst = view_db_path(base, view);
     let f = File::open(input).map_err(|e| format!("cannot open {}: {e}", input.display()))?;
     let mut rdr = BufReader::new(f);
     let mut header_line = String::new();
@@ -1057,16 +1062,16 @@ pub fn import_view(
     }
     // Build BESIDE the destination and rename at the very end: a corrupt export
     // (or a crash mid-import) never destroys an existing tree and never leaves a
-    // half-written one behind. The temp name does not end in `.db`, so
-    // `rebuild_ledger` and every view lister ignore it.
-    let tmp = meta_dir.join(format!(".{view}.import-{}-{}", std::process::id(), now()));
+    // half-written one behind. The temp name is dot-prefixed and lives in the
+    // tree's own directory, so no enumerator can read it as a view.
+    let tmp = home.join(format!(".{view}.import-{}-{}", std::process::id(), now()));
     let side = |p: &std::path::Path, ext: &str| -> std::path::PathBuf {
         let mut s = p.as_os_str().to_os_string();
         s.push(ext);
         std::path::PathBuf::from(s)
     };
     let scratch = |ext: &str| side(&tmp, ext);
-    for ext in ["", "-wal", "-shm"] {
+    for ext in TREE_DB_EXTS {
         let _ = std::fs::remove_file(scratch(ext));
     }
     let built = (|| -> Result<(i64, i64), String> {
@@ -1242,7 +1247,7 @@ pub fn import_view(
     let (nodes, blobs) = match built {
         Ok(v) => v,
         Err(e) => {
-            for ext in ["", "-wal", "-shm"] {
+            for ext in TREE_DB_EXTS {
                 let _ = std::fs::remove_file(scratch(ext));
             }
             return Err(e);
@@ -1255,7 +1260,7 @@ pub fn import_view(
         let _ = std::fs::remove_file(side(&dst, ext));
     }
     if let Err(e) = std::fs::rename(&tmp, &dst) {
-        for ext in ["", "-wal", "-shm"] {
+        for ext in TREE_DB_EXTS {
             let _ = std::fs::remove_file(scratch(ext));
         }
         return Err(format!(
@@ -1283,28 +1288,30 @@ pub fn import_view(
 /// Rewrite the ledger from the trees that actually exist: `data_ref` -> the
 /// number of DISTINCT view dbs holding a name for it. Backs `grovefs refs
 /// rebuild` after out-of-band view-db removal (the only over-count source).
+///
+/// The tree set comes from [`list_view_trees`], the one enumerator: under layout
+/// v2 a `meta/` walk that took every `*.db` it saw would find the definitions
+/// directory's neighbours but not the trees, and a walk that guessed from
+/// directory names would count a half-created directory as a holder.
 pub fn rebuild_ledger(base: &Path) -> rusqlite::Result<usize> {
-    let meta_dir = base.join("meta");
-    let mut views: Vec<std::path::PathBuf> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(&meta_dir) {
-        for ent in rd.flatten() {
-            let p = ent.path();
-            let name = p
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default()
-                .to_string();
-            // Control-plane stores (keys, web accounts, the ledger itself) carry
-            // no node rows and have no `node` table at all: one shared predicate
-            // instead of a list of names this function would have to keep current.
-            if crate::meta::is_view_db(&name) {
-                views.push(p);
-            }
-        }
+    // NON-NEGOTIABLE: on a flat v1 directory the enumerator below sees no trees
+    // at all, and this function's contract is "rewrite the holds from what
+    // exists" — so without the guard it would book ZERO holders and the next
+    // `gc --apply` would free every object in the store. Refusing here is the
+    // difference between a layout change and a data-loss bug.
+    if let Err(msg) = layout_guard(base) {
+        return Err(rusqlite::Error::InvalidParameterName(msg));
     }
+    let views: Vec<std::path::PathBuf> = list_view_trees(base)
+        .into_iter()
+        .map(|name| view_db_path(base, &name))
+        .collect();
     // If this fails the very next `Connection::open` surfaces the real error.
-    let _ = std::fs::create_dir_all(&meta_dir);
-    let mut conn = Connection::open(meta_dir.join(REFS_DB))?;
+    let ledger = control_db_path(base, "refs");
+    if let Some(dir) = ledger.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut conn = Connection::open(&ledger)?;
     conn.execute_batch(
         "PRAGMA busy_timeout=5000;
          PRAGMA journal_mode=WAL;
@@ -1364,8 +1371,9 @@ pub struct BaseViewRemoval {
 
 /// Remove a physical BASE view's metadata tree from a local store: collect its
 /// blob references first (the tree is the only ledger of what it held), delete
-/// `meta/<view>.db` (+ WAL/SHM), then rebuild the cross-view ledger from the
-/// surviving trees so the dead tree's holds are gone. Returns the refs the tree
+/// `meta/<view>/<view>.db` (+ WAL/SHM) and the tree's own directory, then rebuild
+/// the cross-view ledger from the surviving trees so the dead tree's holds are
+/// gone. Returns the refs the tree
 /// held — a blob stays alive iff the rebuilt ledger still lists it; freeing the
 /// unreferenced ones is the caller's job through a `StorageBackend` (the key→
 /// path layout is backend-owned and offline here we only know the store root).
@@ -1376,19 +1384,16 @@ pub fn remove_base_view(base: &Path, view: &str) -> Result<BaseViewRemoval, Stri
     if !crate::layout::valid_view_name(view) {
         return Err(format!("invalid view name '{view}'"));
     }
-    let meta_dir = base.join("meta");
-    let db = meta_dir.join(format!("{view}.db"));
+    layout_guard(base)?;
+    let home = view_dir(base, view);
+    let db = view_db_path(base, view);
     if !db.is_file() {
         return Err(format!(
             "no physical base tree {} — '{view}' is either a governed name (see `grovefs view rm` WITHOUT --base), a name this store never had a tree for, or a tree this store does not hold",
             db.display()
         ));
     }
-    if meta_dir
-        .join("views")
-        .join(format!("{view}.layout"))
-        .is_file()
-    {
+    if defs_dir(base).join(format!("{view}.layout")).is_file() {
         return Err(format!(
             "'{view}' is governed by a view definition — remove the definition first (`grovefs view rm --name {view}`) before removing a base tree of the same name"
         ));
@@ -1414,10 +1419,20 @@ pub fn remove_base_view(base: &Path, view: &str) -> Result<BaseViewRemoval, Stri
             .collect();
         (nodes, refs)
     }; // read-only handle dropped before the delete
-    for ext in ["", "-wal", "-shm"] {
-        let p = meta_dir.join(format!("{view}.db{ext}"));
+    for ext in TREE_DB_EXTS {
+        let p = view_db_with_ext(base, view, ext);
         if p.exists() {
             std::fs::remove_file(&p).map_err(|e| format!("cannot delete {}: {e}", p.display()))?;
+        }
+    }
+    // The tree's directory goes with it, but only when it is genuinely empty:
+    // a dot-prefixed import scratch left by an interrupted `view import` is
+    // evidence, and deleting evidence is worse than leaving one empty folder.
+    if let Err(e) = std::fs::remove_dir(&home) {
+        if e.kind() != std::io::ErrorKind::DirectoryNotEmpty
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(format!("cannot remove tree home {}: {e}", home.display()));
         }
     }
     // The dead tree's holds must die with it: rewrite the ledger from the
@@ -1433,7 +1448,7 @@ pub fn remove_base_view(base: &Path, view: &str) -> Result<BaseViewRemoval, Stri
 /// the backend) can decide per ref after [`remove_base_view`].
 pub fn ledger_holds(base: &Path, dr: &str) -> rusqlite::Result<bool> {
     let conn = Connection::open_with_flags(
-        base.join("meta").join(REFS_DB),
+        control_db_path(base, "refs"),
         OpenFlags::SQLITE_OPEN_READ_ONLY,
     )?;
     conn.busy_timeout(std::time::Duration::from_millis(5000))?;
@@ -1786,12 +1801,8 @@ impl MetaEngine {
             apply_read_pragmas(&conn);
             // Best-effort ledger attach (no DDL — the file must already exist):
             // a standby never writes, and its cross-view hold checks simply read
-            // "no other view" when the sibling refs.db is absent.
-            if path
-                .parent()
-                .map(|d| d.join(REFS_DB).is_file())
-                .unwrap_or(false)
-            {
+            // "no other view" when the store's control ledger is absent.
+            if crate::meta::refs_ledger_for_db(path).is_file() {
                 let _ = attach_refs_ledger(&conn, path);
             }
             return Ok(Self {
@@ -1856,7 +1867,8 @@ impl MetaEngine {
              CREATE INDEX IF NOT EXISTS idx_locks_sid    ON locks(sid);
              CREATE INDEX IF NOT EXISTS idx_locks_expire ON locks(expires_at);",
         )?;
-        // Attach the shared cross-view holder ledger (sibling refs.db) so every
+        // Attach the shared cross-view holder ledger (the store's `_control`
+        // file) so every
         // IMMEDIATE tx below takes its write lock FIRST (uniform global lock
         // order, no cycles) and books adds/removes inside the same commit as
         // the node rows they describe. See the ledger section at the top.
@@ -3085,16 +3097,29 @@ pub enum MetaStore {
 }
 
 impl MetaStore {
-    /// Open a SQLite store for `<base>/meta/<view>.db` (`readonly` for a standby).
+    /// Open a SQLite store for `<base>/meta/<view>/<view>.db` (`readonly` for a
+    /// standby).
+    ///
+    /// The layout guard runs BEFORE any directory is created: a flat v1 store
+    /// must be refused rather than half-upgraded, because silently making
+    /// `meta/<view>/` for the views the operator opens next would leave the old
+    /// flat dbs readable by nothing while still holding the ledger's counts. The
+    /// refusal travels as [`rusqlite::Error::InvalidParameterName`] — the variant
+    /// this module already uses for "the path you handed me is not a tree here"
+    /// ([`attach_refs_ledger`]) — so the server's existing error printing shows
+    /// the whole repair command without a second conversion layer.
     pub fn open_sqlite(
         base: &std::path::Path,
         view: &str,
         readonly: bool,
     ) -> rusqlite::Result<Self> {
-        let path = base.join("meta").join(format!("{view}.db"));
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+        if let Err(msg) = layout_guard(base) {
+            return Err(rusqlite::Error::InvalidParameterName(msg));
         }
+        let path = ensure_view_db_path(base, view)
+            .map_err(|e| rusqlite::Error::InvalidParameterName(format!(
+                "cannot create tree home for '{view}': {e}"
+            )))?;
         MetaEngine::open_ex(&path, readonly).map(MetaStore::Sqlite)
     }
 
@@ -3412,6 +3437,12 @@ impl From<rusqlite::Error> for MetaError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Open a view tree where layout v2 says it lives. Tests name the VIEW,
+    /// never the path: re-spelling `meta/<x>.db` here is exactly how a layout
+    /// change stops being covered by the suite.
+    fn tree(base: &std::path::Path, view: &str) -> MetaEngine {
+        MetaEngine::open(&crate::meta::ensure_view_db_path(base, view).unwrap()).unwrap()
+    }
 
     /// The SQLite read pool is a warm FLOOR plus a retain CEILING, and the two
     /// numbers are load-bearing in opposite directions: the floor is the idle
@@ -4100,10 +4131,8 @@ mod tests {
     #[test]
     fn fork_copies_tree_and_shares_blobs_until_last_holder_leaves() {
         let dir = tempfile::tempdir().unwrap();
-        let meta = dir.path().join("meta");
-        std::fs::create_dir_all(&meta).unwrap();
         {
-            let e = MetaEngine::open(&meta.join("base.db")).unwrap();
+            let e = tree(dir.path(), "base");
             let d = e
                 .create_node(ROOT_INO, "docs", true, None, 0o755, 1000, 1000)
                 .unwrap();
@@ -4118,7 +4147,7 @@ mod tests {
         let st = fork_view(dir.path(), "base", "copy").unwrap();
         assert_eq!(st.nodes, 5, "root + docs + two hard-linked names + own.txt");
         assert_eq!(st.blobs, 2, "shared + own");
-        let copy = MetaEngine::open(&meta.join("copy.db")).unwrap();
+        let copy = tree(dir.path(), "copy");
         let docs = copy.lookup(ROOT_INO, "docs").expect("dir copied");
         let a = copy.lookup(docs.id, "a.txt").expect("file copied");
         let b = copy.lookup(docs.id, "b.txt").expect("hard link copied");
@@ -4132,7 +4161,7 @@ mod tests {
         copy.create_node(ROOT_INO, "scratch", true, None, 0o755, 1000, 1000)
             .unwrap();
         // ...but removing a shared name must not free the blob: the base holds it.
-        let base = MetaEngine::open(&meta.join("base.db")).unwrap();
+        let base = tree(dir.path(), "base");
         assert_eq!(
             copy.unlink(docs.id, "a.txt").unwrap(),
             None,
@@ -4186,10 +4215,8 @@ mod tests {
     #[test]
     fn empty_fork_then_graft_places_renamed_subset_and_shares_bytes() {
         let dir = tempfile::tempdir().unwrap();
-        let meta = dir.path().join("meta");
-        std::fs::create_dir_all(&meta).unwrap();
         {
-            let e = MetaEngine::open(&meta.join("base.db")).unwrap();
+            let e = tree(dir.path(), "base");
             let docs = e
                 .create_node(ROOT_INO, "docs", true, None, 0o755, 1000, 1000)
                 .unwrap();
@@ -4213,7 +4240,7 @@ mod tests {
         }
         let st = fork_view_with(dir.path(), "base", "lab", false).unwrap();
         assert_eq!((st.nodes, st.blobs), (1, 0), "empty fork is root only");
-        let lab = MetaEngine::open(&meta.join("lab.db")).unwrap();
+        let lab = tree(dir.path(), "lab");
         assert!(lab.readdir(ROOT_INO).is_empty(), "nothing was copied");
 
         let items =
@@ -4245,7 +4272,7 @@ mod tests {
         );
         // Two holders now: the base's last-name delete must keep the bytes the
         // fork still names, and the fork's delete then frees them.
-        let base = MetaEngine::open(&meta.join("base.db")).unwrap();
+        let base = tree(dir.path(), "base");
         let docs = base.lookup(ROOT_INO, "docs").unwrap();
         assert_eq!(
             base.unlink(docs.id, "uuid-a").unwrap(),
@@ -4266,10 +4293,8 @@ mod tests {
     #[test]
     fn graft_conflicts_are_all_or_nothing_unless_skipping() {
         let dir = tempfile::tempdir().unwrap();
-        let meta = dir.path().join("meta");
-        std::fs::create_dir_all(&meta).unwrap();
         {
-            let e = MetaEngine::open(&meta.join("base.db")).unwrap();
+            let e = tree(dir.path(), "base");
             let d = e
                 .create_node(ROOT_INO, "d", true, None, 0o755, 1000, 1000)
                 .unwrap();
@@ -4290,7 +4315,7 @@ mod tests {
             (1, 0, 1, 1),
             "one new name, one skipped collision"
         );
-        let lab = MetaEngine::open(&meta.join("lab.db")).unwrap();
+        let lab = tree(dir.path(), "lab");
         let stage = lab.lookup(ROOT_INO, "stage").unwrap();
         assert!(lab.lookup(stage.id, "new.txt").is_some());
         assert!(lab.lookup(stage.id, "x").is_some());
@@ -4312,10 +4337,8 @@ mod tests {
     #[test]
     fn graft_keeps_hard_links_inside_the_subset() {
         let dir = tempfile::tempdir().unwrap();
-        let meta = dir.path().join("meta");
-        std::fs::create_dir_all(&meta).unwrap();
         {
-            let e = MetaEngine::open(&meta.join("base.db")).unwrap();
+            let e = tree(dir.path(), "base");
             let f = e
                 .create_node(ROOT_INO, "a", false, Some("one"), 0o644, 1000, 1000)
                 .unwrap();
@@ -4329,7 +4352,7 @@ mod tests {
             (4, 2, 1),
             "two dirs + two names, one blob"
         );
-        let lab = MetaEngine::open(&meta.join("lab.db")).unwrap();
+        let lab = tree(dir.path(), "lab");
         let p = lab.lookup(ROOT_INO, "p").unwrap();
         let a = lab.lookup(p.id, "a").unwrap();
         let q = lab.lookup(ROOT_INO, "q").unwrap();
@@ -4344,10 +4367,8 @@ mod tests {
     #[test]
     fn graft_is_atomic_on_unknown_source_and_creates_dest_prefix() {
         let dir = tempfile::tempdir().unwrap();
-        let meta = dir.path().join("meta");
-        std::fs::create_dir_all(&meta).unwrap();
         {
-            let e = MetaEngine::open(&meta.join("base.db")).unwrap();
+            let e = tree(dir.path(), "base");
             e.create_node(ROOT_INO, "x", false, Some("blob-x"), 0o644, 1000, 1000)
                 .unwrap();
         }
@@ -4358,7 +4379,7 @@ mod tests {
             err.contains("'missing' does not exist in view 'base'"),
             "{err}"
         );
-        let lab = MetaEngine::open(&meta.join("lab.db")).unwrap();
+        let lab = tree(dir.path(), "lab");
         assert!(
             lab.readdir(ROOT_INO).is_empty(),
             "the good line before the bad one was rolled back too"
@@ -4380,13 +4401,12 @@ mod tests {
     #[test]
     fn fork_refuses_missing_source_and_existing_target() {
         let dir = tempfile::tempdir().unwrap();
-        let meta = dir.path().join("meta");
-        std::fs::create_dir_all(&meta).unwrap();
         assert!(fork_view(dir.path(), "absent", "copy").is_err());
         {
-            let _e = MetaEngine::open(&meta.join("base.db")).unwrap();
+            let _e = tree(dir.path(), "base");
         }
-        std::fs::write(meta.join("copy.db"), b"not a tree").unwrap();
+        std::fs::create_dir_all(crate::meta::view_dir(dir.path(), "copy")).unwrap();
+        std::fs::write(crate::meta::view_db_path(dir.path(), "copy"), b"not a tree").unwrap();
         assert!(fork_view(dir.path(), "base", "copy").is_err());
         assert!(fork_view(dir.path(), "base", "base").is_err());
     }
@@ -4398,10 +4418,8 @@ mod tests {
     #[test]
     fn export_import_roundtrip_preserves_tree_and_hardlinks() {
         let dir = tempfile::tempdir().unwrap();
-        let src_meta = dir.path().join("src/meta");
-        std::fs::create_dir_all(&src_meta).unwrap();
         {
-            let e = MetaEngine::open(&src_meta.join("team.db")).unwrap();
+            let e = tree(&dir.path().join("src"), "team");
             let d = e
                 .create_node(ROOT_INO, "docs", true, None, 0o755, 1000, 1001)
                 .unwrap();
@@ -4423,12 +4441,10 @@ mod tests {
         assert!(text.contains("\"format\":\"grovefs-view-metadata\""));
         assert!(text.contains("\"blobs\":1"));
 
-        let dst_meta = dir.path().join("dst/meta");
-        std::fs::create_dir_all(&dst_meta).unwrap();
         let ist = import_view(&dir.path().join("dst"), "copy", &out, false).unwrap();
         assert_eq!((ist.nodes, ist.blobs), (5, 1));
         assert!(!ist.replaced);
-        let copy = MetaEngine::open(&dst_meta.join("copy.db")).unwrap();
+        let copy = tree(&dir.path().join("dst"), "copy");
         let docs = copy.lookup(ROOT_INO, "docs").expect("dir imported");
         let a = copy.lookup(docs.id, "a.txt").expect("file imported");
         let b = copy.lookup(docs.id, "b.txt").expect("hard link imported");
@@ -4461,10 +4477,8 @@ mod tests {
     #[test]
     fn export_import_refuse_silent_overwrites() {
         let dir = tempfile::tempdir().unwrap();
-        let meta = dir.path().join("meta");
-        std::fs::create_dir_all(&meta).unwrap();
         {
-            let e = MetaEngine::open(&meta.join("team.db")).unwrap();
+            let e = tree(dir.path(), "team");
             e.create_node(ROOT_INO, "f", false, Some("k"), 0o644, 1000, 1000)
                 .unwrap();
         }
@@ -4491,7 +4505,6 @@ mod tests {
     #[test]
     fn import_rejects_bad_header_dangling_parent_and_count_mismatch() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("meta")).unwrap();
         let bad = dir.path().join("bad.jsonl");
         std::fs::write(&bad, "{\"format\":\"other\",\"version\":1}\n").unwrap();
         assert!(import_view(dir.path(), "v", &bad, false).is_err());
@@ -4526,7 +4539,6 @@ mod tests {
     #[test]
     fn failed_replace_keeps_the_previous_tree_and_leaves_no_scratch() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("meta")).unwrap();
         let good = dir.path().join("good.jsonl");
         let text = format!(
             "{{\"format\":\"grovefs-view-metadata\",\"version\":1,\"nodes\":2}}\n{}\n{}\n",
@@ -4549,9 +4561,9 @@ mod tests {
         let err = import_view(dir.path(), "v", &bad, true).unwrap_err();
         assert!(err.contains("missing or non-directory parent"), "{err}");
 
-        let e = MetaEngine::open(&dir.path().join("meta/v.db")).unwrap();
+        let e = tree(dir.path(), "v");
         assert_eq!(e.lookup(ROOT_INO, "keep").unwrap().id, 2);
-        let scratch: Vec<_> = std::fs::read_dir(dir.path().join("meta"))
+        let scratch: Vec<_> = std::fs::read_dir(crate::meta::view_dir(dir.path(), "v"))
             .unwrap()
             .flatten()
             .filter(|x| x.file_name().to_string_lossy().contains(".import-"))
@@ -4588,22 +4600,21 @@ mod tests {
     #[test]
     fn rebuild_ledger_clears_stale_holders() {
         let dir = tempfile::tempdir().unwrap();
-        // Match production layout: view dbs and refs.db all live under <base>/meta.
-        let meta = dir.path().join("meta");
-        std::fs::create_dir_all(&meta).unwrap();
+        // Match production layout: one directory per tree, the ledger in the
+        // control plane — both derived from the store root, not hand-spelled.
         {
-            let a = MetaEngine::open(&meta.join("a.db")).unwrap();
+            let a = tree(dir.path(), "a");
             a.create_node(ROOT_INO, "f", false, Some("k"), 0o644, 1000, 1000)
                 .unwrap();
         } // drop a's engine so its db file can be removed
-        std::fs::remove_file(meta.join("a.db")).unwrap();
+        std::fs::remove_file(crate::meta::view_db_path(dir.path(), "a")).unwrap();
         // Stale holder for "k" lingers from the deleted view; rebuild scans the
         // surviving trees (none reference k) and rewrites the ledger empty.
         let counted = rebuild_ledger(dir.path()).unwrap();
         assert_eq!(counted, 0, "no surviving view references k");
         // A fresh view that creates then unlinks the key now frees it (the
         // orphaned holder row no longer suppresses GC).
-        let c = MetaEngine::open(&meta.join("c.db")).unwrap();
+        let c = tree(dir.path(), "c");
         c.create_node(ROOT_INO, "z", false, Some("k"), 0o644, 1000, 1000)
             .unwrap();
         assert_eq!(

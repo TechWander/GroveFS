@@ -135,7 +135,7 @@ pub struct LayoutRules {
 ///   exposing storage identity).
 /// - [`ViewDef::Fork`]: a lone `fork <physical view>` line, no rules — an
 ///   INDEPENDENT metadata tree seeded from the base view at creation time
-///   (`<meta-dir>/meta/<name>.db`, content bytes shared through the cross-view
+///   (`<meta-dir>/meta/<name>/<name>.db`, content bytes shared through the cross-view
 ///   ledger). Structure (mkdir/rename/unlink) is writable; CONTENT writes are
 ///   refused, and a delete removes only this view's names — the base's tree
 ///   and the shared bytes are untouched.
@@ -198,12 +198,20 @@ fn basename(p: &str) -> &str {
     }
 }
 
-/// A view name used as a db/file component (`meta/<view>.db`,
-/// `meta/views/<name>.layout`): must be a single safe path element.
+/// A view name used as a path component. Since layout v2 a physical tree's
+/// name is used TWICE over — as a directory (`meta/<view>/`) and as the db
+/// inside it (`meta/<view>/<view>.db`) — so a name has to be a single safe path
+/// element that cannot collide with a layout slot: no separators, no dot
+/// prefix (a hidden file would be invisible to the tree enumerator while its
+/// data kept living), and none of
+/// [`RESERVED_VIEW_NAMES`](crate::meta::RESERVED_VIEW_NAMES), which are the
+/// `views/` and `_control/` directories themselves.
 pub fn valid_view_name(name: &str) -> bool {
     !name.is_empty()
         && name != "."
         && name != ".."
+        && !name.starts_with('.')
+        && !crate::meta::RESERVED_VIEW_NAMES.contains(&name)
         && !name.contains('/')
         && !name.contains('\\')
         && !name.chars().any(char::is_whitespace)

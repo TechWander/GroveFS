@@ -9,7 +9,7 @@
 //! model**.
 //!
 //! Mapping from the SQLite schema:
-//! - one `<home>/meta/<view>.db` file  ->  one schema `grovefs_v_<hex(view)>`
+//! - one `<home>/meta/<view>/<view>.db` file  ->  one schema `grovefs_v_<hex(view)>`
 //!   (a deterministic, injection-safe identifier; the per-view sequence keeps
 //!   `id`/`ino` small exactly like the file-per-view model, and the root row is
 //!   pinned at id 1 so [`crate::meta::ROOT_INO`] stays valid);
@@ -2851,7 +2851,8 @@ impl PgEngine {
 
     // ---- base-view teardown and ledger repair (governance plane) -----------
     //
-    // The SQLite arm unlinks `meta/<view>.db` and then rebuilds a file ledger.
+    // The SQLite arm removes the tree's own directory and then rebuilds a file
+    // ledger.
     // On PG the
     // tree is a `grovefs_v_<hex>` schema and the ledger is
     // `grovefs_refs.holders`, so a teardown is "unbook what the tree held, then
@@ -2867,7 +2868,7 @@ impl PgEngine {
     ///
     /// A missing schema is an error, never a cheerful zero: a typo must not
     /// read as a successful removal (the same rule the file arm applies to a
-    /// missing `meta/<view>.db`).
+    /// missing tree directory).
     pub fn remove_view(conn_uri: &str, view: &str) -> Result<PgPurgeReport, String> {
         // A sharded spec names several instances; this tree lives on the one
         // its placement (or its name hash) says, and so does the ledger it

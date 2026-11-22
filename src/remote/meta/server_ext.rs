@@ -325,7 +325,7 @@ impl MetaRuntime {
     fn claim_xfer(&self, handle: &str, who: &str) {
         let mut m = self.xfer_owner.lock();
         if m.len() > 64 {
-            let dir = self.base.join("meta").join(".xfer");
+            let dir = crate::meta::xfer_dir(&self.base);
             m.retain(|h, _| dir.join(h).exists());
         }
         m.insert(handle.to_string(), who.to_string());
@@ -435,7 +435,7 @@ impl MetaRuntime {
 }
 
 /// Central metadata authority. Holds one [`MetaEngine`] per view, opened on
-/// demand against an EXISTING `<base>/meta/<view>.db` (a missing one is
+/// demand against an EXISTING `<base>/meta/<view>/<view>.db` (a missing one is
 /// refused, never created), shared across all connection threads, so
 /// every client mounting the same view sees one consistent tree. Serving a whole
 /// view from a single engine means SQLite writes are serialized in-process by
@@ -454,7 +454,8 @@ pub struct MetaServer {
     /// Capability lifetime in seconds (`--data-access-ttl`); `0` = never expires.
     data_access_ttl: u64,
     /// Optional per-caller credential gate (`--require-api-key`), backed by the
-    /// same `<base>/meta/api_keys.db` `grovefs apikey` / `grovefs mcp` use.
+    /// same `<base>/meta/_control/api_keys.db` `grovefs apikey` / `grovefs mcp`
+    /// use.
     keys: Option<Arc<crate::apikeys::ApiKeyStore>>,
     role: Role,
     peer: Option<String>,
@@ -776,12 +777,19 @@ impl MetaServer {
                 ),
             ));
         }
-        // SQLite trees live under `<base>/meta`; a PG store writes nothing
-        // locally, so creating that directory would be a misleading footprint
-        // (an empty `meta/` on a host that has no local metadata at all). Under
-        // treedb the directory IS still needed — the control plane stayed local.
+        // SQLite trees live under `<base>/meta`, one directory each; a PG store
+        // writes nothing locally, so creating that directory would be a
+        // misleading footprint (an empty `meta/` on a host that has no local
+        // metadata at all). Under treedb the directory IS still needed — the
+        // control plane stayed local.
         if self.store.control_uri().is_none() {
-            std::fs::create_dir_all(self.base.join("meta"))?;
+            // Refusing an unmigrated flat store at STARTUP is the point: a
+            // replica that booted against a flat store would serve "no views"
+            // and let an operator create trees beside the ones it cannot read.
+            if let Err(msg) = crate::meta::layout_guard(&self.base) {
+                return Err(io::Error::other(msg));
+            }
+            std::fs::create_dir_all(crate::meta::meta_dir(&self.base))?;
         }
         // The CONTROL port's own credential store. Built here (and only here)
         // so `--control-listen` is self-contained: it does NOT reuse
@@ -944,10 +952,10 @@ impl MetaServer {
                 addr,
                 match &self.store {
                     StoreKind::Pg(_) => "grovefs_control.web_accounts/web_grants",
-                    StoreKind::Sqlite => "meta/web_accounts.db",
+                    StoreKind::Sqlite => "meta/_control/web_accounts.db",
                     #[cfg(feature = "treedb")]
                     StoreKind::Treedb(_) => {
-                        "meta/web_accounts.db (local: treedb serves trees, not accounts)"
+                        "meta/_control/web_accounts.db (local: treedb serves trees, not accounts)"
                     }
                 }
             );
@@ -2287,10 +2295,14 @@ fn control_dispatch(
                     )
                 }
                 StoreKind::Sqlite => {
-                    let mp = rt.base.join("meta").join(format!("{view}.db"));
-                    if let Some(dir) = mp.parent() {
-                        std::fs::create_dir_all(dir)
-                            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+                    let mp = crate::meta::ensure_view_db_path(&rt.base, &view)
+                        .map_err(|e| format!("cannot create tree home for '{view}': {e}"))?;
+                    if mp.exists() {
+                        // The `has_physical` check above refused a duplicate; this
+                        // is the race door, worded identically on purpose.
+                        return Err(format!(
+                            "view '{view}' already exists — remove it first (`view rm --name {view} --base`)"
+                        ));
                     }
                     let eng = crate::meta::MetaEngine::open(&mp)
                         .map_err(|e| format!("view create: {e}"))?;
@@ -3039,8 +3051,9 @@ fn web_dispatch(
 //
 // A dump is metadata only (ids, names, inodes, `data_ref` keys), yet it can be
 // large — one line per node. So it moves in CHUNKS through a staging file under
-// `<base>/meta/.xfer/`, which never ends in `.db` and is therefore invisible to
-// every view lister and to `refs rebuild`. Handles are MINTED HERE, so a client
+// `<base>/meta/.xfer/`, a dot-prefixed directory that the tree enumerator never
+// reads as a view; `refs rebuild` therefore cannot see a staged dump as a tree.
+// Handles are MINTED HERE, so a client
 // cannot name a path at all; the chunk boundary is always a line boundary, so a
 // chunk is always valid UTF-8 and a row is never split across two messages.
 
@@ -3049,7 +3062,7 @@ fn web_dispatch(
 const XFER_CHUNK: u64 = 4 << 20;
 
 fn xfer_dir(rt: &MetaRuntime) -> std::path::PathBuf {
-    rt.base.join("meta").join(".xfer")
+    crate::meta::xfer_dir(&rt.base)
 }
 
 /// Strict handle check: minted by [`new_xfer_handle`], so anything else is a
@@ -3366,9 +3379,10 @@ fn view_import_commit(
 fn drop_imported_tree(rt: &Arc<MetaRuntime>, view: &str) -> String {
     match &rt.store {
         StoreKind::Sqlite => {
-            for ext in ["", "-wal", "-shm"] {
-                let _ = std::fs::remove_file(rt.base.join("meta").join(format!("{view}.db{ext}")));
+            for ext in crate::meta::TREE_DB_EXTS {
+                let _ = std::fs::remove_file(crate::meta::view_db_with_ext(&rt.base, view, ext));
             }
+            let _ = std::fs::remove_dir(crate::meta::view_dir(&rt.base, view));
             let _ = crate::meta::rebuild_ledger(&rt.base);
             "the imported tree was removed again".to_string()
         }
@@ -3500,7 +3514,7 @@ fn refs_rebuild(rt: &Arc<MetaRuntime>) -> Result<serde_json::Value, String> {
             let n = crate::meta::rebuild_ledger(&rt.base).map_err(|e| e.to_string())?;
             Ok(json!(format!(
                 "refs ledger rebuilt at {}: {n} holder entries across the surviving views",
-                rt.base.join("meta").join("refs.db").display()
+                crate::meta::control_db_path(&rt.base, "refs").display()
             )))
         }
         #[cfg(feature = "treedb")]
@@ -3516,7 +3530,7 @@ fn refs_rebuild(rt: &Arc<MetaRuntime>) -> Result<serde_json::Value, String> {
 
 /// What this server's store says its trees name, in the one shape the audit
 /// judges: the same [`crate::gc::Picture`] the offline scan builds from
-/// `meta/*.db`. Reading the trees WHERE THEY LIVE is the whole reason this runs
+/// `meta/<view>/`. Reading the trees WHERE THEY LIVE is the whole reason this runs
 /// on the server — an operator's machine has neither the local trees nor the
 /// PG schemas, only the admin key.
 fn gc_picture(rt: &Arc<MetaRuntime>) -> Result<crate::gc::Picture, String> {
@@ -3900,10 +3914,6 @@ fn store_for(rt: &MetaRuntime, view: &str) -> io::Result<Arc<MetaStore>> {
     }
     let store = match &rt.store {
         StoreKind::Sqlite => {
-            let path = rt.base.join("meta").join(format!("{view}.db"));
-            if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir).ok();
-            }
             let readonly = rt.role() == Role::Standby;
             MetaStore::open_sqlite(&rt.base, view, readonly)
                 .map_err(|e| io::Error::other(e.to_string()))?
@@ -3965,13 +3975,13 @@ fn load_aliases(store: &dyn crate::mcp::ControlStore) -> io::Result<HashMap<Stri
 /// Does `view` already exist here — as a governed definition (derived / fork /
 /// alias) or as a physical tree — WITHOUT creating anything? This is the probe
 /// `M_OPEN` gates with, and it must stay non-creating: calling
-/// [`view_provider`] first would already have materialized `meta/<view>.db`
-/// (or a PG schema) via [`store_for`].
+/// [`view_provider`] first would already have materialized
+/// `meta/<view>/<view>.db` (or a PG schema) via [`store_for`].
 ///
 /// Backend-agnostic by construction: both questions go to the control store
 /// that follows the metadata backend (a `meta/views/*.layout` file / a
-/// `<name>.db` under SQLite, a `grovefs_control` definition row /
-/// `information_schema.schemata` row under PG).
+/// `meta/<name>/<name>.db` tree directory under SQLite, a `grovefs_control`
+/// definition row / `information_schema.schemata` row under PG).
 fn view_exists(rt: &MetaRuntime, view: &str) -> io::Result<bool> {
     if !crate::layout::valid_view_name(view) {
         return Err(io::Error::new(
@@ -4101,7 +4111,7 @@ fn view_provider(rt: &MetaRuntime, view: &str) -> io::Result<Arc<dyn MetaProvide
             // Never create the base as a side effect of mounting the lens: a
             // published definition whose base was never created is a
             // provisioning mistake, and `store_for` below would otherwise leave
-            // an empty `meta/<base>.db` (or PG schema) behind.
+            // an empty `meta/<base>/<base>.db` (or PG schema) behind.
             if !control.has_physical(&b).map_err(io::Error::other)? {
                 return Err(io::Error::other(format!(
                     "derived view '{view}': its base '{b}' has no physical tree in {} — create the base first (`grovefs view create --view {b}`), then mount `{view}` again",
@@ -4541,7 +4551,7 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
     // Explicit-creation gate: refuse a name that does not ALREADY exist. This
     // must run BEFORE `view_provider`, because that call is what materializes
     // the tree: by the time it fails (or succeeds with an empty tree),
-    // `meta/<view>.db` (or a PG schema) is already on disk — the one side
+    // `meta/<view>/<view>.db` (or a PG schema) is already on disk — the one side
     // effect this gate exists to prevent. The probe is non-creating and
     // backend-agnostic (`has_def` / `has_physical` on the control store).
     //
@@ -4949,21 +4959,30 @@ fn handle_control_conn(
     }
 }
 
-/// Atomically replace `<base>/meta/<view>.db` with a replicated snapshot and
-/// drop every cached engine so the next read opens the fresh copy (derived
+/// Atomically replace `<base>/meta/<view>/<view>.db` with a replicated snapshot
+/// and drop every cached engine so the next read opens the fresh copy (derived
 /// views built on any base are re-resolved too — a snapshot swap is rare and
 /// a full evict is the cheap, correct hammer). The snapshot is
 /// a complete `VACUUM INTO` image (self-contained, rollback-journal), so the old
-/// WAL/shm side files are removed rather than left to shadow it. `view` is
-/// validated to keep the peer from steering writes outside the meta dir.
+/// WAL/shm side files are removed rather than left to shadow it.
+///
+/// The target stays `f(name)`: a standby is told a VIEW NAME and nothing else,
+/// because it does not hold the definitions that would be needed to resolve a
+/// genealogy. `valid_view_name` is the whole of that trust boundary — it is what
+/// keeps the peer from steering a write outside the tree's own directory, and it
+/// now also refuses the two reserved slot names, so a replicated snapshot can
+/// never overwrite the definitions directory or the control plane.
 fn install_snapshot(rt: &MetaRuntime, view: &str, snap: &[u8]) -> io::Result<()> {
-    if view.is_empty() || view.contains('/') || view.contains('\\') || view.contains("..") {
+    if !crate::layout::valid_view_name(view) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "bad view name"));
     }
-    let base = &rt.base;
-    let dir = base.join("meta");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{view}.db"));
+    if let Err(msg) = crate::meta::layout_guard(&rt.base) {
+        return Err(io::Error::other(msg));
+    }
+    let path = crate::meta::ensure_view_db_path(&rt.base, view)?;
+    let dir = crate::meta::view_dir(&rt.base, view);
+    // The staging file sits in the tree's OWN directory: rename is only atomic
+    // within one filesystem, and a per-tree directory is now that unit.
     let tmp = dir.join(format!("{view}.db.push.tmp"));
     let mut f = std::fs::File::create(&tmp)?;
     f.write_all(snap)?;
@@ -4971,39 +4990,24 @@ fn install_snapshot(rt: &MetaRuntime, view: &str, snap: &[u8]) -> io::Result<()>
     drop(f);
     std::fs::rename(&tmp, &path)?; // same-fs rename is atomic
     rt.evict(); // force a reopen of the fresh copy (and any derived lens) on next access
-    let _ = std::fs::remove_file(dir.join(format!("{view}.db-wal")));
-    let _ = std::fs::remove_file(dir.join(format!("{view}.db-shm")));
+    let _ = std::fs::remove_file(crate::meta::view_db_with_ext(&rt.base, view, "-wal"));
+    let _ = std::fs::remove_file(crate::meta::view_db_with_ext(&rt.base, view, "-shm"));
     Ok(())
 }
 
-/// Names of the view dbs currently on disk (stem of each `<base>/meta/*.db`).
-/// The control-plane stores are excluded by the same predicate every other
-/// enumerator uses, so the api-key, web-account and ledger files are never
-/// mistaken for view trees here.
+/// Names of the view trees currently on disk. Goes through the one enumerator,
+/// so the control-plane files in `_control/` cannot be listed as views here (or
+/// anywhere else) even if a fourth store is ever added to that slot.
 fn list_users(base: &Path) -> Vec<String> {
-    let mut out = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(base.join("meta")) {
-        for ent in rd.flatten() {
-            let p = ent.path();
-            let Some(file) = p.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if crate::meta::is_view_db(file) {
-                if let Some(name) = p.file_stem().and_then(|s| s.to_str()) {
-                    out.push(name.to_string());
-                }
-            }
-        }
-    }
-    out
+    crate::meta::list_view_trees(base)
 }
 
-/// Highest epoch persisted across this node's view dbs (0 if none). Seeds the
+/// Highest epoch persisted across this node's view trees (0 if none). Seeds the
 /// in-memory fencing epoch at startup so a restart never moves it backwards.
 fn max_epoch_on_disk(rt: &MetaRuntime) -> i64 {
     let mut max = 0i64;
     for name in list_users(&rt.base) {
-        let p = rt.base.join("meta").join(format!("{name}.db"));
+        let p = crate::meta::view_db_path(&rt.base, &name);
         if let Ok(eng) = MetaEngine::open_ex(&p, true) {
             max = max.max(eng.get_epoch());
         }

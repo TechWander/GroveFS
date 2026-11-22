@@ -142,7 +142,7 @@ NOF="$(mcp call fork_view '{"name":"lab2","base":"release"}')"
 ok "a governed base cannot be forked" "$NOF" "release"
 code "get_view on a fork reports its own tree" 0 \
     python3 "$CALL" --bin "$BIN" --quiet --meta-dir "$STORE" call get_view '{"name":"lab"}'
-ok "fork owns meta/lab.db"          "$( $BIN --home "$STORE" view list )" "lab"
+ok "fork owns meta/lab/lab.db"          "$( $BIN --home "$STORE" view list )" "lab"
 
 note "[6b] empty fork + graft (a curated, renamed subset in one batch plan)"
 # `seed:false` records the fork but copies nothing; the plan is the same text a

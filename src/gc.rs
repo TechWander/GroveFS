@@ -2,16 +2,17 @@
 //!
 //! An object is an ORPHAN when nothing names its bytes anymore: the page
 //! `<data-dir>/blocks/<2hex>/<key>` exists, no surviving view tree carries a
-//! `node.data_ref = key`, and the cross-view ledger (`meta/refs.db`) does not
-//! book it either. That residue is produced by two documented accidents:
+//! `node.data_ref = key`, and the cross-view ledger (`meta/_control/refs.db`)
+//! does not book it either. That residue is produced by two documented
+//! accidents:
 //!
-//! - a view db removed out-of-band (`rm meta/<view>.db`): its tree vanishes, so
-//!   its blobs lose their last namer, but no unlink ever ran;
+//! - a view tree removed out-of-band (`rm -r meta/<view>/`): its tree vanishes,
+//!   so its blobs lose their last namer, but no unlink ever ran;
 //! - a crash between `backend.create` and the node INSERT.
 //!
-//! The scan is deliberately OFFLINE (or at least snapshot-sound): it reads
-//! every surviving `<meta>/*.db` and FAILS when one cannot be read, because a
-//! skipped tree would make every blob it names look orphaned. `--apply` is
+//! The scan is deliberately OFFLINE (or at least snapshot-sound): it reads every
+//! surviving tree directory and FAILS when one cannot be read, because a skipped
+//! tree would make every blob it names look orphaned. `--apply` is
 //! gated by the CLI on "no live mount of this store on this machine / no local
 //! grovefs process using it", and never deletes an object younger than the
 //! grace window.
@@ -205,27 +206,14 @@ fn layout_base(key: &str) -> Option<String> {
     crate::backend::sharded::layout_base(key)
 }
 
-/// Every physical view tree kept beside the ledger (sorted, control dbs out).
+/// Every physical view tree this SQLite store holds (sorted). One enumerator
+/// ([`crate::meta::list_view_trees`]) decides what a tree is, and the layout
+/// guard runs FIRST because this list is the delete decision's input: a flat v1
+/// directory would enumerate as EMPTY under layout v2, every live blob would
+/// look orphaned, and `--apply` would reclaim the store.
 pub fn physical_views(meta_root: &Path) -> Result<Vec<String>, String> {
-    let meta = meta_root.join("meta");
-    let rd = fs::read_dir(&meta)
-        .map_err(|e| format!("no metadata directory {}: {e}", meta.display()))?;
-    let mut views = Vec::new();
-    for ent in rd.flatten() {
-        let p = ent.path();
-        let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if !crate::meta::is_view_db(name) {
-            continue;
-        }
-        if !p.is_file() {
-            continue;
-        }
-        views.push(name.trim_end_matches(".db").to_string());
-    }
-    views.sort();
-    Ok(views)
+    crate::meta::layout_guard(meta_root)?;
+    Ok(crate::meta::list_view_trees(meta_root))
 }
 
 /// The tree side of a [`Picture`]: every surviving view and the content keys
@@ -262,23 +250,12 @@ impl Refs {
 /// cannot be opened aborts the scan: skipping it would misreport its blobs as
 /// orphans, and this module's whole contract is "never guess when deleting".
 fn collect_refs(meta_root: &Path) -> Result<Refs, String> {
-    let meta = meta_root.join("meta");
-    let rd = fs::read_dir(&meta)
-        .map_err(|e| format!("no metadata directory {}: {e}", meta.display()))?;
+    crate::meta::layout_guard(meta_root)?;
     let mut views = Vec::new();
     let mut keys = HashSet::new();
     let mut striped = HashSet::new();
-    for ent in rd.flatten() {
-        let p = ent.path();
-        let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if !crate::meta::is_view_db(name) {
-            continue;
-        }
-        if !p.is_file() {
-            continue;
-        }
+    for name in crate::meta::list_view_trees(meta_root) {
+        let p = crate::meta::view_db_path(meta_root, &name);
         let conn = Connection::open_with_flags(&p, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|e| format!("cannot read view tree {}: {e}", p.display()))?;
         conn.busy_timeout(Duration::from_millis(5000))
@@ -287,7 +264,7 @@ fn collect_refs(meta_root: &Path) -> Result<Refs, String> {
             .prepare("SELECT DISTINCT data_ref FROM node WHERE data_ref IS NOT NULL")
             .map_err(|e| {
                 format!(
-                    "cannot read view tree {} (not a view db?): {e}",
+                    "cannot read view tree {} (not a view tree?): {e}",
                     p.display()
                 )
             })?;
@@ -300,7 +277,7 @@ fn collect_refs(meta_root: &Path) -> Result<Refs, String> {
             }
             keys.insert(dr);
         }
-        views.push(name.trim_end_matches(".db").to_string());
+        views.push(name);
     }
     views.sort();
     Ok(Refs {
@@ -334,7 +311,7 @@ impl Ledger {
 /// Keys the cross-view ledger still books (`holders > 0`). A missing or
 /// table-less ledger means "no holds", never an error.
 fn collect_ledger(meta_root: &Path) -> Result<Ledger, String> {
-    let p = meta_root.join("meta").join("refs.db");
+    let p = crate::meta::control_db_path(meta_root, "refs");
     let mut keys = HashSet::new();
     let mut striped = HashSet::new();
     if !p.is_file() {
@@ -373,18 +350,18 @@ fn collect_ledger(meta_root: &Path) -> Result<Ledger, String> {
 /// halves every deletion verdict needs, with no assumption about WHERE the trees
 /// live.
 ///
-/// The SQLite arm fills this from `meta/*.db` ([`picture_sqlite`]); the control
-/// plane fills it from a PG schema set. Keeping the
-/// two sets identical is what lets one deployment audit be the same decision
-/// in a file store and a database.
+/// The SQLite arm fills this from the tree directories under `meta/`
+/// ([`picture_sqlite`]); the control plane fills it from a PG schema set.
+/// Keeping the two sets identical is what lets one deployment audit be the same
+/// decision in a file store and a database.
 pub struct Picture {
     pub refs: Refs,
     pub ledger: Ledger,
 }
 
-/// Read the [`Picture`] of a local store: every surviving `<meta>/*.db` tree and
-/// `meta/refs.db`. A tree that cannot be read aborts (the same refusal [`scan`]
-/// makes).
+/// Read the [`Picture`] of a local store: every tree directory under `<meta>`
+/// and `meta/_control/refs.db`. A tree that cannot be read aborts (the same
+/// refusal [`scan`] makes).
 pub fn picture_sqlite(meta_root: &Path) -> Result<Picture, String> {
     Ok(Picture {
         refs: collect_refs(meta_root)?,
@@ -714,9 +691,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("store");
         let meta = base.join("meta");
-        fs::create_dir_all(&meta).unwrap();
+        fs::create_dir_all(meta.join("team")).unwrap();
         {
-            let e = MetaEngine::open(&meta.join("team.db")).unwrap();
+            let e = MetaEngine::open(&meta.join("team/team.db")).unwrap();
             e.create_node(ROOT_INO, "live", false, Some("k-live"), 0o644, 1000, 1000)
                 .unwrap();
             e.create_node(
@@ -732,7 +709,7 @@ mod tests {
         }
         crate::meta::rebuild_ledger(&base).unwrap();
         // A stale holder no surviving tree names: reported as held, not deleted.
-        let conn = Connection::open(meta.join("refs.db")).unwrap();
+        let conn = Connection::open(crate::meta::control_db_path(&base, "refs")).unwrap();
         conn.execute(
             "INSERT INTO holders (data_ref, holders) VALUES ('k-held', 1)",
             [],
@@ -798,7 +775,7 @@ mod tests {
     #[test]
     fn an_unreadable_view_tree_aborts_instead_of_faking_orphans() {
         let dir = tempfile::tempdir().unwrap();
-        let meta = dir.path().join("store/meta");
+        let meta = dir.path().join("store/meta/broken");
         fs::create_dir_all(&meta).unwrap();
         fs::write(meta.join("broken.db"), b"not a sqlite database").unwrap();
         let err = scan(

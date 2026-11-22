@@ -4,14 +4,14 @@
 //!
 //! Why this exists: view TREES already lived in PG (one `grovefs_v_<hex>`
 //! schema per view, see [`crate::pg_store`]), but the control-plane state was
-//! deliberately file/SQLite-local (`<meta-dir>/meta/api_keys.db`,
+//! deliberately file/SQLite-local (`<meta-dir>/meta/_control/api_keys.db`,
 //! `<meta-dir>/meta/views/*.layout`). A PG deployment then had TWO systems of
 //! record: governance reads and writes had to hit the meta-server's local disk
 //! as well as Postgres, and a second meta-server (or a HA standby) never saw
 //! either file. Under PG everything now lives in one `grovefs_control` schema,
 //! so a key minted or a lens defined anywhere is authoritative everywhere the
 //! same URI is configured. Under SQLite nothing moves: keys stay in
-//! `meta/api_keys.db`, definitions in `meta/views/*.layout`.
+//! `meta/_control/api_keys.db`, definitions in `meta/views/*.layout`.
 //!
 //! The control plane is low-frequency (auth events, ~1 revoke re-check per
 //! live session per second, governance calls from a CLI/MCP agent), so this

@@ -1,8 +1,8 @@
 //! Cross-view holder-ledger invariants under CONCURRENT metadata writes, plus
 //! the throughput probe the `LEDGER_SERIAL` decision was based on.
 //!
-//! The ledger (`<meta>/refs.db`, table `holders(data_ref, holders)`) counts how
-//! many VIEWS currently hold a name for a content key. Two properties must
+//! The ledger (`meta/_control/refs.db`, table `holders(data_ref, holders)`) counts
+//! how many VIEWS currently hold a name for a content key. Two properties must
 //! survive any interleaving of create/link/rename/unlink from several engines
 //! in one process (which is exactly what a meta-server does: one engine per
 //! view, one thread per client connection):
@@ -22,10 +22,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use grovefs::meta::{MetaEngine, REFS_DB, ROOT_INO};
+use grovefs::meta::{self, MetaEngine, ROOT_INO};
 
-/// Fresh scratch directory per test: view dbs and the shared `refs.db` live
-/// side by side in it, exactly like a real `<base>/meta/`.
+/// Fresh STORE ROOT per test. Trees are opened through the layout funnel, so
+/// this is a real `<base>/meta/<view>/<view>.db` store with the ledger in
+/// `<base>/meta/_control/` — the suite below reads the same files an operator
+/// would, not a simplified stand-in.
 fn scratch(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("grovefs_ledger_{tag}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
@@ -35,13 +37,16 @@ fn scratch(tag: &str) -> PathBuf {
 
 fn open_views(dir: &Path, k: usize) -> Vec<MetaEngine> {
     (0..k)
-        .map(|i| MetaEngine::open(&dir.join(format!("v{i}.db"))).unwrap())
+        .map(|i| {
+            let p = meta::ensure_view_db_path(dir, &format!("v{i}")).unwrap();
+            MetaEngine::open(&p).unwrap()
+        })
         .collect()
 }
 
 /// `data_ref -> holder count` straight from the ledger file.
 fn ledger_holders(dir: &Path) -> HashMap<String, i64> {
-    let conn = rusqlite::Connection::open(dir.join(REFS_DB)).unwrap();
+    let conn = rusqlite::Connection::open(meta::control_db_path(dir, "refs")).unwrap();
     let mut stmt = conn
         .prepare("SELECT data_ref, holders FROM holders")
         .unwrap();
@@ -73,7 +78,7 @@ fn view_name_counts(db: &Path) -> HashMap<String, i64> {
 fn ledger_uses_wal_like_the_view_dbs() {
     let dir = scratch("ledgerwal");
     let _views = open_views(&dir, 1);
-    let conn = rusqlite::Connection::open(dir.join(REFS_DB)).unwrap();
+    let conn = rusqlite::Connection::open(meta::control_db_path(&dir, "refs")).unwrap();
     let mode: String = conn
         .query_row("PRAGMA journal_mode", [], |r| r.get(0))
         .unwrap();
@@ -273,7 +278,7 @@ fn concurrent_metadata_keeps_ledger_invariants() {
     let live = std::mem::take(&mut *blobs.lock().unwrap());
     let mut named: HashSet<String> = HashSet::new();
     for v in 0..VIEWS {
-        named.extend(view_name_counts(&dir.join(format!("v{v}.db"))).into_keys());
+        named.extend(view_name_counts(&meta::view_db_path(&dir, &format!("v{v}"))).into_keys());
     }
     assert!(named.is_empty(), "names survived: {named:?}");
     let dangling: Vec<&String> = live.difference(&named).collect();
@@ -287,15 +292,17 @@ fn concurrent_metadata_keeps_ledger_invariants() {
 
 /// Why `LEDGER_SERIAL` is not the throughput wall: `BEGIN IMMEDIATE` on a view
 /// connection takes the write lock of EVERY attached db up front, so two
-/// engines writing their own view dbs still serialize on the shared `refs.db`
+/// engines writing their own view dbs still serialize on the shared ledger
 /// inside SQLite. This measures that directly — the second writer's BEGIN must
 /// block for as long as the first holds its (empty!) transaction open.
 #[test]
 fn begin_immediate_serializes_on_the_shared_ledger() {
     let dir = scratch("beginlock");
-    let ledger = dir.join(REFS_DB);
+    let ledger = meta::control_db_path(&dir, "refs");
+    std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
     let open = |name: &str| {
-        let conn = rusqlite::Connection::open(dir.join(name)).unwrap();
+        let p = meta::ensure_view_db_path(&dir, name).unwrap();
+        let conn = rusqlite::Connection::open(&p).unwrap();
         conn.execute_batch(&format!(
             "PRAGMA busy_timeout=5000;
              CREATE TABLE IF NOT EXISTS node (id INTEGER PRIMARY KEY);

@@ -47,7 +47,7 @@
 //!
 //! Storage FOLLOWS the metadata backend — one system of record, never two:
 //! - under SQLite (the default) keys live in one local file,
-//!   `<base>/meta/api_keys.db`;
+//!   `<base>/meta/_control/api_keys.db`;
 //! - under PostgreSQL (`--meta-store postgres://…`) the SAME two tables live in the
 //!   shared `grovefs_control` schema ([`crate::control`]) — a key minted or
 //!   revoked against the URI is authoritative for every meta-server, MCP
@@ -555,8 +555,9 @@ enum Backend {
 const STORE_KEY_ENV: &str = "GROVEFS_STORE_KEY";
 
 /// The file the wrapping material lives in when the env does not set it:
-/// `<base>/meta/store.key`, beside `api_keys.db` it wraps rows of.
-const STORE_KEY_FILE: &str = "store.key";
+/// `<base>/meta/_control/store.key`, in the same slot as `api_keys.db` whose
+/// rows it wraps (and, like that db, cold-copied with the control plane).
+const STORE_KEY_FILE: &str = crate::meta::STORE_KEY_FILE;
 
 /// The store's wrapping material, resolved once at open. Two states rather than
 /// an `Option`, because the refusals it produces have to name themselves: "this
@@ -603,7 +604,7 @@ fn load_wrap(base: &Path) -> WrapMaterial {
             )),
         };
     }
-    let path = base.join("meta").join(STORE_KEY_FILE);
+    let path = crate::meta::control_dir(base).join(STORE_KEY_FILE);
     if let Ok(existing) = std::fs::read_to_string(&path) {
         return match crate::secretbox::key_from_hex(&existing) {
             Some(key) => WrapMaterial::Ready {
@@ -708,10 +709,10 @@ fn cell_str(row: &postgres::Row, i: usize) -> Option<String> {
 }
 
 impl ApiKeyStore {
-    /// Open the LOCAL SQLite store at `<base>/meta/api_keys.db` (see
+    /// Open the LOCAL SQLite store at `<base>/meta/_control/api_keys.db` (see
     /// [`ApiKeyStore::open_for`] for backend-routing).
     pub fn open(base: &Path) -> Result<Self, String> {
-        let path = base.join("meta").join("api_keys.db");
+        let path = crate::meta::control_db_path(base, "api_keys");
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -1998,14 +1999,15 @@ mod tests {
         assert_eq!(recent[1].key_label.as_deref(), Some("worker"));
     }
 
-    /// A store plus the DB FILE it wrote to, for the tests that check what is
-    /// actually on disk: the column lists are the store's own description of
-    /// itself, the bytes are the evidence.
+    /// A store plus the ROOT its files live under, for the tests that check what
+    /// is actually on disk: the column lists are the store's own description of
+    /// itself, the bytes are the evidence. The root is what a test needs, not the
+    /// file — reaching the file is [`crate::meta::control_db_path`]'s job.
     fn store_on_disk() -> (ApiKeyStore, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().to_path_buf();
         std::mem::forget(dir);
-        (ApiKeyStore::open(&p).unwrap(), p.join("meta").join("api_keys.db"))
+        (ApiKeyStore::open(&p).unwrap(), p)
     }
 
     /// An RFC 3339 stamp `secs` from now on the store's own clock — what
@@ -2023,7 +2025,8 @@ mod tests {
     /// assertion that means "recoverable" rather than "not selected by `list`".
     #[test]
     fn the_store_holds_a_mask_never_a_secret() {
-        let (s, path) = store_on_disk();
+        let (s, root) = store_on_disk();
+        let path = crate::meta::control_db_path(&root, "api_keys");
         let (id, key) = s
             .create_extended(
                 "laptop",
@@ -2082,9 +2085,9 @@ mod tests {
     /// back the credential the mint printed.
     #[test]
     fn a_minted_credential_is_recoverable_from_another_process() {
-        let (s, db) = store_on_disk();
+        let (s, root) = store_on_disk();
         let (id, key) = s.create("laptop").unwrap();
-        let again = ApiKeyStore::open(db.parent().unwrap().parent().unwrap()).unwrap();
+        let again = ApiKeyStore::open(&root).unwrap();
         match again.reveal(&id).unwrap() {
             StoredSecret::Recoverable(full) => assert_eq!(full, key),
             other => panic!("a minted credential should be recoverable, got {other:?}"),
@@ -2099,11 +2102,11 @@ mod tests {
     /// and the one it replaced does not.
     #[test]
     fn rotate_rewraps_so_reveal_follows_the_current_secret() {
-        let (s, db) = store_on_disk();
+        let (s, root) = store_on_disk();
         let (id, old) = s.create("ci").unwrap();
         let new = s.rotate(&id).unwrap().unwrap();
         assert_ne!(new, old);
-        let again = ApiKeyStore::open(db.parent().unwrap().parent().unwrap()).unwrap();
+        let again = ApiKeyStore::open(&root).unwrap();
         match again.reveal(&id).unwrap() {
             StoredSecret::Recoverable(full) => assert_eq!(full, new),
             other => panic!("rotate left no recoverable copy: {other:?}"),
@@ -2117,10 +2120,9 @@ mod tests {
     /// repair: rotate the key, fix THIS node's material, distrust the row.
     #[test]
     fn each_no_answer_names_its_own_repair() {
-        let (s, db) = store_on_disk();
-        let meta = db.parent().unwrap();
-        let base = meta.parent().unwrap();
-        let key_file = meta.join("store.key");
+        let (s, root) = store_on_disk();
+        let base = root.as_path();
+        let key_file = crate::meta::control_dir(base).join(STORE_KEY_FILE);
         // The material the row was wrapped under, kept so the test can put it
         // back and tell "wrong key" apart from "wrong row".
         let original = std::fs::read_to_string(&key_file).unwrap();
@@ -2394,7 +2396,7 @@ mod tests {
     #[test]
     fn a_pre_bookkeeping_store_is_upgraded_in_place() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("meta").join("api_keys.db");
+        let path = crate::meta::control_db_path(dir.path(), "api_keys");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         {
             let c = rusqlite::Connection::open(&path).unwrap();

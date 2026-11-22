@@ -165,9 +165,9 @@ SQLite backend (default) — effects on disk:
 |---|---|
 | `define_derived_view` | overwrites `<db>/meta/views/<name>.layout` (first line `base <base>` + rule lines) |
 | `alias_view` | writes `<db>/meta/views/<name>.layout` (`alias <real>`); with `retire`, **writes the new one before deleting the old** |
-| `fork_view` | new tree `<db>/meta/<name>.db` (plus `-wal`/`-shm`) + `<db>/meta/views/<name>.layout`, and updates the cross-view ledger `refs.db` (with `seed:false` the tree is root-only) |
-| `graft_view` | inserts rows into the DESTINATION's `<db>/meta/<name>.db` (ids/inos allocated above both existing id and ino spaces, hard links preserved), creates missing destination directories (0755), and books one ledger hold per new blob — one IMMEDIATE transaction, so a refused plan writes nothing. The destination may be a fork **or a bare base view**; only a derived lens or an alias is refused by role |
-| `remove_view` | deletes the `.layout`; if the slot was a fork, also deletes its `meta/<name>.db*` and runs `rebuild_ledger` |
+| `fork_view` | new tree `<db>/meta/<name>/<name>.db` (plus `-wal`/`-shm`) + `<db>/meta/views/<name>.layout`, and updates the cross-view ledger `refs.db` (with `seed:false` the tree is root-only) |
+| `graft_view` | inserts rows into the DESTINATION's `<db>/meta/<name>/<name>.db` (ids/inos allocated above both existing id and ino spaces, hard links preserved), creates missing destination directories (0755), and books one ledger hold per new blob — one IMMEDIATE transaction, so a refused plan writes nothing. The destination may be a fork **or a bare base view**; only a derived lens or an alias is refused by role |
+| `remove_view` | deletes the `.layout`; if the slot was a fork, also deletes its `meta/<name>/<name>.db*` and runs `rebuild_ledger` |
 | `preview_rules` / `validate_definition` / the three read-only probes | **write nothing** |
 
 Under `--meta-store postgres://…` nothing control-plane lands on disk: the
@@ -245,7 +245,7 @@ the CLI cannot, and bypass no guard**.
 | `-32001` right at startup | server ran with `--require-api-key`, client sent no `apiKey` in `initialize` | mint a key with `grovefs apikey create --label agent --for mcp` (plaintext printed once), put it in `initialize.params.apiKey` or export `GROVEFS_MCP_API_KEY` on the server |
 | Auth fails: `invalid api key id` / `invalid api key secret` / `has been revoked` | plaintext transcribed wrong, revoked, or id:secret pasted incorrectly | match the id via `grovefs apikey list`; re-mint if needed |
 | Auth fails though the key is valid | scope does not include the MCP plane | re-mint with `--for mcp` (or `--for any`); a `--for mount` key cannot open the governance interface |
-| `no metadata tree for view 'X' … list_view_tree walks this store's own backend; a remote tree not reachable from here is not` | the view has no tree in the backend the MCP server is bound to (no local `meta/X.db`, and no `--meta-store` was given for the PG schema) | run the server against the right backend (`--meta-dir` on the store machine, or `--meta-store postgres://…`), or keep a local metadata copy (`view import`) |
+| `no metadata tree for view 'X' … list_view_tree walks this store's own backend; a remote tree not reachable from here is not` | the view has no tree in the backend the MCP server is bound to (no local `meta/X/X.db`, and no `--meta-store` was given for the PG schema) | run the server against the right backend (`--meta-dir` on the store machine, or `--meta-store postgres://…`), or keep a local metadata copy (`view import`) |
 | `no physical base tree … — `fork` copies a physical view tree; create the base first` | fork needs a physical base (a `.db` file or a PG schema) | `grovefs --home H init/view create --view B` (or `view --meta-store … create --view B`) first; a derived view is not a tree |
 | Wrote the `.layout` but the mount still shows the old shape | a bare local mount resolves its definition once at mount time | remount; mounts through `meta-server` reshape themselves within ≤2s |
 | `list_view_tree` answers `truncated:true` | hit the `depth`(6)/`max`(800) bounds | drill down with `path` in segments, or raise `depth`/`max` |

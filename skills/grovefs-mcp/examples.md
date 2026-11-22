@@ -107,7 +107,7 @@ derived view name must differ from its base
 ... call list_view_tree '{"view":"ghost"}'
 ```
 ```
-no metadata tree for view 'ghost' (.migtest/skill/store/meta/ghost.db) — list_view_tree walks this store's own backend; a remote tree not reachable from here is not
+no metadata tree for view 'ghost' (.migtest/skill/store/meta/ghost/ghost.db) — list_view_tree walks this store's own backend; a remote tree not reachable from here is not
 ```
 
 All three texts are identical to what `grovefs view …` prints (same library
@@ -184,7 +184,7 @@ the render still reports `"truncated": true` when a bound cuts it.
 ```
 ```
 [stderr] [setlevel] warning — later calls may push notifications/message
-[stderr] [push] notifications/message {"data": "tools/call list_view_tree failed: no metadata tree for view 'ghost' (.migtest/skill/store/meta/ghost.db) \u2014 list_view_tree walks this store's own backend; a remote tree not reachable from here is not", "level": "warning", "logger": "grove-mcp"}
+[stderr] [push] notifications/message {"data": "tools/call list_view_tree failed: no metadata tree for view 'ghost' (.migtest/skill/store/meta/ghost/ghost.db) \u2014 list_view_tree walks this store's own backend; a remote tree not reachable from here is not", "level": "warning", "logger": "grove-mcp"}
 [stderr] the tool refused this call (isError) — not a protocol error
 ```
 

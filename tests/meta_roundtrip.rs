@@ -276,15 +276,16 @@ fn meta_event_bus_pushes_invalidations() {
 }
 
 /// Views are created EXPLICITLY: an `M_OPEN` naming a view that does not exist
-/// is REFUSED with a readable reason and leaves NO `<view>.db` behind, while an
+/// is REFUSED with a readable reason and leaves NO tree behind, while an
 /// existing tree still opens and serves normally.
 #[test]
 fn mount_of_unknown_view_is_refused_without_creating_it() {
     let (addr, d) = spawn_meta_server();
     let base = d.path().to_path_buf();
     assert!(
-        !base.join("meta/ghost.db").exists(),
-        "precondition: no such view yet"
+        !grovefs::meta::view_db_path(&base, "ghost").exists()
+            && !base.join("meta/ghost.db").exists(),
+        "precondition: no such view yet, in either layout"
     );
 
     // Retry only while the listener is still coming up — the refusal we assert
@@ -316,8 +317,10 @@ fn mount_of_unknown_view_is_refused_without_creating_it() {
         "reason must name the way to create it with the concrete view name: {msg}"
     );
     assert!(
-        !base.join("meta/ghost.db").exists(),
-        "an M_OPEN must NOT create the unknown view's db"
+        !grovefs::meta::view_db_path(&base, "ghost").exists()
+            && !base.join("meta/ghost.db").exists(),
+        "an M_OPEN must NOT create the unknown view's tree — not even a flat file \
+         that would make the store look unmigrated"
     );
 
     // An existing physical tree still opens and serves.

@@ -361,8 +361,8 @@ pub fn define_deployment(
     if next.meta.is_empty() {
         eprintln!(
             "note: deployment '{name}' declares no meta-server, so `mount --manager` against it \
-             will be refused — declare one with --meta unless this deployment is data-only \
-             and its clients supply --meta-server themselves"
+             will be refused — a mount always resolves BOTH a meta- and a data-server from the \
+             roster, so declare one with --meta (a data-only deployment is not mountable)"
         );
     }
     file.deployments.insert(name.to_string(), next);

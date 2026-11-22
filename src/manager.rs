@@ -1,9 +1,11 @@
 //! MANAGER: the mount bootstrap — who to call, signed so a client can check.
 //!
-//! What problem this solves (and what it does not). A `mount` today needs two
-//! cluster coordinates typed by the operator:
-//! [`--meta-server`](crate) — a FAILOVER list — and
-//! [`--data-servers`](crate) — the COMPLETE stripe member set. The second is not
+//! What problem this solves (and what it does not). A `mount` needs two
+//! cluster coordinates — a meta-server
+//! (a FAILOVER list) and
+//! a data-server set (the COMPLETE stripe member set). A mount no longer takes
+//! them typed by hand: it resolves both from a signed roster the manager hands
+//! it. The data list is not
 //! a candidate pool: chunk placement is pinned to the exact member-id set
 //! (see [`crate::backend::sharded`]), so a shortened list is refused at the
 //! first striped read rather than silently misrouted. A manager therefore
@@ -354,12 +356,12 @@ impl Roster {
         })
     }
 
-    /// The `--meta-server` value this roster corresponds to.
+    /// The meta-server failover list this roster carries (what a mount dials).
     pub fn meta_list(&self) -> String {
         self.meta.join(",")
     }
 
-    /// The `--data-servers` value, or `None` when the deployment declares no
+    /// The data-server list, or `None` when the deployment declares no
     /// data service (a metadata-only cluster, whose clients keep local bytes).
     pub fn data_list(&self) -> Option<String> {
         if self.data.is_empty() {
@@ -600,7 +602,7 @@ mod tests {
     }
 
     /// An empty data list means "no data service declared", which must map to
-    /// `None` and not to an empty `--data-servers` string. A zero `expires_at`
+    /// `None` and not to an empty data-server string. A zero `expires_at`
     /// parses (it is the "no expiry" bookkeeping value) even though the server
     /// never issues one.
     #[test]

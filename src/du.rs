@@ -229,7 +229,10 @@ fn gather_pg(spec: &str, view: &str) -> io::Result<Vec<FlatNode>> {
 }
 
 fn gather_sqlite(db_path: &std::path::Path, view: &str) -> io::Result<Vec<FlatNode>> {
-    let db_file = db_path.join("meta").join(format!("{view}.db"));
+    // A flat v1 directory reads as "no such tree" rather than as an empty view:
+    // the guard says which, and names the one command that fixes it.
+    crate::meta::layout_guard(db_path).map_err(io::Error::other)?;
+    let db_file = crate::meta::view_db_path(db_path, view);
     if !db_file.exists() {
         return Err(no_tree(view, &db_file.display().to_string()));
     }
@@ -369,7 +372,7 @@ fn split_addrs(list: &str) -> Vec<String> {
 /// `--data-servers` > `--data-dir` > the local store root the tree itself came from.
 ///
 /// The last step is what makes `grovefs du --home R --view V` self-contained:
-/// on a storage node `view create` puts `meta/<view>.db` and the `blocks/` the
+/// on a storage node `view create` puts `meta/<view>/<view>.db` and the `blocks/` the
 /// data-server serves under the same root R.
 /// A tree that came from a meta-server or a PostgreSQL store has no local
 /// counterpart to infer from, so the source stays unresolvable and this

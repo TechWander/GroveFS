@@ -2,7 +2,7 @@
 
 | 项 | 内容 |
 | --- | --- |
-| 状态 | 已实施 |
+| 状态 | 已实施；**后续修订**：手敲坐标的 `--meta-server`/`--data-servers` 挂载入口也已移除（ADR-0001 Q2），下表中「两个地址出路」与「半个拓扑」两行是当时契约、现由 `--manager` 单一入口取代 |
 | 日期 | 2026-11-20 |
 | 前序 | ADR-0001 §7 把「删单机 `--home` 模式」列为本轮未做的负空间；本份兑现它。自由度来自 2026-11-19 的约束放宽（不再支持单机单盘、无需向后兼容、可自由改模块边界与协议），删除方式取自同一轮的裁决：「彻底移除」 |
 | 实现 | `src/main.rs`（`NO_COORDINATES` 常量 + 两处出口；删 `Cmd::Init` 子命令与其分支；删挂载的本地元数据装配臂；删无条件 `create_dir_all(<home>/meta)`）、`src/fs_impl.rs`（−327/+10：客户端 CREATE/UNLINK 组提交管线随其唯一消费者一起删）、`src/meta.rs`（`MetaProvider` 去掉 5 个方法：`supports_create_batch`/`create_nodes_batch`/`supports_unlink_batch`/`unlink_nodes_batch`/`set_read_pool`）、`src/meta/engine.rs`（删 `set_read_pool_size`/`set_read_pool`——挂载进程里已经没有引擎，那条 setter 是死管线）、`.build-bin/suite_helpers.sh`（`gfs_cluster` / `gfs_cluster_view` 预置） |
@@ -12,7 +12,7 @@
 
 **一次挂载必须同时指向一个元数据服务与一个数据服务，否则就在拨号之前失败。** `--home` 退回它本来的角色：节点侧动词（`view create`、`gc`、`import`、`apikey`、`du`）与服务端自己的存储根，而不是任何客户端的存储根。
 
-动机只有一条，但它是正确性而不是审美：**一份权威存储根必须唯一**。单机模式让每个客户端的 `<home>/meta/<view>.db` 都成为那棵树的权威副本，于是
+动机只有一条，但它是正确性而不是审美：**一份权威存储根必须唯一**。单机模式让每个客户端的 `<home>/meta/<view>/<view>.db` 都成为那棵树的权威副本，于是
 
 - 同一个视图名在两台机器上就是两棵互不知情的树——两边都写、都成功、都没有任何机制发现分叉，因为本地臂里根本没有跨主机收敛这个东西；
 - 笔记本可能持有某视图的唯一一份元数据（`meta/` 在客户端本地，而 `blocks/` 早就在服务端了，两份东西各在两台机器上，谁都不是完整备份）；
@@ -26,7 +26,7 @@
 | --- | --- |
 | **降级为「仅测试用途」**（保留本地臂，只在 CLI 里藏起来或加警告） | 用户给的是「可以移除」，不是「必须保留但别说」。留着就仍然是一条会被走到的分支：测试套件依赖它，就等于让回归覆盖的那条路径不是交付出去的那条路径。而且 §1 的三条后果不会因为加了警告而消失——它们只在有人真用本地挂载时发生，而「只有测试用」的约束在文档里靠人守。 |
 | **feature flag / `--allow-local` 逃生舱** | 明确被约束 ④ 否掉（不为旧路径保留 shim）。更实际的理由：一条只在 flag 打开时才编译的分支，要么进整板（那还是双路径回归），要么不进（那它就是没测的代码）。 |
-| **把 `init` 留成 `view create` 的别名** | 它不是一个别名，而是另一种存储位置：`init` 当年写的是「本机的 `<home>/meta/<view>.db`」。`grovefs view --meta-dir D create --view V` 已经是它的远程等价物，且 `--meta-dir` 指的就是 meta-server 那个根。保留别名只会让人以为挂之前还有一步「先在本机建个库」。 |
+| **把 `init` 留成 `view create` 的别名** | 它不是一个别名，而是另一种存储位置：`init` 当年写的是「本机的 `<home>/meta/<view>/<view>.db`」。`grovefs view --meta-dir D create --view V` 已经是它的远程等价物，且 `--meta-dir` 指的就是 meta-server 那个根。保留别名只会让人以为挂之前还有一步「先在本机建个库」。 |
 | **只删 CLI 入口，保留库内 API** | 库内那条路径的唯一调用者就是 CLI 的本地臂；留下它等于留下一份没人测的元数据装配逻辑，而它正是 §1 里最危险的那块。 |
 | **顺手把 `--home` 从全局 flag 里删掉** | 节点侧动词与服务端确实需要一个存储根默认值。挂载接受 `--home` 但**零足迹**（连目录都不建）才是正确的形状，这条被断言钉住，而不是靠「那个 flag 不存在」。 |
 
@@ -35,8 +35,8 @@
 | 可观测 | 内容 | 钉它的地方 |
 | --- | --- | --- |
 | 无坐标挂载 | 退出码 **1**，不 attach 任何东西，且在 daemonize **之前**打印——operator 在自己的终端上看到它，而不是在没人 tail 的日志里 | `test_config.sh` §7 |
-| 拒绝文案 | `NO_COORDINATES` 整段（`src/main.rs:2900`），USAGE 中英各两处 + `docs/deploy.html` 逐字引用；文案里同时给出两条出路（两个地址 / `--manager` + `--roster-key-file`）与 `--home` 的新位置 | 同上（`grep -qF` 三段） |
-| 半个拓扑 | 只给 `--meta-server`（或只给 `--data-servers`）同样拒：**半个拓扑不是拓扑** | 同上 |
+| 拒绝文案 | `NO_COORDINATES` 整段（`src/main.rs`），USAGE 中英各两处 + `docs/deploy.html` 逐字引用。落地当时文案给出两条出路（两个地址 / `--manager` + `--roster-key-file`）；**后续修订后只剩一条**：`--manager` + `--roster-key-file`，手敲坐标的出路已删除 | 同上（`grep -qF`） |
+| 半个拓扑 | 落地当时只给一个手敲坐标（`--meta-server` 或 `--data-servers`）也拒：**半个拓扑不是拓扑**；**后续修订**后手敲坐标整体不存在，拒的是「没给 `--manager`/`GROVEFS_MANAGER` 或 `--roster-key-file`」 | 同上 |
 | `grovefs init` | 已不是子命令：clap 报 `unrecognized subcommand 'init'`，退出码 **2** | 手工核验；`grovefs --help` 的子命令清单里没有它 |
 | 建树入口 | `grovefs view --meta-dir D create --view V [--manifest M]`，其中 `D` 是 meta-server 的根 | 全套件共用 |
 | 挂载横幅 | `mounting view 'x' at /mnt (fully remote: no local store)` | `test_config.sh` §7 |

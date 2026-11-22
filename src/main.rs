@@ -1,7 +1,7 @@
 //! grovefs — a view-view FUSE filesystem.
 //!
 //! One physical object store (`<root>/blocks`, shared), one *view* database
-//! per view (`<meta-dir>/meta/<view>.db`). Mounting as a given view surfaces
+//! per view (`<meta-dir>/meta/<view>/<view>.db`). Mounting as a given view surfaces
 //! only that view tree, and a mount always talks to services for both — a
 //! `meta-server` for the tree, a `data-server` for the bytes. Data IO is fully
 //! decoupled from NFS: it goes through the pluggable `StorageBackend` trait
@@ -45,29 +45,36 @@ use std::sync::Arc;
     long_about = r#"User-view FUSE filesystem.
 
 One physical object store (`<root>/blocks`, content-addressed by UUID), one
-independent view tree per user (`<meta-dir>/meta/<view>.db`). Mounting a view
+independent view tree per user (`<meta-dir>/meta/<view>/<view>.db`). Mounting a view
 surfaces only that view; data IO is fully decoupled from the directory tree.
 
 A view is always served by TWO services — a `meta-server` for the tree and a
-`data-server` for the bytes — and a client names both (`--meta-server` +
-`--data-servers`) or asks a `manager` for one signed roster that carries them
-(`--manager`). They may run on the same machine as the client or on the other
-side of the room; the mount command does not care. `grovefs mcp` adds the
-agent-facing governance surface.
+`data-server` for the bytes — and a mount asks a `manager` for one signed
+roster that carries both coordinates (`--manager` + `--roster-key-file`). A
+mount never names a service address by hand: the deployment's topology is
+declared once at the manager and every client resolves the SAME verified
+roster, so no two mounts of one view can dial different (or half a) cluster.
+The services may run on the same machine as the client or on the other side of
+the room; the mount command does not care. `grovefs mcp` adds the agent-facing
+governance surface.
 "#,
     after_long_help = r#"COMMON USAGE
 
-  A cluster on one machine (the same two services, loopback):
+  A cluster on one machine (a manager bootstraps the two services; loopback):
     grovefs --home ~/grove view create --view alice
-    grovefs meta-server --meta-dir ~/grove --listen 127.0.0.1:50053 &
-    grovefs data-server --data-dir ~/grove --listen 127.0.0.1:50100 &
-    grovefs mount --view alice -m ~/mnt --meta-server 127.0.0.1:50053 --data-servers 127.0.0.1:50100
+    grovefs --home ~/grove manager define --meta 127.0.0.1:50053 --data 127.0.0.1:50100
+    grovefs --home ~/grove manager serve --listen 127.0.0.1:50055 &   # mints join.key/roster.key on first start
+    grovefs meta-server --meta-dir ~/grove --listen 127.0.0.1:50053 --advertise-addr 127.0.0.1:50053 --register-with 127.0.0.1:50055 --join-key-file ~/grove/manager/join.key &
+    grovefs data-server --data-dir ~/grove --listen 127.0.0.1:50100 --advertise-addr 127.0.0.1:50100 --member-id 0 --register-with 127.0.0.1:50055 --join-key-file ~/grove/manager/join.key &
+    grovefs mount --view alice -m ~/mnt --manager 127.0.0.1:50055 --roster-key-file ~/grove/manager/roster.key
     grovefs umount -m ~/mnt
 
-  Central cluster (one shared view across machines):
-    grovefs data-server --data-dir /data    --listen 0.0.0.0:50100 --token SECRET
-    grovefs meta-server --meta-dir /meta --listen 0.0.0.0:50053 --token SECRET
-    grovefs mount --view alice -m /mnt --data-servers host:50100 --meta-server host:50053 --token SECRET
+  Central cluster (one shared view across machines; addresses come from the manager):
+    grovefs --home /srv/gm manager define --meta host:50053 --data host:50100
+    grovefs --home /srv/gm manager serve --listen 0.0.0.0:50055
+    grovefs data-server --data-dir /data --listen 0.0.0.0:50100 --advertise-addr host:50100 --member-id 0 --register-with host:50055 --join-key-file /srv/gm/manager/join.key --token SECRET
+    grovefs meta-server --meta-dir /meta --listen 0.0.0.0:50053 --advertise-addr host:50053 --register-with host:50055 --join-key-file /srv/gm/manager/join.key --token SECRET
+    grovefs mount --view alice -m /mnt --manager host:50055 --roster-key-file /srv/gm/manager/roster.key --token SECRET
 
   Onboard an existing tree (zero-copy when it shares the filesystem):
     grovefs import --meta-dir /meta --view alice --source /srv/legacy
@@ -75,9 +82,9 @@ agent-facing governance surface.
   Per-caller mount credentials instead of one static cluster token (revocable,
   audited; a revoke closes a LIVE mount within 1s and it unmounts itself):
     grovefs apikey      --meta-dir /meta create --label analyst --for mount
-    grovefs meta-server --meta-dir /meta --listen 0.0.0.0:50053 --require-api-key
-    grovefs data-server --data-dir /data    --listen 0.0.0.0:50100 --require-api-key --meta-dir /meta
-    grovefs mount --view alice -m /mnt --data-servers host:50100 --meta-server host:50053 --api-key ID:SECRET
+    grovefs meta-server --meta-dir /meta --listen 0.0.0.0:50053 --advertise-addr host:50053 --require-api-key --register-with host:50055 --join-key-file /srv/gm/manager/join.key
+    grovefs data-server --data-dir /data    --listen 0.0.0.0:50100 --advertise-addr host:50100 --member-id 0 --require-api-key --meta-dir /meta --register-with host:50055 --join-key-file /srv/gm/manager/join.key
+    grovefs mount --view alice -m /mnt --manager host:50055 --roster-key-file /srv/gm/manager/roster.key --api-key ID:SECRET
 
   Server-side governance (no local rules file needed on clients):
     grovefs view --meta-dir /meta define --name lens   --base alice --rules lens.rules
@@ -96,24 +103,27 @@ Run `grovefs <command> --help` for a command's full options.
 
   Long commands shrink: a KEY=VALUE file is auto-loaded into the environment
   ($GROVEFS_CONFIG, else $HOME/.config/grovefs/grovefs.conf),
-  and the repeat-heavy flags fall back to env — GROVEFS_META_SERVER / GROVEFS_DATA_SERVERS /
-  GROVEFS_TOKEN / GROVEFS_STRIPE_BYTES for `mount` and the servers, GROVEFS_HOME, GROVEFS_META_DIR,
+  and the repeat-heavy knobs fall back to env — GROVEFS_MANAGER / GROVEFS_ROSTER_KEY_FILE /
+  GROVEFS_DEPLOYMENT (the mount bootstrap), GROVEFS_TOKEN / GROVEFS_STRIPE_BYTES, GROVEFS_HOME,
+  GROVEFS_META_DIR,
   GROVEFS_STATS, GROVEFS_API_KEY, GROVEFS_MCP_API_KEY, GROVEFS_BW_READ /
-  GROVEFS_BW_WRITE. Precedence is always flag > live env > config file;
-  keep the file 600 if it holds secrets.
+  GROVEFS_BW_WRITE. (GROVEFS_META_SERVER / GROVEFS_DATA_SERVERS now feed only the node-side
+  audit verbs — `du`, `gc --control-server` — never a mount.) Precedence is always flag > live
+  env > config file; keep the file 600 if it holds secrets.
 "#
 )]
 struct Cli {
     /// Default store root for the NODE-side verbs (`view create`, `gc`, `import`,
     /// `apikey`, `du`, and the servers themselves): it holds `blocks/` (data objects)
-    /// and `meta/<view>.db` (one DB per view). Defaults to $GROVEFS_HOME or ~/.grovefs;
+    /// and one directory per view (`meta/<view>/<view>.db`). Defaults to
+    /// $GROVEFS_HOME or ~/.grovefs;
     /// a storage node names its own store path instead (`meta-server --meta-dir`,
     /// `data-server --data-dir`).
     ///
     /// A `mount` never reads or writes it: a mount resolves BOTH a metadata
-    /// service and a data service (`--meta-server` + `--data-servers`, or a
-    /// signed roster via `--manager`) and keeps no authoritative tree or bytes on
-    /// the client's disk — not even a cache of them.
+    /// service and a data service from one signed roster via `--manager` and
+    /// keeps no authoritative tree or bytes on the client's disk — not even a
+    /// cache of them.
     #[arg(long, global = true, verbatim_doc_comment)]
     home: Option<PathBuf>,
 
@@ -132,29 +142,29 @@ enum Cmd {
     /// Tear down with `grovefs umount -m <mountpoint>`.
     #[command(after_long_help = r#"USAGE EXAMPLES
 
-  The only shape a mount takes — a meta-server for the tree, a data-server for the bytes:
-    grovefs mount --view alice -m /mnt --meta-server HOST:50053 --data-servers HOST:50100 --token SECRET
+  The only shape a mount takes — the manager resolves both coordinates from a signed roster:
+    grovefs mount --view alice -m /mnt --manager HOST:50055 --roster-key-file ~/roster.key --token SECRET
 
-  Fail over across meta-server replicas (stays on the first reachable node):
-    grovefs mount --view alice -m /mnt --meta-server PRIMARY:50053,STANDBY:50053 --data-servers HOST:50100
+  A mount NEVER names a service address by hand: there is no --meta-server/--data-servers.
+  Failover across meta-server replicas and cross-server data striping are topology the manager
+  DECLARES (`grovefs manager define --meta/--data`), so the same mount line above transparently
+  dials a replicated or striped deployment:
+    grovefs --home /srv/gm manager define --meta PRIMARY:50053,STANDBY:50053 --data HOST1:50100,HOST2:50100,HOST3:50100
 
-  Stripe one big file across several data-servers (comma list, order-stable):
-    grovefs mount --view alice -m /mnt --meta-server HOST:50053 --data-servers HOST1:50100,HOST2:50100,HOST3:50100
-
-  Ask a manager for both coordinates instead of typing them (signed roster):
-    grovefs mount --view alice -m /mnt --manager HOST:50055 --roster-key-file ~/roster.key
+  Select a non-default deployment the manager serves (--deployment, else GROVEFS_DEPLOYMENT):
+    grovefs mount --view alice -m /mnt --manager HOST:50055 --roster-key-file ~/roster.key --deployment prod
 
   Strict coherence (no client cache; a peer's writes show immediately):
-    grovefs mount --view alice -m /mnt --meta-server HOST:50053 --data-servers HOST:50100 --no-cache
+    grovefs mount --view alice -m /mnt --manager HOST:50055 --roster-key-file ~/roster.key --no-cache
 
   Read-only mount (every mutation returns EROFS):
-    grovefs mount --view alice -m /mnt --meta-server HOST:50053 --data-servers HOST:50100 --ro
+    grovefs mount --view alice -m /mnt --manager HOST:50055 --roster-key-file ~/roster.key --ro
 
   Mount a server-side derived lens or public alias by its name:
-    grovefs mount --view lens -m /mnt --meta-server HOST:50053 --data-servers HOST:50100
+    grovefs mount --view lens -m /mnt --manager HOST:50055 --roster-key-file ~/roster.key
 
   This mount only: a local presentation overlay from a rules file:
-    grovefs mount --view alice -m ~/mnt --meta-server HOST:50053 --data-servers HOST:50100 --layout my.rules
+    grovefs mount --view alice -m ~/mnt --manager HOST:50055 --roster-key-file ~/roster.key --layout my.rules
 
   Detaches by DEFAULT: returns once the mountpoint is live and serves in the
   background (output to --log-file); tear down with `grovefs umount -m ~/mnt`.
@@ -166,16 +176,10 @@ enum Cmd {
         /// Existing directory to mount the view onto.
         #[arg(short, long)]
         mountpoint: PathBuf,
-        /// Remote data service address (host:port). Object IO is shipped over
-        /// the network to a `data-server` (no NFS); nothing is stored on the
-        /// client's disk. A comma-separated list (addr1,addr2,...) enables
-        /// deterministic cross-server striping; a single address is the plain
-        /// one-disk-per-node shape.
-        #[arg(long = "data-servers", value_name = "ADDR[,ADDR]")]
-        data: Option<String>,
         /// Stripe chunk size for cross-server striping: a byte count or a
         /// K/M/G suffix (1024-based, e.g. `16M`, `4194304`). Default 16 MiB.
-        /// Only meaningful with a multi-address `--data-servers` list. The
+        /// Only meaningful when the resolved roster's data list carries several
+        /// data-servers. The
         /// value is baked into each NEW object's `data_ref`
         /// (`s<N>:<stripe>:<uuid>`); existing objects keep the stripe they
         /// were written with, so changing this never requires re-ingesting
@@ -186,28 +190,21 @@ enum Cmd {
             value_parser = grovefs::bwlimit::parse_size_bytes
         )]
         stripe_bytes: Option<u64>,
-        /// Remote metadata service address (host:port). The view tree is served
-        /// by a central `meta-server`, so multiple clients mounting the same view
-        /// share ONE authoritative view (consistent across machines).
-        /// May be a comma-separated failover list (`primary,standby`): the mount
-        /// stays on the first reachable node and falls over to a backup when the
-        /// primary dies (pairs with HA `meta-server --role/--peer`).
-        #[arg(long = "meta-server", value_name = "ADDR[,ADDR]")]
-        meta: Option<String>,
-        /// Resolve BOTH cluster coordinates from a manager instead of typing
-        /// them: ask `HOST:PORT` for the deployment's roster
+        /// Resolve BOTH cluster coordinates from a manager — the only way a
+        /// mount is bootstrapped. Ask `HOST:PORT` for the deployment's roster
         /// (`grovefs manager serve`), verify its signature under
         /// `--roster-key-file`, then connect to the meta- and data-servers
         /// DIRECTLY. A bootstrap step, not a proxy: the manager is consulted
         /// once during the mount and never again, so a manager restart or
         /// outage cannot disturb a live mount (it can only refuse a new one).
-        /// Mutually exclusive with `--meta-server`/`--data-servers` — a mount
-        /// resolves its coordinates one way or the other, never from two
-        /// sources that could disagree. `--roster-key-file` is required: an
-        /// unverified roster is an instruction to connect wherever someone else
-        /// wants, so an unverifiable one fails the mount. Falls back to env
-        /// `GROVEFS_MANAGER`.
-        #[arg(long = "manager", value_name = "HOST:PORT", conflicts_with_all = ["meta", "data"])]
+        /// A mount never takes a hand-typed `meta-server`/`data-server` address
+        /// list: the deployment's topology is declared once at the manager and
+        /// every client resolves the SAME signed roster, so no two mounts of one
+        /// view can dial different (or half a) cluster. `--roster-key-file` is
+        /// required: an unverified roster is an instruction to connect wherever
+        /// someone else wants, so an unverifiable one fails the mount. Falls
+        /// back to env `GROVEFS_MANAGER`.
+        #[arg(long = "manager", value_name = "HOST:PORT")]
         manager: Option<String>,
         /// Which deployment `--manager` should resolve (default `default`, the
         /// name `manager define` uses when given no `--name`). Falls back to
@@ -232,7 +229,8 @@ enum Cmd {
         /// attribute/dentry cache and read file data straight through
         /// (FOPEN_DIRECT_IO), so one client's writes are visible to another
         /// immediately instead of after the cache TTL. Trade: no client-side
-        /// caching, so more metadata/data round-trips. Pairs with `--meta-server`.
+        /// caching, so more metadata/data round-trips. Pairs with a
+        /// manager-resolved `meta-server`.
         #[arg(long = "no-cache")]
         strict: bool,
         /// Access token presented to a `meta-server` started with `--token`.
@@ -285,7 +283,7 @@ enum Cmd {
         /// directory listings fall back to plain READDIR + per-entry LOOKUP —
         /// useful as an A/B benchmark knob and for compatibility debugging.
         /// READDIRPLUS is only ever offered on mounts whose metadata provider
-        /// pages inside its own store: a `--meta-server` backed by SQLite or PG
+        /// pages inside its own store: a `meta-server` backed by SQLite or PG
         /// (which serve the paged M_READDIRP RPC). Derived/lens mounts answer a
         /// whole listing per buffer, so this flag changes nothing for them.
         #[arg(long)]
@@ -373,31 +371,31 @@ enum Cmd {
         /// Connects and revokes are logged, and the key is re-verified on live
         /// connections (once per second), so a revoke closes an established
         /// mount rather than only refusing the next one. The store is
-        /// `<meta-dir>/meta/api_keys.db`; `--meta-dir` defaults to this node's
+        /// `<meta-dir>/meta/_control/api_keys.db`; `--meta-dir` defaults to this node's
         /// first `--data-dir`, so a colocated deployment needs no extra flag and a
         /// split one points at a synced/colocated copy of that file.
         #[arg(long)]
         require_api_key: bool,
-        /// Metadata root holding `meta/api_keys.db` for `--require-api-key` (the
+        /// Metadata root holding `meta/_control/api_keys.db` for `--require-api-key` (the
         /// same layout `grovefs apikey --meta-dir` manages). Defaults to the
         /// first `--data-dir`.
         #[arg(long = "meta-dir", value_name = "DIR")]
         keys_from: Option<PathBuf>,
         /// Key/audit backend for `--require-api-key`. Unset / `"sqlite"` reads
-        /// the local `<meta-dir>/meta/api_keys.db`; a `postgres://…`
+        /// the local `<meta-dir>/meta/_control/api_keys.db`; a `postgres://…`
         /// (`postgresql://…`) URI — or the `GROVEFS_META_STORE` env — reads the shared
         /// `grovefs_control.api_keys` table, so a data-server on a PG deployment
         /// gates mounts against the SAME registry its meta-server does with no
         /// file to colocate (and `--meta-dir` is then unused).
         #[arg(long = "meta-store", value_name = "URI")]
         store: Option<String>,
-        /// This node's stable identity within a striped cluster. When clients
-        /// mount with a comma `--data-servers h1:port,h2:port,...` list, chunk
+        /// This node's stable identity within a striped cluster. When a
+        /// deployment's roster carries several data-servers, chunk
         /// placement is normally decided by list position, so reordering the
         /// addresses would silently misroute reads/writes of existing objects.
         /// Each data-server started with a DISTINCT `--member-id` (0, 1, 2, …)
-        /// lets those clients place chunks by member IDENTITY instead: the
-        /// `--data-servers` order then no longer matters, and a disk replaced
+        /// lets those mounts place chunks by member IDENTITY instead: the
+        /// declared data-server order then no longer matters, and a disk replaced
         /// behind the same id keeps its bytes addressable. Members of one
         /// stripe must use unique ids; the id must stay FIXED for a given
         /// store — changing it re-maps every chunk family. Falls back to
@@ -460,7 +458,7 @@ enum Cmd {
         #[arg(long = "register-ttl", value_name = "SECS")]
         register_ttl: Option<u64>,
     },
-    /// Run the central metadata service many `mount --meta-server` clients share.
+    /// Run the central metadata service that many a client's mount shares.
     ///
     /// Hosts the authoritative per-view DB that those clients share (no NFS);
     /// pairs with `data-server`.
@@ -469,9 +467,9 @@ enum Cmd {
         #[arg(short, long, default_value = "127.0.0.1:50053")]
         listen: String,
         /// Authoritative metadata root for this server: under SQLite every
-        /// view DB lives under `<meta-dir>/meta/<view>.db` (created explicitly
+        /// view DB lives in `<meta-dir>/meta/<view>/<view>.db` (created explicitly
         /// by `view create` / `view import`, never by a mount) and
-        /// the API-key/audit store lives at `<meta-dir>/meta/api_keys.db`;
+        /// the API-key/audit store lives at `<meta-dir>/meta/_control/api_keys.db`;
         /// under PostgreSQL (`--meta-store postgres://…`) the view trees AND the
         /// control plane
         /// (definitions, keys, audit) live in that engine, making `<meta-dir>` a
@@ -488,7 +486,7 @@ enum Cmd {
         /// Gate `M_OPEN` on a revocable per-caller credential instead of (or in
         /// addition to) a static `--token`: every client must present a live key
         /// minted by `grovefs apikey create --for mount` (`mount --api-key`). The
-        /// store is `<meta-dir>/meta/api_keys.db` — the same file `grovefs mcp
+        /// store is `<meta-dir>/meta/_control/api_keys.db` — the same file `grovefs mcp
         /// --meta-dir` authenticates against and `grovefs apikey --meta-dir`
         /// manages, so one credential registry serves both entrances while key
         /// SCOPES keep them apart. Connects and revokes are audited, and live
@@ -691,7 +689,7 @@ enum Cmd {
         /// never a prerequisite for serving (an HA primary that cannot reach its
         /// directory service must still fail over to its peers). Requires
         /// `--join-key-file`; with `--role`/`--peer` the ORDER of the
-        /// `mount --meta-server` failover list comes from `manager define
+        /// failover list a mount gets comes from `manager define
         /// --meta primary,standby`, which is where the preference belongs. Env
         /// `GROVEFS_REGISTER_WITH`/`GROVEFS_JOIN_KEY_FILE` fill the two flags.
         #[arg(long = "register-with", value_name = "HOST:PORT")]
@@ -776,7 +774,7 @@ enum Cmd {
     },
     /// Manage server-side views: base trees, derived lenses, pure aliases and forks.
     ///
-    /// A BASE view is a physical tree (`meta/<name>.db`): mountable read-write,
+    /// A BASE view is a physical tree (`meta/<name>/<name>.db`): mountable read-write,
     /// the only kind whose deletes do real garbage collection. A DERIVED view is a
     /// named presentation lens over ONE physical tree, mounted read-only; a pure
     /// ALIAS maps a public name to a real name (writable, real name not
@@ -898,7 +896,7 @@ NOTES
         /// handshake. Off by default: a plain `grovefs mcp` trusts whoever can
         /// spawn it (the same OS boundary as read access to its `--meta-dir`).
         /// Either way, every
-        /// tool call is appended to `<meta-dir>/meta/api_keys.db`'s audit log.
+        /// tool call is appended to `<meta-dir>/meta/_control/api_keys.db`'s audit log.
         #[arg(long)]
         require_api_key: bool,
         /// Control-plane backend. Unset / `"sqlite"` governs the local
@@ -921,13 +919,13 @@ NOTES
     /// The audit log records every tool call (timestamp, key, tool, success,
     /// detail).
     Apikey {
-        /// The metadata root holding `meta/api_keys.db` — same option name and
+        /// The metadata root holding `meta/_control/api_keys.db` — same option name and
         /// directory as `grovefs mcp --meta-dir` / `meta-server --meta-dir`; falls
         /// back to the global `--home`.
         #[arg(long = "meta-dir", value_name = "DIR")]
         db_path: Option<PathBuf>,
         /// Key/audit backend. Unset / `"sqlite"` uses the local
-        /// `<meta-dir>/meta/api_keys.db`; a `postgres://…` (`postgresql://…`)
+        /// `<meta-dir>/meta/_control/api_keys.db`; a `postgres://…` (`postgresql://…`)
         /// URI — or the `GROVEFS_META_STORE` env — uses the shared
         /// `grovefs_control.api_keys`/`mcp_calls` tables, so a key minted here
         /// is authoritative for every meta-/data-server and MCP pointing at that
@@ -1017,26 +1015,26 @@ NOTES
         action: Option<WebAction>,
     },
     /// Inspect and repair the cross-view blob reference ledger (the shared
-    /// `meta/refs.db` that decides when a physical object may actually be
+    /// `meta/_control/refs.db` that decides when a physical object may actually be
     /// deleted). A blob is freed only when its last name in EVERY view holding
     /// it is removed; this ledger is what makes a delete in one view safe for
     /// another view sharing the same object (e.g. `import` of one source into
     /// two views). Normally maintenance-free — it is updated atomically with
-    /// every create/delete — but a view db removed OUT-OF-BAND (`rm meta/x.db`,
+    /// every create/delete — but a tree removed OUT-OF-BAND (`rm -rf meta/x/`,
     /// a fresh `--home`) never released its holds, so the ledger over-counts and
     /// keeps bytes too long. `refs rebuild` rewrites it from the trees that
-    /// actually exist. Works on the SQLite store (`meta/refs.db`) and, through
-    /// `--meta-store postgres://…`, on the ledger that lives IN the PostgreSQL
-    /// schemas. See `grovefs view create`.
+    /// actually exist. Works on the SQLite store (`meta/_control/refs.db`) and,
+    /// through `--meta-store postgres://…`, on the ledger that lives IN the
+    /// PostgreSQL schemas. See `grovefs view create`.
     Refs {
-        /// The metadata root holding `meta/refs.db` and the per-view trees
-        /// `meta/*.db` — same option name and directory as `meta-server
-        /// --meta-dir`; falls back to the global `--home`.
+        /// The metadata root holding `meta/_control/refs.db` and one directory per
+        /// view tree — same option name and directory as `meta-server --meta-dir`;
+        /// falls back to the global `--home`.
         #[arg(long = "meta-dir", value_name = "DIR")]
         db_path: Option<PathBuf>,
         /// Metadata STORE URI: a `postgres://…` URI rebuilds the ledger that
-        /// lives IN the PostgreSQL schemas instead of `meta/refs.db`. Falls back
-        /// to `$GROVEFS_META_STORE`, exactly like `gc`'s backend guards.
+        /// lives IN the PostgreSQL schemas instead of `meta/_control/refs.db`. Falls
+        /// back to `$GROVEFS_META_STORE`, exactly like `gc`'s backend guards.
         #[arg(long = "meta-store", value_name = "URI")]
         store: Option<String>,
         /// Rebuild the ledger on the REMOTE deployment behind `meta-server
@@ -1051,11 +1049,36 @@ NOTES
         #[command(subcommand)]
         action: RefsAction,
     },
+    /// Inspect or migrate the on-disk METADATA LAYOUT of a local store.
+    ///
+    /// Layout v2 gave every physical view tree its own directory —
+    /// `meta/<view>/<view>.db` with its WAL/SHM beside it — and moved the
+    /// control-plane stores (`refs`, `api_keys`, `web_accounts`, the store key)
+    /// into `meta/_control/`, so `meta/` lists trees and nothing else. A store
+    /// created by an older build is still FLAT (`meta/<view>.db` among its
+    /// control files), and no other command reads that shape: `view list` would
+    /// show no views, `gc` would find no trees and `refs rebuild` would book no
+    /// holders. Every such command therefore REFUSES a flat store and names this
+    /// one verb instead of half-reading it.
+    ///
+    /// `migrate` moves files only — the ledger counts content keys, not paths, so
+    /// nothing has to be recomputed — and it is idempotent: an interrupted run
+    /// leaves the already-moved trees in place and finishes the rest. It must run
+    /// QUIESCED (no mount of this store, no `meta-server`/`data-server` on it),
+    /// which the command checks rather than trusts.
+    Layout {
+        /// The metadata root to inspect or migrate — the same directory
+        /// `meta-server --meta-dir` uses. Falls back to the global `--home`.
+        #[arg(long = "meta-dir", value_name = "DIR")]
+        db_path: Option<PathBuf>,
+        #[command(subcommand)]
+        action: LayoutAction,
+    },
     /// Audit and reclaim ORPHAN objects (offline GC).
     ///
     /// An orphan is an object that NO surviving view tree names and the
     /// cross-view ledger does not book — the residue of an out-of-band
-    /// `rm meta/<view>.db` (no unlink ever ran) or a crash between object
+    /// `rm meta/<view>/<view>.db` (no unlink ever ran) or a crash between object
     /// creation and the node insert. SCAN IS THE DEFAULT: it prints the counts,
     /// the biggest orphans and any ledger-held keys that must first be released
     /// with `grovefs refs rebuild`.
@@ -1073,8 +1096,9 @@ NOTES
     /// tree that cannot be read aborts the whole scan rather than guessing — a
     /// skipped tree would make every blob it names look orphaned.
     Gc {
-        /// Metadata root holding `meta/*.db` — same option name and directory
-        /// as `meta-server --meta-dir`; falls back to the global `--home`.
+        /// Metadata root holding one directory per view tree — the same option name
+        /// and directory as `meta-server --meta-dir`; falls back to the global
+        /// `--home`.
         #[arg(long = "meta-dir", value_name = "DIR")]
         db_path: Option<PathBuf>,
         /// Data root(s) holding `blocks/` — comma-separated for several disks,
@@ -1141,7 +1165,7 @@ NOTES
     /// deployment's backend, and a `postgres://…` URI is refused rather than
     /// served as a local import the deployment never sees.
     Import {
-        /// Metadata root holding `meta/<view>.db` — same option name and
+        /// Metadata root holding `meta/<view>/<view>.db` — same option name and
         /// directory as `meta-server --meta-dir`; falls back to `--home`.
         #[arg(long = "meta-dir", value_name = "DIR")]
         db_path: Option<PathBuf>,
@@ -1159,7 +1183,7 @@ NOTES
         #[arg(long)]
         source: PathBuf,
         /// Metadata backend of the deployment this import would write into. The
-        /// command produces a LOCAL SQLite tree (`meta/<view>.db` plus hardlinks
+        /// command produces a LOCAL SQLite tree (`meta/<view>/<view>.db` plus hardlinks
         /// or copies under `blocks/`), so a `postgres://…` store —
         /// given here or through `GROVEFS_META_STORE` — is REFUSED with the
         /// alternative named (rsync/cp through a mounted path), never silently
@@ -1196,7 +1220,7 @@ NOTES
         /// PostgreSQL store URI (same as meta-server --meta-store).
         #[arg(long = "meta-store", value_name = "URI")]
         store: Option<String>,
-        /// Metadata root for SQLite mode (meta/<view>.db lives under here).
+        /// Metadata root for SQLite mode (meta/<view>/<view>.db lives here).
         #[arg(long = "meta-dir", value_name = "DIR")]
         db_path: Option<PathBuf>,
         /// Data-server endpoint(s) for batch stat: `host:port`, or a
@@ -1294,7 +1318,7 @@ enum ManagerAction {
         #[arg(long, default_value = grovefs::manager::DEFAULT_DEPLOYMENT)]
         name: String,
         /// The meta-server failover list, IN PREFERENCE ORDER — this exact list
-        /// and order is what a mount hands `--meta-server`, so the primary is
+        /// and order is what a mount dials, so the primary is
         /// the first address here, not a flag on the client.
         #[arg(long, value_name = "ADDR[,ADDR]")]
         meta: Option<String>,
@@ -1338,7 +1362,7 @@ enum ViewAction {
     /// neither does writing into a name that has no tree.
     Create {
         /// Name of the new base (physical) view; its tree lives at
-        /// `<meta-dir>/meta/<view>.db`.
+        /// `<meta-dir>/meta/<view>/<view>.db`.
         #[arg(long)]
         view: String,
         /// Optional seed manifest (`mkdir <path>` / `touch <path>` lines, `#`
@@ -1434,7 +1458,7 @@ enum ViewAction {
         #[arg(long)]
         rules: PathBuf,
     },
-    /// List every view: bare base trees (`meta/<name>.db` with no definition),
+    /// List every view: bare base trees (`meta/<name>/<name>.db` with no definition),
     /// derived views (name, base, rule counts, read-only), forks (independent
     /// trees, structure writable / content read-only) and pure aliases
     /// (name → real view, writable).
@@ -1455,7 +1479,7 @@ enum ViewAction {
     /// root/data-server that actually stores the objects).
     ///
     /// What "the tree" is depends on the backend the name lives in. A local
-    /// store loses `meta/<name>.db` (+ WAL/SHM) and the shared `refs` ledger is
+    /// store loses `meta/<name>/<name>.db` (+ WAL/SHM) and the shared `refs` ledger is
     /// recomputed from the trees that survive. With
     /// `--meta-store postgres://…` the tree is a `grovefs_v_<hex>` schema, so
     /// the command unbooks what the schema held and drops it in ONE
@@ -1526,7 +1550,7 @@ enum ViewAction {
         force: bool,
     },
     /// Import a metadata tree written by `view export` into a NEW local base
-    /// tree (`meta/<view>.db`), preserving ids/inode numbers (hard links stay
+    /// tree (`meta/<view>/<view>.db`), preserving ids/inode numbers (hard links stay
     /// hard links) and rebuilding the cross-view ledger afterwards. The target
     /// must not be governed by a definition; an existing tree needs
     /// `--replace`, and every mount/meta-server using this store must be
@@ -1544,7 +1568,7 @@ enum ViewAction {
         view: String,
         #[arg(long = "in")]
         input: PathBuf,
-        /// Replace an existing `meta/<view>.db` (offline migration only).
+        /// Replace an existing tree db (offline migration only).
         #[arg(long)]
         replace: bool,
         /// Record the imported tree as a fork of this physical base view
@@ -1560,7 +1584,7 @@ enum ViewAction {
     /// leaves it as a rollback point. Metadata only — content bytes stay in
     /// the data domain they live in (the server-side gc unions ALL instances'
     /// ledgers, so nothing is reclaimed out from under the moved view); mounts
-    /// keep pointing at the same `--data-servers`. Refuses a view mounted on
+    /// keep resolving the same data servers through the manager. Refuses a view mounted on
     /// this machine; quiesce other machines yourself.
     Move {
         #[arg(long)]
@@ -1925,12 +1949,285 @@ enum WebGrantAction {
 
 #[derive(Subcommand)]
 enum RefsAction {
-    /// Recompute `meta/refs.db` from the surviving view trees: for every
+    /// Recompute `meta/_control/refs.db` from the surviving view trees: for every
     /// `data_ref`, count the DISTINCT views still holding a name for it and
     /// rewrite the holder rows. Clears holds stranded by an out-of-band view-db
     /// removal (the only over-count source) so their blobs become freeable again.
     /// A missing/empty ledger is (re)built; healthy stores need no rebuild.
     Rebuild,
+}
+
+#[derive(Subcommand)]
+enum LayoutAction {
+    /// Report the layout one metadata root uses, the trees it holds and where
+    /// each file lives. Read-only, safe against a live store.
+    Show,
+    /// Move a FLAT pre-v2 store into the per-tree layout: checkpoint each db so
+    /// the file that moves is self-contained, then `rename` it into its new
+    /// home. Refuses while the store has a live mount or a local grovefs process
+    /// using it (pass `--dry-run` to see the plan without touching anything).
+    Migrate {
+        /// Print what would move and stop: no checkpoint, no rename.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+/// One file the migrator has to place: `dest` is where it goes, `object` groups
+/// the sidecars that belong to one db so they travel together, and `sidecar`
+/// marks the wrap material a checkpoint is allowed to swallow.
+struct LayoutMove {
+    object: String,
+    src: PathBuf,
+    dest: PathBuf,
+    sidecar: bool,
+}
+
+/// Classify the flat files a pre-v2 `meta/` holds into moves. Everything here
+/// is name arithmetic — the same rule the layout itself is built from, so the
+/// migrator cannot invent a location the runtime would not look in.
+fn layout_plan(base: &Path) -> Vec<LayoutMove> {
+    let mut out = Vec::new();
+    for name in grovefs::meta::legacy_flat_entries(base) {
+        let src = grovefs::meta::meta_dir(base).join(&name);
+        // The wrap material is a plain file, not a db: it goes to the control
+        // slot under its own name.
+        if name == grovefs::meta::STORE_KEY_FILE {
+            out.push(LayoutMove {
+                object: "store.key".to_string(),
+                src,
+                dest: grovefs::meta::control_dir(base).join(grovefs::meta::STORE_KEY_FILE),
+                sidecar: false,
+            });
+            continue;
+        }
+        // Longest suffix first: `api_keys.db-wal` must not classify as
+        // `api_keys.db` + a stray `-wal`.
+        let (stem, suffix) = [
+            (".db.push.tmp", ".push.tmp"),
+            (".db-wal", "-wal"),
+            (".db-shm", "-shm"),
+            (".db", ""),
+        ]
+        .into_iter()
+        .find_map(|(sfx, keep)| name.strip_suffix(sfx).map(|st| (st.to_string(), keep)))
+        .unwrap_or((name.clone(), ""));
+        let file = format!("{stem}.db{suffix}");
+        let dest = if grovefs::meta::CONTROL_DB_STEMS.contains(&stem.as_str()) {
+            grovefs::meta::control_dir(base).join(&file)
+        } else {
+            grovefs::meta::view_dir(base, &stem).join(&file)
+        };
+        out.push(LayoutMove {
+            object: stem,
+            src,
+            dest,
+            sidecar: !suffix.is_empty(),
+        });
+    }
+    out.sort_by(|a, b| a.dest.cmp(&b.dest));
+    out
+}
+
+/// `grovefs layout show`: what a store IS, in the words an operator needs
+/// before deciding to migrate it (and the answer to "where do this view's files
+/// live?", which is the question that motivated the per-tree directory).
+fn layout_show(base: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let flat = grovefs::meta::legacy_flat_entries(base);
+    let meta = grovefs::meta::meta_dir(base);
+    if !meta.is_dir() {
+        return Err(format!("no metadata directory {}", meta.display()).into());
+    }
+    println!("metadata root:  {}", base.display());
+    if flat.is_empty() {
+        println!("layout:         v2 — one directory per view tree, control plane in meta/_control");
+        let trees = grovefs::meta::list_view_trees(base);
+        println!("view trees:     {}", trees.len());
+        for t in &trees {
+            println!(
+                "  {t:<24} {}",
+                grovefs::meta::view_db_path(base, t).display()
+            );
+        }
+    } else {
+        println!("layout:         v1 FLAT (pre-v2) — no command reads this shape; migrate it");
+        let plan = layout_plan(base);
+        println!("flat files:     {}", plan.len());
+        for m in &plan {
+            println!("  {}  ->  {}", m.src.display(), m.dest.display());
+        }
+    }
+    for (label, p) in [
+        ("definitions", grovefs::meta::defs_dir(base)),
+        ("control plane", grovefs::meta::control_dir(base)),
+        ("transfer spool", grovefs::meta::xfer_dir(base)),
+    ] {
+        let n = std::fs::read_dir(&p)
+            .map(|rd| rd.filter_map(|e| e.ok()).count())
+            .unwrap_or(0);
+        println!("{label:<14} {} ({n} entr(y|ies))", p.display());
+    }
+    Ok(())
+}
+
+/// `grovefs layout migrate`: the one-shot offline move from the flat layout to
+/// the per-tree layout. Idempotent, and deliberately NOT a rewrite of anything
+/// but file locations — the holder ledger counts content keys, and a view's
+/// inode numbers and `data_ref` keys live inside its own db, so no bookkeeping
+/// depends on where the db sat.
+fn layout_migrate(base: &Path, dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let flat = grovefs::meta::legacy_flat_entries(base);
+    if flat.is_empty() {
+        println!(
+            "{} already uses the v2 layout — nothing to do",
+            grovefs::meta::meta_dir(base).display()
+        );
+        return Ok(());
+    }
+    let plan = layout_plan(base);
+    // Legacy tree names, for the mount gate: `gc_live_mounts` matches a
+    // `grovefs:` entry by VIEW NAME, and under this layout the names come from
+    // the flat files, not from the (still empty) tree directories.
+    let mut names: Vec<String> = Vec::new();
+    for m in &plan {
+        if !grovefs::meta::CONTROL_DB_STEMS.contains(&m.object.as_str())
+            && m.object != "store.key"
+            && !names.contains(&m.object)
+        {
+            names.push(m.object.clone());
+        }
+    }
+    if dry_run {
+        println!(
+            "dry run: {} flat file(s) in {} would move into the v2 layout ({} view tree(s), control plane into meta/_control)",
+            plan.len(),
+            grovefs::meta::meta_dir(base).display(),
+            names.len(),
+        );
+        for m in &plan {
+            println!("  {}  ->  {}", m.src.display(), m.dest.display());
+        }
+        println!("  nothing was moved; run without --dry-run to migrate");
+        return Ok(());
+    }
+    // The quiesce doors are gc's, for the same reason: a live writer would keep
+    // its handle on the OLD inode, so the moved file would be authoritative for
+    // nobody and the running server would keep answering from the copy that is
+    // no longer where the layout says the tree lives.
+    let live = gc_live_mounts(base, &[base.to_path_buf()], &names);
+    if !live.is_empty() {
+        return Err(format!(
+            "layout migrate refused: this store has live mounts — {}; unmount them first (the layout is a file-location contract, so it cannot change under a writer)",
+            live.join("; ")
+        )
+        .into());
+    }
+    let users = local_store_users(base, &[base.to_path_buf()]);
+    if !users.is_empty() {
+        return Err(format!(
+            "layout migrate refused: this store is in use by local grovefs process(es) — {}; stop the meta-server/data-server and any mount first",
+            users.join("; ")
+        )
+        .into());
+    }
+    // Fold each db's WAL into its main file BEFORE the move, so what travels is
+    // a self-contained database. A checkpoint that fails (a garbage or corrupt
+    // file) is not a reason to abandon the operator's data: the sidecars are
+    // then carried along untouched instead of being dropped, which is the
+    // conservative direction.
+    let mut moved = 0usize;
+    let mut absorbed = 0usize;
+    for m in &plan {
+        if let Some(dir) = m.dest.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let foldable = m.dest.to_string_lossy().ends_with(".db") && m.src.is_file();
+        let folded = foldable
+            && rusqlite::Connection::open(&m.src)
+                .and_then(|c| {
+                    c.execute_batch("PRAGMA busy_timeout=5000; PRAGMA wal_checkpoint(TRUNCATE);")
+                })
+                .is_ok();
+        if m.src == m.dest {
+            continue;
+        }
+        // Folding a WAL into its db deletes the `-wal`/`-shm` that were just
+        // absorbed, so a sidecar can legitimately be gone by the time its own
+        // turn comes — its content already travels inside the moved `.db`.
+        // A missing MAIN db is a different matter: nothing else accounts for
+        // those bytes, so that stays a hard error.
+        if m.sidecar && !m.src.exists() {
+            absorbed += 1;
+            continue;
+        }
+        move_into(&m.src, &m.dest)?;
+        moved += 1;
+        if folded {
+            if let Some(n) = m.src.file_name().and_then(|n| n.to_str()) {
+                for sfx in ["-wal", "-shm", ".push.tmp"] {
+                    let leftover = grovefs::meta::meta_dir(base).join(format!("{n}{sfx}"));
+                    if leftover.is_file() {
+                        let _ = std::fs::remove_file(&leftover);
+                    }
+                }
+            }
+        }
+    }
+    let left = grovefs::meta::legacy_flat_entries(base);
+    if !left.is_empty() {
+        return Err(format!(
+            "migration incomplete: {} flat file(s) still in {} ({} moved) — run `grovefs layout --meta-dir {} migrate` again; it finishes where it stopped",
+            left.len(),
+            grovefs::meta::meta_dir(base).display(),
+            moved,
+            base.display(),
+        )
+        .into());
+    }
+    println!(
+        "migrated {} flat file(s) into the v2 layout: {} view tree(s) now live in meta/<view>/<view>.db, the control plane in meta/_control/{}",
+        moved,
+        names.len(),
+        if absorbed == 0 {
+            String::new()
+        } else {
+            format!(" ({absorbed} sidecar(s) needed no move: the checkpoint had already folded them into their db)")
+        }
+    );
+    println!(
+        "  the ledger was NOT rewritten (it books content keys, not paths) — but every OTHER node holding a copy of this meta dir must be migrated the same way: an HA standby and any host that receives `meta/views/` by hand"
+    );
+    println!(
+        "  verify with `grovefs layout --meta-dir {} show`, then start the meta-server"
+    , base.display());
+    Ok(())
+}
+
+/// Rename, with a copy fallback for the one case a rename cannot express: the
+/// source and destination are on different filesystems (a bind-mounted `meta/`
+/// subtree, an operator staging the new layout on another disk). The copy is
+/// fsynced before the source is unlinked, so a crash mid-move leaves either the
+/// old file complete or the new one complete — never a half file at the new
+/// location that the layout would read as a tree.
+fn move_into(src: &Path, dest: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    match std::fs::rename(src, dest) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            std::fs::copy(src, dest).map_err(|e2| -> Box<dyn std::error::Error> {
+                format!(
+                    "cannot move {} to {}: {e} (copy fallback: {e2})",
+                    src.display(),
+                    dest.display()
+                )
+                .into()
+            })?;
+            let f = std::fs::OpenOptions::new().write(true).open(dest)?;
+            f.sync_all()?;
+            drop(f);
+            std::fs::remove_file(src)?;
+            Ok(())
+        }
+    }
 }
 
 /// Auto-load a `KEY=VALUE` config file into the environment, WITHOUT clobbering
@@ -2060,7 +2357,9 @@ fn base_dir(home: &Option<PathBuf>) -> PathBuf {
 }
 
 fn meta_path(base: &Path, view: &str) -> PathBuf {
-    base.join("meta").join(format!("{view}.db"))
+    // One funnel for the whole product: `crate::meta` owns the answer, so a CLI
+    // arm cannot drift from what the server, the engine and `gc` compute.
+    grovefs::meta::view_db_path(base, view)
 }
 
 /// Start one server's manager heartbeat when `--register-with` was given, and
@@ -2545,9 +2844,10 @@ fn rollback_imported_tree(vbase: &Path, store: Option<&str>, view: &str) -> Stri
             }
         };
     }
-    for ext in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(vbase.join("meta").join(format!("{view}.db{ext}")));
+    for ext in grovefs::meta::TREE_DB_EXTS {
+        let _ = std::fs::remove_file(grovefs::meta::view_db_with_ext(vbase, view, ext));
     }
+    let _ = std::fs::remove_dir(grovefs::meta::view_dir(vbase, view));
     let _ = meta::rebuild_ledger(vbase);
     "the imported tree was removed again".to_string()
 }
@@ -2893,21 +3193,24 @@ fn main() {
     std::process::exit(rc);
 }
 
-/// The one refusal every mount without BOTH cluster coordinates gets. Spelled
-/// out rather than reduced to "missing --meta-server": a mount is not a
-/// command that can be repaired by guessing, so the operator is told what has
-/// to be running and why one disk cannot answer for both roles.
+/// The one refusal every mount without a manager gets. Spelled out rather than
+/// reduced to "missing --manager": a mount is not a command that can be
+/// repaired by guessing, so the operator is told what has to be running and why
+/// a hand-typed address list is no longer an option.
 const NO_COORDINATES: &str = concat!(
-    "a mount needs BOTH services: a metadata service (--meta-server) and a data ",
-    "service (--data-servers). ",
-    "There is no single-machine mode: one --home holding a view's tree AND its ",
-    "bytes would make every client an authoritative store, so two mounts of one ",
-    "view diverge and a laptop can end up holding the only copy. Pass the two ",
-    "addresses, each optionally a comma list (failover for the first, striping for ",
-    "the second), or --manager HOST:PORT --roster-key-file PATH to have both resolved ",
-    "from a signed roster. GROVEFS_META_SERVER / GROVEFS_DATA_SERVERS satisfy this ",
-    "too. --home stays the store root of the node-side verbs (view create, gc, ",
-    "import, apikey, du) and of the servers themselves, never of a mount."
+    "a mount resolves its cluster coordinates from the deployment's manager: there is no ",
+    "longer a way to name a metadata or data service by hand. ",
+    "Pass --manager HOST:PORT --roster-key-file PATH (or the GROVEFS_MANAGER / ",
+    "GROVEFS_ROSTER_KEY_FILE env knobs) to fetch the deployment's SIGNED roster and dial ",
+    "the meta- and data-servers it declares. ",
+    "Directly naming the addresses was removed on purpose: one --home holding a view's tree ",
+    "AND its bytes would make every client an authoritative store, and hand-typed lists let ",
+    "two mounts of one view dial different (or half a) cluster; a manager declaring the ",
+    "topology once and every client verifying the same signature is what keeps them ",
+    "consistent. Start the services with --register-with the manager, then ",
+    "`grovefs manager define`/`serve` it. --home stays the store root of the node-side ",
+    "verbs (view create, gc, import, apikey, du) and of the servers themselves, never of ",
+    "a mount."
 );
 
 fn real_main() -> Result<(), Box<dyn std::error::Error>> {
@@ -2934,9 +3237,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Mount {
             view,
             mountpoint,
-            data,
             stripe_bytes,
-            meta,
             manager,
             deployment,
             roster_key_file,
@@ -2958,52 +3259,32 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             foreground,
             log_file,
         } => {
-            // Cluster coordinates need not be retyped on every mount: each of
-            // the repeat-heavy flags falls back to its env knob when unset —
-            // the live env wins over the config file, an explicit flag wins
-            // over both (see `load_config_file`). The detached re-exec keeps
-            // these: the child inherits the resolved env below.
-            let data = data.or_else(|| std::env::var("GROVEFS_DATA_SERVERS").ok());
-            let meta = meta.or_else(|| std::env::var("GROVEFS_META_SERVER").ok());
+            // Every mount is bootstrapped from the deployment's manager: the
+            // repeat-heavy knobs fall back to their env when unset — the live
+            // env wins over the config file, an explicit flag wins over both
+            // (see `load_config_file`). The detached re-exec keeps these: the
+            // child inherits the resolved env below.
             let manager = manager.or_else(|| std::env::var("GROVEFS_MANAGER").ok());
             let roster_key_file = roster_key_file
                 .or_else(|| std::env::var("GROVEFS_ROSTER_KEY_FILE").ok().map(PathBuf::from));
             let deployment = deployment
                 .or_else(|| std::env::var("GROVEFS_DEPLOYMENT").ok())
                 .unwrap_or_else(|| grovefs::manager::DEFAULT_DEPLOYMENT.to_string());
-            if let Some(mgr) = &manager {
-                // Checked HERE as well as by clap: `conflicts_with` only sees
-                // flags, and an env-borne coordinate would otherwise silently
-                // lose to (or win over) the roster.
-                if meta.is_some() || data.is_some() {
-                    return Err(format!(
-                        "mount --manager {mgr} resolves BOTH cluster coordinates, so it cannot be \
-                         combined with --meta-server/--data-servers (or their GROVEFS_ env knobs): \
-                         a mount must take its addresses from one source. Drop the explicit \
-                         addresses to be told what to dial, or drop --manager to dial what you typed."
-                    )
-                    .into());
-                }
-                if roster_key_file.is_none() {
-                    return Err(format!(
-                        "mount --manager {mgr} needs --roster-key-file PATH (or \
-                         GROVEFS_ROSTER_KEY_FILE): a roster nobody verified is an instruction to \
-                         connect wherever whoever answered wanted you to, which is exactly what \
-                         the signature exists to rule out."
-                    )
-                    .into());
-                }
-            } else if deployment != grovefs::manager::DEFAULT_DEPLOYMENT {
-                eprintln!(
-                    "note: --deployment only names what `mount --manager` resolves; without \
-                     --manager it has no effect (coordinates come from --meta-server/--data-servers)"
-                );
-            }
-            // No single-machine mode: BOTH coordinates must be known before anything is
-            // dialed - and before the daemonize below, so an operator reads this refusal
-            // on their own terminal instead of in a log nobody is tailing.
-            if manager.is_none() && (meta.is_none() || data.is_none()) {
+            // Fail-closed, and checked BEFORE the daemonize below so an operator
+            // reads this refusal on their own terminal instead of in a log nobody
+            // is tailing. A mount no longer accepts hand-typed coordinates: the
+            // only way to learn what to dial is the manager and its signed roster.
+            let Some(mgr) = manager.as_deref() else {
                 return Err(NO_COORDINATES.into());
+            };
+            if roster_key_file.is_none() {
+                return Err(format!(
+                    "mount --manager {mgr} needs --roster-key-file PATH (or \
+                     GROVEFS_ROSTER_KEY_FILE): a roster nobody verified is an instruction to \
+                     connect wherever whoever answered wanted you to, which is exactly what \
+                     the signature exists to rule out."
+                )
+                .into());
             }
             let token = token.or_else(|| std::env::var("GROVEFS_TOKEN").ok());
             // Content rate caps: explicit flag > live env/config-file knob;
@@ -3025,53 +3306,52 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             }
             std::fs::create_dir_all(&mountpoint)?;
             // Resolve the coordinates from the manager, ONCE, before anything is
-            // dialed; from here down `meta`/`data` are exactly what an operator
-            // would have typed. Fail-closed by construction: a roster that does
-            // not verify under the key we were handed is an error, never a
-            // warning followed by a mount to wherever it happened to point.
-            let (meta, data) = match &manager {
-                None => (meta, data),
-                Some(mgr) => {
-                    let path = roster_key_file.as_ref().ok_or_else(|| {
-                        format!("mount --manager {mgr} needs --roster-key-file PATH")
-                    })?;
-                    let key = grovefs::manager::read_hex_key_file(path)
-                        .map_err(|e| format!("mount --manager: {e}"))?;
-                    let roster = grovefs::manager::lookup(mgr, &deployment, &key)
-                        .map_err(|e| format!("mount --manager {mgr}: {e}"))?;
-                    println!(
-                        "manager {mgr}: deployment '{}' epoch {} resolved meta [{}] data [{}] \
-                         (signature verified, valid for {}s more)",
-                        roster.deployment,
-                        roster.epoch,
-                        roster.meta.join(","),
-                        roster.data.join(","),
-                        roster
-                            .expires_at
-                            .saturating_sub(grovefs::crypto::now_secs()),
-                    );
-                    // A half deployment is not mountable either: there is no local
-                    // arm left to absorb the missing side, so refuse the roster.
-                    if roster.meta.is_empty() || roster.data.is_empty() {
-                        return Err(format!(
-                            "mount --manager {mgr}: deployment '{}' resolves to meta [{}] data [{}] \
-                             — a mount needs both a metadata service and a data service, and this \
-                             roster has no registered {}; start the missing role with \
-                             --register-with this manager",
-                            roster.deployment,
-                            roster.meta.join(","),
-                            roster.data.join(","),
-                            if roster.meta.is_empty() {
-                                "meta-server"
-                            } else {
-                                "data-server"
-                            }
-                        )
-                        .into());
+            // dialed. Fail-closed by construction: a roster that does not verify
+            // under the key we were handed is an error, never a warning followed
+            // by a mount to wherever it happened to point. From here down
+            // `meta_addr`/`data_addr` are exactly the coordinates an operator
+            // would otherwise have had to type by hand.
+            let path = roster_key_file
+                .as_ref()
+                .expect("--roster-key-file presence checked before the daemonize");
+            let key = grovefs::manager::read_hex_key_file(path)
+                .map_err(|e| format!("mount --manager: {e}"))?;
+            let roster = grovefs::manager::lookup(mgr, &deployment, &key)
+                .map_err(|e| format!("mount --manager {mgr}: {e}"))?;
+            println!(
+                "manager {mgr}: deployment '{}' epoch {} resolved meta [{}] data [{}] \
+                 (signature verified, valid for {}s more)",
+                roster.deployment,
+                roster.epoch,
+                roster.meta.join(","),
+                roster.data.join(","),
+                roster
+                    .expires_at
+                    .saturating_sub(grovefs::crypto::now_secs()),
+            );
+            // A half deployment is not mountable either: there is no local
+            // arm left to absorb the missing side, so refuse the roster.
+            if roster.meta.is_empty() || roster.data.is_empty() {
+                return Err(format!(
+                    "mount --manager {mgr}: deployment '{}' resolves to meta [{}] data [{}] \
+                     — a mount needs both a metadata service and a data service, and this \
+                     roster has no registered {}; start the missing role with \
+                     --register-with this manager",
+                    roster.deployment,
+                    roster.meta.join(","),
+                    roster.data.join(","),
+                    if roster.meta.is_empty() {
+                        "meta-server"
+                    } else {
+                        "data-server"
                     }
-                    (Some(roster.meta_list()), roster.data_list())
-                }
-            };
+                )
+                .into());
+            }
+            let meta_addr = roster.meta_list();
+            let data_addr = roster
+                .data_list()
+                .expect("roster.data non-empty (checked just above)");
             // ---- opt-in per-stage latency telemetry ----
             // Enabled by `--stats` OR env `GROVEFS_STATS=1|true`. Off by default,
             // where every instrument site is a single relaxed load that skips all
@@ -3123,16 +3403,10 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             // mount that never passed a genuine meta — closing the rogue-meta-arms-
             // honest-data hole (see `grovefs::remote::dac`).
             let data_capability: String;
-            // Metadata source: the central `meta-server` — a single authoritative
-            // view shared across clients. There is no second arm: a mount cannot
-            // bind a local `<home>/meta/<view>.db`, so the two coordinates the
-            // checks above guaranteed are the only source a mount can bind.
-            // Destructuring them into non-Option names here means the code below
-            // cannot even express "no address".
-            let (meta_addr, data_addr) = match (&meta, &data) {
-                (Some(m), Some(d)) => (m.clone(), d.clone()),
-                _ => return Err(NO_COORDINATES.into()),
-            };
+            // Metadata + data source: the two coordinates the roster just
+            // resolved. There is no second arm: a mount cannot bind a local
+            // `<home>/meta/<view>/<view>.db`, and `meta_addr`/`data_addr` above
+            // are non-Option, so the code below cannot even express "no address".
             let meta_provider: Arc<dyn MetaProvider> = {
                 let addr = meta_addr.as_str();
                 println!("using remote metadata service at {addr}");
@@ -3203,7 +3477,8 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             let fence_epoch = meta_provider.fence_handle();
             let meta_for_fence = meta_provider.clone();
             // Keep a display-capable handle for the invalidation listener:
-            // for `--layout` + `--meta-server`, the lens translates source-coordinate
+            // for `--layout` over a roster-resolved meta-server, the lens translates
+            // source-coordinate
             // events into display coordinates at the kernel notifier.
             let provider_for_events: Option<Arc<dyn MetaProvider>> = Some(meta_provider.clone());
             let fence_refresh: Arc<dyn Fn() -> u64 + Send + Sync> =
@@ -3252,7 +3527,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         || std::env::var_os("GROVEFS_STRIPE_BYTES").is_some()
                     {
                         eprintln!(
-                            "note: --stripe-bytes / GROVEFS_STRIPE_BYTES has no effect with a single --data-servers address (striping needs a comma list)"
+                            "note: --stripe-bytes / GROVEFS_STRIPE_BYTES has no effect with a single data-server in the roster (striping needs a deployment that declares several)"
                         );
                     }
                     let one = addrs.first().copied().unwrap_or(addr);
@@ -3433,7 +3708,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             // backend: a `--meta-store postgres://…` (or `GROVEFS_META_STORE`) data-server
             // gates mounts against the shared `grovefs_control` tables — the SAME
             // registry its meta-server uses — with no local file to colocate; a
-            // SQLite node reads `<meta-dir>/meta/api_keys.db` (defaulting to
+            // SQLite node reads `<meta-dir>/meta/_control/api_keys.db` (defaulting to
             // this node's first `--data-dir`, or a synced copy for a split one).
             let srv = if require_api_key {
                 let store = resolve_store(store);
@@ -3470,8 +3745,8 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             let srv = match member_id {
                 Some(id) => {
                     println!(
-                        "data-server: member-id {id} — clients that stripe across a comma \
-                         --data-servers list place chunks by this identity, so their order \
+                        "data-server: member-id {id} — clients that stripe across a deployment's \
+                         data-server list place chunks by this identity, so their order \
                          is irrelevant (must be unique across the cluster's members)"
                     );
                     srv.with_member_id(id)
@@ -3918,6 +4193,11 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                             "created BASE view '{view}' (schema grovefs_v_<hex>) on instance '{home}'"
                         );
                     } else {
+                        // A flat pre-v2 store is refused here rather than being
+                        // half-upgraded: creating `meta/<view>/` beside the old
+                        // flat dbs would leave the two shapes disagreeing about
+                        // where this store's trees live.
+                        grovefs::meta::layout_guard(&vbase)?;
                         let mp = meta_path(&vbase, &view);
                         if let Some(dir) = mp.parent() {
                             std::fs::create_dir_all(dir)?;
@@ -4191,7 +4471,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     // SQLite arm. (The PG arm above owns a schema and returned
                     // before it; by here the tree really is
-                    // the local file `meta/<name>.db`.)
+                    // the local file `meta/<name>/<name>.db`.)
                     require_sqlite("`view rm --base`")?;
                     let rm = meta::remove_base_view(&vbase, &name)?;
                     let droot = data_root.unwrap_or_else(|| vbase.clone());
@@ -4491,7 +4771,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         );
                     }
                     println!(
-                        "  metadata only: content bytes stay in the data domain — keep mounts pointed at the same --data-servers (server-side gc unions all instances' ledgers, so nothing is reclaimed out from under this view)"
+                        "  metadata only: content bytes stay in the data domain — keep mounts resolving the same data servers (server-side gc unions all instances' ledgers, so nothing is reclaimed out from under this view)"
                     );
                 }
                 ViewAction::Pool {
@@ -4709,7 +4989,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         // printing the mount recipe first would bury that.
                         grovefs::apikeys::Scope::Mount | grovefs::apikeys::Scope::Any => {
                             println!("Present it to a `--require-api-key` server as");
-                            println!("  grovefs mount --meta-server ... --data-servers ... --api-key '{full}' -m /mnt/x");
+                            println!("  grovefs mount --manager ... --roster-key-file ... --api-key '{full}' -m /mnt/x");
                             println!("(or export GROVEFS_API_KEY='{full}' so it stays out of the command line).");
                         }
                         grovefs::apikeys::Scope::Mcp => {
@@ -5320,10 +5600,17 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                     let counted = grovefs::meta::rebuild_ledger(&rbase)?;
                     println!(
                         "refs ledger rebuilt at {}: {} holder entries across the surviving views",
-                        rbase.join("meta").join("refs.db").display(),
+                        grovefs::meta::control_db_path(&rbase, "refs").display(),
                         counted
                     );
                 }
+            }
+        }
+        Cmd::Layout { db_path, action } => {
+            let lbase = db_path.unwrap_or_else(|| base.clone());
+            match action {
+                LayoutAction::Show => layout_show(&lbase)?,
+                LayoutAction::Migrate { dry_run } => layout_migrate(&lbase, dry_run)?,
             }
         }
         Cmd::Gc {
@@ -5489,7 +5776,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             // deployment's backend IS SQLite. The backend is `--meta-store`, or
             // the `GROVEFS_META_STORE` env behind it (the same flag > env chain
             // as every other control-plane command). Refusing
-            // beats the alternative — standing up `meta/<view>.db` plus
+            // beats the alternative — standing up `meta/<view>/<view>.db` plus
             // `blocks/` beside a root whose running meta-server serves the
             // cluster, printing a success about a tree nothing ever reads: the
             // same refuse-not-downgrade rule `Cmd::View` applies to the other
@@ -5506,23 +5793,15 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             }
             // Import writes the authoritative tree directly — that is only
             // sound for a PHYSICAL view. A derived name is served through its
-            // base's db; writing a separate `<view>.db` under the virtual name
-            // would create a shadow tree nothing ever reads.
-            if mbase
-                .join("meta")
-                .join("views")
-                .join(format!("{view}.layout"))
-                .is_file()
-            {
+            // base's db; writing a separate tree directory under the virtual
+            // name would create a shadow tree nothing ever reads.
+            let slot = grovefs::meta::defs_dir(&mbase).join(format!("{view}.layout"));
+            if slot.is_file() {
                 // Resolve the slot so BOTH governance shapes are covered: a
                 // derived name would write a shadow `<view>.db` nothing reads,
                 // and an alias name is not a storage identity at all — the
                 // server resolves it to the real view, whose db import would
                 // bypass here lives under a different name.
-                let slot = mbase
-                    .join("meta")
-                    .join("views")
-                    .join(format!("{view}.layout"));
                 let target = grovefs::layout::LayoutRules::parse_def_file(&slot)
                     .map(|d| match d {
                         grovefs::layout::ViewDef::Alias(real) => format!(
@@ -5562,6 +5841,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 return Ok(());
             }
+            grovefs::meta::layout_guard(&mbase)?;
             let mp = meta_path(&mbase, &view);
             // A view DB that is absent here gets created by MetaEngine::open below,
             // which stands up a new physical BASE view as a side effect of the import.
@@ -6070,7 +6350,7 @@ fn gc_live_mounts(mbase: &Path, roots: &[PathBuf], views: &[String]) -> Vec<Stri
         // The same view NAME can mount in unrelated stores, so attribute the
         // entry to the process that serves it before calling it a writer of
         // THIS store. A daemon that names another store — or is a remote
-        // `--meta-server`/`--data-servers` client — never touches these pages.
+        // `--manager`-bootstrapped client — never touches these pages.
         match gc_mount_daemon(mpp) {
             Some(pid) if !proc_store_hit(pid, mbase, roots) => continue,
             // No daemon visible: a stale FUSE entry whose mountpoint no longer
@@ -6181,10 +6461,7 @@ fn gc_writer_reason(name: &str, mbase: &Path, views: &[String]) -> Option<String
     if views.iter().any(|v| v == name) {
         return Some("writable view tree".to_string());
     }
-    let slot = mbase
-        .join("meta")
-        .join("views")
-        .join(format!("{name}.layout"));
+    let slot = grovefs::meta::defs_dir(mbase).join(format!("{name}.layout"));
     if !slot.is_file() {
         return None;
     }
@@ -6223,7 +6500,8 @@ fn local_store_users(mbase: &Path, roots: &[PathBuf]) -> Vec<String> {
 /// Does one process reference this store? Args first (`--home`/`--meta-dir`/
 /// `--data-dir`/`--data-dir`, in both `--flag value` and `--flag=value` form),
 /// then the GROVEFS_* env knobs. A grovefs process that names NO store falls
-/// back to `$HOME/.grovefs` unless it is a remote client (`--meta-server`/`--data-servers`),
+/// back to `$HOME/.grovefs` unless it is a remote client (`--manager`, or the
+/// retired `--meta-server`/`--data-servers` of an older running mount),
 /// which never writes a local page tree.
 fn proc_store_hit(pid: u32, mbase: &Path, roots: &[PathBuf]) -> bool {
     let Some(args) = proc_args(pid) else {
@@ -6238,7 +6516,9 @@ fn proc_store_hit(pid: u32, mbase: &Path, roots: &[PathBuf]) -> bool {
     // Which knobs were given on the command line; a flag overrides its env twin.
     let mut seen = (false, false, false); // --home, --meta-dir, --data-dir
     for (i, a) in args.iter().enumerate() {
-        if a == "--meta-server"
+        if a == "--manager"
+            || a.starts_with("--manager=")
+            || a == "--meta-server"
             || a == "--data-servers"
             || a.starts_with("--meta-server=")
             || a.starts_with("--data-servers=")
