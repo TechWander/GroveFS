@@ -2236,8 +2236,11 @@ fn move_into(src: &Path, dest: &Path) -> Result<(), Box<dyn std::error::Error>> 
 /// `$GROVEFS_CONFIG` (explicit path) > `$HOME/.config/grovefs/grovefs.conf`;
 /// the first existing file wins. Only
 /// `GROVEFS_`-prefixed keys are honored (the rest are ignored with a warning);
-/// recognized: GROVEFS_HOME, GROVEFS_META_SERVER / GROVEFS_DATA_SERVERS / GROVEFS_TOKEN
-/// (mount defaults), GROVEFS_STRIPE_BYTES (mount stripe size), GROVEFS_STATS,
+/// recognized: GROVEFS_MANAGER / GROVEFS_ROSTER_KEY_FILE / GROVEFS_DEPLOYMENT (the
+/// mount bootstrap), GROVEFS_TOKEN (the credential a mount presents),
+/// GROVEFS_STRIPE_BYTES (mount stripe size), GROVEFS_HOME (the node-side store
+/// root), GROVEFS_META_DIR, GROVEFS_META_SERVER / GROVEFS_DATA_SERVERS (read by
+/// `du` and `gc --control-server` only — never by a mount), GROVEFS_STATS,
 /// GROVEFS_API_KEY, GROVEFS_MCP_API_KEY, …
 /// The file is read once before clap parses, so the existing per-knob env
 /// fallbacks consume the values without any extra plumbing; the mount
