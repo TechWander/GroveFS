@@ -2063,11 +2063,13 @@ $Y meta-server --meta-store postgres://user:pw@10.0.0.9:5432/grovefs --listen 0.
 
   注册表把凭据留在文件里（不进 argv、不进 journal、不进库——放置表只存**名字**），并给每个实例一个稳定名字供放置表引用。注册表读不了 = fail-fast 拒绝启动，绝不静默降级；meta-server 启动横幅会打印 `N PG instance(s) [main, team1] — control plane on 'main'`（只有名字，没有 URI）。
 
+  **记录各存在哪里（全貌与逐表结构见 docs.html §24.2/§24.3）**：PG 档只有元数据入库——控制面实例（注册表首条，代码 `PgBook::control()`）独占 `grovefs_control.*`（`view_defs` / `api_keys` / `mcp_calls` / `view_placement` / `web_accounts` / `web_grants`）；每个实例（含控制面）各持一本 `grovefs_refs.holders` 账本，外加落在它上面的那些 `grovefs_v_<hex>` schema——每个物理树 schema 里就三张表：`node`（节点元数据，根行钉死 id=1）、`ctrl`（`epoch` + 五条连接池声明键 `POOL_CTRL_KEYS`，随 `view move` 一起搬）、`locks`（POSIX 记录锁），DDL 由 `ensure_schema` 在引擎 open 时幂等建立。schema 名 = `grovefs_v_` + 视图名原始字节的 lowercase hex（`schema_for`）：字符集收敛到 `[0-9a-f]`，无法用引号/点伪造（注入面在编码这一步就被掐掉），PG 63 字节标识符上限换算成视图名 ≤ 25 字节、超长点名拒绝。内容字节从不进 PG，仍逐 data-server 各存各的 `blocks/`；派生视图/别名不占 schema、不开引擎，连接成本为 0（计费口径是「活跃物理树 × 地板」）。
+
   **放置**：`view create` 自动选**放置数最少**的实例（并列取注册表顺序）；`view create --pg-instance team1` 显式钉住（`view move` 是另一个改写放置行的入口，见下）；fork 跟随基视图、`import` 自动放置、`view rm` 忘记放置行。放置表 `grovefs_control.view_placement` 在控制面实例上，`write`/`delete` 与控制面 DDL 同一把 advisory lock 序列化。**挂载怎么找到对库**：客户端永远只连 meta-server，不感知实例——meta-server 在 `M_OPEN` 时经放置表把视图解析到实例，由**服务端**向各实例扇出 PG 连接（所以担心的「都经一个服务的负载」只是元数据 RPC 负载，本来就是轻量路径；PG 连接不是经它中转的，是它替你选路）。视图→实例的解析顺序：放置行 → **扩容自愈**（无行但 schema 在控制面实例上 = 单实例升注册表前的旧视图，pin 回原库一次）→ 老哈希分片部署的 FNV-1a 回退（见 `probe_pg_shard.sh`）；控制面不可达时**拒绝而非猜**——猜错库会种下没人再找得到的 schema。单 URI 原样透传，一实例部署零额外查询。
 
   语义不变量：`view list` 跨实例合并；`refs --meta-store … rebuild` **逐实例重算后求和**（不再拒绝多实例）；服务端 `gc`（`gc.scan`/`gc.apply`）**跨实例并集扫描**，所有实例的账本与树都数完才判孤儿；fork/graft 的源与目标必须在同一实例（一条 `INSERT … SELECT` 跨不了库），不同实例会点名两个落点拒绝而不是连错服务器。给实例集合加一台机器**不影响**已放置视图的落点（放置行说了算），只影响新视图的均衡。
 
-  边界（刻意如此）：① **一个实例 = 一份独立的「元数据 + 内容」域**——`grovefs_refs.holders` 账本在每个实例里各有一本（SQL 事务不能跨库），但 fork/graft 拒绝跨实例对保证了**账本对它能看到的所有共享都是完备的**（与树写同事务），所以每实例必须配自己的 data-server；② 容量公式：`Σ实例 (max_connections − 运维余量) / (写地板 + 读地板)`（默认档即 `/ 12`）个同时存活视图——**同一集群建第二个库不提升容量**（`max_connections` 是 per cluster process），真实扩容是独立 PG 进程/主机；③ 基视图删文件后引用失效问题不存在（派生/别名/fork 与基同实例放置，跨实例拒绝在先）；④ **高可用按实例各管各的**：流复制 / PITR 逐实例独立配置，GroveFS 不做跨实例故障转移；控制面实例另承载放置表与控制面表，搬动它是手工操作（`pg_dump` 迁表 + 改注册表首行，见 docs.html §24.5）。
+  边界（刻意如此）：① **一个实例 = 一份独立的「元数据 + 内容」域**——`grovefs_refs.holders` 账本在每个实例里各有一本（SQL 事务不能跨库），但 fork/graft 拒绝跨实例对保证了**账本对它能看到的所有共享都是完备的**（与树写同事务），所以每实例必须配自己的 data-server；② 容量公式：`Σ实例 (max_connections − 运维余量) / (写地板 + 读地板)`（默认档即 `/ 12`）个同时存活视图——**同一集群建第二个库不提升容量**（`max_connections` 是 per cluster process），真实扩容是独立 PG 进程/主机；③ 基视图删文件后引用失效问题不存在（派生/别名/fork 与基同实例放置，跨实例拒绝在先）；④ **高可用按实例各管各的**：流复制 / PITR 逐实例独立配置，GroveFS 不做跨实例故障转移；控制面实例另承载放置表与控制面表，搬动它是手工操作（`pg_dump` 迁表 + 改注册表首行，见 docs.html §24.7）。
 
   **切换机制：把已存在的视图搬到另一实例（`view move`）**——放置只在创建时自动选，事后调整用这条命令：
 

@@ -430,15 +430,17 @@
     <li><a href="#honest"><b>23</b>诚实标注的边界</a></li>
   </ol>
 
-  <h2>PG 专项<span class="goal">连接 · 放置 · 切换</span></h2>
+  <h2>PG 专项<span class="goal">连接 · 布局 · 放置 · 切换</span></h2>
   <ol>
     <li><a href="#pg"><b>24</b>PostgreSQL 专项</a>
       <ol class="sub">
         <li><a href="#pg-econ">24.1 连接经济学</a></li>
-        <li><a href="#pg-registry">24.2 多实例注册表与放置</a></li>
-        <li><a href="#pg-move">24.3 切换机制 view move</a></li>
-        <li><a href="#pg-ops">24.4 多实例运维</a></li>
-        <li><a href="#pg-honest">24.5 诚实边界与取证</a></li>
+        <li><a href="#pg-layout">24.2 存储布局全貌</a></li>
+        <li><a href="#pg-schema">24.3 视图存储结构</a></li>
+        <li><a href="#pg-registry">24.4 多实例注册表与放置</a></li>
+        <li><a href="#pg-move">24.5 切换机制 view move</a></li>
+        <li><a href="#pg-ops">24.6 多实例运维</a></li>
+        <li><a href="#pg-honest">24.7 诚实边界与取证</a></li>
       </ol>
     </li>
   </ol>
@@ -743,7 +745,7 @@ $Y mount --view alice \
         <tr><td>写吞吐（本仓库实测）</td><td><b>767–1,109 ops/s</b>（N=1 1,109 / N=4 811 / N=8 767；并发写仍单写者串行）</td><td><b>~4.6k ops/s</b>（N=4 峰值 5,202；N≥8 因重试略降；写连接缓存 prepared statement 后 N=1/4/8 为 3,048–3,118 / 4,784–5,202 / 4,518–4,680，<code>GROVEFS_PG_SYNC_COMMIT=off</code> 可再到 6.3k，代价见 §11）</td></tr>
         <tr><td>单事务上限</td><td>无硬闸门</td><td>无硬闸门</td></tr>
         <tr><td>可用性</td><td>原生 HA：<code>--role/--peer/--witness</code> 主备 + 快照转发；单写者，切换有窗口</td><td>交给 PG（流复制 / PITR）</td></tr>
-        <tr><td>视图规模</td><td>一视图一 <code>.db</code> 一引擎，约 10 + (读池−1)×~1.3 fd/视图（引擎读池暖地板 = <code>READ_POOL_SIZE = 1</code>、突发保留上限 <code>READ_POOL_RETAIN = 8</code>；<code>GROVEFS_SQLITE_READ_POOL</code> 抬暖地板），65535 下约四千视图</td><td>每视图默认 12 连接（暖地板 8 写 + 4 读；<code>--pg-*-pool</code>/<code>--pg-*-pool-max</code> 把地板与突发上限分开后，空闲视图只占地板，单视图可用 <code>grovefs view pool</code> 覆盖）；<code>--pg-pool-idle-secs</code> 收回地板以上、<code>--engine-idle-secs</code> 驱逐整台引擎后按活跃视图数计；活跃集仍超 <code>max_connections</code> 时上多实例注册表+放置（<a href="#pg-registry">§24.2</a>），容量随实例数线性增长</td></tr>
+        <tr><td>视图规模</td><td>一视图一 <code>.db</code> 一引擎，约 10 + (读池−1)×~1.3 fd/视图（引擎读池暖地板 = <code>READ_POOL_SIZE = 1</code>、突发保留上限 <code>READ_POOL_RETAIN = 8</code>；<code>GROVEFS_SQLITE_READ_POOL</code> 抬暖地板），65535 下约四千视图</td><td>每视图默认 12 连接（暖地板 8 写 + 4 读；<code>--pg-*-pool</code>/<code>--pg-*-pool-max</code> 把地板与突发上限分开后，空闲视图只占地板，单视图可用 <code>grovefs view pool</code> 覆盖）；<code>--pg-pool-idle-secs</code> 收回地板以上、<code>--engine-idle-secs</code> 驱逐整台引擎后按活跃视图数计；活跃集仍超 <code>max_connections</code> 时上多实例注册表+放置（<a href="#pg-registry">§24.4</a>），容量随实例数线性增长</td></tr>
       </tbody>
     </table>
     <div class="grid">
@@ -976,11 +978,11 @@ $Y meta-server --meta-store postgres://grove:pw@10.0.0.9:5432/grovefs --listen 0
         <tr><td>内容字节</td><td colspan="2">不变——仍在 data-server 的 <code>blocks/</code> 里，与元数据后端选哪种完全无关</td></tr>
         <tr><td>控制面（key / 视图定义 / 审计）</td><td>本地 <code>api_keys.db</code> + <code>meta/views/*.layout</code></td><td>共享 schema <code>grovefs_control.api_keys</code>/<code>view_defs</code>/<code>mcp_calls</code>，<b>本地不落任何控制面文件</b>（<code>control</code> 套件实证）</td></tr>
         <tr><td>高可用</td><td>grovefs 自研快照主备（<code>--role</code>/<code>--peer</code>/<code>--witness</code>，§5.8）</td><td>交给 PG 自身：流复制 / <code>pg_basebackup</code> / PITR（§16.3）。两套是<b>二选一</b>：<code>--meta-store</code> 与 <code>--role standby</code>/<code>--peer</code>/<code>--witness</code> 同时给，启动即 fail-fast</td></tr>
-        <tr><td>PG 连接占用</td><td>无此概念（每视图只是一个本地文件句柄）</td><td>挂载中的视图默认各占 8 写 + 4 读连接（暖地板）；卸载静默后由 <code>meta-server --engine-idle-secs</code>（默认 300s）回收，下次访问自动重开——<b>常驻连接只跟“最近活跃视图数”成正比</b>，视图总数不再被 <code>max_connections/12</code> 封顶（<code>evict</code> 套件实测：6 视图 76 连接→回收后 4）；挂着但没人读写的视图连地板都占着，这一块由 <code>--pg-*-pool</code> 把地板调低、静默过 <code>--pg-pool-idle-secs</code> 自动收回（实测空闲 12→3 条、create-heavy 吞吐不变）；活跃集仍超时上多实例注册表+放置（<a href="#pg">§24.2</a>）</td></tr>
+        <tr><td>PG 连接占用</td><td>无此概念（每视图只是一个本地文件句柄）</td><td>挂载中的视图默认各占 8 写 + 4 读连接（暖地板）；卸载静默后由 <code>meta-server --engine-idle-secs</code>（默认 300s）回收，下次访问自动重开——<b>常驻连接只跟“最近活跃视图数”成正比</b>，视图总数不再被 <code>max_connections/12</code> 封顶（<code>evict</code> 套件实测：6 视图 76 连接→回收后 4）；挂着但没人读写的视图连地板都占着，这一块由 <code>--pg-*-pool</code> 把地板调低、静默过 <code>--pg-pool-idle-secs</code> 自动收回（实测空闲 12→3 条、create-heavy 吞吐不变）；活跃集仍超时上多实例注册表+放置（<a href="#pg">§24.4</a>）</td></tr>
         <tr><td>备份</td><td>冷拷 <code>&lt;V&gt;.db</code> 或 <code>VACUUM INTO</code>，另备 <code>blocks/</code></td><td>一次 <code>pg_dump</code> 覆盖视图树+锁+控制面；<code>blocks/</code> 仍单独备（§16.2）</td></tr>
         <tr><td>引用计数账本</td><td>本地 <code>meta/_control/refs.db</code>（一节点一份）</td><td>共享 schema <code>grovefs_refs</code>（<code>grovefs_refs.holders</code>）</td></tr>
         <tr><td>单视图元数据搬运（<code>view export</code> / <code>view import</code>）</td><td>可用：树就是一个 <code>&lt;V&gt;.db</code> 文件，导出即读它</td><td><b>可用</b>：REPEATABLE READ 只读快照把 schema 导出成与 SQLite 档逐行同形的宿主无关 JSONL；导入单事务重建（失败整体回滚、新建 schema 一并 DROP），<code>--as-fork</code> 写 <code>fork &lt;base&gt;</code> 定义（<code>xfer</code> 套件 PG 档实证）。整库级备份另用 <code>pg_dump</code> / 逻辑复制（§16.2）</td></tr>
-        <tr><td>尚未提供的操作</td><td>—（本节命令全部可用）</td><td>零拷贝 <code>import</code>、<code>gc --apply</code>（本地形态）、原生 HA 均按“拒绝而非降级”给出点名文案。<b>可用的</b>：<code>view fork</code>/<code>view graft</code>（<code>INSERT … SELECT</code> 跨 schema 整树复制 / 挑子集重发 id，同事务订账本）、<code>view export</code>/<code>view import</code>（REPEATABLE READ 只读快照导出宿主无关 JSONL；导入单事务 DELETE→INSERT→校验→抬序列→修账本，<code>--as-fork</code> 写 <code>fork &lt;base&gt;</code> 定义）、<code>view rm --base</code>（事务性销账 + <code>DROP SCHEMA</code> + 字节回收）、<code>refs rebuild</code>（按存活树重算 <code>grovefs_refs.holders</code>，多实例逐实例求和）、<code>view define/alias/rm --name</code>、<code>apikey</code>、<code>mcp</code>（§13.3；<code>forksrv</code>/<code>xfer</code> 套件 PG 档实证）；多实例注册表下另有 <code>view create --pg-instance</code> 钉住与 <code>view move</code> 搬家（<a href="#pg">§24.2/§24.3</a>）</td></tr>
+        <tr><td>尚未提供的操作</td><td>—（本节命令全部可用）</td><td>零拷贝 <code>import</code>、<code>gc --apply</code>（本地形态）、原生 HA 均按“拒绝而非降级”给出点名文案。<b>可用的</b>：<code>view fork</code>/<code>view graft</code>（<code>INSERT … SELECT</code> 跨 schema 整树复制 / 挑子集重发 id，同事务订账本）、<code>view export</code>/<code>view import</code>（REPEATABLE READ 只读快照导出宿主无关 JSONL；导入单事务 DELETE→INSERT→校验→抬序列→修账本，<code>--as-fork</code> 写 <code>fork &lt;base&gt;</code> 定义）、<code>view rm --base</code>（事务性销账 + <code>DROP SCHEMA</code> + 字节回收）、<code>refs rebuild</code>（按存活树重算 <code>grovefs_refs.holders</code>，多实例逐实例求和）、<code>view define/alias/rm --name</code>、<code>apikey</code>、<code>mcp</code>（§13.3；<code>forksrv</code>/<code>xfer</code> 套件 PG 档实证）；多实例注册表下另有 <code>view create --pg-instance</code> 钉住与 <code>view move</code> 搬家（<a href="#pg">§24.4/§24.5</a>）</td></tr>
       </tbody>
     </table>
     <div class="warn"><b>最容易踩的两个坑</b>：① <b>控制面必须指同一个 URI</b>——PG 部署下跑 <code>view</code>/<code>apikey</code>/<code>mcp</code> 若不带 <code>--meta-store postgres://…</code>（或 env <code>GROVEFS_META_STORE</code>，见 <a href="#s-config-keys">§9.4</a>），治理动作会写进一份服务端永不在看的本地文件：铸出来的 key Mount 不认、定义的透镜不成形。② <b>挂载不会替你建 schema</b>——PG 下基视图要显式 <code>grovefs view --meta-store &lt;同一个 URI&gt; create --view V</code>；schema 不存在时 <code>M_OPEN</code> 直接拒绝并提示这条命令。存量 SQLite 树的数据按 <a href="#case">§6.4</a> 的单向搬移步骤迁移。</div>
@@ -1898,7 +1900,7 @@ $Y mount --view alice \\
       <li><b>控制面随元数据后端走</b>：SQLite 部署下 key/审计落 <code>api_keys.db</code>、视图定义落 <code>meta/views/*.layout</code>；PG 部署下两者全进 <code>grovefs_control</code> schema——一次 <code>pg_dump</code> 覆盖树+锁+控制面，没有本地要单独冷拷的控制面文件（<code>control</code> 套件实证；见 §16.2）。</li>
       <li>建表由服务端在 view 首次 <code>M_OPEN</code> 时幂等 <code>CREATE SCHEMA IF NOT EXISTS</code> + <code>CREATE TABLE IF NOT EXISTS</code> 完成，不需要预迁移脚本；根节点固定 id=1，<code>setval(pg_get_serial_sequence(...), MAX(id))</code> 对齐序列，<code>ROOT_INO</code> 语义与 SQLite 完全一致。</li>
       <li><b>写并行（PG 独有，opt-in）</b>：默认 SQLite 后端对同一 view 是<b>单写者</b>（一条权威连接 + 互斥锁）；换 <code>--meta-store postgres://…</code> 后写路径改为至多 <code>PG_WRITE_POOL_SIZE = 8</code> 连接的 <b>SERIALIZABLE 写连接池</b>（HopsFS 路线，事务基座交给 PostgreSQL 自带 SSI）：不相交 <code>(parent_id, name)</code> 行上的并发写真正并行提交，读写重叠的一例由 SSI 中止并透明重试（200µs–25ms 指数退避、<code>SERIALIZATION_MAX_ATTEMPTS = 12</code>），<code>SQLSTATE 40001/40P01</code> 绝不外泄给 POSIX 调用方；<code>rename</code> 的环检查读、<code>unlink</code> 的引用计数 GC 读都并回同一事务。这是把「单权威写者」放宽为「单权威调度（serially equivalent）」，I1–I4 在任意 SSI 接受的调度下逐条不变。</li>
-      <li><b>多个 PG 实例：实例注册表 + 视图放置</b>（专项详解与切换机制见 <a href="#pg">§24</a>）：<code>--meta-store</code> 接受内联逗号列表（自动命名 <code>pg1..pgN</code>）或 <code>file:</code> 实例注册表（每行 <code>名字 = postgres://…</code>，首条 = 控制面；读不了 fail-fast 拒绝启动），每个视图的 <code>grovefs_v_&lt;hex&gt;</code> schema 落在<b>恰好一个</b>实例上，落点由放置表 <code>grovefs_control.view_placement</code>（只存实例名，凭据不入库）说了算：<code>view create</code> 自动选放置数最少的实例、<code>--pg-instance</code> 显式钉住、fork 跟随基视图、<code>view import</code> 自动放置、<code>view move</code> 事后搬家（<a href="#pg-move">§24.3</a> 四步切换 snapshot→build→flip→retire）、<code>view rm</code> 忘记放置行。客户端不感知实例——meta-server 在 <code>M_OPEN</code> 时按解析序（单实例直传 → 放置行 → 扩容自愈 → 老哈希分片回退）选路，控制面不可达时<b>拒绝而非猜</b>（<a href="#pg-registry">§24.2</a>）。<code>view list</code> 跨实例合并、<code>refs rebuild</code> 逐实例重算后求和、服务端 <code>gc</code> 跨实例并集扫描。边界：①一个实例 = 一份独立的「元数据 + 内容」域（<code>grovefs_refs.holders</code> 每实例一本、SQL 事务跨不了库），所以<b>每个实例必须配自己的 data-server</b>；②fork/graft 的源与目标必须同实例（点名两个落点的错误，而不是连错服务器）；③给实例集合加机器<b>不影响</b>已放置视图的落点（放置行说了算），同集群建第二库不提升容量（<code>max_connections</code> 是 per cluster process）。取证 <code>test_pg.sh</code> 第 8 节 55 项断言（含 move 四步实测）+ <code>.build-bin/probe_pg_shard.sh</code>（哈希路由兼容层：两库 8 视图 schema「一个且仅一个」、同一 meta-server 服务两侧、跨分片不串账）+ 解析/放置 13 条单测（<code>shard_tests</code>）。</li>
+      <li><b>多个 PG 实例：实例注册表 + 视图放置</b>（存储布局、schema 结构、路由与切换机制专项见 <a href="#pg">§24.2–§24.5</a>）：<code>--meta-store</code> 接受内联逗号列表（自动命名 <code>pg1..pgN</code>）或 <code>file:</code> 实例注册表（每行 <code>名字 = postgres://…</code>，首条 = 控制面；读不了 fail-fast 拒绝启动），每个视图的 <code>grovefs_v_&lt;hex&gt;</code> schema 落在<b>恰好一个</b>实例上，落点由放置表 <code>grovefs_control.view_placement</code>（只存实例名，凭据不入库）说了算：<code>view create</code> 自动选放置数最少的实例、<code>--pg-instance</code> 显式钉住、fork 跟随基视图、<code>view import</code> 自动放置、<code>view move</code> 事后搬家（<a href="#pg-move">§24.5</a> 四步切换 snapshot→build→flip→retire）、<code>view rm</code> 忘记放置行。客户端不感知实例——meta-server 在 <code>M_OPEN</code> 时按解析序（单实例直传 → 放置行 → 扩容自愈 → 老哈希分片回退）选路，控制面不可达时<b>拒绝而非猜</b>（<a href="#pg-registry">§24.4</a>）。<code>view list</code> 跨实例合并、<code>refs rebuild</code> 逐实例重算后求和、服务端 <code>gc</code> 跨实例并集扫描。边界：①一个实例 = 一份独立的「元数据 + 内容」域（<code>grovefs_refs.holders</code> 每实例一本、SQL 事务跨不了库），所以<b>每个实例必须配自己的 data-server</b>；②fork/graft 的源与目标必须同实例（点名两个落点的错误，而不是连错服务器）；③给实例集合加机器<b>不影响</b>已放置视图的落点（放置行说了算），同集群建第二库不提升容量（<code>max_connections</code> 是 per cluster process）。取证 <code>test_pg.sh</code> 第 8 节 55 项断言（含 move 四步实测）+ <code>.build-bin/probe_pg_shard.sh</code>（哈希路由兼容层：两库 8 视图 schema「一个且仅一个」、同一 meta-server 服务两侧、跨分片不串账）+ 解析/放置 13 条单测（<code>shard_tests</code>）。</li>
       <li><b>为什么没做 Redis</b>：Redis 的 K/V+TTL 模型与视图树（rename/unlink/hardlink/refcount GC 需事务、锁需行级仲裁）不同构——把 relational 语义硬塞进 Redis 等于在应用层重做一个 PG，收益为负。<b>GroveFS 只加 PG，不加 Redis</b>。</li>
     </ul>
     <div class="note">由 <code>test_pg.sh</code> 19 个断言证明（拒绝 PG+HA 组合、单客户端 CRUD/rename/hardlink/symlink、<code>docker exec psql</code> 直接数 <code>grovefs_v_&lt;hex&gt;</code> 行数、跨客户端 mount A/B 收敛、hardlink unlink 跨端可见）；<b>写并行</b>另由 <code>pg_ssi</code> Rust 套件（5 项：distinct-parents 并行、同名竞争唯一胜出、并发 rename、hardlink 双名并发 unlink 仅一次 GC、混合 create+rename 收敛）与 <code>pg_parallel</code> bash 套件（三挂载 45 并发 create 墙钟远低于串行等效、同名并发 mkdir 恰一次成功且 <code>node</code> 表恰一行、无序列化错误外泄）端到端证明；无 PG 主机上均自动 SKIP，不拉低 GREEN。</div>
@@ -3531,7 +3533,7 @@ grovefs apikey --meta-dir /data/cluster list                  <span class="cmt">
     <table>
       <tr><th>件</th><th>位置</th><th>方式</th></tr>
       <tr><td>数据对象</td><td><code>&lt;中心&gt;/blocks/</code></td><td>普通目录,<code>rsync -a</code>/文件系统快照直接备;用过 <code>grovefs import</code>(§14.7)后部分对象是与源目录共享的硬链接——<code>rsync -a -H</code>/<code>cp -a</code> 保留链接免内容翻倍,源目录也应进同一备份</td></tr>
-      <tr><td>权威视图</td><td><code>&lt;meta-dir&gt;/meta/&lt;view&gt;/&lt;view&gt;.db</code>(含 WAL)；PG 落 <code>grovefs_v_&lt;hex&gt;</code> schema（多实例部署逐实例各落一些，放置分布查 <code>grovefs_control.view_placement</code>，<a href="#pg-ops">§24.4</a>）</td><td><b>勿在有写活动时裸拷</b>;流程见 14.3；PG 下树在库里，随逐实例 <code>pg_dump</code> 走（多实例每实例一份，见 16.3 与 <a href="#pg-ops">§24.4</a>）</td></tr>
+      <tr><td>权威视图</td><td><code>&lt;meta-dir&gt;/meta/&lt;view&gt;/&lt;view&gt;.db</code>(含 WAL)；PG 落 <code>grovefs_v_&lt;hex&gt;</code> schema（多实例部署逐实例各落一些，放置分布查 <code>grovefs_control.view_placement</code>，<a href="#pg-ops">§24.6</a>）</td><td><b>勿在有写活动时裸拷</b>;流程见 14.3；PG 下树在库里，随逐实例 <code>pg_dump</code> 走（多实例每实例一份，见 16.3 与 <a href="#pg-ops">§24.6</a>）</td></tr>
       <tr><td>视图定义(派生/别名)</td><td>SQLite:<code>&lt;meta-dir&gt;/meta/views/*.layout</code>;PG:<code>grovefs_control.view_defs</code></td><td>SQLite:普通文本文件,随控制面目录(<code>meta/_control/</code>)一起拷(HA 备机也需手工同步,见 §14.6/§14.8);PG:随库复制/入 dump,无手工同步</td></tr>
       <tr><td>token</td><td><code>/etc/grovefs/grovefs.env</code></td><td>单独加密保存(丢失 = 所有客户端挂不上)</td></tr>
       <tr><td>API key 注册表与审计</td><td>SQLite:<code>&lt;meta-dir&gt;/meta/_control/api_keys.db</code>(含 <code>-wal</code>；用过 <code>apikey create</code> 才存在)/ PG:<code>grovefs_control.api_keys</code>+<code>mcp_calls</code></td><td>SQLite 随 <code>meta/</code> 一起<b>冷拷</b>(先停写)。开了 <code>--require-api-key</code> 时它是准入的唯一依据——丢了 = 一切 key 鉴不上、历史审计断档。<b>切勿单独删除 <code>-wal</code></b>(会连带删掉尚未 checkpoint 的 key 行与审计行)；PG 模式下它在 <code>grovefs_control</code> 里,随 <code>pg_dump</code> 走,无独立文件要备</td></tr>
@@ -3556,7 +3558,7 @@ sudo sh -c 'echo probe &gt; /mnt/da/probe.txt' &amp;&amp; cat /mnt/db/probe.txt<
     <ul>
       <li><b>一台存储机(元数据根与数据根同一个目录)</b>:先 <code>umount</code> 停写、停 <code>meta-server</code> 与 <code>data-server</code>,再 <code>cp -a</code>/<code>rsync</code> 整个存储根;恢复 = 拷回原位 → 起两个服务 → 客户端重挂 → <code>ls</code>/<code>cat</code> 抽查。二进制不在备份范围——重装 <code>grovefs</code> 即可。<b>分家部署要各自拷</b>:两个根是两条独立命令的产物(<code>meta-server --meta-dir</code> 与 <code>data-server --data-dir</code>),少拷一个都恢复不出来——<code>meta/</code> 里没有字节,<code>blocks/</code> 里没有名字。</li>
       <li><b>SQLite + 自研 HA</b>:备机坏了 → 修好后直接 <code>systemctl start</code>,它从主继续收 ~500ms 快照追平,无需手工灌数据;主机坏了 → 备自动提升,旧主修好 <code>start</code> 后见高 epoch <b>自动降级</b>,配 <code>--witness</code> 时带旧快照重启也会被仲裁挡在 standby(<code>test_ha.sh</code> 段 9 证明)。两半全丢需重建:从归档快照恢复 <code>&lt;meta-dir&gt;/meta/</code>,且 epoch 重置的前提是<b>所有 data-server 同时换新</b>(否则残留 <code>.fence_token</code> 会挡住写——fail-safe 的正确行为,非损坏)。standby 的实时快照是<b>复制体不是归档备份</b>,仍建议定期对主/备任一侧做异地归档快照。</li>
-      <li><b>PostgreSQL 后端</b>:视图树备份完全交给 PG 工具链(<code>pg_dump</code>/<code>pg_basebackup</code> + WAL 归档/PITR)；<b>多实例部署逐实例各做一份</b>（控制面实例那份同时覆盖放置表与控制面，<a href="#pg-ops">§24.4</a>）；GroveFS 侧只备 <code>blocks/</code> + env 文件。<code>--meta-store</code> 模式下自研快照备份 API 有意返回错误(设计如此)。</li>
+      <li><b>PostgreSQL 后端</b>:视图树备份完全交给 PG 工具链(<code>pg_dump</code>/<code>pg_basebackup</code> + WAL 归档/PITR)；<b>多实例部署逐实例各做一份</b>（控制面实例那份同时覆盖放置表与控制面，<a href="#pg-ops">§24.6</a>）；GroveFS 侧只备 <code>blocks/</code> + env 文件。<code>--meta-store</code> 模式下自研快照备份 API 有意返回错误(设计如此)。</li>
     </ul>
     <h4>恢复后的验收（三种流程都适用）</h4>
     <ul class="checks">
@@ -3979,7 +3981,7 @@ MAX_FRAME = 1&lt;&lt;28 (256 MiB)：声明超此值的帧直接拒收而非先�
     <table class="wide">
       <thead><tr><th>要办的事</th><th>SQLite（默认）</th><th>PostgreSQL</th><th>只有一档能做 / 落点不同</th></tr></thead>
       <tbody>
-        <tr><td>建基视图（物理树）</td><td><code>view --meta-dir D create --view V</code></td><td><code>view --meta-store postgres://… create --view V</code>（多实例注册表可加 <code>--pg-instance NAME</code> 钉住，§24.2）</td><td>只换树所在的存储</td></tr>
+        <tr><td>建基视图（物理树）</td><td><code>view --meta-dir D create --view V</code></td><td><code>view --meta-store postgres://… create --view V</code>（多实例注册表可加 <code>--pg-instance NAME</code> 钉住，§24.4）</td><td>只换树所在的存储</td></tr>
         <tr><td>预建目录层级</td><td><code>view create --view V --manifest M</code>（或 <code>init --manifest M</code>）</td><td>建树后 <code>view import --view V --in dump</code></td><td>manifest 是本地 seed；远程库只能装 dump</td></tr>
         <tr><td>派生透镜</td><td><code>view --meta-dir D define --name V --base B --rules F</code></td><td><code>view --meta-store postgres://… define …</code></td><td>定义落点：<code>meta/views/*.layout</code> / <code>grovefs_control.view_defs</code></td></tr>
         <tr><td>纯别名</td><td><code>view --meta-dir D alias --name A --real R</code></td><td>同左，换 <code>--meta-store</code></td><td>同上（两档定义各落自己的控制面存储）</td></tr>
@@ -3987,8 +3989,8 @@ MAX_FRAME = 1&lt;&lt;28 (256 MiB)：声明超此值的帧直接拒收而非先�
         <tr><td>接枝 graft</td><td><code>view --meta-dir D graft --name F --src B --map PLAN</code></td><td><code>view --meta-store postgres://… graft …</code></td><td>装得下一个事务就一个事务</td></tr>
         <tr><td>导出元数据</td><td><code>view --meta-dir D export --view V --out F</code></td><td><code>view --meta-store postgres://… export …</code></td><td>JSONL 格式两档一致（不含字节）</td></tr>
         <tr><td>导入元数据</td><td><code>view --meta-dir D import --view V --in F [--as-fork B]</code></td><td><code>view --meta-store postgres://… import …</code></td><td>同一份 JSONL 两档通用，无需为某一档再拆 dump</td></tr>
-        <tr><td>重建跨视图账本</td><td><code>refs --meta-dir D rebuild</code></td><td><code>refs --meta-store postgres://… rebuild</code></td><td>都是读树重算，静止时跑；PG 多实例逐实例重算后求和（§24.2）</td></tr>
-        <tr><td>把已存在视图搬到另一实例</td><td>—（每视图本来就只有一个家）</td><td><code>view --meta-store file:REG move --view V --pg-instance NAME [--keep-source]</code></td><td><b>仅多实例 PG 档</b>：四步切换 snapshot→build→flip→retire，回退与守卫见 <a href="#pg-move">§24.3</a></td></tr>
+        <tr><td>重建跨视图账本</td><td><code>refs --meta-dir D rebuild</code></td><td><code>refs --meta-store postgres://… rebuild</code></td><td>都是读树重算，静止时跑；PG 多实例逐实例重算后求和（§24.4）</td></tr>
+        <tr><td>把已存在视图搬到另一实例</td><td>—（每视图本来就只有一个家）</td><td><code>view --meta-store file:REG move --view V --pg-instance NAME [--keep-source]</code></td><td><b>仅多实例 PG 档</b>：四步切换 snapshot→build→flip→retire，回退与守卫见 <a href="#pg-move">§24.5</a></td></tr>
         <tr><td>删基视图（连字节）</td><td><code>view --meta-dir D rm --name V --base --data-dir R</code></td><td><code>view --meta-store postgres://… rm --base …</code></td><td>PG：销账 + <code>DROP SCHEMA</code> 一个事务</td></tr>
         <tr><td>扫孤儿对象</td><td><code>gc --meta-dir D --data-dir R [--apply]</code></td><td><code>gc --control-server H:P --data-servers A [--apply]</code></td><td>就地 <code>--data-dir</code> 形态<b>只有 SQLite</b>（树与字节同机）</td></tr>
         <tr><td>用量统计</td><td><code>du --meta-dir D --data-servers A --total</code></td><td><code>du --meta-store postgres://… --data-servers A --total</code></td><td>名字不存在时两档同一句 <code>no tree for view …</code></td></tr>
@@ -4004,8 +4006,8 @@ MAX_FRAME = 1&lt;&lt;28 (256 MiB)：声明超此值的帧直接拒收而非先�
       <tr><th>目的</th><th>命令</th></tr>
       <tr><td>挂载（唯一的挂载形态）</td><td><code>grovefs mount --view U -m MP --manager H:PORT --roster-key-file F [--deployment NAME] [--token T] [--api-key ID:SECRET] [--ro] [--no-cache] [--threads N] [--run-as-uid N] [--layout F] [--stats [--stats-file F] [--stats-interval S]] [--foreground|--log-file F]</code>(默认转后台,挂载点就绪即返回；两个坐标只从 manager 的签名 roster 解析——不给 <code>--manager</code>/<code>GROVEFS_MANAGER</code> 或 <code>--roster-key-file</code> 就 fail-closed 拒挂；手敲的 <code>--meta-server</code>/<code>--data-servers</code> 已从 <code>mount</code> 移除，见 <a href="#prod-mgr">§4.2</a>)</td></tr>
       <tr><td>显示规则文件</td><td>每行 <code>hide &lt;src&gt;</code> / <code>only &lt;src&gt;</code> / <code>map &lt;src&gt; &lt;dst&gt;</code> / <code>link &lt;src&gt; &lt;dst&gt;</code>(<code>#</code> 注释，绝对路径，见 §14.5)</td></tr>
-      <tr><td>创建基视图(物理树)</td><td><code>grovefs view --meta-dir D create --view V [--manifest F]</code>(显式立一棵真实存储树；PG 换 <code>--meta-store postgres://…</code>（多实例注册表可加 <code>--pg-instance NAME</code> 钉住，<a href="#pg-registry">§24.2</a>），其余参数原样，§22.1；<b>只有基视图的删除才真正回收底层字节</b>——跨视图引用账本归零才物理 GC，见 §13.3/§14.6)</td></tr>
-      <tr><td>视图搬家(多实例 PG)</td><td><code>grovefs view --meta-store file:REG move --view V --pg-instance NAME [--keep-source]</code>(四步切换 snapshot→build→flip→retire；回退、守卫、扩容流程见 <a href="#pg-move">§24.3</a>)</td></tr>
+      <tr><td>创建基视图(物理树)</td><td><code>grovefs view --meta-dir D create --view V [--manifest F]</code>(显式立一棵真实存储树；PG 换 <code>--meta-store postgres://…</code>（多实例注册表可加 <code>--pg-instance NAME</code> 钉住，<a href="#pg-registry">§24.4</a>），其余参数原样，§22.1；<b>只有基视图的删除才真正回收底层字节</b>——跨视图引用账本归零才物理 GC，见 §13.3/§14.6)</td></tr>
+      <tr><td>视图搬家(多实例 PG)</td><td><code>grovefs view --meta-store file:REG move --view V --pg-instance NAME [--keep-source]</code>(四步切换 snapshot→build→flip→retire；回退、守卫、扩容流程见 <a href="#pg-move">§24.5</a>)</td></tr>
       <tr><td>单视图连接池旋钮(PG)</td><td><code>grovefs view --meta-store postgres://… pool --view V [--write FLOOR[:MAX]] [--read FLOOR[:MAX]] [--idle-secs N] [--inherit]</code>(不带旗标即查看；声明落在该视图自己 schema 的 <code>ctrl</code> 表，随 <code>view move</code> 迁移，下一次引擎 open 生效，见 <a href="#pg-econ">§24.1</a>)</td></tr>
       <tr><td>定义派生视图</td><td><code>grovefs view --meta-dir D define --name V --base B --rules F</code>(存于 <code>D/meta/views/V.layout</code>（SQLite；PG 落 <code>grovefs_control.view_defs</code>），<code>mount --view V</code> 即得形状，虚拟视图挂载只读、写走基名 <code>B</code>，见 §14.6)</td></tr>
       <tr><td>定义纯别名</td><td><code>grovefs view --meta-dir D alias --name A --real R</code>(公开名 1:1 映射真实视图：<code>A</code> 全树可写，<code>R</code> 不可直挂，见 §14.8)</td></tr>
@@ -4047,8 +4049,8 @@ MAX_FRAME = 1&lt;&lt;28 (256 MiB)：声明超此值的帧直接拒收而非先�
         <tr><td><code>--map F|-</code></td><td>接枝计划文件(<code>-</code> = stdin)</td><td><code>graft</code></td><td>§14.8.1</td></tr>
         <tr><td><code>--src V</code> / <code>--dest D</code> / <code>--skip-existing</code></td><td>取条目来源(默认 fork 的基)/无 TAB 行的目标目录 / 跳过已存在名</td><td><code>graft</code></td><td>§14.8.1</td></tr>
         <tr><td><code>--out F</code> / <code>--force</code></td><td>导出文件 / 覆盖</td><td><code>export</code></td><td>§14.8.2</td></tr>
-        <tr><td><code>--pg-instance NAME</code></td><td>多实例 PG 档：<code>create</code> 钉住放置实例；<code>move</code> 指定目标实例</td><td><code>create</code>、<code>move</code></td><td><a href="#pg-registry">§24.2</a> / <a href="#pg-move">§24.3</a></td></tr>
-        <tr><td><code>--keep-source</code></td><td>move 切换后保留源 schema 作回滚点（反向 move 幂等复用副本）</td><td><code>move</code></td><td><a href="#pg-move">§24.3</a></td></tr>
+        <tr><td><code>--pg-instance NAME</code></td><td>多实例 PG 档：<code>create</code> 钉住放置实例；<code>move</code> 指定目标实例</td><td><code>create</code>、<code>move</code></td><td><a href="#pg-registry">§24.4</a> / <a href="#pg-move">§24.5</a></td></tr>
+        <tr><td><code>--keep-source</code></td><td>move 切换后保留源 schema 作回滚点（反向 move 幂等复用副本）</td><td><code>move</code></td><td><a href="#pg-move">§24.5</a></td></tr>
         <tr><td><code>--in F</code> / <code>--replace</code> / <code>--as-fork B</code></td><td>导入文件 / 替换旧树 / 记为 fork</td><td><code>import</code></td><td>§14.8.2</td></tr>
         <tr><td><code>--base</code>（rm）/ <code>--data-dir R</code></td><td>删整棵基树 + 回收无人持有字节</td><td><code>rm</code></td><td>§14.8.3</td></tr>
       </tbody>
@@ -4127,9 +4129,9 @@ MAX_FRAME = 1&lt;&lt;28 (256 MiB)：声明超此值的帧直接拒收而非先�
   </section>
 
   <section id="pg">
-    <h2 class="title"><span class="num">24</span>PostgreSQL 专项：连接经济学 · 多实例放置 · 切换机制<span class="lv lv2">进阶</span></h2>
-    <div class="chaphead"><b>本章目标</b><span>把 PG 档独有的三件事一次讲透：连接从哪来、多实例怎么放、已存在视图怎么搬。</span><b>前置</b><span>§5.9 已换芯或正打算换。</span><b>可跳过</b><span>SQLite 档没有连接经济学也没有实例概念，整章可跳；换芯步骤本身在 §5.9/§6.4。</span></div>
-    <p class="lead">PG 内容散在各章（§4.1 选型、§5.9 换芯对照、§6.4/§6.9.2 实操、§11.2 语义、§13.3 账本、§16.2–§16.3 备份），本章把它们收拢成一条 PG 主线，并写清这一档独有的两件大事——<b>多实例放置</b>（解决连接数封顶）与<b>切换机制</b>（把已存在视图搬到另一实例）。客户端全程不感知：挂载命令逐字不变，实例拓扑是 meta-server 背后的私事。</p>
+    <h2 class="title"><span class="num">24</span>PostgreSQL 专项：连接经济学 · 存储布局 · 多实例放置 · 切换机制<span class="lv lv2">进阶</span></h2>
+    <div class="chaphead"><b>本章目标</b><span>把 PG 档独有的四件事一次讲透：连接从哪来、字节放哪里（含一棵树在库里的形状）、多实例怎么放、已存在视图怎么搬。</span><b>前置</b><span>§5.9 已换芯或正打算换。</span><b>可跳过</b><span>SQLite 档没有连接经济学也没有实例概念，整章可跳；换芯步骤本身在 §5.9/§6.4。</span></div>
+    <p class="lead">PG 内容散在各章（§4.1 选型、§5.9 换芯对照、§6.4/§6.9.2 实操、§11.2 语义、§13.3 账本、§16.2–§16.3 备份），本章把它们收拢成一条 PG 主线，并写清这一档独有的三件大事——<b>存储布局与视图 schema 结构</b>（谁存什么、存在哪里）、<b>多实例放置</b>（解决连接数封顶）与<b>切换机制</b>（把已存在视图搬到另一实例）。客户端全程不感知：挂载命令逐字不变，实例拓扑是 meta-server 背后的私事。</p>
 
     <h3 id="pg-econ">24.1 连接经济学：暖地板与保留上限，与三条解法</h3>
     <p>PG 后端每棵<b>活跃</b>视图在 meta-server 里常驻一套引擎池：<b>8 条 SERIALIZABLE 写连接</b>（SSI 透明重试，§11.2）+ <b>4 条只读连接</b>（各缓存 ≤16 条 prepared statement）。写路径对等地缓存 ≤32 条（<code>WRITE_STMT_CACHE_CAP</code>，代码内置无开关）——<code>tokio-postgres</code> 没有 <code>prepare_cached</code>，缓存自建于 <code>WriteConn</code>/<code>WriteTx</code>，事务体内 SQL 一字不改即命中。实测（<code>bench_pg_conc.sh</code>，默认 <code>sync_commit=on</code>）：FUSE 台架写吞吐 N=1/4/8 为 <b>3,048–3,118 / 4,784–5,202 / 4,518–4,680 ops/s</b>，对照无缓存构建 2,556–2,577 / 4,131–4,200 / 3,350–3,497，即 <b>+18–21% / +15–24% / +30–36%</b>；叠加 <code>GROVEFS_PG_SYNC_COMMIT=off</code> 在 N=4 稳定再到 6,142（+18%）。池宽用 <code>GROVEFS_PG_WRITE_POOL</code>/<code>GROVEFS_PG_READ_POOL</code> 调——这两个是下面的<b>暖地板</b>，不是池上限。</p>
@@ -4146,12 +4148,51 @@ MAX_FRAME = 1&lt;&lt;28 (256 MiB)：声明超此值的帧直接拒收而非先�
     <div class="grid">
       <div class="card"><h4>解法一：空闲驱逐（默认已生效）</h4><p>常驻连接只跟“最近 N 分钟活跃视图数”成正比。适合活跃集稳定在个位数到几十的部署。</p></div>
       <div class="card"><h4>解法二：地板/上限分离（<code>--pg-*-pool[-max]</code>）</h4><p>活跃集大但并发不高（典型：fork 多的舰队，内容写被 <code>EROFS</code> 挡住）——把地板调到真实并发度，突发仍能爬回上限，实测不付吞吐。单视图可用 <code>grovefs view pool</code> 点名。</p></div>
-      <div class="card"><h4>解法三：多实例放置（§24.2）</h4><p>活跃视图真的很多、单个 PG 集群 <code>max_connections</code> 仍然封顶时，把不同视图放到不同<b>独立 PG 进程/主机</b>上，容量随实例数线性增长。</p></div>
+      <div class="card"><h4>解法三：多实例放置（§24.4）</h4><p>活跃视图真的很多、单个 PG 集群 <code>max_connections</code> 仍然封顶时，把不同视图放到不同<b>独立 PG 进程/主机</b>上，容量随实例数线性增长。</p></div>
     </div>
     <div class="warn"><b>容量公式与两个常见误判</b>：单实例容量 ≈ <code>(max_connections − 运维余量) / (写地板 + 读地板)</code> 棵同时存活视图（默认档即 <code>/ 12</code>），多实例 = 逐实例求和。两个误判：① <b>同一个 PG 集群里再建第二个数据库不提升容量</b>——<code>max_connections</code> 是 per cluster process 的；真实扩容是独立 PG 进程 / 独立主机。② <b>上限不是并发闸门</b>：突发峰值实测 31–33 条连接远超上限 12，因为 32 个在途写线程在池空时各自临时建连——容量要按「地板 + 突发并发」算，不是按上限算。</div>
 
-    <h3 id="pg-registry">24.2 多实例：实例注册表 + 视图放置</h3>
-    <p>多实例的答案是<b>把不同视图放到不同实例上</b>（一个视图的树永远只落在一个实例上，不复制）。<code>--meta-store</code> 两种写法：</p>
+    <h3 id="pg-layout">24.2 存储布局全貌：哪个实例存什么、存在哪里</h3>
+    <p>谈路由与搬家之前，先把「记录到底在哪」钉死。PG 档<b>只有元数据入库</b>：内容字节永远躺在各 <code>data-server</code> 的 <code>blocks/</code> 目录里（§13）——一个视图被放到哪个实例，不决定它的字节在哪，那是数据面的另一条轴。一份 <code>--meta-store</code> spec 经 <code>expand_store_spec</code> 解析成有序实例清单 <code>PgBook</code>（<code>src/pg_store.rs</code>），注册表<b>首条即控制面</b>（<code>PgBook::control()</code>）。四类落点：</p>
+    <table>
+      <tr><th>落点</th><th>schema / 表</th><th>存什么</th><th>谁读写</th></tr>
+      <tr><td rowspan="5"><b>控制面实例</b><br>（注册表首条）</td><td><code>grovefs_control.view_defs</code></td><td>派生视图 / 别名定义（SQLite 档 <code>meta/views/*.layout</code> 的等价物）</td><td><code>view define/alias/rm --name</code> 写；meta-server 每次 <code>M_OPEN</code> 读</td></tr>
+      <tr><td><code>grovefs_control.api_keys</code></td><td>逐调用方可撤销凭据（scope、TTL、撤销、铸造者、备注与密钥指纹）</td><td><code>apikey</code> 系命令铸造；meta- 与 data-server 的门都查这同一本</td></tr>
+      <tr><td><code>grovefs_control.mcp_calls</code></td><td>治理面审计流水</td><td>每个治理 op 落一行；<code>apikey calls</code> / 网页台账读</td></tr>
+      <tr><td><code>grovefs_control.view_placement</code></td><td>放置表：视图名 → 实例<b>名</b>（URI 与凭据绝不入库）</td><td><code>view create</code> / <code>--pg-instance</code> / <code>view move</code> / <code>rm</code> 写，引擎 open 读（§24.4）</td></tr>
+      <tr><td><code>grovefs_control.web_accounts</code> / <code>web_grants</code></td><td>网页管理台账号与基视图授权</td><td><code>grovefs web</code> 网关（<a href="#s15-web">§14.9.3</a>）</td></tr>
+      <tr><td><b>每一个 PG 实例</b>（含控制面）</td><td><code>grovefs_refs.holders</code></td><td>跨视图共享字节账本（<code>data_ref → holders</code> 计数，镜像 SQLite 的 <code>&lt;meta&gt;/refs.db</code>）——<b>每实例各一本</b>：SQL 事务跨不了库，而 fork/graft 拒绝跨实例对（§24.4 边界①）保证每本对它能看到的所有共享都是完备的，且与树写同事务</td><td><code>refs rebuild</code> 逐实例重算后求和；<code>gc</code> 跨实例并集扫描后才判孤儿</td></tr>
+      <tr><td><b>视图所在实例</b></td><td><code>grovefs_v_&lt;hex&gt;</code> schema（内部结构见 §24.3）</td><td>该视图一棵树：节点 / ctrl / POSIX 锁；一棵树恰好落一个实例</td><td>meta-server 为该视图开的引擎池（§24.1）</td></tr>
+      <tr><td><b>data-server（不在 PG 里）</b></td><td><code>&lt;data-dir&gt;/blocks/</code></td><td>内容字节（数据面权威），逐 data-server 单独存放</td><td>data-server 直接 IO；备份走 <code>rsync</code> 不走 <code>pg_dump</code></td></tr>
+    </table>
+    <pre><code><span class="cmt"># 一张图（三实例注册表，main 为首 = 控制面）</span>
+meta-server --meta-store file:/etc/grovefs/instances.conf
+ ├─ main   grovefs_control.*（定义/凭据/审计/放置/网页账号）+ grovefs_refs.holders + grovefs_v_*（落在 main 的树）
+ ├─ team1  grovefs_refs.holders + grovefs_v_*（落在 team1 的树）
+ └─ team2  grovefs_refs.holders + grovefs_v_*（落在 team2 的树）
+data-server×N  blocks/ 内容字节——从不进 PG
+客户端          只见 meta-server 一个地址（实例拓扑是服务端私事）</code></pre>
+    <p>三条推论：<b>① 备份按落点拆</b>——<code>pg_dump</code> 每实例一份，控制面实例那份同时覆盖全部控制表与它承载的树（§24.6）；<b>② 控制面只有一份权威记录</b>——除首条外的实例装再多，<code>view_placement</code>/<code>api_keys</code> 也只此一本，不存在跨实例协商，搬动控制面没有自动工具（§24.7）；<b>③ 每实例必须配自己的 data-server</b>——账本与字节分在两个进程里，跨实例 fork/graft 被拒正是为了让每本账都完备、可独立回收。</p>
+
+    <h3 id="pg-schema">24.3 视图在 PG 里的存储结构：一棵物理树一个 schema</h3>
+    <p>PG 档的映射照抄 SQLite 的文件布局（<code>pg_store.rs</code> 模块头注释）：一个 <code>&lt;home&gt;/meta/&lt;view&gt;/&lt;view&gt;.db</code> 文件 ⇄ 一个 <code>grovefs_v_&lt;hex(view)&gt;</code> schema；<code>INTEGER PRIMARY KEY</code>（rowid）⇄ <code>BIGSERIAL PRIMARY KEY</code>，每视图自己的序列让 <code>id</code>/<code>ino</code> 保持和「一视图一文件」模型一样小。DDL 由 <code>ensure_schema</code> 在引擎 open 时幂等建立，一个 schema 里就三张表：</p>
+    <table>
+      <tr><th>表</th><th>形状</th><th>作用与索引</th></tr>
+      <tr><td><code>node</code></td><td><code>id</code>（BIGSERIAL PK）、<code>parent_id</code>、<code>name</code>、<code>is_dir</code>、<code>data_ref</code>、<code>link_target</code>、<code>mode</code>、<code>uid</code>/<code>gid</code>、<code>mtime</code>/<code>atime</code>/<code>ctime</code>、<code>ino</code>；<code>UNIQUE(parent_id, name)</code></td><td>文件系统节点元数据。四条索引：<code>node_parent(parent_id)</code>、<code>node_parent_kind(parent_id, is_dir)</code>（目录 nlink 的 <code>COUNT</code> 留在索引里不回表）、<code>node_dataref(data_ref)</code>（删名销账/graft 按键找行）、<code>node_ino(ino)</code>（getattr 主路径）。根行钉死 <code>id=1</code>（<code>crate::meta::ROOT_INO</code> 恒真）；显式插 id 后对齐 BIGSERIAL 序列，下一条默认 id 从 <code>max(id)+1</code> 起</td></tr>
+      <tr><td><code>ctrl</code></td><td><code>(k TEXT PK, v BIGINT)</code></td><td>视图级键值：一是 <code>epoch</code>（HA 的 API 兼容位——PG 档启动即拒自研 HA，这里是死路径），二是五条连接池声明 <code>POOL_CTRL_KEYS</code>：<code>pg_write_warm</code>/<code>pg_write_max</code>/<code>pg_read_warm</code>/<code>pg_read_max</code>/<code>pg_pool_idle_secs</code>（<code>grovefs view pool</code> 写、下一次引擎 open 读，§24.1）。键值与树同 schema，所以 <code>view move</code> 的快照把它们一起搬走，零额外表、也不碰控制面</td></tr>
+      <tr><td><code>locks</code></td><td><code>id</code>、<code>ino</code>、<code>owner</code>、<code>sid</code>、<code>l_start</code>/<code>l_end</code>、<code>pid</code>、<code>ltype</code>、<code>expires_at</code></td><td>POSIX 记录锁（含会话 <code>sid</code> 与过期时间）。索引 <code>locks_ino(ino,l_start,l_end)</code>（冲突探测）、<code>locks_owner</code>/<code>locks_sid</code>（按持有者/会话批量释放）、<code>locks_expire</code>（过期回收）</td></tr>
+    </table>
+    <h4>schema 名的由来与注入安全性</h4>
+    <ul>
+      <li><code>schema_for(view)</code> = <code>grovefs_v_</code> + 视图名<b>原始字节的 lowercase hex</b>。hex 把字符集收敛到 <code>[0-9a-f]</code>：标识符永远不需要引号，也无法用引号、点、空格伪造出一个 schema 名——视图名从不直接拼进 SQL，注入面在编码这一步就被掐掉；</li>
+      <li>PG 标识符 63 字节上限：<code>grovefs_v_</code> 占 10 字节、hex 每字节省 2 字节，于是视图名 <b>≤ 25 字节</b>；超长名在 open 时点名拒绝，不做静默截断（截断会让两个名字混进同一棵树）；</li>
+      <li>少数面向操作台的查询（读写 <code>ctrl</code> 的键）统一过 <code>quoted_schema()</code> 加双引号——不是当下必需（hex 名可证无需引号），是把引用规则钉死，单测 <code>quoted_schema_wraps_for_the_sql_interpolation</code> 守着；</li>
+      <li>schema 名是不可逆的 hex，视图原名只存在放置表 <code>view_placement.view</code>（TEXT 主键）与控制面里——巡检时按名找库要经同一解析序反查（§24.4），或按 hex 前缀 <code>\dn grovefs_v_*</code> 数树（§24.6）。</li>
+    </ul>
+    <p><b>只有物理树才有 schema，也只有物理树付连接成本</b>：基视图与 fork 各持一棵树、各占一个 schema、各付一套池（§24.1 的计费口径是「活跃<b>物理树</b> × 地板」，不是视图名数）；派生视图的定义在 <code>grovefs_control.view_defs</code>、纯别名解析到真名——两者都不开引擎，挂载它们复用基树的池，连接成本为 0。</p>
+
+    <h3 id="pg-registry">24.4 多实例：实例注册表 + 视图放置</h3>
+    <p>多实例的答案是<b>把不同视图放到不同实例上</b>（一个视图的树永远只落在一个实例上，不复制）。spec 的解析入口是 <code>pg_store.rs::expand_store_spec</code> → <code>PgBook</code>；<code>is_pg_store</code> 统一识别 <code>postgres://</code>/<code>postgresql://</code>/<code>file:</code> 三种形态（旧代码里逐处 <code>starts_with("postgres://")</code> 的判定已全部换成它）。<code>--meta-store</code> 两种写法：</p>
     <pre><code><span class="cmt"># 形态 A：内联逗号列表——自动命名 pg1..pgN，名字只在列表顺序不变时稳定，适合不再增长的小集合</span>
 $Y meta-server --meta-store 'postgres://…/db1,postgres://…/db2' --listen 0.0.0.0:50110
 
@@ -4163,20 +4204,20 @@ $Y meta-server --meta-store file:/etc/grovefs/instances.conf --listen 0.0.0.0:50
     <p>注册表把凭据留在文件里（不进 argv、不进 journal、不进库——放置表只存<b>名字</b>）；注册表读不了 = fail-fast 拒绝启动，绝不静默降级。</p>
     <h4>放置：一棵树落一个实例，落点由放置表说了算</h4>
     <ul>
-      <li><b>自动放置</b>：<code>view create</code> 选<b>放置数最少</b>的实例（并列取注册表顺序）。</li>
-      <li><b>显式钉住</b>：<code>view create --pg-instance team1</code>（<code>view move</code> 是另一个改写放置行的入口，见 §24.3）。</li>
-      <li><b>fork 跟随基视图</b>、<code>view import</code> 自动放置、<code>view rm --base</code> 忘记放置行（schema 与放置行同清）。</li>
-      <li>放置表 <code>grovefs_control.view_placement</code> 在控制面实例上，写/删与控制面 DDL 用同一把 advisory lock 序列化。</li>
+      <li><b>自动放置</b>：<code>view create</code> 选<b>放置数最少</b>的实例（并列取注册表顺序）——代码 <code>place_new_view</code> 拿 <code>placement_counts</code>（对放置表 <code>GROUP BY instance</code>）取最小者，贪婪地把新视图摊平到整个实例集。</li>
+      <li><b>显式钉住</b>：<code>view create --pg-instance team1</code>——操作者点名的实例赢过任何陈旧放置行（<code>write_placement</code> 覆盖式写）；<code>view move</code> 是另一个改写放置行的入口，见 §24.5。</li>
+      <li><b>fork 跟随基视图</b>（<code>place_with_home</code>：家由被复制的基树决定，<code>DO NOTHING</code> 保留既有行——同名重建到别处会留下没人引的 schema）、<code>view import</code> 自动放置、<code>view rm --base</code> 忘记放置行（schema 与放置行同清；<code>forget_view_placement</code> 是 best-effort，树已删完，控制面临时不可达只会偏斜后续均衡，不算错）。</li>
+      <li>放置表 <code>grovefs_control.view_placement</code>（<code>view TEXT PK / instance TEXT / updated_at TEXT</code>）在控制面实例上，写/删与控制面 DDL 用同一把 advisory lock 序列化；只存实例名，凭据不入库。</li>
     </ul>
     <h4>挂载怎么找到对库：客户端永远只连 meta-server</h4>
-    <p>客户端不感知实例——meta-server 在 <code>M_OPEN</code> 时把视图解析到实例，由<b>服务端</b>向各实例扇出 PG 连接（“都经一个服务的负载”只是元数据 RPC，本来就是轻量路径；PG 连接不是经它中转的，是它替你选路）。视图→实例的解析顺序：</p>
+    <p>客户端不感知实例——meta-server 在 <code>M_OPEN</code> 时把视图解析到实例，由<b>服务端</b>向各实例扇出 PG 连接（“都经一个服务的负载”只是元数据 RPC，本来就是轻量路径；PG 连接不是经它中转的，是它替你选路）。解析入口 <code>resolve_view_home</code>（引擎 open 经 <code>resolve_view_uri</code> 调它），四层顺序：</p>
     <ol>
-      <li><b>单实例直传</b>：一个 URI 原样透传，零额外查询。</li>
-      <li><b>放置行</b>：<code>view_placement</code> 说了算。</li>
-      <li><b>扩容自愈</b>：无行但 schema 在控制面实例上 = 单实例升注册表前的旧视图，pin 回原库一次（顺手写下一行放置）。</li>
-      <li><b>FNV-1a 哈希回退</b>：兼容更老的哈希分片部署（<code>.build-bin/probe_pg_shard.sh</code>）。</li>
+      <li><b>单实例直传</b>：一个 URI 原样透传，零额外查询——单实例部署为这套机制付的运行时代价恰好是 0。</li>
+      <li><b>放置行</b>：<code>view_placement</code> 说了算（<code>lookup_placement</code>）；行里点了注册表没定义的实例名 = 报错点名两边，不猜。</li>
+      <li><b>扩容自愈</b>：无行但 schema 在控制面实例上 = 单实例升注册表前的旧视图，pin 回原库一次（顺手写下一行放置）——<code>lookup_placement</code> 在同一事务里顺带探 <code>information_schema.schemata</code>，不多打一个往返。</li>
+      <li><b>FNV-1a 哈希回退</b>：兼容更老的哈希分片部署（<code>.build-bin/probe_pg_shard.sh</code>）——<code>view_hash</code> 对<b>展开后</b>的实例清单取模，与老 <code>route_store</code> 对同一逗号列表产生一致映射。</li>
     </ol>
-    <div class="warn"><b>控制面不可达时拒绝而非猜</b>——猜错库会种下没人再找得到的 schema。给实例集合加一台机器<b>不影响</b>已放置视图的落点（放置行说了算），只影响新视图的均衡。</div>
+    <div class="warn"><b>控制面不可达时拒绝而非猜</b>——猜错库会种下没人再找得到的 schema。给实例集合加一台机器<b>不影响</b>已放置视图的落点（放置行说了算），只影响新视图的均衡。放置为什么要压在哈希之上（<code>pg_store.rs</code> 模块头注释）：纯哈希按名字一对一、加实例会把所有旧视图重映射——那是数据搬家不是拨开关；有了放置行，扩容只影响新视图，老视图要动得走明面上的 <code>view move</code>。</div>
     <h4>语义不变量（多实例下全部成立）</h4>
     <ul>
       <li><code>view list</code> <b>跨实例合并</b>；</li>
@@ -4192,8 +4233,8 @@ $Y meta-server --meta-store file:/etc/grovefs/instances.conf --listen 0.0.0.0:50
       <li>容量公式见 §24.1：同集群建第二库无益，真扩容 = 独立进程/主机。</li>
     </ul>
 
-    <h3 id="pg-move">24.3 切换机制：把已存在的视图搬到另一实例（<code>view move</code>）</h3>
-    <p>放置只在创建时自动选，事后调整用这条命令：</p>
+    <h3 id="pg-move">24.5 切换机制：把已存在的视图搬到另一实例（<code>view move</code>）</h3>
+    <p>放置只在创建时自动选，事后调整用这条命令（代码：<code>pg_store.rs::move_view</code> → <code>PgMoveReport</code>；建树复用 <code>import_into</code>——与 <code>view import</code> 同一条不碰放置的通路）：</p>
     <pre><code>$Y view --meta-store file:/etc/grovefs/instances.conf move --view V --pg-instance team1
 $Y view --meta-store file:/etc/grovefs/instances.conf move --view V --pg-instance team1 --keep-source   <span class="cmt"># 源留作回滚点</span></code></pre>
     <h4>四步切换：snapshot → build → flip → retire</h4>
@@ -4211,7 +4252,7 @@ $Y view --meta-store file:/etc/grovefs/instances.conf move --view V --pg-instanc
       <li>视图挂载中拒绝（先卸载本机挂载；其他机器上挂载的要自己静默）；</li>
       <li>必须在存储机上跑（带 <code>--control-server</code> 拒绝）；SQLite 档拒绝（每视图本来就只有一个家）；</li>
       <li>alias/derived 拒绝（它们不拥有树）；</li>
-      <li><b>fork 可以搬，但基视图不跟随</b>——搬家后的 fork 与基视图分属两实例，后续 <code>graft</code> 这一对会被跨实例拒绝（§24.2 边界①的推论，搬家前想清楚）。</li>
+      <li><b>fork 可以搬，但基视图不跟随</b>——搬家后的 fork 与基视图分属两实例，后续 <code>graft</code> 这一对会被跨实例拒绝（§24.4 边界①的推论，搬家前想清楚）。</li>
     </ul>
     <h4>扩容全流程（五步串起来）</h4>
     <pre><code><span class="cmt"># ① 新 PG 实例装好库与账号（每实例一条，GRANT 同 §6.4）</span>
@@ -4221,9 +4262,9 @@ echo 'team1 = postgres://grove:pw@10.0.0.2:5433/grovefs' &gt;&gt; /etc/grovefs/i
 <span class="cmt"># ③ 重启 meta-server（横幅报新实例清单）</span>
 sudo systemctl restart grove-meta-server
 <span class="cmt"># ④ 新视图自动向新机器均衡；旧视图原地不动（放置行 / 自愈 pin 说了算）</span>
-<span class="cmt"># ⑤ 热点视图减负：view move（§24.3 四步）</span></code></pre>
+<span class="cmt"># ⑤ 热点视图减负：view move（§24.5 四步）</span></code></pre>
 
-    <h3 id="pg-ops">24.4 多实例运维：巡检 / 备份 / 回收</h3>
+    <h3 id="pg-ops">24.6 多实例运维：巡检 / 备份 / 回收</h3>
     <pre><code><span class="cmt"># 巡检：每实例各看 schema 数与放置分布（放置表在控制面实例上）</span>
 psql "postgres://…@main/grovefs" -c "SELECT instance, count(*) FROM grovefs_control.view_placement GROUP BY instance ORDER BY 2;"
 psql "postgres://…@main/grovefs" -c '\dn grovefs_v_*'          <span class="cmt"># 逐实例跑一遍；目标分布与放置表一致</span>
@@ -4233,11 +4274,11 @@ pg_dump --format=custom "postgres://…@team1/grovefs" &gt; grovefs-team1.dump
 <span class="cmt"># 回收/账本：命令不变，行为已跨实例——refs rebuild 逐实例求和；服务端 gc 跨实例并集扫描</span></code></pre>
     <p><code>du</code>、<code>view export</code>/<code>import</code>、<code>apikey</code> 等治理命令照旧带 <code>--meta-store &lt;spec&gt;</code>（注册表串或 file: 路径），解析到哪个实例就直连哪个库；远程 <code>gc --control-server</code> 形态两档通吃、多实例下自动并集扫描。</p>
 
-    <h3 id="pg-honest">24.5 诚实边界与取证</h3>
+    <h3 id="pg-honest">24.7 诚实边界与取证</h3>
     <ul>
       <li><b>控制面本身的切换没有工具</b>：注册表首条实例承载控制面（<code>grovefs_control.*</code> + 放置表）；要把它挪到另一台机器，须手工 <code>pg_dump -t 'grovefs_control.*'</code> 迁表 + 改注册表首行。罕见操作刻意不自动化——风险窗口大，宁人审。</li>
       <li><b>PG 与自研 HA 互斥</b>（<code>--role/--peer/--witness</code> 同给启动即 fail-fast）；PG 档可用性交给 PG 自身流复制 / PITR（§16.3）。</li>
-      <li><b>同集群建第二个库不提升容量</b>（§24.1）；<b>每个实例必须配自己的 data-server</b>（§24.2 边界①）。</li>
+      <li><b>同集群建第二个库不提升容量</b>（§24.1）；<b>每个实例必须配自己的 data-server</b>（§24.4 边界①）。</li>
       <li><b>fork 搬家的后续影响</b>：fork 可搬但 base 不跟随，此后该对 <code>graft</code> 被跨实例拒绝——先搬 fork 还是先搬 base，决定了这对视图还能不能再接枝。</li>
       <li><b>老哈希分片部署的兼容口径</b>：没有注册表、没有放置行的部署仍可读（解析序第 4 层回退），但新部署一律建议 file: 注册表——哈希落点改不了、搬不走，注册表+放置才是可运维形态。</li>
     </ul>
