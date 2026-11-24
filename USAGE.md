@@ -2634,7 +2634,7 @@ journalctl -u grove-meta-server -f        # systemd 下实时追日志
 | 件 | 位置 | 方式 |
 | --- | --- | --- |
 | 数据对象 | data-server `--data-dir` 下的 `blocks/` | 普通目录,`rsync -a`/文件系统快照直接备;若用过 `grovefs import`(§3.3),部分对象是与源目录共享的硬链接——用 `rsync -a -H` 或 `cp -a` 保留链接避免内容翻倍,且源目录本身也应进同一备份 |
-| 权威视图 | `<meta-dir>/meta/<view>/<view>.db`(含 WAL) | 见下三种流程;**勿在有写活动时裸拷** |
+| 权威视图 | SQLite:`<meta-dir>/meta/<view>/<view>.db`(含 WAL);treedb 后端:**不在 `<meta-dir>` 下**,见下文「treedb 后端」 | 见下三种流程;**勿在有写活动时裸拷** |
 | 跨视图账本 | `<meta-dir>/meta/_control/refs.db` | 随 `meta/` 一起拷;丢失/替换后可用 `grovefs refs --meta-dir D rebuild` 按现存视图重算(只会高估不误删) |
 | API key 注册表 | SQLite:`<meta-dir>/meta/_control/api_keys.db`(含 WAL);PG:`grovefs_control.api_keys`/`mcp_calls` | SQLite 同上,冷拷;PG 随 `pg_dump` 进库,均无独立文件要备 |
 | 视图定义(派生/别名) | SQLite:`<meta-dir>/meta/views/*.layout`;PG:`grovefs_control.view_defs` | SQLite 普通文本文件,需一并拷(HA 备机也需手工同步,§3.2/§3.4);PG 随库复制,均无手工同步 |
@@ -2650,6 +2650,16 @@ journalctl -u grove-meta-server -f        # systemd 下实时追日志
 - 两半都丢且要重建:从最近一份归档快照恢复 `<meta-dir>/meta/`,epoch 从头开始的前提是**所有 data-server 也同时换新**(否则残留 `.fence_token` 会挡住写——这是 fail-safe 的正确行为,不是损坏)。
 
 **PostgreSQL 后端**:视图树备份完全交给 PG 工具链(`pg_dump`/`pg_basebackup` + WAL 归档/PITR);GroveFS 侧只备 `blocks/` + env 文件——key、审计与视图定义都已在 `grovefs_control` schema 里,一次 `pg_dump` 同时覆盖树+控制面(`control` 套件实证),没有本地要单独冷拷的控制面文件。`--meta-store` 模式下自研快照备份 API 有意返回错误(设计如此)。可直接照抄的 dump/恢复/演练命令（含 DBA 建库与恢复后核对项）见 **§15.7**。
+
+**treedb 后端**(`--meta-store treedb://host:port`):元数据**不在 `<meta-dir>` 下** —— 那串 URI 只是一条 TCP 坐标,真正的树长在 `treedb-server` 进程的 `--dir` 目录里(一份快照 + 一条 WAL)。所以这一档要备的是**引擎的目录**（开了归档就连归档目录一起）,`grovefs` 侧没有要单独冷拷的元数据文件:控制面(apikey / 审计 / 视图定义 / 账户与授权)早已落成引擎里的 `grovefs_control__*` 通用表,**随同一次引擎备份一起走**。三种形状:
+
+- **冷拷**:停 `treedb-server` 之后 `cp -a` 它的 `--dir`(优雅停服自带最后一次 checkpoint,故还原不依赖尾日志重放),RPO = 停服那一刻。恢复用 `treedb-load --in F --dir D`(两侧目录都要独占、非空即拒)。
+- **在线切面**:`treedb-backup --primary HOST:PORT --out F.dump` —— 主不用停、也不用先 checkpoint,`--out -` 可直接接 gzip(摘要走 stderr,字节流不被污染)。但切面固定在**某一个 seq** 上,不是持续追赶。
+- **按时间点**:让 `treedb-server` 带 `--archive-dir A` 起步(checkpoint 在抹历史之前先把 WAL 段与将被覆盖的快照拷进归档),之后 `treedb-pitr --dir D --archive A --to-seq N --out NEW` 就能落在两次 checkpoint **之间**的任意一条 op 末尾 —— 这是唯一能做到这点的形状,`--dry-run` 先看计划不写字节。N 取 `treedb-server --stats` 的 `wal_seq`:一条 op 可能产多条日志而 WAL 里没有组边界,落在组中间会得到「该 op 只生效一半」的状态。
+
+三条不做:**无增量备份、无加密备份、无归档保留策略**(归档只增不减;清老段之前要确认被当锚点的那些快照还在)。两个坑:① `--archive-dir` 必须**从第一天就开** —— 关掉期间做过的 checkpoint 会在归档里留一个洞,越过它的恢复报缺口而不拼两边历史;② **换代要服务端与 grovefs 成对升**,`treedb-migrate` 只抬目录格式不抬线协议,而**不开认证时跨代混跑不报错、只读回垃圾**(引擎 DESIGN §4.4 末四臂实测:同一条 `--stats` 在错代解出 `protocol = 0`、`wal = 0 B`)—— 想要这道闸门就开认证(`GROVEFS_TREEDB_KEY_FILE`)。
+
+诚实边界:上述形状在 treedb 仓实测(其 DESIGN §6.7 / §6.10 / §6.11,2026-11-24 于 rev `a749266` 复跑:冷拷逐项相等、在线切面自洽、含 v0.7.0 三条批量记录的「归档 → PITR」恢复结果与停服冷 dump **逐字节相同**);但**本仓的回归板没有覆盖 treedb 后端的备份** —— `.build-bin` 里 `treedb` / `treedbmatrix` 两段跑的是接入面形状自检与断言矩阵重放,端到端备份演练未做。`blocks/` 里内容字节那一档与后端无关,照上表备。
 
 **迁到新机器/换系统**:元数据不绑定硬件(只存对象 key,路径是 key 的纯函数),整目录冷拷即可用;要按视图选择性迁移用 `view export/import`(详见 §3.4.2)。三个拓扑边界:多盘 `--data-dir` 的数量/顺序要一致(等盘克隆原位顶替可,增删/调序会重映射;或合并成单 root);条带 `s<N>:` 要保留 N 个 data-server 及顺序;整目录拷会把 HA `epoch` 带过去,旧主必须先停。PG 后端用 `pg_dump`/逻辑复制。
 
