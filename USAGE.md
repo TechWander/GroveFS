@@ -2661,6 +2661,8 @@ journalctl -u grove-meta-server -f        # systemd 下实时追日志
 
 诚实边界:上述形状在 treedb 仓实测(其 DESIGN §6.7 / §6.10 / §6.11,2026-11-24 于 rev `a749266` 复跑:冷拷逐项相等、在线切面自洽、含 v0.7.0 三条批量记录的「归档 → PITR」恢复结果与停服冷 dump **逐字节相同**);但**本仓的回归板没有覆盖 treedb 后端的备份** —— `.build-bin` 里 `treedb` / `treedbmatrix` 两段跑的是接入面形状自检与断言矩阵重放,端到端备份演练未做。`blocks/` 里内容字节那一档与后端无关,照上表备。
 
+**pin 门槛**(别照抄就跑,本仓各分支钉的引擎版本不一样):`treedb-backup`、`treedb-dump` / `treedb-load`、`--archive-dir` 与 `treedb-pitr` 这四个**都是引擎 v0.6.0 才有的二进制/旗标**,`treedb-standby --promote` 要 v0.4.0。按 `git show <分支>:Cargo.toml` 里 `treedb = { ..., tag = ... }` 那行实读:`master` 仍钉 `v0.3.7`(所以这一档**只有冷拷与副本目录两形可用**,其余命令在那个版本里压根不存在),集成前沿 `feat/treedb-hardlink` 已钉 `v0.7.0`。换引擎二进制时必须与服务端**成对**换 —— 见上面那条混代静默错读。
+
 **迁到新机器/换系统**:元数据不绑定硬件(只存对象 key,路径是 key 的纯函数),整目录冷拷即可用;要按视图选择性迁移用 `view export/import`(详见 §3.4.2)。三个拓扑边界:多盘 `--data-dir` 的数量/顺序要一致(等盘克隆原位顶替可,增删/调序会重映射;或合并成单 root);条带 `s<N>:` 要保留 N 个 data-server 及顺序;整目录拷会把 HA `epoch` 带过去,旧主必须先停。PG 后端用 `pg_dump`/逻辑复制。
 
 ### 12.4 升级与滚动变更
