@@ -372,8 +372,10 @@ export const ZH: Readonly<Record<string, string>> = {
   'control plane': '控制面',
   'placement count unreadable': '放置计数不可读',
   '${v} view(s) placed': '已放置 ${v} 个视图',
-  '${n} view(s) predate the placement table and are hash-routed':
-    '${n} 个视图早于放置表建立，按哈希路由',
+  '${n} view(s) have no placement row and are hash-routed':
+    '${n} 个视图没有放置行，按哈希路由',
+  '${n} view(s) point at an instance the registry no longer defines — their mount is refused until the registry or placement is fixed':
+    '${n} 个视图指向注册表已不再定义的实例 — 在修正注册表或放置前其挂载会被拒绝',
   'the process this console is talking to': '本控制台正在对话的进程',
   namespace: '命名空间',
   '${n} base view(s)': '${n} 个基视图',

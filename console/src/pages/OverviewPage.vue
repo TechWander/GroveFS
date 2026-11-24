@@ -89,10 +89,14 @@ function openBase(name: string): void {
 
 /** `base` only means "the trees live here" on a SQLite backend — on PG and
     treedb it holds no trees at all, so the line names what it actually is.
-    The vocabulary lives here because a comparison inside a bound prop reads
-    to the i18n audit as an untranslated display string. */
+    Keyed off `metadataBackend` (where the TREES live), NOT `backend` (the
+    CONTROL-plane backend): a treedb deployment's control plane is still local
+    SQLite, so `backend` says "sqlite" while its trees sit in the engine —
+    trusting `backend` would mislabel a treedb box "metadata root". The
+    vocabulary lives here because a comparison inside a bound prop reads to the
+    i18n audit as an untranslated display string. */
 const baseLabel = computed(() =>
-  store.value?.backend === 'sqlite' ? 'metadata root' : 'local anchor (--meta-dir)',
+  store.value?.metadataBackend === 'sqlite' ? 'metadata root' : 'local anchor (--meta-dir)',
 )
 </script>
 
@@ -184,7 +188,7 @@ const baseLabel = computed(() =>
           </StatLine>
           <StatLine :label="baseLabel">
             <code>{{ store.base || '—' }}</code>
-            <span v-if="store.backendLayout && store.backend !== 'sqlite'" class="muted">
+            <span v-if="store.backendLayout && store.metadataBackend !== 'sqlite'" class="muted">
               · {{ store.backendLayout }}
             </span>
           </StatLine>
@@ -241,8 +245,16 @@ const baseLabel = computed(() =>
           <li v-if="store.pgInstances.unplaced" class="static muted">
             {{
               t(
-                '${n} view(s) predate the placement table and are hash-routed',
+                '${n} view(s) have no placement row and are hash-routed',
                 { n: store.pgInstances.unplaced },
+              )
+            }}
+          </li>
+          <li v-if="store.pgInstances.dangling" class="static err">
+            {{
+              t(
+                '${n} view(s) point at an instance the registry no longer defines — their mount is refused until the registry or placement is fixed',
+                { n: store.pgInstances.dangling },
               )
             }}
           </li>

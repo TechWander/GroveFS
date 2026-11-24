@@ -2118,12 +2118,25 @@ fn control_dispatch(
                 .web_auth
                 .as_ref()
                 .and_then(|w| w.list().ok().map(|v| v.len()));
+            // The physical trees, listed once and reused: `views` counts them,
+            // and the PG ledger subtracts its placed-row set from them to name
+            // the hash-routed remainder (`unplaced`) apart from rows that point
+            // at a retired instance (`dangling`).
+            let trees = physical_tree_list(rt)?;
             Ok(json!({
+                // `backend` is the CONTROL-plane backend; `metadataBackend` is
+                // where the TREES live. They differ on a treedb deployment,
+                // whose control plane stays in local SQLite (`backend` =
+                // "sqlite") while its trees sit in the engine (`metadataBackend`
+                // = "treedb"). The console must key the base-directory label and
+                // layout note off `metadataBackend`, never off `backend`, or a
+                // treedb box is mislabelled "metadata root".
                 "backend": rt.control.backend(),
+                "metadataBackend": rt.store.backend_name(),
                 "describe": rt.control.describe(),
                 "base": rt.base.display().to_string(),
                 "role": format!("{:?}", rt.role()),
-                "views": physical_tree_list(rt)?.len(),
+                "views": trees.len(),
                 "definitions": rt.control.list_defs()?.len(),
                 "accounts": accounts,
                 "liveKeys": keys,
@@ -2147,14 +2160,15 @@ fn control_dispatch(
                 // now degrades to NAMES-only via `expand_store_spec` — counts
                 // missing beats failing the whole snapshot over one panel.
                 "pgInstances": match &rt.store {
-                    StoreKind::Pg(spec) => match crate::pg_store::placement_ledger(spec) {
-                        Ok((rows, unplaced)) => Some(json!({
+                    StoreKind::Pg(spec) => match crate::pg_store::placement_ledger(spec, &trees) {
+                        Ok((rows, unplaced, dangling)) => Some(json!({
                             "instances": rows.iter().map(|r| json!({
                                 "name": r.name,
                                 "views": r.views,
                                 "control": r.control,
                             })).collect::<Vec<_>>(),
                             "unplaced": unplaced,
+                            "dangling": dangling,
                         })),
                         Err(_) => crate::pg_store::expand_store_spec(spec)
                             .ok()
@@ -2165,6 +2179,7 @@ fn control_dispatch(
                                     "control": i.name == b.control().name,
                                 })).collect::<Vec<_>>(),
                                 "unplaced": null,
+                                "dangling": null,
                             })),
                     },
                     _ => None,

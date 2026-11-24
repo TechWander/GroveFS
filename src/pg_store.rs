@@ -586,17 +586,27 @@ pub struct PgLedgerRow {
 
 /// Per-instance view counts straight from the placement table — the same
 /// ledger `place_new_view` balances against, so the console shows the rule's
-/// own inputs rather than a second accounting that could drift. `unplaced`
-/// counts the trees that PREDATE the table (or live on single-instance
-/// specs): hash-routed, deliberately absent here, and worth naming because
-/// "the dropdown's numbers don't add up to the view total" is otherwise an
-/// operator mystery. A plain read — no DDL, no advisory lock: an unreadable
-/// table is no placement yet, which is a wrong answer only in the sense that
-/// zero rows already is.
-pub fn placement_ledger(spec: &str) -> Result<(Vec<PgLedgerRow>, usize), String> {
+/// own inputs rather than a second accounting that could drift. Two residual
+/// buckets are reported apart, because they are different operator facts:
+/// - `unplaced`: trees with NO placement row. These are the hash-routed set
+///   (they predate the table, or live on a single-instance spec that
+///   deliberately writes no rows). Computed as `all_views` minus the views that
+///   have a row; forced to `0` for a single-instance book, where "no row" is
+///   the normal state, not a legacy-hashing signal worth surfacing.
+/// - `dangling`: rows that name an instance the registry no longer defines.
+///   [`resolve_view_home`] REFUSES such a view (a routing error that fails the
+///   mount), so it must never be shown as a benign hash-routed remainder — the
+///   operator has to fix the registry or re-place the view.
+/// A plain read — no DDL, no advisory lock: an unreadable table is no placement
+/// yet, which is a wrong answer only in the sense that zero rows already is.
+pub fn placement_ledger(
+    spec: &str,
+    all_views: &[String],
+) -> Result<(Vec<PgLedgerRow>, usize, usize), String> {
     let book = expand_store_spec(spec)?;
     let mut counts: Vec<usize> = vec![0; book.instances.len()];
-    let mut unplaced = 0usize;
+    let mut dangling = 0usize;
+    let mut placed: std::collections::HashSet<String> = Default::default();
     let mut c = Client::connect(&book.control().uri, NoTls)
         .map_err(|e| format!("postgres connect {}: {e}", book.control().name))?;
     let rows = c
@@ -607,15 +617,22 @@ pub fn placement_ledger(spec: &str) -> Result<(Vec<PgLedgerRow>, usize), String>
         .map_err(|e| format!("postgres read {PG_PLACEMENT_TABLE}: {e}"))?;
     let control_name = book.control().name.to_string();
     for r in rows {
+        let view: String = r.get(0);
         let instance: String = r.get(1);
+        placed.insert(view);
         match book.instances.iter().position(|i| i.name == instance) {
-            // A row naming a retired registry entry counts as unplaced:
-            // nothing in TODAY'S book routes there, and the overview must
-            // not show a phantom instance or silently drop the view.
             Some(k) => counts[k] += 1,
-            None => unplaced += 1,
+            // A row naming a retired registry entry: nothing in TODAY'S book
+            // routes there, and resolve refuses the view — a dangling error,
+            // not an unplaced hash-routed tree.
+            None => dangling += 1,
         }
     }
+    let unplaced = if book.instances.len() > 1 {
+        all_views.iter().filter(|v| !placed.contains(*v)).count()
+    } else {
+        0
+    };
     Ok((
         book.instances
             .iter()
@@ -627,6 +644,7 @@ pub fn placement_ledger(spec: &str) -> Result<(Vec<PgLedgerRow>, usize), String>
             })
             .collect(),
         unplaced,
+        dangling,
     ))
 }
 

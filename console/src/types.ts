@@ -49,6 +49,10 @@ export interface InfoResult {
 /** `store.info` — the administrator's deployment snapshot. */
 export interface StoreInfo {
   backend?: string
+  /** Where the TREES live, which differs from `backend` (the control-plane
+      backend) on a treedb deployment: control stays SQLite, trees sit in the
+      engine. The base-directory label and layout note key off THIS. */
+  metadataBackend?: string
   describe?: string
   base?: string
   role?: string
@@ -69,8 +73,7 @@ export interface StoreInfo {
 }
 
 /** One registry instance as `store.info` reports it; counts are `null` when
-    the control plane could not be read, and `unplaced` names the trees that
-    predate the placement table (hash-routed, on no instance's ledger). */
+    the control plane could not be read. */
 export interface PgLedgerRow {
   name: string
   views: number | null
@@ -79,7 +82,12 @@ export interface PgLedgerRow {
 
 export interface PgLedger {
   instances: PgLedgerRow[]
+  /** Trees with NO placement row — the hash-routed set (predate the table, or
+      a single-instance spec that writes none). `null` when unreadable. */
   unplaced: number | null
+  /** Placement rows naming an instance the registry no longer defines: a
+      routing ERROR whose mount is refused, distinct from `unplaced`. */
+  dangling: number | null
 }
 
 /** The API's own kind spelling; `derived` is what the console calls a lens. */
