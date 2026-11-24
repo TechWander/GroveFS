@@ -146,7 +146,27 @@ postgres = { version = "0.19", default-features = false, optional = true }
 # behaviour-only bump on top: auto-checkpoint no longer stops the round (it
 # dispatches a background replay snapshot and trims the WAL prefix), which
 # matters here because the event loop is the only ack path.
-treedb = { git = "https://github.com/TechWander/treedb.git", tag = "v0.5.1", optional = true }
+#
+# Why v0.5.1 -> v0.6.0 (protocol 6 -> 7, 52/30 -> 41/23 ops/replies,
+# SNAP_VERSION 3 -> 4): the engine deleted its four dedicated control-plane op
+# groups (`Key*`/`Audit*`/`Def*`/`Place*`). This adapter never called them — the
+# control plane had already been moved into `grovefs_control__` generic tables
+# (upstream DESIGN.md 10 stage C4) — so the bump is still zero source change
+# here. It is not zero change for operators though: deleting frames is not a tag
+# append, so a meta-server built on this pin must talk to a same-generation
+# server, and an engine data dir written by <= v0.5.x needs `treedb-migrate`
+# (v3 -> v4, and it refuses outright when those four legacy tables are non-empty)
+# before the new binary will open it.
+# v0.7.0 on top is a pure append again (protocol stays 7, SNAP_VERSION stays 4):
+# three bulk shapes (`TableClear` / `RowRangeDelete` / `TableRename`) plus
+# same-value elision on `RowPut`. Nothing here issues them yet. Two things to
+# remember when we do: `Op::Batch` is atomic inside ONE engine instance only and
+# the engine does not know which instance holds a table (sharding, if we ever
+# need it, is ours to route — upstream DESIGN.md 8 item 19); and after the
+# elision `Stats.seq` advancing is no longer equivalent to "a write happened",
+# so a `stamp_used`-style rewrite of an identical row costs nothing but also
+# leaves no trace in the WAL (upstream DESIGN.md 8 item 18).
+treedb = { git = "https://github.com/TechWander/treedb.git", tag = "v0.7.0", optional = true }
 # Opt-in per-stage latency telemetry (src/stats.rs): high-dynamic-range histograms
 # for offline bottleneck diagnosis. Pure-Rust, zero deps. Only touched when
 # `--stats` / `GROVEFS_STATS=1` is on; the disabled path costs one atomic load.
