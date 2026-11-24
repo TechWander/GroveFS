@@ -86,6 +86,14 @@ function toAudit(): void {
 function openBase(name: string): void {
   void openView(name)
 }
+
+/** `base` only means "the trees live here" on a SQLite backend — on PG and
+    treedb it holds no trees at all, so the line names what it actually is.
+    The vocabulary lives here because a comparison inside a bound prop reads
+    to the i18n audit as an untranslated display string. */
+const baseLabel = computed(() =>
+  store.value?.backend === 'sqlite' ? 'metadata root' : 'local anchor (--meta-dir)',
+)
 </script>
 
 <template>
@@ -174,8 +182,11 @@ function openBase(name: string): void {
             <b>{{ info.backend || '—' }}</b>
             <span class="muted">· {{ store.describe || '' }}</span>
           </StatLine>
-          <StatLine label="metadata root">
+          <StatLine :label="baseLabel">
             <code>{{ store.base || '—' }}</code>
+            <span v-if="store.backendLayout && store.backend !== 'sqlite'" class="muted">
+              · {{ store.backendLayout }}
+            </span>
           </StatLine>
           <StatLine label="server role">
             <b>{{ store.role || '—' }}</b>
@@ -208,6 +219,34 @@ function openBase(name: string): void {
             </span>
           </StatLine>
         </div>
+        <!-- A PG deployment's real question is WHERE each tree lives, and the
+             placement table answers it exactly — the same ledger the balancer
+             and the create-view dropdown read, so the three faces cannot
+             drift apart. SQLite keeps one db file per view under the base and
+             treedb one tree per view in its server: nothing to spread, so no
+             ledger. -->
+        <ul v-if="store.pgInstances" class="list">
+          <li v-for="i in store.pgInstances.instances" :key="i.name" class="static">
+            <b>{{ i.name }}</b>
+            <span v-if="i.control" class="muted">· {{ t('control plane') }}</span>
+            <span class="muted">
+              ·
+              {{
+                i.views === null
+                  ? t('placement count unreadable')
+                  : t('${v} view(s) placed', { v: i.views })
+              }}
+            </span>
+          </li>
+          <li v-if="store.pgInstances.unplaced" class="static muted">
+            {{
+              t(
+                '${n} view(s) predate the placement table and are hash-routed',
+                { n: store.pgInstances.unplaced },
+              )
+            }}
+          </li>
+        </ul>
         <p class="muted">
           {{
             t(

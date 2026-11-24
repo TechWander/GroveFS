@@ -575,6 +575,61 @@ fn place_with_home(spec: &str, view: &str, home: &str) -> Result<(), String> {
     write_placement(&book, view, home, false)
 }
 
+/// One registry instance as the overview page shows it: its name, how many
+/// views the placement table currently sends to it, and whether it is the
+/// control plane (registry order decides that — first entry).
+pub struct PgLedgerRow {
+    pub name: String,
+    pub views: usize,
+    pub control: bool,
+}
+
+/// Per-instance view counts straight from the placement table — the same
+/// ledger `place_new_view` balances against, so the console shows the rule's
+/// own inputs rather than a second accounting that could drift. `unplaced`
+/// counts the trees that PREDATE the table (or live on single-instance
+/// specs): hash-routed, deliberately absent here, and worth naming because
+/// "the dropdown's numbers don't add up to the view total" is otherwise an
+/// operator mystery. A plain read — no DDL, no advisory lock: an unreadable
+/// table is no placement yet, which is a wrong answer only in the sense that
+/// zero rows already is.
+pub fn placement_ledger(spec: &str) -> Result<(Vec<PgLedgerRow>, usize), String> {
+    let book = expand_store_spec(spec)?;
+    let mut counts: Vec<usize> = vec![0; book.instances.len()];
+    let mut unplaced = 0usize;
+    let mut c = Client::connect(&book.control().uri, NoTls)
+        .map_err(|e| format!("postgres connect {}: {e}", book.control().name))?;
+    let rows = c
+        .query(
+            &format!("SELECT view, instance FROM {PG_PLACEMENT_TABLE}"),
+            &[],
+        )
+        .map_err(|e| format!("postgres read {PG_PLACEMENT_TABLE}: {e}"))?;
+    let control_name = book.control().name.to_string();
+    for r in rows {
+        let instance: String = r.get(1);
+        match book.instances.iter().position(|i| i.name == instance) {
+            // A row naming a retired registry entry counts as unplaced:
+            // nothing in TODAY'S book routes there, and the overview must
+            // not show a phantom instance or silently drop the view.
+            Some(k) => counts[k] += 1,
+            None => unplaced += 1,
+        }
+    }
+    Ok((
+        book.instances
+            .iter()
+            .enumerate()
+            .map(|(k, i)| PgLedgerRow {
+                name: i.name.clone(),
+                views: counts[k],
+                control: i.name == control_name,
+            })
+            .collect(),
+        unplaced,
+    ))
+}
+
 /// Route a store specification that may name several PostgreSQL instances
 /// (an inline `uri,uri,...` list or a `file:` registry) to the one that owns
 /// `view`.

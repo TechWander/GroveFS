@@ -2136,20 +2136,44 @@ fn control_dispatch(
                 // hand, which is the fact the console's audit page should say
                 // out loud rather than leave as a silently growing table.
                 "auditRetention": rt.audit_retention,
-                // Registry instance NAMES (never URIs — those embed passwords,
-                // and this reply crosses the governance wire): what feeds the
-                // console's placement dropdown for `view create`, so it sees
-                // the same expanded book the startup banner printed. A
-                // non-PG backend is `null` (there is nothing to pick); a PG
-                // spec whose registry cannot be re-read right now degrades to
-                // `null` too — store.info must still answer with every other
-                // field rather than fail the whole snapshot over one dropdown.
+                // Registry instances as the overview shows them: NAMES plus
+                // each one's placed-view count (never URIs — those embed
+                // passwords, and this reply crosses the governance wire).
+                // One read feeds both console faces: `view create` maps the
+                // names into its dropdown and sees which pick is least loaded,
+                // the overview lists the same ledger the balancer uses. A
+                // non-PG backend is `null` (there is no book to show); a PG
+                // spec whose registry or control plane cannot be read right
+                // now degrades to NAMES-only via `expand_store_spec` — counts
+                // missing beats failing the whole snapshot over one panel.
                 "pgInstances": match &rt.store {
-                    StoreKind::Pg(spec) => crate::pg_store::expand_store_spec(spec)
-                        .ok()
-                        .map(|b| b.instances.iter().map(|i| i.name.clone()).collect::<Vec<_>>()),
+                    StoreKind::Pg(spec) => match crate::pg_store::placement_ledger(spec) {
+                        Ok((rows, unplaced)) => Some(json!({
+                            "instances": rows.iter().map(|r| json!({
+                                "name": r.name,
+                                "views": r.views,
+                                "control": r.control,
+                            })).collect::<Vec<_>>(),
+                            "unplaced": unplaced,
+                        })),
+                        Err(_) => crate::pg_store::expand_store_spec(spec)
+                            .ok()
+                            .map(|b| json!({
+                                "instances": b.instances.iter().map(|i| json!({
+                                    "name": i.name,
+                                    "views": null,
+                                    "control": i.name == b.control().name,
+                                })).collect::<Vec<_>>(),
+                                "unplaced": null,
+                            })),
+                    },
                     _ => None,
                 },
+                // The banner's own second line, shipped so the console can
+                // say what `base` MEANS here instead of labelling every
+                // backend's directory "metadata root": under SQLite the base
+                // holds the trees; under PG/treedb it holds no trees at all.
+                "backendLayout": rt.store.backend_layout(),
             }))
         }
         // A delegated caller's list is its own definitions: the same lens/fork

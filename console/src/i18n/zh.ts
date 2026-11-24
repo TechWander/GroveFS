@@ -142,6 +142,7 @@ export const ZH: Readonly<Record<string, string>> = {
   name: '名称',
   'PG instance': 'PG 实例',
   'auto — least loaded': '自动 — 选最少负载的实例',
+  'auto — currently ${n} (${v} view(s))': '自动 — 当前落 ${n}（${v} 个视图）',
   'the new view’s tree is created on this instance; later writes always follow it':
     '新视图的树建在所选实例上；后续写入始终跟随该实例',
   Create: '创建',
@@ -367,6 +368,12 @@ export const ZH: Readonly<Record<string, string>> = {
   'storage backend': '存储后端',
   'one store for metadata and content': '元数据与内容同库',
   'metadata root': '元数据根',
+  'local anchor (--meta-dir)': '本机锚点（--meta-dir）',
+  'control plane': '控制面',
+  'placement count unreadable': '放置计数不可读',
+  '${v} view(s) placed': '已放置 ${v} 个视图',
+  '${n} view(s) predate the placement table and are hash-routed':
+    '${n} 个视图早于放置表建立，按哈希路由',
   'the process this console is talking to': '本控制台正在对话的进程',
   namespace: '命名空间',
   '${n} base view(s)': '${n} 个基视图',

@@ -62,8 +62,24 @@ export interface StoreInfo {
   residentViews?: number
   /** `null` means rows are kept until an operator purges them by hand. */
   auditRetention?: string | null
-  /** Registry instance NAMES for the placement dropdown; `null` on a non-PG backend. */
-  pgInstances?: string[] | null
+  /** Registry instances with their placed-view counts; `null` on a non-PG backend. */
+  pgInstances?: PgLedger | null
+  /** The banner's own words on where trees live and what `base` holds here. */
+  backendLayout?: string
+}
+
+/** One registry instance as `store.info` reports it; counts are `null` when
+    the control plane could not be read, and `unplaced` names the trees that
+    predate the placement table (hash-routed, on no instance's ledger). */
+export interface PgLedgerRow {
+  name: string
+  views: number | null
+  control: boolean
+}
+
+export interface PgLedger {
+  instances: PgLedgerRow[]
+  unplaced: number | null
 }
 
 /** The API's own kind spelling; `derived` is what the console calls a lens. */
