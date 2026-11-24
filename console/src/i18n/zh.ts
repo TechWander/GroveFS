@@ -141,6 +141,9 @@ export const ZH: Readonly<Record<string, string>> = {
   'New base view': '新建基视图',
   name: '名称',
   'PG instance': 'PG 实例',
+  'auto — least loaded': '自动 — 选最少负载的实例',
+  'the new view’s tree is created on this instance; later writes always follow it':
+    '新视图的树建在所选实例上；后续写入始终跟随该实例',
   Create: '创建',
   'a base view owns physical deletion; lenses, aliases and forks reshape one':
     '基视图拥有物理删除权；透镜、别名与 fork 是对基的重塑',

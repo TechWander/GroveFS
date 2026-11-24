@@ -2136,6 +2136,20 @@ fn control_dispatch(
                 // hand, which is the fact the console's audit page should say
                 // out loud rather than leave as a silently growing table.
                 "auditRetention": rt.audit_retention,
+                // Registry instance NAMES (never URIs — those embed passwords,
+                // and this reply crosses the governance wire): what feeds the
+                // console's placement dropdown for `view create`, so it sees
+                // the same expanded book the startup banner printed. A
+                // non-PG backend is `null` (there is nothing to pick); a PG
+                // spec whose registry cannot be re-read right now degrades to
+                // `null` too — store.info must still answer with every other
+                // field rather than fail the whole snapshot over one dropdown.
+                "pgInstances": match &rt.store {
+                    StoreKind::Pg(spec) => crate::pg_store::expand_store_spec(spec)
+                        .ok()
+                        .map(|b| b.instances.iter().map(|i| i.name.clone()).collect::<Vec<_>>()),
+                    _ => None,
+                },
             }))
         }
         // A delegated caller's list is its own definitions: the same lens/fork

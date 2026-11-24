@@ -62,6 +62,8 @@ export interface StoreInfo {
   residentViews?: number
   /** `null` means rows are kept until an operator purges them by hand. */
   auditRetention?: string | null
+  /** Registry instance NAMES for the placement dropdown; `null` on a non-PG backend. */
+  pgInstances?: string[] | null
 }
 
 /** The API's own kind spelling; `derived` is what the console calls a lens. */

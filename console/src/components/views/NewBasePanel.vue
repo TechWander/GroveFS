@@ -2,17 +2,20 @@
 /*
   Create a base view — the one act on this page that chooses where bytes live.
 
-  `PG instance` is optional and empty means "pick one", which is why the field's
-  placeholder says so rather than leaving the box unexplained: placement is the
-  decision this form is really asking for, and on a deployment with one instance
-  it is a decision nobody wants to make twice.
+  The instance dropdown lists the control plane's own registry (via
+  `store.info`), never a copy typed into this file: it is the same expanded
+  book the startup banner printed and the book `place_new_view` balances
+  against. Empty selection means "auto" — the least-loaded placement the CLI
+  gives without `--pg-instance`; one entry means there is no decision to make
+  and the row hides itself instead of asking the operator to confirm the
+  obvious.
 
   When the signed-in account cannot create one, the panel does not offer a button
   guaranteed to be refused — it says whose act it is instead. That is the single
   place in the console where a capability is hidden rather than refused, because
   here the refusal would arrive on every page load, not on one verb.
 */
-import { ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useCatalogStore } from '@/stores/catalog'
 import { useOps } from '@/composables/useOps'
 import { useSessionStore } from '@/stores/session'
@@ -25,15 +28,26 @@ import ActionButton from '@/components/ui/ActionButton.vue'
 const catalog = useCatalogStore()
 const session = useSessionStore()
 const ui = useUiStore()
-const { api } = useOps()
+const { api, soft } = useOps()
 
 const name = ref('')
 const instance = ref('')
+const instances = ref<string[]>([])
+
+onMounted(async () => {
+  // A failing or ACL-refused store.info leaves the list empty, which hides
+  // the row: creating with auto placement stays possible either way.
+  const r = await soft('store.info', {})
+  const list = r.ok ? r.r?.pgInstances : undefined
+  if (Array.isArray(list)) instances.value = list
+})
+
+const selectable = computed(() => instances.value.length > 1)
 
 async function create(): Promise<void> {
   const view = name.value.trim()
   const args: Record<string, unknown> = { view }
-  if (instance.value.trim()) args.pg_instance = instance.value.trim()
+  if (selectable.value && instance.value) args.pg_instance = instance.value
   const r = await api('view.create', args)
   // A created view may have taken a name that already had a definition, and the
   // server's own note about that IS the answer — shown, not swallowed.
@@ -54,8 +68,14 @@ async function create(): Promise<void> {
     <FieldRow for="new-base-name" label="name">
       <input id="new-base-name" v-model="name" placeholder="project-x" />
     </FieldRow>
-    <FieldRow for="new-base-pg" label="PG instance">
-      <input id="new-base-pg" v-model="instance" placeholder="(least loaded)" />
+    <FieldRow v-if="selectable" for="new-base-pg" label="PG instance">
+      <select id="new-base-pg" v-model="instance">
+        <option value="">{{ t('auto — least loaded') }}</option>
+        <option v-for="i in instances" :key="i" :value="i">{{ i }}</option>
+      </select>
+      <template #hint>
+        {{ t('the new view’s tree is created on this instance; later writes always follow it') }}
+      </template>
     </FieldRow>
     <p class="muted">
       {{ t('a base view owns physical deletion; lenses, aliases and forks reshape one') }}
