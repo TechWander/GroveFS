@@ -18,6 +18,7 @@ import { computed, ref } from 'vue'
 import type { AuditRow } from '@/types'
 import { useOps } from '@/composables/useOps'
 import { usePageLoad } from '@/composables/usePageLoad'
+import { useCatalogStore } from '@/stores/catalog'
 import { useFilterStore } from '@/stores/filters'
 import { useSessionStore } from '@/stores/session'
 import { useUiStore } from '@/stores/ui'
@@ -44,6 +45,7 @@ import LoadingHint from '@/components/ui/LoadingHint.vue'
 import AuditTable from '@/components/audit/AuditTable.vue'
 
 const filters = useFilterStore()
+const catalog = useCatalogStore()
 const session = useSessionStore()
 const ui = useUiStore()
 const { api, soft } = useOps()
@@ -57,6 +59,9 @@ const retention = ref<string | null | undefined>(undefined)
 
 async function load(): Promise<void> {
   rows.value = (await api('apikey.calls', { limit: filters.auditLimit })) ?? []
+  // The view dropdown lists NAMES, and the namespace is the catalog three
+  // other pages already share — a cached read here, not a second registry.
+  void catalog.loadViews()
   const life = await soft('store.info', {})
   retention.value = life.ok && life.r ? life.r.auditRetention : undefined
   // A filter left over from an earlier load can name an op that is no longer in
@@ -95,6 +100,16 @@ const keyOptions = computed<KeyChoice[]>(() => {
   const ks = keys.value
   if (f.key !== 'all' && !ks.some((k) => k.id === f.key)) return [...ks, { id: f.key, label: null }]
   return ks
+})
+
+/** What the view dropdown offers: every name the namespace knows, plus the one
+    a jump from the views page selected — a view deleted moments ago can still
+    be the thing being searched for, and a `<select>` that drops its own value
+    renders blank. */
+const viewOptions = computed<string[]>(() => {
+  const ns = catalog.views.map((v) => v.name)
+  if (f.view !== 'all' && !ns.includes(f.view)) return [...ns, f.view]
+  return ns
 })
 
 /** What a row minted, by id — the parent→child link the store itself does not
@@ -145,6 +160,10 @@ const hit = computed(() =>
     if (f.plane !== 'all' && r.method !== f.plane) return false
     if (f.op !== 'all' && r.tool !== f.op) return false
     if (f.key !== 'all' && r.key_id !== f.key) return false
+    // The view a call is ABOUT is only recoverable from the server's own
+    // message — the row has no view column — so this is a mention match over
+    // the detail text, stated as such under the table.
+    if (f.view !== 'all' && !String(r.detail ?? '').includes(f.view)) return false
     if (f.verdict === 'ok' && !r.ok) return false
     if (f.verdict === 'failed' && r.ok) return false
     const q = f.q.trim().toLowerCase()
@@ -220,6 +239,12 @@ const kept = computed(() => {
           <select id="audit-op" v-model="f.op">
             <option value="all">{{ t('every op') }}</option>
             <option v-for="o in ops" :key="o" :value="o">{{ o }}</option>
+          </select>
+        </FldRow>
+        <FldRow :label="'view'" for="audit-view">
+          <select id="audit-view" v-model="f.view">
+            <option value="all">{{ t('every view') }}</option>
+            <option v-for="v in viewOptions" :key="v" :value="v">{{ v }}</option>
           </select>
         </FldRow>
         <FldRow :label="'key'" for="audit-key">

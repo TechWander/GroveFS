@@ -16,6 +16,7 @@
 import { computed, onMounted, ref } from 'vue'
 import type { AuditRow, KeyRow } from '@/types'
 import { useOps } from '@/composables/useOps'
+import { useNav } from '@/composables/useNav'
 import { keyLabel, keyTone, keyWhy } from '@/utils/keys'
 import { humanLeft } from '@/utils/time'
 import { t } from '@/i18n'
@@ -23,6 +24,7 @@ import BaseDrawer from '@/components/overlay/BaseDrawer.vue'
 import DrawerSection from '@/components/overlay/DrawerSection.vue'
 import KvList from '@/components/layout/KvList.vue'
 import KvRow from '@/components/layout/KvRow.vue'
+import ActionButton from '@/components/ui/ActionButton.vue'
 import MonoText from '@/components/ui/MonoText.vue'
 import MaskText from '@/components/ui/MaskText.vue'
 import StateBadge from '@/components/ui/StateBadge.vue'
@@ -36,6 +38,7 @@ const props = defineProps<{ row: KeyRow }>()
 const emit = defineEmits<{ close: [] }>()
 
 const { soft } = useOps()
+const { openView, openAccount, openAuditOfKey } = useNav()
 
 const recent = ref<{ error: string } | null>(null)
 const mine = ref<AuditRow[]>([])
@@ -103,7 +106,15 @@ onMounted(async () => {
         <KvRow label="key"><MaskText :hint="props.row.secret_hint" /></KvRow>
         <KvRow label="plane"><MonoText :text="props.row.scope" /></KvRow>
         <KvRow label="view">
-          <MonoText v-if="props.row.view" :text="props.row.view" />
+          <button
+            v-if="props.row.view"
+            type="button"
+            class="mini mono"
+            :title="t('open this view')"
+            @click="openView(String(props.row.view))"
+          >
+            {{ props.row.view }}
+          </button>
           <span v-else class="muted">{{ t('unbound — every tree') }}</span>
         </KvRow>
       </KvList>
@@ -117,11 +128,27 @@ onMounted(async () => {
           <span v-else class="muted">{{ t('no note') }}</span>
         </KvRow>
         <KvRow label="owner">
-          <span v-if="props.row.owner">{{ props.row.owner }}</span>
+          <button
+            v-if="props.row.owner"
+            type="button"
+            class="mini mono"
+            :title="t('open this account')"
+            @click="openAccount(String(props.row.owner))"
+          >
+            {{ props.row.owner }}
+          </button>
           <span v-else class="muted">{{ t('unassigned') }}</span>
         </KvRow>
         <KvRow label="minted by">
-          <span v-if="props.row.created_by">{{ props.row.created_by }}</span>
+          <button
+            v-if="props.row.created_by"
+            type="button"
+            class="mini mono"
+            :title="t('open this account')"
+            @click="openAccount(String(props.row.created_by))"
+          >
+            {{ props.row.created_by }}
+          </button>
           <span v-else class="muted">
             {{ t('unknown — this row predates the bookkeeping columns') }}
           </span>
@@ -156,6 +183,14 @@ onMounted(async () => {
       <p v-else-if="recent" class="err">{{ recent.error }}</p>
       <AuditTable v-else-if="mine.length" :rows="mine" :empty="'no calls recorded for it yet'" />
       <p v-else class="muted">{{ t('no calls recorded for it yet') }}</p>
+      <!-- Eight rows is a sample; the credential's WHOLE trail — every window,
+           the op and verdict filters included — is the audit page with this key
+           already picked. -->
+      <ActionButton
+        :action="() => void openAuditOfKey(props.row.id)"
+        :label="'open the audit page'"
+        variant="link"
+      />
     </DrawerSection>
 
     <template #left>

@@ -9,9 +9,16 @@ import type { AuditRow } from '@/types'
  * says so with the key that signed.
  */
 export function auditActor(r: AuditRow): string | null {
+  return auditAccount(r) ?? r.key_label ?? r.key_id ?? null
+}
+
+/** The ACCOUNT behind a row, when one signed it — `null` for a call made by a
+    bare credential. This is what makes "open this account" an honest link:
+    the actor string a table shows may name a KEY instead, and a jump that
+    searches for it would find nothing. */
+export function auditAccount(r: AuditRow): string | null {
   const m = /account=([^\s@]+)/.exec(String(r.detail ?? ''))
-  if (m) return m[1]
-  return r.key_label || r.key_id || null
+  return m ? m[1] : null
 }
 
 /** The distinct values of one field, sorted — what builds the audit page's two

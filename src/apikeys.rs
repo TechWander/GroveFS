@@ -556,7 +556,11 @@ const STORE_KEY_ENV: &str = "GROVEFS_STORE_KEY";
 
 /// The file the wrapping material lives in when the env does not set it:
 /// `<base>/meta/_control/store.key`, in the same slot as `api_keys.db` whose
-/// rows it wraps (and, like that db, cold-copied with the control plane).
+/// rows it wraps (and, like that db, cold-copied with the control plane). Under
+/// PostgreSQL the slot is still consulted — but a MISSING file is no longer
+/// silently minted once the shared table holds wrapped copies (see
+/// [`WrapMode`]): a private key here could never open rows the deployment
+/// wrapped under another node's material.
 const STORE_KEY_FILE: &str = crate::meta::STORE_KEY_FILE;
 
 /// The store's wrapping material, resolved once at open. Two states rather than
@@ -580,8 +584,24 @@ impl WrapMaterial {
     }
 }
 
+/// Can this process mint missing wrapping material without creating a lie?
+/// The LOCAL store wraps rows that live in the same directory — key and table
+/// cold-copy together, so a key private to this directory agrees with every
+/// row it will ever meet. The SHARED PostgreSQL table cannot be so guaranteed:
+/// every meta-server and local CLI arm writes the same `api_keys`, and a key
+/// invented by one of them silently diverges from the material that wrapped
+/// the rows the others already wrote (see [`WrapMode::SharedTable`]).
+enum WrapMode {
+    Local,
+    /// How many rows in the shared table already hold a wrapped copy. An `Err`
+    /// means the table could not be asked — which REFUSES a mint rather than
+    /// trusting an answer that never arrived.
+    SharedTable { wrapped_rows: Result<i64, String> },
+}
+
 /// Resolve the wrapping material: [`STORE_KEY_ENV`], then
-/// `<base>/meta/`[`STORE_KEY_FILE`] (created `0600` on first use).
+/// `<base>/meta/`[`STORE_KEY_FILE`], then — only under [`WrapMode::Local`], or
+/// into a not-yet-wrapped shared table — a fresh key created `0600`.
 ///
 /// A store without material mints show-once keys, exactly as it did before the
 /// `secret_enc` column: `Absent` is a degraded mode and never a reason to write
@@ -589,7 +609,7 @@ impl WrapMaterial {
 /// authenticates without any of this, and refusing to start a meta-server
 /// because a recovery-only key is unwritable would take live mounts down with
 /// it. The cost is stated where it is paid: [`ApiKeyStore::reveal`] says so.
-fn load_wrap(base: &Path) -> WrapMaterial {
+fn load_wrap(base: &Path, mode: WrapMode) -> WrapMaterial {
     if let Some(raw) = std::env::var_os(STORE_KEY_ENV) {
         let raw = raw.to_string_lossy();
         return match crate::secretbox::key_from_hex(&raw) {
@@ -617,6 +637,35 @@ fn load_wrap(base: &Path) -> WrapMaterial {
                 crate::secretbox::KEY_BYTES * 2
             )),
         };
+    }
+    // No file and no env. Minting one is safe exactly when nothing else can
+    // disagree with it — see [`WrapMode`].
+    if let WrapMode::SharedTable { wrapped_rows } = &mode {
+        match wrapped_rows {
+            // The shared table holds no wrapped copies yet: this key starts
+            // the era and every later row gets wrapped under whatever material
+            // each writer resolves, so an empty table is the ONE case where a
+            // fresh mint here cannot diverge from anything.
+            Ok(0) => {}
+            Ok(n) => {
+                return WrapMaterial::Absent(format!(
+                    "{} is missing, and the shared PostgreSQL table already holds {n} row(s) \
+                     with wrapped copies minted under other material — refusing to mint a key \
+                     that could never open them; give EVERY process aimed at this table the \
+                     same {STORE_KEY_ENV} (or the same store.key file), then rotate the keys \
+                     to re-wrap their copies under it",
+                    path.display()
+                ))
+            }
+            Err(e) => {
+                return WrapMaterial::Absent(format!(
+                    "{} is missing and the shared table's wrapped-copy count is unknown ({e}), \
+                     so a freshly minted key here might not open rows other nodes wrapped; \
+                     export {STORE_KEY_ENV} instead",
+                    path.display()
+                ))
+            }
+        }
     }
     match write_store_key(&path) {
         Ok(key) => WrapMaterial::Ready {
@@ -746,7 +795,7 @@ impl ApiKeyStore {
         }
         Ok(Self {
             backend: Backend::Sqlite(parking_lot::Mutex::new(conn)),
-            wrap: load_wrap(base),
+            wrap: load_wrap(base, WrapMode::Local),
         })
     }
 
@@ -758,20 +807,35 @@ impl ApiKeyStore {
     /// of them within the re-check window.
     ///
     /// `base` is this process's metadata root (`meta-server --meta-dir`, which
-    /// under PG holds no authoritative record but is exactly the scratch
-    /// directory a wrapping key belongs in). Every meta-server in the deployment
+    /// under PG holds no authoritative record but is where a node that keeps
+    /// its material on disk puts it). Every meta-server in the deployment
     /// must be given the SAME material — this file, or `GROVEFS_STORE_KEY` —
     /// because they share one `api_keys` table: a reveal against a node holding
     /// a different key says so rather than returning another node's secret.
+    /// A node that has NEITHER is not handed a freshly minted key once the
+    /// table already holds wrapped copies — that is precisely how a deployment
+    /// drifts into rows nobody can open (see [`WrapMode`]); it mints show-once
+    /// keys instead, and the refusal says how to fix the deployment.
     pub fn open_pg(uri: &str, base: &Path) -> Result<Self, String> {
         // PG's ALTERs are idempotent, so the DDL and the migrations go in one
         // ordered batch (see [`PgPool::open`]).
         let mut ddl: Vec<&str> = vec![KEYS_DDL_PG, CALLS_DDL_PG, CALLS_TS_INDEX_PG];
         ddl.extend(KEY_MIGRATIONS.iter().map(|(_, _, pg)| *pg));
         let pool = PgPool::open(uri, &ddl)?;
+        // Ask the table what a fresh local key would have to agree with
+        // (post-migration, `secret_enc` exists on both backends).
+        let wrapped_rows = pool
+            .query(
+                "SELECT count(*) FROM grovefs_control.api_keys WHERE secret_enc IS NOT NULL",
+                &[],
+                |r| r.get::<_, i64>(0),
+            )
+            .and_then(|mut rows| {
+                rows.pop().ok_or_else(|| "count query returned no row".to_string())
+            });
         Ok(Self {
             backend: Backend::Pg(pool),
-            wrap: load_wrap(base),
+            wrap: load_wrap(base, WrapMode::SharedTable { wrapped_rows }),
         })
     }
 
@@ -1348,9 +1412,22 @@ impl ApiKeyStore {
             }
         };
         let Some(full) = crate::secretbox::unseal(&key, &blob) else {
+            // The two backends fail this way for different reasons, and the
+            // fix each names is different: a local store was restored around a
+            // rotated/foreign key file; a shared table has rows that OTHER
+            // processes wrapped with material this one never got.
+            let why = match &self.backend {
+                Backend::Sqlite(_) => "it was wrapped by a different store key".to_string(),
+                Backend::Pg(_) => format!(
+                    "it was wrapped under different material. This table is SHARED: every \
+                     meta-server and local CLI arm aimed at it must be given the same \
+                     {STORE_KEY_ENV} (or the same store.key file). Rotating this key re-wraps \
+                     its copy under the material this process holds; the live credential \
+                     authenticates unchanged either way."
+                ),
+            };
             return Ok(StoredSecret::Unopenable(format!(
-                "the wrapped copy does not open under this process's material ({}): it was 
-                 wrapped by a different store key",
+                "the wrapped copy does not open under this process's material ({}): {why}",
                 self.wrap.source()
             )));
         };
@@ -1614,6 +1691,61 @@ mod tests {
         let p = dir.path().to_path_buf();
         std::mem::forget(dir);
         ApiKeyStore::open(&p).unwrap()
+    }
+
+    /// The minting guard that keeps a PostgreSQL deployment from drifting into
+    /// rows nobody can open: with wrapped copies already in the shared table,
+    /// a node with no material refuses to invent its own — and says why.
+    #[test]
+    fn shared_table_refuses_to_mint_diverging_material() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let key_file = crate::meta::control_dir(base).join(STORE_KEY_FILE);
+        let m = load_wrap(base, WrapMode::SharedTable { wrapped_rows: Ok(3) });
+        assert!(matches!(m, WrapMaterial::Absent(_)));
+        // The point of the guard: NO file. A mint here would wrap the next
+        // rows under a key the rest of the deployment can never open.
+        assert!(!key_file.exists());
+        let why = m.source();
+        assert!(why.contains("holds 3 row(s) with wrapped copies"), "{why}");
+        assert!(why.contains(STORE_KEY_ENV), "{why}");
+        // An unknown count refuses too — silence is not evidence of an empty
+        // table.
+        let m = load_wrap(
+            base,
+            WrapMode::SharedTable {
+                wrapped_rows: Err("connection reset".into()),
+            },
+        );
+        assert!(matches!(m, WrapMaterial::Absent(_)));
+        assert!(!key_file.exists());
+    }
+
+    /// The two cases where a shared table DOES get a fresh key: still empty
+    /// (this node starts the era), or already provisioned by the operator (the
+    /// existing file wins over any count).
+    #[test]
+    fn shared_table_material_sources_stay_honest() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let key_file = crate::meta::control_dir(base).join(STORE_KEY_FILE);
+        let m = load_wrap(base, WrapMode::SharedTable { wrapped_rows: Ok(0) });
+        assert!(matches!(m, WrapMaterial::Ready { .. }));
+        assert!(key_file.exists());
+        assert!(m.source().contains("(created)"), "{}", m.source());
+        // A second resolve takes the same file back — the create_new lock held.
+        let m2 = load_wrap(base, WrapMode::SharedTable { wrapped_rows: Ok(9) });
+        match (m, m2) {
+            (WrapMaterial::Ready { key: a, .. }, WrapMaterial::Ready { key: b, .. }) => {
+                assert_eq!(a, b)
+            }
+            _ => panic!("file-present must resolve Ready whatever the count says"),
+        }
+        // The LOCAL mode is untouched by the guard: rows and key cold-copy
+        // together, so a private mint can never disagree with the table.
+        let dir = tempfile::tempdir().unwrap();
+        let m = load_wrap(dir.path(), WrapMode::Local);
+        assert!(matches!(m, WrapMaterial::Ready { .. }));
     }
 
     #[test]

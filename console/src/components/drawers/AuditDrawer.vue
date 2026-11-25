@@ -11,7 +11,8 @@ import type { AuditRow } from '@/types'
 import { computed } from 'vue'
 import { useUiStore } from '@/stores/ui'
 import { useFilterStore } from '@/stores/filters'
-import { auditActor, mintedKey } from '@/utils/audit'
+import { useNav } from '@/composables/useNav'
+import { auditAccount, auditActor, mintedKey } from '@/utils/audit'
 import { t } from '@/i18n'
 import BaseDrawer from '@/components/overlay/BaseDrawer.vue'
 import DrawerSection from '@/components/overlay/DrawerSection.vue'
@@ -26,7 +27,11 @@ const props = defineProps<{ row: AuditRow }>()
 
 const ui = useUiStore()
 const filters = useFilterStore()
+const { openKeysOf, openAccount } = useNav()
 const who = (): string | null => auditActor(props.row)
+/** The row's account, when an ACCOUNT signed the call — the only case where
+    "open this account" is a jump that lands somewhere. */
+const account = computed(() => auditAccount(props.row))
 
 /** The credential this row MINTED, when it minted one. The store keeps no
     parent→child column, so the audit message is the only place the link lives —
@@ -56,7 +61,16 @@ function showChild(): void {
       <KvList>
         <KvRow label="when" mono :value="props.row.ts || '—'" />
         <KvRow label="who">
-          <span v-if="who()">{{ who() }}</span>
+          <button
+            v-if="account"
+            type="button"
+            class="mini mono"
+            :title="t('open this account')"
+            @click="openAccount(account)"
+          >
+            {{ account }}
+          </button>
+          <span v-else-if="who()">{{ who() }}</span>
           <span v-else class="muted">{{ t('no account on it') }}</span>
         </KvRow>
         <KvRow label="plane" mono :value="props.row.method" />
@@ -70,6 +84,13 @@ function showChild(): void {
           />
           <MonoText v-else-if="props.row.key_id" :text="props.row.key_id" />
           <template v-else>—</template>
+          <!-- The registry row behind this id: the keys page searched to it. -->
+          <ActionButton
+            v-if="props.row.key_id"
+            :action="() => void openKeysOf(String(props.row.key_id))"
+            :label="'open in keys page'"
+            variant="link"
+          />
         </KvRow>
         <KvRow v-if="props.row.tool === 'apikey.create'" label="minted">
           <template v-if="child">

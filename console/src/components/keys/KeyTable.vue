@@ -14,6 +14,7 @@
 import { computed } from 'vue'
 import type { Column } from '@/components/ui/table'
 import type { KeyRow } from '@/types'
+import { useNav } from '@/composables/useNav'
 import { useUiStore } from '@/stores/ui'
 import { expiryLine, keyLabel, keyTone, keyWhy } from '@/utils/keys'
 import { t } from '@/i18n'
@@ -41,6 +42,7 @@ const props = withDefaults(
 )
 
 const ui = useUiStore()
+const { openView, openAccount } = useNav()
 
 const COLS: Column<KeyRow>[] = [
   { id: 'label', label: 'label', cls: 'nowrap' },
@@ -89,7 +91,17 @@ const open = (r: KeyRow): void => ui.openDrawer({ kind: 'key', row: r })
     </template>
 
     <template #cell-view="{ row }">
-      <MonoText v-if="row.view" :text="row.view" />
+      <!-- A bound view is a link everywhere it appears: "which tree does this
+           key open" is answered by looking at the tree. -->
+      <button
+        v-if="row.view"
+        type="button"
+        class="mini mono"
+        :title="t('open this view')"
+        @click="openView(String(row.view))"
+      >
+        {{ row.view }}
+      </button>
       <span v-else class="muted">{{ t('any view') }}</span>
     </template>
 
@@ -106,6 +118,8 @@ const open = (r: KeyRow): void => ui.openDrawer({ kind: 'key', row: r })
         :name="row.owner"
         :sub="row.created_by ? t('minted by ${who}', { who: row.created_by }) : null"
         :off="!!row.revoked_at"
+        :go="!!row.owner"
+        @navigate="row.owner && openAccount(row.owner)"
       />
     </template>
 

@@ -4,12 +4,18 @@ import { useUiStore } from '@/stores/ui'
 import { router } from '@/router'
 
 /*
-  The three jumps the console makes between pages.
+  The jumps the console makes between pages.
 
   The hand-written file had one global `go(page)` and poked `ST.sel` / `ST.keyFilter`
   by hand at every call site — which is how "open this base view" could set the
   selection on one page and forget it on another. Here a jump carries BOTH facts
   it is about: what to select, and where to go.
+
+  Every related entity shown as text is a candidate for one of these jumps: a
+  key's view, a key's owner, a call's key or account, a view's keys and its
+  audit trail. The jumps never invent a second list page — they set the filter
+  the destination already offers and walk there, so the verbs, the search box
+  and the chips stay in ONE place per entity.
 
   `catalog.sel` is deliberately not cleared by navigation: the views page's
   picker remembers what you last opened, so a pill clicked from the accounts page
@@ -45,5 +51,46 @@ export function useNav() {
     return to('keys')
   }
 
-  return { to, pickView, openView, openKeysOf }
+  /** A key's audit trail is not a separate list either — it is the audit page
+      with that credential already picked in the key dropdown. */
+  const openAuditOfKey = (id: string): Promise<void> => {
+    filters.auditFilter.key = id
+    return to('audit')
+  }
+
+  /** The calls that mention one view, from the view's own page: the audit row
+      carries no view column (the name is in the server's message), so this is
+      the search box pointed at that name, opened as the view-filter chip. */
+  const openAuditOfView = (name: string): Promise<void> => {
+    filters.auditFilter.view = name
+    return to('audit')
+  }
+
+  /** A view's keys are the keys page with the view binding selected. */
+  const openKeysOfView = (name: string): Promise<void> => {
+    filters.keyFilter.view = name
+    filters.keyFilter.q = ''
+    filters.keyFilter.state = 'all'
+    return to('keys')
+  }
+
+  /** An account mentioned anywhere — a key's owner, a call's actor — is the
+      accounts page searched to that name. */
+  const openAccount = (name: string): Promise<void> => {
+    filters.accFilter.q = name
+    filters.accFilter.role = 'all'
+    filters.accFilter.state = 'all'
+    return to('accounts')
+  }
+
+  return {
+    to,
+    pickView,
+    openView,
+    openKeysOf,
+    openAuditOfKey,
+    openAuditOfView,
+    openKeysOfView,
+    openAccount,
+  }
 }

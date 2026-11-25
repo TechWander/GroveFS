@@ -9,14 +9,16 @@
 */
 import type { Column } from '@/components/ui/table'
 import type { KeyRow } from '@/types'
+import { useNav } from '@/composables/useNav'
 import { keyLabel, keyTone, keyWhy } from '@/utils/keys'
 import { t } from '@/i18n'
 import DataTable from '@/components/ui/DataTable.vue'
 import TwoLineCell from '@/components/ui/TwoLineCell.vue'
-import MonoText from '@/components/ui/MonoText.vue'
 import StateBadge from '@/components/ui/StateBadge.vue'
 
 const props = defineProps<{ rows: KeyRow[]; empty?: string }>()
+
+const { openView } = useNav()
 
 const COLS: Column<KeyRow>[] = [
   { id: 'label', label: 'label' },
@@ -32,7 +34,15 @@ const COLS: Column<KeyRow>[] = [
       <TwoLineCell :top="row.label" :sub="row.id" sub-mono />
     </template>
     <template #cell-view="{ row }">
-      <MonoText v-if="row.view" :text="row.view" />
+      <button
+        v-if="row.view"
+        type="button"
+        class="mini mono"
+        :title="t('open this view')"
+        @click="openView(String(row.view))"
+      >
+        {{ row.view }}
+      </button>
       <span v-else class="muted">{{ t('any view') }}</span>
     </template>
     <template #cell-state="{ row }">

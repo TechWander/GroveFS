@@ -395,6 +395,10 @@ export const ZH: Readonly<Record<string, string>> = {
   'Every count is a snapshot of the instant this page loaded; anything created elsewhere appears after a refresh.':
     '每个计数都是本页加载那一刻的快照；其他地方的创建需刷新后才会出现。',
   'open the audit page': '打开审计页',
+  'open this view': '打开该视图',
+  'open this account': '打开该账号',
+  'open in keys page': '在密钥页中打开',
+  'this view’s calls': '该视图的调用',
   '· the first owner was created by `meta-server --admin-user`':
     '· 首任管理员由 `meta-server --admin-user` 创建',
   '${n} expired and refused': '${n} 把已过期并被拒绝',

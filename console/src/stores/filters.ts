@@ -40,6 +40,10 @@ export interface AuditFilter {
       a console click arrives on the gateway's own key and names its account in
       the message. `all` means every key. */
   key: string
+  /** Which VIEW the calls are ABOUT. The audit row has no view column — the
+      name lives in the server's message — so this matches rows whose detail
+      mentions the name, and "all" shows every row. */
+  view: string
 }
 
 const fresh = {
@@ -53,6 +57,7 @@ const fresh = {
     op: 'all',
     verdict: 'all',
     key: 'all',
+    view: 'all',
   }),
 }
 

@@ -19,6 +19,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import type { KeyRow, ViewStats } from '@/types'
 import { exportUrl } from '@/api/http'
 import { useOps } from '@/composables/useOps'
+import { useNav } from '@/composables/useNav'
 import { useCatalogStore } from '@/stores/catalog'
 import { useSessionStore } from '@/stores/session'
 import { useUiStore } from '@/stores/ui'
@@ -43,6 +44,7 @@ const catalog = useCatalogStore()
 const session = useSessionStore()
 const ui = useUiStore()
 const { api, soft } = useOps()
+const { openView, openKeysOfView, openAuditOfView } = useNav()
 
 const stats = ref<ViewStats | null>(null)
 const pending = ref(false)
@@ -185,7 +187,18 @@ function doExport(): void {
         <div>
           <h3 class="det-h">{{ t('This name') }}</h3>
           <KvList>
-            <KvRow label="base" :value="stats.base" mono />
+            <KvRow label="base">
+              <button
+                v-if="stats.base"
+                type="button"
+                class="mini mono"
+                :title="t('open this base view')"
+                @click="openView(String(stats.base))"
+              >
+                {{ stats.base }}
+              </button>
+              <span v-else>—</span>
+            </KvRow>
             <KvRow label="stamp" :value="stampText(stats.stamp)" mono />
             <KvRow label="tree" :value="treeText" />
             <KvRow
@@ -193,14 +206,18 @@ function doExport(): void {
               :value="stats.resident ? t('open') : t('not open')"
               muted
             />
-            <KvRow
-              label="keys"
-              :value="
-                stats.keys === null || stats.keys === undefined
-                  ? null
-                  : t('${n} bound to this name', { n: stats.keys })
-              "
-            />
+            <KvRow label="keys">
+              <button
+                v-if="stats.keys !== null && stats.keys !== undefined"
+                type="button"
+                class="mini"
+                :title="t('open in keys page')"
+                @click="openKeysOfView(stats.name)"
+              >
+                {{ t('${n} bound to this name', { n: stats.keys }) }}
+              </button>
+              <span v-else>—</span>
+            </KvRow>
           </KvList>
         </div>
         <div>
@@ -216,6 +233,9 @@ function doExport(): void {
 
       <div class="row toolbar">
         <button type="button" @click="doExport">{{ t('Export dump') }}</button>
+        <button type="button" @click="openAuditOfView(stats.name)">
+          {{ t('this view’s calls') }}
+        </button>
         <button v-if="session.can('fork.create')" type="button" @click="forkOpen = true">
           {{ t('Fork…') }}
         </button>
@@ -239,7 +259,11 @@ function doExport(): void {
       <ImportPanel :stats="stats" />
 
       <template v-if="session.can('apikey.create')">
-        <BarRow :title="'Keys bound to ${name}'" :level="3" :vars="{ name: stats.name }" />
+        <BarRow :title="'Keys bound to ${name}'" :level="3" :vars="{ name: stats.name }">
+          <button type="button" class="mini" @click="openKeysOfView(stats.name)">
+            {{ t('open in keys page') }}
+          </button>
+        </BarRow>
         <p v-if="keysError" class="err">{{ keysError }}</p>
         <KeyTable
           v-else
