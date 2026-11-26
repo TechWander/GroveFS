@@ -719,6 +719,9 @@ export const ZH: Readonly<Record<string, string>> = {
   'This registry is owned by a --meta-store file the operator edits by hand — the page is read-only here.':
     '此注册表由操作员手编的 --meta-store 文件所有 — 本页在此为只读。',
   'control plane: ${where}': '控制平面：${where}',
+  /* 视图页长列表：有界滚动 + 窄屏折叠抽屉 */
+  'Show list': '展开列表',
+  'Hide list': '收起列表',
   /* 审计保留面板：窗口设置与立即清理 */
   'Audit retention': '审计保留',
   'retention window': '保留窗口',

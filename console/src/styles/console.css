@@ -1910,6 +1910,20 @@ pre.plain {
   overflow: hidden;
   box-shadow: var(--shadow-sm);
 }
+/* The view picker is a bounded scroll region: a namespace far past 50 names
+   scrolls inside its own column instead of stretching the page and pushing the
+   detail pane out of reach. `overscroll-behavior: contain` keeps a flick at the
+   end of the list from also scrolling the page behind it. */
+#view-list {
+  max-height: min(66vh, 34rem);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+/* The collapse control is a narrow-screen affordance only — a wide layout has
+   room for the picker beside the detail, so nothing to hide. */
+.list-toggle {
+  display: none;
+}
 .list li {
   display: flex;
   align-items: baseline;
@@ -2561,6 +2575,24 @@ details.help > .body {
   }
   .split {
     grid-template-columns: 1fr;
+  }
+}
+
+/* Phone width: the picker sits above the detail and a long namespace would
+   bury it, so reveal the collapse toggle and let `.is-collapsed` hide the list
+   back to just the filter box. Above 768px the toggle stays hidden and the
+   list always renders — the class has no effect there. */
+@media (max-width: 768px) {
+  .list-toggle {
+    display: inline-flex;
+    align-items: center;
+    margin-left: auto;
+  }
+  #view-list {
+    max-height: 58vh;
+  }
+  #view-list.is-collapsed {
+    display: none;
   }
 }
 

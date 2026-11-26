@@ -12,8 +12,15 @@
   operator needs before touching or deleting anything. The selected row carries
   `aria-current`, and the whole row is a button — the hand-written list had a
   click handler on an `<li>` and no way to reach it from the keyboard.
+
+  Long namespaces (well past 50 views) stay usable two ways: the list is a
+  bounded scroll region so it never stretches the page, and below 768px a single
+  toggle collapses it back to just the filter box — the detail pane is what
+  matters on a phone, and a picker you can put away is better than one that
+  pushes it off screen. The collapse is a CLASS, never an inline style: the
+  gateway's `style-src 'self'` CSP would drop a bound one.
 */
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { useCatalogStore } from '@/stores/catalog'
 import { useFilterStore } from '@/stores/filters'
 import { useNav } from '@/composables/useNav'
@@ -31,6 +38,10 @@ const filters = useFilterStore()
 const { pickView } = useNav()
 
 const total = computed(() => catalog.views.length)
+/* Only consulted below the 768px breakpoint (see `console.css`): on a wide
+   screen the list is always shown, so this starts un-collapsed and the desktop
+   layout ignores it entirely. */
+const collapsed = ref(false)
 
 const rows = computed(() => {
   const q = filters.vFilter.q.trim().toLowerCase()
@@ -65,6 +76,15 @@ const below = (name: string, kind: string): number =>
   <div class="col-narrow">
     <BarRow :title="'View list'">
       <CountPill id="view-count" :text="counted(rows.length, total)" />
+      <button
+        type="button"
+        class="list-toggle mini"
+        :aria-expanded="!collapsed"
+        aria-controls="view-list"
+        @click="collapsed = !collapsed"
+      >
+        {{ collapsed ? t('Show list') : t('Hide list') }}
+      </button>
     </BarRow>
 
     <div class="filterbox">
@@ -82,7 +102,7 @@ const below = (name: string, kind: string): number =>
       />
     </div>
 
-    <ul id="view-list" class="list">
+    <ul id="view-list" :class="['list', { 'is-collapsed': collapsed }]">
       <li v-if="!total" class="static muted">{{ t('no views you can see') }}</li>
       <li v-else-if="!rows.length" class="static muted">{{ t('no views match the filter') }}</li>
       <li
