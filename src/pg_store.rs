@@ -192,6 +192,13 @@ pub fn expand_store_spec(spec: &str) -> Result<PgBook, String> {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
+            // A staged control handover is directive, not instance: routing
+            // stays on the FIRST entry until the next start applies the
+            // migration and rotates the file, so the parser simply skips it.
+            // (A stale reader therefore never half-honours a handover.)
+            if line.starts_with(CONTROL_PENDING_DIRECTIVE) {
+                continue;
+            }
             let bad = |msg: String| format!("{path}:{}: {msg}", ln + 1);
             let Some((name, uri)) = line.split_once('=') else {
                 return Err(bad(
@@ -527,6 +534,10 @@ pub struct InstanceReport {
     pub instances: Vec<InstanceSummary>,
     /// view -> instance, exactly the rows `view create` wrote.
     pub placement: HashMap<String, String>,
+    /// Whether this spec points at the server's OWN managed registry
+    /// ([`managed_registry_path`]) — the console's instance CRUD is offered
+    /// only then, never against an operator-owned `file:` registry.
+    pub managed: bool,
     /// Why placement is empty, when reading it failed. Never swallowed: the
     /// console shows this sentence instead of pretending nothing is placed.
     pub error: Option<String>,
@@ -559,6 +570,7 @@ pub fn instance_report(spec: &str) -> Result<InstanceReport, String> {
         return Ok(InstanceReport {
             instances,
             placement: HashMap::new(),
+            managed: false,
             error: None,
         });
     }
@@ -593,12 +605,14 @@ pub fn instance_report(spec: &str) -> Result<InstanceReport, String> {
             Ok(InstanceReport {
                 instances,
                 placement,
+                managed: false,
                 error: None,
             })
         }
         Err(e) => Ok(InstanceReport {
             instances,
             placement: HashMap::new(),
+            managed: false,
             error: Some(e),
         }),
     }
@@ -5039,6 +5053,805 @@ fn write_err_str(e: WriteErr) -> String {
     }
 }
 
+// ---- managed instance registry (the console's storage plane) ---------------
+//
+// `--meta-store postgres://…` used to be the only way to declare instances:
+// the text lives in a unit file, and every change is an edit-plus-restart on
+// the operator's box. The web console instead needs a system of record it can
+// read AND write while the server runs. A `file:` registry already is one —
+// [`expand_store_spec`] re-reads it per resolution, so an appended line takes
+// effect on the next open with no restart. This section makes the server the
+// author of that file:
+//
+// - `serve()` ADOPTS an inline spec once: `<base>/instances.conf` is written
+//   from the comma list and the server runs on `file:<that path>` from then
+//   on. The first instance is named `control` (it carries the control plane),
+//   later ones keep their positional `pgN` names so existing placement rows
+//   still resolve.
+// - `storage.add/update/remove/relocate/preview/set_control` (Super-only, see
+//   `server_ext`) edit the registry and enforce the placement guards — an
+//   instance with views on it cannot be deleted, the control plane cannot be
+//   deleted, and a handover is staged as a `@control-pending` directive that
+//   only the NEXT startup applies, at a moment no request can be in flight.
+// - A `file:` spec the operator wrote themselves stays READ-ONLY to the
+//   console: editing a file someone else owns, that other machines' servers
+//   also read, is not this page's promise.
+
+/// File name of the server-managed registry under `--meta-dir`.
+pub const MANAGED_REGISTRY_FILE: &str = "instances.conf";
+
+/// Directive line marking a staged control-plane handover. The line records
+/// the TARGET instance name; startup runs the `grovefs_control` migration
+/// first, then rewrites the registry with the target first and the directive
+/// gone. A server that is not restarted never silently half-migrates.
+pub const CONTROL_PENDING_DIRECTIVE: &str = "@control-pending=";
+
+/// Where the managed registry lives for this base.
+pub fn managed_registry_path(base: &Path) -> std::path::PathBuf {
+    base.join(MANAGED_REGISTRY_FILE)
+}
+
+/// Is this spec the server's own managed registry? Adoption (which rewrites
+/// an inline spec to `file:<base>/instances.conf`) and the write guards of
+/// the `storage.*` ops both answer from this single comparison.
+pub fn is_managed_spec(spec: &str, base: &Path) -> bool {
+    let Some(path) = spec.strip_prefix("file:").map(str::trim).map(std::path::PathBuf::from) else {
+        return false;
+    };
+    path == managed_registry_path(base)
+}
+
+/// Adopt an inline (comma-list) PG spec into the managed registry, returning
+/// the spec to RUN on: `file:<base>/instances.conf`. Idempotent — a file that
+/// already exists is kept as the source of truth (console edits must survive
+/// a restart that still names the old inline flag), and a `file:` spec is
+/// returned untouched. Names: the FIRST instance is `control`; later ones are
+/// named as the inline auto-naming named them (`pgN`), so placement rows
+/// written before adoption still resolve.
+pub fn adopt_inline_spec(base: &Path, spec: &str) -> Result<String, String> {
+    if spec.trim().starts_with("file:") {
+        return Ok(spec.trim().to_string());
+    }
+    let path = managed_registry_path(base);
+    if path.exists() {
+        return Ok(format!("file:{}", path.display()));
+    }
+    let book = expand_store_spec(spec)?;
+    let mut text = "# GroveFS-managed PG instance registry (adopted from --meta-store at startup).\n\
+         # The FIRST entry carries the control plane; the console edits this file\n\
+         # through the storage page (`storage.*` governance ops, admin only).\n\
+         # A `@control-pending=` line is a staged control handover — see USAGE.\n"
+        .to_string();
+    for (i, inst) in book.instances.iter().enumerate() {
+        let name = if i == 0 { "control" } else { &inst.name };
+        text.push_str(&format!("{name} = {}\n", inst.uri));
+    }
+    std::fs::write(&path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    Ok(format!("file:{}", path.display()))
+}
+
+/// What `registry()` hands back: instance lines in book order plus the
+/// staged-handover directives, as (name, URI) pairs and target names.
+type RegistryLines = (Vec<(String, String)>, Vec<String>);
+
+/// Read the managed registry into (instance lines, directive lines). Only
+/// ever called on a path `is_managed_spec` matched, so a missing or
+/// unparsable file is a real error the op must surface, never a silent
+/// empty book. Instance parsing goes through `expand_store_spec`, so the
+/// console can never accept a line the router itself would refuse.
+fn registry(path: &Path) -> Result<RegistryLines, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read the managed registry {}: {e}", path.display()))?;
+    let book = expand_store_spec(&format!("file:{}", path.display()))?;
+    let directives = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with(CONTROL_PENDING_DIRECTIVE))
+        .map(|l| l[CONTROL_PENDING_DIRECTIVE.len()..].trim().to_string())
+        .collect();
+    let insts = book
+        .instances
+        .iter()
+        .map(|i| (i.name.clone(), i.uri.clone()))
+        .collect();
+    Ok((insts, directives))
+}
+
+/// Write the managed registry atomically: directives first, instances in
+/// book order (the FIRST entry is the control plane by contract).
+fn write_registry(path: &Path, directives: &[String], insts: &[(String, String)]) -> Result<(), String> {
+    let mut text = "# GroveFS-managed PG instance registry — edited by the web console's\n\
+        # storage page (`storage.*` governance ops, admin only). The FIRST entry\n\
+        # carries the control plane; @control-pending lines stage a handover.\n"
+        .to_string();
+    for d in directives {
+        text.push_str(&format!("{CONTROL_PENDING_DIRECTIVE}{d}\n"));
+    }
+    for (name, uri) in insts {
+        text.push_str(&format!("{name} = {uri}\n"));
+    }
+    let tmp = path.with_extension("conf.tmp");
+    std::fs::write(&tmp, &text)
+        .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("cannot replace {}: {e}", path.display()))
+}
+
+/// A URI the registry may hold: a postgres:// (or postgresql://) connection
+/// string that actually CONNECTS. Naming an instance is free; taking it live
+/// means the credentials work, or the next mount discovers a book that
+/// routes to a database nobody can open.
+fn check_instance_uri(uri: &str) -> Result<(), String> {
+    if !uri.starts_with("postgres://") && !uri.starts_with("postgresql://") {
+        return Err(format!(
+            "`{}` is not a postgres:// URI — the registry routes view trees to PostgreSQL databases only",
+            redact_uri(uri)
+        ));
+    }
+    Client::connect(uri, NoTls)
+        .map_err(|e| format!("cannot connect to {}: {e}", redact_uri(uri)))?;
+    Ok(())
+}
+
+/// `storage.add`: validate, trial-connect, append. Hot for routing the moment
+/// it lands — `expand_store_spec` re-reads the file per resolution, so the
+/// new instance joins the balancer and the `--pg-instance` pin set without a
+/// restart.
+pub fn registry_add(base: &Path, name: &str, uri: &str) -> Result<String, String> {
+    let path = managed_registry_path(base);
+    let (mut insts, directives) = registry(&path)?;
+    let name = name.trim();
+    if !valid_instance_name(name) {
+        return Err(format!("instance name '{name}' must be 1-24 chars of [A-Za-z0-9_-]"));
+    }
+    if insts.iter().any(|(n, _)| n == name) {
+        return Err(format!("instance '{name}' already exists — edit it instead (storage.update)"));
+    }
+    check_instance_uri(uri.trim())?;
+    insts.push((name.to_string(), uri.trim().to_string()));
+    write_registry(&path, &directives, &insts)?;
+    Ok(format!("instance '{name}' added and is routable now (trial connection verified)"))
+}
+
+/// `storage.update`: point a name at a (new) URI. The NAME is the placement
+/// identity, so views placed on this instance keep resolving — they just land
+/// on the new database, which must hold their schemas (a relocated or
+/// restored deployment). Renaming is add + relocate + remove, never here.
+/// The control plane's URI is not editable in place: changing it under the
+/// running control schema would split the system of record — that move is a
+/// handover (`storage.set_control`), which migrates the tables.
+pub fn registry_update(base: &Path, name: &str, uri: &str) -> Result<String, String> {
+    let path = managed_registry_path(base);
+    let (mut insts, directives) = registry(&path)?;
+    // The FIRST entry carries the control plane; its URI is not editable here
+    // (the doc above promises it) — moving `grovefs_control` under a running
+    // server is a handover, not a re-point. Enforce that, don't just document
+    // it: an operator who edits the control line silently orphans the system of
+    // record, since placement/keys/audit still live on the OLD database.
+    if insts.first().map(|(n, _)| n.as_str()) == Some(name.trim()) {
+        return Err(format!(
+            "instance '{name}' is the control plane — its URI cannot be edited in place (that would strand grovefs_control on the old database); promote another instance with storage.set_control instead"
+        ));
+    }
+    let Some((_, slot)) = insts.iter_mut().find(|(n, _)| n == name.trim()) else {
+        return Err(format!("instance '{name}' is not in the registry"));
+    };
+    if slot == uri.trim() {
+        return Err(format!("instance '{name}' already uses this URI — nothing to change"));
+    }
+    check_instance_uri(uri.trim())?;
+    *slot = uri.trim().to_string();
+    write_registry(&path, &directives, &insts)?;
+    Ok(format!("instance '{name}' now points at {}", redact_uri(uri.trim())))
+}
+
+/// The guards behind deleting an instance, evaluated server-side from the
+/// placement table. `None` placed counts mean the control plane could not be
+/// read — MISSING evidence refuses, it does not pass ("cannot check" is never
+/// "checked clean").
+pub struct RegistryRemovalBlock {
+    /// views with a placement row naming this instance
+    pub placed_views: Vec<String>,
+    /// placement rows that still dangle toward this (retired) name
+    pub dangling_rows: usize,
+    /// this instance IS the control plane
+    pub control: bool,
+}
+
+impl RegistryRemovalBlock {
+    fn refusal(&self, name: &str) -> String {
+        if self.control {
+            return format!(
+                "instance '{name}' carries the control plane (grovefs_control: keys, definitions, audit, placement) — deleting it would delete the system of record. Promote another instance first (storage.set_control), verify the handover at the next start, then delete this one."
+            );
+        }
+        if !self.placed_views.is_empty() {
+            return format!(
+                "instance '{name}' still hosts {} ({}) — relocate every one of them to another instance (storage.relocate) before removing it; the removal guard REFUSES rather than orphaning a view's tree",
+                crate::cli_style::plural(self.placed_views.len(), "placed view", "placed views"),
+                self.placed_views.join(", ")
+            );
+        }
+        format!(
+            "{} placement row(s) still reference '{}' although no live view does — clean them (`refs rebuild` on the control plane, or delete the stale rows) before removing the instance",
+            self.dangling_rows, name
+        )
+    }
+}
+
+/// `storage.remove`: run the guards, then drop the line. Refuses the control
+/// plane, any instance with placed views, and any instance dangling placement
+/// rows still point at. Content bytes never live in a PG instance's schemas,
+/// so no data-root scan is required to delete one safely.
+pub fn registry_remove(spec: &str, base: &Path, name: &str) -> Result<String, String> {
+    let path = managed_registry_path(base);
+    let (insts, directives) = registry(&path)?;
+    let name = name.trim();
+    let book = expand_store_spec(spec)?;
+    if !insts.iter().any(|(n, _)| n == name) {
+        return Err(format!("instance '{name}' is not in the registry"));
+    }
+    let control_name = book.control().name.clone();
+    // `instance_report` degrades SOFTLY (Ok + error field) so the console can
+    // still render; for a deletion guard that shape is exactly the trap — an
+    // unreachable control plane reads as "nothing placed". MISSING evidence
+    // refuses here, it never passes.
+    let ledger = instance_report(spec).map_err(|e| format!("cannot read the placement ledger to guard the removal: {e}"))?;
+    if let Some(e) = &ledger.error {
+        return Err(format!(
+            "cannot verify the placement ledger to guard the removal: {e} — an instance may only be removed once its placed views are known to be zero"
+        ));
+    }
+    let placement = ledger.placement;
+    let placed_views: Vec<String> = placement
+        .iter()
+        .filter(|(_, inst)| **inst == *name)
+        .map(|(view, _)| view.clone())
+        .collect();
+    let dangling_rows = placement
+        .values()
+        .filter(|inst| **inst == *name)
+        .count();
+    let block = RegistryRemovalBlock {
+        placed_views,
+        dangling_rows,
+        control: name == control_name,
+    };
+    if block.control || !block.placed_views.is_empty() || block.dangling_rows > 0 {
+        return Err(block.refusal(name));
+    }
+    let insts: Vec<(String, String)> = insts.into_iter().filter(|(n, _)| n != name).collect();
+    write_registry(&path, &directives, &insts)?;
+    // The book re-reads the file: confirm the removal is real, so the reply
+    // never claims a line is gone while a stale reader still routes to it.
+    if expand_store_spec(spec).is_ok_and(|b| b.by_name(name).is_some()) {
+        return Err(format!(
+            "'{name}' is still routable after the rewrite — registry {} did not persist",
+            path.display()
+        ));
+    }
+    Ok(format!("instance '{name}' removed (it hosted no placed views)"))
+}
+
+/// `storage.preview`: the deletion preview the console must show BEFORE an
+/// operator confirms — the affected view list, node counts and distinct
+/// `data_ref` counts per view, the control flag, and the shared-ledger
+/// consistency numbers (see [`refs_consistency`]).
+pub fn remove_preview(spec: &str, name: &str) -> Result<serde_json::Value, String> {
+    let book = expand_store_spec(spec)?;
+    let inst = book
+        .by_name(name)
+        .ok_or_else(|| format!("instance '{name}' is not in the registry (instances: {})", book.names()))?
+        .clone();
+    let ledger = instance_report(spec)?;
+    // Same rule as the removal guard: an unreadable placement ledger is
+    // missing evidence, and missing evidence refuses. Report the block (with
+    // the reason) rather than an empty (clean-looking) preview.
+    if let Some(e) = &ledger.error {
+        return Ok(serde_json::json!({
+            "instance": name,
+            "uri": inst.uri,
+            "control": name == book.control().name,
+            "views": [],
+            "placedViews": [],
+            "placedCount": null,
+            "canDelete": false,
+            "blockReason": format!("the placement ledger is unreadable right now: {e}"),
+            "refs": refs_consistency(spec, &std::collections::HashMap::new()),
+        }));
+    }
+    let mut views: Vec<serde_json::Value> = Vec::new();
+    let placed_views: Vec<String> = ledger
+        .placement
+        .iter()
+        .filter(|(_, i)| **i == *name)
+        .map(|(v, _)| v.clone())
+        .collect();
+    for view in &placed_views {
+        let probe = (|| -> Result<(i64, i64, i64), String> {
+            let mut c = Client::connect(&inst.uri, NoTls)
+                .map_err(|e| format!("cannot reach instance '{name}' ({e})"))?;
+            let schema = schema_for(view).ok_or_else(|| format!("view '{view}' has no PG schema shape"))?;
+            if !schema_exists(&mut c, &schema)? {
+                return Ok((-1, 0, 0));
+            }
+            let nodes: i64 = c
+                .query(&format!("SELECT COUNT(*) FROM {schema}.node"), &[])
+                .map_err(|e| format!("postgres count {schema}.node: {e}"))?
+                .first()
+                .map(|r| r.get(0))
+                .unwrap_or(0);
+            let refs_n: i64 = c
+                .query(
+                    &format!("SELECT COUNT(DISTINCT data_ref) FROM {schema}.node WHERE data_ref IS NOT NULL"),
+                    &[],
+                )
+                .map_err(|e| format!("postgres count refs: {e}"))?
+                .first()
+                .map(|r| r.get(0))
+                .unwrap_or(0);
+            Ok((1, nodes, refs_n))
+        })();
+        match probe {
+            Ok((has, nodes, refs_n)) => views.push(serde_json::json!({
+                "view": view, "hasSchema": has >= 0, "nodes": nodes, "distinctRefs": refs_n,
+            })),
+            // An instance the guards cannot read is reported, not skipped:
+            // the console must refuse to delete what it cannot verify.
+            Err(e) => return Err(format!("preview of instance '{name}' failed: {e}")),
+        }
+    }
+    let refs = refs_consistency(spec, &ledger.placement);
+    let control = name == book.control().name;
+    Ok(serde_json::json!({
+        "instance": name,
+        "uri": inst.uri,
+        "control": control,
+        "views": views,
+        "placedViews": placed_views,
+        "placedCount": views.len(),
+        "canDelete": !control && views.is_empty(),
+        "blockReason": if control {
+            Some("this instance carries the control plane — set_control elsewhere first".to_string())
+        } else if !views.is_empty() {
+            Some(format!("{} placed view(s) — relocate them first", views.len()))
+        } else {
+            None
+        },
+        "refs": refs,
+    }))
+}
+
+/// `grovefs_refs` consistency across the book — the check behind the
+/// console's delete dialog ("no dangling references"). Per instance it
+/// answers the two questions an operator can act on:
+/// - `missingViews`: placement rows name this instance for a view whose
+///   schema is NOT here — opening that view refuses (a dangling route), so
+///   the ledger and the physical layout disagree.
+/// - `holderRows` / `zeroRows`: the shared `grovefs_refs.holders` ledger's
+///   size and how many booked refs sit at zero holders (GC candidates, not
+///   corruption, but worth showing before an instance goes away).
+///
+/// Read-only. An unreachable instance is a NOTE in the report — missing
+/// evidence refuses a delete; it never passes it.
+fn refs_consistency(spec: &str, placement: &HashMap<String, String>) -> serde_json::Value {
+    let book = match expand_store_spec(spec) {
+        Ok(b) => b,
+        Err(e) => return serde_json::json!({ "error": e }),
+    };
+    let per_instance: Vec<serde_json::Value> = book
+        .instances
+        .iter()
+        .map(|inst| {
+            let placed_here: Vec<&String> = placement
+                .iter()
+                .filter(|(_, i)| **i == *inst.name)
+                .map(|(v, _)| v)
+                .collect();
+            let read = (|| -> Result<(Vec<String>, i64, i64), String> {
+                let mut c = Client::connect(&inst.uri, NoTls)
+                    .map_err(|e| format!("unreachable ({e})"))?;
+                let mut missing: Vec<String> = Vec::new();
+                for v in &placed_here {
+                    let Some(schema) = schema_for(v) else {
+                        missing.push(v.to_string());
+                        continue;
+                    };
+                    if !schema_exists(&mut c, &schema)? {
+                        missing.push(v.to_string());
+                    }
+                }
+                let (rows, zero) = match c.query(
+                    &format!(
+                        "SELECT COUNT(*), COUNT(*) FILTER (WHERE holders <= 0) FROM {PG_REFS_TABLE}"
+                    ),
+                    &[],
+                ) {
+                    Ok(q) => q
+                        .first()
+                        .map(|r| (r.get::<_, i64>(0), r.get::<_, i64>(1)))
+                        .unwrap_or((0, 0)),
+                    // No ledger yet = nothing booked, which is consistent.
+                    Err(e) if is_undefined_table(&e) => (0, 0),
+                    Err(e) => return Err(format!("cannot read {PG_REFS_TABLE}: {e}")),
+                };
+                Ok((missing, rows, zero))
+            })();
+            match read {
+                Ok((missing, rows, zero)) => serde_json::json!({
+                    "instance": inst.name,
+                    "holderRows": rows,
+                    "zeroRows": zero,
+                    "missingViews": missing,
+                }),
+                Err(e) => serde_json::json!({
+                    "instance": inst.name, "error": e,
+                }),
+            }
+        })
+        .collect();
+    let unreachable: Vec<String> = book
+        .instances
+        .iter()
+        .filter(|i| {
+            // Names, not URIs: this reply crosses the governance wire.
+            per_instance.iter().any(|p| {
+                p.get("instance").and_then(|v| v.as_str()) == Some(i.name.as_str())
+                    && p.get("error").is_some()
+            })
+        })
+        .map(|i| i.name.clone())
+        .collect();
+    serde_json::json!({
+        "instances": per_instance,
+        // The console must SHOW this: an instance the check could not read
+        // is unverified, and a delete dialog must not treat unverified as
+        // clean (the remove guard refuses on the same evidence).
+        "unverified": unreachable,
+    })
+}
+
+/// `storage.relocate` — the server-side form of `grovefs view move`, used by
+/// the console to empty an instance before deleting it and to rebalance.
+/// One view at a time: a whole-batch move across a network has more failure
+/// modes than an operator watching each step deserves.
+pub fn relocate(
+    spec: &str,
+    view: &str,
+    to: &str,
+    keep_source: bool,
+) -> Result<serde_json::Value, String> {
+    let rep = move_view(spec, view, to, keep_source)?;
+    Ok(serde_json::json!({
+        "view": view,
+        "from": rep.from,
+        "to": rep.to,
+        "nodes": rep.nodes,
+        "blobs": rep.blobs,
+        "sourceDropped": rep.source_dropped,
+    }))
+}
+
+/// What a completed control-plane handover moved, for the reply/banner.
+pub struct ControlHandover {
+    pub target: String,
+    pub tables: usize,
+    pub rows: i64,
+}
+
+/// `storage.set_control`: stage a control-plane handover to another
+/// registry instance. The heavy lifting runs at the NEXT start
+/// ([`apply_pending_control`]) — copying `grovefs_control` while requests
+/// could still write to the old plane is how two systems of record are
+/// born, and a restart is the one moment that cannot happen. The current
+/// control plane stays fully authoritative until then.
+pub fn set_control(base: &Path, name: &str) -> Result<String, String> {
+    let path = managed_registry_path(base);
+    let (insts, directives) = registry(&path)?;
+    let name = name.trim();
+    if !directives.is_empty() {
+        return Err(format!(
+            "a handover to '{}' is already staged — restart the server to apply it, or clear the line to abort",
+            directives[0]
+        ));
+    }
+    if insts.is_empty() {
+        return Err("registry has no instances".into());
+    }
+    if insts[0].0 == name {
+        return Err(format!("instance '{name}' already carries the control plane"));
+    }
+    if !insts.iter().any(|(n, _)| n == name) {
+        return Err(format!(
+            "instance '{name}' is not in the registry ({})",
+            insts
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    // Stage only what startup can honour: copying a schema whose tables
+    // cross-reference each other needs an ordering this migration does not
+    // claim to know, so a book that grew FK constraints by hand fails here
+    // rather than half-way through at boot.
+    let mut c = Client::connect(&insts[0].1, NoTls)
+        .map_err(|e| format!("cannot reach the current control plane: {e}"))?;
+    let fks = c
+        .query(
+            "SELECT COUNT(*) FROM pg_constraint con\
+             JOIN pg_namespace n ON n.oid = con.connamespace\
+             WHERE n.nspname = 'grovefs_control' AND con.contype = 'f'",
+            &[],
+        )
+        .map_err(|e| format!("cannot inspect the control schema: {e}"))?
+        .first()
+        .map(|r| r.get::<_, i64>(0))
+        .unwrap_or(0);
+    if fks > 0 {
+        return Err(format!(
+            "the control schema holds {fks} foreign-key constraint(s) — the built-in handover migrates GroveFS's own tables only; move the plane by hand (pg_dump) and edit the registry"
+        ));
+    }
+    write_registry(&path, &[name.to_string()], &insts)?;
+    Ok(format!(
+        "handover to '{name}' staged — restart the meta-server to apply it (the copy runs before any request can reach either plane)"
+    ))
+}
+
+/// The staged handover, for `store.info`: the console shows WHY the control
+/// badge is about to move and what it must do to finish the job.
+pub fn pending_control_note(base: &Path) -> Option<String> {
+    let (_, directives) = registry(&managed_registry_path(base)).ok()?;
+    directives.first().cloned()
+}
+
+/// Startup step for a staged handover: if the managed registry carries a
+/// `@control-pending=` line, migrate `grovefs_control` to that instance,
+/// verify row counts, rotate the target to FIRST and clear the directive.
+/// Returns `Ok(Some(..))` when a handover was applied, `Ok(None)` when
+/// nothing was pending. `serve()` runs this BEFORE any listener exists and
+/// before `control_store_for` opens the plane — the only moment no request
+/// can write to the old control database while the copy runs.
+pub fn apply_pending_control(base: &Path) -> Result<Option<ControlHandover>, String> {
+    let path = managed_registry_path(base);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let (insts, directives) = registry(&path)?;
+    let Some(pending) = directives.first().cloned() else {
+        return Ok(None);
+    };
+    if directives.len() > 1 {
+        return Err(format!(
+            "registry {} holds {} `{}` lines — one staged handover at a time",
+            path.display(),
+            directives.len(),
+            CONTROL_PENDING_DIRECTIVE
+        ));
+    }
+    let source_uri = insts
+        .first()
+        .map(|(_, u)| u.clone())
+        .ok_or_else(|| "registry has no instances to migrate from".to_string())?;
+    let target_uri = insts
+        .iter()
+        .find(|(n, _)| *n == pending)
+        .map(|(_, u)| u.clone())
+        .ok_or_else(|| {
+            format!("@control-pending names '{pending}', which the registry does not define")
+        })?;
+    let report = migrate_control_plane(&source_uri, &target_uri, &pending)?;
+    // The tables landed: rotate the target first, drop the directive, and
+    // only then write — the file is the commit point of the handover.
+    let mut rotated: Vec<(String, String)> = Vec::with_capacity(insts.len());
+    rotated.push(insts.iter().find(|(n, _)| *n == pending).cloned().expect("checked above"));
+    rotated.extend(insts.iter().filter(|(n, _)| *n != pending).cloned());
+    write_registry(&path, &[], &rotated)?;
+    Ok(Some(ControlHandover {
+        target: pending,
+        tables: report.0,
+        rows: report.1,
+    }))
+}
+
+/// Copy every `grovefs_control` table — DDL (constraints included, via
+/// `pg_get_tabledef`), secondary indexes, rows — from the current control
+/// database to the target, fix identities, verify row-for-row. The caller
+/// rotates the registry only when every count agreed; a crash before that
+/// rename leaves the directive in place, so the next start re-runs the
+/// migration against a clean target (the vacancy guard above refuses a
+/// target whose control tables already hold rows).
+fn migrate_control_plane(source_uri: &str, target_uri: &str, target_name: &str) -> Result<(usize, i64), String> {
+    let mut src = Client::connect(source_uri, NoTls)
+        .map_err(|e| format!("cannot connect to the current control plane: {e}"))?;
+    let mut dst = Client::connect(target_uri, NoTls)
+        .map_err(|e| format!("cannot connect to the control-handover target '{target_name}': {e}"))?;
+    dst.execute("CREATE SCHEMA IF NOT EXISTS grovefs_control", &[])
+        .map_err(|e| format!("cannot create grovefs_control on the target: {e}"))?;
+    let tables = control_tables(&mut src)?;
+    if tables.is_empty() {
+        return Err("the current control database has no grovefs_control tables to migrate".into());
+    }
+    // Same fail-closed rule `storage.set_control` stages on; defensive
+    // because the directive line is editable on disk between staging and
+    // the restart that applies it.
+    let fks: i64 = src
+        .query(
+            "SELECT COUNT(*) FROM pg_constraint con\
+             JOIN pg_namespace n ON n.oid = con.connamespace\
+             WHERE n.nspname = 'grovefs_control' AND con.contype = 'f'",
+            &[],
+        )
+        .map_err(|e| format!("cannot inspect the control schema: {e}"))?
+        .first()
+        .map(|r| r.get::<_, i64>(0))
+        .unwrap_or(0);
+    if fks > 0 {
+        return Err(format!(
+            "the control schema holds {fks} foreign-key constraint(s), which the built-in handover cannot order safely — aborting, the registry was NOT rotated"
+        ));
+    }
+    guard_target_vacant(&mut dst, &tables)?;
+    // Serialize against every control-plane writer on the SAME advisory lock
+    // class their DDL takes — while this copy runs, no concurrent `view
+    // create` / apikey write can land a row the copy would miss. (At serve()
+    // time this process holds no requests anyway; this also fences a second
+    // node sharing the database.)
+    src.execute(
+        "SELECT pg_advisory_xact_lock($1)",
+        &[&crate::control::DDL_LOCK_CLASS],
+    )
+    .map_err(|e| format!("cannot take the control DDL lock on the source: {e}"))?;
+    let mut rows_total = 0i64;
+    for t in &tables {
+        // Count BEFORE the copy, compare after: an in-flight writer on the
+        // source (the advisory lock above fences THIS process's plane, not a
+        // second node sharing the database) shows up as a count mismatch and
+        // aborts the rotation — the directive survives, so the next start
+        // retries cleanly.
+        let before = table_rows(&mut src, t)?;
+        copy_control_table(&mut src, &mut dst, t)?;
+        let after = table_rows(&mut dst, t)?;
+        if after != before {
+            return Err(format!(
+                "handover aborted: table {t} landed with {after} rows, source has {before} — the registry was NOT rotated, nothing changed for clients"
+            ));
+        }
+        rows_total += before;
+    }
+    fix_identities(&mut dst, &tables)?;
+    Ok((tables.len(), rows_total))
+}
+
+fn control_tables(c: &mut Client) -> Result<Vec<String>, String> {
+    let rows = c
+        .query(
+            "SELECT table_name FROM information_schema.tables
+             WHERE table_schema = 'grovefs_control' AND table_type = 'BASE TABLE'
+             ORDER BY table_name",
+            &[],
+        )
+        .map_err(|e| format!("cannot enumerate the control tables: {e}"))?;
+    Ok(rows.into_iter().map(|r| r.get::<_, String>(0)).collect())
+}
+
+/// The target's control tables must be absent or EMPTY: rows already there
+/// mean the database is in use by something this handover does not know
+/// about, and merging two control planes silently is exactly the split-brain
+/// the directive flow exists to prevent.
+fn guard_target_vacant(dst: &mut Client, tables: &[String]) -> Result<(), String> {
+    let have = control_tables(dst)?;
+    for t in tables {
+        if have.contains(t) {
+            let n = table_rows(dst, t)?;
+            if n > 0 {
+                return Err(format!(
+                    "the handover target already holds {} row(s) in grovefs_control.{t} — pick an empty database (or clear that table) before handing the control plane over",
+                    n
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn table_rows(c: &mut Client, table: &str) -> Result<i64, String> {
+    c.query(
+        &format!("SELECT COUNT(*) FROM grovefs_control.\"{table}\""),
+        &[],
+    )
+    .map_err(|e| format!("cannot count grovefs_control.{table}: {e}"))?
+    .first()
+    .map(|r| r.get::<_, i64>(0))
+    .ok_or_else(|| format!("no count row for grovefs_control.{table}"))
+}
+
+/// DDL + rows for one table. `pg_get_tabledef` carries the constraints the
+/// runtime writes depend on (PRIMARY KEY / UNIQUE); secondary indexes follow
+/// with `CREATE INDEX IF NOT EXISTS` so a re-run after a crash is idempotent.
+fn copy_control_table(src: &mut Client, dst: &mut Client, table: &str) -> Result<(), String> {
+    let fqn = format!("grovefs_control.\"{table}\"");
+    let ddl_rows = src
+        .query(&format!("SELECT pg_get_tabledef({fqn}::regclass)"), &[])
+        .map_err(|e| format!("cannot read the tabledef of {table}: {e}"))?;
+    let ddl: String = ddl_rows
+        .first()
+        .map(|r| r.get::<_, Option<String>>(0).unwrap_or_default())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("{table} produced no tabledef — refusing to migrate blind"))?;
+    // Oids inside the def are the SOURCE's; quote-normalize and re-target.
+    let create = ddl.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ");
+    dst.simple_query(&create)
+        .map_err(|e| format!("cannot create grovefs_control.{table} on the target: {e}"))?;
+    let idx_rows = src
+        .query(
+            "SELECT indexdef FROM pg_indexes
+             WHERE schemaname = 'grovefs_control' AND tablename = $1
+               AND indexdef NOT LIKE '%_pkey%'",
+            &[&table],
+        )
+        .map_err(|e| format!("cannot read the indexes of {table}: {e}"))?;
+    for r in idx_rows {
+        let def: String = r.get(0);
+        let def = def.replace("CREATE UNIQUE INDEX ", "CREATE UNIQUE INDEX IF NOT EXISTS ");
+        let def = def.replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ");
+        dst.simple_query(&def)
+            .map_err(|e| format!("cannot create an index of {table} on the target: {e}"))?;
+    }
+    // Rows: one COPY stream each way. OVERRIDING SYSTEM VALUE because
+    // `api_keys.seq`/`mcp_calls.seq` are GENERATED ALWAYS identities whose
+    // existing values must travel verbatim (audit order is part of the row).
+    use std::io::Read as _;
+    let mut buf = Vec::new();
+    let mut reader = src
+        .copy_out(&format!("COPY {fqn} TO STDOUT (FORMAT binary)"))
+        .map_err(|e| format!("cannot copy out {table}: {e}"))?;
+    reader
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("cannot buffer {table}: {e}"))?;
+    let mut writer = dst
+        .copy_in(&format!(
+            "COPY {fqn} FROM STDIN (FORMAT binary) OVERRIDING SYSTEM VALUE"
+        ))
+        .map_err(|e| format!("cannot copy in {table}: {e}"))?;
+    writer
+        .write_all(&buf)
+        .map_err(|e| format!("cannot feed the copy of {table}: {e}"))?;
+    writer
+        .finish()
+        .map_err(|e| format!("cannot finish the copy of {table}: {e}"))?;
+    Ok(())
+}
+
+/// After explicit identity values landed, every identity/serial sequence in
+/// the schema must resume ABOVE them, or the first INSERT on the new control
+/// plane collides with a copied row.
+fn fix_identities(dst: &mut Client, tables: &[String]) -> Result<(), String> {
+    for t in tables {
+        let rows = dst
+            .query(
+                "SELECT a.attname, pg_get_serial_sequence('grovefs_control.\"' || $1 || '\"', a.attname)\n                 FROM pg_attribute a\n                 WHERE a.attrelid = 'grovefs_control.\"' || $1 || '\"'::regclass\n                   AND a.attidentity IN ('a', 'd')",
+                &[t],
+            )
+            .map_err(|e| format!("cannot find the identities of {t}: {e}"))?;
+        for r in rows {
+            let col: String = r.get(0);
+            let seq: Option<String> = r.get(1);
+            let Some(seq) = seq else { continue };
+            // Resume ABOVE the copied values; `false` means the next
+            // nextval() IS that boundary value (still unused by any row).
+            dst.execute(
+                &format!(
+                    "SELECT setval('{seq}', COALESCE((SELECT MAX(\"{col}\") FROM grovefs_control.\"{t}\"), 0) + 1, false)"
+                ),
+                &[],
+            )
+            .map_err(|e| format!("cannot fix the sequence {seq}: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod shard_tests {
     use super::{
@@ -5523,6 +6336,7 @@ mod pool_tests {
         assert!(report.instances[0].control);
         assert_eq!(report.instances[0].uri, "postgres://u:p@h/db");
         assert_eq!(report.instances[0].placed_views, None);
+        assert!(!report.managed);
         assert!(report.placement.is_empty());
         assert!(report.error.is_none());
     }
@@ -5534,5 +6348,215 @@ mod pool_tests {
         let path = std::env::temp_dir().join("grovefs-no-such-instances.conf");
         let err = instance_report(&format!("file:{}", path.display())).unwrap_err();
         assert!(err.contains("grovefs-no-such-instances.conf"), "{err}");
+    }
+}
+
+/// The managed registry's file-layer rules — the guards the console's
+/// storage page runs on. All pure-filesystem: no database is dialed (the
+/// trial connects live in `check_instance_uri`, covered by the PG suite).
+#[cfg(test)]
+mod registry_tests {
+    use super::{
+        adopt_inline_spec, is_managed_spec, managed_registry_path, pending_control_note, registry,
+        registry_add, registry_remove, registry_update, set_control, CONTROL_PENDING_DIRECTIVE,
+    };
+    use std::path::{Path, PathBuf};
+
+    /// A throwaway base directory, removed when the test ends.
+    fn dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("grovefs-registry-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn seeded(tag: &str) -> PathBuf {
+        let d = dir(tag);
+        std::fs::write(
+            managed_registry_path(&d),
+            "# GroveFS-managed\ncontrol = postgres://u:p@127.0.0.1:5432/a\nteam = postgres://u:p@127.0.0.1:5432/b\n",
+        )
+        .unwrap();
+        d
+    }
+
+    fn names(path: &Path) -> Vec<String> {
+        registry(path).unwrap().0.into_iter().map(|(n, _)| n).collect()
+    }
+
+    /// A fresh inline spec is adopted: the FIRST instance is named
+    /// `control`, later ones keep their positional names so existing
+    /// placement rows still resolve after the switch to `file:`.
+    #[test]
+    fn adopt_names_the_first_instance_control() {
+        let d = dir("adopt");
+        let spec = "postgres://u@h/db1,postgres://u@h/db2";
+        let adopted = adopt_inline_spec(&d, spec).unwrap();
+        assert_eq!(adopted, format!("file:{}", managed_registry_path(&d).display()));
+        let book = super::expand_store_spec(&adopted).unwrap();
+        assert_eq!(book.names(), "control, pg2");
+        assert_eq!(book.control().uri, "postgres://u@h/db1");
+        // Adoption is idempotent and CONSERVATIVE: once the file exists it
+        // is the source of truth (console edits must survive a restart that
+        // still passes the old inline flag).
+        std::fs::write(managed_registry_path(&d), "solo = postgres://u@h/db9\n").unwrap();
+        let again = adopt_inline_spec(&d, spec).unwrap();
+        assert_eq!(again, adopted);
+        let book = super::expand_store_spec(&again).unwrap();
+        assert_eq!(book.names(), "solo");
+        // A `file:` spec is returned untouched — adoption never rewrites an
+        // registry the operator owns.
+        assert_eq!(adopt_inline_spec(&d, &adopted).unwrap(), adopted);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A directive line is skipped by the ROUTER (routing stays on the first
+    /// entry until the handover is applied) but read by `registry()` — the
+    /// two parsers must disagree in exactly this one way.
+    #[test]
+    fn directive_lines_parse_for_the_registry_not_the_router() {
+        let d = dir("directive");
+        let path = managed_registry_path(&d);
+        std::fs::write(
+            &path,
+            &format!(
+                "control = postgres://u@h/db1\n{CONTROL_PENDING_DIRECTIVE}team\nteam = postgres://u@h/db2\n"
+            ),
+        )
+        .unwrap();
+        let book = super::expand_store_spec(&format!("file:{}", path.display())).unwrap();
+        assert_eq!(book.control().name, "control");
+        assert_eq!(book.instances.len(), 2);
+        let (insts, directives) = registry(&path).unwrap();
+        assert_eq!(insts.len(), 2);
+        assert_eq!(directives, vec!["team".to_string()]);
+        assert_eq!(pending_control_note(&d).as_deref(), Some("team"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn managed_spec_recognizes_only_its_own_path() {
+        let d = dir("ismgmt");
+        let path = managed_registry_path(&d);
+        std::fs::write(&path, "a = postgres://u@h/d\n").unwrap();
+        assert!(is_managed_spec(&format!("file:{}", path.display()), &d));
+        assert!(!is_managed_spec("file:/elsewhere/instances.conf", &d));
+        assert!(!is_managed_spec("postgres://u@h/db", &d));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `storage.add` validates the NAME the same way the placement table
+    /// must, and never dials a connection for a line it will not write.
+    #[test]
+    fn registry_add_validates_before_connecting() {
+        let d = seeded("add");
+        let path = managed_registry_path(&d);
+        let err = registry_add(&d, "bad name!", "postgres://u@h/x").unwrap_err();
+        assert!(err.contains("1-24 chars"), "{err}");
+        let err = registry_add(&d, "control", "postgres://u@h/x").unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
+        let err = registry_add(&d, "new1", "mysql://u@h/x").unwrap_err();
+        assert!(err.contains("not a postgres://"), "{err}");
+        // Nothing was written by any refusal.
+        assert_eq!(names(&path), vec!["control", "team"]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `storage.update` refuses an unchanged URI, refuses to re-point the
+    /// control plane (that is a handover, not an edit), and a rename is not
+    /// this verb's job (placement rows key on the name).
+    #[test]
+    fn registry_update_rejects_noop() {
+        let d = seeded("upd");
+        let err =
+            registry_update(&d, "team", "postgres://u:p@127.0.0.1:5432/b").unwrap_err();
+        assert!(err.contains("already uses this URI"), "{err}");
+        let err = registry_update(&d, "ghost", "postgres://u@h/x").unwrap_err();
+        assert!(err.contains("not in the registry"), "{err}");
+        // The control plane (FIRST entry) URI is not editable in place — the
+        // guard fires before any connection is dialed, so it holds offline.
+        let err = registry_update(&d, "control", "postgres://u@h/other").unwrap_err();
+        assert!(err.contains("control plane"), "{err}");
+        assert!(err.contains("storage.set_control"), "{err}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `storage.set_control` stages a handover as a directive and refuses
+    /// the no-ops; the instance list keeps its order until a restart
+    /// applies the migration.
+    #[test]
+    fn set_control_stages_a_directive_without_reordering() {
+        let d = seeded("setctl");
+        let err = set_control(&d, "control").unwrap_err();
+        assert!(err.contains("already carries the control plane"), "{err}");
+        let err = set_control(&d, "ghost").unwrap_err();
+        assert!(err.contains("not in the registry"), "{err}");
+        // A real target needs a reachable source (the FK guard) — this box
+        // has no listening PG, so staging refuses HERE rather than half-
+        // staging a directive startup cannot apply.
+        let _ = std::fs::remove_dir_all(&d);
+        let d = dir("setctl-offline");
+        let path2 = managed_registry_path(&d);
+        std::fs::write(
+            &path2,
+            "control = postgres://u:pw@127.0.0.1:1/a\nteam = postgres://u:pw@127.0.0.1:1/b\n",
+        )
+        .unwrap();
+        let err = set_control(&d, "team").unwrap_err();
+        assert!(err.contains("cannot reach the current control plane"), "{err}");
+        // And a staged directive refuses to double-stage — the guard runs
+        // BEFORE any connection is dialed, so it fires even offline.
+        std::fs::write(
+            &path2,
+            &format!(
+                "control = postgres://u:pw@127.0.0.1:1/a\n{CONTROL_PENDING_DIRECTIVE}team\nteam = postgres://u:pw@127.0.0.1:1/b\n"
+            ),
+        )
+        .unwrap();
+        let err = set_control(&d, "team").unwrap_err();
+        assert!(err.contains("already staged"), "{err}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `storage.remove` runs its guards against the LIVE placement ledger,
+    /// so without a control plane to read it the removal is REFUSED (missing
+    /// evidence refuses, never passes) and the registry stands unchanged.
+    #[test]
+    fn registry_remove_refuses_when_placement_is_unreadable() {
+        let d = seeded("rm");
+        let path = managed_registry_path(&d);
+        let spec = format!("file:{}", path.display());
+        let err = registry_remove(&spec, &d, "team").unwrap_err();
+        assert!(err.contains("placement ledger"), "{err}");
+        assert_eq!(names(&path), vec!["control", "team"]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The atomic rewrite keeps directives ahead of instances, so a crash
+    /// mid-write can never leave a registry whose pending handover was
+    /// silently dropped.
+    #[test]
+    fn write_registry_keeps_directives_and_order() {
+        let d = dir("write");
+        let path = managed_registry_path(&d);
+        super::write_registry(
+            &path,
+            &["backup".to_string()],
+            &[
+                ("main".into(), "postgres://u@h/a".into()),
+                ("backup".into(), "postgres://u@h/b".into()),
+            ],
+        )
+        .unwrap();
+        let (insts, directives) = registry(&path).unwrap();
+        assert_eq!(directives, vec!["backup".to_string()]);
+        assert_eq!(
+            insts,
+            vec![
+                ("main".to_string(), "postgres://u@h/a".to_string()),
+                ("backup".to_string(), "postgres://u@h/b".to_string()),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

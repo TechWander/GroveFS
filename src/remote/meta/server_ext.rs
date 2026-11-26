@@ -191,8 +191,17 @@ impl StoreKind {
 /// URIs are returned VERBATIM (credentials included): `store.info` is
 /// Super-only, and this page exists so an operator can verify the real
 /// connection string. `redact_uri` still guards logs, refusals and the CLI.
-fn storage_snapshot(store: &StoreKind) -> serde_json::Value {
+///
+/// `managed` says whether the console may EDIT this registry: true only for
+/// the spec `serve()` adopted to `<base>/instances.conf` — an operator-owned
+/// `file:` registry (or a bare inline spec that was never adopted, e.g. on a
+/// node whose start refused) stays read-only to the storage page.
+fn storage_snapshot(store: &StoreKind, base: &Path) -> serde_json::Value {
     use serde_json::json;
+    let managed = match store {
+        StoreKind::Pg(spec) => crate::pg_store::is_managed_spec(spec, base),
+        _ => false,
+    };
     match store {
         StoreKind::Pg(spec) => match crate::pg_store::instance_report(spec) {
             Ok(report) => json!({
@@ -209,6 +218,11 @@ fn storage_snapshot(store: &StoreKind) -> serde_json::Value {
                     .collect::<Vec<_>>(),
                 "placement": report.placement,
                 "instanceError": report.error,
+                // The storage page's CRUD affordance, and the staged control
+                // handover (a `@control-pending=` line) if one is waiting
+                // for the next start.
+                "managed": managed,
+                "pendingControl": crate::pg_store::pending_control_note(base),
             }),
             // An unreadable registry still names the deployment: keep one row
             // from the raw spec so the page renders and the error is visible.
@@ -222,6 +236,8 @@ fn storage_snapshot(store: &StoreKind) -> serde_json::Value {
                 }],
                 "placement": {},
                 "instanceError": e,
+                "managed": managed,
+                "pendingControl": null,
             }),
         },
         StoreKind::Sqlite => json!({
@@ -234,6 +250,8 @@ fn storage_snapshot(store: &StoreKind) -> serde_json::Value {
             }],
             "placement": {},
             "instanceError": null,
+            "managed": false,
+            "pendingControl": null,
         }),
         #[cfg(feature = "treedb")]
         StoreKind::Treedb(addr) => json!({
@@ -246,6 +264,8 @@ fn storage_snapshot(store: &StoreKind) -> serde_json::Value {
             }],
             "placement": {},
             "instanceError": null,
+            "managed": false,
+            "pendingControl": null,
         }),
     }
 }
@@ -863,12 +883,43 @@ impl MetaServer {
                 ),
             ));
         }
+        // The PG spec goes through the managed-registry layer FIRST (see
+        // `pg_store::adopt_inline_spec`): an inline comma list is adopted
+        // once into `<base>/instances.conf` — first instance named
+        // `control` — and the server runs on `file:` from then on, so the
+        // console's storage page has ONE system of record to edit while
+        // `expand_store_spec`'s read-per-resolution keeps changes hot. A
+        // staged control handover is applied HERE, before any listener
+        // exists and before the control plane opens: the only moment no
+        // request can write to the old plane while its tables are copied.
+        let mut store = self.store.clone();
+        if let StoreKind::Pg(spec) = &store {
+            let adopted = crate::pg_store::adopt_inline_spec(&self.base, spec)
+                .map_err(io::Error::other)?;
+            if adopted != spec.trim() {
+                println!(
+                    "meta-server: --meta-store adopted into the managed registry {} (first instance named 'control')",
+                    crate::pg_store::managed_registry_path(&self.base).display()
+                );
+            }
+            store = StoreKind::Pg(adopted);
+            let handover = crate::pg_store::apply_pending_control(&self.base)
+                .map_err(io::Error::other)?;
+            if let Some(h) = &handover {
+                println!(
+                    "meta-server: control plane migrated to instance '{}' — {} copied, {} rows verified against grovefs_control on the source",
+                    h.target,
+                    crate::cli_style::plural(h.tables, "table", "tables"),
+                    h.rows
+                );
+            }
+        }
         // SQLite trees live under `<base>/meta`, one directory each; a PG store
         // writes nothing locally, so creating that directory would be a
         // misleading footprint (an empty `meta/` on a host that has no local
         // metadata at all). Under treedb the directory IS still needed — the
         // control plane stayed local.
-        if self.store.control_uri().is_none() {
+        if store.control_uri().is_none() {
             // Refusing an unmigrated flat store at STARTUP is the point: a
             // replica that booted against a flat store would serve "no views"
             // and let an operator create trees beside the ones it cannot read.
@@ -886,7 +937,7 @@ impl MetaServer {
         let (ctl_keys, web_auth, admin_note) = match &self.control_listen {
             None => (None, None, None),
             Some(_) => {
-                let store_uri = self.store.control_uri();
+                let store_uri = store.control_uri();
                 let keys = Arc::new(
                     crate::apikeys::ApiKeyStore::open_for(&self.base, store_uri)
                         .map_err(io::Error::other)?,
@@ -930,8 +981,8 @@ impl MetaServer {
         // that operators already grep for is unchanged.
         println!(
             "meta-server: metadata backend {} — {}",
-            self.store.backend_name(),
-            self.store.backend_layout()
+            store.backend_name(),
+            store.backend_layout()
         );
         // Instance registry, NAMES only (URIs embed passwords and the banner
         // lands in the journal): an operator running a multi-instance
@@ -939,7 +990,7 @@ impl MetaServer {
         // plane and whether every registry line parsed. An unreadable
         // registry fails the start — a server that cannot answer "where does
         // view X live" must not come up looking healthy.
-        if let StoreKind::Pg(spec) = &self.store {
+        if let StoreKind::Pg(spec) = &store {
             let book = crate::pg_store::expand_store_spec(spec).map_err(|e| {
                 io::Error::new(io::ErrorKind::InvalidInput, format!("--meta-store: {e}"))
             })?;
@@ -949,6 +1000,16 @@ impl MetaServer {
                     crate::cli_style::plural(book.instances.len(), "PG instance", "PG instances"),
                     book.names(),
                     book.control().name
+                );
+            }
+            // Say it out loud whenever the page can edit this registry: an
+            // operator must know from the journal whether instance changes
+            // made in the console persist here (managed) or belong to a file
+            // they own (read-only) — the storage page shows the same flag.
+            if crate::pg_store::is_managed_spec(spec, &self.base) {
+                println!(
+                    "meta-server: instance registry is console-managed ({}) — the storage page can add/edit/relocate/remove without a restart; control handovers apply at the next start",
+                    crate::pg_store::managed_registry_path(&self.base).display()
                 );
             }
         }
@@ -972,7 +1033,7 @@ impl MetaServer {
         // definitions/aliases/forks from the shared `grovefs_control` schema, a
         // SQLite store from the local `meta/views` dir — one system of record per
         // backend, never a local file the PG deployment would ignore.
-        let control = crate::mcp::control_store_for(&self.base, self.store.control_uri())
+        let control = crate::mcp::control_store_for(&self.base, store.control_uri())
             .map_err(io::Error::other)?;
         let rt = Arc::new(MetaRuntime {
             base: self.base.clone(),
@@ -988,7 +1049,7 @@ impl MetaServer {
             sync_repl: self.sync_repl && self.peer.is_some(),
             standby_push: Mutex::new(()),
             witness: self.witness.clone(),
-            store: self.store.clone(),
+            store,
             control,
             views: Arc::new(Mutex::new(HashMap::new())),
             bases: Arc::new(Mutex::new(HashMap::new())),
@@ -1974,9 +2035,21 @@ fn gates(op: &str) -> Result<Vec<Gate>, String> {
         "audit.retention.set" => vec![Gate::Super(
             "it decides when audit rows belonging to every credential in the deployment die",
         )],
+        // The storage plane: instance CRUD edits the managed registry (which
+        // every view route resolves through), relocate moves a tree between
+        // databases, set_control restages the system of record. None of it
+        // is per-view, all of it is deployment-wide — Super only, and the
+        // server-side guards (`pg_store::registry_*`) refuse an unsafe
+        // removal rather than the gate being the only check.
+        "storage.add" | "storage.update" | "storage.remove" | "storage.preview"
+        | "storage.set_control" | "storage.relocate" => {
+            vec![Gate::Super(
+                "it changes where EVERY view's metadata lives, not just one view's",
+            )]
+        }
         other => {
             return Err(format!(
-                "control op '{other}' has no access rule (unknown, or added to the dispatcher \n                     without one) — refusing. Known ops: info, whoami, login, def.list/get/put/remove, \n                     stamp, physical.list/has, fork.has/create/drop/graft, view.create/stats/export/import, \n                     view.rm_base, refs.rebuild, gc.scan/apply, apikey.create/list/revoke/delete/rotate/set_ro/update/secret/calls/purge, \n                     audit.retention.get/set, \n                     account.list/create/passwd/role/disable/delete, grant.list/add/remove"
+                "control op '{other}' has no access rule (unknown, or added to the dispatcher \n                     without one) — refusing. Known ops: info, whoami, login, def.list/get/put/remove, \n                     stamp, physical.list/has, fork.has/create/drop/graft, view.create/stats/export/import, \n                     view.rm_base, refs.rebuild, gc.scan/apply, apikey.create/list/revoke/delete/rotate/set_ro/update/secret/calls/purge, \n                     audit.retention.get/set, storage.add/update/remove/preview/set_control/relocate, \n                     account.list/create/passwd/role/disable/delete, grant.list/add/remove"
             ));
         }
     };
@@ -2310,7 +2383,7 @@ fn control_dispatch(
                 "auditRetention": rt.audit_retention.lock().clone(),
                 // What the metadata store IS (sqlite / one PG / a PG book /
                 // treedb) and where each view lives inside it.
-                "storage": storage_snapshot(&rt.store),
+                "storage": storage_snapshot(&rt.store, &rt.base),
             }))
         }
         // A delegated caller's list is its own definitions: the same lens/fork
@@ -2926,6 +2999,108 @@ fn control_dispatch(
             };
             Ok(json!({ "retention": eff, "trimmedNow": trimmed }))
         }
+        // The storage plane: the console's instance CRUD against the
+        // managed registry (`<base>/instances.conf`, adopted from
+        // `--meta-store` at first start). All Super (see `gates`), all
+        // guarded server-side — the registry is the router's own source of
+        // truth, so `expand_store_spec` re-reads it per resolution and an
+        // added instance is routable immediately while a REMOVED one must
+        // first give up every placed view (the guard refuses otherwise).
+        "storage.add" | "storage.update" | "storage.remove" | "storage.preview"
+        | "storage.set_control" | "storage.relocate" => {
+            let spec = match &rt.store {
+                StoreKind::Pg(s) => s.clone(),
+                StoreKind::Sqlite => {
+                    return Err("this deployment's metadata lives in local SQLite files — there is no instance registry to manage".to_string())
+                }
+                #[cfg(feature = "treedb")]
+                StoreKind::Treedb(_) => {
+                    return Err("treedb: this build serves one tree instance per meta-server, and its control plane stays in local SQLite — there is no instance registry to manage here yet".to_string())
+                }
+            };
+            if !crate::pg_store::is_managed_spec(&spec, &rt.base) {
+                return Err(
+                    "the instance registry is not server-managed (a --meta-store file the operator owns) — edit that file instead; the storage page is read-only here"
+                        .to_string(),
+                );
+            }
+            let name = req_str(a, "instance").unwrap_or_default();
+            match op {
+                "storage.add" => {
+                    let name = req_str(a, "name")?;
+                    let uri = req_str(a, "uri")?;
+                    let msg = crate::pg_store::registry_add(&rt.base, &name, &uri)?;
+                    Ok(json!({ "ok": true, "msg": msg }))
+                }
+                "storage.update" => {
+                    let uri = req_str(a, "uri")?;
+                    let msg = crate::pg_store::registry_update(&rt.base, &name, &uri)?;
+                    Ok(json!({ "ok": true, "msg": msg }))
+                }
+                "storage.remove" => {
+                    let msg = crate::pg_store::registry_remove(&spec, &rt.base, &name)?;
+                    Ok(json!({ "ok": true, "msg": msg }))
+                }
+                // The deletion preview: affected views + node/ref counts +
+                // the grovefs_refs consistency scan. Read-only, so an
+                // operator-facing call the dialog runs before ANY confirm.
+                "storage.preview" => {
+                    let mut v = crate::pg_store::remove_preview(&spec, &name)?;
+                    if let Some(p) = v.as_object_mut() {
+                        p.insert("managed".into(), json!(true));
+                    }
+                    Ok(v)
+                }
+                "storage.set_control" => {
+                    let msg = crate::pg_store::set_control(&rt.base, &name)?;
+                    Ok(json!({ "ok": true, "msg": msg, "restartRequired": true }))
+                }
+                // One view off one instance onto another — the verb the
+                // console loops over to empty an instance before deleting
+                // it. `move_view` flips the placement row last, so a failed
+                // copy changes nothing; a COMPLETED move must still evict
+                // this server's cached engine, or a live mount keeps writing
+                // to the retired source schema (EIO at best, a split tree
+                // at worst). Mounted sessions on OTHER machines follow the
+                // same flip on their next resolve.
+                "storage.relocate" => {
+                    let view = req_str(a, "view")?;
+                    let to = req_str(a, "to")?;
+                    let keep = a
+                        .get("keepSource")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    // The same guard the CLI's `view move` runs: a mount on
+                    // THIS host keeps its pooled connection to the source
+                    // schema open across the flip — move it after unmount.
+                    // Sessions on other machines re-resolve per op, and the
+                    // reply states what this server cannot see.
+                    if let Some(mp) = mounted_here(&view) {
+                        return Err(format!(
+                            "view '{view}' is mounted on this host at {mp} — unmount it before relocating, or the mount keeps writing to the source schema"
+                        ));
+                    }
+                    let rep = crate::pg_store::relocate(&spec, &view, &to, keep)?;
+                    // A COMPLETED move must drop this server's cached engine
+                    // (and the lenses built on it), or a later op on a warm
+                    // mount writes into the retired source schema. In-flight
+                    // ops keep their own Arc clones — the reopen path is the
+                    // same one HA/fence eviction already exercises.
+                    let evicted = evict_group(rt, &view);
+                    Ok(json!({
+                        "ok": true,
+                        "move": rep,
+                        "evicted": evicted,
+                        "note": if evicted > 0 {
+                            "this server's cached engines for the view were dropped, so the next op re-opens on the target"
+                        } else {
+                            "no cached engine for the view needed dropping here; mounts on OTHER machines follow the placement row on their next resolve"
+                        },
+                    }))
+                }
+                _ => unreachable!("the arm's op set is exact"),
+            }
+        }
         // The console's own plane: sign-in identity, accounts and their base-view
         // delegation, and the per-view detail page. Every one of these is judged
         // by `gates` above, exactly like the view verbs.
@@ -2933,7 +3108,7 @@ fn control_dispatch(
         | "account.disable" | "account.delete" | "grant.list" | "grant.add" | "grant.remove"
         | "view.stats" => web_dispatch(rt, who, op, a),
         other => Err(format!(
-            "unknown control op '{other}' (known: info, store.info, whoami, def.list/get/put/remove, stamp, physical.list/has, fork.has/create/drop/graft, view.create/stats/export/import, view.rm_base, refs.rebuild, gc.scan/apply, apikey.create/list/revoke/delete/rotate/set_ro/update/calls/purge, audit.retention.get/set, account.list/create/passwd/role/disable/delete, grant.list/add/remove)"
+            "unknown control op '{other}' (known: info, store.info, whoami, def.list/get/put/remove, stamp, physical.list/has, fork.has/create/drop/graft, view.create/stats/export/import, view.rm_base, refs.rebuild, gc.scan/apply, apikey.create/list/revoke/delete/rotate/set_ro/update/calls/purge, audit.retention.get/set, storage.add/update/remove/preview/set_control/relocate, account.list/create/passwd/role/disable/delete, grant.list/add/remove)"
         )),
     }
 }
@@ -4150,6 +4325,32 @@ fn evict_idle(rt: &MetaRuntime) -> usize {
         gone += 1;
     }
     gone
+}
+
+/// Evict ONE base view's engine group — the physical entry plus every
+/// derived name (lens/alias/fork) resolved onto it — with no idle check.
+/// Used after a placement flip (`storage.relocate`): the route changed
+/// NOW, so waiting for the sweeper's idle window would keep a warm engine
+/// open against the retired source schema. Mirrors `evict_idle`'s removal
+/// set exactly (cache + the name→provider/base/def maps); in-flight ops
+/// hold their own `Arc` clones and finish safely on the old handle.
+fn evict_group(rt: &MetaRuntime, base: &str) -> usize {
+    let mut cache = rt.cache.lock();
+    let mut views = rt.views.lock();
+    let mut bases = rt.bases.lock();
+    let mut defs = rt.defs.lock();
+    let names: Vec<String> = bases
+        .iter()
+        .filter(|(_, b)| **b == *base)
+        .map(|(n, _)| n.clone())
+        .collect();
+    let had = cache.remove(base).is_some() as usize;
+    for n in names {
+        views.remove(n.as_str());
+        bases.remove(n.as_str());
+        defs.remove(n.as_str());
+    }
+    had
 }
 
 /// Open (or reuse) the authoritative PHYSICAL engine for a base view name.

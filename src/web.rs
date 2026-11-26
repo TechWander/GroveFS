@@ -131,8 +131,13 @@ fn block_for(fails: u32) -> Duration {
 /// Present and worth naming: `view.create` (standing up a base view is exactly
 /// what a management page is for, and the server requires an administrator),
 /// `def.put`/`fork.create` (a delegated account's own lens and fork work), and
-/// the `account.*`/`grant.*` plane. `login` is NOT here — it is its own route,
-/// because it runs before there is a session to authorize with.
+/// the `account.*`/`grant.*` plane. The `storage.*` plane is here for the same
+/// reason `view.create` is: instance registration is the deployment decision an
+/// operator makes WHILE the server runs — the server gates every one of them
+/// `Super`, the guards in `pg_store::registry_*` refuse an unsafe removal (a
+/// control plane, an instance with placed views), and the reply never carries
+/// more authority than the gate already checked. `login` is NOT here — it is
+/// its own route, because it runs before there is a session to authorize with.
 const ALLOWED_OPS: &[&str] = &[
     "info",
     "whoami",
@@ -148,6 +153,12 @@ const ALLOWED_OPS: &[&str] = &[
     "fork.drop",
     "view.create",
     "view.stats",
+    "storage.add",
+    "storage.update",
+    "storage.remove",
+    "storage.preview",
+    "storage.set_control",
+    "storage.relocate",
     "apikey.list",
     "apikey.create",
     "apikey.revoke",
