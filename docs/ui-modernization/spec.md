@@ -184,3 +184,18 @@ pub fn instance_report(spec: &str) -> Result<InstanceReport, String>
 * 风险：响应内含明文数据库密码（按需求保留）。缓解：`store.info` 仅 `Super`；页面提供“隐藏”切换；不写入审计、localStorage 或 URL；除 Storage/ViewDetail 外不重复渲染。
 * 风险：导航第 6 项在 320px 挤压。缓解：<480px 仅图标 + `aria-label`。
 * 回滚：后端仅新增字段与只读函数；前端页面按文件粒度独立，可单独回退 `StoragePage.vue` 与 `PAGES` 条目；`console.css` 一次性替换，保留 git 可回退。
+
+## 6. 追加范围：受管注册表的治理写面（2026-11-26）
+
+用户后续要求把 PG 实例的增删改查从 `instances.conf` 迁至网页端，并为 treedb 提供同款清单管理。
+这将本规格「不改变任何写路径语义」的边界**扩展到受管注册表的写入**，交付记录见
+`verification.md` §5：
+
+- 新增六个 Super 治理 op `storage.{add,update,remove,preview,set_control,relocate}`，同步登记
+  `gates` / dispatch / `ALLOWED_OPS`，默认拒绝与 ACL 一致性测试兜底。
+- 完整守卫流程：删除前必 preview（受影响视图 + node/distinct-ref 计数 + `grovefs_refs` 一致性），
+  非空即拒；控制平面实例须先 `set_control` 两阶段交接（暂存 `@control-pending=`，重启迁移）。
+- treedb 以「清单非路由器」如实建模：卡片无 control、`serving` 标记路由地址，`set_control`/`relocate`
+  如实拒绝，保留实验性标记与「控制平面仍在本地 SQLite」说明。
+- 视图页长列表（>50）有界滚动 + ≤768px 折叠抽屉；滚动条配色统一为主题令牌，修深色档遗留暖米色。
+- 未变项：CSP、产物文件名、`store.info` 仅 Super、非托管注册表仍为只读降级。
