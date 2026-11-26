@@ -1,21 +1,31 @@
 /*
-  GroveFS management console — “field ledger”.
+  GroveFS management console — “field instrument”.
 
   A governance console is an instrument, not a marketing site: the operator
   reads dense tables, compares fingerprints and signs off changes. So the visual
-  language is archival rather than glossy — warm paper, ink, one pine accent,
-  a serif voice for titles and a monospace voice for data. The page is ruled
-  like a ledger, the chrome is a masthead, and every colour carries a meaning.
+  language is archival rather than glossy — a ruled green-grey canvas, white
+  plates with a lit top lip, one pine family graded deep-to-lit, a serif voice
+  for titles, the UI stack for prose and a monospace voice for data. The page is
+  ruled like a ledger, the chrome is a masthead, and every colour carries a
+  meaning.
+
+  Depth is built from four things only, so it stays coherent across sixty rules:
+  a graded surface fill (light at the lip, settling at the base), a stacked
+  shadow (contact + distance, both tinted with the ink hue rather than neutral
+  grey), a 1px inner highlight on the top edge, and one lit pine spine on the
+  objects that are elevated. Nothing on the page floats on blur alone.
 
   Constraints that shaped this file:
     · the gateway's CSP is `'self'` only, so no webfonts, icon CDNs or data:
       images. Display type uses the platform's old-style serif (Iowan, Palatino,
-      Songti) and body type the platform UI stack; icons are inline SVG;
+      Songti, Noto Serif CJK) and body type the platform UI stack; icons are
+      inline SVG; the canvas ruling is a background gradient, not a texture file;
     · every state is also words, not colour alone (`aria-current`, badges with
       text), because an operator may be colour-blind and an audit depends on
       reading the row, not the tint;
     · one :root ladder for colour, type, space, radius, elevation and motion —
-      components reference tokens, so the whole console moves together.
+      components reference tokens, so the whole console moves together, and the
+      dark theme is nothing but a second filling of that same ladder.
 
   Palette roles: paper = surface, ink = text, pine = “you can act here”,
   moss = healthy, ochre = attention, rust = destructive. The four view kinds
@@ -25,42 +35,71 @@
 :root {
   color-scheme: light;
 
-  /* ---- surfaces & line: a neutral instrument canvas, not warm paper ----
-     The console is a working surface: a faint green-grey canvas holds white
-     cards, and the only saturated colour on screen means "you can act here"
-     or a state that needs a decision. */
-  --bg: #f4f6f2;
+  /* ---- surfaces: a layered canvas ----
+     Depth here is honest layering, not blur: a green-grey canvas carries white
+     plates, and a plate carries its own hairline highlight so an edge reads as
+     a machined lip rather than a sticker. The only saturated colour on screen
+     means "you can act here" or a state that needs a decision. */
+  --bg: #e7ebe4;
   --bg-2: #ffffff;
-  --bg-subtle: #f7f9f6;
-  --bg-sunken: #ecefe9;
-  --line: #e2e6df;
-  --line-soft: #eef1ec;
-  --line-strong: #cfd6cc;
+  --bg-3: #fbfcfa;
+  --bg-subtle: #f2f5f1;
+  --bg-sunken: #dfe5dc;
+  --surface: #ffffff;
+  /* Filled with a gradient, so a card is lighter at the lip and settles into
+     the canvas at its base — the direction of the assumed light source. */
+  --surface-grad: linear-gradient(180deg, var(--bg-2) 0%, var(--bg-3) 100%);
+  --line: #dde3d9;
+  --line-soft: #eaeee7;
+  --line-strong: #c6cfc3;
+
+  /* ---- canvas & ruling ----
+     Two cold blooms anchor the page to the top-left, then a 2rem ledger ruling
+     over the whole canvas. It is a background image, not an <img>, so the
+     `'self'` CSP has nothing to refuse and there is no extra request. */
+  --mesh:
+    radial-gradient(70rem 34rem at 8% -22%, rgba(255, 255, 255, 0.95) 0%, rgba(255, 255, 255, 0) 60%),
+    radial-gradient(46rem 26rem at 92% -8%, rgba(15, 107, 79, 0.07) 0%, rgba(15, 107, 79, 0) 62%),
+    var(--bg);
+  --texture: repeating-linear-gradient(
+    180deg,
+    rgba(13, 24, 18, 0.032) 0 1px,
+    transparent 1px 2rem
+  );
 
   /* ---- ink ---- */
-  --fg: #101c16;
-  --fg-dim: #55635a;
+  --fg: #0d1812;
+  --fg-dim: #4f5e55;
   /* Faint is still text, not decoration: at 4.5:1 on the canvas it clears the
      contrast floor for the 11–12px labels, table headers and micro captions it
      carries. */
-  --fg-faint: #6d7a71;
+  --fg-faint: #6a786f;
 
-  /* ---- accent: pine ---- */
+  /* ---- accent: pine, as a ladder rather than one flat green ----
+     A single pine value cannot be both the deep spine and the lit face of a
+     control, so the family gets three rungs and one gradient. Everything that
+     used to be `--accent` still is; the new rungs only add depth to it. */
   --accent: #0f6b4f;
-  --accent-hover: #0b5740;
-  --accent-soft: #e3f0e8;
-  --accent-line: #b7d3c5;
+  --accent-2: #17835f;
+  --accent-3: #4ec396;
+  --accent-hover: #0a5340;
+  --accent-soft: #dcefe5;
+  --accent-line: #a6d2bf;
+  --accent-grad: linear-gradient(135deg, #0b5a42 0%, var(--accent) 46%, #2a9c72 100%);
+  --accent-grad-hover: linear-gradient(135deg, #093f30 0%, var(--accent-hover) 46%, #1f8a64 100%);
+  --accent-ink: #f2fbf6;
+  --gold: #96690f;
 
   /* ---- state ---- */
-  --ok: #26724a;
-  --ok-soft: #e7f1e9;
-  --ok-line: #b9d5c0;
+  --ok: #237a4a;
+  --ok-soft: #e4f1e7;
+  --ok-line: #b3d5ba;
   --warn: #8a5a0b;
-  --warn-soft: #f8efdc;
-  --warn-line: #dfc79a;
+  --warn-soft: #f8eed8;
+  --warn-line: #dcc394;
   --err: #a63a2a;
-  --err-soft: #f9e9e4;
-  --err-line: #e0b8ac;
+  --err-soft: #f9e8e3;
+  --err-line: #dfb4a8;
 
   /* ---- view kinds ---- */
   --k-base: #0f6b4f;
@@ -69,7 +108,7 @@
   --k-lens: #8a5f10;
 
   /* ---- type ladder ---- */
-  --fs-page: clamp(1.75rem, 1.4rem + 1.1vw, 2.25rem);
+  --fs-page: clamp(2rem, 1.55rem + 1.7vw, 2.9rem);
   --fs-section: 1.0625rem;
   --fs-body: 1rem;
   --fs-table: 0.9375rem;
@@ -84,32 +123,56 @@
   --sp-5: 1.25rem;
   --sp-6: 1.75rem;
   --sp-7: 2.5rem;
+  --sp-8: 3.5rem;
 
   /* ---- radius: instruments, not bubbles ---- */
   --r-xs: 6px;
   --r-sm: 8px;
   --r-md: 12px;
   --r-lg: 16px;
+  --r-xl: 20px;
+  --r-pill: 999px;
 
-  /* ---- elevation: soft distance, never a drop shadow ---- */
-  --shadow-xs: 0 1px 2px rgba(16, 28, 22, 0.05);
-  --shadow-sm: 0 1px 2px rgba(16, 28, 22, 0.05), 0 10px 24px -20px rgba(16, 28, 22, 0.35);
-  --shadow-md: 0 1px 2px rgba(16, 28, 22, 0.05), 0 18px 40px -26px rgba(16, 28, 22, 0.35);
-  --shadow-lg: -20px 0 56px rgba(16, 28, 22, 0.16);
+  /* ---- elevation: two stacked shadows plus an inner lip ----
+     One blurred shadow reads as a smudge; a contact shadow, a distance shadow
+     and a 1px inner highlight read as one physical object with an edge. The
+     tint is the ink hue, never neutral grey, so lift stays part of the palette.
+     `--hair` is bolted on top of whichever shadow a plate carries. */
+  --shadow-xs: 0 1px 1px rgba(13, 24, 18, 0.04), 0 1px 2px rgba(13, 24, 18, 0.05);
+  --shadow-sm:
+    0 1px 1px rgba(13, 24, 18, 0.04), 0 2px 4px -1px rgba(13, 24, 18, 0.07),
+    0 14px 26px -16px rgba(13, 24, 18, 0.2);
+  --shadow-md:
+    0 1px 1px rgba(13, 24, 18, 0.04), 0 5px 12px -4px rgba(13, 24, 18, 0.11),
+    0 24px 46px -22px rgba(13, 24, 18, 0.26);
+  --shadow-lg: -26px 0 70px -14px rgba(13, 24, 18, 0.26);
+  --lift: 0 2px 3px rgba(13, 24, 18, 0.05), 0 18px 34px -18px rgba(13, 24, 18, 0.3);
+  --hair: inset 0 1px 0 rgba(255, 255, 255, 0.9);
+  --glow: 0 8px 22px -10px rgba(15, 107, 79, 0.55);
   --ring: 0 0 0 3px rgba(15, 107, 79, 0.18);
 
-  /* ---- motion ---- */
+  /* ---- motion ----
+     Two slower steps and a spring, so an arrival can overshoot a hair instead
+     of sliding on glass. The reduced-motion block at the end still flattens
+     all of it. */
   --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-spring: cubic-bezier(0.22, 1.2, 0.36, 1);
   --dur: 0.2s;
+  --dur-2: 0.32s;
+  --dur-3: 0.55s;
 
   --font-ui:
     system-ui, -apple-system, 'Segoe UI', Roboto, 'PingFang SC', 'Hiragino Sans GB',
     'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif;
-  --font-display: var(--font-ui);
-  /* The sign-in drawing keeps the old archival voice; nothing else does. */
+  /* Three voices, one per kind of information: an old-style serif says "this is
+     a heading", the UI stack says "this is prose", the mono says "this is
+     data". The display voice used to be aliased to the UI stack, which left
+     the console speaking in one register. */
   --font-serif:
     'Iowan Old Style', 'Palatino Linotype', Palatino, 'Songti SC', 'Noto Serif CJK SC', Georgia,
-    serif;
+    'DejaVu Serif', serif;
+  --font-display: var(--font-serif);
   --mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace;
 }
 
@@ -124,22 +187,47 @@
 :root[data-theme='dark'] {
   color-scheme: dark;
 
-  --bg: #0f1512;
-  --bg-2: #171f1a;
-  --bg-subtle: #131a16;
-  --bg-sunken: #0b100e;
-  --line: #263029;
-  --line-soft: #1d2622;
-  --line-strong: #37453c;
+  /* Dark inverts the layering rule instead of the palette: the canvas drops
+     below the lightest it was, and each plate climbs a rung, so depth still
+     reads as height. The hue stays a green-black so the pine accent keeps
+     meaning "you can act here" and moss still reads healthy; a neutral grey
+     canvas would flatten the state colours the operator relies on.
+     `color-scheme` flips native form controls and the scrollbar to match. */
+  --bg: #0b100e;
+  --bg-2: #16201a;
+  --bg-3: #1a251e;
+  --bg-subtle: #131b16;
+  --bg-sunken: #080c0a;
+  --surface: #16201a;
+  --surface-grad: linear-gradient(180deg, var(--bg-3) 0%, var(--bg-2) 100%);
+  --line: #29362f;
+  --line-soft: #1f2924;
+  --line-strong: #3a4a41;
+
+  --mesh:
+    radial-gradient(70rem 34rem at 8% -22%, rgba(56, 82, 68, 0.5) 0%, rgba(56, 82, 68, 0) 60%),
+    radial-gradient(46rem 26rem at 92% -8%, rgba(53, 177, 131, 0.12) 0%, rgba(53, 177, 131, 0) 62%),
+    var(--bg);
+  --texture: repeating-linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.026) 0 1px,
+    transparent 1px 2rem
+  );
 
   --fg: #e6ece7;
   --fg-dim: #9aab9f;
   --fg-faint: #7b8b80;
 
   --accent: #35b183;
-  --accent-hover: #4cc596;
+  --accent-2: #4cc596;
+  --accent-3: #82ddb6;
+  --accent-hover: #5ed3a5;
   --accent-soft: #14312a;
-  --accent-line: #265c48;
+  --accent-line: #2a6450;
+  --accent-grad: linear-gradient(135deg, #1b7a59 0%, var(--accent) 46%, #55c399 100%);
+  --accent-grad-hover: linear-gradient(135deg, #24906a 0%, var(--accent-hover) 46%, #6ad3a8 100%);
+  --accent-ink: #04150e;
+  --gold: #d9ad57;
 
   --ok: #4bb377;
   --ok-soft: #132a1d;
@@ -156,23 +244,22 @@
   --k-alias: #4fb8b8;
   --k-lens: #d0a24a;
 
-  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.4);
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4), 0 12px 28px -20px rgba(0, 0, 0, 0.7);
-  --shadow-md: 0 1px 2px rgba(0, 0, 0, 0.4), 0 18px 40px -26px rgba(0, 0, 0, 0.8);
-  --shadow-lg: -20px 0 56px rgba(0, 0, 0, 0.5);
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.45);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.45), 0 14px 28px -18px rgba(0, 0, 0, 0.8);
+  --shadow-md: 0 1px 3px rgba(0, 0, 0, 0.5), 0 24px 46px -22px rgba(0, 0, 0, 0.9);
+  --shadow-lg: -26px 0 70px -14px rgba(0, 0, 0, 0.7);
+  --lift: 0 2px 3px rgba(0, 0, 0, 0.5), 0 18px 34px -18px rgba(0, 0, 0, 0.85);
+  /* On a dark plate the lip catches a little light rather than a lot. */
+  --hair: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  --glow: 0 8px 22px -10px rgba(53, 177, 131, 0.5);
   --ring: 0 0 0 3px rgba(53, 177, 131, 0.32);
 }
 
-/* The canvas, header and selection are the three places that hardcoded a light
-   value instead of a token; override them for dark rather than re-plumbing the
-   gradient shorthand everywhere. */
-:root[data-theme='dark'] body {
-  background:
-    radial-gradient(64rem 30rem at 12% -18%, #1a241e 0%, rgba(26, 36, 30, 0) 62%),
-    var(--bg);
-}
+/* The header and selection are the two places that still hardcoded a light
+   value; they read the tokens now, so only the translucent masthead needs an
+   explicit dark figure. */
 :root[data-theme='dark'] header {
-  background: rgba(20, 27, 23, 0.9);
+  background: rgba(19, 26, 22, 0.82);
 }
 :root[data-theme='dark'] ::selection {
   background: #235240;
@@ -224,9 +311,11 @@
 
 body {
   margin: 0;
-  background:
-    radial-gradient(64rem 30rem at 12% -18%, #ffffff 0%, rgba(255, 255, 255, 0) 62%),
-    var(--bg);
+  /* A ruled canvas anchored to the viewport: the bloom stays where the operator
+     is looking instead of stretching down a long table, and the 2rem ruling
+     gives the whole page a measure to be read against. */
+  background: var(--texture), var(--mesh);
+  background-attachment: fixed, fixed;
   color: var(--fg);
   font: var(--fs-body) / 1.6 var(--font-ui);
   -webkit-font-smoothing: antialiased;
@@ -520,10 +609,10 @@ td,
 
 /* ================================================================ chrome ==== */
 
-/* A masthead: a 3px pine spine, paper, and tabs whose active state is a rule
-   on the baseline rather than a floating pill. The numbered tabs are the
-   console's one decorative signature — they read like a ledger's section
-   markers and cost nothing at runtime. */
+/* A masthead: a lit pine spine, a translucent bar that casts an edge onto the
+   page beneath it, and tabs whose active state is a solid chip rather than a
+   tint. The numbered tabs are the console's one decorative signature — they read
+   like a ledger's section markers and cost nothing at runtime. */
 header {
   position: sticky;
   top: 0;
@@ -531,19 +620,24 @@ header {
   display: flex;
   align-items: stretch;
   gap: var(--sp-5);
-  height: 3.9rem;
+  height: 4.25rem;
   padding: 0 clamp(1rem, 3vw, 2rem);
-  background: rgba(255, 255, 255, 0.92);
-  -webkit-backdrop-filter: blur(14px) saturate(130%);
-  backdrop-filter: blur(14px) saturate(130%);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.97) 0%, rgba(250, 252, 249, 0.88) 100%);
+  -webkit-backdrop-filter: blur(16px) saturate(150%);
+  backdrop-filter: blur(16px) saturate(150%);
   border-bottom: 1px solid var(--line);
+  box-shadow:
+    0 1px 0 rgba(13, 24, 18, 0.03),
+    0 14px 28px -24px rgba(13, 24, 18, 0.55);
 }
 header::before {
   content: '';
   position: absolute;
   inset: 0 0 auto 0;
-  height: 2px;
-  background: linear-gradient(90deg, var(--accent), #2f8f6b 55%, transparent);
+  height: 3px;
+  /* The spine lights up from the brand end and dies out past the tabs, so the
+     eye enters the bar at the left rather than reading a rule of one weight. */
+  background: linear-gradient(90deg, #0a5140 0%, var(--accent) 24%, var(--accent-3) 62%, rgba(78, 195, 150, 0) 96%);
 }
 .brand {
   display: inline-flex;
@@ -553,21 +647,22 @@ header::before {
   padding-right: var(--sp-4);
   border-right: 1px solid var(--line);
   font-family: var(--font-display);
-  font-size: 1.2rem;
-  font-weight: 700;
-  letter-spacing: -0.025em;
+  font-size: 1.34rem;
+  font-weight: 600;
+  letter-spacing: -0.028em;
 }
 .brand .logo {
   flex: none;
   border-radius: var(--r-xs);
+  box-shadow: var(--shadow-xs);
 }
 
-/* Tabs, as pills on the bar. The current page is a filled chip AND
+/* Tabs, as chips on the bar. The current page is a filled chip AND
    `aria-current`, because the tint alone is not an announcement. */
 nav {
   display: flex;
   align-items: center;
-  gap: 2px;
+  gap: 0.2rem;
   flex: 0 1 auto;
   min-width: 0;
   overflow-x: auto;
@@ -583,10 +678,10 @@ nav button {
   display: inline-flex;
   align-items: center;
   gap: 0.42rem;
-  height: 2.2rem;
-  padding: 0 0.72rem;
-  border: 0;
-  border-radius: var(--r-sm);
+  height: 2.35rem;
+  padding: 0 0.8rem;
+  border: 1px solid transparent;
+  border-radius: var(--r-pill);
   background: transparent;
   color: var(--fg-dim);
   font-family: inherit;
@@ -596,7 +691,9 @@ nav button {
   scroll-snap-align: start;
   transition:
     color var(--dur) var(--ease),
-    background var(--dur) var(--ease);
+    background var(--dur) var(--ease),
+    border-color var(--dur) var(--ease),
+    box-shadow var(--dur) var(--ease);
 }
 nav button .idx {
   font-family: var(--mono);
@@ -612,24 +709,29 @@ nav button svg {
 }
 nav button:hover {
   background: var(--bg-subtle);
+  border-color: var(--line);
   color: var(--fg);
 }
 nav button:hover svg,
 nav button:hover .idx {
   opacity: 1;
-  color: var(--fg);
+  color: var(--fg-dim);
 }
 nav button.on {
-  background: var(--accent-soft);
-  color: var(--accent);
-  font-weight: 650;
+  background: var(--accent-grad);
+  border-color: transparent;
+  color: var(--accent-ink);
+  font-weight: 620;
+  box-shadow:
+    var(--glow),
+    inset 0 1px 0 rgba(255, 255, 255, 0.2);
 }
 nav button.on svg {
   opacity: 1;
-  color: var(--accent);
+  color: var(--accent-ink);
 }
 nav button.on .idx {
-  color: var(--accent);
+  color: var(--accent-3);
 }
 nav button:focus-visible {
   outline: 2px solid var(--accent);
@@ -643,13 +745,19 @@ nav button:focus-visible {
   margin-left: auto;
   min-width: 0;
 }
+/* The signed-in identity is a plate, not loose text: an operator scanning the
+   bar needs to find "which account am I acting as" in one flicker. */
 #who-account {
   max-width: 12rem;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  padding: 0.3rem 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  background: var(--bg-2);
   font-family: var(--mono);
-  font-size: var(--fs-label);
+  font-size: var(--fs-micro);
   font-weight: 600;
   letter-spacing: -0.01em;
 }
@@ -691,10 +799,11 @@ main:focus {
   transform: translateY(-200%);
   padding: 0.55rem 0.9rem;
   border-radius: var(--r-sm);
-  background: var(--accent);
-  color: #fbf9f3;
+  background: var(--accent-grad);
+  color: var(--accent-ink);
   font: 600 var(--fs-label) / 1 var(--font-ui);
   text-decoration: none;
+  box-shadow: var(--shadow-md);
   transition: transform var(--dur) var(--ease);
 }
 .skip-link:focus-visible {
@@ -722,9 +831,10 @@ main:focus {
   opacity: 0;
 }
 
-/* One serif title and a rule: the page opens like a section of a printed
+/* One serif title and a fading rule: the page opens like a section of a printed
    ledger, and every `.bar` below it stays a smaller, in-page heading. */
 .page-head {
+  position: relative;
   display: flex;
   align-items: flex-end;
   gap: var(--sp-4);
@@ -732,6 +842,18 @@ main:focus {
   padding-bottom: var(--sp-5);
   border-bottom: 1px solid var(--line);
   flex-wrap: wrap;
+}
+/* The rule under a page title carries one weight only for part of its width:
+   it starts lit at the pine end and fades out, which gives the heading block a
+   corner to sit in instead of an even hairline across the whole screen. */
+.page-head::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  bottom: -1px;
+  width: min(24rem, 45%);
+  height: 2px;
+  background: linear-gradient(90deg, var(--accent) 0%, var(--accent-3) 50%, rgba(78, 195, 150, 0) 100%);
 }
 .page-head .ph-t {
   min-width: 0;
@@ -743,31 +865,32 @@ main:focus {
   display: flex;
   align-items: center;
   gap: 0.55rem;
-  margin: 0 0 0.6rem;
+  margin: 0 0 0.7rem;
   color: var(--accent);
   font-family: var(--mono);
   font-size: 0.6875rem;
   font-weight: 600;
-  letter-spacing: 0.16em;
+  letter-spacing: 0.18em;
   text-transform: uppercase;
 }
 .page-head .ph-kicker::before {
   content: '';
-  width: 1.75rem;
+  width: 1.9rem;
   height: 2px;
-  background: var(--accent);
+  border-radius: var(--r-pill);
+  background: linear-gradient(90deg, var(--accent), var(--accent-3));
 }
 .page-head h2 {
   margin: 0;
   font-family: var(--font-display);
   font-size: var(--fs-page);
   font-weight: 600;
-  letter-spacing: -0.025em;
-  line-height: 1.05;
+  letter-spacing: -0.03em;
+  line-height: 1.02;
 }
 .page-head .ph-t .muted {
   margin: var(--sp-3) 0 0;
-  max-width: 72ch;
+  max-width: 68ch;
   font-size: var(--fs-table);
   line-height: 1.6;
 }
@@ -782,21 +905,23 @@ main:focus {
 /* The refresh verb beside a page title reads as a secondary button, not a link
    lost in the heading. */
 .page-head .ph-a button.link {
-  padding: 0.4rem 0.85rem;
+  padding: 0.42rem 0.9rem;
   border: 1px solid var(--line);
-  border-radius: var(--r-sm);
-  background: var(--bg-2);
+  border-radius: var(--r-pill);
+  background: var(--surface-grad);
   color: var(--fg-dim);
   text-decoration: none;
   font-family: var(--mono);
   font-size: var(--fs-micro);
   letter-spacing: 0.06em;
   text-transform: uppercase;
+  box-shadow: var(--shadow-xs);
 }
 .page-head .ph-a button.link:hover {
   border-color: var(--accent-line);
   background: var(--accent-soft);
   color: var(--accent);
+  box-shadow: var(--shadow-sm);
 }
 
 .bar {
@@ -804,8 +929,8 @@ main:focus {
   align-items: baseline;
   gap: var(--sp-3);
   flex-wrap: wrap;
-  margin: var(--sp-6) 0 var(--sp-3);
-  padding-bottom: 0.45rem;
+  margin: var(--sp-7) 0 var(--sp-3);
+  padding-bottom: 0.5rem;
   border-bottom: 1px solid var(--line-soft);
 }
 .bar:first-child {
@@ -814,8 +939,11 @@ main:focus {
 .bar h2,
 .bar h3 {
   margin: 0;
-  padding-left: 0.6rem;
+  padding-left: 0.65rem;
   border-left: 3px solid var(--accent);
+  /* The spine is graded top-to-bottom, so an in-page heading matches the lit
+     masthead rather than introducing a fourth green. */
+  border-image: linear-gradient(180deg, var(--accent), var(--accent-3)) 1;
   font-family: var(--font-display);
   font-size: 1.32rem;
   font-weight: 600;
@@ -831,23 +959,26 @@ main:focus {
 .cards {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: var(--sp-4);
+  gap: var(--sp-5);
 }
 .card {
   position: relative;
   display: grid;
   align-content: start;
   gap: 0.3rem;
-  min-height: 7.75rem;
+  min-height: 8.25rem;
   padding: var(--sp-5);
-  background: var(--bg-2);
+  background: var(--surface-grad);
   border: 1px solid var(--line);
-  border-radius: var(--r-md);
-  box-shadow: var(--shadow-sm);
+  border-radius: var(--r-lg);
+  /* A plate, not a sticker: distance shadow plus a 1px inner lip at the top. */
+  box-shadow:
+    var(--shadow-sm),
+    var(--hair);
   overflow: hidden;
   transition:
-    transform var(--dur) var(--ease),
-    box-shadow var(--dur) var(--ease),
+    transform var(--dur-2) var(--ease-out),
+    box-shadow var(--dur-2) var(--ease-out),
     border-color var(--dur) var(--ease);
 }
 .card .k {
@@ -855,17 +986,17 @@ main:focus {
   font-family: var(--mono);
   font-size: 0.6875rem;
   font-weight: 500;
-  letter-spacing: 0.11em;
+  letter-spacing: 0.12em;
   text-transform: uppercase;
 }
 .card .n {
-  margin-top: 0.15rem;
+  margin-top: 0.2rem;
   color: var(--fg);
   font-family: var(--font-display);
-  font-size: 2.15rem;
+  font-size: 2.6rem;
   font-weight: 600;
-  line-height: 1.05;
-  letter-spacing: -0.03em;
+  line-height: 1;
+  letter-spacing: -0.035em;
 }
 /* A card whose value is a NAME (a backend, an account), not a count: the
    figure size belongs to numbers, so text steps down to heading size. */
@@ -878,29 +1009,31 @@ main:focus {
   letter-spacing: -0.01em;
   word-break: break-word;
 }
-/* The caption sits on the card's baseline, so a row of cards reads as one
-   band even when the values above it differ in height. */
+/* The caption sits on the card's baseline behind its own rule, so a row of
+   cards reads as one band even when the values above it differ in height. */
 .card .s {
   margin-top: auto;
-  padding-top: var(--sp-2);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--line-soft);
   font-size: var(--fs-label);
   color: var(--fg-dim);
   line-height: 1.45;
 }
 
-/* A 2px cap in a STATE hue, only where the card is reporting a state. */
+/* A 3px cap in a STATE hue, graded so it reads as light leaking over the top
+   edge rather than a sticker; only where the card is reporting a state. */
 .card.ok::before,
 .card.warn::before {
   content: '';
   position: absolute;
   inset: 0 0 auto 0;
-  height: 2px;
+  height: 3px;
 }
 .card.ok::before {
-  background: var(--ok);
+  background: linear-gradient(90deg, var(--ok), var(--ok-line) 70%, rgba(179, 213, 186, 0));
 }
 .card.warn::before {
-  background: var(--warn);
+  background: linear-gradient(90deg, var(--warn), var(--warn-line) 70%, rgba(220, 195, 148, 0));
 }
 .card.ok .n {
   color: var(--ok);
@@ -912,14 +1045,16 @@ main:focus {
 .card.link-card {
   cursor: pointer;
 }
-/* Hover lifts the plate and prints a 4px offset — the one “physical” gesture in
-   the console, reserved for the cards that actually navigate. */
+/* Hover lifts the plate and prints a hard offset — the one “physical” gesture in
+   the console, reserved for the cards that actually navigate. The offset sits
+   under a real drop shadow, so it reads as thickness rather than decoration. */
 .card.link-card:hover {
-  transform: translate(-1px, -2px);
+  transform: translate(-2px, -3px);
   border-color: var(--accent-line);
   box-shadow:
-    4px 4px 0 var(--accent-soft),
-    var(--shadow-sm);
+    5px 6px 0 -1px var(--accent-soft),
+    var(--lift),
+    var(--hair);
 }
 .card.link-card::after {
   content: '→';
@@ -932,7 +1067,14 @@ main:focus {
   transform: translateX(-4px);
   transition:
     opacity var(--dur) var(--ease),
-    transform var(--dur) var(--ease);
+    transform var(--dur-2) var(--ease-out);
+}
+/* Pressing a card that navigates should feel like committing to it. */
+.card.link-card:active {
+  transform: translate(0, 0);
+  box-shadow:
+    var(--shadow-xs),
+    var(--hair);
 }
 .card.link-card:hover::after,
 .card.link-card:focus-visible::after {
@@ -946,49 +1088,61 @@ button {
   font: inherit;
   font-size: var(--fs-table);
   line-height: 1.2;
-  height: 2.125rem;
-  padding: 0 0.85rem;
-  border-radius: var(--r-sm);
+  height: 2.25rem;
+  padding: 0 0.95rem;
+  border-radius: var(--r-md);
   border: 1px solid var(--line);
-  background: var(--bg-2);
+  background: var(--surface-grad);
   color: var(--fg);
   cursor: pointer;
+  box-shadow:
+    var(--shadow-xs),
+    var(--hair);
   transition:
     background var(--dur) var(--ease),
     border-color var(--dur) var(--ease),
     color var(--dur) var(--ease),
-    box-shadow var(--dur) var(--ease),
+    box-shadow var(--dur-2) var(--ease-out),
     transform var(--dur) var(--ease);
 }
 button:hover:not(:disabled) {
   background: var(--bg-subtle);
   border-color: var(--line-strong);
+  box-shadow:
+    var(--shadow-sm),
+    var(--hair);
 }
 button:active:not(:disabled) {
   transform: translateY(1px);
+  box-shadow: var(--shadow-xs);
 }
 button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
 
-/* The primary verb is printed on pine stock: a solid block with a 2px offset
-   edge that presses in on hover and flattens on click. */
+/* The primary verb is printed on graded pine stock: a lit face, a hard offset
+   edge that reads as thickness, and a soft pine glow so the eye lands on the
+   action first. It presses flat on click. */
 button.primary {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: #fbf9f3;
-  font-weight: 600;
-  box-shadow: 2px 2px 0 var(--accent-line);
+  background: var(--accent-grad);
+  border-color: transparent;
+  color: var(--accent-ink);
+  font-weight: 620;
+  box-shadow:
+    2px 2px 0 var(--accent-line),
+    var(--glow);
 }
 button.primary:hover:not(:disabled) {
-  background: var(--accent-hover);
-  border-color: var(--accent-hover);
-  box-shadow: 3px 3px 0 var(--accent-line);
+  background: var(--accent-grad-hover);
+  border-color: transparent;
+  box-shadow:
+    3px 3px 0 var(--accent-line),
+    var(--glow);
 }
 button.primary:active:not(:disabled) {
   box-shadow: 0 0 0 var(--accent-line);
-  transform: translate(1px, 1px);
+  transform: translate(2px, 2px);
 }
 
 button.danger {
@@ -1005,12 +1159,14 @@ button.link {
   padding: 0 0.1rem;
   border-color: transparent;
   background: none;
+  box-shadow: none;
   color: var(--accent);
   text-decoration: none;
 }
 button.link:hover:not(:disabled) {
   background: none;
   border-color: transparent;
+  box-shadow: none;
   color: var(--accent-hover);
   text-decoration: underline;
 }
@@ -1019,16 +1175,18 @@ button.link:hover:not(:disabled) {
    does not compete with the primary verb of the page. */
 button.mini {
   height: auto;
-  padding: 0.16rem 0.34rem;
+  padding: 0.18rem 0.4rem;
   border-color: transparent;
   background: none;
+  box-shadow: none;
   color: var(--accent);
   font-size: var(--fs-label);
-  border-radius: 6px;
+  border-radius: var(--r-xs);
 }
 button.mini:hover:not(:disabled) {
   background: var(--accent-soft);
   border-color: transparent;
+  box-shadow: none;
   text-decoration: none;
 }
 button.mini.danger {
@@ -1044,16 +1202,19 @@ select,
 textarea {
   font: inherit;
   font-size: var(--fs-table);
-  height: 2.125rem;
+  height: 2.25rem;
   background: var(--bg-2);
   color: var(--fg);
   border: 1px solid var(--line-strong);
-  border-radius: var(--r-sm);
-  padding: 0 0.65rem;
+  border-radius: var(--r-md);
+  padding: 0 0.7rem;
   min-width: 0;
+  /* A field is dug into the plate, so it catches a shadow on its own top edge
+     instead of floating above it like a button does. */
+  box-shadow: inset 0 1px 2px rgba(13, 24, 18, 0.05);
   transition:
     border-color var(--dur) var(--ease),
-    box-shadow var(--dur) var(--ease);
+    box-shadow var(--dur-2) var(--ease-out);
 }
 select {
   padding-right: 0.5rem;
@@ -1062,7 +1223,7 @@ select {
 textarea {
   height: auto;
   min-height: 7rem;
-  padding: 0.55rem 0.65rem;
+  padding: 0.55rem 0.7rem;
   font-family: var(--mono);
   font-size: 0.875rem;
   line-height: 1.6;
@@ -1079,14 +1240,16 @@ textarea::placeholder {
 input:hover,
 select:hover,
 textarea:hover {
-  border-color: var(--line-strong);
+  border-color: var(--accent-line);
 }
 input:focus,
 select:focus,
 textarea:focus {
   outline: none;
   border-color: var(--accent);
-  box-shadow: var(--ring);
+  box-shadow:
+    var(--ring),
+    inset 0 1px 2px rgba(13, 24, 18, 0.04);
 }
 input:disabled,
 select:disabled,
@@ -1116,8 +1279,8 @@ input[type='file']::file-selector-button {
   margin-right: 0.6rem;
   padding: 0.25rem 0.6rem;
   border: 1px solid var(--line-strong);
-  border-radius: var(--r-xs);
-  background: var(--bg-subtle);
+  border-radius: var(--r-sm);
+  background: var(--surface-grad);
   color: var(--fg);
   font: inherit;
   font-size: var(--fs-label);
@@ -1133,10 +1296,12 @@ input[type='file']::file-selector-button {
   align-items: start;
   padding: var(--sp-5);
   margin-bottom: var(--sp-4);
-  background: var(--bg-2);
+  background: var(--surface-grad);
   border: 1px solid var(--line);
-  border-radius: var(--r-md);
-  box-shadow: var(--shadow-sm);
+  border-radius: var(--r-lg);
+  box-shadow:
+    var(--shadow-sm),
+    var(--hair);
 }
 /* One labelled control: label above, control under it, its quiet sentence
    under that. Declared for the whole console rather than inside `.panel`, as
@@ -1207,12 +1372,12 @@ input[type='file']::file-selector-button {
   font-family: var(--mono);
   font-size: 0.6875rem;
   font-weight: 600;
-  letter-spacing: 0.11em;
+  letter-spacing: 0.12em;
   text-transform: uppercase;
   color: var(--fg-dim);
-  background: var(--bg-subtle);
+  background: linear-gradient(180deg, var(--bg-subtle) 0%, var(--bg-3) 100%);
   border-bottom: 1px solid var(--line);
-  border-radius: var(--r-md) var(--r-md) 0 0;
+  border-radius: var(--r-lg) var(--r-lg) 0 0;
 }
 /* A bare sentence in a panel spans the grid; the verbs live in `.panel-foot`. */
 .panel > .muted {
@@ -1232,16 +1397,21 @@ input[type='file']::file-selector-button {
   grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
 }
 
-/* The one-time secret: the highest-value moment on the keys page. */
+/* The one-time secret: the highest-value moment on the keys page, so it is the
+   one panel on the page that is tinted all the way through and lit on the left. */
 .secret-card {
   display: flex;
   align-items: center;
   gap: var(--sp-3);
-  background: var(--accent-soft);
+  background: linear-gradient(120deg, var(--accent-soft) 0%, var(--bg-2) 100%);
   border: 1px solid var(--accent-line);
-  border-radius: var(--r-sm);
-  padding: 0.65rem 0.8rem;
+  border-left: 3px solid var(--accent);
+  border-radius: var(--r-md);
+  padding: 0.75rem 0.9rem;
   margin: var(--sp-3) 0;
+  box-shadow:
+    var(--shadow-xs),
+    var(--hair);
 }
 .secret-card .secret {
   margin: 0;
@@ -1252,15 +1422,17 @@ input[type='file']::file-selector-button {
 }
 .secret-card button.link {
   flex: none;
-  padding: 0.25rem 0.6rem;
+  padding: 0.25rem 0.65rem;
   border: 1px solid var(--accent-line);
-  border-radius: 6px;
+  border-radius: var(--r-pill);
   background: var(--bg-2);
+  box-shadow: var(--shadow-xs);
   font-size: var(--fs-label);
   text-decoration: none;
 }
 .secret-card button.link:hover {
-  background: #fff;
+  background: var(--bg-2);
+  border-color: var(--accent);
   text-decoration: none;
 }
 .copy-probe {
@@ -1274,12 +1446,14 @@ input[type='file']::file-selector-button {
 /* ---- filter bar ---- */
 
 .filterbar {
-  background: var(--bg-2);
+  background: var(--surface-grad);
   border: 1px solid var(--line);
-  border-radius: var(--r-sm);
-  padding: var(--sp-3) var(--sp-4);
-  margin-bottom: var(--sp-3);
-  box-shadow: var(--shadow-xs);
+  border-radius: var(--r-lg);
+  padding: var(--sp-4);
+  margin-bottom: var(--sp-4);
+  box-shadow:
+    var(--shadow-sm),
+    var(--hair);
 }
 .filterbox {
   display: flex;
@@ -1357,21 +1531,23 @@ input[type='file']::file-selector-button {
   display: inline-flex;
   align-items: center;
   gap: 0.35rem;
-  height: 1.9rem;
-  padding: 0 0.65rem;
-  border-radius: var(--r-xs);
+  height: 1.95rem;
+  padding: 0 0.7rem;
+  border-radius: var(--r-pill);
   border: 1px solid var(--line);
-  background: var(--bg-2);
+  background: var(--surface-grad);
   color: var(--fg-dim);
   font-family: var(--font-ui);
   font-size: var(--fs-label);
   white-space: nowrap;
   cursor: pointer;
+  box-shadow: var(--shadow-xs);
   transition:
     background var(--dur) var(--ease),
     color var(--dur) var(--ease),
     border-color var(--dur) var(--ease),
-    box-shadow var(--dur) var(--ease);
+    box-shadow var(--dur) var(--ease),
+    transform var(--dur) var(--ease);
 }
 .chip::before {
   content: '';
@@ -1380,6 +1556,7 @@ input[type='file']::file-selector-button {
   border-radius: 50%;
   background: var(--line-strong);
   flex: none;
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.6);
 }
 .chip.dotless::before {
   content: none;
@@ -1402,7 +1579,8 @@ input[type='file']::file-selector-button {
 .chip:hover {
   border-color: var(--accent-line);
   color: var(--accent);
-  background: var(--bg-subtle);
+  background: var(--accent-soft);
+  transform: translateY(-1px);
 }
 .chip .c-sub {
   opacity: 0.65;
@@ -1411,16 +1589,20 @@ input[type='file']::file-selector-button {
   font-variant-numeric: tabular-nums;
 }
 .chip.on {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: #fbf9f3;
-  font-weight: 600;
+  background: var(--accent-grad);
+  border-color: transparent;
+  color: var(--accent-ink);
+  font-weight: 620;
+  box-shadow:
+    var(--shadow-sm),
+    inset 0 1px 0 rgba(255, 255, 255, 0.2);
 }
 .chip.on::before {
-  background: #d9e8df;
+  background: var(--accent-3);
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.28);
 }
 .chip.on .c-sub {
-  opacity: 0.8;
+  opacity: 0.85;
 }
 
 /* ---- busy & waiting ---- */
@@ -1472,7 +1654,7 @@ label.check input {
   overflow-x: auto;
   -webkit-overflow-scrolling: touch;
   border: 1px solid var(--line);
-  border-radius: var(--r-md);
+  border-radius: var(--r-lg);
   background-color: var(--bg-2);
   background-image:
     linear-gradient(to right, var(--bg-2) 40%, rgba(251, 249, 243, 0)),
@@ -1491,7 +1673,9 @@ label.check input {
     1.5rem 100%;
   background-repeat: no-repeat;
   background-attachment: local, local, scroll, scroll;
-  box-shadow: var(--shadow-sm);
+  box-shadow:
+    var(--shadow-sm),
+    var(--hair);
   overscroll-behavior-x: contain;
 }
 table {
@@ -1502,7 +1686,7 @@ table {
 th,
 td {
   text-align: left;
-  padding: 0.68rem 0.8rem;
+  padding: 0.72rem 0.85rem;
   border-bottom: 1px solid var(--line-soft);
   vertical-align: middle;
 }
@@ -1510,28 +1694,28 @@ td {
    looks pasted against the rounded frame. */
 th:first-child,
 td:first-child {
-  padding-left: 1rem;
+  padding-left: 1.1rem;
 }
 th:last-child,
 td:last-child {
-  padding-right: 1rem;
+  padding-right: 1.1rem;
 }
 th {
   color: var(--fg-faint);
   font-family: var(--mono);
-  font-weight: 500;
+  font-weight: 600;
   font-size: 0.6875rem;
   text-transform: uppercase;
-  letter-spacing: 0.11em;
+  letter-spacing: 0.12em;
   white-space: nowrap;
-  background: var(--bg-subtle);
+  background: linear-gradient(180deg, var(--bg-3) 0%, var(--bg-subtle) 100%);
   border-bottom: 1px solid var(--line-strong);
 }
 tbody tr {
   transition: background var(--dur) var(--ease);
 }
 tbody tr:nth-child(even) {
-  background: rgba(23, 33, 28, 0.014);
+  background: rgba(13, 24, 18, 0.016);
 }
 tbody tr:hover {
   background: var(--bg-subtle);
@@ -1541,8 +1725,10 @@ tbody tr:last-child td {
 }
 tbody tr.cur,
 tbody tr.cur:hover {
-  background: var(--accent-soft);
-  box-shadow: inset 2px 0 0 var(--accent);
+  /* The tint fades along the row, so the 3px spine at its left is where the
+     selection starts rather than the whole row glowing at once. */
+  background: linear-gradient(90deg, var(--accent-soft) 0%, transparent 78%);
+  box-shadow: inset 3px 0 0 var(--accent);
 }
 tbody tr.click {
   cursor: pointer;
@@ -1600,9 +1786,9 @@ td.empty svg {
   display: inline-flex;
   align-items: center;
   gap: 0.3rem;
-  padding: 0.12rem 0.45rem;
+  padding: 0.14rem 0.5rem;
   border: 1px solid var(--line);
-  border-radius: var(--r-xs);
+  border-radius: var(--r-pill);
   background: var(--bg-2);
   color: var(--fg-dim);
   font-family: var(--mono);
@@ -1611,6 +1797,7 @@ td.empty svg {
   line-height: 1.5;
   letter-spacing: 0.02em;
   white-space: nowrap;
+  box-shadow: var(--shadow-xs);
 }
 .badge.admin {
   color: var(--warn);
@@ -1750,8 +1937,8 @@ button.count-pill:hover {
   color: var(--fg-faint);
   font-family: var(--mono);
   font-size: 0.6875rem;
-  font-weight: 500;
-  letter-spacing: 0.08em;
+  font-weight: 600;
+  letter-spacing: 0.1em;
   text-transform: uppercase;
   padding-top: 0.15rem;
 }
@@ -1790,9 +1977,10 @@ button.count-pill:hover {
 .import-box {
   padding: var(--sp-4);
   margin-bottom: var(--sp-4);
-  background: var(--bg-subtle);
+  background: var(--bg-sunken);
   border: 1px solid var(--line);
-  border-radius: var(--r-sm);
+  border-radius: var(--r-md);
+  box-shadow: inset 0 1px 2px rgba(13, 24, 18, 0.05);
 }
 .import-grid {
   display: grid;
@@ -2308,10 +2496,10 @@ details.help > .body {
   position: fixed;
   inset: 0;
   z-index: 30;
-  background: rgba(15, 25, 20, 0.4);
-  -webkit-backdrop-filter: blur(2px);
-  backdrop-filter: blur(2px);
-  animation: fade-in 0.16s var(--ease);
+  background: rgba(8, 16, 12, 0.52);
+  -webkit-backdrop-filter: blur(3px) saturate(120%);
+  backdrop-filter: blur(3px) saturate(120%);
+  animation: fade-in 0.2s var(--ease);
 }
 .drawer {
   position: fixed;
@@ -2322,12 +2510,21 @@ details.help > .body {
   width: min(30rem, 100vw);
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
-  background: var(--bg-2);
-  border-left: 1px solid var(--line);
-  border-radius: var(--r-lg) 0 0 var(--r-lg);
-  box-shadow: var(--shadow-lg);
-  animation: slide-in 0.2s var(--ease);
+  background: var(--surface-grad);
+  border-left: 1px solid var(--line-strong);
+  border-radius: var(--r-xl) 0 0 var(--r-xl);
+  box-shadow:
+    var(--shadow-lg),
+    var(--hair);
+  animation: slide-in var(--dur-2) var(--ease-out);
   overflow: hidden;
+}
+.drawer::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 3px;
+  background: var(--accent-grad);
 }
 .drawer .dh {
   display: flex;
@@ -2335,7 +2532,7 @@ details.help > .body {
   gap: var(--sp-2);
   padding: var(--sp-4) var(--sp-5);
   border-bottom: 1px solid var(--line);
-  background: var(--bg-2);
+  background: linear-gradient(180deg, var(--bg-3) 0%, var(--bg-2) 100%);
 }
 .drawer .dh h2 {
   margin: 0;
@@ -2437,21 +2634,34 @@ details.help > .body {
   display: grid;
   place-items: center;
   padding: var(--sp-4);
-  background: rgba(15, 25, 20, 0.46);
-  -webkit-backdrop-filter: blur(3px);
-  backdrop-filter: blur(3px);
-  animation: fade-in 0.16s var(--ease);
+  background: rgba(8, 16, 12, 0.5);
+  -webkit-backdrop-filter: blur(4px) saturate(120%);
+  backdrop-filter: blur(4px) saturate(120%);
+  animation: fade-in 0.2s var(--ease);
 }
 .modal {
+  position: relative;
   width: min(32rem, 100%);
   max-height: 88vh;
   overflow: auto;
-  background: var(--bg-2);
-  border: 1px solid var(--line);
-  border-radius: var(--r-lg);
+  background: var(--surface-grad);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-xl);
   padding: var(--sp-5);
-  box-shadow: var(--shadow-md);
-  animation: pop 0.16s var(--ease);
+  box-shadow:
+    var(--shadow-md),
+    var(--hair);
+  animation: pop var(--dur-2) var(--ease-spring);
+}
+/* The same lit edge the masthead and the drawer wear, so a dialog arriving on
+   top of everything is recognisably the same object at a higher level. */
+.modal::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 3px;
+  border-radius: var(--r-xl) var(--r-xl) 0 0;
+  background: var(--accent-grad);
 }
 .modal h3 {
   margin: 0 0 var(--sp-3);
@@ -2487,17 +2697,19 @@ details.help > .body {
   max-width: min(26rem, calc(100vw - 2rem));
 }
 .toast {
-  background: var(--bg-2);
+  background: var(--surface-grad);
   border: 1px solid var(--line);
   border-left: 3px solid var(--accent);
-  border-radius: var(--r-sm);
-  padding: 0.65rem 0.85rem;
+  border-radius: var(--r-md);
+  padding: 0.7rem 0.9rem;
   font-size: 0.875rem;
   line-height: 1.5;
   white-space: pre-line;
   word-break: break-word;
-  box-shadow: var(--shadow-md);
-  animation: toast-in 0.2s var(--ease);
+  box-shadow:
+    var(--shadow-md),
+    var(--hair);
+  animation: toast-in var(--dur-2) var(--ease-out);
 }
 .toast.bad {
   border-left-color: var(--err);
@@ -2506,41 +2718,41 @@ details.help > .body {
   border-left-color: var(--ok);
 }
 
-/* The overview's figures land one after another, a 20 ms beat apart: the eye
-   follows the row instead of taking eight plates at once. `backwards` (not
-   `both`) is deliberate — once the run is over the animation stops applying,
-   so the hover lift on a link card keeps working. */
+/* The overview's figures land one after another: the eye follows the row instead
+   of taking eight plates at once. `backwards` (not `both`) is deliberate — once
+   the run is over the animation stops applying, so the hover lift on a link card
+   keeps working. */
 @media (prefers-reduced-motion: no-preference) {
   .cards .card {
-    animation: card-in 0.26s var(--ease) backwards;
+    animation: card-in var(--dur-3) var(--ease-out) backwards;
   }
   .cards .card:nth-child(2) {
-    animation-delay: 0.02s;
+    animation-delay: 0.045s;
   }
   .cards .card:nth-child(3) {
-    animation-delay: 0.04s;
+    animation-delay: 0.09s;
   }
   .cards .card:nth-child(4) {
-    animation-delay: 0.06s;
+    animation-delay: 0.135s;
   }
   .cards .card:nth-child(5) {
-    animation-delay: 0.08s;
+    animation-delay: 0.18s;
   }
   .cards .card:nth-child(6) {
-    animation-delay: 0.1s;
+    animation-delay: 0.225s;
   }
   .cards .card:nth-child(7) {
-    animation-delay: 0.12s;
+    animation-delay: 0.27s;
   }
   .cards .card:nth-child(8) {
-    animation-delay: 0.14s;
+    animation-delay: 0.315s;
   }
 }
 
 @keyframes card-in {
   from {
     opacity: 0;
-    transform: translateY(6px);
+    transform: translateY(12px) scale(0.985);
   }
 }
 @keyframes fade-in {
@@ -2550,19 +2762,19 @@ details.help > .body {
 }
 @keyframes pop {
   from {
-    transform: scale(0.97) translateY(4px);
+    transform: scale(0.955) translateY(12px);
     opacity: 0;
   }
 }
 @keyframes slide-in {
   from {
-    transform: translateX(1.5rem);
-    opacity: 0.4;
+    transform: translateX(2.25rem);
+    opacity: 0.3;
   }
 }
 @keyframes toast-in {
   from {
-    transform: translateY(8px) scale(0.98);
+    transform: translateY(14px) scale(0.97);
     opacity: 0;
   }
 }
@@ -2570,6 +2782,255 @@ details.help > .body {
   to {
     transform: rotate(360deg);
   }
+}
+
+/* ==================================================== audit retention bar ==== */
+
+/* The policy strip at the top of the audit page. It is the only element on the
+   console that is tinted pine all the way across at rest, because it answers the
+   question every row below it is read against: "how long is this kept?". Value
+   first, meaning second, controls to the right. */
+.retbar {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--sp-3) var(--sp-5);
+  margin: 0 0 var(--sp-5);
+  padding: var(--sp-4) var(--sp-4) var(--sp-4) calc(var(--sp-5) + 3px);
+  background: linear-gradient(120deg, var(--accent-soft) 0%, var(--bg-2) 46%);
+  border: 1px solid var(--accent-line);
+  border-radius: var(--r-lg);
+  box-shadow:
+    var(--shadow-sm),
+    var(--hair);
+  overflow: hidden;
+}
+.retbar::before {
+  content: '';
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 3px;
+  background: linear-gradient(180deg, var(--accent), var(--accent-3));
+}
+/* A session that may read the policy but not move it loses the pine wash: the
+   strip is then a report, and only a report is allowed to look editable. */
+.retbar.is-read {
+  background: var(--surface-grad);
+  border-color: var(--line);
+}
+.retbar.is-read::before {
+  background: var(--line-strong);
+}
+.retbar-lead {
+  display: flex;
+  align-items: baseline;
+  gap: 0.4rem 0.85rem;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.retbar-k {
+  color: var(--fg-faint);
+  font-family: var(--mono);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+/* The configured window is the loudest word on the page after the title: it is
+   a figure, so it wears the display voice at card weight. */
+.retbar-v {
+  padding: 0.05rem 0.5rem;
+  border-radius: var(--r-sm);
+  background: var(--bg-2);
+  border: 1px solid var(--accent-line);
+  color: var(--accent);
+  font-family: var(--font-display);
+  font-size: 1.5rem;
+  font-weight: 600;
+  line-height: 1.15;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  box-shadow:
+    var(--shadow-xs),
+    var(--hair);
+}
+.retbar.is-read .retbar-v {
+  border-color: var(--line);
+  color: var(--fg);
+}
+.retbar-s {
+  color: var(--fg-dim);
+  font-size: var(--fs-label);
+  line-height: 1.45;
+}
+.retbar-edit {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.retbar-set {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.retbar-input {
+  width: 7.5rem;
+  font-family: var(--mono);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.retbar-chips {
+  display: flex;
+  gap: 0.2rem;
+  flex-wrap: wrap;
+}
+/* Presets live inside an already-raised strip, so they sit flat: no shadow of
+   their own, and a width that keeps six of them on one line. */
+.retbar-chips .chip {
+  height: 1.8rem;
+  padding: 0 0.55rem;
+  box-shadow: none;
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+}
+.retbar-chips .chip:hover {
+  transform: none;
+}
+.retbar-verbs {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+.retbar-load {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--fg-dim);
+  font-family: var(--mono);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.retbar-load select {
+  height: 1.95rem;
+  padding: 0 0.5rem;
+  border-radius: var(--r-pill);
+  font-family: var(--mono);
+  font-size: var(--fs-label);
+  text-transform: none;
+  letter-spacing: 0;
+}
+/* The last action's sentence spans the strip; it is a footnote to the policy,
+   not another control. */
+.retbar-msg {
+  grid-column: 1 / -1;
+  margin: 0;
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--line-soft);
+  font-size: var(--fs-label);
+  line-height: 1.5;
+}
+
+/* =============================================================== pager ==== */
+
+/* The page controls sit under the table they slice, so the reader who has
+   reached the end of a page finds the next one where they stopped looking. */
+.pager {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+  margin: var(--sp-3) 0 var(--sp-5);
+  padding: var(--sp-3) var(--sp-4);
+  background: var(--surface-grad);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  box-shadow:
+    var(--shadow-sm),
+    var(--hair);
+}
+.pager-range {
+  color: var(--fg-dim);
+  font-family: var(--mono);
+  font-size: var(--fs-micro);
+  letter-spacing: 0.04em;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.pager-size {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-left: auto;
+  color: var(--fg-faint);
+  font-family: var(--mono);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.pager-size select {
+  height: 1.95rem;
+  padding: 0 0.5rem;
+  border-radius: var(--r-pill);
+  font-family: var(--mono);
+  font-size: var(--fs-label);
+  letter-spacing: 0;
+  text-transform: none;
+}
+.pager-nav {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+}
+.pager-nav button {
+  height: 1.95rem;
+  min-width: 1.95rem;
+  padding: 0 0.45rem;
+  border-radius: var(--r-pill);
+  font-family: var(--mono);
+  font-size: var(--fs-label);
+  font-variant-numeric: tabular-nums;
+  box-shadow: none;
+}
+.pager-nav button:hover:not(:disabled) {
+  background: var(--accent-soft);
+  border-color: var(--accent-line);
+  color: var(--accent);
+  box-shadow: none;
+}
+.pager-nav .pg-edge {
+  font-size: 1.05rem;
+  line-height: 1;
+  color: var(--fg-dim);
+}
+/* The current page is not merely disabled — it is filled, so it reads as where
+   the reader is even though it cannot be clicked again. */
+.pager-nav .pg-num.on,
+.pager-nav .pg-num.on:disabled {
+  opacity: 1;
+  cursor: default;
+  background: var(--accent-grad);
+  border-color: transparent;
+  color: var(--accent-ink);
+  font-weight: 620;
+  box-shadow:
+    var(--shadow-sm),
+    inset 0 1px 0 rgba(255, 255, 255, 0.2);
+}
+.pg-gap {
+  padding: 0 0.15rem;
+  color: var(--fg-faint);
+  font-family: var(--mono);
 }
 
 /* =========================================================== responsive ==== */
@@ -2586,6 +3047,15 @@ details.help > .body {
   }
   .split {
     grid-template-columns: 1fr;
+  }
+  /* The policy strip stacks: the readout keeps the whole first line and the
+     editing affordances move under it rather than squeezing the window value. */
+  .retbar {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .retbar-edit,
+  .retbar-load {
+    justify-content: flex-start;
   }
 }
 
@@ -2604,6 +3074,19 @@ details.help > .body {
   }
   #view-list.is-collapsed {
     display: none;
+  }
+  .retbar-v {
+    font-size: 1.25rem;
+  }
+  /* The pager has no room for a right-aligned width select: the row count and
+     the page numbers stay, the width control drops to its own line. */
+  .pager {
+    justify-content: center;
+  }
+  .pager-size {
+    margin-left: 0;
+    flex: 1 1 100%;
+    justify-content: space-between;
   }
 }
 
@@ -2831,17 +3314,20 @@ details.help > .body {
   flex-direction: column;
   gap: 0.15rem;
   padding: var(--sp-3) var(--sp-4);
-  background: var(--bg-2);
+  background: var(--surface-grad);
   border: 1px solid var(--line);
   border-radius: var(--r-md);
-  box-shadow: var(--shadow-xs);
+  box-shadow:
+    var(--shadow-xs),
+    var(--hair);
 }
 .sstat-n {
-  font-size: 1.6rem;
-  font-weight: 680;
-  line-height: 1.1;
+  font-family: var(--font-display);
+  font-size: 1.9rem;
+  font-weight: 600;
+  line-height: 1.05;
   font-variant-numeric: tabular-nums;
-  letter-spacing: -0.02em;
+  letter-spacing: -0.03em;
 }
 .sstat-l {
   color: var(--fg-faint);
@@ -2865,13 +3351,14 @@ details.help > .body {
   gap: var(--sp-3);
   flex-wrap: wrap;
   margin: 0 0 var(--sp-4);
-  padding: 0.6rem 0.9rem;
-  background: var(--warn-soft);
+  padding: 0.7rem 0.95rem;
+  background: linear-gradient(120deg, var(--warn-soft) 0%, var(--bg-2) 100%);
   border: 1px solid var(--warn-line);
   border-left: 3px solid var(--warn);
-  border-radius: var(--r-sm);
+  border-radius: var(--r-md);
   color: var(--fg);
   font-size: var(--fs-label);
+  box-shadow: var(--shadow-xs);
 }
 .banner-warn .link {
   margin-left: auto;
@@ -2890,33 +3377,39 @@ details.help > .body {
   gap: var(--sp-3);
   min-width: 0;
   padding: var(--sp-4);
-  background: var(--bg-2);
+  background: var(--surface-grad);
   border: 1px solid var(--line);
-  border-radius: var(--r-md);
-  box-shadow: var(--shadow-xs);
+  border-radius: var(--r-lg);
+  box-shadow:
+    var(--shadow-sm),
+    var(--hair);
   overflow: hidden;
   transition:
-    box-shadow var(--dur) var(--ease),
-    transform var(--dur) var(--ease),
+    box-shadow var(--dur-2) var(--ease-out),
+    transform var(--dur-2) var(--ease-out),
     border-color var(--dur) var(--ease);
 }
-/* A hairline spine at the top of every card, lit on hover and on the control
-   plane: the card gains emphasis from an accent line, not a heavier shadow. */
+/* A spine at the top of every card, faint at rest and fully lit on hover and on
+   the control plane: the card gains emphasis from light, not from a heavier
+   shadow. */
 .inst-card::before {
   content: '';
   position: absolute;
   inset: 0 0 auto 0;
   height: 3px;
-  background: linear-gradient(90deg, var(--accent), transparent 70%);
-  opacity: 0;
-  transition: opacity var(--dur) var(--ease);
+  background: linear-gradient(90deg, var(--accent), var(--accent-3) 45%, transparent 78%);
+  opacity: 0.22;
+  transition: opacity var(--dur-2) var(--ease);
 }
 .inst-card:hover {
-  transform: translateY(-2px);
-  box-shadow: var(--shadow-sm);
+  transform: translateY(-3px);
+  border-color: var(--accent-line);
+  box-shadow:
+    var(--lift),
+    var(--hair);
 }
 .inst-card:hover::before {
-  opacity: 0.55;
+  opacity: 1;
 }
 /* The control plane is a different KIND of instance, not a worse one: the
    border says "this one owns the namespace book" without shouting. */

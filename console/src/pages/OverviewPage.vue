@@ -29,6 +29,7 @@ import { useOps } from '@/composables/useOps'
 import { usePageLoad } from '@/composables/usePageLoad'
 import { useSessionStore } from '@/stores/session'
 import { useNav } from '@/composables/useNav'
+import { treeEngine, type Engine } from '@/utils/engine'
 import { t } from '@/i18n'
 import PageHead from '@/components/layout/PageHead.vue'
 import BarRow from '@/components/layout/BarRow.vue'
@@ -89,14 +90,44 @@ function openBase(name: string): void {
 
 /** `base` only means "the trees live here" on a SQLite backend — on PG and
     treedb it holds no trees at all, so the line names what it actually is.
-    Keyed off `metadataBackend` (where the TREES live), NOT `backend` (the
+    Keyed off the TREE ENGINE (`metadataBackend`), NOT `backend` (the
     CONTROL-plane backend): a treedb deployment's control plane is still local
     SQLite, so `backend` says "sqlite" while its trees sit in the engine —
     trusting `backend` would mislabel a treedb box "metadata root". The
     vocabulary lives here because a comparison inside a bound prop reads to the
     i18n audit as an untranslated display string. */
+const engine = computed<Engine>(() => treeEngine(store.value))
 const baseLabel = computed(() =>
-  store.value?.metadataBackend === 'sqlite' ? 'metadata root' : 'local anchor (--meta-dir)',
+  engine.value === 'sqlite' ? 'metadata root' : 'local anchor (--meta-dir)',
+)
+
+/*
+  The engine, and the words that go with it.
+
+  The first card used to print `info.backend` under the label "backend" with the
+  SQLite sentence underneath, so a treedb box announced itself as
+  "backend: sqlite / one store for metadata and content" two feet away from a
+  Storage page showing two treedb servers. The card now answers the question an
+  operator is actually asking — WHERE the trees are — and says the control
+  plane's engine separately, in its own row. A delegated account cannot read
+  `store.info`, so it gets the honest version of what it CAN see: the control
+  plane, named as such.
+*/
+const ENGINE_SUB: Record<Engine, string> = {
+  sqlite: 'one store for metadata and content',
+  postgres: 'one schema per view, instances from the registry',
+  treedb: 'trees in the treedb servers; control plane in local SQLite',
+  unknown: 'the server named a backend this console does not know',
+}
+/** What to PRINT as the engine: the server's own word when it has one, an em
+    dash when it has none — never a name this console invented. */
+const engineText = computed(() =>
+  engine.value === 'unknown' ? store.value?.metadataBackend || '—' : engine.value,
+)
+const engineCard = computed(() =>
+  store.value
+    ? { label: 'tree engine', value: engineText.value, sub: ENGINE_SUB[engine.value] }
+    : { label: 'control plane', value: info.value?.backend || '—', sub: 'the store that answered this page' },
 )
 </script>
 
@@ -113,9 +144,9 @@ const baseLabel = computed(() =>
   <template v-else-if="info">
     <div class="cards">
       <StatCard
-        label="backend"
-        :value="info.backend"
-        :sub="'one store for metadata and content'"
+        :label="engineCard.label"
+        :value="engineCard.value"
+        :sub="engineCard.sub"
         tone="mute"
       />
       <StatCard
@@ -182,15 +213,21 @@ const baseLabel = computed(() =>
       </BarRow>
       <div class="detail">
         <div class="grid2">
-          <StatLine label="storage backend">
+          <!-- Two names, two rows: the engine the trees live in (with the
+               server's own layout line, which is about exactly that) and the
+               control plane that answers governance calls. They are the same
+               store on SQLite and PostgreSQL, and different ones on treedb —
+               which is why they are never merged into one "backend" value. -->
+          <StatLine label="tree engine">
+            <b>{{ engineText }}</b>
+            <span v-if="store.backendLayout" class="muted">· {{ store.backendLayout }}</span>
+          </StatLine>
+          <StatLine label="control plane">
             <b>{{ info.backend || '—' }}</b>
             <span class="muted">· {{ store.describe || '' }}</span>
           </StatLine>
           <StatLine :label="baseLabel">
             <code>{{ store.base || '—' }}</code>
-            <span v-if="store.backendLayout && store.metadataBackend !== 'sqlite'" class="muted">
-              · {{ store.backendLayout }}
-            </span>
           </StatLine>
           <StatLine label="server role">
             <b>{{ store.role || '—' }}</b>

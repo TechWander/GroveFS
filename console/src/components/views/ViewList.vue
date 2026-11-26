@@ -55,7 +55,11 @@ const rows = computed(() => {
 })
 
 /* The instance chips exist only where a choice exists: one logical instance is
-   a fact about the row, not a filter the operator has to set. */
+   a fact about the row, not a filter the operator has to set. Under SQLite there
+   is no choice at all — the same local store holds every tree — so neither the
+   chips nor the row badge appear; a `local` tag on an embedded deployment is the
+   kind of answer that makes a reader look for the instance they cannot see. */
+const showInstance = computed(() => catalog.showsInstance)
 const instanceChips = computed(() => {
   const names = catalog.storage?.instances.map((i) => i.name) ?? []
   return [
@@ -70,6 +74,12 @@ const instanceChips = computed(() => {
 
 const below = (name: string, kind: string): number =>
   kind === 'base' ? viewChildren(catalog.views, name).length : 0
+
+/* An unresolved name is hash-routed on PG (the router's own answer) and simply
+   unknown on treedb (its server was not readable), so the two fall back
+   differently rather than one word lying about the other deployment. */
+const homeOf = (name: string): string =>
+  catalog.instanceOf(name) ?? (catalog.engine === 'postgres' ? 'hash' : '—')
 </script>
 
 <template>
@@ -96,7 +106,7 @@ const below = (name: string, kind: string): number =>
       />
       <ChipGroup v-model="filters.vFilter.kind" :items="KIND_CHIPS" />
       <ChipGroup
-        v-if="(catalog.storage?.instances.length ?? 0) > 1"
+        v-if="showInstance && (catalog.storage?.instances.length ?? 0) > 1"
         v-model="filters.vFilter.instance"
         :items="instanceChips"
       />
@@ -128,8 +138,8 @@ const below = (name: string, kind: string): number =>
           :text="String(below(v.name, v.kind))"
           :title="t('names derived directly from it')"
         />
-        <span v-if="catalog.storage" class="inst" :title="t('metadata instance hosting this view')">
-          {{ catalog.instanceOf(v.name) ?? 'hash' }}
+        <span v-if="showInstance" class="inst" :title="t('metadata instance hosting this view')">
+          {{ homeOf(v.name) }}
         </span>
         <span class="kind">{{ kindName(v.kind) }}</span>
       </li>

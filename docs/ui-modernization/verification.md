@@ -105,3 +105,82 @@ treedb 多实例清单管理、视图页长列表布局修复，以及一轮视�
 本轮以静态门 + 单元/集成测试为验收；§2/§3 的多实例 PG 与 treedb 演示栈真机走查（CRUD 全链路、
 删除守卫拒绝文案、preview 一致性数字、>50 视图滚动与 ≤768px 折叠截图）建议按 §4 验证计划第 8–12
 项在换版后复跑一遍，换版校验须遵循「重载文档 + 校验运行中标志物」而非仅 fetch 资源新鲜度。
+
+## 6. 引擎判据、审计模块与视觉重设计（2026-11-26 第二次追加）
+
+对应规格 §7。量具：无头 Chrome 147 + CDP，脚本 `.tmpedit/rd_verify.mjs`（真实输入登录、
+逐页截图、`getComputedStyle` 探活、DOM 序与文本扫描断言）。两档部署各自跑一遍：
+现网 treedb 档（fdb4 :8787，截图 `.tmpedit/shots-deployed/`）与临时 sqlite 档
+（本机 :15412，截图 `.tmpedit/shots-sqlite-arm/`）。
+
+### 6.1 静态门
+
+| 检查 | 结果 |
+|---|---|
+| `npm run typecheck` | 通过 |
+| `npm run lint` | 通过 |
+| `npm run i18n:audit` | 通过（`t()` 492 串 0 缺失；退出码 0；仍列 7 条 legacy 词条，属旧版页面遗留） |
+| `npm run build` | 通过，201 modules／3.15s；`src/webui/`：`app.css 58.57 kB`（gzip 11.76）、`app.js 296.78 kB`（gzip 104.46）、`index.html 1.61 kB` |
+| `cargo test --release --features treedb --lib` | 304 passed / 0 failed（含 treedb registry 8 条，其中 `repair_splits_duplicated_names` 为本轮新增） |
+
+### 6.2 换版与产物一致性
+
+- 本机 release 二进制 md5 `648709bb3cc633f3fed6d684983a156c`；gfs1／gfs2／gfs-client／gfs-fdb4
+  四机 `/usr/local/bin/grovefs` 已全部对齐（`fdb4_upgrade.sh status` 复核）。
+- gfs1 根盘已不再满（实测 86%、余 343M），`/usr/local/bin/grovefs` 为普通实文件而非
+  `/data/gfs1/grovefs.bin` 的软链；`fdb4_upgrade.sh push` 的 gfs1 分支只写后者并回显前者，
+  所以那一行报 `9416687f…` 是脚本读错了文件、不是安装失败。已手工 `tee`+`mv` 补装，
+  两个路径现在都是 `648709bb…`。
+- fdb4 栈按 `/data/fdb/stack-start.treedb.sh` 重启：meta-server pid=428661、web pid=428684，
+  manager pid=415658 全程未动，treedb 引擎（7777/7778）未重启；50055/50110/50111/8787/7777/7778 均在听。
+- 换版校验按「重载文档 + 校验运行标志物」：从 :8787 取回的三份产物与本机 `src/webui/`
+  逐字节相同 —— `index.html 1c7a8e6b…`、`app.js 9e09794a…`、`app.css 470350b2…`。
+
+### 6.3 事故与恢复（如实记录）
+
+本轮第一次重启误用了 `.deploy/restart_fdb4.sh`：该脚本硬编码 `$BASE/stack-start.sh`，而那份
+launcher 是 2026-11-25 SQLite 档时期的产物（`--meta-dir $BASE/sqlite`、不传 `--meta-store`），
+于是把在跑的 treedb 档 meta-server 换成了 sqlite 档，web 随即以
+`authentication failed: unknown api key id` 拒起（`web-gw.key` 属于 treedb 控制面库）。
+影响面：约 2 分钟内 sqlite 档 meta-server 起来过又停掉；treedb 引擎进程与 manager 全程未动，
+数据面、视图树、审计台账均未受影响，无任何写入。随后按正确入口重启并复核。
+
+**教训**：fdb4 换版重启的唯一入口是 `.build-bin/fdb4_upgrade.sh restart`（它从
+`/proc/<pid>/cmdline` 回读原命令行，不会改档）；`.deploy/restart_fdb4.sh` 已不适用于当前拓扑。
+
+### 6.4 现网 treedb 档真机断言
+
+| 断言 | 结果 |
+|---|---|
+| 树引擎与控制面分开呈现 | Overview 卡片「树引擎 treedb」＋「树存于 treedb 服务器；控制面在本地 SQLite」，本部署区两栏 `treedb` / `sqlite · /data/fdb/treedb/ctrl (local files)` ✔ |
+| 实例名自愈 | 注册表由两条 `primary` 变为 `primary = 127.0.0.1:7778` / `primary-2 = 127.0.0.1:7777`；meta.log 第 1036 行打出 `treedb registry renamed the duplicated instance 'primary' to 'primary-2' — instances are addressed by name` ✔ |
+| 徽标不再冒充控制面 | 两张 treedb 卡徽标均为「服务中」+「实验性」，无「控制面」；卡下保留一句「控制面：本地 SQLite」 ✔ |
+| 审计页 DOM 顺序 | `page-head → retbar is-edit → bar → filterbar → tbl-wrap → pager → muted`，retbar/pager 均存在，默认每页 20 行 ✔ |
+| 分页翻页 | 点页码 2 后首行时间由 `11-26 20:33:31` 变为 `11-26 20:29:10` ✔ |
+| 每页条数切换 | 20→50 后表体 50 行；因全部装入，`.pager` 按 `hit.length > size` 正确卸载 ✔ |
+| 设计 token 实渲染 | body 画布 = 账簿细线 `repeating-linear-gradient` + 两层 radial bloom；header 68px + 投影；活动导航为 pine 三段渐变实底 + `rgb(242,251,246)` 文字；卡片 16px 圆角 + 白→`#fbfcfa` 渐变表面 + 三层墨色阴影 + 1px 内高光 ✔ |
+| 三声字体 | `.card:not(.text) .n` = Iowan Old Style 衬线栈 / 41.6px（2.6rem）；`.card.text .n` 按设计降到 system-ui / 19px；`th` 渐变带 + 1.32px 字距 ✔ |
+| 深色档 | 截图 `06_audit_dark` 无残留浅色面 ✔ |
+| 窄屏 430px | 截图 `08_audit_narrow`：retbar 折叠为单列，无横向溢出 ✔ |
+| 控制台错误 | 无 ✔ |
+
+### 6.5 sqlite 档真机断言（任务 1 的反向验证）
+
+用同一二进制在本机拉起一个纯 sqlite 档栈（`meta-server --meta-dir /tmp/gfs-arm/srv
+--control-listen 127.0.0.1:15411` + `web --listen 127.0.0.1:15412`，一个基视图），
+逐页扫描可见文本中的 `treedb`：
+
+| 页面 | `treedb` 出现次数 | 引擎词频 |
+|---|---|---|
+| 总览 | 0 | sqlite ×3 |
+| 视图 | 0 | — |
+| 存储 | 0 | sqlite ×2（小标题为「嵌入式 SQLite」，不渲染实例卡） |
+| 密钥 | 0 | — |
+| 账号 | 0 | — |
+| 审计 | 0 | — |
+
+Overview 卡片为「树引擎 sqlite」+「元数据与内容同库」，本部署区两栏
+`sqlite · one db file per view under <base>/meta/` 与 `sqlite · /tmp/gfs-arm/srv (local files)`。
+审计页 retbar 存在、pager 缺席（17 行 ≤ 20，属正确语义）。验证后临时栈已停、
+`/tmp/gfs-arm` 已清除，现网不受影响。
+

@@ -14,7 +14,7 @@
   super-only op — so for a delegated operator the soft call simply shows no line
   rather than breaking the page.
 */
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import type { AuditRow } from '@/types'
 import { useOps } from '@/composables/useOps'
 import { usePageLoad } from '@/composables/usePageLoad'
@@ -40,6 +40,7 @@ import BarRow from '@/components/layout/BarRow.vue'
 import FldRow from '@/components/layout/FldRow.vue'
 import FilterBar from '@/components/ui/FilterBar.vue'
 import ChipGroup from '@/components/ui/ChipGroup.vue'
+import ListPager from '@/components/ui/ListPager.vue'
 import ActionButton from '@/components/ui/ActionButton.vue'
 import LoadingHint from '@/components/ui/LoadingHint.vue'
 import AuditTable from '@/components/audit/AuditTable.vue'
@@ -50,8 +51,6 @@ const catalog = useCatalogStore()
 const session = useSessionStore()
 const ui = useUiStore()
 const { api, soft } = useOps()
-
-const LIMITS = [50, 200, 1000]
 
 const rows = ref<AuditRow[]>([])
 /** `undefined` means this account may not read the retention setting, which is a
@@ -77,11 +76,6 @@ async function load(): Promise<void> {
 const { pending, error } = usePageLoad(load)
 
 function refresh(): void {
-  ui.reload()
-}
-
-function setLimit(ev: Event): void {
-  filters.auditLimit = Number((ev.target as HTMLSelectElement).value)
   ui.reload()
 }
 
@@ -200,6 +194,35 @@ const kept = computed(() => {
       })
     : t('the server keeps every row until an operator purges them (`grovefs apikey purge`)')
 })
+
+/*
+  Paging the matched rows.
+
+  `hit` is the whole filtered set — it can be a thousand rows deep on a box that
+  loads 1000, and a table that long hides the filter that produced it. The pager
+  splits THAT set, so the counts on the chips, the `counted()` pill and the
+  "no calls match the filter" line all keep describing the same thing the table
+  does. `page` is clamped rather than trusted: a refresh that narrows the result
+  can leave the stored page past its end, and page 7 of three pages would render
+  an empty table under a control that still claims to be on it.
+*/
+const pageCount = computed(() =>
+  Math.max(1, Math.ceil(hit.value.length / filters.auditPageSize)),
+)
+const page = computed(() => Math.min(filters.auditPage, pageCount.value))
+const paged = computed(() => {
+  const start = (page.value - 1) * filters.auditPageSize
+  return hit.value.slice(start, start + filters.auditPageSize)
+})
+
+// Any change to what is BEING FILTERED restarts at page 1 — the operator asked a
+// new question, and the old answer's page number does not carry over.
+watch(
+  [() => ({ ...f }), () => filters.auditPageSize],
+  () => {
+    filters.auditPage = 1
+  },
+)
 </script>
 
 <template>
@@ -217,12 +240,17 @@ const kept = computed(() => {
   <p v-else-if="error" class="err">{{ error }}</p>
 
   <template v-else>
+    <!-- The retention policy and the load ceiling, at the TOP: how long this
+         trail is kept decides how the rows below are read, so the answer sits
+         where the question is asked — not after a thousand rows of scrolling.
+         The strip shows its editor per verb, so a delegated account that
+         cannot read `store.info` at all sees no strip instead of a dash. -->
+    <AuditRetentionPanel
+      v-if="retention !== undefined || session.can('audit.retention.set')"
+      :current="retention"
+    />
+
     <BarRow :title="'Governance calls'">
-      <FldRow :label="'rows to load'" for="audit-limit">
-        <select :value="String(filters.auditLimit)" @change="setLimit">
-          <option v-for="n in LIMITS" :key="n" :value="String(n)">{{ n }}</option>
-        </select>
-      </FldRow>
       <span class="muted">{{ kept }}</span>
     </BarRow>
 
@@ -296,16 +324,19 @@ const kept = computed(() => {
     </BarRow>
 
     <AuditTable
-      :rows="hit"
+      :rows="paged"
       :empty="rows.length ? 'no calls match the filter' : 'no governance calls yet'"
     />
 
-    <!-- The retention window and the on-demand cut are Super-only ops, so the
-         panel appears exactly when the session can route them. It sits UNDER the
-         table it governs: the admin reads what is there, then decides the window. -->
-    <AuditRetentionPanel
-      v-if="session.can('audit.retention.set') && session.can('apikey.purge')"
-      :current="retention ?? null"
+    <!-- Paging controls sit where the reader reaches the end of a page: the
+         range they just read, the width they want next, the page numbers. -->
+    <ListPager
+      v-if="hit.length > filters.auditPageSize"
+      :page="page"
+      :size="filters.auditPageSize"
+      :total="hit.length"
+      @update:page="filters.auditPage = $event"
+      @update:size="filters.auditPageSize = $event"
     />
 
     <p class="muted">

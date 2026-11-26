@@ -9,7 +9,7 @@ import { defineStore } from 'pinia'
   switch. They are cleared at sign-in, because a stale search box carried onto a
   different account hides rows you did not look for. `auditLimit` lives here for
   the same reason the old file kept it on `ST`: "refresh" must not shrink the
-  window you chose.
+  window you chose — and neither must it reset the page you were reading.
 */
 
 export interface KindFilter {
@@ -77,6 +77,13 @@ export const useFilterStore = defineStore('filters', () => {
   const accFilter = reactive<AccountFilter>(fresh.accounts())
   const auditFilter = reactive<AuditFilter>(fresh.audit())
   const auditLimit = ref(50)
+  /* Paging the loaded rows. `auditLimit` is how many rows the server was asked
+     for; these two decide how many of the MATCHING ones are on screen at once,
+     so a 1000-row load stays a scrollable page instead of a wall. The page
+     resets on any filter change (see AuditPage) — landing on page 7 of a
+     result set you just narrowed is never the set you meant. */
+  const auditPage = ref(1)
+  const auditPageSize = ref(20)
 
   function reset() {
     Object.assign(vFilter, fresh.views())
@@ -84,7 +91,18 @@ export const useFilterStore = defineStore('filters', () => {
     Object.assign(accFilter, fresh.accounts())
     Object.assign(auditFilter, fresh.audit())
     auditLimit.value = 50
+    auditPage.value = 1
+    auditPageSize.value = 20
   }
 
-  return { vFilter, keyFilter, accFilter, auditFilter, auditLimit, reset }
+  return {
+    vFilter,
+    keyFilter,
+    accFilter,
+    auditFilter,
+    auditLimit,
+    auditPage,
+    auditPageSize,
+    reset,
+  }
 })

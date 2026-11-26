@@ -52,7 +52,9 @@ const emit = defineEmits<{
   setcontrol: [inst: StoreInstance]
   relocate: [inst: StoreInstance]
   remove: [inst: StoreInstance]
-  toggle: [name: string]
+  /** The instance, not its name: a name is only an identity while the registry
+      stays unique, and the page keys its cards by name+address. */
+  toggle: [inst: StoreInstance]
 }>()
 
 const session = useSessionStore()
@@ -70,10 +72,6 @@ const editable = computed(() => props.managed)
 // in place — each is the transaction of a different verb (a handover / a restart).
 const uriLocked = computed(() => (isPg.value ? props.inst.control : props.inst.serving === true))
 const canCreate = computed(() => session.can('view.create'))
-
-function onToggle(): void {
-  emit('toggle', props.inst.name)
-}
 </script>
 
 <template>
@@ -114,7 +112,7 @@ function onToggle(): void {
       <code v-if="!canHide || !hidden">{{ inst.uri ?? '—' }}</code>
       <code v-else class="masked">••••••••••••••••••••</code>
       <div class="inst-uri-actions">
-        <button v-if="canHide" type="button" class="mini" :aria-pressed="hidden" @click="onToggle">
+        <button v-if="canHide" type="button" class="mini" :aria-pressed="hidden" @click="emit('toggle', inst)">
           {{ hidden ? t('Show') : t('Hide') }}
         </button>
         <CopyButton v-if="inst.uri" :text="inst.uri" />

@@ -1,6 +1,7 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import { useOps } from '@/composables/useOps'
+import { storageEngine } from '@/utils/engine'
 import { messageOf } from '@/utils/error'
 import { mergeViews } from '@/utils/views'
 import type { StoreInfo, ViewRow } from '@/types'
@@ -34,6 +35,11 @@ export const useCatalogStore = defineStore('catalog', () => {
   const storage = ref<StoreInfo['storage'] | null>(null)
   const storagePending = ref(false)
 
+  /** Which engine carries the trees, read from the storage snapshot alone —
+      never from the control plane's name, which says `sqlite` on a treedb
+      deployment and would switch this store to the wrong layout. */
+  const engine = computed(() => storageEngine(storage.value))
+
   async function loadStorage(force = false): Promise<void> {
     if (storage.value && !force) return
     if (storagePending.value) return
@@ -46,15 +52,31 @@ export const useCatalogStore = defineStore('catalog', () => {
     }
   }
 
-  /** Which instance hosts a view. A single logical instance answers for every
-      name; a multi-instance view with no placement row is hash-routed, and
-      `null` is the honest answer (the list renders it as `hash`). */
+  /** Which instance hosts a view. The answer means something different per
+      engine, so the engine decides which book is read:
+        · treedb — no placement ledger exists; the snapshot carries each
+          server's live `viewNames`, and a view on an unreachable server is
+          simply unanswerable (`null`), NOT the PG word for "routed by hash".
+        · PostgreSQL — the placement row wins; a single logical instance
+          answers for every name; anything else is hash-routed.
+        · SQLite — one embedded store, so there is no instance question to ask
+          (callers hide the column; see `showsInstance`). */
   function instanceOf(view: string): string | null {
     const s = storage.value
     if (!s) return null
+    if (s.backend === 'treedb') {
+      return s.instances.find((i) => i.viewNames?.includes(view))?.name ?? null
+    }
     if (s.placement[view]) return s.placement[view]
     return s.instances.length === 1 ? s.instances[0].name : null
   }
+
+  /** Whether "which instance?" is a question this deployment can answer. On
+      SQLite every tree sits in the same local store, so printing `local` on
+      every row would be noise, not information. */
+  const showsInstance = computed(
+    () => engine.value === 'postgres' || engine.value === 'treedb',
+  )
 
   /** `force` re-reads even a populated list; a page that needs the namespace at
       its freshest (the views page, right after a create) asks for it. */
@@ -89,6 +111,8 @@ export const useCatalogStore = defineStore('catalog', () => {
     byName,
     storage,
     storagePending,
+    engine,
+    showsInstance,
     loadViews,
     loadStorage,
     instanceOf,

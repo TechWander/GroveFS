@@ -134,6 +134,10 @@ pub fn instance_report(spec: &str) -> Result<InstanceReport, String>
 
 ### 3.5 设计系统（`console/src/styles/console.css` 重写 tokens + 组件适配）
 
+> 本节是 2026-11-22 那一轮的记录，其 token 数值与字体决策已被 §7.3（2026-11-26 视觉再设计）
+> 整体取代：画布/文字/强调的具体色值、圆角、阴影、动效时长都已变更，`--font-display`
+> 也从系统 sans 回到衬线栈。以代码为准的读者请直接读 §7.3。
+
 * 画布：`--bg:#f4f6f2`；surface `--bg-2:#ffffff`；`--bg-subtle:#f7f9f6`；`--bg-sunken:#ecefe9`；`--line:#e2e6df`；`--line-soft:#eef1ec`；`--line-strong:#cfd6cc`。
 * 文字：`--fg:#101c16`、`--fg-dim:#55635a`、`--fg-faint:#6d7a71`（纸面对比 ≥4.5:1）。
 * 强调：`--accent:#0f6b4f`、`--accent-hover:#0b5740`、`--accent-soft:#e3f0e8`、`--accent-line:#b7d3c5`。
@@ -199,3 +203,78 @@ pub fn instance_report(spec: &str) -> Result<InstanceReport, String>
   如实拒绝，保留实验性标记与「控制平面仍在本地 SQLite」说明。
 - 视图页长列表（>50）有界滚动 + ≤768px 折叠抽屉；滚动条配色统一为主题令牌，修深色档遗留暖米色。
 - 未变项：CSP、产物文件名、`store.info` 仅 Super、非托管注册表仍为只读降级。
+
+## 7. 追加范围：引擎判据、审计模块与视觉体系（2026-11-26）
+
+用户提出三项要求：修正部署引擎信息的混淆、把审计保留策略与分页做进审计页、用
+frontend-design 方法整体重做视觉。逐条落地如下。
+
+### 7.1 部署引擎的真值判据
+
+- 后端有两个语义不同的 `backend` 字段，前端必须分开读，不能拿其一当其二：
+  `store.info.backend` 是**控制面**（treedb 档仍为 `"sqlite"`，因为定义、密钥、账号、审计
+  落在本地 SQLite），`store.info.metadataBackend` 才是**树引擎**（取自 `rt.store.backend_name()`）。
+  轻量 `info` 只返回 `rt.control.backend()`，故要看树引擎必须走 `store.info`。
+- Overview 标题下并列两枚 chip：`控制面 sqlite` 与 `树引擎 treedb`。treedb 专属块（实验性
+  说明、实例清单、路由措辞）只在树引擎为 treedb 时渲染；sqlite/pg 档不出现任何 treedb 字样。
+- 中文措辞同批纠正：`InstanceCard` 上 treedb 的 `serving` 徽标曾译作「主控服务」，与 PG 的
+  `control plane`「控制面」在中文里语义碰撞（treedb 根本没有 control 实例），改为「服务中」；
+  并把 zh.ts 中 11 处「控制平面」统一到规范词条「控制面」，与徽标、`（控制面）` 括注同词。
+- 后端同批修掉一个会让引擎信息真的读错的状态：treedb 注册表按**名字**寻址
+  （`storage.update/remove/preview` 都是 `find(|(n,_)| n == name)` 取第一条），而旧版收养把
+  每个 serving 地址都写成 `primary` —— 重名的那台服务器对所有写动词隐形，网页也把两张卡
+  折叠成一个键。现由 `unique_name()` 保证收养不重名，并由 `treedb_repair_names()` 在启动时
+  自愈历史重名（保留每条名字的首次出现，后续加 `-2`/`-3` 后缀；地址与行序不动），改名逐条
+  打进启动日志，因为操作员手上那本书确实被改了。
+
+### 7.2 审计模块
+
+- **保留策略上移**：`AuditRetentionPanel` 从页底移入 `page-head` 正下方，套新的 `.retbar` 条幅
+  — grid `minmax(0,1fr) auto`、pine 渐变洗底、3px 左脊、`.retbar-v` 用 serif 数值 chip 显示当前
+  生效档位，右侧是预设 chips 与「载入行数」动词。非 Super 只读时走 `.retbar.is-read`，去 pine
+  化以免被读成可写。
+- **列表分页**：新增 `console/src/components/ui/ListPager.vue`，`.pager` 条幅含每页 20/50/100
+  切换与页码导航（首尾 + 当前邻域 + 省略号），页态存 `filters.auditPage` / `auditPageSize`。
+- 审计页 DOM 顺序固定为 `page-head → retbar → bar → filterbar → tbl-wrap → pager → muted`，
+  已由无头浏览器断言（见 `verification.md`）。
+- 分页是已取回集合内的前端切片，不改后端 `limit` 语义、不改审计写入与保留默认值。
+
+### 7.3 视觉体系（当前值，替代 §3.5）
+
+设计语言为 “field instrument”：有细线的绿灰画布、带受光上唇的白板面、单一松绿家族由深到
+亮分级、衬线标题 + 系统 UI 正文 + mono 数据三声配对。
+
+* 画布：`--bg:#e7ebe4`；`--bg-2:#ffffff`、`--bg-3:#fbfcfa`（板面渐变终点）、
+  `--bg-subtle:#f2f5f1`、`--bg-sunken:#dfe5dc`；`--line:#dde3d9`、`--line-soft:#eaeee7`、
+  `--line-strong:#c6cfc3`。
+* 画布不是纯色：`--mesh` 两层 radial bloom（白色高光 + pine 淡染），`--texture` 用
+  `repeating-linear-gradient(180deg, rgba(13,24,18,.032) 0 1px, transparent 1px 2rem)` 画
+  账簿细线；`body` 取 `background: var(--texture), var(--mesh)` 且两层都 `fixed`。
+* 文字：`--fg:#0d1812`、`--fg-dim:#4f5e55`、`--fg-faint:#6a786f`。
+* 强调：`--accent:#0f6b4f`、`--accent-2:#17835f`、`--accent-3:#4ec396`、
+  `--accent-hover:#0a5340`、`--accent-soft:#dcefe5`、`--accent-line:#a6d2bf`、
+  `--accent-ink:#f2fbf6`（实底 pine 上的文字色）、`--gold:#96690f`。
+  `--accent-grad` / `--accent-grad-hover` 是 135° 三段 pine 渐变，用于活动导航项、主按钮、
+  选中 chip、当前页码。
+* 字体：`--font-display: var(--font-serif)`，即回到衬线栈 `'Iowan Old Style',
+  'Palatino Linotype', Palatino, 'Songti SC', 'Noto Serif CJK SC', Georgia,
+  'DejaVu Serif', serif`（中文宿主装有 Noto Serif CJK SC，可实渲染）；页面标题
+  `--fs-page: clamp(2rem, 1.55rem + 1.7vw, 2.9rem)`；统计数字 `.card .n`、`.sstat-n`、
+  `.retbar-v` 一律 serif；数据、连接串、表格仍走 `--mono`。
+* 圆角：`--r-xs:6px; --r-sm:8px; --r-md:12px; --r-lg:16px; --r-xl:20px`（抽屉/对话框）、
+  `--r-pill:999px`（导航项、chip、徽标、页码）。
+* 深度只用四件事，以免六十条规则各说各话：`--surface-grad` 板面渐变（上唇亮、基部沉）、
+  堆叠阴影（接触 + 距离两层，皆以墨色 `rgba(13,24,18,α)` 着色而非中性灰）、1px 内高光
+  `--hair`、以及抬升物件上的 pine 脊（`--glow` 与 3px `--accent-grad` 左边脊）。无一处靠
+  模糊蒙混成层次。
+* 动效：`--dur:.2s`、`--dur-2:.32s`、`--dur-3:.55s`；`--ease` 保留，新增
+  `--ease-out: cubic-bezier(.16,1,.3,1)` 与 `--ease-spring: cubic-bezier(.22,1.2,.36,1)`
+  （对话框 pop）。卡片入场 stagger 间隔 45ms × 8 张；hover 位移 2–3px 并给 link 卡加
+  `5px 6px 0` 的 accent-soft 偏移实影；按下时 `translate(2px,2px)` 收掉偏移。末段
+  `@media (prefers-reduced-motion: reduce)` 的 `*` 兜底规则不变，压平全部动画与过渡。
+* 深色档：`:root[data-theme='dark']` 只覆盖 token 值（含新增的 `--mesh`、`--texture`、
+  `--accent-grad-hover`、`--hair` 等），组件层不出现硬编码浅色。本轮顺手清掉表头、选中行、
+  secret-card、skip-link、file 按钮漏网的几处，并留下一条可复验的不变量：除 token 定义行外，
+  `console.css` 全文 `#rrggbb` 计数为 0（`awk 'NR>1 && /#[0-9a-fA-F]{3,6}\b/ && !/^\s*--/'` 无输出）。
+* §3.6 的边界全部保持：无 webfont、无 CDN 图标、无内联 `style`、无 `data:` 图片；
+  CSP `style-src 'self'` 下所有渐变与纹理都写在 `app.css` 里。

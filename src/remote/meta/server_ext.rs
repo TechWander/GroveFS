@@ -966,6 +966,17 @@ impl MetaServer {
                     crate::treedb_store::treedb_registry_path(&self.base).display()
                 );
             }
+            // An older build adopted EVERY serving address as `primary`, and the
+            // registry addresses instances by NAME — a duplicated row is a server
+            // no console verb can reach. Split the names at start (addresses and
+            // row order untouched) and say so, since the operator's book changed.
+            let renamed = crate::treedb_store::treedb_repair_names(&self.base)
+                .map_err(io::Error::other)?;
+            for (old, new) in &renamed {
+                println!(
+                    "meta-server: treedb registry renamed the duplicated instance '{old}' to '{new}' — instances are addressed by name",
+                );
+            }
         }
         // SQLite trees live under `<base>/meta`, one directory each; a PG store
         // writes nothing locally, so creating that directory would be a

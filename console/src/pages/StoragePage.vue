@@ -33,6 +33,7 @@ import { usePageLoad } from '@/composables/usePageLoad'
 import { useCatalogStore } from '@/stores/catalog'
 import { useSessionStore } from '@/stores/session'
 import { useUiStore } from '@/stores/ui'
+import { instanceKey, treeEngine } from '@/utils/engine'
 import { t } from '@/i18n'
 import PageHead from '@/components/layout/PageHead.vue'
 import PanelBox from '@/components/layout/PanelBox.vue'
@@ -78,31 +79,46 @@ async function load(): Promise<void> {
 const { pending, error } = usePageLoad(load)
 
 const storage = computed(() => info.value?.storage ?? null)
-const backend = computed(() => storage.value?.backend ?? info.value?.backend ?? 'sqlite')
-const isPg = computed(() => backend.value === 'postgres')
-const isTreedb = computed(() => backend.value === 'treedb')
+/*
+  The engine, from the ONE field that names it (`metadataBackend`, confirmed by
+  `storage.backend`). `info.backend` is deliberately NOT part of this decision:
+  it is the CONTROL-plane backend, and a treedb deployment keeps its control
+  plane in local SQLite — reading it as the engine made this page choose the
+  SQLite layout on a treedb box, and the reverse mistake shows a SQLite
+  deployment the treedb cards it does not have. `unknown` is shown as unknown
+  rather than guessed into one of the three.
+*/
+const engine = computed(() => treeEngine(info.value))
+const isSqlite = computed(() => engine.value === 'sqlite')
+const isPg = computed(() => engine.value === 'postgres')
+const isTreedb = computed(() => engine.value === 'treedb')
 const instances = computed(() => storage.value?.instances ?? [])
 const managed = computed(() => storage.value?.managed === true)
 const pendingControl = computed(() => storage.value?.pendingControl ?? null)
 const multi = computed(() => instances.value.length > 1)
 
-/** The views resolved onto one card. PG reads the placement ledger; treedb
-    carries a live `viewNames` list on the snapshot (`null` = unreachable, shown
-    as an empty head — the card's guard still re-checks on any verb). */
+/** The views resolved onto one card, keyed by `name@uri`. The registry
+    addresses an instance by NAME and an older treedb adoption wrote every
+    serving address as `primary` — one key, two servers, and the second card's
+    view count overwrote the first. The address is what distinguishes them. */
 const perInstance = computed(() => {
   const map = new Map<string, string[]>()
+  for (const inst of instances.value) map.set(instanceKey(inst), [])
   if (isTreedb.value) {
-    for (const inst of instances.value) map.set(inst.name, inst.viewNames ?? [])
+    for (const inst of instances.value) {
+      map.set(instanceKey(inst), inst.viewNames ?? [])
+    }
     return map
   }
-  for (const inst of instances.value) map.set(inst.name, [])
   for (const view of names.value) {
     const home = catalog.instanceOf(view)
-    if (home) map.get(home)?.push(view)
+    if (!home) continue
+    const inst = instances.value.find((i) => i.name === home)
+    if (inst) map.get(instanceKey(inst))?.push(view)
   }
   return map
 })
-const viewsFor = (name: string): string[] => perInstance.value.get(name) ?? []
+const viewsFor = (inst: StoreInstance): string[] => perInstance.value.get(instanceKey(inst)) ?? []
 
 /** Names with no placement row (a multi-instance PG view is hash-routed). */
 const unplaced = computed(() =>
@@ -125,10 +141,10 @@ const relocateTargets = computed(() =>
     : [],
 )
 
-function toggleHidden(name: string): void {
+function toggleHidden(key: string): void {
   const next = new Set(hidden.value)
-  if (next.has(name)) next.delete(name)
-  else next.add(name)
+  if (next.has(key)) next.delete(key)
+  else next.add(key)
   hidden.value = next
 }
 function refresh(): void {
@@ -150,7 +166,7 @@ function created(): void {
       "
     >
       <template #actions>
-        <StateBadge v-if="backend" :label="backend" tone="admin" />
+        <StateBadge v-if="engine !== 'unknown'" :label="engine" tone="admin" />
         <ActionButton :action="refresh" :label="'refresh'" variant="link" />
       </template>
     </PageHead>
@@ -167,7 +183,7 @@ function created(): void {
       </p>
 
       <!-- ── SQLite: one embedded store per view, no instances to choose ── -->
-      <PanelBox v-if="backend === 'sqlite'" :title="'Embedded SQLite'">
+      <PanelBox v-if="isSqlite" :title="'Embedded SQLite'">
         <KvList>
           <KvRow label="base directory" :value="info.base" mono />
           <KvRow label="views" :value="info.views ?? names.length" />
@@ -241,20 +257,20 @@ function created(): void {
         <div class="inst-grid">
           <InstanceCard
             v-for="inst in instances"
-            :key="inst.name"
+            :key="instanceKey(inst)"
             :inst="inst"
             :backend="isPg ? 'postgres' : 'treedb'"
             :managed="managed"
-            :views="viewsFor(inst.name)"
+            :views="viewsFor(inst)"
             :max-count="maxCount"
             :can-hide="!!inst.uri"
-            :hidden="hidden.has(inst.name)"
+            :hidden="hidden.has(instanceKey(inst))"
             @addbase="createOn = $event"
             @edit="editTarget = $event"
             @relocate="relocateTarget = $event"
             @setcontrol="setControlTarget = $event"
             @remove="removeTarget = $event"
-            @toggle="toggleHidden"
+            @toggle="toggleHidden(instanceKey($event))"
           />
         </div>
 
@@ -315,7 +331,8 @@ function created(): void {
       <!-- ── unknown backend: still name what the server said ── -->
       <PanelBox v-else :title="'Storage'">
         <KvList>
-          <KvRow label="backend" :value="backend" />
+          <KvRow label="tree engine" :value="info.metadataBackend || '—'" />
+          <KvRow label="control plane" :value="info.backend || '—'" />
           <KvRow label="describe" :value="info.describe" />
           <KvRow label="base" :value="info.base" mono />
         </KvList>
@@ -346,7 +363,7 @@ function created(): void {
     <RelocateModal
       v-if="relocateTarget"
       :inst="relocateTarget"
-      :views="viewsFor(relocateTarget.name)"
+      :views="viewsFor(relocateTarget)"
       :targets="relocateTargets"
       @close="relocateTarget = null"
     />

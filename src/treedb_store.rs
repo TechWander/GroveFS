@@ -1336,17 +1336,68 @@ fn write_treedb_registry(base: &std::path::Path, insts: &[(String, String)]) -> 
     std::fs::rename(&tmp, &path).map_err(|e| format!("cannot replace {}: {e}", path.display()))
 }
 
-/// 确保本机 serving 地址在册：首次启动时收养，把它作为 `primary` 插到最前。已有
-/// 文件保持为准（网页端编辑跨重启存活）。返回是否真的写了文件（供 banner 判新）。
+/// 在册名字之外挑一个不冲突的名字：原名可用就用原名，否则加 `-2`、`-3`…
+/// 后缀不得突破 `valid_treedb_name` 的 24 字符上限，所以必要时截短词干。
+///
+/// 这不是防御性装饰：注册表按**名字**寻址（`storage.update/remove/preview` 都是
+/// `find(|(n, _)| n == name)` 取第一条），两条同名行等于把后面的那台服务器从所有
+/// 写动词面前藏起来，网页端也把两张卡片折叠成一个键。
+fn unique_name(taken: &[String], desired: &str) -> String {
+    if !taken.iter().any(|n| n == desired) {
+        return desired.to_string();
+    }
+    for i in 2u32..1000 {
+        let suffix = format!("-{i}");
+        let stem: String = desired
+            .chars()
+            .take(24usize.saturating_sub(suffix.len()))
+            .collect();
+        let cand = format!("{stem}{suffix}");
+        if !taken.iter().any(|n| n == &cand) {
+            return cand;
+        }
+    }
+    // 一千条同名行不会发生，但服务端路径绝不 panic：退回原名，让调用方的重名
+    // 守卫（`treedb_add`）去拒绝，而不是悄悄写下一条冲突行。
+    desired.to_string()
+}
+
+/// 确保本机 serving 地址在册：首次启动时收养，第一个叫 `primary`，后续地址取
+/// 不冲突的名字（旧版把每条都写成 `primary`，见 [`unique_name`]）。已有文件保持
+/// 为准（网页端编辑跨重启存活）。返回是否真的写了文件（供 banner 判新）。
 pub fn adopt_treedb_spec(base: &std::path::Path, addr: &str) -> Result<bool, String> {
     let addr = addr.trim();
     let mut insts = treedb_registry(base)?;
     if insts.iter().any(|(_, a)| a == addr) {
         return Ok(false);
     }
-    insts.insert(0, ("primary".to_string(), addr.to_string()));
+    let taken: Vec<String> = insts.iter().map(|(n, _)| n.clone()).collect();
+    let name = unique_name(&taken, "primary");
+    insts.insert(0, (name, addr.to_string()));
     write_treedb_registry(base, &insts)?;
     Ok(true)
+}
+
+/// 修历史遗留的重名：保留每条名字的第一次出现，之后的依次加后缀。返回
+/// `(旧名, 新名)` 供启动日志点名——操作员手改过的那本书以他为准，这里只把
+/// 无法寻址的重复项分开，不改任何地址、不删任何行。
+pub fn treedb_repair_names(base: &std::path::Path) -> Result<Vec<(String, String)>, String> {
+    let insts = treedb_registry(base)?;
+    let mut taken: Vec<String> = Vec::new();
+    let mut fixed = Vec::new();
+    let mut out = Vec::new();
+    for (name, addr) in insts {
+        let keep = unique_name(&taken, &name);
+        if keep != name {
+            fixed.push((name.clone(), keep.clone()));
+        }
+        taken.push(keep.clone());
+        out.push((keep, addr));
+    }
+    if !fixed.is_empty() {
+        write_treedb_registry(base, &out)?;
+    }
+    Ok(fixed)
 }
 
 /// `storage.add`（treedb 档）：校验名字 + 试连列视图，然后追加。**登记**这台服务器，
@@ -1530,9 +1581,53 @@ mod registry_tests {
         // 再收养同一地址不写文件（不重复插行）。
         assert!(!adopt_treedb_spec(&d, "127.0.0.1:7777").unwrap());
         assert_eq!(treedb_registry(&d).unwrap().len(), 1);
-        // 换一个地址收养 → 追加，serving 判定靠地址匹配而非位置。
+        // 换一个地址收养 → 追加，serving 判定靠地址匹配而非位置；名字必须
+        // 不冲突（注册表按名字寻址，重名等于把一台服务器藏起来）。
         assert!(adopt_treedb_spec(&d, "127.0.0.1:7778").unwrap());
-        assert_eq!(treedb_registry(&d).unwrap().len(), 2);
+        let insts = treedb_registry(&d).unwrap();
+        assert_eq!(insts.len(), 2);
+        assert_eq!(
+            insts,
+            vec![
+                ("primary-2".to_string(), "127.0.0.1:7778".to_string()),
+                ("primary".to_string(), "127.0.0.1:7777".to_string()),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 历史遗留的重名书（旧版 adopt 把每个 serving 地址都写成 `primary`）在启动
+    /// 时被自愈：第一条保留原名，后续加后缀，地址与行序不动，且幂等。
+    #[test]
+    fn repair_splits_duplicated_names() {
+        let d = dir("dup");
+        write_treedb_registry(
+            &d,
+            &[
+                ("primary".to_string(), "127.0.0.1:7777".to_string()),
+                ("primary".to_string(), "127.0.0.1:7778".to_string()),
+                ("primary".to_string(), "127.0.0.1:7779".to_string()),
+            ],
+        )
+        .unwrap();
+        let fixed = treedb_repair_names(&d).unwrap();
+        assert_eq!(
+            fixed,
+            vec![
+                ("primary".to_string(), "primary-2".to_string()),
+                ("primary".to_string(), "primary-3".to_string()),
+            ]
+        );
+        assert_eq!(
+            treedb_registry(&d).unwrap(),
+            vec![
+                ("primary".to_string(), "127.0.0.1:7777".to_string()),
+                ("primary-2".to_string(), "127.0.0.1:7778".to_string()),
+                ("primary-3".to_string(), "127.0.0.1:7779".to_string()),
+            ]
+        );
+        // 名字已经唯一 → 再跑一次不写文件、不产生改名记录。
+        assert!(treedb_repair_names(&d).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1586,11 +1681,14 @@ mod registry_tests {
         let err = treedb_remove(&d, &serving, "ghost").unwrap_err();
         assert!(err.contains("not in the registry"), "{err}");
         // 非 serving 但读不到清单 → 证据缺失拒绝，而不是放行（端口 1 无监听，
-        // 与 `add_validates_name_before_connecting` 同一先例；adopt 插首位，所以
-        // 这个名字命中的第一条就是它）。
+        // 与 `add_validates_name_before_connecting` 同一先例；adopt 插首位并按
+        // 在册名字取名，所以第二条叫 `primary-2`）。
         adopt_treedb_spec(&d, "127.0.0.1:1").unwrap();
-        let err = treedb_remove(&d, &serving, "primary").unwrap_err();
+        let err = treedb_remove(&d, &serving, "primary-2").unwrap_err();
         assert!(err.contains("cannot read the view list"), "{err}");
+        // 两条现在各自可寻址：`primary` 仍是那条 serving。
+        let err = treedb_remove(&d, &serving, "primary").unwrap_err();
+        assert!(err.contains("routes to"), "{err}");
         let _ = std::fs::remove_dir_all(&d);
     }
 

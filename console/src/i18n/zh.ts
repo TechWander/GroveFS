@@ -374,7 +374,13 @@ export const ZH: Readonly<Record<string, string>> = {
 
   /* 总览页：「本部署」区块 */
   'storage backend': '存储后端',
+  'tree engine': '树引擎',
   'one store for metadata and content': '元数据与内容同库',
+  'one schema per view, instances from the registry': '每视图一个 schema，实例取自注册表',
+  'trees in the treedb servers; control plane in local SQLite':
+    '树存于 treedb 服务器；控制面在本地 SQLite',
+  'the server named a backend this console does not know': '服务器报出了本控制台不认识的 backend',
+  'the store that answered this page': '应答本页的存储',
   'metadata root': '元数据根',
   'local anchor (--meta-dir)': '本机锚点（--meta-dir）',
   'control plane': '控制面',
@@ -599,7 +605,7 @@ export const ZH: Readonly<Record<string, string>> = {
   address: '地址',
   'local SQLite': '本地 SQLite',
   'Trees live in the treedb server; definitions, keys and accounts stay in the local SQLite control plane. This backend is experimental and runs as a single instance.':
-    '树存放在 treedb 服务中；定义、密钥与账号仍在本地 SQLite 控制平面。该后端为实验性，单实例运行。',
+    '树存放在 treedb 服务中；定义、密钥与账号仍在本地 SQLite 控制面。该后端为实验性，单实例运行。',
   '${n} view(s) across ${i} instance(s)': '${n} 个视图，分布在 ${i} 个实例',
   'keys, definitions, accounts, audit and placement live here':
     '密钥、定义、账号、审计与置放表都在此实例',
@@ -647,18 +653,21 @@ export const ZH: Readonly<Record<string, string>> = {
   'view(s) here': '个视图在此',
   'Refresh failed — showing the last loaded snapshot.': '刷新失败 — 正显示上次加载的快照。',
   /* 存储页：实例增删改查与守卫流程 */
-  serving: '主控服务',
+  /* treedb owns no control-plane instance (that is local SQLite), so this badge
+     must not read like one: it only says the running server routes its trees to
+     this address. The 控制面 wording belongs to the PG badge above it. */
+  serving: '服务中',
   'the address this meta-server routes its trees to': '本元数据服务器将树路由到的地址',
   experimental: '实验性',
   'treedb is an EXPERIMENTAL backend': 'treedb 是实验性后端',
-  'control plane: local SQLite': '控制平面：本地 SQLite',
-  'the control plane URI moves by handover, not edit': '控制平面连接串需通过交接（handover）变更，不可直接编辑',
+  'control plane: local SQLite': '控制面：本地 SQLite',
+  'the control plane URI moves by handover, not edit': '控制面连接串需通过交接（handover）变更，不可直接编辑',
   'the serving address changes with a restart, not here': '服务地址随 --meta-store 重启生效，不在此处更改',
   'Edit URI': '编辑连接串',
   Relocate: '迁移视图',
   'move this instance’s views onto another': '将此实例上的视图迁移到其他实例',
   'nothing to relocate': '没有需要迁移的视图',
-  'Set as control': '设为控制平面',
+  'Set as control': '设为控制面',
   'Edit ${name}': '编辑 ${name}',
   'connection string': '连接串',
   'views placed on this name now resolve here; the database must already hold their schemas':
@@ -676,7 +685,7 @@ export const ZH: Readonly<Record<string, string>> = {
   cancel: '取消',
   'Delete instance ${name}': '删除实例 ${name}',
   'this instance carries the control plane — promote another first':
-    '此实例承载控制平面 — 请先提升其他实例',
+    '此实例承载控制面 — 请先提升其他实例',
   'this is the address the meta-server routes to': '这正是元数据服务器路由到的地址',
   'Deleting removes the registry line only; content bytes live on the data servers and are never touched here.':
     '删除仅移除注册表中的一行；内容字节位于数据服务器，此处绝不触碰。',
@@ -692,7 +701,7 @@ export const ZH: Readonly<Record<string, string>> = {
   holders: '持有者',
   zero: '零引用',
   'dangling routes': '悬空路由',
-  'unverified instances (control plane was unreachable):': '未验证实例（控制平面不可达）：',
+  'unverified instances (control plane was unreachable):': '未验证实例（控制面不可达）：',
   'the guard refuses this removal': '守卫拒绝了此次删除',
   'Relocate ${name}': '迁移 ${name}',
   Done: '完成',
@@ -702,31 +711,31 @@ export const ZH: Readonly<Record<string, string>> = {
     '将每个已置放视图迁移到其他实例。挂在本机上的视图必须先卸载。',
   ' (control)': '（控制面）',
   Move: '迁移',
-  'Make ${name} the control plane': '将 ${name} 设为控制平面',
+  'Make ${name} the control plane': '将 ${name} 设为控制面',
   'Stage handover': '登记交接',
   'This stages a handover of grovefs_control — keys, definitions, accounts, audit and the placement ledger — to ${name}.':
     '这将登记一次 grovefs_control 的交接 — 密钥、定义、账号、审计与置放表 — 迁往 ${name}。',
   'Nothing moves yet: the copy runs the next time the meta-server starts, before any request is served. Restart it to finish, and the control badge moves then.':
     '目前尚未搬迁：副本会在元数据服务器下次启动、处理任何请求之前执行。请重启以完成，届时控制面标记随之迁移。',
   'The current plane must be reachable and hold no foreign-key constraints, or the server refuses and explains why.':
-    '当前控制平面必须可达且不含外键约束，否则服务器会拒绝并说明原因。',
+    '当前控制面必须可达且不含外键约束，否则服务器会拒绝并说明原因。',
   'A control-plane handover to ${name} is staged — restart the meta-server to apply it.':
-    '已登记向 ${name} 的控制平面交接 — 请重启元数据服务器以生效。',
+    '已登记向 ${name} 的控制面交接 — 请重启元数据服务器以生效。',
   'treedb is EXPERIMENTAL: the control plane (definitions, keys, accounts) stays in local SQLite and this registry is inventory, not a router.':
-    'treedb 为实验性：控制平面（定义、密钥、账号）仍在本地 SQLite，此注册表是清单而非路由器。',
+    'treedb 为实验性：控制面（定义、密钥、账号）仍在本地 SQLite，此注册表是清单而非路由器。',
   'No instances are registered yet.': '尚未注册任何实例。',
   'Register instance': '注册实例',
   'This registry is owned by a --meta-store file the operator edits by hand — the page is read-only here.':
     '此注册表由操作员手编的 --meta-store 文件所有 — 本页在此为只读。',
-  'control plane: ${where}': '控制平面：${where}',
+  'control plane: ${where}': '控制面：${where}',
   /* 视图页长列表：有界滚动 + 窄屏折叠抽屉 */
   'Show list': '展开列表',
   'Hide list': '收起列表',
-  /* 审计保留面板：窗口设置与立即清理 */
-  'Audit retention': '审计保留',
+  /* 审计页顶部的保留策略条：窗口设置与立即清理 */
+  'retention policy': '保留策略',
   'retention window': '保留窗口',
-  'rows older than this are swept; “never” keeps them until purged by hand':
-    '早于此窗口的行会被清理；“never” 则保留，直到手动清除',
+  'kept until purged': '保留至手动清理',
+  'retention is an administrator’s reading': '保留窗口仅管理员可读',
   'use a duration like 45m, 24h, 90d, or `never`': '请用 45m、24h、90d 这类时长，或 `never`',
   'window set to ${w}; ${n} row(s) older than that were trimmed now':
     '窗口已设为 ${w}；早于该窗口的 ${n} 行已立即清理',
@@ -734,8 +743,6 @@ export const ZH: Readonly<Record<string, string>> = {
     '已停用自动清理 — 记录将保留，直到操作员手动清除',
   '${n} row(s) are older than ${b} (nothing deleted yet)': '早于 ${b} 的记录有 ${n} 行（尚未删除）',
   'deleted ${n} row(s) older than ${b}': '已删除早于 ${b} 的 ${n} 行记录',
-  'currently: rows older than ${w} are swept': '当前：早于 ${w} 的行会被清理',
-  'currently: every row is kept until an operator purges it': '当前：全部保留，直到操作员手动清除',
   'preview cut': '预览清理量',
   'count rows older than the drafted window, delete nothing': '统计早于所填窗口的行数，不做删除',
   'purge now': '立即清理',
@@ -743,4 +750,12 @@ export const ZH: Readonly<Record<string, string>> = {
   'save window': '保存窗口',
   'apply the retention policy (a duration also trims now)':
     '应用保留策略（设为时长会同时立即清理）',
+  /* 审计列表分页 */
+  pagination: '分页',
+  'per page': '每页',
+  'rows per page': '每页行数',
+  'previous page': '上一页',
+  'next page': '下一页',
+  'page ${n}': '第 ${n} 页',
+  'rows ${a}–${b} of ${n}': '第 ${a}–${b} 行，共 ${n} 行',
 }
