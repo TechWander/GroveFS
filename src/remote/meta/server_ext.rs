@@ -2428,6 +2428,28 @@ fn control_dispatch(
             // the hash-routed remainder (`unplaced`) apart from rows that point
             // at a retired instance (`dangling`).
             let trees = physical_tree_list(rt)?;
+            // The HA configuration, reported only when there IS one.
+            //
+            // `role` above is `Primary` on every plain node — that is what
+            // [`MetaRuntime::role`] guarantees — so the word alone carries no
+            // information an operator can act on, and on a configured pair it is
+            // only half of it: "Primary" does not say whether the peer is alive,
+            // how far replication ran, or whether the arbiter lease that admits
+            // writes is still held. So when HA is unconfigured this stays `null`
+            // (the console says so in words) and when it is on, the snapshot
+            // ships the four facts that decide whether the pair is healthy.
+            // Monotonic instants are shipped as elapsed SECONDS because the wire
+            // has no unit for an `Instant`.
+            let ha = rt.ha.as_ref().map(|h| {
+                json!({
+                    "peer": rt.peer,
+                    "epoch": h.epoch.load(Ordering::SeqCst),
+                    "lastPeerSec": h.last_peer.lock().elapsed().as_secs(),
+                    "leaseValid": h.lease_valid(),
+                    "syncRepl": rt.sync_repl,
+                    "witness": rt.witness,
+                })
+            });
             Ok(json!({
                 // `backend` is the CONTROL-plane backend; `metadataBackend` is
                 // where the TREES live. They differ on a treedb deployment,
@@ -2440,7 +2462,11 @@ fn control_dispatch(
                 "metadataBackend": rt.store.backend_name(),
                 "describe": rt.control.describe(),
                 "base": rt.base.display().to_string(),
+                // The NODE's HA role (`MetaRuntime::role`), NOT the web account's
+                // role — the same word means two things on this page, so the
+                // console labels both. `None` below means HA is unconfigured.
                 "role": format!("{:?}", rt.role()),
+                "ha": ha,
                 "views": trees.len(),
                 "definitions": rt.control.list_defs()?.len(),
                 "accounts": accounts,

@@ -151,7 +151,12 @@ export interface StoreInfo {
   metadataBackend?: string
   describe?: string
   base?: string
+  /** The NODE's HA role (`Primary` / `Standby`) — nothing to do with the web
+      account's role in `InfoResult`, which is the other "role" on this page. */
   role?: string
+  /** Set only when the meta-server runs as one half of an HA pair; `null` on a
+      plain single-writer node. Native HA exists for the SQLite arm only. */
+  ha?: HaSnapshot | null
   views?: number
   definitions?: number
   accounts?: number | null
@@ -168,6 +173,23 @@ export interface StoreInfo {
   pgInstances?: PgLedger | null
   /** The banner's own words on where trees live and what `base` holds here. */
   backendLayout?: string
+}
+
+/** `store.info.ha` — the pair's health, as the serving node sees it. */
+export interface HaSnapshot {
+  /** The peer's `host:port`, if the node was given one. */
+  peer?: string | null
+  /** Fencing epoch; bumped on every promotion. */
+  epoch: number
+  /** Seconds since the last heartbeat from the peer, as this node counts them. */
+  lastPeerSec: number
+  /** Whether the arbiter lease that admits writes is still trusted here. */
+  leaseValid: boolean
+  /** `--sync-repl`: writes block until the standby has installed the snapshot. */
+  syncRepl: boolean
+  /** Arbiter address(es), comma-separated in the launch flags; `null` when the
+      pair fences peer-only. */
+  witness?: string | null
 }
 
 /** One registry instance as `store.info` reports it; counts are `null` when

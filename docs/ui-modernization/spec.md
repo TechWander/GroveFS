@@ -373,3 +373,24 @@ unknown 档说「不从那个名字推断任何东西」。
 - **未破坏项**：CSP `style-src 'self'` 下无内联 `style`（构建产物 grep `style=` 为 0）、
   产物名仍固定为 `src/webui/{index.html,app.js,app.css}`、响应式断点与
   `prefers-reduced-motion` 兜底不变、`console.css` 除 token 定义外零硬编码色值。
+
+## 9. 追加范围：节点角色与账户角色不得共用一个词（2026-11-26 第四次追加）
+
+概览页曾打印 `server role: Primary` / `本控制台正在对话的进程`。操作员问“这是啥意思”，
+原因有三层，逐层修：
+
+- **一词两义**：`store.info.role` 是**节点**在 HA 副本对里的位置（`Primary`/`Standby`），
+  `whoami` 回的 `info.role` 是**账户**权限（`admin`/`user`）。两者都叫 role，同页出现却
+  没有任何限定。现在标签分别为 `node role (HA)` 与 `account role: ${r}`，被退役的旧 key
+  `server role`、`the process this console is talking to` 已从 `zh.ts` 删除。
+- **值恒真**：`MetaRuntime::role()` 对未配 HA 的节点**恒返回 `Primary`**，所以这一行在单写
+  部署上是纯噪音。`store.info` 因此新增 `ha` 字段：**只在真的配了 HA 时非 `null`**，内容是
+  判定这对副本是否健康的四项事实——对端地址、距上次对端心跳的秒数、fencing 纪元、仲裁租约
+  是否在握，外加同步复制与 witness 清单。单调时钟过线时换算成“距今秒数”，`Instant` 不上线。
+- **该说不说的分支**：`ha == null` 时界面写“未启用”加一句解释，而不是继续印 `Primary`；
+  PG 档另写“冗余由 PostgreSQL 复制承担”——原生 HA 的快照投递只在 SQLite 档成立（`serve()`
+  对 PG store 拒收 `--role/--peer/--witness`），给 PG 部署念一句它开不了的功能是误导。
+
+`primary`/`standby` 两个词进字典（译作「主（Primary）」「备（Standby）」），与留在英文的
+API 名词（`admin`、`mount`）区分开：节点角色决定这里是否接受写，它是要据此动手的运维判据，
+不是接口名字。

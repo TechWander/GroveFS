@@ -151,6 +151,53 @@ const ENGINE_NOTE: Record<Engine, string> = {
     'The server named a backend this console does not know, so nothing here is inferred from that name.',
 }
 const engineNote = computed(() => t(ENGINE_NOTE[engine.value]))
+
+/*
+  Two roles, two lines.
+
+  `store.info.role` is the NODE's place in an HA pair; `info.role` (the `whoami`
+  reply) is what the signed-in ACCOUNT may do. Both arrived under the bare word
+  "role", and the pair read as one sentence about one subject — "Primary / the
+  process this console is talking to" said nothing about which process that was
+  and nothing about the role it names. Each line now names its own subject.
+
+  The node's line also had no way to be informative: a node started without HA
+  reports `Primary` by construction (`MetaRuntime::role`), so the word was noise
+  on every single-writer deployment. `store.info.ha` is `null` exactly when that
+  is the truth, so the line can say it, and when HA IS configured the same line
+  carries the four facts that decide whether the pair is healthy — peer,
+  heartbeat age, fencing epoch, arbiter lease.
+*/
+const isHa = computed(() => store.value?.ha != null)
+/** The two HA roles, in the operator's language: the pair is the one place where
+    the word decides whether writes are accepted here, so it is not API vocabulary
+    that stays English the way `admin` and `mount` do. */
+const NODE_ROLE: Record<string, string> = { Primary: 'primary', Standby: 'standby' }
+const nodeRoleValue = computed(() => {
+  if (!isHa.value) return t('not configured')
+  const role = store.value?.role
+  return role ? t(NODE_ROLE[role] || 'the server named a role this console does not know') : '—'
+})
+/** The quiet line under the node's role. `role` alone is half a sentence in both
+    states, and the engine decides which half: native HA snapshot shipping is a
+    SQLite-arm path (a PG store refuses the flags at boot), so a PG deployment is
+    told where its redundancy actually lives instead of being shown a line about
+    a feature it cannot switch on. */
+const nodeRoleNote = computed(() => {
+  const ha = store.value?.ha
+  if (!ha) {
+    return engine.value === 'postgres'
+      ? t('no GroveFS HA pair — PostgreSQL replication carries redundancy here')
+      : t('single writer, no standby: one meta-server answers every request')
+  }
+  return [
+    t('peer ${p}', { p: ha.peer || t('none set') }),
+    t('last beat ${n}s ago', { n: ha.lastPeerSec }),
+    t('epoch ${n}', { n: ha.epoch }),
+    t('lease ${v}', { v: ha.leaseValid ? t('held') : t('lost') }),
+    t('${mode} replication', { mode: t(ha.syncRepl ? 'synchronous' : 'async') }),
+  ].join(' · ')
+})
 </script>
 
 <template>
@@ -177,7 +224,7 @@ const engineNote = computed(() => t(ENGINE_NOTE[engine.value]))
       <StatCard
         label="signed in as"
         :value="info.actor || session.account"
-        :sub="info.role || ''"
+        :sub="t('account role: ${r}', { r: info.role || '—' })"
         tone="mute"
       />
 
@@ -299,9 +346,9 @@ const engineNote = computed(() => t(ENGINE_NOTE[engine.value]))
           <StatLine :label="baseLabel">
             <code>{{ store.base || '—' }}</code>
           </StatLine>
-          <StatLine label="server role">
-            <b>{{ store.role || '—' }}</b>
-            <span class="muted">{{ t('the process this console is talking to') }}</span>
+          <StatLine label="node role (HA)">
+            <b>{{ nodeRoleValue }}</b>
+            <span class="muted">{{ nodeRoleNote }}</span>
           </StatLine>
         </div>
         <!-- A PG deployment's real question is WHERE each tree lives, and the
