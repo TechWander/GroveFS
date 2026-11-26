@@ -156,6 +156,10 @@ const grantHit = computed(() => {
   <template v-else>
     <CreateAccountPanel v-if="session.isSuper" />
 
+    <BarRow :title="'Accounts and their reach'">
+      <span class="muted">{{ t('a role decides what an account may do; a delegation, which trees') }}</span>
+    </BarRow>
+
     <FilterBar :count="counted(hit.length, accounts.length)">
       <template #search>
         <input

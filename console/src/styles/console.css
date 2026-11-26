@@ -125,6 +125,15 @@
   --sp-7: 2.5rem;
   --sp-8: 3.5rem;
 
+  /* ---- section rhythm ----
+     ONE distance separates two blocks on a page. It is carried by the heading
+     that OPENS a block (`.bar`), because block siblings in normal flow collapse
+     their adjacent margins: a panel's own bottom margin and the heading's top
+     margin resolve to this value instead of adding up. A heading is then closer
+     to the content under it (`--sp-4`) than to the block above it — the grouping
+     cue the eye actually uses. 1.75rem = 28px, inside the 24–32px band. */
+  --section-gap: 1.75rem;
+
   /* ---- radius: instruments, not bubbles ---- */
   --r-xs: 6px;
   --r-sm: 8px;
@@ -377,6 +386,29 @@ td,
   white-space: pre-line;
   word-break: break-word;
   margin: var(--sp-2) 0 0;
+}
+/* A refusal with an action attached (see `utils/error.ts`): the sentence to act
+   on is the loud line, the server's own words stay under it in small mono, and
+   the jump to the page that can fix it is part of the same box. */
+.refusal {
+  margin: var(--sp-3) 0 0;
+  padding: var(--sp-3);
+  border: 1px solid var(--err-line);
+  border-left-width: 3px;
+  border-radius: var(--r-md);
+  background: var(--err-soft);
+}
+.refusal-head {
+  margin: 0;
+  color: var(--err);
+  font-size: var(--fs-label);
+  line-height: 1.5;
+}
+.refusal-detail {
+  margin: var(--sp-2) 0 0;
+  color: var(--fg-dim);
+  font-size: var(--fs-micro);
+  word-break: break-word;
 }
 .ok-text {
   color: var(--ok);
@@ -838,7 +870,7 @@ main:focus {
   display: flex;
   align-items: flex-end;
   gap: var(--sp-4);
-  margin: 0 0 var(--sp-6);
+  margin: 0 0 var(--section-gap);
   padding-bottom: var(--sp-5);
   border-bottom: 1px solid var(--line);
   flex-wrap: wrap;
@@ -929,7 +961,7 @@ main:focus {
   align-items: baseline;
   gap: var(--sp-3);
   flex-wrap: wrap;
-  margin: var(--sp-7) 0 var(--sp-3);
+  margin: var(--section-gap) 0 var(--sp-4);
   padding-bottom: 0.5rem;
   border-bottom: 1px solid var(--line-soft);
 }
@@ -952,6 +984,60 @@ main:focus {
 }
 .bar .muted {
   font-size: var(--fs-label);
+}
+
+/* The one sentence that explains WHY this page names two engines: it opens the
+   deployment block, above the two rows it makes sense of. Quieter than a heading
+   and louder than a footnote, because it is the answer to the question an
+   operator arrived with. */
+.engine-note {
+  margin: 0 0 var(--sp-5);
+  padding-bottom: var(--sp-4);
+  border-bottom: 1px solid var(--line-soft);
+  color: var(--fg-dim);
+  font-size: var(--fs-table);
+  line-height: 1.55;
+  text-wrap: pretty;
+}
+
+/* The typical path: the order the nav items are meant to be used in, stated once
+   as a numbered flow instead of left to be inferred from six equal links. */
+.flow {
+  display: grid;
+  gap: var(--sp-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  counter-reset: flow;
+}
+.flow li {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+  counter-increment: flow;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-sm);
+  background: var(--bg-2);
+}
+.flow li::before {
+  content: counter(flow);
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 1.4rem;
+  height: 1.4rem;
+  border-radius: var(--r-pill);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-line);
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: 0.6875rem;
+  font-weight: 700;
+}
+.flow .muted {
+  font-size: var(--fs-micro);
 }
 
 /* ---- overview cards ---- */
@@ -2907,27 +2993,6 @@ details.help > .body {
   gap: var(--sp-2);
   flex-wrap: wrap;
 }
-.retbar-load {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.5rem;
-  color: var(--fg-dim);
-  font-family: var(--mono);
-  font-size: 0.6875rem;
-  font-weight: 600;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  white-space: nowrap;
-}
-.retbar-load select {
-  height: 1.95rem;
-  padding: 0 0.5rem;
-  border-radius: var(--r-pill);
-  font-family: var(--mono);
-  font-size: var(--fs-label);
-  text-transform: none;
-  letter-spacing: 0;
-}
 /* The last action's sentence spans the strip; it is a footnote to the policy,
    not another control. */
 .retbar-msg {
@@ -2948,7 +3013,10 @@ details.help > .body {
   align-items: center;
   gap: var(--sp-3);
   flex-wrap: wrap;
-  margin: var(--sp-3) 0 var(--sp-5);
+  /* The pager belongs to the table above it, not to the next section: a small
+     top margin keeps them one unit, while `.bar`'s own top margin is what
+     separates this block from whatever heading follows. */
+  margin: var(--sp-4) 0 0;
   padding: var(--sp-3) var(--sp-4);
   background: var(--surface-grad);
   border: 1px solid var(--line);
@@ -2977,6 +3045,19 @@ details.help > .body {
   letter-spacing: 0.1em;
   text-transform: uppercase;
   white-space: nowrap;
+}
+/* Two auto margins in one flex row split the free space between them, which
+   would strand the fetch ceiling in the middle of the bar. Only the first
+   control of the pair is pushed right. */
+.pager-size + .pager-size {
+  margin-left: 0;
+}
+.pager-note {
+  flex-basis: 100%;
+  margin: 0;
+  color: var(--fg-faint);
+  font-size: var(--fs-micro);
+  line-height: 1.5;
 }
 .pager-size select {
   height: 1.95rem;
@@ -3053,8 +3134,7 @@ details.help > .body {
   .retbar {
     grid-template-columns: minmax(0, 1fr);
   }
-  .retbar-edit,
-  .retbar-load {
+  .retbar-edit {
     justify-content: flex-start;
   }
 }
@@ -3450,6 +3530,11 @@ details.help > .body {
 }
 .inst-uri-label .cred {
   color: var(--warn);
+}
+/* The treedb counterpart of `contains credentials`: nothing is exposed here, and
+   nothing is missing either — it is a stated design fact, so it is quiet. */
+.inst-uri-label .cred.none {
+  color: var(--accent);
 }
 .inst-uri code {
   display: block;

@@ -152,6 +152,9 @@ const ALLOWED_OPS: &[&str] = &[
     "fork.create",
     "fork.drop",
     "view.create",
+    // Pure read of the placement rule, so the create form can say WHICH instance
+    // the default pick means instead of leaving the operator to guess it.
+    "view.plan",
     "view.stats",
     "storage.add",
     "storage.update",

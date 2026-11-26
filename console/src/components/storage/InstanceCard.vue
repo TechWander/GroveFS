@@ -14,7 +14,10 @@
       local SQLite), so a card never claims `control`; the one whose address
       equals the configured `--meta-store` is `serving` (this server's trees).
       Relocation is not wired, so the card offers no Relocate and the page notes
-      the inventory-only routing.
+      the inventory-only routing. A treedb URI carries NO credential at all —
+      `parse_addr` accepts only a bare host:port — which is a design decision,
+      not a missing field, so the card says so where a PG card says
+      `contains credentials`.
 
   Every write verb is gated on BOTH `managed` (a server-adopted registry) and
   the routed-op list (`session.can`), so an operator-owned registry or a
@@ -108,6 +111,13 @@ const canCreate = computed(() => session.can('view.create'))
       <div class="inst-uri-label">
         <span>{{ isPg ? t('connection') : t('address') }}</span>
         <span v-if="isPg" class="cred">{{ t('contains credentials') }}</span>
+        <span
+          v-else-if="props.backend === 'treedb'"
+          class="cred none"
+          :title="t('treedb authenticates the address, not a password: see the note below the card')"
+        >
+          {{ t('no credentials') }}
+        </span>
       </div>
       <code v-if="!canHide || !hidden">{{ inst.uri ?? '—' }}</code>
       <code v-else class="masked">••••••••••••••••••••</code>
@@ -139,6 +149,18 @@ const canCreate = computed(() => session.can('view.create'))
 
     <p v-if="props.backend === 'treedb' && !inst.control" class="inst-note">
       {{ t('control plane: local SQLite') }}
+    </p>
+    <!-- An empty username/password field is what an operator expects to have
+         MISSED here, so the card states that nothing is missing: treedb's
+         address IS the identity, and the engine's optional handshake is one
+         process-wide key file (`GROVEFS_TREEDB_KEY_FILE`), never a per-instance
+         credential this page could store or show. -->
+    <p v-if="props.backend === 'treedb'" class="inst-note">
+      {{
+        t(
+          'no username or password: a treedb address is trusted as-is. Engine authentication, when this deployment uses it, is one server-wide key file (GROVEFS_TREEDB_KEY_FILE), not a credential stored per instance.',
+        )
+      }}
     </p>
 
     <div class="inst-actions">

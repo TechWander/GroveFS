@@ -2,8 +2,15 @@
 /*
   Page controls for a list that is ALREADY loaded — the audit page pulls the
   newest N rows and filters them here, so paging is arithmetic, not another
-  request. The server's own `limit` stays a separate knob ("rows to load"): this
-  one decides how much of the answer is on screen at once.
+  request.
+
+  Two numbers sit in this row and they mean different things, which is why they
+  are labelled differently and kept together:
+
+  · the FETCH CEILING (`fetchLimit`) — how many rows the server was asked for.
+    Raising it is the only way to read further back, and it reloads.
+  · the PAGE WIDTH (`size`) — how much of that answer is on screen at once.
+    Pure arithmetic, no request.
 
   Two rules the markup follows:
 
@@ -31,14 +38,31 @@ const props = defineProps<{
   total: number
   /** The widths offered. Defaults to the console's own ladder. */
   sizes?: number[]
+  /** The ceiling the server was asked for; omitted where a list has no such
+      knob (the accounts and keys pages page a full list, so they pass nothing). */
+  fetchLimit?: number
+  /** How many rows that fetch actually returned. Equal to `fetchLimit` when
+      there are older rows the reader has not pulled — `total` cannot say that,
+      because a filter can shrink the matched set to nothing. */
+  loaded?: number
+  /** The ceilings offered. */
+  fetchLimits?: number[]
 }>()
 
 const emit = defineEmits<{
   'update:page': [n: number]
   'update:size': [n: number]
+  'update:fetchLimit': [n: number]
 }>()
 
 const widths = computed(() => props.sizes ?? [20, 50, 100])
+const ceilings = computed(() => props.fetchLimits ?? [50, 200, 1000])
+/** Did the server fill the order? Then the trail almost certainly runs deeper
+    than what is on screen, and the reader is entitled to know that the pager's
+    "of N" is a count of the LOADED set, not of the deployment's history. */
+const atCeiling = computed(
+  () => props.fetchLimit !== undefined && props.loaded === props.fetchLimit,
+)
 const pages = computed(() => Math.max(1, Math.ceil(props.total / props.size)))
 const from = computed(() => (props.total ? (props.page - 1) * props.size + 1 : 0))
 const to = computed(() => Math.min(props.total, props.page * props.size))
@@ -70,6 +94,14 @@ function onWidth(ev: Event): void {
   emit('update:size', Number((ev.target as HTMLSelectElement).value))
   emit('update:page', 1)
 }
+
+/* Raising or lowering the ceiling REPLACES the loaded set with a bigger (or
+   smaller) answer, so the page resets with it — the same rule `onWidth` follows
+   for a different reason. */
+function onCeiling(ev: Event): void {
+  emit('update:fetchLimit', Number((ev.target as HTMLSelectElement).value))
+  emit('update:page', 1)
+}
 </script>
 
 <template>
@@ -77,6 +109,17 @@ function onWidth(ev: Event): void {
     <span class="pager-range">
       {{ t('rows ${a}–${b} of ${n}', { a: from, b: to, n: props.total }) }}
     </span>
+
+    <label v-if="props.fetchLimit !== undefined" class="pager-size pager-fetch">
+      <span>{{ t('fetched from server') }}</span>
+      <select
+        :value="String(props.fetchLimit)"
+        :aria-label="t('how many newest rows to fetch from the server')"
+        @change="onCeiling"
+      >
+        <option v-for="n in ceilings" :key="n" :value="String(n)">{{ n }}</option>
+      </select>
+    </label>
 
     <label class="pager-size">
       <span>{{ t('per page') }}</span>
@@ -119,5 +162,16 @@ function onWidth(ev: Event): void {
         ›
       </button>
     </div>
+
+    <!-- Its own row (`.pager` wraps), because it qualifies the number the reader
+         just looked at: "of ${n}" counts the LOADED set, not the trail. -->
+    <p v-if="atCeiling" class="pager-note">
+      {{
+        t(
+          'the server was asked for ${n} rows and returned ${n}, so older calls are almost certainly still there — raise “fetched from server” to read further back',
+          { n: props.fetchLimit },
+        )
+      }}
+    </p>
   </nav>
 </template>

@@ -852,6 +852,20 @@ pub fn bootstrap_owner(
 /// caller may read as a grant.
 const MAX_BASE_HOPS: usize = 4;
 
+/// The question "does this name own a physical tree?", as one specific caller
+/// answers it.
+///
+/// It is a parameter and not a `ControlStore` method because the control store
+/// CANNOT always answer it. Under `treedb://` the trees live inside the engine
+/// and the control plane is local SQLite, whose `has_physical` looks for a
+/// `meta/<name>/<name>.db` file that this deployment never writes — so a store
+/// read on its own reports "no tree" for a base that is mounted, written and
+/// listed by `view list` at the same instant. The meta-server passes its own
+/// enumerator (`server_ext::physical_tree_exists`), the one `view list` answers
+/// from, so name resolution can never disagree with the listing the operator is
+/// looking at. Every other caller keeps [`ControlStore::has_physical`].
+pub type TreeProbe<'a> = &'a dyn Fn(&str) -> Result<bool, String>;
+
 /// Resolve any view name to the BASE (physical, un-delegated-by-definition)
 /// view that owns it:
 ///
@@ -866,6 +880,17 @@ const MAX_BASE_HOPS: usize = 4;
 /// error — the ACL call site treats an error as a refusal, never as "assume
 /// allowed".
 pub fn resolve_base(store: &dyn ControlStore, name: &str) -> Result<String, String> {
+    resolve_base_tree(store, name, &|n| store.has_physical(n))
+}
+
+/// [`resolve_base`] with the tree question supplied from outside. A caller
+/// whose trees do not live in the control store MUST use this — see
+/// [`TreeProbe`] for why `store.has_physical` is not a safe default there.
+pub fn resolve_base_tree(
+    store: &dyn ControlStore,
+    name: &str,
+    has_tree: TreeProbe<'_>,
+) -> Result<String, String> {
     let mut cur = name.to_string();
     for _ in 0..MAX_BASE_HOPS {
         let def = match store.get_def(&cur)? {
@@ -873,7 +898,7 @@ pub fn resolve_base(store: &dyn ControlStore, name: &str) -> Result<String, Stri
             None => {
                 // No definition: a base only if its tree actually exists (the
                 // same gate `view_provider` applies to a mount).
-                if store.has_physical(&cur)? {
+                if has_tree(&cur)? {
                     return Ok(cur);
                 }
                 return Err(format!("view '{cur}' has neither a definition nor a tree"));
@@ -968,10 +993,23 @@ impl Principal {
     /// ownership chain first, so a lens/fork/alias is authorized by the base it
     /// hangs off.
     pub fn manages(&self, store: &dyn ControlStore, name: &str) -> Result<bool, String> {
+        self.manages_tree(store, name, &|n| store.has_physical(n))
+    }
+
+    /// [`Self::manages`] with the tree question supplied by the caller. See
+    /// [`TreeProbe`]: a server whose trees sit in an external engine must ask
+    /// through it, or a delegated account governing a live treedb base reads as
+    /// governing nothing.
+    pub fn manages_tree(
+        &self,
+        store: &dyn ControlStore,
+        name: &str,
+        has_tree: TreeProbe<'_>,
+    ) -> Result<bool, String> {
         if self.is_super() {
             return Ok(true);
         }
-        let base = resolve_base(store, name)?;
+        let base = resolve_base_tree(store, name, has_tree)?;
         Ok(self.manages_base(&base))
     }
 
@@ -979,7 +1017,14 @@ impl Principal {
     /// resolved to rather than saying "forbidden", so the fix (`grant <account>
     /// <base>`) is obvious from the message alone.
     pub fn refusal(&self, store: &dyn ControlStore, name: &str) -> String {
-        match resolve_base(store, name) {
+        self.refusal_tree(store, name, &|n| store.has_physical(n))
+    }
+
+    /// [`Self::refusal`] resolved against the caller's own tree question, so the
+    /// sentence an operator reads cannot blame them for a tree the backend can
+    /// see but the control store cannot.
+    pub fn refusal_tree(&self, store: &dyn ControlStore, name: &str, has_tree: TreeProbe<'_>) -> String {
+        match resolve_base_tree(store, name, has_tree) {
             Ok(base) => format!(
                 "account '{}' is not delegated base view '{base}' (the name '{name}' resolves to it) — an admin grants it with `grant {account} {base}`",
                 self.account,
@@ -1213,6 +1258,126 @@ mod tests {
         assert!(!p.is_super());
         assert!(p.manages_base("team"));
         assert!(!p.manages_base("team2"));
+    }
+
+    /// A control plane that holds DEFINITIONS but no trees — the exact shape of
+    /// a `treedb://` deployment, where the local SQLite store keeps the fork /
+    /// lens / alias slots while every physical tree lives inside the engine.
+    struct DefsOnly;
+
+    impl ControlStore for DefsOnly {
+        fn backend(&self) -> &'static str {
+            "sqlite"
+        }
+        fn describe(&self) -> String {
+            "defs-only test store".into()
+        }
+        fn list_defs(&self) -> Result<Vec<(String, String)>, String> {
+            Ok(vec![
+                ("lens1".into(), "base team".into()),
+                ("fork2".into(), "fork team2".into()),
+            ])
+        }
+        fn get_def_raw(&self, name: &str) -> Result<Option<String>, String> {
+            Ok(match name {
+                "lens1" => Some("base team".into()),
+                "fork2" => Some("fork team2".into()),
+                _ => None,
+            })
+        }
+        fn put_def(&self, _name: &str, _text: &str) -> Result<(), String> {
+            unreachable!("resolution reads only")
+        }
+        fn remove_def(&self, _name: &str) -> Result<bool, String> {
+            unreachable!("resolution reads only")
+        }
+        fn stamp(&self, _name: &str) -> Option<String> {
+            None
+        }
+        // The trap this whole test exists for: no local `meta/<name>/<name>.db`,
+        // so the control store alone answers "no tree" for a treedb base that
+        // the engine reports as present.
+        fn list_physical(&self) -> Result<Vec<String>, String> {
+            Ok(vec![])
+        }
+        fn has_physical(&self, _name: &str) -> Result<bool, String> {
+            Ok(false)
+        }
+        fn store_for_db_path(&self, _db: &std::path::Path) -> std::sync::Arc<dyn ControlStore> {
+            unreachable!("resolution never opens another store")
+        }
+        fn has_fork_tree(&self, _name: &str) -> Result<bool, String> {
+            Ok(false)
+        }
+        fn create_fork_tree(
+            &self,
+            _base: &str,
+            _name: &str,
+            _seed: bool,
+        ) -> Result<crate::meta::ForkStats, String> {
+            unreachable!("resolution never writes")
+        }
+        fn graft_tree(
+            &self,
+            _dst: &str,
+            _src: &str,
+            _items: &[crate::meta::GraftItem],
+            _dest: &str,
+            _skip_existing: bool,
+        ) -> Result<crate::meta::GraftStats, String> {
+            unreachable!("resolution never writes")
+        }
+        fn destroy_fork_tree(&self, _name: &str) {}
+        fn drop_fork_tree(&self, _name: &str) -> Result<(), String> {
+            unreachable!("resolution never writes")
+        }
+        fn open_ro_view(
+            &self,
+            _view: &str,
+        ) -> Result<std::sync::Arc<dyn crate::meta::MetaProvider>, String> {
+            unreachable!("resolution never opens a tree")
+        }
+        fn base_tree_missing_note(&self, _view: &str) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn a_tree_outside_the_control_store_needs_the_probe_to_resolve() {
+        let store = DefsOnly;
+        // Without the probe the base is invisible: the 2026-11-26 live failure,
+        // where granting a real treedb view died on "neither a definition nor a
+        // tree" because nothing outside the control store was ever asked.
+        assert!(resolve_base(&store, "team").is_err());
+        // With it, the name resolves and the definition chain still chases.
+        let engine_has = |n: &str| -> Result<bool, String> { Ok(n == "team" || n == "team2") };
+        assert_eq!(resolve_base_tree(&store, "team", &engine_has).unwrap(), "team");
+        assert_eq!(resolve_base_tree(&store, "lens1", &engine_has).unwrap(), "team");
+        // A name neither the defs nor the engine know stays an error — the probe
+        // widens the answer to the truth, not to "assume allowed".
+        assert!(resolve_base_tree(&store, "ghost", &engine_has).is_err());
+        // And the ACL follows it: the same delegate is refused on the blind read
+        // and admitted through the engine's answer.
+        let p = Principal {
+            account: "alice".into(),
+            role: Role::User,
+            bases: vec!["team".into()],
+        };
+        let store_ref: &dyn ControlStore = &store;
+        let ask: TreeProbe = &engine_has;
+        // The blind read does not answer "no", it ANSWERS "that view does not
+        // exist" — which is the sentence the console rendered for a mounted view.
+        assert!(p.manages(store_ref, "team").is_err());
+        assert!(p.manages_tree(store_ref, "team", ask).unwrap());
+        assert!(p.manages_tree(store_ref, "lens1", ask).unwrap());
+        assert!(!p.manages_tree(store_ref, "fork2", ask).unwrap());
+        // A name nothing reports is still an error, and every ACL call site turns
+        // an error into a refusal (`unwrap_or(false)`), never into a grant.
+        assert!(p.manages_tree(store_ref, "ghost", ask).is_err());
+        // The refusal a caller sees must not quote the blind answer either: the
+        // probe turns "that view does not exist" into the true "not delegated".
+        assert!(p.refusal(store_ref, "team").contains("neither a definition"));
+        assert!(p.refusal_tree(store_ref, "lens1", ask).contains("not delegated"));
     }
 
     #[test]

@@ -215,6 +215,27 @@ const paged = computed(() => {
   return hit.value.slice(start, start + filters.auditPageSize)
 })
 
+/*
+  The one pager control that is not arithmetic.
+
+  `auditLimit` is how many rows the SERVER was asked for; everything else on this
+  page filters or splits that answer. Moving the ceiling therefore reloads — and
+  it is the control that answers "how do I see further back?", which is why it
+  sits with the pager instead of in the retention strip it used to live in.
+*/
+function setCeiling(n: number): void {
+  filters.auditLimit = n
+  filters.auditPage = 1
+  ui.reload()
+}
+
+/** Show the pager when there is more to read one way or the other: more loaded
+    rows to page through, or a fetch that filled its ceiling so an older answer
+    is probably still in the trail. A short, filtered list hides it. */
+const canReadMore = computed(
+  () => hit.value.length > filters.auditPageSize || rows.value.length >= filters.auditLimit,
+)
+
 // Any change to what is BEING FILTERED restarts at page 1 — the operator asked a
 // new question, and the old answer's page number does not carry over.
 watch(
@@ -240,11 +261,11 @@ watch(
   <p v-else-if="error" class="err">{{ error }}</p>
 
   <template v-else>
-    <!-- The retention policy and the load ceiling, at the TOP: how long this
-         trail is kept decides how the rows below are read, so the answer sits
-         where the question is asked — not after a thousand rows of scrolling.
-         The strip shows its editor per verb, so a delegated account that
-         cannot read `store.info` at all sees no strip instead of a dash. -->
+    <!-- The retention policy, at the TOP: how long this trail is kept decides
+         how the rows below are read, so the answer sits where the question is
+         asked — not after a thousand rows of scrolling. The strip shows its
+         editor per verb, so a delegated account that cannot read `store.info`
+         at all sees no strip instead of a dash. -->
     <AuditRetentionPanel
       v-if="retention !== undefined || session.can('audit.retention.set')"
       :current="retention"
@@ -329,14 +350,18 @@ watch(
     />
 
     <!-- Paging controls sit where the reader reaches the end of a page: the
-         range they just read, the width they want next, the page numbers. -->
+         range they just read, how deep the fetch went, the width they want next,
+         the page numbers. -->
     <ListPager
-      v-if="hit.length > filters.auditPageSize"
+      v-if="canReadMore"
       :page="page"
       :size="filters.auditPageSize"
       :total="hit.length"
+      :fetch-limit="filters.auditLimit"
+      :loaded="rows.length"
       @update:page="filters.auditPage = $event"
       @update:size="filters.auditPageSize = $event"
+      @update:fetch-limit="setCeiling"
     />
 
     <p class="muted">

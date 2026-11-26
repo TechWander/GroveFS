@@ -3,12 +3,19 @@
   Create a base view — the one act on this page that chooses where bytes live.
 
   The instance dropdown lists the control plane's own registry (via
-  `store.info`), never a copy typed into this file: it is the same expanded
-  book the startup banner printed and the book `place_new_view` balances
-  against. Empty selection means "auto" — the least-loaded placement the CLI
-  gives without `--pg-instance`; one entry means there is no decision to make
-  and the row hides itself instead of asking the operator to confirm the
-  obvious.
+  `store.info`), never a copy typed into this file. It is not a PostgreSQL-only
+  affordance: a treedb deployment keeps its own named book
+  (`treedb_instances.conf`, managed from the Storage page), and `view.create`'
+  `instance` argument pins the home on both engines. One entry means there is no
+  decision to make, so the row hides itself instead of asking the operator to
+  confirm the obvious.
+
+  "Leaving it empty" means different rules per engine, and the form says which.
+  PostgreSQL takes the least-loaded instance — countable here off the same
+  ledger the balancer reads. treedb hashes the NAME across its serving
+  addresses, which no count can predict, so that answer is ASKED of the server
+  (`view.plan`) rather than reimplemented in the browser; the plan also reports a
+  name that already exists, which is the refusal the create button would get.
 
   When the signed-in account cannot create one, the panel does not offer a button
   guaranteed to be refused — it says whose act it is instead. That is the single
@@ -20,6 +27,7 @@ import { useCatalogStore } from '@/stores/catalog'
 import { useOps } from '@/composables/useOps'
 import { useSessionStore } from '@/stores/session'
 import { useUiStore } from '@/stores/ui'
+import type { PlacementPlan } from '@/api/ops'
 import { t } from '@/i18n'
 import PanelBox from '@/components/layout/PanelBox.vue'
 import FieldRow from '@/components/layout/FieldRow.vue'
@@ -30,29 +38,40 @@ const session = useSessionStore()
 const ui = useUiStore()
 const { api, soft } = useOps()
 
-/* `pgInstance` pins the target when the form is opened FROM an instance card;
+/* `instance` pins the target when the form is opened FROM an instance card;
    the field stays editable so the operator can still change their mind. */
-const props = defineProps<{ pgInstance?: string }>()
+const props = defineProps<{ instance?: string }>()
 const emit = defineEmits<{ created: [name: string] }>()
 
 const name = ref('')
-const instance = ref(props.pgInstance ?? '')
+const instance = ref(props.instance ?? '')
 watch(
-  () => props.pgInstance,
+  () => props.instance,
   (v) => {
     if (v) instance.value = v
   },
 )
 
-/* The instance a new base may land on. The instance BOOK is a PostgreSQL
-   thing: SQLite and treedb report exactly one logical store, so a picker there
-   would be a choice with one button — noise that also mislabels the backend.
-   Show the SELECT only when there is genuinely more than one instance to pick
-   from; with one instance the create call simply omits `pg_instance` and the
-   server places it. */
-const instances = ref<{ name: string; views: number | null; control: boolean }[]>([])
-const isPg = computed(() => catalog.storage?.backend === 'postgres')
-const showInstanceField = computed(() => isPg.value && instances.value.length > 1)
+/* Every registry row the snapshot reported, before the engine filters it. */
+interface Row {
+  name: string
+  views: number | null
+  control: boolean
+  serving?: boolean
+}
+const rows = ref<Row[]>([])
+const engine = computed(() => catalog.engine)
+
+/* The rows a new tree may actually be pinned to. A treedb registry can carry
+   inventory this server's `--meta-store` does not route to, and pinning one is
+   refused by name — so it is not a choice worth offering. PostgreSQL has no
+   such flag: every registry row routes. */
+const instances = computed(() =>
+  engine.value === 'treedb' ? rows.value.filter((i) => i.serving !== false) : rows.value,
+)
+const showInstanceField = computed(
+  () => (engine.value === 'postgres' || engine.value === 'treedb') && instances.value.length > 1,
+)
 
 onMounted(async () => {
   // Placement ledger first (per-instance counts come from the control plane);
@@ -63,23 +82,54 @@ onMounted(async () => {
   if (!r.ok) return
   const ledger = r.r?.pgInstances?.instances
   if (Array.isArray(ledger)) {
-    instances.value = ledger
+    rows.value = ledger
     return
   }
   const st = r.r?.storage
-  if (st?.backend === 'postgres' && Array.isArray(st.instances))
-    instances.value = st.instances.map((i: { name: string; placedViews: number | null; control: boolean }) => ({
+  if (
+    (st?.backend === 'postgres' || st?.backend === 'treedb') &&
+    Array.isArray(st.instances)
+  )
+    rows.value = st.instances.map((i) => ({
       name: i.name,
       views: i.placedViews ?? null,
       control: i.control,
+      serving: i.serving,
     }))
 })
 
-// The auto option IS least-loaded placement, so say which instance that
-// currently means — the same fewest-views-then-registry-order rule the
-// server applies, read off the same ledger. Counts missing (control plane
-// was unreachable at snapshot time) falls back to the plain wording.
+/* treedb's auto placement, asked of the server that owns the rule. Debounced by
+   sequence number: typing a name fires several lookups and only the last one may
+   land. An old binary that does not route `view.plan`, or a name too short to be
+   real, leaves it null and the option falls back to the plain wording. */
+const plan = ref<PlacementPlan | null>(null)
+let planSeq = 0
+watch(name, async (v) => {
+  const view = v.trim()
+  if (engine.value !== 'treedb' || view.length < 2) {
+    plan.value = null
+    return
+  }
+  const seq = ++planSeq
+  const r = await soft('view.plan', { view })
+  if (seq !== planSeq) return
+  plan.value = r.ok ? (r.r ?? null) : null
+})
+
+// The auto option IS the engine's own rule, so say which instance that currently
+// means. PostgreSQL: the fewest-views-then-registry-order rule read off the same
+// ledger the balancer uses (missing counts fall back to the plain wording).
+// treedb: the hash's answer for the name typed, plus the honest statement of the
+// rule while the name is still empty.
 const autoLabel = computed(() => {
+  if (engine.value === 'treedb') {
+    const p = plan.value
+    if (!p) return t('auto — by name hash across the serving instances')
+    const at = p.instance || p.addr || ''
+    return p.exists
+      ? t('auto — ${n} (a tree of this name is already there)', { n: at })
+      : t('auto — ${n} (this name hashes there)', { n: at })
+  }
   const known = instances.value.filter((i) => i.views !== null)
   if (known.length === 0 || !showInstanceField.value) return t('auto — least loaded')
   const min = Math.min(...known.map((i) => i.views as number))
@@ -92,7 +142,7 @@ const autoLabel = computed(() => {
 async function create(): Promise<void> {
   const view = name.value.trim()
   const args: Record<string, unknown> = { view }
-  if (showInstanceField.value && instance.value) args.pg_instance = instance.value
+  if (showInstanceField.value && instance.value) args.instance = instance.value
   const r = await api('view.create', args)
   // A created view may have taken a name that already had a definition, and the
   // server's own note about that IS the answer — shown, not swallowed.
@@ -114,17 +164,31 @@ async function create(): Promise<void> {
     <FieldRow for="new-base-name" label="name">
       <input id="new-base-name" v-model="name" placeholder="project-x" />
     </FieldRow>
-    <FieldRow v-if="showInstanceField" for="new-base-pg" label="PG instance">
-      <select id="new-base-pg" v-model="instance">
+    <FieldRow v-if="showInstanceField" for="new-base-instance" :label="'instance'">
+      <select id="new-base-instance" v-model="instance">
         <option value="">{{ autoLabel }}</option>
         <option v-for="i in instances" :key="i.name" :value="i.name">
           {{ i.views === null ? i.name : `${i.name} — ${i.views} view(s)` }}
         </option>
       </select>
       <template #hint>
-        {{ t('the new view’s tree is created on this instance; later writes always follow it') }}
+        {{
+          engine === 'treedb'
+            ? t(
+                'the tree is created on this treedb server; later writes always follow it. No username or password is asked for: treedb trusts the network address.',
+              )
+            : t('the new view’s tree is created on this instance; later writes always follow it')
+        }}
       </template>
     </FieldRow>
+    <p v-if="plan && plan.exists" class="err">
+      {{
+        t(
+          'a tree named ${n} already exists on ${i} — Create would be refused, so pick another name',
+          { n: name.trim(), i: plan.instance || plan.addr || '' },
+        )
+      }}
+    </p>
     <p class="muted">
       {{ t('a base view owns physical deletion; lenses, aliases and forks reshape one') }}
     </p>

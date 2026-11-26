@@ -231,7 +231,7 @@ frontend-design 方法整体重做视觉。逐条落地如下。
 
 - **保留策略上移**：`AuditRetentionPanel` 从页底移入 `page-head` 正下方，套新的 `.retbar` 条幅
   — grid `minmax(0,1fr) auto`、pine 渐变洗底、3px 左脊、`.retbar-v` 用 serif 数值 chip 显示当前
-  生效档位，右侧是预设 chips 与「载入行数」动词。非 Super 只读时走 `.retbar.is-read`，去 pine
+  生效档位，右侧是预设 chips 与窗口动词；读取上限的控件在分页条（§8.4）。非 Super 只读时走 `.retbar.is-read`，去 pine
   化以免被读成可写。
 - **列表分页**：新增 `console/src/components/ui/ListPager.vue`，`.pager` 条幅含每页 20/50/100
   切换与页码导航（首尾 + 当前邻域 + 省略号），页态存 `filters.auditPage` / `auditPageSize`。
@@ -278,3 +278,98 @@ frontend-design 方法整体重做视觉。逐条落地如下。
   `console.css` 全文 `#rrggbb` 计数为 0（`awk 'NR>1 && /#[0-9a-fA-F]{3,6}\b/ && !/^\s*--/'` 无输出）。
 * §3.6 的边界全部保持：无 webfont、无 CDN 图标、无内联 `style`、无 `data:` 图片；
   CSP `style-src 'self'` 下所有渐变与纹理都写在 `app.css` 里。
+
+## 8. 追加范围：部署后四条反馈（2026-11-26 第三次追加）
+
+换版部署到现网 treedb 档后，用户提出四条反馈：引擎与凭据的展示仍让人困惑、审计「载入行数」
+价值存疑、授权视图时报 `view 'test1100' has neither a definition nor a tree`、信息架构层面
+仍嫌混乱。逐条落地如下，交付记录见 `verification.md` §7。
+
+### 8.1 控制面为何仍是 SQLite：两枚 chip 之外必须有一句解释
+
+`store.info` 的 `backend`（控制面）与 `metadataBackend`（树引擎）在前端已经分开读、分开标
+（§7.1），但**分开标不等于解释**。概览页的「本部署」区因此在两栏之上加一段 `.engine-note`，
+按 `catalog.engine` 四档各给一句完整关系陈述（`ENGINE_NOTE: Record<Engine, string>`）：treedb 档
+说的是「树住在 treedb 服务器里；控制面 — 定义、凭据、账号和这条审计轨迹 — 是你正在通信的
+meta-server 上的本地 SQLite。本页出现两个引擎名，是对两个不同问题各自给出的答案，而不是
+同一次部署被报了两遍」。sqlite 档说「一个存储承担全部」，postgres 档说「同一个产品扮演两种角色」，
+unknown 档说「不从那个名字推断任何东西」。
+
+该区随后按「概览 → 操作 → 明细」重排，并给两组明细各配一句 `det-h` 小标题：
+`Where the data lives`（两栏存储 + 实例账）与 `How far the trail goes`（审计轨迹覆盖范围）。
+
+> 维护约束：`ENGINE_NOTE` 的 key 是 map 查表，`i18n-audit` 的字面量扫描看不见它，必须手工
+> 登记进 `zh.ts`（`ENGINE_SUB` 同理）。这是本目录唯一一处「门是绿的但翻译可能缺」的地方。
+
+### 8.2 创建视图可选 treedb 实例，且默认落点由服务端回答
+
+- `view.create` 的实例字段从 `pg_instance` 规范为 `instance`（`pg_instance` 仍是 CLI 在发的别称，
+  两者同义），treedb 臂按名钉位；名字不在注册表、或地址不在本机 `--meta-store` 路由集合内，
+  都用服务端原文拒绝，**不静默回落**。
+- 新增纯读 op `view.plan`（`Gate::Super`，与 `view.create` 同级可见性）：`find_tree_home` 命中
+  已有树则 `exists: true`，否则 `plan_placement` 给出哈希落点，再经 `treedb_registry` 反查实例名。
+  它不 open、不写、不改任何东西。存在的全部理由：「不选的话默认落哪台」必须由拥有那条哈希规则
+  的一侧回答，前端复刻 FNV-1a 就是本仓反复消灭的「两张表回答同一个问题」。
+- `NewBasePanel` 的实例下拉按 `catalog.engine` 分流：treedb 只列 `store.info` 标为 `serving` 的行
+  （清单里的非路由条目不是落点候选），PG 列全簿。视图名输入后按序列号防抖调 `view.plan`，
+  auto 标签实时播报落点，`exists` 为真时把 `view.create` 即将收到的拒绝提前标红在表单里。
+
+### 8.3 treedb 不需要账号密码：这是设计，界面上要这么说
+
+决策、边界与未来前置条件记入 `docs/adr/0003-treedb-address-identity.md`。界面三处如实标注：
+实例卡 URI 行旁的 `no credentials` 徽标 + 卡下一句小字（引擎认证是服务器全局
+`GROVEFS_TREEDB_KEY_FILE`，不是 per-instance 凭据）、注册表单的地址 hint、新建基视图的 hint。
+任何一处都没有留下空的密码字段。
+
+盲区（本轮真机截图抓到）：`store.info` 的 treedb 臂会随快照下发一句 `routingNote`，前端若把它
+当文案原样渲染，中文界面就会出现整句英文，而 i18n 门查不出来（模板里那句 `t('…')` 只是回退分支，
+服务端字段一有值就永远走不到）。规矩与 §8.1 的 `ENGINE_NOTE` 同源：**服务端持有事实，控制台持有
+操作员读到的句子**。`StoragePage.vue` 因此只从 `routingNote` 里取那个数字
+（`^treedb routes new trees by name hash across (\d+) serving address\(es\)`），措辞归字典；
+句式对不上时退回服务端原文，不编造。新增任何「后端 JSON 字段直接当文案渲染」的地方，都必须同步
+登记 zh.ts 译文并写明回退路径。
+
+### 8.4 「载入行数」：既不是总数也不是已加载数，于是搬家并改名
+
+判定结论：那个控件的值是**发给后端的 `limit`**（50/200/1000），不是后端返回的审计行总数，
+也不是当前分页已加载的行数。所以它与 pager 的「共 N 条」不冗余，但①标签误导（读起来像
+「已经载入了这么多」）、②位置错位（它 govern 的是读取窗口，与保留策略无关）。
+
+- 迁入 `ListPager`：新 props `fetchLimit` / `loaded` / `fetchLimits` 与 `update:fetchLimit` 事件，
+  标签改 `fetched from server`，改档即回第一页；`AuditRetentionPanel` 删掉 `retbar-load`、
+  `LIMITS`、`setLimit` 与对 `useFilterStore` 的依赖，头注释写明它为何不再持有这个控件。
+- 新增一条只在信息有价值时出现的句子：当 `loaded === fetchLimit`（服务端被要求返回 N 行且
+  确实返回了 N 行）时，pager 下方说明更早的调用几乎肯定还在，调高上限即可继续向前翻。
+- 用户设想的「预计可清理 N 条 + 实际清理动作」本就已存在，位置不动：`preview cut` 回显
+  `${n} row(s) are older than ${b} (nothing deleted yet)`，`purge now` 是执行入口。
+
+### 8.5 授权报错：后端修判定，前端给下一步
+
+- 后端根因（已修）：`webauth::resolve_base` 直接问 `store.has_physical()`，而 treedb 档的树在引擎里、
+  本地控制面没有 `meta/<name>/<name>.db`，于是判定恒 false — 视图真实存在也会被拒成
+  「既无定义也无树」。修复是注入 `TreeProbe`（`resolve_base_tree` / `manages_tree` / `refusal_tree`），
+  由 `server_ext.rs` 用 `physical_tree_exists` 把「问每一个引擎」这一步漏斗进去。
+- 前端两层，且都不改写服务器原文：`utils/error.ts` 的 `refusalOf()` 把四条已知拒绝正则映射成
+  「一句可执行的下一步 + 该去哪个页面」，`messageOf()` 的逐字透传契约不变；`GrantPanel` 在发请求
+  之前先按本页已加载的命名空间拦截未知视图，把幽灵视图变成「先创建，再授权」，失败内联渲染
+  （标题 + 服务器原文 + `open that page`），且不 rethrow — rethrow 会让 `ActionButton` 再 toast 一次，
+  同一句话以两种形态出现。
+
+### 8.6 信息架构：一个 section-gap、每页一句区域标题、一条跨页路径
+
+- **节奏**：新增 `--section-gap: 1.75rem`（28px，落在要求的 24–32px 区间）。它由**开启区块的
+  标题** `.bar` 的 `margin-top` 承载，靠块级兄弟的垂直 margin collapsing 统一全站，而不是给每个
+  区块补 `margin-bottom`——后者与 panel 自带的间距折叠后仍是同一个数，却要求每个新组件重新对齐。
+  `.page-head` 底部与 `.pager` 顶部同步改用该 token。
+- **分区**：六页（Overview / Audit / Storage / Views / Keys / Accounts，按使用频率）一律
+  「概览 → 操作 → 明细」自上而下；每组卡片或表格前一句 `.bar` 标题 + 一句说明：
+  `At a glance`、`Typical path`、`Where the data lives`、`How far the trail goes`、
+  `This deployment`、`Instances`、`Keys you can see`、`Accounts and their reach`。区块内的小标题
+  复用既有 `det-h` 原语，不另造第二套（本轮曾加 `.grp`，发现与 `det-h` 重复后删除）。
+- **引导**：Overview 新增 `.flow` 四步（创建基准视图 → 授权账号 → 签发挂载密钥 → 查看发生了什么），
+  CSS counter 编号，每步是跳转链接。Storage 页把 `Register instance` 从表格之后的孤立工具条移进
+  `Instances` 标题行——动词开在它作用的那个区；Keys 页的 HelpPanel 从「表单与表格之间」移到页末，
+  因为它是参考而非步骤。Views 页原本已有 BarRow 分区，本轮不动其结构。
+- **未破坏项**：CSP `style-src 'self'` 下无内联 `style`（构建产物 grep `style=` 为 0）、
+  产物名仍固定为 `src/webui/{index.html,app.js,app.css}`、响应式断点与
+  `prefers-reduced-motion` 兜底不变、`console.css` 除 token 定义外零硬编码色值。

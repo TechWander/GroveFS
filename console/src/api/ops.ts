@@ -40,6 +40,7 @@ export type Op =
   | 'fork.create'
   | 'fork.drop'
   | 'view.create'
+  | 'view.plan'
   | 'view.stats'
   | 'apikey.list'
   | 'apikey.create'
@@ -91,6 +92,7 @@ export interface OpResult {
   'fork.create': ForkStats
   'fork.drop': unknown
   'view.create': string | { note?: string }
+  'view.plan': PlacementPlan
   'view.stats': ViewStats
   'apikey.list': KeyRow[]
   'apikey.create': KeySecret
@@ -123,6 +125,19 @@ export interface OpResult {
   'storage.preview': StoragePreview
   'storage.set_control': { ok: boolean; msg: string; restartRequired: boolean }
   'storage.relocate': RelocateResult
+}
+
+/** `view.plan` — where a new base view would land, answered by the server that
+    OWNS the rule rather than by a copy of it in the browser. `instance` is null
+    when the chosen address has no registry name; `exists` means the name is
+    already a tree somewhere, so `view.create` would refuse it. */
+export interface PlacementPlan {
+  backend: string
+  rule: string
+  addr: string | null
+  instance: string | null
+  exists: boolean
+  serving: number | null
 }
 
 /** `fork.create` — the metadata tree that was copied. */

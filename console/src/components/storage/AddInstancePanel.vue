@@ -67,7 +67,9 @@ async function create(): Promise<void> {
         {{
           isPg
             ? t('the meta-server dials it once before saving; an unreachable URI is refused')
-            : t('treedb routes to one --meta-store address; this records an inventory entry')
+            : t(
+                'host:port only — treedb takes no username or password, because the address is the identity (engine authentication is the server-wide GROVEFS_TREEDB_KEY_FILE, not a per-instance field)',
+              )
         }}
       </template>
     </FieldRow>

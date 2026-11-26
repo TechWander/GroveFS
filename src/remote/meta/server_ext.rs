@@ -2080,7 +2080,10 @@ fn gates(op: &str) -> Result<Vec<Gate>, String> {
         "view.import.commit" => vec![Gate::Import],
         // Placement, refcounts and content-byte GC cross every tenant.
         "view.create" => vec![Gate::Super(
-            "a new base view picks a storage home (PG instance / data root), which is a deployment decision",
+            "a new base view picks a storage home (PG or treedb instance / data root), which is a deployment decision",
+        )],
+        "view.plan" => vec![Gate::Super(
+            "it reveals which storage home a new tree would be placed on",
         )],
         "view.rm_base" | "refs.rebuild" | "gc.scan" | "gc.apply" => vec![Gate::Super(
             "it destroys or rewrites state shared by more views than the caller's own",
@@ -2123,7 +2126,7 @@ fn gates(op: &str) -> Result<Vec<Gate>, String> {
         }
         other => {
             return Err(format!(
-                "control op '{other}' has no access rule (unknown, or added to the dispatcher \n                     without one) — refusing. Known ops: info, whoami, login, def.list/get/put/remove, \n                     stamp, physical.list/has, fork.has/create/drop/graft, view.create/stats/export/import, \n                     view.rm_base, refs.rebuild, gc.scan/apply, apikey.create/list/revoke/delete/rotate/set_ro/update/secret/calls/purge, \n                     audit.retention.get/set, storage.add/update/remove/preview/set_control/relocate, \n                     account.list/create/passwd/role/disable/delete, grant.list/add/remove"
+                "control op '{other}' has no access rule (unknown, or added to the dispatcher \n                     without one) — refusing. Known ops: info, whoami, login, def.list/get/put/remove, \n                     stamp, physical.list/has, fork.has/create/drop/graft, view.create/stats/plan/export/import, \n                     view.rm_base, refs.rebuild, gc.scan/apply, apikey.create/list/revoke/delete/rotate/set_ro/update/secret/calls/purge, \n                     audit.retention.get/set, storage.add/update/remove/preview/set_control/relocate, \n                     account.list/create/passwd/role/disable/delete, grant.list/add/remove"
             ));
         }
     };
@@ -2136,6 +2139,43 @@ fn gates(op: &str) -> Result<Vec<Gate>, String> {
 /// is either a dead button or a promise the console cannot keep.
 pub fn control_op_known(op: &str) -> bool {
     gates(op).is_ok()
+}
+
+/// The tree question as THIS backend answers it, handed to the governance name
+/// resolver.
+///
+/// `webauth` cannot call [`physical_tree_exists`] by itself: it is passed a
+/// `&dyn ControlStore`, and under `treedb://` that store's own `has_physical`
+/// looks for a local `meta/<name>/<name>.db` file the deployment never writes —
+/// the trees are inside the engine. The result was that `grant bob test1100` on
+/// a live treedb base was refused with "view 'test1100' has neither a definition
+/// nor a tree" while `view list` on the same page showed the view mounted and
+/// written (found 2026-11-26 on the fdb4 box, where `grant.list` had been
+/// permanently empty for exactly this reason). Same funnel, same answer as
+/// `view list`, so the two can no longer disagree.
+fn tree_probe(rt: &MetaRuntime) -> impl Fn(&str) -> Result<bool, String> + '_ {
+    move |n| physical_tree_exists(rt, n)
+}
+
+/// `Principal::manages` against the backend's own tree answer.
+fn governs(rt: &MetaRuntime, who: &crate::webauth::Principal, name: &str) -> bool {
+    let ask = tree_probe(rt);
+    who.manages_tree(rt.control.as_ref(), name, &ask)
+        .unwrap_or(false)
+}
+
+/// The refusal sentence, resolved the same way, so a denial never quotes the
+/// control store's blind answer as its reason.
+fn govern_refusal(rt: &MetaRuntime, who: &crate::webauth::Principal, name: &str) -> String {
+    let ask = tree_probe(rt);
+    who.refusal_tree(rt.control.as_ref(), name, &ask)
+}
+
+/// `webauth::resolve_base` against the backend's own tree answer: the base a
+/// grant is STORED under must be the base `view list` says exists.
+fn resolve_base_rt(rt: &MetaRuntime, name: &str) -> Result<String, String> {
+    let ask = tree_probe(rt);
+    crate::webauth::resolve_base_tree(rt.control.as_ref(), name, &ask)
 }
 
 /// Refuse unless `who` governs `name`. `allow_new` is for the verbs that CREATE
@@ -2152,7 +2192,7 @@ fn may_govern(
     if who.is_super() {
         return Ok(());
     }
-    if who.manages(rt.control.as_ref(), name).unwrap_or(false) {
+    if governs(rt, who, name) {
         return Ok(());
     }
     if allow_new {
@@ -2163,7 +2203,7 @@ fn may_govern(
             return Ok(());
         }
     }
-    Err(who.refusal(rt.control.as_ref(), name))
+    Err(govern_refusal(rt, who, name))
 }
 
 /// Does this principal see this credential row? Its own, or bound to a view it
@@ -2181,7 +2221,7 @@ fn key_visible(
         return true;
     }
     match &k.view {
-        Some(v) => who.manages(rt.control.as_ref(), v).unwrap_or(false),
+        Some(v) => governs(rt, who, v),
         None => false,
     }
 }
@@ -2316,7 +2356,7 @@ fn visible(
         // A name that fails to resolve is hidden rather than reported: to a
         // delegate it is not theirs either way, and a broken chain elsewhere in
         // the deployment is not information this listing needs to leak.
-        .filter(|n| who.manages(rt.control.as_ref(), n).unwrap_or(false))
+        .filter(|n| governs(rt, who, n))
         .collect()
 }
 
@@ -2659,8 +2699,15 @@ fn control_dispatch(
             // are interpreted by the process that owns the store.
             let manifest = a.get("manifest").and_then(|v| v.as_str());
             // Same semantics as the CLI's `view create --pg-instance`: an
-            // explicit instance name pins the home, otherwise least-loaded.
-            let pg_instance = a.get("pg_instance").and_then(|v| v.as_str());
+            // explicit instance name pins the home, otherwise least-loaded. The
+            // field is called `instance` now because the book is no longer a
+            // PostgreSQL-only thing — a treedb deployment has a named registry too
+            // (`treedb_instances.conf`, managed from the Storage page) — but
+            // `pg_instance` keeps working as the alias the CLI already sends.
+            let pg_instance = a
+                .get("instance")
+                .and_then(|v| v.as_str())
+                .or_else(|| a.get("pg_instance").and_then(|v| v.as_str()));
             if !crate::layout::valid_view_name(&view) {
                 return Err(format!("invalid view name '{view}'"));
             }
@@ -2715,7 +2762,37 @@ fn control_dispatch(
                     // to be re-checked here because that gate only looked at
                     // local db files — two lists answering one question, the
                     // pattern this funnel removes.)
-                    let home = crate::treedb_store::plan_placement(addrs, &view);
+                    //
+                    // An instance name pins the home exactly as `--pg-instance`
+                    // does for PG. Without one, the view's hash picks the server,
+                    // which is the only rule available and the one later reads
+                    // re-derive — but the operator is entitled to choose the disk
+                    // a tree lands on, and the Storage page now offers the names.
+                    let home = match pg_instance {
+                        None => crate::treedb_store::plan_placement(addrs, &view),
+                        Some(want) => {
+                            let book = crate::treedb_store::treedb_registry(&rt.base)
+                                .unwrap_or_default();
+                            let named = book
+                                .iter()
+                                .find(|(n, _)| n == want)
+                                .map(|(_, addr)| addr.clone());
+                            match named {
+                                None => return Err(format!(
+                                    "no treedb instance named '{want}' — the registry defines {} (the Storage page lists them)",
+                                    if book.is_empty() {
+                                        "none".to_string()
+                                    } else {
+                                        book.iter().map(|(n, _)| format!("'{n}'")).collect::<Vec<_>>().join(", ")
+                                    }
+                                )),
+                                Some(addr) if !addrs.iter().any(|x| x == &addr) => return Err(format!(
+                                    "treedb instance '{want}' points at {addr}, which this server's --meta-store does not route to — it cannot hold a view later reads would find",
+                                )),
+                                Some(addr) => addr,
+                            }
+                        }
+                    };
                     let eng = crate::meta::MetaStore::open_treedb(&home, &view, false)
                         .map_err(|e| format!("view create: {e}"))?;
                     // The def-home marker: trees live in the engine, but the
@@ -2729,11 +2806,73 @@ fn control_dispatch(
                     // Like PG: the bytes belong to the data servers, so there is
                     // no local root a manifest `touch` line could write into.
                     let note = seed_if_manifest(&eng, None, manifest)?;
-                    format!("created BASE view '{view}' in treedb at {home}{note}")
+                    // Say WHICH instance the hash chose when nobody pinned one:
+                    // "in treedb" alone leaves the operator guessing where the
+                    // tree went, and the next question is always that one.
+                    let on = crate::treedb_store::treedb_registry(&rt.base)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|(_, addr)| addr == &home)
+                        .map(|(n, _)| format!("instance '{n}' at {home}"))
+                        .unwrap_or_else(|| home.clone());
+                    format!("created BASE view '{view}' in treedb on {on}{note}")
                 }
             };
             rt.evict();
             Ok(json!(report))
+        }
+        // "Then which instance does the default pick?" — answered by the SAME
+        // function the create arm calls, so the console can NAME the instance
+        // instead of guessing it from view counts. A count cannot predict
+        // treedb's rule (a name hash), and a second implementation of the rule
+        // in the front end is the two-lists-answering-one-question pattern this
+        // file keeps removing. Pure: nothing is opened, nothing is written.
+        "view.plan" => {
+            let view = req_str(a, "view")?;
+            if !crate::layout::valid_view_name(&view) {
+                return Err(format!("invalid view name '{view}'"));
+            }
+            match &rt.store {
+                #[cfg(feature = "treedb")]
+                StoreKind::Treedb(addrs) => {
+                    // A name the engine already serves is PLACED, so report
+                    // where it lives rather than where a new name with the same
+                    // spelling would hash to.
+                    let (addr, exists) = match crate::treedb_store::find_tree_home(addrs, &view)? {
+                        Some(h) => (h, true),
+                        None => (crate::treedb_store::plan_placement(addrs, &view), false),
+                    };
+                    let named = crate::treedb_store::treedb_registry(&rt.base)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|(_, x)| x == &addr)
+                        .map(|(n, _)| n);
+                    Ok(json!({
+                        "backend": "treedb",
+                        "rule": "name hash",
+                        "addr": addr,
+                        "instance": named,
+                        "exists": exists,
+                        "serving": addrs.len(),
+                    }))
+                }
+                StoreKind::Pg(_) => Ok(json!({
+                    "backend": "postgres",
+                    "rule": "least loaded",
+                    "addr": null,
+                    "instance": null,
+                    "exists": physical_tree_exists(rt, &view)?,
+                    "serving": serde_json::Value::Null,
+                })),
+                StoreKind::Sqlite => Ok(json!({
+                    "backend": "sqlite",
+                    "rule": "the local metadata root",
+                    "addr": null,
+                    "instance": null,
+                    "exists": physical_tree_exists(rt, &view)?,
+                    "serving": serde_json::Value::Null,
+                })),
+            }
         }
         "view.rm_base" => {
             let view = req_str(a, "view")?;
@@ -3300,7 +3439,7 @@ fn control_dispatch(
         | "account.disable" | "account.delete" | "grant.list" | "grant.add" | "grant.remove"
         | "view.stats" => web_dispatch(rt, who, op, a),
         other => Err(format!(
-            "unknown control op '{other}' (known: info, store.info, whoami, def.list/get/put/remove, stamp, physical.list/has, fork.has/create/drop/graft, view.create/stats/export/import, view.rm_base, refs.rebuild, gc.scan/apply, apikey.create/list/revoke/delete/rotate/set_ro/update/calls/purge, audit.retention.get/set, storage.add/update/remove/preview/set_control/relocate, account.list/create/passwd/role/disable/delete, grant.list/add/remove)"
+            "unknown control op '{other}' (known: info, store.info, whoami, def.list/get/put/remove, stamp, physical.list/has, fork.has/create/drop/graft, view.create/stats/plan/export/import, view.rm_base, refs.rebuild, gc.scan/apply, apikey.create/list/revoke/delete/rotate/set_ro/update/calls/purge, audit.retention.get/set, storage.add/update/remove/preview/set_control/relocate, account.list/create/passwd/role/disable/delete, grant.list/add/remove)"
         )),
     }
 }
@@ -3313,7 +3452,7 @@ fn visible_pairs(
     defs: Vec<(String, String)>,
 ) -> Vec<(String, String)> {
     defs.into_iter()
-        .filter(|(n, _)| who.manages(rt.control.as_ref(), n).unwrap_or(false))
+        .filter(|(n, _)| governs(rt, who, n))
         .collect()
 }
 
@@ -3537,7 +3676,7 @@ fn web_dispatch(
             // would be a row that matches nothing (the ACL resolves outward from
             // any name to its base), so normalizing here turns a mistake into a
             // working grant and says what it did.
-            let base = webauth::resolve_base(rt.control.as_ref(), &named)?;
+            let base = resolve_base_rt(rt, &named)?;
             s.grant(&account, &base, Some(&who.account))?;
             Ok(json!({
                 "account": account,
@@ -3549,8 +3688,7 @@ fn web_dispatch(
         "grant.remove" => {
             let account = webauth::normalize_account(&req_str(a, "account")?)?;
             let named = req_str(a, "base")?;
-            let base = webauth::resolve_base(rt.control.as_ref(), &named)
-                .unwrap_or_else(|_| named.clone());
+            let base = resolve_base_rt(rt, &named).unwrap_or_else(|_| named.clone());
             // Removing the delegation an active session relies on takes effect on
             // that session's NEXT call (the principal is re-read per request), so
             // there is nothing to expire and nothing to invalidate here.
@@ -3580,7 +3718,7 @@ fn web_dispatch(
                 None if physical_tree_exists(rt, &view)? => "base",
                 None => "none",
             };
-            let base = webauth::resolve_base(rt.control.as_ref(), &view).ok();
+            let base = resolve_base_rt(rt, &view).ok();
             // The view's FAMILY: every name that resolves to this same base.
             // Only computed for a base name (a delegate's own view list is
             // small, and this is one resolve per name).
@@ -3596,7 +3734,7 @@ fn web_dispatch(
                 names.dedup();
                 for n in names {
                     if n != view
-                        && webauth::resolve_base(rt.control.as_ref(), &n)
+                        && resolve_base_rt(rt, &n)
                             .ok()
                             .as_deref()
                             == Some(view.as_str())

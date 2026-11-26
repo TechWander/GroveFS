@@ -184,3 +184,136 @@ Overview 卡片为「树引擎 sqlite」+「元数据与内容同库」，本部
 审计页 retbar 存在、pager 缺席（17 行 ≤ 20，属正确语义）。验证后临时栈已停、
 `/tmp/gfs-arm` 已清除，现网不受影响。
 
+## 7. 部署后四条反馈（2026-11-26 第三次追加）
+
+对应规格 §8 与 ADR-0003。量具同上：无头 Chrome + CDP，脚本 `.tmpedit/r3_verify.mjs`
+（真实输入登录、点语言按钮切 EN/ZH、逐页截图、`getComputedStyle` 与 DOM 序断言）加
+`.tmpedit/r3_narrow.mjs`（窄屏溢出）；驱动入口是本机隧道 `127.0.0.1:18787 → gfs-fdb4:8787`，
+截图落在 `.tmpedit/shots-r3/`（15 张）。
+
+### 7.1 静态门
+
+| 检查 | 结果 |
+|---|---|
+| `npm run typecheck` | 通过 |
+| `npm run lint` | 通过 |
+| `npm run i18n:audit` | `zh.ts entries 633`／`strings sent to t(): 526`／`of which missing: 0`／打印 `no missing keys`；另列 `legacy entries zh.ts lacks: 8` |
+| `npm run build` | 通过；`src/webui/`：`app.css 59.55 kB`、`app.js 309.82 kB`、`index.html 1.61 kB`。同源码连跑两次三份产物 md5 全等，构建可复现（产物要提交，这条必须成立） |
+| `cargo test --features treedb,web --lib` | 305 passed / 0 failed（`--lib` 显式指定，避免集成测试缺席造成假绿） |
+
+`legacy entries zh.ts lacks: 8` 的口径要说清：该数字只是把新表与旧手写控制台
+`src/webui/app.js` 里的 `const I18N_ZH`（392 条）作集合差，不判断旧词条是否仍被页面使用；
+真正的「用到却没译」由 `missing: 0` 度量。这 8 条里 7 条是旧控制台自己的长句（新页面不再发这些串），
+1 条是本轮**主动删除**的 `'rows to load': '载入行数'` —— 那个标签误导操作员（见 §7.3）。
+
+上一轮记的「492 串 0 缺失」是本轮改动前的基线，本轮增至 526 串（其中一条被 §7.5 的
+banner 改写从模板里挪进了常量，仍计数）：新增的区块标题、落位预测句与行动化拒绝文案都进了表。
+
+### 7.2 后端与 API 取证
+
+在 gfs-fdb4 上直接打控制面（`/tmp/probe_round3.sh`、`/tmp/probe_grant3.sh`，登录字段是
+`account` 而非 `user`）：
+
+| 事实 | 实测 |
+|---|---|
+| 两个引擎名确实是两件事 | `store.info` → `backend:"sqlite"`、`metadataBackend:"treedb"`；顶层 `instances:[]`，实例清单在 `storage.instances`，每行带 `serving` |
+| 落位规则归服务端回答 | `view.plan {"view":"probe-r3-a"}` → `{"addr":"127.0.0.1:7778","instance":"primary","rule":"name hash","exists":false,"serving":2}` |
+| 已有名会被如实预告 | `view.plan {"view":"test1100"}` → `exists:true`、`instance:"primary"` |
+| `instance` 真能钉位 | `view.create {"view":"probe-r3-a","instance":"primary-2"}` → `created BASE view 'probe-r3-a' in treedb on instance 'primary-2' at 127.0.0.1:7777`，再 `view.plan` 复核落点未变 |
+| 授权修复已上线 | `grant.add bob→test1100` 成功返回 `{"account":"bob","asNamed":true,"base":"test1100","grantedBy":"rootops"}` —— 这正是用户报的失败用例 |
+| 真幽灵视图仍报原句 | `grant.add bob→ghost-nope` → `view 'ghost-nope' has neither a definition nor a tree`（前端映射需要它原样透传） |
+
+`test1100` 经 `physical.list` 证实一直真实存在（`["alpha","bravo","charlie","cxrt","echo","fk1",
+"india","test110","test1100"]`），报错不是幽灵视图，而是 §8.5 记的 `resolve_base` 判定路径缺陷。
+探针视图 `probe-r3-a`、`uictl-1` 验证后均已 `view rm --base` 删除，收尾复核注册表命中 0。
+
+### 7.3 换版与产物一致性
+
+- release 二进制 md5 `d6194b67903de4cf7b75c3803ec02e81`；gfs1／gfs2／gfs-client／gfs-fdb4
+  四机 `/usr/local/bin/grovefs` 全部对齐。
+- `fdb4_upgrade.sh push` 的 gfs1 分支仍只写 `/data/gfs1/grovefs.bin` 却回显
+  `/usr/local/bin/grovefs` 的校验和——本轮再次手工补装并复核，两个路径同为 `d6194b67…`
+  （脚本自身的这一处口径问题未改，见 §6.2 同样记录；gfs1 登录用户不是 root，补装须走 `sudo`）。
+- 重启走 `.build-bin/fdb4_upgrade.sh restart`：meta-server pid=434838（50110/50111）、
+  web pid=434980（8787），manager pid=415658 未动（其 `exe` 显示 `(deleted)`，即仍在跑换版前的
+  inode，与 §6.3 的约定一致：manager 不归本脚本重启），treedb 引擎 7777/7778 未重启；
+  meta-server 命令行仍是
+  `--meta-dir /data/fdb/treedb/ctrl --meta-store treedb://127.0.0.1:7777,127.0.0.1:7778`（档未变）。
+- 换版校验按「重载文档 + 校验运行标志物」：从 :8787 取回的三份产物与本机 `src/webui/`
+  逐字节相同 —— `index.html 1c7a8e6b…`、`app.js cb37a947…`、`app.css 3213d05b…`。
+- CSP 与产物名复核：`index.html` 无 `style=` 属性、无 `<style>` 块，仍是固定名
+  `index.html` / `app.js` / `app.css`（`include_str!` 内嵌，故改前端必须重装二进制）。
+
+### 7.4 真机断言（47 项，全绿）
+
+| 反馈 | 断言 | 实测 |
+|---|---|---|
+| 1a | 概览用一句话解释两个引擎名的关系 | `.engine-note` 存在，EN 与 ZH 各读到一次完整句；ZH 为「树住在 treedb 服务器里；控制面 — 定义、凭据、账号和这条审计轨迹 — 是你正在通信的 meta-server 上的本地 SQLite。本页出现两个引擎名，是对两个不同问题各自给出的答案…」 ✔ |
+| 1a | 不是并列两枚 chip 了事 | 小标题点名「树引擎」，`tree engine` 命中 ✔ |
+| 1b | 创建表单暴露实例下拉 | `#new-base-instance` 存在，`option` 恰 3 条（auto + primary + primary-2） ✔ |
+| 1b | 「不选默认落哪台」由服务端回答 | 输入 `uictl-1` 后 auto 项变为 `auto — primary-2 (this name hashes there)` ✔ |
+| 1b | 已占用的名在调用前就拦下 | 输入 `test1100` 后 `#view-new .err` = `a tree named test1100 already exists on primary — Create would be refused, so pick another name` ✔ |
+| 1b | 钉位真的生效（UI 路径，非 curl） | 选 `primary-2` 点「创建」→ toast `created BASE view 'uictl-1' in treedb on instance 'primary-2' at 127.0.0.1:7777` ✔ |
+| 1c | treedb 卡如实标注无需凭据 | `.inst-uri-label .cred.none` 两枚，文本 `no credentials|no credentials`（ZH：`无需凭据|无需凭据`） ✔ |
+| 1c | 说明认证住在何处，避免误以为漏填 | 实例卡正文含 `GROVEFS_TREEDB_KEY_FILE`；注册表单 hint 同句 ✔ |
+| 1c | 页面上不存在空的必填凭据框 | 存储页 `input[type=password]` 计数 0 ✔ |
+| 2 | 「载入行数」不在保留策略条里 | `.retbar select` 计数 0 ✔ |
+| 2 | 上限控件迁入分页条并改名 | `.pager .pager-fetch select` 存在，标签 `fetched from server`（ZH：`服务端读取行数`） ✔ |
+| 2 | 提高上限确实多发一次请求 | 50→200 后 `.pager-note` = `the server was asked for 200 rows and returned 200, so older calls are almost certainly still there — raise “fetched from server” to read further back` ✔ |
+| 3 | 拒绝就地显示、不是一闪而过的 toast | 点「授予」后 `.refusal` 出现，`.toast` 计数 0 ✔ |
+| 3 | 第一行给行动、第二行留服务器原句 | head：`there is no view named uictl-1 on this server — create it first, or delegate one that the Views page lists`；detail：`view 'uictl-1' has neither a definition nor a tree`；并附「打开该页」链接 ✔ |
+| 4 | 区块节奏 28px | 首个 `.bar` computed `margin-top = 28px`，`.page-head` `margin-bottom = 28px` ✔ |
+| 4 | 概览有跨页引导 | `.flow li` = 4（ZH 渲染为「创建基准视图 → 授权给某个账号 → 签发挂载密钥 → 查看发生了什么」） ✔ |
+| 4 | 明细区有层级而非一片卡片 | `.detail .det-h` = 2 ✔ |
+| 4 | 密钥页参照区排在数据之后 | 文档序 `.bar h2`（`你可见的密钥`）早于 `.help` ✔ |
+| 4 | 窄屏无横向溢出（另跑 9 项） | 420／640／820px × overview／views／audit 共 9 格，`scrollWidth − clientWidth = 0px` ✔ |
+| — | 控制台错误 | 页面侧 0；唯一一条是首屏 `GET /api/session` 的 401 —— 无会话时的探针，
+其存在本身就是「先问一次再决定要不要摆登录卡」的实现，见 §7.6 ✔ |
+
+### 7.5 只有截图能抓到的缺陷：服务端句子顶穿了前端字典
+
+真机截图（`.tmpedit/shots-r3/08_storage_zh.png`）暴露出一处静态门与断言脚本都判不出来的问题：
+存储页顶部那枚「实验性」横幅在中文界面下仍是整句英文。根因不在译文，而在措辞的归属：
+`store.info` 的 treedb 臂把这句话当数据发了出来（`src/remote/meta/server_ext.rs` 的
+`routingNote`），前端写的是 `storage?.routingNote ?? t('…')` —— 服务端字段有值时，
+字典里那条译文永远走不到。i18n 门看不见它，因为模板里确实写了 `t('…')`；断言也看不见它，
+因为那条断言查的是实例卡徽标。
+
+修法按本仓既有规矩：**服务端持有事实（这台部署有几个在服地址），控制台持有操作员读到的句子**。
+`StoragePage.vue` 现在从 `routingNote` 里取出数字，用字典键
+`treedb routes new trees by name hash across ${n} serving address(es); other entries are inventory, not placement targets` 渲染；句式一旦对不上就退回服务端原文，
+而不是编一句话出来。zh.ts 补进对应译文，`missing` 仍为 0。复验断言：
+
+| 断言 | 实测 |
+|---|---|
+| 中文界面下横幅已译，数字仍来自服务端 | `.exp-banner` = 「实验性 treedb 按名称哈希把新树路由到 2 个在服地址；其余条目只是清单，不是落位目标」 ✔ |
+
+**教训**：凡是「后端 JSON 字段直接当文案渲染」的地方，都是字典的盲区；新增这类字段时要一并
+登记译文并写明回退路径，光看 `t()` 调用次数不足以证明页面是双语的。
+
+### 7.6 唯一一条 console error 的定性
+
+`47 项`跑完只记到一条：`network/error: … 401 (Unauthorized)`。用清掉 cookie 的干净 profile
+单独取证（`.tmpedit/p401c.mjs`，为此给 `cdp.mjs` 加了首屏 `httpErrors` 记录）：
+
+```
+boot-phase http errors: ["401 http://127.0.0.1:18787/api/session"]
+sign-in card present: true
+```
+
+即它是应用启动时「现在这个浏览器还会话在吗」的那一次探测：无会话 → 401 → 摆登录卡，
+属预期路径，不是任何一页的数据请求失败。页面侧 console error 为 0。
+
+### 7.7 量具自身的三处纠正（如实记录）
+
+首轮 `RUN_EXIT=1` 的失败全在脚本、不在被测页面，值得记下来避免复发：
+
+1. 语言切换原先靠 `page.navigate(BASE + '/#/')` —— 同文档 hash 跳转不触发模块重载，
+   于是「切到 EN」实际什么都没做，英文正则断言全判 FAIL，而页面输出的中文恰恰证明译文是对的。
+   现在改成点真实的 `.lang-btn` 并以 `localStorage['gfs.lang']` 校验到位（`t()` 走的是响应式
+   ref，本就无需 reload）。
+2. 点击 helper 原先「先 `scrollIntoView`、再另发一次 `querySelector` 量盒子」，中间隔了一次
+   Vue 重渲染，`#r3-grant` 已不在，`getBoundingClientRect()` 抛 null。合并成一次 evaluate 后消失。
+   同时删掉了 `#page-accounts` 这类页面根本不存在的外壳 id（页面由 `PageHead` 起头，不包 id）。
+3. 跨主机清理走 `execSync` 嵌套引号会静默失败（首轮就漏下了 `uictl-1`）。改为先在 fdb4 落
+   `/tmp/rmview.sh`、只收一个 argv，脚本并断言 `removed base view 'uictl-1'` 出现后才继续。

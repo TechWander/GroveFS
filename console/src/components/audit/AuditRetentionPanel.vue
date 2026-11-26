@@ -15,15 +15,20 @@
   so a dry-run preview sits beside it: an operator sees the size of the cut
   before taking it, and the danger verb is the one they have to reach for.
 
-  The readout (what is configured, how many rows are loaded) is shown to anyone
-  the parent lets see it; the EDIT affordances appear per verb, so a session that
-  can read `store.info` but not write `audit.retention.set` gets a policy it
-  cannot click — never a button that only ever 403s. A refusal on one call is
-  still shown inline verbatim: the server's sentence is the answer.
+  The readout (what is configured) is shown to anyone the parent lets see it; the
+  EDIT affordances appear per verb, so a session that can read `store.info` but
+  not write `audit.retention.set` gets a policy it cannot click — never a button
+  that only ever 403s. A refusal on one call is still shown inline verbatim: the
+  server's sentence is the answer.
+
+  How many rows were FETCHED is not this strip's business: it is a property of
+  the table below, and it lives in the pager next to that table (see
+  `ListPager`). An earlier revision carried a "rows to load" select here, and an
+  operator read its number as "how many audit rows exist" — a policy bar is the
+  wrong place to answer a reading-depth question.
 */
 import { computed, ref, watch } from 'vue'
 import { useOps } from '@/composables/useOps'
-import { useFilterStore } from '@/stores/filters'
 import { useSessionStore } from '@/stores/session'
 import { useUiStore } from '@/stores/ui'
 import { messageOf } from '@/utils/error'
@@ -32,7 +37,6 @@ import ActionButton from '@/components/ui/ActionButton.vue'
 
 const { api } = useOps()
 const ui = useUiStore()
-const filters = useFilterStore()
 const session = useSessionStore()
 
 /** What the server currently keeps (`null` = until purged by hand, `undefined`
@@ -79,15 +83,6 @@ const currentSentence = computed(() => {
     ? t('rows older than ${w} are swept', { w: props.current })
     : t('every row is kept until an operator purges it')
 })
-
-/** The load ceiling, next to the page controls that live under the table: this
-    is how many rows the SERVER was asked for, the pager only splits them. */
-const LIMITS = [50, 200, 1000]
-function setLimit(ev: Event): void {
-  filters.auditLimit = Number((ev.target as HTMLSelectElement).value)
-  filters.auditPage = 1
-  ui.reload()
-}
 
 function usePreset(v: string): void {
   touched.value = true
@@ -213,13 +208,6 @@ async function purgeNow(): Promise<void> {
         />
       </div>
     </div>
-
-    <label class="retbar-load">
-      <span>{{ t('rows to load') }}</span>
-      <select :value="String(filters.auditLimit)" @change="setLimit">
-        <option v-for="n in LIMITS" :key="n" :value="String(n)">{{ n }}</option>
-      </select>
-    </label>
 
     <p v-if="status" :class="['retbar-msg', failed ? 'err' : 'muted']">{{ status }}</p>
   </section>

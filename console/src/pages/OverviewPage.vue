@@ -129,6 +129,28 @@ const engineCard = computed(() =>
     ? { label: 'tree engine', value: engineText.value, sub: ENGINE_SUB[engine.value] }
     : { label: 'control plane', value: info.value?.backend || '—', sub: 'the store that answered this page' },
 )
+
+/*
+  The sentence the two rows cannot say.
+
+  `tree engine: treedb` beside `control plane: sqlite` reads as a contradiction,
+  and the operator's question — why does it still say sqlite? — is only
+  answerable in prose. One sentence per engine, keyed off the TREE ENGINE, shown
+  ABOVE the two rows so the reader has the frame before the figures. The keys are
+  looked up through this map rather than passed to `t()` as a literal, so
+  `zh.ts` carries them by hand — the same way `ENGINE_SUB` does.
+*/
+const ENGINE_NOTE: Record<Engine, string> = {
+  sqlite:
+    'One store does everything here: the trees, the definitions, the credentials, the accounts and the audit trail all live in the SQLite files under the base directory.',
+  postgres:
+    'The trees are PostgreSQL schemas, while definitions, credentials, accounts and the audit trail live in the instance marked control — one product playing two roles.',
+  treedb:
+    'The trees live in the treedb servers; the control plane — definitions, credentials, accounts and this audit trail — is local SQLite on the meta-server you are talking to. Two engine names on this page are two answers to two different questions, not one deployment reported twice.',
+  unknown:
+    'The server named a backend this console does not know, so nothing here is inferred from that name.',
+}
+const engineNote = computed(() => t(ENGINE_NOTE[engine.value]))
 </script>
 
 <template>
@@ -142,6 +164,9 @@ const engineCard = computed(() =>
   <LoadingHint v-else-if="!cardsReady && pending" />
 
   <template v-else-if="info">
+    <BarRow :title="'At a glance'">
+      <span class="muted">{{ t('every figure is a count this page can click through') }}</span>
+    </BarRow>
     <div class="cards">
       <StatCard
         :label="engineCard.label"
@@ -208,10 +233,55 @@ const engineCard = computed(() =>
     </div>
 
     <template v-if="store">
+      <!-- The order the six nav items are meant to be used in. It lives here
+           because the overview is the page both a first-time and a returning
+           operator reads, and nowhere else does the console state that a base
+           view comes before a delegation, or a delegation before a key. -->
+      <BarRow :title="'Typical path'" />
+      <ol class="flow">
+        <li>
+          <button type="button" class="link" @click="to('views')">
+            {{ t('Create the base view') }}
+          </button>
+          <span class="muted">
+            {{ t('a name and a storage home — every lens, alias and fork is shaped out of one') }}
+          </span>
+        </li>
+        <li>
+          <button type="button" class="link" @click="to('accounts')">
+            {{ t('Delegate it to an account') }}
+          </button>
+          <span class="muted">
+            {{ t('the account governs that base and everything derived from it') }}
+          </span>
+        </li>
+        <li>
+          <button type="button" class="link" @click="to('keys')">
+            {{ t('Issue the mount key') }}
+          </button>
+          <span class="muted">{{ t('the credential a client mounts the view with') }}</span>
+        </li>
+        <li>
+          <button type="button" class="link" @click="to('audit')">
+            {{ t('Read what happened') }}
+          </button>
+          <span class="muted">
+            {{ t('every call above is written to the trail as it is made') }}
+          </span>
+        </li>
+      </ol>
+
       <BarRow :title="'This deployment'">
         <span class="muted">{{ t('read live from the meta-server that answered this page') }}</span>
       </BarRow>
       <div class="detail">
+        <p class="engine-note">{{ engineNote }}</p>
+        <!-- Two groups, two labels: where a tree and a credential physically
+             live, and what the deployment keeps over time. Four rows of the
+             first answer the question "which machine do I log into"; the second
+             answers "how much history is there". Mixing them in one grid is what
+             made this panel read as a wall of pairs. -->
+        <h3 class="det-h">{{ t('Where the data lives') }}</h3>
         <div class="grid2">
           <!-- Two names, two rows: the engine the trees live in (with the
                server's own layout line, which is about exactly that) and the
@@ -232,17 +302,6 @@ const engineCard = computed(() =>
           <StatLine label="server role">
             <b>{{ store.role || '—' }}</b>
             <span class="muted">{{ t('the process this console is talking to') }}</span>
-          </StatLine>
-          <!-- The cards above already carry every counter this page knows. What
-               stays here is the substrate an operator quotes in a ticket — where
-               the bytes live, which process answered, and how long the trail is
-               kept — so the panel does not repeat the row of figures it sits
-               under. -->
-          <StatLine label="audit trail">
-            <b v-if="store.auditRetention">
-              {{ t('rows older than ${w} are swept', { w: store.auditRetention }) }}
-            </b>
-            <b v-else>{{ t('every row is kept until an operator purges it') }}</b>
           </StatLine>
         </div>
         <!-- A PG deployment's real question is WHERE each tree lives, and the
@@ -281,6 +340,19 @@ const engineCard = computed(() =>
             }}
           </li>
         </ul>
+        <!-- The cards above already carry every counter this page knows. What
+             stays here is the substrate an operator quotes in a ticket — how
+             long the trail is kept — so the panel does not repeat the row of
+             figures it sits under. -->
+        <h3 class="det-h">{{ t('How far the trail goes') }}</h3>
+        <div class="grid2">
+          <StatLine label="audit trail">
+            <b v-if="store.auditRetention">
+              {{ t('rows older than ${w} are swept', { w: store.auditRetention }) }}
+            </b>
+            <b v-else>{{ t('every row is kept until an operator purges it') }}</b>
+          </StatLine>
+        </div>
         <p class="muted">
           {{
             t(

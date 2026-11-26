@@ -28,6 +28,7 @@ import { KEY_BUCKETS, keyBucket, type KeyBucket } from '@/utils/keys'
 import { counted } from '@/utils/text'
 import { t } from '@/i18n'
 import PageHead from '@/components/layout/PageHead.vue'
+import BarRow from '@/components/layout/BarRow.vue'
 import HelpPanel from '@/components/layout/HelpPanel.vue'
 import FldRow from '@/components/layout/FldRow.vue'
 import FilterBar from '@/components/ui/FilterBar.vue'
@@ -159,12 +160,13 @@ const HELP: [string, string][] = [
 
     <MintPanel />
 
-    <HelpPanel :summary="'What each action does — and what GroveFS keeps'" :pairs="HELP" />
-
     <LoadingHint v-if="pending && !rows.length" />
     <p v-else-if="error" class="err">{{ error }}</p>
 
     <template v-else>
+      <BarRow :title="'Keys you can see'">
+        <span class="muted">{{ t('the mint form above is where a new one starts') }}</span>
+      </BarRow>
       <FilterBar :count="counted(hit.length, rows.length)">
         <template #search>
           <input
@@ -201,5 +203,10 @@ const HELP: [string, string][] = [
         :empty="rows.length ? 'no keys match the filter' : 'no keys you can see'"
       />
     </template>
+
+    <!-- Reference, not a step: it used to sit between the mint form and the
+         table, which pushed the data below a collapsed wall of prose every
+         single time the page loaded. -->
+    <HelpPanel :summary="'What each action does — and what GroveFS keeps'" :pairs="HELP" />
   </div>
 </template>

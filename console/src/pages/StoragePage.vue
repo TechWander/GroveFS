@@ -51,6 +51,13 @@ import RemovePreviewModal from '@/components/storage/RemovePreviewModal.vue'
 import RelocateModal from '@/components/storage/RelocateModal.vue'
 import SetControlModal from '@/components/storage/SetControlModal.vue'
 
+/* The two banner sentences, as dictionary keys: one for the shape the server
+   reports per deployment, one for a treedb that named no serving address. */
+const ROUTING_NOTE =
+  'treedb routes new trees by name hash across ${n} serving address(es); other entries are inventory, not placement targets'
+const NO_ROUTING_NOTE =
+  'treedb is EXPERIMENTAL: the control plane (definitions, keys, accounts) stays in local SQLite and this registry is inventory, not a router.'
+
 const { api } = useOps()
 const catalog = useCatalogStore()
 const session = useSessionStore()
@@ -96,6 +103,20 @@ const instances = computed(() => storage.value?.instances ?? [])
 const managed = computed(() => storage.value?.managed === true)
 const pendingControl = computed(() => storage.value?.pendingControl ?? null)
 const multi = computed(() => instances.value.length > 1)
+
+/** The treedb banner's sentence. The server owns the FACT — how many addresses
+    it routes to — and the console owns the wording an operator reads, so the
+    count is lifted out of the server's English and re-rendered through the
+    dictionary. An unrecognized shape shows the server's own text rather than a
+    sentence we invented. */
+const routingNoteText = computed(() => {
+  const note = storage.value?.routingNote
+  if (!note) return t(NO_ROUTING_NOTE)
+  const n = /^treedb routes new trees by name hash across (\d+) serving address\(es\)/.exec(note)
+  return n
+    ? t(ROUTING_NOTE, { n: n[1] })
+    : note
+})
 
 /** The views resolved onto one card, keyed by `name@uri`. The registry
     addresses an instance by NAME and an older treedb adoption wrote every
@@ -202,20 +223,23 @@ function created(): void {
 
       <!-- ── PostgreSQL / treedb: the instance grid ── -->
       <template v-else-if="isPg || isTreedb">
-        <!-- treedb is honest about its limits up front, not buried in a card. -->
+        <!-- treedb is honest about its limits up front, not buried in a card.
+             The sentence belongs to the dictionary, not to the wire: the server
+             owns the FACT (how many addresses it routes to), the console owns the
+             wording an operator reads — a passthrough of `routingNote` used to
+             leave this banner in English on a Chinese page. The count is lifted
+             out of the server's sentence and re-inserted, so a future change of
+             phrasing server-side cannot silently change the number shown here;
+             an unrecognized shape falls back to the server's own text. -->
         <div v-if="isTreedb" class="exp-banner">
           <StateBadge tone="warn" :label="t('experimental')" />
-          <span>
-            {{
-              storage?.routingNote ??
-              t(
-                'treedb is EXPERIMENTAL: the control plane (definitions, keys, accounts) stays in local SQLite and this registry is inventory, not a router.',
-              )
-            }}
-          </span>
+          <span>{{ routingNoteText }}</span>
         </div>
 
         <!-- One number per fact: instances, views, placed, still hash-routed. -->
+        <BarRow :title="'This deployment'">
+          <span class="muted">{{ t('counts read from the registry the balancer uses') }}</span>
+        </BarRow>
         <div class="storage-stats">
           <div class="sstat">
             <span class="sstat-n">{{ instances.length }}</span>
@@ -247,7 +271,17 @@ function created(): void {
           }}
         </div>
 
-        <!-- The register form appears in place, not on a separate screen. -->
+        <!-- The verb opens the zone it acts on, and the form appears under it
+             in place — not on a separate screen, and not after the grid it is
+             meant to feed. -->
+        <BarRow :title="'Instances'">
+          <ActionButton
+            v-if="managed && session.can('storage.add')"
+            :action="() => (showAdd = true)"
+            :label="'Register instance'"
+            variant="mini"
+          />
+        </BarRow>
         <AddInstancePanel v-if="showAdd && managed" :is-pg="isPg" @close="showAdd = false" />
 
         <div v-if="!instances.length" class="muted">
@@ -274,17 +308,7 @@ function created(): void {
           />
         </div>
 
-        <!-- Managed registry: offer the register verb (Super). The grid above is
-             read-only without it, matching the server's own refusal. -->
-        <div v-if="managed && session.can('storage.add')" class="inst-toolbar">
-          <ActionButton
-            v-if="!showAdd"
-            :action="() => (showAdd = true)"
-            :label="'Register instance'"
-            variant="primary"
-          />
-        </div>
-        <p v-else-if="!managed && (isPg || isTreedb)" class="muted">
+        <p v-if="!managed && (isPg || isTreedb)" class="muted">
           {{
             t(
               'This registry is owned by a --meta-store file the operator edits by hand — the page is read-only here.',
@@ -308,7 +332,7 @@ function created(): void {
         <NewBasePanel
           v-if="createOn && session.can('view.create')"
           :key="createOn"
-          :pg-instance="createOn"
+          :instance="createOn"
           @created="created"
         />
         <p v-if="createOn && session.can('view.create')" class="muted">
