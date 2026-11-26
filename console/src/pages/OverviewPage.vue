@@ -348,7 +348,10 @@ const nodeRoleNote = computed(() => {
           </StatLine>
           <StatLine label="node role (HA)">
             <b>{{ nodeRoleValue }}</b>
-            <span class="muted">{{ nodeRoleNote }}</span>
+            <!-- The `· ` separator is the sibling rows' rhythm (tree engine and
+                 control plane both put it inside the muted span), so the note
+                 reads as a qualifier of the value rather than a new sentence. -->
+            <span class="muted">· {{ nodeRoleNote }}</span>
           </StatLine>
         </div>
         <!-- A PG deployment's real question is WHERE each tree lives, and the
