@@ -55,15 +55,15 @@ or checksums.
 
 ```bash
 python3 scripts/mcp_call.py --meta-dir <D>/store --quiet \
-  call define_derived_view '{"name":"release","base":"team","rules":"hide /seeds/photos/private"}'
+  call define_derived_view '{"name":"lens_release","base":"team","rules":"hide /seeds/photos/private"}'
 ```
 ```
-defined derived view 'release' over base 'team': 1 hide, 0 only, 0 reloc rule(s)
-note: mounts of 'release' are read-only (virtual shape) — write to base view 'team'
+defined derived view 'lens_release' over base 'team': 1 hide, 0 only, 0 reloc rule(s)
+note: mounts of 'lens_release' are read-only (virtual shape) — write to base view 'team'
 ```
 
 ```bash
-python3 scripts/mcp_call.py --meta-dir <D>/store --quiet call list_view_tree '{"view":"release"}'
+python3 scripts/mcp_call.py --meta-dir <D>/store --quiet call list_view_tree '{"view":"lens_release"}'
 ```
 ```
 {
@@ -128,7 +128,7 @@ design rather than by packet loss:
 
 ```
 {"id":1,"jsonrpc":"2.0","result":{"capabilities":{"completions":{},"logging":{},"prompts":{"listChanged":false},"resources":{"listChanged":false,"subscribe":false},"tools":{"listChanged":false}},"instructions":"GroveFS view governance over ONE control-plane store …","protocolVersion":"2025-06-18","serverInfo":{"name":"grovefs","title":"GroveFS view governance","version":"0.1.0"}}}
-{"id":2,"jsonrpc":"2.0","result":{"content":[{"text":"{\n  \"db_path\": \".migtest/skill/store\",\n  \"defined\": [\n    {\n      \"hide\": 1,\n      \"kind\": \"derived\",\n      \"line\": \"view 'release' -> base 'team': 1 hide, 0 only, 0 reloc rule(s) (read-only)\",\n      \"mount\": \"read-only (derived)\",\n      \"name\": \"release\",\n ...
+{"id":2,"jsonrpc":"2.0","result":{"content":[{"text":"{\n  \"db_path\": \".migtest/skill/store\",\n  \"defined\": [\n    {\n      \"hide\": 1,\n      \"kind\": \"derived\",\n      \"line\": \"view 'lens_release' -> base 'team': 1 hide, 0 only, 0 reloc rule(s) (read-only)\",\n      \"mount\": \"read-only (derived)\",\n      \"name\": \"lens_release\",\n ...
 ```
 
 The `instructions` field in the `initialize` result is the server's own
@@ -142,15 +142,15 @@ echoed back.
 ## 4. Resources / completion / log pushes
 
 ```bash
-... read grovefs://view/release/definition
+... read grovefs://view/lens_release/definition
 ```
 ```
 {
   "contents": [
     {
       "mimeType": "application/json",
-      "text": "{\n  \"base\": \"team\",\n  \"definition\": \"base team\\nhide /seeds/photos/private\",\n  \"hide\": 1,\n  \"kind\": \"derived\",\n  \"mount\": \"read-only (virtual shape; writes go to the base view)\",\n  \"name\": \"release\",\n  \"only\": 0,\n  \"reloc\": 0\n}",
-      "uri": "grovefs://view/release/definition"
+      "text": "{\n  \"base\": \"team\",\n  \"definition\": \"base team\\nhide /seeds/photos/private\",\n  \"hide\": 1,\n  \"kind\": \"derived\",\n  \"mount\": \"read-only (virtual shape; writes go to the base view)\",\n  \"name\": \"lens_release\",\n  \"only\": 0,\n  \"reloc\": 0\n}",
+      "uri": "grovefs://view/lens_release/definition"
     }
   ]
 }
@@ -176,7 +176,7 @@ the render still reports `"truncated": true` when a bound cuts it.
 ... complete base 'r'
 ```
 ```
-{"completion": {"hasMore": false, "total": 1, "values": ["release"]}}
+{"completion": {"hasMore": false, "total": 1, "values": ["lens_release"]}}
 ```
 
 ```bash
@@ -196,25 +196,25 @@ written **after** the response, so the client must keep reading (the
 ## 5. One public name per view, and gapless rotation
 
 ```bash
-... call alias_view '{"name":"team-public","real":"team"}'
+... call alias_view '{"name":"bias_team-public","real":"team"}'
 ```
 ```
-defined pure alias 'team-public' -> real view 'team'
+defined pure alias 'bias_team-public' -> real view 'team'
 note: 'team' is no longer a mount entry point while this definition exists (mounts by its real name are refused, locally and via meta-server); alias mounts show the FULL tree and are WRITABLE
 ```
 
 ```bash
-... call alias_view '{"name":"team-2","real":"team"}'            # trying to add a second public name
+... call alias_view '{"name":"bias_team-2","real":"team"}'            # trying to add a second public name
 ```
 ```
-real view 'team' is already governed by alias 'team-public' — one public name per real view; to rotate it gaplessly use `grovefs view alias --name team-2 --real team --retire team-public`
+real view 'team' is already governed by alias 'bias_team-public' — one public name per real view; to rotate it gaplessly use `grovefs view alias --name bias_team-2 --real team --retire bias_team-public`
 ```
 
 The correct move retires the old name in the same call (write-before-remove, so
 the public name never has a gap):
 
 ```bash
-... call alias_view '{"name":"team-public2","real":"team","retire":"team-public"}'
+... call alias_view '{"name":"bias_team-public2","real":"team","retire":"bias_team-public"}'
 ```
 
 ## 6. The gate (`--require-api-key`) and the audit

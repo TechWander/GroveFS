@@ -370,10 +370,12 @@ fn migrate_refuses_a_store_that_a_grovefs_process_is_using() {
 
 A fork, a derived lens and a pure alias all belong to ONE base view, so since
 v3 they land INSIDE that base's directory instead of scattered at the top
-level. The policy (`nested` default, `grouped` separators, `flat` legacy) only
-decides where NEW members go — every read resolves by scanning, so flipping it
-never orphans an existing tree. These three tests pin the placement the
-feature is FOR, and the compatibility that makes it safe to adopt. */
+level — and each definition file NAMES ITS KIND (`bias_*`, `lens_*`), while a
+fork's def travels inside the fork's own tree directory. The policy (`nested`
+default, `grouped` separators, `flat` legacy) only decides where NEW members
+go — every read resolves by scanning, so flipping it never orphans an existing
+tree. These three tests pin the placement the feature is FOR, and the
+compatibility that makes it safe to adopt. */
 
 /// One `define` needs a rules file; a lone `only` line is the smallest valid one.
 fn rules(dir: &Path, name: &str, body: &str) -> String {
@@ -399,36 +401,50 @@ fn family_members_land_inside_their_base_view() {
         "the fork tree nests inside its base"
     );
     assert!(
-        meta.join("v/lab.layout").is_file(),
-        "the fork definition nests inside its base too"
+        meta.join("v/lab/lab.layout").is_file(),
+        "the fork definition travels with the fork's own tree dir"
+    );
+    assert!(
+        !meta.join("v/lab.layout").exists(),
+        "not beside the base any more"
     );
     assert!(!meta.join("lab").exists(), "no top-level fork dir");
 
     let r = rules(dir.path(), "lens.rules", "only /sub\n");
     let (ok, o, e) = gv(&[
-        "view", "--home", h, "define", "--name", "lens", "--base", "v", "--rules", &r,
+        "view", "--home", h, "define", "--name", "lens_v", "--base", "v", "--rules", &r,
     ]);
     assert!(ok, "define: {o}{e}");
     assert!(
-        meta.join("v/lens.layout").is_file(),
-        "the lens definition lands inside the base dir"
+        meta.join("v/lens_v.layout").is_file(),
+        "the lens definition lands inside the base dir, its name stating its kind"
     );
     assert!(
-        !meta.join("views/lens.layout").exists(),
+        !meta.join("views/lens_v.layout").exists(),
         "not at the top-level defs slot"
     );
 
-    let (ok, o, e) = gv(&["view", "--home", h, "alias", "--name", "pub", "--real", "v"]);
+    let (ok, o, e) = gv(&["view", "--home", h, "alias", "--name", "bias_pub", "--real", "v"]);
     assert!(ok, "alias: {o}{e}");
     assert!(
-        meta.join("v/pub.layout").is_file(),
-        "the alias definition lands inside the base dir"
+        meta.join("v/bias_pub.layout").is_file(),
+        "the alias definition lands inside the base dir, its name stating its kind"
     );
+
+    // Kind prefixes are governance: an unprefixed alias/lens is refused.
+    let (ok, _o, e) = gv(&["view", "--home", h, "alias", "--name", "pub", "--real", "v"]);
+    assert!(!ok, "unprefixed alias must be refused");
+    assert!(e.contains("bias_<alias>"), "refusal names the convention: {e}");
+    let (ok, _o, e) = gv(&[
+        "view", "--home", h, "define", "--name", "docs", "--base", "v", "--rules", &r,
+    ]);
+    assert!(!ok, "unprefixed lens must be refused");
+    assert!(e.contains("lens_<name>"), "refusal names the convention: {e}");
 
     // The enumerator descends the family layer, so every member is still listed.
     let (ok, o, e) = gv(&["view", "--home", h, "list", "--json"]);
     assert!(ok, "list --json: {o}{e}");
-    for name in ["v", "lab", "lens", "pub"] {
+    for name in ["v", "lab", "lens_v", "bias_pub"] {
         assert!(o.contains(name), "`view list` must carry {name}:\n{o}");
     }
 
@@ -465,11 +481,11 @@ fn grouped_policy_separates_family_members() {
 
     let r = rules(dir.path(), "lens.rules", "only /sub\n");
     let (ok, o, e) = gv(&[
-        "view", "--home", h, "define", "--name", "lens", "--base", "v", "--rules", &r,
+        "view", "--home", h, "define", "--name", "lens_v", "--base", "v", "--rules", &r,
     ]);
     assert!(ok, "define: {o}{e}");
     assert!(
-        meta.join("v/views/lens.layout").is_file(),
+        meta.join("v/views/lens_v.layout").is_file(),
         "grouped lens def lands behind the base's views/ separator"
     );
 
@@ -477,7 +493,7 @@ fn grouped_policy_separates_family_members() {
     let (ok, o, _e) = gv(&["view", "--home", h, "list", "--json"]);
     assert!(ok, "list: {o}");
     assert!(
-        o.contains("lab") && o.contains("lens"),
+        o.contains("lab") && o.contains("lens_v"),
         "members still listed:\n{o}"
     );
 }
@@ -504,11 +520,11 @@ fn a_flat_store_still_reads_after_the_policy_flips_to_nested() {
     );
     let r = rules(dir.path(), "oldlens.rules", "only /sub\n");
     let (ok, o, e) = gv(&[
-        "view", "--home", h, "define", "--name", "oldlens", "--base", "v", "--rules", &r,
+        "view", "--home", h, "define", "--name", "lens_old", "--base", "v", "--rules", &r,
     ]);
     assert!(ok, "define: {o}{e}");
     assert!(
-        meta.join("views/oldlens.layout").is_file(),
+        meta.join("views/lens_old.layout").is_file(),
         "a flat def lands at the top-level defs slot"
     );
 
@@ -522,13 +538,13 @@ fn a_flat_store_still_reads_after_the_policy_flips_to_nested() {
         "the flip must not disturb the existing flat fork"
     );
     assert!(
-        meta.join("views/oldlens.layout").is_file(),
+        meta.join("views/lens_old.layout").is_file(),
         "nor re-home the existing flat def"
     );
 
     let (ok, o, e) = gv(&["view", "--home", h, "list", "--json"]);
     assert!(ok, "list after flip: {o}{e}");
-    for name in ["v", "old", "oldlens"] {
+    for name in ["v", "old", "lens_old"] {
         assert!(
             o.contains(name),
             "a top-level member resolves under the nested policy: {name}\n{o}"

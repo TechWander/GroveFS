@@ -279,11 +279,16 @@ pub fn is_view_db(name: &str) -> bool {
 //     <view>.db
 //     <fork>/            NESTED (the default): a fork's whole family dir
 //       <fork>.db         sits inside its base directory
-//     <derived>.layout    a derived/alias definition file likewise
+//       <fork>.layout     a fork's definition lives WITH ITS OWN TREE, so the
+//     <bias>.layout       unit (tree + sidecars + def) is one directory
+//     <lens>.layout       alias/lens definitions sit beside the base
 //     forks/             GROUPED (opt-in): the same members under
 //       <fork>/...       reserved separator slots instead of loose
+//         <fork>.layout
 //     views/
-//       <derived>.layout
+//       <bias>.layout    (names carry their kind: `bias_*` aliases,
+//                        `lens_*` derived views — the file name alone
+//                        states purpose and family)
 //   views/               top-level definition slots (flat policy, and every
 //                        pre-v3 definition that was never re-homed)
 //   _control/  .xfer/    unchanged
@@ -507,16 +512,27 @@ pub fn tree_home_rel_dir(base: &Path, view: &str) -> String {
 }
 
 /// A definition slot THIS STORE HOLDS for `name`, found by scanning: the
-/// top-level `meta/views/<name>.layout`, a family-nested
-/// `meta/<base>/<name>.layout`, or a grouped `meta/<base>/views/<name>.layout`
-/// (both separator spellings are probed regardless of the current policy —
-/// the policy decides NEW placement only). `None` = no definition file for
-/// this name anywhere in the store.
+/// top-level `meta/views/<name>.layout`, a tree's own directory
+/// (`meta/<name>/<name>.layout` flat, `meta/<base>/<name>/<name>.layout`
+/// nested, `meta/<base>/forks/<name>/<name>.layout` grouped — a fork's
+/// definition travels WITH its tree), a family-nested
+/// `meta/<base>/<name>.layout` (alias/lens defs, and pre-convention forks),
+/// or a grouped `meta/<base>/views/<name>.layout` (both separator spellings
+/// are probed regardless of the current policy — the policy decides NEW
+/// placement only). `None` = no definition file for this name anywhere in
+/// the store.
 pub fn find_def_slot(base: &Path, name: &str) -> Option<PathBuf> {
     let m = meta_dir(base);
     let top = m.join(DEFS_SUBDIR).join(format!("{name}.layout"));
     if top.is_file() {
         return Some(top);
+    }
+    // A flat fork's def inside its OWN tree directory (a base tree at
+    // `meta/<name>/` may hold one too; the scan below proves it is a def by
+    // content callers parse, never by location alone).
+    let own = m.join(name).join(format!("{name}.layout"));
+    if own.is_file() {
+        return Some(own);
     }
     let rd = std::fs::read_dir(&m).ok()?;
     for ent in rd.flatten() {
@@ -526,6 +542,17 @@ pub fn find_def_slot(base: &Path, name: &str) -> Option<PathBuf> {
         };
         if !is_view_tree_dir(&bname) || !dir.is_dir() {
             continue;
+        }
+        let cand = dir.join(name).join(format!("{name}.layout"));
+        if cand.is_file() {
+            return Some(cand);
+        }
+        let cand = dir
+            .join(FORKS_SUBDIR)
+            .join(name)
+            .join(format!("{name}.layout"));
+        if cand.is_file() {
+            return Some(cand);
         }
         let cand = dir.join(format!("{name}.layout"));
         if cand.is_file() {
@@ -541,7 +568,9 @@ pub fn find_def_slot(base: &Path, name: &str) -> Option<PathBuf> {
 
 /// Where a NEW definition for `name` lands: beside its base tree's home
 /// (`parent` = the base view the definition names), or at the top-level
-/// `meta/views/` when there is no family or the policy is `flat`.
+/// `meta/views/` when there is no family or the policy is `flat`. ALIAS and
+/// DERIVED defs only — a FORK's def belongs inside its own tree directory,
+/// which is [`fork_def_slot`].
 pub fn new_def_slot(base: &Path, name: &str, parent: Option<&str>) -> PathBuf {
     match (parent, family_policy(base)) {
         (Some(p), FamilyLayout::Nested) => view_dir(base, p).join(format!("{name}.layout")),
@@ -550,6 +579,17 @@ pub fn new_def_slot(base: &Path, name: &str, parent: Option<&str>) -> PathBuf {
             .join(format!("{name}.layout")),
         _ => defs_dir(base).join(format!("{name}.layout")),
     }
+}
+
+/// Where a FORK's definition lands: in the SAME directory as the fork's own
+/// tree db, so the tree and the name that makes it mountable are one unit
+/// (`meta/<base>/<fork>/<fork>.layout` nested, `meta/<base>/forks/<fork>/…`
+/// grouped, `meta/<fork>/<fork>.layout` flat). The tree directory is
+/// resolved by the same scan as [`view_dir`], so a fork created before this
+/// convention keeps updating its slot in place; a not-yet-created tree falls
+/// back to the flat own-directory spelling like [`view_dir`] itself does.
+pub fn fork_def_slot(base: &Path, name: &str) -> PathBuf {
+    view_dir(base, name).join(format!("{name}.layout"))
 }
 
 /// The tree db THIS STORE ACTUALLY HOLDS for `view`, found by scanning
@@ -1143,9 +1183,21 @@ mod tests {
         assert_eq!(view_dir(base, "lab"), m.join("team/lab"));
         let trees = list_view_trees(base);
         assert_eq!(trees, ["lab", "photos", "studio", "team"]);
-        // def slots move with the family, both separator spellings
-        std::fs::write(m.join("team/lab.layout"), b"fork team\n").unwrap();
-        assert_eq!(find_def_slot(base, "lab"), Some(m.join("team/lab.layout")));
+        // a fork's def travels WITH its own tree directory (the convention
+        // this store now writes): update-in-place finds it inside the tree
+        std::fs::write(m.join("team/lab/lab.layout"), b"fork team\n").unwrap();
+        assert_eq!(
+            find_def_slot(base, "lab"),
+            Some(m.join("team/lab/lab.layout"))
+        );
+        assert_eq!(fork_def_slot(base, "lab"), m.join("team/lab/lab.layout"));
+        assert_eq!(
+            fork_def_slot(base, "studio"),
+            m.join("photos/forks/studio/studio.layout")
+        );
+        // a fork whose tree is not created yet falls back to the flat own
+        // spelling, exactly like view_dir
+        assert_eq!(fork_def_slot(base, "fresh"), m.join("fresh/fresh.layout"));
         // grouped def separator: meta/photos/views/lens.layout (the separator
         // dir exists on disk only once a grouped def lands, mirror how
         // `new_def_slot` creates it lazily)
@@ -1181,6 +1233,10 @@ mod tests {
         assert_eq!(
             new_def_slot(base, "lens", Some("team")),
             meta_dir(base).join("team/lens.layout")
+        );
+        assert_eq!(
+            fork_def_slot(base, "lab"),
+            meta_dir(base).join("lab/lab.layout")
         );
         set_family_policy(base, FamilyLayout::Grouped).unwrap();
         assert_eq!(family_policy(base), FamilyLayout::Grouped);

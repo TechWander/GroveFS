@@ -1696,7 +1696,10 @@ mod tests {
         );
         let m = load_wrap(base, WrapMode::SharedTable);
         assert!(matches!(m, WrapMaterial::Absent(_)));
-        assert!(!key_file.exists(), "a PG resolve must never create a store.key");
+        assert!(
+            !key_file.exists(),
+            "a PG resolve must never create a store.key"
+        );
         let why = m.source();
         assert!(why.contains(STORE_KEY_ENV), "{why}");
         assert!(why.contains("no per-node store.key"), "{why}");

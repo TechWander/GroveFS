@@ -110,7 +110,7 @@ GroveFS view governance over ONE control-plane store (local SQLite files, or a P
 - `get_view` — one slot in full, including the verbatim `definition` rules (read before editing)
 - `list_view_tree` — the exact listing a mount would show; pass `view`, or `base` + `rules` to preview an unpublished lens. Each entry `path` is the absolute DISPLAY path to reuse in rules. `size` is metadata (dirs 4096, files 0, symlinks target length), never a byte count.
 
-## Reshape (writes the store's definition slots — SQLite meta/views/*.layout, PG grovefs_control.view_defs; live meta-server mounts hot-reload within their cache TTL)
+## Reshape (writes the store's definition slots — SQLite `<base>/meta/**.layout` slots (fork defs inside the fork's own tree dir, alias/lens defs in the base's family dir, legacy ones under meta/views/), PG grovefs_control.view_defs; live meta-server mounts hot-reload within their cache TTL)
 - `define_derived_view` — read-only lens from rule text: `hide /x` (prune), `only /x` (serve just that), `map /src /dst` (re-home), `link /src /dst` (second name). Paths MUST come from `list_view_tree`; a `base` line inside rules is refused.
 - `alias_view` — writable public name for a physical view; `retire` rotates the previous name gaplessly
 - `remove_view` — drop a definition (a fork also drops its own tree; content bytes survive while any view holds them)
@@ -336,9 +336,10 @@ impl FileControlStore {
     }
 
     /// The base view a definition body names (`alias`/`fork`/`base`), which is
-    /// the family directory a FRESH definition slot lands in. An unparseable
-    /// body places at the top level — writing a definition never refuses on
-    /// parse grounds (the ops that read it report the malformation).
+    /// the family directory a FRESH alias/lens definition slot lands in. An
+    /// unparseable body places at the top level — writing a definition never
+    /// refuses on parse grounds (the ops that read it report the
+    /// malformation).
     fn def_parent(&self, text: &str) -> Option<String> {
         match LayoutRules::parse_def(text) {
             Ok(ViewDef::Alias(b)) | Ok(ViewDef::Fork(b)) | Ok(ViewDef::Derived(b, _)) => Some(b),
@@ -422,17 +423,27 @@ impl ControlStore for FileControlStore {
 
     fn put_def(&self, name: &str, text: &str) -> Result<(), String> {
         // An existing slot is updated IN PLACE wherever it lives (flipping the
-        // family policy never re-homes a definition); a fresh one lands inside
-        // the base it names, per the store's family policy.
+        // family policy never re-homes a definition); a fresh one lands by
+        // KIND: a fork's def travels WITH ITS OWN TREE directory, an alias or
+        // lens def lands inside the base it names, per the store's family
+        // policy.
         let p = match crate::meta::find_def_slot(&self.base, name) {
             Some(p) => p,
-            None => {
-                let parent = self.def_parent(text);
-                // A member of a base whose tree is gone stays at the top
-                // level — the family dir would dangle.
-                let anchor = parent.filter(|b| crate::meta::find_view_db(&self.base, b).is_some());
-                crate::meta::new_def_slot(&self.base, name, anchor.as_deref())
-            }
+            None => match LayoutRules::parse_def(text) {
+                // The fork tree is created BEFORE its def on every path
+                // (fork_view_seeded, fork.create), so view_dir resolves the
+                // real nested home; a stray def without a tree falls back to
+                // the flat own-directory spelling.
+                Ok(ViewDef::Fork(_)) => crate::meta::fork_def_slot(&self.base, name),
+                _ => {
+                    let parent = self.def_parent(text);
+                    // A member of a base whose tree is gone stays at the top
+                    // level — the family dir would dangle.
+                    let anchor =
+                        parent.filter(|b| crate::meta::find_view_db(&self.base, b).is_some());
+                    crate::meta::new_def_slot(&self.base, name, anchor.as_deref())
+                }
+            },
         };
         if let Some(dir) = p.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -512,17 +523,22 @@ impl ControlStore for FileControlStore {
         // Nothing to roll back is not an error: this door only runs when a
         // creation failed part-way, so the tree is either absent (a no-op) or
         // already correct.
+        // Resolve the tree directory BEFORE its db goes — after the unlink the
+        // scan can no longer tell a nested home from the flat spelling.
+        let dir = crate::meta::view_dir(&self.base, name);
         for ext in crate::meta::TREE_DB_EXTS {
             let _ = std::fs::remove_file(crate::meta::view_db_with_ext(&self.base, name, ext));
         }
         // The directory the failed attempt made goes with its db, but only while
         // it is empty.
-        let _ = std::fs::remove_dir(crate::meta::view_dir(&self.base, name));
+        let _ = std::fs::remove_dir(dir);
     }
 
     fn drop_fork_tree(&self, name: &str) -> Result<(), String> {
         // Definition is gone first: the name stops resolving even if a db file
         // lingers (e.g. a live meta-server still holds its handle open).
+        // Captured BEFORE the unlinks for the same scan-reason as above.
+        let dir = crate::meta::view_dir(&self.base, name);
         for ext in crate::meta::TREE_DB_EXTS {
             let db = crate::meta::view_db_with_ext(&self.base, name, ext);
             if db.exists() {
@@ -540,7 +556,7 @@ impl ControlStore for FileControlStore {
             .map_err(|e| format!("fork tree removed, but the ledger rebuild failed: {e}"))?;
         // Best effort: an empty tree directory is noise in `view list`-adjacent
         // tooling, but a non-empty one (an interrupted import scratch) is kept.
-        let _ = std::fs::remove_dir(crate::meta::view_dir(&self.base, name));
+        let _ = std::fs::remove_dir(dir);
         Ok(())
     }
 
@@ -937,6 +953,11 @@ fn check_derived_definition(
     if !valid_view_name(name) {
         return Err(valid_view_name_error(name));
     }
+    if !name.starts_with(LENS_PREFIX) {
+        return Err(format!(
+            "invalid derived view name '{name}' — derived (lens) views are named '{LENS_PREFIX}<name>' so the definition file states its kind and family (try '{LENS_PREFIX}{name}')"
+        ));
+    }
     if !valid_view_name(base) {
         return Err(format!("invalid base view name '{base}'"));
     }
@@ -1051,6 +1072,11 @@ pub fn alias_view(
     if !valid_view_name(name) {
         return Err(format!(
             "invalid alias name '{name}' (must be one safe path element)"
+        ));
+    }
+    if !name.starts_with(BIAS_PREFIX) {
+        return Err(format!(
+            "invalid alias name '{name}' — pure aliases are named '{BIAS_PREFIX}<alias>' so the definition file states its kind and family (try '{BIAS_PREFIX}{name}')"
         ));
     }
     if !valid_view_name(real) {
@@ -1189,6 +1215,32 @@ pub fn alias_view(
         out.push(OutLine::Note(note));
     }
     Ok(out)
+}
+
+/// The mandatory name prefix of a PURE ALIAS definition (`bias_pub`): the
+/// definition file then states its kind and its base family from its name
+/// alone, wherever it lands.
+pub const BIAS_PREFIX: &str = "bias_";
+/// The mandatory name prefix of a DERIVED (lens) definition (`lens_docs`).
+pub const LENS_PREFIX: &str = "lens_";
+
+/// The naming convention gate for a raw definition write (`def.put` on the
+/// control plane, whichever backend serves it): when the body PARSES as an
+/// alias or a derived definition its name must carry the kind prefix; a
+/// fork def and an unparseable body pass through untouched (writing never
+/// refuses on parse grounds — the reading ops report the malformation).
+/// The refusal strings match `alias_view`/`define_view` byte-for-byte so
+/// every entrance says the same thing.
+pub fn check_def_name_kind(name: &str, text: &str) -> Result<(), String> {
+    match LayoutRules::parse_def(text) {
+        Ok(ViewDef::Alias(_)) if !name.starts_with(BIAS_PREFIX) => Err(format!(
+            "invalid alias name '{name}' — pure aliases are named '{BIAS_PREFIX}<alias>' so the definition file states its kind and family (try '{BIAS_PREFIX}{name}')"
+        )),
+        Ok(ViewDef::Derived(_, _)) if !name.starts_with(LENS_PREFIX) => Err(format!(
+            "invalid derived view name '{name}' — derived (lens) views are named '{LENS_PREFIX}<name>' so the definition file states its kind and family (try '{LENS_PREFIX}{name}')"
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Create an INDEPENDENT metadata tree `name` seeded from the physical view
@@ -2425,7 +2477,7 @@ pub fn tool_defs() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "name": str_prop("Derived view name (one safe path element, must differ from base)"),
+                    "name": str_prop("Derived view name (one safe path element, must differ from base and start with 'lens_', e.g. 'lens_docs')"),
                     "base": str_prop("Physical view whose tree this lens displays"),
                     "rules": str_prop("Layout rules text, e.g. \"# only docs\\nonly /docs\""),
                     "db_path": str_prop("Metadata root; defaults to the server's --meta-dir/--home (ignored under a PG-bound server — one URI-bound control plane serves every slot)")
@@ -2441,7 +2493,7 @@ pub fn tool_defs() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "name": str_prop("Public alias name (must differ from the real view name)"),
+                    "name": str_prop("Public alias name (must differ from the real view name and start with 'bias_', e.g. 'bias_pub')"),
                     "real": str_prop("Physical view the alias maps onto"),
                     "retire": str_prop("Previous alias name of the same real view to retire atomically (optional)"),
                     "db_path": str_prop("Metadata root; defaults to the server's --meta-dir/--home (ignored under a PG-bound server — one URI-bound control plane serves every slot)")
@@ -3600,16 +3652,16 @@ mod tests {
                 .unwrap()
                 .to_string()
         };
-        // A real physical tree is aliasable.
-        let okres = call(1, "alias_view", json!({"name": "pub", "real": "team"}));
+        // A real physical tree is aliasable (bias_ naming convention).
+        let okres = call(1, "alias_view", json!({"name": "bias_pub", "real": "team"}));
         assert_eq!(okres["result"]["isError"], Value::Null);
-        assert!(text(&okres).contains("defined pure alias 'pub' -> real view 'team'"));
+        assert!(text(&okres).contains("defined pure alias 'bias_pub' -> real view 'team'"));
         // A target with no physical tree is refused at definition time, not
         // deferred to mount (§5-10), and the refusal names the missing view.
         let bad = call(
             2,
             "alias_view",
-            json!({"name": "ghost", "real": "no-such-tree"}),
+            json!({"name": "bias_ghost", "real": "no-such-tree"}),
         );
         assert_eq!(bad["result"]["isError"], true);
         assert!(
@@ -3625,7 +3677,11 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .all(|d| d["name"] != "ghost"));
+            .all(|d| d["name"] != "bias_ghost"));
+        // An unprefixed alias name is refused with the convention spelled out.
+        let np = call(4, "alias_view", json!({"name": "pub", "real": "team"}));
+        assert_eq!(np["result"]["isError"], true);
+        assert!(text(&np).contains("'bias_<alias>'"), "{}", text(&np));
     }
 
     #[test]
@@ -3655,18 +3711,19 @@ mod tests {
         let d = call(
             11,
             "define_derived_view",
-            json!({"name": "docsonly", "base": "team", "rules": "# cut\nonly /docs"}),
+            json!({"name": "lens_docsonly", "base": "team", "rules": "# cut\nonly /docs"}),
         );
         assert!(text(&d).contains(
-            "defined derived view 'docsonly' over base 'team': 0 hide, 1 only, 0 reloc rules"
+            "defined derived view 'lens_docsonly' over base 'team': 0 hide, 1 only, 0 reloc rules"
         ));
-        // v3: a fresh definition lands inside its base's family dir.
-        assert!(home.join("meta/team/docsonly.layout").is_file());
-        // name == base is the same refusal the CLI prints.
+        // v3: a fresh lens definition lands inside its base's family dir.
+        assert!(home.join("meta/team/lens_docsonly.layout").is_file());
+        // name == base is the same refusal the CLI prints (the prefix guard
+        // runs first, so the name carries it here to reach the differ).
         let same = call(
             12,
             "define_derived_view",
-            json!({"name": "team", "base": "team", "rules": "only /docs"}),
+            json!({"name": "lens_team", "base": "lens_team", "rules": "only /docs"}),
         );
         assert_eq!(same["result"]["isError"], true);
         assert!(text(&same).contains("derived view name must differ from its base"));
@@ -3676,7 +3733,7 @@ mod tests {
         let vrej = call(
             19,
             "validate_definition",
-            json!({"name": "team", "base": "team", "rules": "only /docs"}),
+            json!({"name": "lens_team", "base": "lens_team", "rules": "only /docs"}),
         );
         assert_eq!(vrej["result"]["isError"], true);
         assert!(text(&vrej).contains("derived view name must differ from its base"));
@@ -3685,7 +3742,7 @@ mod tests {
         let vok = call(
             20,
             "validate_definition",
-            json!({"name": "newsafe", "base": "team", "rules": "hide /photos/private"}),
+            json!({"name": "lens_newsafe", "base": "team", "rules": "hide /photos/private"}),
         );
         let vv: Value = serde_json::from_str(&text(&vok)).unwrap();
         assert_eq!(vv["accepted"], true);
@@ -3693,36 +3750,47 @@ mod tests {
         assert_eq!(vv["hide"], 1);
         assert_eq!(vv["would_replace_existing_definition"], false);
         assert_eq!(vv["base_view_db_present"], true);
-        assert!(!home.join("meta/team/newsafe.layout").exists());
+        assert!(!home.join("meta/team/lens_newsafe.layout").exists());
+        // An unprefixed lens name never reaches the write.
+        let np2 = call(
+            21,
+            "define_derived_view",
+            json!({"name": "docs", "base": "team", "rules": "only /docs"}),
+        );
+        assert_eq!(np2["result"]["isError"], true);
+        assert!(text(&np2).contains("'lens_<name>'"), "{}", text(&np2));
         // alias, then list sees BOTH governance shapes plus the physical tree.
-        let a = call(13, "alias_view", json!({"name": "public", "real": "team"}));
-        assert!(text(&a).contains("defined pure alias 'public' -> real view 'team'"));
+        let a = call(13, "alias_view", json!({"name": "bias_public", "real": "team"}));
+        assert!(text(&a).contains("defined pure alias 'bias_public' -> real view 'team'"));
         let l = call(14, "list_views", json!({}));
         let parsed: Value = serde_json::from_str(&text(&l)).unwrap();
         assert_eq!(parsed["physical"], json!(["team"]));
-        assert_eq!(parsed["defined"][0]["name"], "docsonly"); // sorted: d < p
-        assert_eq!(parsed["defined"][0]["kind"], "derived");
-        assert_eq!(parsed["defined"][0]["only"], 1);
-        assert_eq!(parsed["defined"][1]["kind"], "alias");
+        assert_eq!(parsed["defined"][0]["name"], "bias_public"); // sorted: b < l
+        assert_eq!(parsed["defined"][0]["kind"], "alias");
+        assert_eq!(parsed["defined"][1]["name"], "lens_docsonly");
+        assert_eq!(parsed["defined"][1]["kind"], "derived");
+        assert_eq!(parsed["defined"][1]["only"], 1);
         // gapless rotation through the tool (write-before-delete contract).
         let rot = call(
             15,
             "alias_view",
-            json!({"name": "public2", "real": "team", "retire": "public"}),
+            json!({"name": "bias_public2", "real": "team", "retire": "bias_public"}),
         );
         assert!(
-            text(&rot).contains("rotated public name for real view 'team': 'public' -> 'public2'")
+            text(&rot).contains(
+                "rotated public name for real view 'team': 'bias_public' -> 'bias_public2'"
+            )
         );
-        assert!(!home.join("meta/team/public.layout").exists());
+        assert!(!home.join("meta/team/bias_public.layout").exists());
         // remove both definitions; data (team.db) untouched.
-        for (i, n) in [(16, "docsonly"), (17, "public2")] {
+        for (i, n) in [(16, "lens_docsonly"), (17, "bias_public2")] {
             let r = call(i, "remove_view", json!({"name": n}));
             assert!(text(&r).contains("removed view definition"));
         }
         assert!(crate::meta::view_db_path(&home, "team").is_file());
-        let gone = call(18, "remove_view", json!({"name": "docsonly"}));
+        let gone = call(18, "remove_view", json!({"name": "lens_docsonly"}));
         assert_eq!(gone["result"]["isError"], true);
-        assert!(text(&gone).starts_with("no view definition 'docsonly' in"));
+        assert!(text(&gone).starts_with("no view definition 'lens_docsonly' in"));
     }
 
     /// The fork→graft flow an agent is meant to use: an EMPTY fork, then a
@@ -3790,13 +3858,13 @@ mod tests {
         let d = call(
             42,
             "define_derived_view",
-            json!({"name": "lens", "base": "base", "rules": "only /docs"}),
+            json!({"name": "lens_docs", "base": "base", "rules": "only /docs"}),
         );
         assert!(!d["result"]["isError"].as_bool().unwrap_or(false));
         let lens = call(
             43,
             "graft_view",
-            json!({"name": "lens", "map": "docs/uuid-1"}),
+            json!({"name": "lens_docs", "map": "docs/uuid-1"}),
         );
         assert_eq!(lens["result"]["isError"], true);
         assert!(text(&lens).contains("derived lens"), "{}", text(&lens));
@@ -3866,8 +3934,9 @@ mod tests {
         // Fork the real tree: 3 entries (root+docs+a.md), 1 shared blob.
         let f = call(31, "fork_view", json!({"name": "lab", "base": "base"}));
         assert!(text(&f).contains("forked view 'lab' from base 'base': 3 entries, 1 shared object"));
+        // The fork's def travels WITH ITS OWN TREE: same directory as lab.db.
         assert_eq!(
-            std::fs::read_to_string(home.join("meta/base/lab.layout")).unwrap(),
+            std::fs::read_to_string(home.join("meta/base/lab/lab.layout")).unwrap(),
             "fork base\n"
         );
         assert!(crate::meta::view_db_path(&home, "lab").is_file());
@@ -3886,18 +3955,18 @@ mod tests {
         assert_eq!(dv["own_tree"], "meta/base/lab/lab.db");
         assert!(dv["mount"].as_str().unwrap().contains("content read-only"));
         // A fork is a tree identity, not a public name: aliasing it is refused.
-        let a = call(34, "alias_view", json!({"name": "pub", "real": "lab"}));
+        let a = call(34, "alias_view", json!({"name": "bias_pub", "real": "lab"}));
         assert_eq!(a["result"]["isError"], true);
         assert!(text(&a).contains("is a fork"));
-        // A GOVERNED base name cannot be forked: 'lens' resolves through a
+        // A GOVERNED base name cannot be forked: 'lens_docs' resolves through a
         // definition, and `base` without a definition still forks fine.
         let dv2 = call(
             35,
             "define_derived_view",
-            json!({"name": "lens", "base": "base", "rules": "only /docs"}),
+            json!({"name": "lens_docs", "base": "base", "rules": "only /docs"}),
         );
-        assert!(text(&dv2).contains("defined derived view 'lens' over base 'base'"));
-        let f2 = call(36, "fork_view", json!({"name": "lab2", "base": "lens"}));
+        assert!(text(&dv2).contains("defined derived view 'lens_docs' over base 'base'"));
+        let f2 = call(36, "fork_view", json!({"name": "lab2", "base": "lens_docs"}));
         assert_eq!(f2["result"]["isError"], true);
         assert!(text(&f2).contains("is governed by a definition"));
         // Re-forking an existing name is refused before any tree is copied.
@@ -3909,6 +3978,10 @@ mod tests {
         assert!(text(&r).contains("removed fork view 'lab' of base 'base'"));
         assert!(!crate::meta::view_db_path(&home, "lab").exists());
         assert!(crate::meta::view_db_path(&home, "base").is_file());
+        // The whole tree home goes — directory and def slot included, not just
+        // the db files (the dir is resolved before the unlinks for this).
+        assert!(!home.join("meta/base/lab").exists());
+        assert!(!home.join("meta/base/lab/lab.layout").exists());
     }
 
     #[test]
@@ -3990,10 +4063,10 @@ mod tests {
         let d = call(
             21,
             "define_derived_view",
-            json!({"name": "safe", "base": "team", "rules": "hide /photos/private"}),
+            json!({"name": "lens_safe", "base": "team", "rules": "hide /photos/private"}),
         );
-        assert!(text(&d).contains("defined derived view 'safe'"));
-        let lens = call(22, "list_view_tree", json!({"view": "safe", "depth": 10}));
+        assert!(text(&d).contains("defined derived view 'lens_safe'"));
+        let lens = call(22, "list_view_tree", json!({"view": "lens_safe", "depth": 10}));
         let pl: Value = serde_json::from_str(&text(&lens)).unwrap();
         assert_eq!(pl["kind"], "derived");
         assert_eq!(pl["rendered_from"], "team"); // walked the base THROUGH the lens
@@ -4012,9 +4085,9 @@ mod tests {
         let simpaths = paths(&sim);
         assert!(simpaths.contains(&"/docs".to_string()));
         assert!(!simpaths.contains(&"/photos".to_string()));
-        assert!(!home.join("meta/team/safe2.layout").exists());
+        assert!(!home.join("meta/team/lens_safe2.layout").exists());
         // (4) get_view echoes the EXACT rules text for read-modify-write.
-        let g = call(24, "get_view", json!({"name": "safe"}));
+        let g = call(24, "get_view", json!({"name": "lens_safe"}));
         let pg: Value = serde_json::from_str(&text(&g)).unwrap();
         assert_eq!(pg["kind"], "derived");
         assert_eq!(pg["base"], "team");
@@ -4023,8 +4096,8 @@ mod tests {
             .unwrap()
             .contains("hide /photos/private"));
         // (5) a real listing under an alias resolves to the FULL real tree.
-        call(25, "alias_view", json!({"name": "pub", "real": "team"}));
-        let a = call(26, "list_view_tree", json!({"view": "pub", "depth": 10}));
+        call(25, "alias_view", json!({"name": "bias_pub", "real": "team"}));
+        let a = call(26, "list_view_tree", json!({"view": "bias_pub", "depth": 10}));
         let pa: Value = serde_json::from_str(&text(&a)).unwrap();
         assert_eq!(pa["kind"], "alias");
         assert!(paths(&a).contains(&"/photos/private/x.jpg".to_string()));
@@ -4111,10 +4184,10 @@ mod tests {
         let d = sess
             .handle(&json!({"jsonrpc":"2.0","id":7,"method":"tools/call",
                             "params":{"name":"define_derived_view",
-                                      "arguments":{"name":"docs","base":"team","rules":"only /docs"}}}))
+                                      "arguments":{"name":"lens_docs","base":"team","rules":"only /docs"}}}))
             .unwrap();
         assert_ne!(d["result"]["isError"], true);
-        assert!(home.join("meta/team/docs.layout").is_file());
+        assert!(home.join("meta/team/lens_docs.layout").is_file());
 
         let calls = store.recent_calls(50).unwrap();
         let define = calls
@@ -4400,7 +4473,7 @@ mod tests {
         let verdict = assert_mirrors(&call(
             4,
             "validate_definition",
-            json!({"name": "safe", "base": "team", "rules": "hide /photos/private"}),
+            json!({"name": "lens_safe", "base": "team", "rules": "hide /photos/private"}),
         ));
         assert_eq!(verdict["accepted"], true);
         assert_eq!(verdict["dry_run"], true);
@@ -4499,11 +4572,11 @@ mod tests {
             )
             .unwrap()
         };
-        call(1, "alias_view", json!({"name": "pub", "real": "team"}));
+        call(1, "alias_view", json!({"name": "bias_pub", "real": "team"}));
         call(
             2,
             "define_derived_view",
-            json!({"name": "safe", "base": "team", "rules": "hide /photos/private"}),
+            json!({"name": "lens_safe", "base": "team", "rules": "hide /photos/private"}),
         );
         let asked = |id: i64, params: Value| -> Vec<String> {
             ask(
@@ -4524,8 +4597,8 @@ mod tests {
                    "argument":{"name":"name","value":""}}),
         );
         assert!(all.contains(&"team".to_string()));
-        assert!(all.contains(&"pub".to_string()));
-        assert!(all.contains(&"safe".to_string()));
+        assert!(all.contains(&"bias_pub".to_string()));
+        assert!(all.contains(&"lens_safe".to_string()));
         // reshape-view's `base` can only be a physical tree.
         let bases = asked(
             4,
@@ -4539,7 +4612,7 @@ mod tests {
             json!({"ref":{"type":"ref/prompt","name":"rotate-alias"},
                    "argument":{"name":"old","value":""}}),
         );
-        assert_eq!(olds, vec!["pub".to_string()]);
+        assert_eq!(olds, vec!["bias_pub".to_string()]);
         let _ = d;
     }
 

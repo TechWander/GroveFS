@@ -11,8 +11,12 @@ remove view definitions (read-only lenses, writable public aliases, standalone
 forks).
 
 **This entrance is the control plane**, and its home follows the metadata
-backend: on embedded SQLite it writes `<meta-dir>/meta/views/*.layout` (a fork
-additionally writes `meta/<name>/<name>.db` and rebuilds the `refs.db` ledger); when
+backend: on embedded SQLite it writes the `.layout` definition slots — per
+the v3 family default a lens `lens_<name>.layout` and a bias `bias_<name>.layout`
+land inside the base view's directory `meta/<base>/`, and a fork's own
+`<name>.layout` travels inside its tree directory `meta/<base>/<name>/`
+(the fork additionally writes `<name>.db` there and rebuilds the `refs.db`
+ledger); `meta/views/` holds defs only on a `flat` store or legacy ones. When
 the server runs with `--meta-store postgres://…` definitions write to the PG table
 `grovefs_control.view_defs` instead and nothing control-plane lands on local
 disk — a fork there copies the `grovefs_v_<hex>` schema itself (one transaction,
@@ -65,7 +69,7 @@ with the dependency-free script in this directory (see `scripts/mcp_call.py`):
 ```bash
 python3 scripts/mcp_call.py --meta-dir <D> list                    # tools/list
 python3 scripts/mcp_call.py --meta-dir <D> call list_views '{}'
-python3 scripts/mcp_call.py --meta-dir <D> call define_derived_view '{"name":"release","base":"team","rules":"hide /photos/private"}'
+python3 scripts/mcp_call.py --meta-dir <D> call define_derived_view '{"name":"lens_release","base":"team","rules":"hide /photos/private"}'
 python3 scripts/mcp_call.py --meta-dir <D> --api-key ID:SECRET list # through a --require-api-key gate
 ```
 
@@ -276,6 +280,8 @@ lines interpolates your own names/paths.
 | `get_view` / `list_view_tree` on an unknown name | `no view '<name>' in <store> (not a definition nor a physical view tree) — \`list_views\` names what exists` |
 | Bad verb or ambiguous destination in rules | `bad layout rules: line <N>: …` |
 | Derived name == base name | `derived view name must differ from its base` |
+| An alias without the `bias_` prefix | `invalid alias name '<name>' — pure aliases are named 'bias_<alias>' so the definition file states its kind and family (try 'bias_<name>')` |
+| A derived (lens) name without the `lens_` prefix | `invalid derived view name '<name>' — derived (lens) views are named 'lens_<name>' so the definition file states its kind and family (try 'lens_<name>')` |
 | Definition name collides with a physical db name | `'<name>' already names a physical view db — pick another name` |
 | Defining over an alias / fork name | `'<name>' is a pure alias — remove it first …` / `'<name>' is a fork (an independent metadata tree) — remove it first …` |
 | Alias target is itself an alias | `alias target '<real>' is itself an alias (-> '<x>') — chains are not supported; alias the physical view instead` |

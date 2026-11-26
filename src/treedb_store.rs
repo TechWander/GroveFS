@@ -1115,7 +1115,8 @@ fn valid_treedb_name(name: &str) -> bool {
     let n = name.trim();
     !n.is_empty()
         && n.len() <= 24
-        && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        && n.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// 拨一次并列出视图，用来证明一个 `host:port` 真的是活的 treedb 服务器（走与
@@ -1161,10 +1162,7 @@ pub fn treedb_registry(base: &std::path::Path) -> Result<Vec<(String, String)>, 
 
 /// 原子重写注册表：tmp + rename。注释头写明这是清单而非路由器，免得后来者以为
 /// 加一行就能让新视图落过去。
-fn write_treedb_registry(
-    base: &std::path::Path,
-    insts: &[(String, String)],
-) -> Result<(), String> {
+fn write_treedb_registry(base: &std::path::Path, insts: &[(String, String)]) -> Result<(), String> {
     let path = treedb_registry_path(base);
     let mut text = "# GroveFS-managed treedb instance registry — edited by the web console's\n\
         # storage page (`storage.*`, admin only). treedb is EXPERIMENTAL: this file is\n\
@@ -1244,17 +1242,17 @@ pub fn treedb_update(
     probe_treedb_addr(addr)?;
     insts[idx].1 = addr.trim().to_string();
     write_treedb_registry(base, &insts)?;
-    Ok(format!("instance '{}' now points at {}", name.trim(), addr.trim()))
+    Ok(format!(
+        "instance '{}' now points at {}",
+        name.trim(),
+        addr.trim()
+    ))
 }
 
 /// `storage.remove`（treedb 档）：跑守卫后删行。serving 记录删不掉；只要目标服务器还
 /// 报有视图就删不掉（没有搬迁通道，删了就是把树孤立）；证据读不到也拒绝。空清单
 /// 且非 serving 才允许遗忘，删后重读验证文件确已生效。
-pub fn treedb_remove(
-    base: &std::path::Path,
-    serving: &str,
-    name: &str,
-) -> Result<String, String> {
+pub fn treedb_remove(base: &std::path::Path, serving: &str, name: &str) -> Result<String, String> {
     let insts = treedb_registry(base)?;
     let name = name.trim();
     let Some((_, addr)) = insts.iter().find(|(n, _)| n == name) else {
@@ -1267,8 +1265,9 @@ pub fn treedb_remove(
         ));
     }
     // 证据缺失即拒绝：读不到清单 = 无法证明它是空的，那就不能遗忘它。
-    let views = TreedbStore::list_views(&addr)
-        .map_err(|e| format!("cannot read the view list of treedb at {addr} to guard the removal: {e}"))?;
+    let views = TreedbStore::list_views(&addr).map_err(|e| {
+        format!("cannot read the view list of treedb at {addr} to guard the removal: {e}")
+    })?;
     if !views.is_empty() {
         let shown: Vec<&str> = views.iter().take(20).map(String::as_str).collect();
         return Err(format!(
@@ -1285,9 +1284,7 @@ pub fn treedb_remove(
             treedb_registry_path(base).display()
         ));
     }
-    Ok(format!(
-        "instance '{name}' removed (it hosted no views)"
-    ))
+    Ok(format!("instance '{name}' removed (it hosted no views)"))
 }
 
 /// `storage.preview`（treedb 档）：删除前的预览卡片——视图清单、数量、serving/control
@@ -1349,10 +1346,8 @@ mod registry_tests {
     use super::*;
 
     fn dir(tag: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "grovefs-treedb-reg-{tag}-{}",
-            std::process::id()
-        ));
+        let d =
+            std::env::temp_dir().join(format!("grovefs-treedb-reg-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -1365,7 +1360,10 @@ mod registry_tests {
         assert!(treedb_registry(&d).unwrap().is_empty());
         assert!(adopt_treedb_spec(&d, "127.0.0.1:7777").unwrap());
         let insts = treedb_registry(&d).unwrap();
-        assert_eq!(insts, vec![("primary".to_string(), "127.0.0.1:7777".to_string())]);
+        assert_eq!(
+            insts,
+            vec![("primary".to_string(), "127.0.0.1:7777".to_string())]
+        );
         // 再收养同一地址不写文件（不重复插行）。
         assert!(!adopt_treedb_spec(&d, "127.0.0.1:7777").unwrap());
         assert_eq!(treedb_registry(&d).unwrap().len(), 1);
@@ -1378,10 +1376,7 @@ mod registry_tests {
     #[test]
     fn registry_path_is_under_base() {
         let d = dir("path");
-        assert_eq!(
-            treedb_registry_path(&d),
-            d.join(TREEDB_REGISTRY_FILE)
-        );
+        assert_eq!(treedb_registry_path(&d), d.join(TREEDB_REGISTRY_FILE));
         let _ = std::fs::remove_dir_all(&d);
     }
 

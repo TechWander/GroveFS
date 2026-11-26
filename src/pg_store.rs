@@ -5095,7 +5095,11 @@ pub fn managed_registry_path(base: &Path) -> std::path::PathBuf {
 /// an inline spec to `file:<base>/instances.conf`) and the write guards of
 /// the `storage.*` ops both answer from this single comparison.
 pub fn is_managed_spec(spec: &str, base: &Path) -> bool {
-    let Some(path) = spec.strip_prefix("file:").map(str::trim).map(std::path::PathBuf::from) else {
+    let Some(path) = spec
+        .strip_prefix("file:")
+        .map(str::trim)
+        .map(std::path::PathBuf::from)
+    else {
         return false;
     };
     path == managed_registry_path(base)
@@ -5117,11 +5121,12 @@ pub fn adopt_inline_spec(base: &Path, spec: &str) -> Result<String, String> {
         return Ok(format!("file:{}", path.display()));
     }
     let book = expand_store_spec(spec)?;
-    let mut text = "# GroveFS-managed PG instance registry (adopted from --meta-store at startup).\n\
+    let mut text =
+        "# GroveFS-managed PG instance registry (adopted from --meta-store at startup).\n\
          # The FIRST entry carries the control plane; the console edits this file\n\
          # through the storage page (`storage.*` governance ops, admin only).\n\
          # A `@control-pending=` line is a staged control handover — see USAGE.\n"
-        .to_string();
+            .to_string();
     for (i, inst) in book.instances.iter().enumerate() {
         let name = if i == 0 { "control" } else { &inst.name };
         text.push_str(&format!("{name} = {}\n", inst.uri));
@@ -5159,7 +5164,11 @@ fn registry(path: &Path) -> Result<RegistryLines, String> {
 
 /// Write the managed registry atomically: directives first, instances in
 /// book order (the FIRST entry is the control plane by contract).
-fn write_registry(path: &Path, directives: &[String], insts: &[(String, String)]) -> Result<(), String> {
+fn write_registry(
+    path: &Path,
+    directives: &[String],
+    insts: &[(String, String)],
+) -> Result<(), String> {
     let mut text = "# GroveFS-managed PG instance registry — edited by the web console's\n\
         # storage page (`storage.*` governance ops, admin only). The FIRST entry\n\
         # carries the control plane; @control-pending lines stage a handover.\n"
@@ -5171,8 +5180,7 @@ fn write_registry(path: &Path, directives: &[String], insts: &[(String, String)]
         text.push_str(&format!("{name} = {uri}\n"));
     }
     let tmp = path.with_extension("conf.tmp");
-    std::fs::write(&tmp, &text)
-        .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    std::fs::write(&tmp, &text).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, path).map_err(|e| format!("cannot replace {}: {e}", path.display()))
 }
 
@@ -5201,15 +5209,21 @@ pub fn registry_add(base: &Path, name: &str, uri: &str) -> Result<String, String
     let (mut insts, directives) = registry(&path)?;
     let name = name.trim();
     if !valid_instance_name(name) {
-        return Err(format!("instance name '{name}' must be 1-24 chars of [A-Za-z0-9_-]"));
+        return Err(format!(
+            "instance name '{name}' must be 1-24 chars of [A-Za-z0-9_-]"
+        ));
     }
     if insts.iter().any(|(n, _)| n == name) {
-        return Err(format!("instance '{name}' already exists — edit it instead (storage.update)"));
+        return Err(format!(
+            "instance '{name}' already exists — edit it instead (storage.update)"
+        ));
     }
     check_instance_uri(uri.trim())?;
     insts.push((name.to_string(), uri.trim().to_string()));
     write_registry(&path, &directives, &insts)?;
-    Ok(format!("instance '{name}' added and is routable now (trial connection verified)"))
+    Ok(format!(
+        "instance '{name}' added and is routable now (trial connection verified)"
+    ))
 }
 
 /// `storage.update`: point a name at a (new) URI. The NAME is the placement
@@ -5236,12 +5250,17 @@ pub fn registry_update(base: &Path, name: &str, uri: &str) -> Result<String, Str
         return Err(format!("instance '{name}' is not in the registry"));
     };
     if slot == uri.trim() {
-        return Err(format!("instance '{name}' already uses this URI — nothing to change"));
+        return Err(format!(
+            "instance '{name}' already uses this URI — nothing to change"
+        ));
     }
     check_instance_uri(uri.trim())?;
     *slot = uri.trim().to_string();
     write_registry(&path, &directives, &insts)?;
-    Ok(format!("instance '{name}' now points at {}", redact_uri(uri.trim())))
+    Ok(format!(
+        "instance '{name}' now points at {}",
+        redact_uri(uri.trim())
+    ))
 }
 
 /// The guards behind deleting an instance, evaluated server-side from the
@@ -5295,7 +5314,8 @@ pub fn registry_remove(spec: &str, base: &Path, name: &str) -> Result<String, St
     // still render; for a deletion guard that shape is exactly the trap — an
     // unreachable control plane reads as "nothing placed". MISSING evidence
     // refuses here, it never passes.
-    let ledger = instance_report(spec).map_err(|e| format!("cannot read the placement ledger to guard the removal: {e}"))?;
+    let ledger = instance_report(spec)
+        .map_err(|e| format!("cannot read the placement ledger to guard the removal: {e}"))?;
     if let Some(e) = &ledger.error {
         return Err(format!(
             "cannot verify the placement ledger to guard the removal: {e} — an instance may only be removed once its placed views are known to be zero"
@@ -5307,10 +5327,7 @@ pub fn registry_remove(spec: &str, base: &Path, name: &str) -> Result<String, St
         .filter(|(_, inst)| **inst == *name)
         .map(|(view, _)| view.clone())
         .collect();
-    let dangling_rows = placement
-        .values()
-        .filter(|inst| **inst == *name)
-        .count();
+    let dangling_rows = placement.values().filter(|inst| **inst == *name).count();
     let block = RegistryRemovalBlock {
         placed_views,
         dangling_rows,
@@ -5329,7 +5346,9 @@ pub fn registry_remove(spec: &str, base: &Path, name: &str) -> Result<String, St
             path.display()
         ));
     }
-    Ok(format!("instance '{name}' removed (it hosted no placed views)"))
+    Ok(format!(
+        "instance '{name}' removed (it hosted no placed views)"
+    ))
 }
 
 /// `storage.preview`: the deletion preview the console must show BEFORE an
@@ -5340,7 +5359,12 @@ pub fn remove_preview(spec: &str, name: &str) -> Result<serde_json::Value, Strin
     let book = expand_store_spec(spec)?;
     let inst = book
         .by_name(name)
-        .ok_or_else(|| format!("instance '{name}' is not in the registry (instances: {})", book.names()))?
+        .ok_or_else(|| {
+            format!(
+                "instance '{name}' is not in the registry (instances: {})",
+                book.names()
+            )
+        })?
         .clone();
     let ledger = instance_report(spec)?;
     // Same rule as the removal guard: an unreadable placement ledger is
@@ -5370,7 +5394,8 @@ pub fn remove_preview(spec: &str, name: &str) -> Result<serde_json::Value, Strin
         let probe = (|| -> Result<(i64, i64, i64), String> {
             let mut c = Client::connect(&inst.uri, NoTls)
                 .map_err(|e| format!("cannot reach instance '{name}' ({e})"))?;
-            let schema = schema_for(view).ok_or_else(|| format!("view '{view}' has no PG schema shape"))?;
+            let schema =
+                schema_for(view).ok_or_else(|| format!("view '{view}' has no PG schema shape"))?;
             if !schema_exists(&mut c, &schema)? {
                 return Ok((-1, 0, 0));
             }
@@ -5448,8 +5473,8 @@ fn refs_consistency(spec: &str, placement: &HashMap<String, String>) -> serde_js
                 .map(|(v, _)| v)
                 .collect();
             let read = (|| -> Result<(Vec<String>, i64, i64), String> {
-                let mut c = Client::connect(&inst.uri, NoTls)
-                    .map_err(|e| format!("unreachable ({e})"))?;
+                let mut c =
+                    Client::connect(&inst.uri, NoTls).map_err(|e| format!("unreachable ({e})"))?;
                 let mut missing: Vec<String> = Vec::new();
                 for v in &placed_here {
                     let Some(schema) = schema_for(v) else {
@@ -5558,7 +5583,9 @@ pub fn set_control(base: &Path, name: &str) -> Result<String, String> {
         return Err("registry has no instances".into());
     }
     if insts[0].0 == name {
-        return Err(format!("instance '{name}' already carries the control plane"));
+        return Err(format!(
+            "instance '{name}' already carries the control plane"
+        ));
     }
     if !insts.iter().any(|(n, _)| n == name) {
         return Err(format!(
@@ -5644,7 +5671,13 @@ pub fn apply_pending_control(base: &Path) -> Result<Option<ControlHandover>, Str
     // The tables landed: rotate the target first, drop the directive, and
     // only then write — the file is the commit point of the handover.
     let mut rotated: Vec<(String, String)> = Vec::with_capacity(insts.len());
-    rotated.push(insts.iter().find(|(n, _)| *n == pending).cloned().expect("checked above"));
+    rotated.push(
+        insts
+            .iter()
+            .find(|(n, _)| *n == pending)
+            .cloned()
+            .expect("checked above"),
+    );
     rotated.extend(insts.iter().filter(|(n, _)| *n != pending).cloned());
     write_registry(&path, &[], &rotated)?;
     Ok(Some(ControlHandover {
@@ -5661,11 +5694,16 @@ pub fn apply_pending_control(base: &Path) -> Result<Option<ControlHandover>, Str
 /// rename leaves the directive in place, so the next start re-runs the
 /// migration against a clean target (the vacancy guard above refuses a
 /// target whose control tables already hold rows).
-fn migrate_control_plane(source_uri: &str, target_uri: &str, target_name: &str) -> Result<(usize, i64), String> {
+fn migrate_control_plane(
+    source_uri: &str,
+    target_uri: &str,
+    target_name: &str,
+) -> Result<(usize, i64), String> {
     let mut src = Client::connect(source_uri, NoTls)
         .map_err(|e| format!("cannot connect to the current control plane: {e}"))?;
-    let mut dst = Client::connect(target_uri, NoTls)
-        .map_err(|e| format!("cannot connect to the control-handover target '{target_name}': {e}"))?;
+    let mut dst = Client::connect(target_uri, NoTls).map_err(|e| {
+        format!("cannot connect to the control-handover target '{target_name}': {e}")
+    })?;
     dst.execute("CREATE SCHEMA IF NOT EXISTS grovefs_control", &[])
         .map_err(|e| format!("cannot create grovefs_control on the target: {e}"))?;
     let tables = control_tables(&mut src)?;
@@ -6381,7 +6419,12 @@ mod registry_tests {
     }
 
     fn names(path: &Path) -> Vec<String> {
-        registry(path).unwrap().0.into_iter().map(|(n, _)| n).collect()
+        registry(path)
+            .unwrap()
+            .0
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect()
     }
 
     /// A fresh inline spec is adopted: the FIRST instance is named
@@ -6392,7 +6435,10 @@ mod registry_tests {
         let d = dir("adopt");
         let spec = "postgres://u@h/db1,postgres://u@h/db2";
         let adopted = adopt_inline_spec(&d, spec).unwrap();
-        assert_eq!(adopted, format!("file:{}", managed_registry_path(&d).display()));
+        assert_eq!(
+            adopted,
+            format!("file:{}", managed_registry_path(&d).display())
+        );
         let book = super::expand_store_spec(&adopted).unwrap();
         assert_eq!(book.names(), "control, pg2");
         assert_eq!(book.control().uri, "postgres://u@h/db1");
@@ -6468,8 +6514,7 @@ mod registry_tests {
     #[test]
     fn registry_update_rejects_noop() {
         let d = seeded("upd");
-        let err =
-            registry_update(&d, "team", "postgres://u:p@127.0.0.1:5432/b").unwrap_err();
+        let err = registry_update(&d, "team", "postgres://u:p@127.0.0.1:5432/b").unwrap_err();
         assert!(err.contains("already uses this URI"), "{err}");
         let err = registry_update(&d, "ghost", "postgres://u@h/x").unwrap_err();
         assert!(err.contains("not in the registry"), "{err}");
@@ -6503,7 +6548,10 @@ mod registry_tests {
         )
         .unwrap();
         let err = set_control(&d, "team").unwrap_err();
-        assert!(err.contains("cannot reach the current control plane"), "{err}");
+        assert!(
+            err.contains("cannot reach the current control plane"),
+            "{err}"
+        );
         // And a staged directive refuses to double-stage — the guard runs
         // BEFORE any connection is dialed, so it fires even offline.
         std::fs::write(

@@ -106,14 +106,14 @@ RULES="hide $PRIV"
 note "[3] draft -> dry-run -> publish -> verify (never guess a path)"
 BAD="$(mcp call preview_rules '{"rules":"bog /x"}')"
 ok "bad verb refused with line no." "$BAD" "line 1: unknown layout verb 'bog'"
-VAL="$(mcp call validate_definition "{\"name\":\"release\",\"base\":\"team\",\"rules\":\"$RULES\"}")"
+VAL="$(mcp call validate_definition "{\"name\":\"lens_release\",\"base\":\"team\",\"rules\":\"$RULES\"}")"
 ok "dry run accepted, writes nothing" "$VAL" '"accepted": true'
-DEF="$(mcp call define_derived_view "{\"name\":\"release\",\"base\":\"team\",\"rules\":\"$RULES\"}")"
-ok "derived view published"         "$DEF" "defined derived view 'release' over base 'team': 1 hide"
-NEW="$(mcp call list_view_tree '{"view":"release"}')"
+DEF="$(mcp call define_derived_view "{\"name\":\"lens_release\",\"base\":\"team\",\"rules\":\"$RULES\"}")"
+ok "derived view published"         "$DEF" "defined derived view 'lens_release' over base 'team': 1 hide"
+NEW="$(mcp call list_view_tree '{"view":"lens_release"}')"
 ok "lens renders the base tree"     "$NEW" "$DOC"
 no "pruned subtree is gone"         "$NEW" "$PRIV"
-GV="$(mcp call get_view '{"name":"release"}')"
+GV="$(mcp call get_view '{"name":"lens_release"}')"
 ok "verbatim rules read back"       "$GV" "hide $PRIV"
 
 note "[4] governance guards answer with the CLI's own words"
@@ -125,21 +125,21 @@ GONE="$(mcp call remove_view '{"name":"team"}')"
 ok "a physical base is not a definition slot" "$GONE" "no view definition 'team'"
 
 note "[5] alias (public writable name) and gapless rotation"
-AL="$(mcp call alias_view '{"name":"team-public","real":"team"}')"
-ok "alias created, real name governed" "$AL" "alias 'team-public' -> real view 'team'"
-DUP="$(mcp call alias_view '{"name":"team-2","real":"team"}')"
-ok "one public name per real view"  "$DUP" "already governed by alias 'team-public'"
-ROT="$(mcp call alias_view '{"name":"team-public2","real":"team","retire":"team-public"}')"
-ok "rotation retires the old name"  "$ROT" "team-public"
+AL="$(mcp call alias_view '{"name":"bias_team-public","real":"team"}')"
+ok "alias created, real name governed" "$AL" "alias 'bias_team-public' -> real view 'team'"
+DUP="$(mcp call alias_view '{"name":"bias_team-2","real":"team"}')"
+ok "one public name per real view"  "$DUP" "already governed by alias 'bias_team-public'"
+ROT="$(mcp call alias_view '{"name":"bias_team-public2","real":"team","retire":"bias_team-public"}')"
+ok "rotation retires the old name"  "$ROT" "bias_team-public"
 code "rotation refuses a non-alias retire" 3 \
     python3 "$CALL" --bin "$BIN" --quiet --meta-dir "$STORE" call alias_view \
-    '{"name":"team-public3","real":"team","retire":"release"}'
+    '{"name":"bias_team-public3","real":"team","retire":"lens_release"}'
 
 note "[6] fork (independent tree, shared bytes) — any backend, here the local SQLite one"
 FK="$(mcp call fork_view '{"name":"lab","base":"team"}')"
 ok "fork seeded from the base"      "$FK" "forked view 'lab' from base 'team'"
-NOF="$(mcp call fork_view '{"name":"lab2","base":"release"}')"
-ok "a governed base cannot be forked" "$NOF" "release"
+NOF="$(mcp call fork_view '{"name":"lab2","base":"lens_release"}')"
+ok "a governed base cannot be forked" "$NOF" "lens_release"
 code "get_view on a fork reports its own tree" 0 \
     python3 "$CALL" --bin "$BIN" --quiet --meta-dir "$STORE" call get_view '{"name":"lab"}'
 ok "fork owns meta/lab/lab.db"          "$( $BIN --home "$STORE" view list )" "lab"
@@ -159,7 +159,7 @@ no "nothing else was grafted"       "$PICK" "/photos"
 note "[7] the same governance as resources / prompts / completion"
 RES="$(mcp resources)"
 ok "view tree exposed as resource"  "$RES" "grovefs://view/team/tree"
-RD="$(mcp read grovefs://view/release/tree)"
+RD="$(mcp read grovefs://view/lens_release/tree)"
 ok "resource bytes match the tool"  "$RD" '"contents"'
 no "pruned path absent in resource" "$RD" "$PRIV"
 code "unknown resource URI is a protocol error" 2 \
@@ -167,7 +167,7 @@ code "unknown resource URI is a protocol error" 2 \
 PR="$(mcp prompt reshape-view '{"base":"team"}')"
 ok "reshape playbook instantiated"  "$PR" "validate_definition"
 CP="$(mcp complete base 'r')"
-ok "completion offers real view names" "$CP" "release"
+ok "completion offers real view names" "$CP" "lens_release"
 
 note "[8] logging: setLevel warning -> a refused call pushes notifications/message (a successful one does not)"
 python3 "$CALL" --bin "$BIN" --quiet --meta-dir "$STORE" setlevel warning call list_view_tree '{"view":"ghost"}' > /dev/null 2>"$TMP/notes"
@@ -181,10 +181,10 @@ RMF="$(mcp call remove_view '{"name":"lab"}')"
 ok "fork removed with its tree"     "$RMF" "removed fork view 'lab'"
 RMP="$(mcp call remove_view '{"name":"pick"}')"
 ok "grafted fork removed as well"   "$RMP" "removed fork view 'pick'"
-RMD="$(mcp call remove_view '{"name":"release"}')"
-ok "definition removed, data intact" "$RMD" "removed view definition 'release'"
-RMA="$(mcp call remove_view '{"name":"team-public2"}')"
-ok "alias removed"                  "$RMA" "removed view definition 'team-public2'"
+RMD="$(mcp call remove_view '{"name":"lens_release"}')"
+ok "definition removed, data intact" "$RMD" "removed view definition 'lens_release'"
+RMA="$(mcp call remove_view '{"name":"bias_team-public2"}')"
+ok "alias removed"                  "$RMA" "removed view definition 'bias_team-public2'"
 FINAL="$(mcp call list_views)"
 no "no definitions left"            "$FINAL" '"kind": "derived"'
 ok "base view survives"             "$FINAL" '"team"'

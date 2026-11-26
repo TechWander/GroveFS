@@ -23,7 +23,7 @@
 - **视图绑定 / 只读的 API key（推荐访问控制）**：`grovefs apikey create --for mount --view V [--ro]` 铸出的凭据自带「**能开哪棵树、读写还是只读**」两个维度——绑定 `--view V` 的 key 只能 `M_OPEN` 视图 V（开别的视图在握手处即 `E_AUTH` 拒绝），`--ro` 的 key 被服务端**逐写意图 op 拒 `E_NOTPERM`**（meta 面）与 `EROFS`（data 面内容写），并在 `M_OPEN` 回包里提示客户端只读挂载，故「只读」不依赖客户端自觉 `-o ro`。只读↔读写还可 `apikey set-ro --id X [--rw|--ro]` **原地互切**——服务端在同一 ≤1s 复验 tick 上重读凭据行当前 `ro` 值，活挂载免重铸、免重连即按新值放行/拒写。这两维都在服务端硬强制、与客户端自报 uid 无关（key 才是真正的门）。系统级 key（省略 `--view`）仍可开任意视图。
 - **跨视图共享对象的删除安全（引用账本 `refs`）**：一个 `data_ref` 命名**唯一**一个底层对象，却可能被多个物理视图同时挂着名字（`grovefs import` 同一源文件进两个视图解析成同一 key、派生视图/别名共享基视图字节）。视图内的 `node.data_ref` 引用计数看不见别的视图，单看它会误删他视图仍在引用的对象。故记账落在 `<base>/meta/_control/refs.db`（PG 后端落共享表 `grovefs_refs.holders`）：每个视图 ATTACH 该账本，把 holder 计数与节点增删纳入**同一个 IMMEDIATE 事务**，跨文件原子提交。物理删除的准确规则是「**该视图内此 key 的最后一个名字被摘除、且全局账本再无其它视图持有**」——只有此时才 `backend.remove`。视图 db 被 out-of-band 删除（`rm meta/x/x.db`、新 `--home`）只会让账本**高估**、对象多留不误删；`grovefs refs --meta-dir D rebuild` 按现存视图树重算 holder 归位。**只有基视图（`grovefs view create` 显式创建的物理树）的删除才真正回收底层字节**，派生视图/别名挂载只读、其删除从不物理 GC。删基视图需显式声明 `grovefs view rm --name V --base`（删 `meta/V/V.db`+WAL/SHM、`refs rebuild` 重建账本、回收到零其他视图持有的字节；PG 部署与活挂载拒绝，字节走 `--data-dir`）。账本里没有行的键即该视图私有（空账本不需要任何初始化步骤）。账本归位后仍残留、或落在了 `blocks/` 却没有任何 `node` 行命名（外部拷入、半份恢复）的无人命名页，用离线 `grovefs gc --meta-dir D [--data-dir R] [--apply]` 审计/回收：默认只扫描，`--apply` 只删超过 `--older-than`（默认 24h）的页、永不删账本仍持有的键，并要求本存储无活挂载、本机无 grovefs 进程（PG 部署直接拒绝）。
 - **每客户端显示定制（`mount --layout rules.txt`）**：同一棵权威树、同一份字节，不同挂载点各自套一层「显示透镜」——`hide` 隐藏子树、`only` 白名单、`map` 把条目重排到别的路径（源位让位）、`link` 建两处同时可见的别名。透镜只做 `MetaProvider` 层的路径翻译：真实条目保持真实 inode，数据 IO/锁/GC/失效推送全部直通，不复制目录项、不影响其它挂载的视图。
-- **服务端派生视图（`grovefs view define` + `mount --view <派生名>`）**：想把形状**集中管理在服务端**——`grovefs view define --name docsonly --base team --rules F` 把规则落进基视图目录 `<meta-dir>/meta/<基>/<name>.layout`（v3 `nested` 默认；`flat` 下才是顶层 `<meta-dir>/meta/views/<name>.layout`）（首行 `base <物理视图>`；PG 后端下同一条命令 `--meta-store postgres://…` 写进 `grovefs_control.view_defs` 表），客户端只 `mount --view docsonly`，**无需任何本地规则文件**。**虚拟视图一律只读挂载**：形状集中治理、只分发不修改，写入只属于原（物理）视图——客户端据 `M_OPEN` 握手标志直接落内核只读（写 `EROFS`），`meta-server` 另对派生名的写意图 op 设权威门禁（绕开挂载直接说话也过不了这道门）。同名派生视图由服务端单例渲染（虚拟 inode 跨机一致），**改定义热生效**（`meta-server` 逐 op 检查定义 mtime，已挂载连接 ≤2s TTL 内自动换形、免重挂）；挂载一侧只在 `M_OPEN` 解析一次定义，换形由服务端逐 op 的检查推给它。
+- **服务端派生视图（`grovefs view define` + `mount --view <派生名>`）**：想把形状**集中管理在服务端**——`grovefs view define --name lens_docsonly --base team --rules F` 把规则落进基视图目录 `<meta-dir>/meta/<基>/<name>.layout`（v3 `nested` 默认；`flat` 下才是顶层 `<meta-dir>/meta/views/<name>.layout`）（首行 `base <物理视图>`；PG 后端下同一条命令 `--meta-store postgres://…` 写进 `grovefs_control.view_defs` 表），客户端只 `mount --view lens_docsonly`，**无需任何本地规则文件**。**虚拟视图一律只读挂载**：形状集中治理、只分发不修改，写入只属于原（物理）视图——客户端据 `M_OPEN` 握手标志直接落内核只读（写 `EROFS`），`meta-server` 另对派生名的写意图 op 设权威门禁（绕开挂载直接说话也过不了这道门）。同名派生视图由服务端单例渲染（虚拟 inode 跨机一致），**改定义热生效**（`meta-server` 逐 op 检查定义 mtime，已挂载连接 ≤2s TTL 内自动换形、免重挂）；挂载一侧只在 `M_OPEN` 解析一次定义，换形由服务端逐 op 的检查推给它。
 - **服务端纯别名（`grovefs view alias`）**：治理「叫什么」而非「长什么样」——公开名 1:1 映射物理视图（定义仅一行 `alias <真实视图>`），别名挂载**全树可写**，而真实名从此**不是挂载入口**（本地与 `meta-server` 都拒挂被治理的真实名）：对外名字可自由轮换、存储身份不外露，猜出真实名也挂不进来；公开名泄露时 `--retire` 一条命令原子轮换（旧名失效、真实名全程拒挂）。与派生视图同属一份 `.layout` 文本（nested 默认落基视图目录、flat 同放 `meta/views/`）、同一 `list/rm`；视图绑定 key 记在真实名，对别名与基名同时生效；拒绝别名链与派生目标；`import` 拒绝别名目标（别名不是存储身份）。
 - **服务端 fork 视图（`grovefs view fork`）**：基视图与派生透镜之间的「可组织、不可上传」中间态——`grovefs view fork --name lab --base team` 把基视图的目录项**复制**成一份独立元数据树（nested 默认 `meta/team/lab/lab.db`——树目录嵌在基目录 team 里；flat 下才是 `meta/lab/lab.db`），保留 inode/硬链接，内容字节不复制、经跨视图账本共享；定义仅一行 `fork <基视图>`。fork 挂载后 **结构可写**（`mkdir`/`rename`/`unlink`/`symlink`/`link`/`chmod` 全放行）、**内容写一律 `EROFS`**（`write`/`truncate`；上传字节属于基视图），删除只摘 fork 自己的元数据、基视图分毫不动，共享对象只在**最后一个持有视图**摘名后才回收。内容只读这件事由 `M_OPEN` 回包的第 3 个标志字节告知客户端，挂载据此在 FUSE 层拒内容写；同名定义槽与派生/别名共用 `view list`/`view rm`，删 fork 会一并删掉它自己的树并重建账本。基必须是**一份物理视图**（有定义的名字不能当基）——两档后端同一语义：SQLite 复制一棵 `.db` 的行；PG 在一个事务里 `INSERT … SELECT` 跨 schema 复制（`forksrv` 套件逐档实证）。`alias` 拒绝指向 fork（fork 是树身份，不是公开名——给它发 key 用 `apikey create --view lab`）。fork 支持**策展**：`--empty` 只建根、不复制任何条目，再用 `view graft` 把别处视图里选中的条目接进来——计划一行一条（`<src>` 原样落 `--dest`，或 `<src>TAB<dst>` 同时改名/换目录），`--map -` 直接读 stdin 便于外部程序生成；整份计划**一个事务**（要么全落、要么全不落）、字节零复制（条目进 fork，对象仍经跨视图账本共享），同名默认拒绝、`--skip-existing` 改为跳过。
 - **存量数据零拷贝导入（`grovefs import`）**：服务端已有一批目录数据（如 `/data/legacy`）时，`grovefs import --view V --source DIR` 把整棵树登记进视图——同文件系统下对象就是源文件的**硬链接**（零额外字节，两个路径读写同一 inode、双向实时可见），跨设备自动退化为流式拷贝；目录层级/时间戳/权限/属主保真，重跑即增量补新文件，删视图里的名字只摘 `blocks/` 链接**绝不伤源数据**。可与派生视图/透镜组合出虚拟目录（`map` 导入路径到任意形状；**派生虚拟视图挂载只读**，写走原视图）。
@@ -51,7 +51,7 @@
 │    │     ├── 本地:  MetaEngine  → <home>/meta/<view>/<view>.db
 │    │     ├── 远程:  RemoteMeta  → meta-server（中心权威）
 │    │     └── 透镜:  LayoutMeta  → mount --layout（每客户端显示定制，装饰以上任一）
-│    │           ├── 派生视图: 服务端 LayoutMeta 单例 → mount --view <派生名>（ 规则由 grovefs view define 集中定义于基视图目录 meta/<基>/<派生名>.layout——nested 默认，flat 才在 meta/views/）
+│    │           ├── 派生视图: 服务端 LayoutMeta 单例 → mount --view <派生名>（ 规则由 grovefs view define 集中定义于基视图目录 meta/<基>/lens_<派生名>.layout——nested 默认，flat 才在 meta/views/）
 │    │           ├── fork 视图: fork <基视图> → 落基视图目录内 meta/<基视图>/<名>/<名>.db（nested 默认；flat 顶层 meta/<名>/<名>.db；结构可写、内容 EROFS，字节共享）
 │    │           └── 纯别名: alias <真实视图> → 公开名 1:1 映射,全树可写,真实名 不可直挂（名字治理）
 │    └── StorageBackend trait 数据对象 IO
@@ -86,10 +86,10 @@ link <src> <dst>    镜像：<src> 保留、<dst> 再挂一个名字（同一 in
 | 入口 | 规则来源 | 生效范围 | 写语义 |
 |---|---|---|---|
 | `mount --layout F` | 客户端本地文件 | 只影响这个挂载 | 全树可写，写落真实条目 |
-| `grovefs view define --name D --base B --rules F` | 服务端控制面（SQLite：nested 默认 `meta/B/D.layout`、flat `meta/views/D.layout`；PG：`grovefs_control.view_defs`） | 所有挂 `--view D` 的客户端 | 派生挂载只读，写回基视图 |
+| `grovefs view define --name lens_D --base B --rules F` | 服务端控制面（SQLite：nested 默认 `meta/B/lens_D.layout`、flat `meta/views/lens_D.layout`；PG：`grovefs_control.view_defs`；名必须 `lens_` 前缀） | 所有挂 `--view lens_D` 的客户端 | 派生挂载只读，写回基视图 |
 | `grovefs view fork --name X --base B` | 独立元数据树 `meta/B/X/X.db`（nested 默认；flat `meta/X/X.db`） | 单独一棵可组织的树 | 结构可写、内容 `EROFS`、字节共享 |
 | `grovefs view fork --name X --base B --empty` + `grovefs view graft --name X --map P` | 空树 + 接枝计划 | 策展后的 fork | 只落选中的条目，字节仍共享 |
-| `grovefs view alias --name P --real R` | `alias <R>` 一行 | 公开名 1:1 治理 | 全树可写，真实名拒挂 |
+| `grovefs view alias --name bias_P --real R` | `alias <R>` 一行（名必须 `bias_` 前缀，nested 默认落 `meta/R/bias_P.layout`） | 公开名 1:1 治理 | 全树可写，真实名拒挂 |
 
 定制出的形状**可以和基视图完全不一样**：`<src>` 端被基树钉死，`<dst>` 端随你发明；想让自定义树成为视图全貌，配一条 `only <新树根>` 即可。透镜做不到的只有一件事——凭空造内容：渲染出的每个条目都是基树某条目的换名/镜像/裁剪加合成目录，字节永远不复制。热生效：挂载在 ≤2s 内自动换形——`meta-server` 逐 op 复查定义的变更票据，已建立的连接不必重挂；`M_OPEN` 时解析一次定义。
 
@@ -107,7 +107,7 @@ link <src> <dst>    镜像：<src> 保留、<dst> 再挂一个名字（同一 in
 │   ├── refs.db            跨视图共享对象持有者账本（GC 依它判「最后一个名字」；派生/别名/fork 共享基字节）
 │   ├── api_keys.db        API key 摘要 + 调用审计（SQLite 后端的控制面；PG 后端进 grovefs_control）
 │   └── store.key          开启 api_keys.db 里那份密文副本的密钥（0600，首次使用时原子创建）
-├── views/*.layout         派生/别名/fork 的定义(派生=首行 `base <B>` + 规则行;别名=单行 `alias <R>`;fork=单行 `fork <B>`)
+├── views/*.layout         顶层定义槽（flat 家族布局；nested/grouped 下派生/别名定义落基视图目录 `meta/<基>/lens_*.layout`/`bias_*.layout`，fork 定义随树落 `meta/<基>/<fork>/<fork>.layout`。派生=首行 `base <B>` + 规则行;别名=单行 `alias <R>`;fork=单行 `fork <B>`)
 └── .xfer/                 export/import 的服务端暂存区（点开头，永不是树）
 数据字节：blocks/<2hex>/<key>（key=UUID，按哈希扇出 256 桶，单目录条目不随总量增长）
 PG 后端（meta-server --meta-store postgres://…）：一 view 一 schema `grovefs_v_<hex(view)>`，同构 node/ctrl/locks
@@ -409,28 +409,28 @@ note.txt
 
 ## 服务端派生视图：一份数据、不同 `--view` 名不同形状（`grovefs view`）
 
-`--layout` 由每个客户端自备规则；当希望把形状**集中管理在服务端**（团队内不同名字共享同一显示契约）时，用派生视图：`grovefs view define` 把规则存进基视图目录 `<meta-dir>/meta/<基>/<name>.layout`（nested 默认；flat 下才是 `<meta-dir>/meta/views/<name>.layout`）（首行 `base <物理视图>`，余行同 `--layout` 四动词；SQLite 后端落此文件，`view … --meta-store postgres://…` 时写进 PG 的 `grovefs_control.view_defs` 表），客户端只需 `mount --view <派生名>`，**不需本地规则文件**。派生（虚拟）视图**一律只读挂载**——形状是集中治理的分发视图，所有写入都属于原（基名）视图。同名派生视图在不同机器上由服务端同一份定义渲染（虚拟 inode 跨机一致）；访问控制仍由视图绑定 / 只读 API key 承担（形状与权限两面正交）。挂载不带 `--layout` 时，形状由服务端解析 `<meta-dir>/meta/views/<view>.layout` 后经 `M_OPEN` 回包告知客户端——客户端手里永远不需要一份规则文件。
+`--layout` 由每个客户端自备规则；当希望把形状**集中管理在服务端**（团队内不同名字共享同一显示契约）时，用派生视图：`grovefs view define` 把规则存进基视图目录 `<meta-dir>/meta/<基>/lens_<name>.layout`（nested 默认；flat 下才是 `<meta-dir>/meta/views/lens_<name>.layout`；派生名必须 `lens_` 前缀）（首行 `base <物理视图>`，余行同 `--layout` 四动词；SQLite 后端落此文件，`view … --meta-store postgres://…` 时写进 PG 的 `grovefs_control.view_defs` 表），客户端只需 `mount --view <派生名>`，**不需本地规则文件**。派生（虚拟）视图**一律只读挂载**——形状是集中治理的分发视图，所有写入都属于原（基名）视图。同名派生视图在不同机器上由服务端同一份定义渲染（虚拟 inode 跨机一致）；访问控制仍由视图绑定 / 只读 API key 承担（形状与权限两面正交）。挂载不带 `--layout` 时，形状由服务端解析 `<meta-dir>/meta/views/<view>.layout` 后经 `M_OPEN` 回包告知客户端——客户端手里永远不需要一份规则文件。
 
 ```text
 $ cat docsonly.rules
 # show only the docs subtree
 only /docs
-$ grovefs view --meta-dir $BASE define --name docsonly --base team --rules docsonly.rules
-defined derived view 'docsonly' over base 'team': 0 hide, 1 only, 0 reloc rule(s)
-note: mounts of 'docsonly' are read-only (virtual shape) — write to base view 'team'
+$ grovefs view --meta-dir $BASE define --name lens_docsonly --base team --rules docsonly.rules
+defined derived view 'lens_docsonly' over base 'team': 0 hide, 1 only, 0 reloc rule(s)
+note: mounts of 'lens_docsonly' are read-only (virtual shape) — write to base view 'team'
 $ grovefs view --meta-dir $BASE define --name team --base team --rules docsonly.rules   # 名与基同名
 error: derived view name must differ from its base
 $ grovefs view --meta-dir $BASE list
-view 'docsonly' -> base 'team': 0 hide, 1 only, 0 reloc rule(s) (read-only)
+view 'lens_docsonly' -> base 'team': 0 hide, 1 only, 0 reloc rule(s) (read-only)
 base view 'team' -> own tree meta/team/team.db (read-write; deletes free a shared object only when no view holds it)
 
-$ grovefs mount --view docsonly -m mnt --manager 127.0.0.1:16510 --roster-key-file ~/roster.key   # 派生名直接挂，无 --layout
+$ grovefs mount --view lens_docsonly -m mnt --manager 127.0.0.1:16510 --roster-key-file ~/roster.key   # 派生名直接挂，无 --layout
 manager 127.0.0.1:16510: deployment 'default' epoch 1 resolved meta [127.0.0.1:16511] data [127.0.0.1:16512] (signature verified, valid for 3599s more)
 using remote metadata service at 127.0.0.1:16511
-derived view 'docsonly' over base 'team': read-only lens
+derived view 'lens_docsonly' over base 'team': read-only lens
 note: derived (virtual) views mount read-only — write to base view 'team'
 using remote data service at 127.0.0.1:16512
-mounting view 'docsonly' at /tmp/vdemo0j0V/mnt (fully remote: no local store, read-only)
+mounting view 'lens_docsonly' at /tmp/vdemo0j0V/mnt (fully remote: no local store, read-only)
 $ ls mnt                                       # 派生名挂载点：只有 docs
 docs
 $ ls mnt_full                                  # 基名挂的是同一棵完整树（可写）
@@ -442,8 +442,8 @@ a.md
 b.md
 $ echo "from lens" > mnt/docs/2026/c.md        # 经虚拟视图写一律拒绝
 bash: /tmp/vdemo0j0V/mnt/docs/2026/c.md: Read-only file system
-$ grovefs view --meta-dir $BASE rm --name docsonly
-removed view definition 'docsonly' (underlying data untouched)
+$ grovefs view --meta-dir $BASE rm --name lens_docsonly
+removed view definition 'lens_docsonly' (underlying data untouched)
 ```
 
 语义与守卫：define 拒绝 `name == base`、拒绝 base 本身是派生视图（不嵌套透镜）、拒绝遮蔽已有物理 `<name>.db`；非法规则 fail-fast（不会退化成「全显示」）。**虚拟视图一律只读（硬契约）**：写只属于原（基名）视图——`meta-server` 在 `M_OPEN` 握手回包里带派生标志，客户端直接落内核只读挂载（写 `EROFS`、`flock` 写锁同拒），服务端另对派生名的写意图 op 加独立权威门禁（回 `E_NOTPERM`，有意不用 `E_ROFS` 以免被误读为 HA 故障转移信号），改过的客户端也绕不过——判定在持有存储的那一侧。**改定义热生效、免重挂**：`meta-server` 每次分发 op 前检查定义文件 mtime，`define` 替换后已建立的挂载连接在客户端缓存 TTL（≤2s）内自动切到新形状（换形后只读契约不变）；`view rm` 则**不**热作用（已挂载者保持打开时的形状直到重挂，避免抽掉正在使用的树）。共享 meta-server 下，派生视图的订阅者**同时注册进自身名与 base 名两个桶**，基侧写双播即时失效、对派生挂载即时可见（`layout` 套件第 9 节 e2e 验证：基写→派生立即可见、派生挂载写/删被 `EROFS` 拒且基树无痕、re-define→同连接换形）；`view rm` 只删定义不动数据。`grovefs view` 与 `grovefs apikey` 一样操作服务端本地文件，需在 meta-server 所在机器执行（或共享同一 `--meta-dir`）；HA 部署下要把整个 `meta/`（定义与 fork 树嵌在各基视图目录里，不只是 `meta/views/`）当配置状态、随 `api_keys.db` 一样手工同步到备机。
@@ -453,9 +453,9 @@ removed view definition 'docsonly' (underlying data untouched)
 ```text
 $ ls mnt                                    # docsonly = only /docs，挂载中
 docs
-$ grovefs view --meta-dir $BASE define --name docsonly --base team --rules broader.rules
-view 'docsonly' already defined — replacing it (live meta-server mounts hot-reload it within their cache TTL)
-defined derived view 'docsonly' over base 'team': 0 hide, 2 only, 0 reloc rule(s)
+$ grovefs view --meta-dir $BASE define --name lens_docsonly --base team --rules broader.rules
+view 'lens_docsonly' already defined — replacing it (live meta-server mounts hot-reload it within their cache TTL)
+defined derived view 'lens_docsonly' over base 'team': 0 hide, 2 only, 0 reloc rule(s)
 $ sleep 3
 $ ls mnt                                    # 同一个挂载，没有重挂，形状自动变宽
 docs
@@ -464,18 +464,18 @@ photos
 
 ## 纯别名：名字治理（`grovefs view alias`）
 
-派生视图治理「长什么样」；**纯别名**治理「叫什么」：名字就是别名，映射值才是真实名。定义同放基视图目录 `<meta-dir>/meta/<真实视图>/<name>.layout`（nested 默认；flat 下才是 `<meta-dir>/meta/views/<name>.layout`）（PG 后端：`grovefs_control.view_defs` 表行），首行 `alias <真实视图>`、不带任何规则行。与派生视图恰成正反两面：**别名挂载全树可写**（它就是真实视图的原形），而**真实名从此不是挂载入口**——`meta-server` 拒挂被治理的真实名，对外名字可以自由轮换，存储身份不随名字外露：
+派生视图治理「长什么样」；**纯别名**治理「叫什么」：名字就是别名，映射值才是真实名。别名名必须 `bias_` 前缀，定义同放基视图目录 `<meta-dir>/meta/<真实视图>/bias_<name>.layout`（nested 默认；flat 下才是 `<meta-dir>/meta/views/bias_<name>.layout`）（PG 后端：`grovefs_control.view_defs` 表行），首行 `alias <真实视图>`、不带任何规则行。与派生视图恰成正反两面：**别名挂载全树可写**（它就是真实视图的原形），而**真实名从此不是挂载入口**——`meta-server` 拒挂被治理的真实名，对外名字可以自由轮换，存储身份不随名字外露：
 
 ```text
-$ grovefs view --meta-dir $BASE alias --name teamwork --real team
-defined pure alias 'teamwork' -> real view 'team'
+$ grovefs view --meta-dir $BASE alias --name bias_teamwork --real team
+defined pure alias 'bias_teamwork' -> real view 'team'
 note: 'team' is no longer a mount entry point while this definition exists (the meta-server refuses a mount of the real name); alias mounts show the FULL tree and are WRITABLE
-$ grovefs mount --view teamwork -m mnt_leak --manager 127.0.0.1:16510 --roster-key-file ~/roster.key   # 全树、可写
+$ grovefs mount --view bias_teamwork -m mnt_leak --manager 127.0.0.1:16510 --roster-key-file ~/roster.key   # 全树、可写
 manager 127.0.0.1:16510: deployment 'default' epoch 1 resolved meta [127.0.0.1:16511] data [127.0.0.1:16512] (signature verified, valid for 3599s more)
 using remote metadata service at 127.0.0.1:16511
-alias view 'teamwork' resolves to real view 'team' (full tree, writable)
+alias view 'bias_teamwork' resolves to real view 'team' (full tree, writable)
 using remote data service at 127.0.0.1:16512
-mounting view 'teamwork' at /tmp/vdemo0j0V/mnt_leak (fully remote: no local store)
+mounting view 'bias_teamwork' at /tmp/vdemo0j0V/mnt_leak (fully remote: no local store)
 $ echo "hello alias" > mnt_leak/docs/hello.md
 alias write: OK (hello alias)
 $ grovefs mount --view team -m mnt_t --manager 127.0.0.1:16510 --roster-key-file ~/roster.key          # 直挂真实名被拒
@@ -488,10 +488,10 @@ error: grovefs: background mount exited (exit status: 1) before mounting
 公开名泄露后，**一条 `--retire` 命令原子轮换**（先写新名再删旧名，真实名全程被治理、无裸露窗口；视图绑定 key 记在真实名上，对别名与基名同时生效，故轮换公开名不需重铸 key）：
 
 ```bash
-$ grovefs view --meta-dir $BASE alias --name teamwork2 --real team --retire teamwork     # 旧公开名已泄露，换成 teamwork2
-rotated public name for real view 'team': 'teamwork' -> 'teamwork2' (gapless — 'team' stayed governed throughout, 'teamwork' no longer resolves)
-$ grovefs mount --view teamwork -m /mnt/leak --manager 127.0.0.1:16510 --roster-key-file ~/roster.key   # 拿旧泄露名再挂
-error: view 'teamwork' does not exist on this meta-server (sqlite): no tree and no definition — views are created explicitly, so unknown names are refused instead of becoming an empty tree; create it first: `grovefs view --meta-dir /tmp/retiretvmc/home create --view teamwork` (or seed a tree with `grovefs view import`)
+$ grovefs view --meta-dir $BASE alias --name bias_teamwork2 --real team --retire bias_teamwork     # 旧公开名已泄露，换成 bias_teamwork2
+rotated public name for real view 'team': 'bias_teamwork' -> 'bias_teamwork2' (gapless — 'team' stayed governed throughout, 'bias_teamwork' no longer resolves)
+$ grovefs mount --view bias_teamwork -m /mnt/leak --manager 127.0.0.1:16510 --roster-key-file ~/roster.key   # 拿旧泄露名再挂
+error: view 'bias_teamwork' does not exist on this meta-server (sqlite): no tree and no definition — views are created explicitly, so unknown names are refused instead of becoming an empty tree; create it first: `grovefs view --meta-dir /tmp/retiretvmc/home create --view bias_teamwork` (or seed a tree with `grovefs view import`)
 error: grovefs: background mount exited (exit status: 1) before mounting
 ```
 
@@ -1066,9 +1066,9 @@ SKIP_BENCH=1 bash .build-bin/run_all.sh   # 跳过吞吐基准（纯功能回归
 | 挂载（唯一形态） | `grovefs mount --view U -m MP --manager H:P --roster-key-file F [--deployment N] [--token T] [--api-key ID:SECRET] [--ro] [--no-cache] [--threads N] [--run-as-uid N] [--layout F] [--no-readdirplus] [--stats] [--foreground\|--log-file F]`（默认转后台；坐标只从 manager 的签名 roster 解析，不给 `--manager`/`GROVEFS_MANAGER` 或 `--roster-key-file` 就 fail-closed 拒挂；手敲 `--meta-server`/`--data-servers` 已从 mount 移除） |
 | 挂载引导（只指一个地址） | `grovefs manager --state-dir D define --name N --meta M[,M2] --data A[,A2]` / `manager --state-dir D serve --listen H:P [--roster-ttl S] [--register-ttl S] [--require-registered]` / `manager status --server H:P [--deployment N] --join-key-file F`；节点 `meta-server`/`data-server --register-with H:P --join-key-file F [--advertise-addr A] [--deployment N]`；客户机 `mount --manager H:P --roster-key-file F [--deployment N]`（`--manager`/`--roster-key-file` 是 mount 唯一的坐标来源，旧 `--meta-server`/`--data-servers` 已从 mount 移除） |
 | 显示规则文件 | 每行 `hide <src>` / `only <src>` / `map <src> <dst>` / `link <src> <dst>`（`#` 注释，绝对路径） |
-| 定义派生视图 | `grovefs view --meta-dir D define --name V --base B --rules F`（存于 `D/meta/B/V.layout`，nested 默认；flat 下 `D/meta/views/V.layout`，客户端 `mount --view V` 即得形状；虚拟视图挂载只读） |
-| 定义纯别名 | `grovefs view --meta-dir D alias --name A --real R`（公开名 1:1 映射真实视图：`A` 全树可写，`R` 不可直挂） |
-| 泄露后轮换公开名 | `grovefs view --meta-dir D alias --name A2 --real R --retire A`（先写后删零窗口：`A` 失效、`R` 全程不可直挂、授权不动） |
+| 定义派生视图 | `grovefs view --meta-dir D define --name lens_V --base B --rules F`（存于 `D/meta/B/V.layout`，nested 默认；flat 下 `D/meta/views/V.layout`，客户端 `mount --view V` 即得形状；虚拟视图挂载只读） |
+| 定义纯别名 | `grovefs view --meta-dir D alias --name bias_A --real R`（公开名 1:1 映射真实视图：`A` 全树可写，`R` 不可直挂） |
+| 泄露后轮换公开名 | `grovefs view --meta-dir D alias --name bias_A2 --real R --retire bias_A`（先写后删零窗口：`A` 失效、`R` 全程不可直挂、授权不动） |
 | 创建 fork 视图 | `grovefs view --meta-dir D fork --name L --base R`（复制目录项成独立树，nested 默认落 `meta/R/L/L.db`；flat `meta/L/L.db`，字节共享；结构可写、内容 `EROFS`；`--empty` 只建根，供接枝策展） |
 | 接枝进 fork | `grovefs view --meta-dir D graft --name L [--src S] --map PLAN\|- [--dest P] [--skip-existing]`（计划一行一条 `<src>[TAB<dst>]`，整份一事务、字节共享；目录源带整棵子树，目标基名即改名） |
 | 导出/导入单视图元数据 | `grovefs view --meta-dir D export --view V --out F [--force]`（宿主无关 JSONL，不含字节）/ `grovefs view --meta-dir D import --view V --in F [--replace] [--as-fork B]`（原子替换；字节另拷 `blocks/`） |

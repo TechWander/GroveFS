@@ -916,8 +916,8 @@ impl MetaServer {
         // request can write to the old plane while its tables are copied.
         let mut store = self.store.clone();
         if let StoreKind::Pg(spec) = &store {
-            let adopted = crate::pg_store::adopt_inline_spec(&self.base, spec)
-                .map_err(io::Error::other)?;
+            let adopted =
+                crate::pg_store::adopt_inline_spec(&self.base, spec).map_err(io::Error::other)?;
             if adopted != spec.trim() {
                 println!(
                     "meta-server: --meta-store adopted into the managed registry {} (first instance named 'control')",
@@ -925,8 +925,8 @@ impl MetaServer {
                 );
             }
             store = StoreKind::Pg(adopted);
-            let handover = crate::pg_store::apply_pending_control(&self.base)
-                .map_err(io::Error::other)?;
+            let handover =
+                crate::pg_store::apply_pending_control(&self.base).map_err(io::Error::other)?;
             if let Some(h) = &handover {
                 println!(
                     "meta-server: control plane migrated to instance '{}' — {} copied, {} rows verified against grovefs_control on the source",
@@ -943,9 +943,7 @@ impl MetaServer {
         // row, so the storage page always tells the truth about where trees live.
         #[cfg(feature = "treedb")]
         if let StoreKind::Treedb(addr) = &store {
-            if crate::treedb_store::adopt_treedb_spec(&self.base, addr)
-                .map_err(io::Error::other)?
-            {
+            if crate::treedb_store::adopt_treedb_spec(&self.base, addr).map_err(io::Error::other)? {
                 println!(
                     "meta-server: treedb inventory {} seeded with the serving address (treedb is EXPERIMENTAL — control plane stays in local SQLite, no server-side move yet)",
                     crate::treedb_store::treedb_registry_path(&self.base).display()
@@ -2441,6 +2439,10 @@ fn control_dispatch(
         "def.put" => {
             let name = req_str(a, "name")?;
             let text = req_str(a, "text")?;
+            // The kind-prefix naming convention (bias_/lens_) is enforced on
+            // EVERY entrance that writes a def, this raw editor included, so
+            // the console cannot create what the CLI refuses.
+            crate::mcp::check_def_name_kind(&name, &text)?;
             rt.control.put_def(&name, &text)?;
             // A cached lens built from the OLD text must not keep serving: the
             // same eviction the local CLI relies on for hot reload.

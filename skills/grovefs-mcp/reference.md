@@ -163,11 +163,11 @@ SQLite backend (default) — effects on disk:
 
 | Tool | On-disk effect |
 |---|---|
-| `define_derived_view` | overwrites `<db>/meta/views/<name>.layout` (first line `base <base>` + rule lines) |
-| `alias_view` | writes `<db>/meta/views/<name>.layout` (`alias <real>`); with `retire`, **writes the new one before deleting the old** |
-| `fork_view` | new tree `<db>/meta/<name>/<name>.db` (plus `-wal`/`-shm`) + `<db>/meta/views/<name>.layout`, and updates the cross-view ledger `refs.db` (with `seed:false` the tree is root-only) |
+| `define_derived_view` | overwrites the lens slot — nested default `<db>/meta/<base>/lens_<name>.layout` (flat/legacy: `meta/views/lens_<name>.layout`); first line `base <base>` + rule lines. A name without the `lens_` prefix is refused |
+| `alias_view` | writes the bias slot — nested default `<db>/meta/<real>/bias_<name>.layout` (`alias <real>`); a name without the `bias_` prefix is refused; with `retire`, **writes the new one before deleting the old** |
+| `fork_view` | new tree `<db>/meta/<base>/<name>/<name>.db` (nested; plus `-wal`/`-shm`) + the def in the SAME directory `<name>.layout`, and updates the cross-view ledger `refs.db` (with `seed:false` the tree is root-only) |
 | `graft_view` | inserts rows into the DESTINATION's `<db>/meta/<name>/<name>.db` (ids/inos allocated above both existing id and ino spaces, hard links preserved), creates missing destination directories (0755), and books one ledger hold per new blob — one IMMEDIATE transaction, so a refused plan writes nothing. The destination may be a fork **or a bare base view**; only a derived lens or an alias is refused by role |
-| `remove_view` | deletes the `.layout`; if the slot was a fork, also deletes its `meta/<name>/<name>.db*` and runs `rebuild_ledger` |
+| `remove_view` | deletes the `.layout` wherever the scan finds it; if the slot was a fork, also deletes its tree directory `<name>.db*` (and the nested/grouped equivalents) and runs `rebuild_ledger` |
 | `preview_rules` / `validate_definition` / the three read-only probes | **write nothing** |
 
 Under `--meta-store postgres://…` nothing control-plane lands on disk: the
@@ -218,7 +218,9 @@ cannot, and neither bypasses a guard.
 **Four interface-only calls** (no same-named CLI subcommand; they are read-only
 probe / dry-run library functions in `grovefs::mcp`):
 `get_view`, `list_view_tree`, `preview_rules`, `validate_definition`. The
-approximate CLI equivalents: read `<db>/meta/views/<name>.layout` directly (or
+approximate CLI equivalents: read the def slot directly — nested
+`<db>/meta/<base>/lens_<name>.layout` / `bias_<name>.layout`, a fork's
+`<db>/meta/<base>/<name>/<name>.layout` (flat: `meta/views/<name>.layout`) (or
 the `grovefs_control.view_defs` row under `--meta-store`); temporarily `mount
 --layout FILE` to see a lens's shape; illegal rules fail fast
 at `view define` — whereas the interface reaches the same verdict **without

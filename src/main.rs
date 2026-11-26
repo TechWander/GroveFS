@@ -162,9 +162,9 @@ COMMON USAGE
       --roster-key-file /srv/gm/manager/roster.key --api-key ID:SECRET
 
   Server-side governance (no local rules file needed on clients):
-    grovefs view --meta-dir /meta define --name lens \
+    grovefs view --meta-dir /meta define --name lens_docs \
       --base alice --rules lens.rules
-    grovefs view --meta-dir /meta alias --name public --real alice
+    grovefs view --meta-dir /meta alias --name bias_public --real alice
 
   Audit/reclaim orphan bytes in a LOCAL store (offline; scan is the default):
     grovefs gc --meta-dir ~/grovefs          # report
@@ -1583,10 +1583,10 @@ enum ManagerAction {
 
   Publish a read-only lens over alice:
     grovefs view --meta-dir /meta define \
-      --name lens --base alice --rules lens.rules
+      --name lens_docs --base alice --rules lens.rules
 
   Give alice a writable public name (its real name stops being mountable):
-    grovefs view --meta-dir /meta alias --name public --real alice
+    grovefs view --meta-dir /meta alias --name bias_public --real alice
 
   Curate a subset into an independent tree:
     grovefs view --meta-dir /meta fork --name curated --base alice
@@ -1720,7 +1720,7 @@ enum ViewAction {
     #[command(
         about = "Create or replace a read-only derived view.",
         after_help = r#"EXAMPLES
-  grovefs view --meta-dir /meta define --name lens \
+  grovefs view --meta-dir /meta define --name lens_docs \
     --base alice --rules lens.rules"#
     )]
     Define {
@@ -1783,7 +1783,7 @@ enum ViewAction {
         about = "Remove a view definition, or a whole base tree.",
         after_help = r#"EXAMPLES
   Remove the definition only (the base schema is untouched):
-    grovefs view --meta-dir /meta rm --name lens
+    grovefs view --meta-dir /meta rm --name lens_docs
   Remove a whole base tree and its unreferenced bytes:
     grovefs view --meta-dir /meta rm --base --name alice --data-dir /meta"#
     )]
@@ -1818,7 +1818,7 @@ enum ViewAction {
     /// just remount under the new name.
     #[command(
         about = "Create or rotate a writable public alias.",
-        after_help = "EXAMPLES\n  grovefs view --meta-dir /meta alias --name public --real alice"
+        after_help = "EXAMPLES\n  grovefs view --meta-dir /meta alias --name bias_public --real alice"
     )]
     Alias {
         /// Public alias name clients mount.
