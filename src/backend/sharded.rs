@@ -319,12 +319,14 @@ impl ShardedBackend {
         let ck = self.chunk(l, 0).1;
         for i in 1..self.servers.len() {
             match self.probe(i, &ck) {
-                Probe::Present(_) => return Err(io::Error::other(format!(
+                Probe::Present(_) => {
+                    return Err(io::Error::other(format!(
                     "object {} keeps chunk #0 on data-server #{i}, but this --data-servers list \
                          orders it at #0: the servers are right and their order is not, so \
                          sizes and reads would be attributed to the wrong member",
                     l.base
-                ))),
+                )))
+                }
                 // A definite miss elsewhere is consistent with an empty object.
                 Probe::Absent => {}
                 // Nothing was confirmed, so emptiness is not established either.
@@ -1028,7 +1030,10 @@ impl UnstripedGuard {
              deployment declares fewer data-servers than the tree was written across — a roster \
              is the DECLARED set, never a subset to work around an outage",
         );
-        if !self.reported.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        if !self
+            .reported
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
             eprintln!("grovefs: refusing to read a striped object through one data-server: {msg}");
         }
         Err(io::Error::other(msg))

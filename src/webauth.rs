@@ -926,7 +926,11 @@ impl Principal {
         }
         let role = Role::parse(&role)?;
         let bases = store.bases_of(&account)?;
-        Ok(Principal { account, role, bases })
+        Ok(Principal {
+            account,
+            role,
+            bases,
+        })
     }
 
     /// The caller behind a governance connection that names NO actor: an
@@ -1225,7 +1229,10 @@ mod tests {
 
         // First start: the flag creates the owner.
         let line = bootstrap_owner(&s, "Alice", "first-owner-pw").unwrap();
-        assert!(line.contains("created the first web account 'alice'"), "{line}");
+        assert!(
+            line.contains("created the first web account 'alice'"),
+            "{line}"
+        );
         assert_eq!(s.get("alice").unwrap().unwrap().role, "admin");
         // A restart of the SAME unit re-reads the flag: ignored, not an error,
         // and it must not touch the existing password.

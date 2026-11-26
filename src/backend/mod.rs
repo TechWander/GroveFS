@@ -273,6 +273,6 @@ pub fn open_local_roots(roots: &[std::path::PathBuf]) -> io::Result<Box<dyn Stor
 }
 
 #[cfg(feature = "native")]
-pub use sharded::{ShardedBackend, STRIPE_BYTES};
-#[cfg(feature = "native")]
 pub use sharded::UnstripedGuard;
+#[cfg(feature = "native")]
+pub use sharded::{ShardedBackend, STRIPE_BYTES};

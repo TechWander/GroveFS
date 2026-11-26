@@ -33,20 +33,46 @@ export function distinct(rows: AuditRow[], key: 'method' | 'tool'): string[] {
  * How far back the audit page offers to look. The window is applied CLIENT-side
  * over the rows already loaded, because the server's `limit` is a row count and a
  * person asking "what happened today" wants the hours, not the newest 200 of an
- * idle weekend.
+ * idle weekend. `custom` carries an explicit from/to date pair (UTC days, to
+ * match the RFC 3339 stamps the rows carry).
  */
 export const WINDOWS: [string, string][] = [
   ['all', 'all time'],
   ['1h', 'last hour'],
   ['24h', 'last 24 hours'],
   ['7d', 'last 7 days'],
+  ['30d', 'last 30 days'],
+  ['180d', 'last 180 days'],
+  ['360d', 'last 360 days'],
+  ['custom', 'custom range'],
 ]
 
-const WIN_MS: Record<string, number> = { '1h': 36e5, '24h': 864e5, '7d': 7 * 864e5 }
+const DAY = 86_400_000
+const WIN_MS: Record<string, number> = {
+  '1h': 36e5,
+  '24h': DAY,
+  '7d': 7 * DAY,
+  '30d': 30 * DAY,
+  '180d': 180 * DAY,
+  '360d': 360 * DAY,
+}
 
-export function withinWindow(ts: string, w: string): boolean {
+export function withinWindow(ts: string, w: string, from?: string, to?: string): boolean {
   if (!w || w === 'all') return true
   const t0 = Date.parse(ts)
+  if (w === 'custom') {
+    if (!Number.isFinite(t0)) return false
+    // Empty bounds are open ends: a half-filled range still filters.
+    if (from) {
+      const a = Date.parse(`${from}T00:00:00Z`)
+      if (Number.isFinite(a) && t0 < a) return false
+    }
+    if (to) {
+      const b = Date.parse(`${to}T23:59:59.999Z`)
+      if (Number.isFinite(b) && t0 > b) return false
+    }
+    return true
+  }
   const span = WIN_MS[w]
   return span !== undefined && Number.isFinite(t0) && Date.now() - t0 <= span
 }

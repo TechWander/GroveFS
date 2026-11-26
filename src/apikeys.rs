@@ -367,11 +367,13 @@ pub fn duration_secs(ttl: &str) -> Result<Option<i64>, String> {
         return Ok(None);
     }
     let (digits, unit) = t.split_at(t.len() - 1);
-    let n: i64 = digits
-        .parse()
-        .map_err(|_| format!("bad ttl '{ttl}': expected a count and a unit, like 45m, 24h or 7d"))?;
+    let n: i64 = digits.parse().map_err(|_| {
+        format!("bad ttl '{ttl}': expected a count and a unit, like 45m, 24h or 7d")
+    })?;
     if n <= 0 {
-        return Err(format!("bad ttl '{ttl}': the count must be positive (or `never`)"));
+        return Err(format!(
+            "bad ttl '{ttl}': the count must be positive (or `never`)"
+        ));
     }
     let secs = match unit {
         "s" => n,
@@ -415,7 +417,8 @@ pub fn cutoff_from_age(ago: &str) -> Result<String, String> {
         ));
     };
     let when = chrono::Local::now()
-        - chrono::Duration::try_seconds(secs).ok_or_else(|| format!("retention '{ago}' overflows"))?;
+        - chrono::Duration::try_seconds(secs)
+            .ok_or_else(|| format!("retention '{ago}' overflows"))?;
     Ok(when.to_rfc3339())
 }
 
@@ -538,8 +541,7 @@ const CALLS_DDL_PG: &str = "CREATE TABLE IF NOT EXISTS grovefs_control.mcp_calls
 /// The retention sweep runs `DELETE … WHERE ts < cutoff` on a timer; without
 /// this index every pass is a full scan of the audit table. Kept beside the
 /// DDL so an existing store gets it the next time it opens.
-const CALLS_TS_INDEX_SQLITE: &str =
-    "CREATE INDEX IF NOT EXISTS mcp_calls_ts ON mcp_calls(ts)";
+const CALLS_TS_INDEX_SQLITE: &str = "CREATE INDEX IF NOT EXISTS mcp_calls_ts ON mcp_calls(ts)";
 const CALLS_TS_INDEX_PG: &str =
     "CREATE INDEX IF NOT EXISTS mcp_calls_ts ON grovefs_control.mcp_calls(ts)";
 
@@ -570,7 +572,10 @@ const STORE_KEY_FILE: &str = crate::meta::STORE_KEY_FILE;
 /// different things to fix, and an operator handed the first for the second
 /// wastes the afternoon.
 enum WrapMaterial {
-    Ready { key: [u8; crate::secretbox::KEY_BYTES], source: String },
+    Ready {
+        key: [u8; crate::secretbox::KEY_BYTES],
+        source: String,
+    },
     Absent(String),
 }
 
@@ -667,10 +672,9 @@ fn load_wrap(base: &Path, mode: WrapMode) -> WrapMaterial {
             key,
             source: format!("{} (created)", path.display()),
         },
-        Err(e) => WrapMaterial::Absent(format!(
-            "{} cannot be created or read: {e}",
-            path.display()
-        )),
+        Err(e) => {
+            WrapMaterial::Absent(format!("{} cannot be created or read: {e}", path.display()))
+        }
     }
 }
 
@@ -678,9 +682,7 @@ fn load_wrap(base: &Path, mode: WrapMode) -> WrapMaterial {
 /// just wrote. `create_new` is the lock: two meta-servers starting against the
 /// same fresh directory must not each invent a key and then disagree about every
 /// row the other wrapped.
-fn write_store_key(
-    path: &Path,
-) -> Result<[u8; crate::secretbox::KEY_BYTES], std::io::Error> {
+fn write_store_key(path: &Path) -> Result<[u8; crate::secretbox::KEY_BYTES], std::io::Error> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     if let Some(dir) = path.parent() {
@@ -1546,11 +1548,9 @@ impl ApiKeyStore {
                 .lock()
                 .execute("DELETE FROM api_keys WHERE id = ?1", params![id])
                 .map_err(|e| e.to_string())?,
-            Backend::Pg(pool) => pool
-                .execute(
-                    "DELETE FROM grovefs_control.api_keys WHERE id = $1",
-                    &[&id],
-                )? as usize,
+            Backend::Pg(pool) => {
+                pool.execute("DELETE FROM grovefs_control.api_keys WHERE id = $1", &[&id])? as usize
+            }
         };
         Ok(n > 0)
     }
@@ -2157,7 +2157,10 @@ mod tests {
             bytes.extend_from_slice(&wal);
         }
         let hay = String::from_utf8_lossy(&bytes);
-        assert!(!hay.contains(secret), "the plaintext secret reached the file");
+        assert!(
+            !hay.contains(secret),
+            "the plaintext secret reached the file"
+        );
         assert!(!hay.contains(&key), "nor the assembled key");
         assert!(
             hay.contains(&sha256_hex(secret)),
@@ -2294,7 +2297,10 @@ mod tests {
             matches!(s2.reveal(&id).unwrap(), StoredSecret::NeverStored),
             "no copy is a different answer from an unopenable one"
         );
-        assert!(!s2.list().unwrap()[0].secret_available, "and `list` says so");
+        assert!(
+            !s2.list().unwrap()[0].secret_available,
+            "and `list` says so"
+        );
     }
 
     /// A key with a deadline is refused AFTER it and the refusal says so —
@@ -2315,7 +2321,10 @@ mod tests {
                 Some("admin"),
             )
             .unwrap();
-        assert!(s.authenticate(&key).is_ok(), "a FUTURE deadline changes nothing");
+        assert!(
+            s.authenticate(&key).is_ok(),
+            "a FUTURE deadline changes nothing"
+        );
         let listed = s.list().unwrap();
         assert!(!listed[0].expired);
         assert!(listed[0].expires_at.is_some());
@@ -2409,7 +2418,10 @@ mod tests {
             );
         }
         for dur in ["45m", "24h", "7d", "365d", "30s"] {
-            assert!(expires_from_ttl(dur).unwrap().is_some(), "'{dur}' is a deadline");
+            assert!(
+                expires_from_ttl(dur).unwrap().is_some(),
+                "'{dur}' is a deadline"
+            );
         }
         for bad in ["7", "7x", "1w", "-3d", "0d", "d", "h", "1.5d", "some"] {
             assert!(
@@ -2430,18 +2442,14 @@ mod tests {
         let (id, key) = s
             .create_bound("keep", Scope::Mcp, Some("team1"), true, Some("alice"))
             .unwrap();
-        let row = || {
-            s.list()
-                .unwrap()
-                .into_iter()
-                .find(|k| k.id == id)
-                .unwrap()
-        };
+        let row = || s.list().unwrap().into_iter().find(|k| k.id == id).unwrap();
         assert!(
             s.update_fields(&id, None, None).is_err(),
             "an update that changes nothing should say so"
         );
-        assert!(s.update_fields(&id, Some("hand over on the 3rd"), None).unwrap());
+        assert!(s
+            .update_fields(&id, Some("hand over on the 3rd"), None)
+            .unwrap());
         assert_eq!(row().note.as_deref(), Some("hand over on the 3rd"));
         assert_eq!(row().scope, "mcp");
         assert_eq!(row().view.as_deref(), Some("team1"));
@@ -2463,7 +2471,10 @@ mod tests {
         // must not have written half a row.
         let long = "x".repeat(NOTE_MAX + 1);
         assert!(s.update_fields(&id, Some(&long), None).is_err());
-        assert!(row().expires_at.is_some(), "the earlier deadline survived a refused note");
+        assert!(
+            row().expires_at.is_some(),
+            "the earlier deadline survived a refused note"
+        );
         // Revoke is final.
         s.revoke(&id).unwrap();
         assert!(!s.update_fields(&id, Some("x"), None).unwrap());
@@ -2489,7 +2500,10 @@ mod tests {
 
         assert!(s.delete(&id).unwrap(), "the row was there");
         assert!(!s.delete(&id).unwrap(), "a second delete matches nothing");
-        assert!(s.authenticate(&key).is_err(), "a deleted secret cannot authenticate");
+        assert!(
+            s.authenticate(&key).is_err(),
+            "a deleted secret cannot authenticate"
+        );
         let kept = s
             .recent_calls(10)
             .unwrap()

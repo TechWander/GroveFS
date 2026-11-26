@@ -217,6 +217,17 @@ pub fn valid_view_name(name: &str) -> bool {
         && !name.chars().any(char::is_whitespace)
 }
 
+/// The user-facing explanation for a rejected view name. One place, so every
+/// verb (`create`, `fork`, `define`, `alias`, `export`, `import`) states the
+/// same rule instead of a bare "invalid view name".
+pub fn view_name_error(name: &str) -> String {
+    let shown = if name.is_empty() { "(empty)" } else { name };
+    format!(
+        "invalid view name '{shown}': use one path element (no '/', '\\' or \
+         whitespace) that does not start with '.' and is not reserved, e.g. photos"
+    )
+}
+
 impl LayoutRules {
     /// Parse a rules file body. Fails on an unknown verb or a destination used
     /// by two rules (display paths must be unambiguous).
@@ -359,7 +370,7 @@ impl LayoutRules {
                     ));
                 }
                 if !valid_view_name(v) {
-                    return Err(format!("line {}: invalid view name '{v}'", ln + 1));
+                    return Err(format!("line {}: {}", ln + 1, view_name_error(v)));
                 }
                 if alias.replace(v.to_string()).is_some() {
                     return Err(format!(
@@ -380,7 +391,7 @@ impl LayoutRules {
                     ));
                 }
                 if !valid_view_name(v) {
-                    return Err(format!("line {}: invalid view name '{v}'", ln + 1));
+                    return Err(format!("line {}: {}", ln + 1, view_name_error(v)));
                 }
                 if fork.replace(v.to_string()).is_some() {
                     return Err(format!(

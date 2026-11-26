@@ -281,9 +281,7 @@ pub fn redact_uri(uri: &str) -> String {
     // The authority ends at the first `/`, `?` or (for `?opts` without a path)
     // nothing; a `@` after that boundary is part of a parameter value, not a
     // credential separator.
-    let auth_end = rest
-        .find(['/', '?'])
-        .unwrap_or(rest.len());
+    let auth_end = rest.find(['/', '?']).unwrap_or(rest.len());
     let (authority, tail) = rest.split_at(auth_end);
     let Some(at) = authority.rfind('@') else {
         return uri.to_string();
@@ -360,8 +358,7 @@ pub fn resolve_view_home(spec: &str, view: &str) -> Result<(String, String), Str
             // comma splitter, which would hand back the spec itself as the
             // connection URI. For an inline comma list the two agree exactly
             // (same order, same URIs), so legacy mapping never moves.
-            let i =
-                &book.instances[(view_hash(view) % book.instances.len() as u64) as usize];
+            let i = &book.instances[(view_hash(view) % book.instances.len() as u64) as usize];
             Ok((i.name.clone(), i.uri.clone()))
         }
     }
@@ -434,12 +431,7 @@ fn lookup_placement(book: &PgBook, view: &str) -> Result<(Option<String>, bool),
 /// placement; the default `DO NOTHING` keeps an old row so re-creating a
 /// view never silently moves its home away from a schema that already lives
 /// there (an explicit `--pg-instance` is the documented way to move one).
-fn write_placement(
-    book: &PgBook,
-    view: &str,
-    instance: &str,
-    upsert: bool,
-) -> Result<(), String> {
+fn write_placement(book: &PgBook, view: &str, instance: &str, upsert: bool) -> Result<(), String> {
     let ctl = book.control();
     let mut c = Client::connect(&ctl.uri, NoTls)
         .map_err(|e| format!("postgres connect {}: {e}", ctl.name))?;
@@ -515,15 +507,110 @@ pub fn place_new_view(
     Ok((pick.name.clone(), pick.uri.clone()))
 }
 
+/// One instance as the console reports it. `uri` is the FULL connection
+/// string, credentials included: `store.info` is Super-only and an operator
+/// checking a registry needs the real value, not a mask. Logs and error
+/// messages keep going through [`redact_uri`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct InstanceSummary {
+    pub name: String,
+    pub uri: String,
+    pub control: bool,
+    /// `None` for a single-instance spec (nothing is placed) or when the
+    /// control plane could not be read.
+    pub placed_views: Option<i64>,
+}
+
+/// Read-only snapshot of the instance book plus the placement table.
+#[derive(Clone, Debug)]
+pub struct InstanceReport {
+    pub instances: Vec<InstanceSummary>,
+    /// view -> instance, exactly the rows `view create` wrote.
+    pub placement: HashMap<String, String>,
+    /// Why placement is empty, when reading it failed. Never swallowed: the
+    /// console shows this sentence instead of pretending nothing is placed.
+    pub error: Option<String>,
+}
+
+/// Report the store's instances and their placement map for `store.info`.
+///
+/// Single-instance specs pay ZERO queries: routing is the identity and there
+/// is no placement to read. Multi-instance specs open one connection to the
+/// control instance; a missing table means "nothing placed yet", while an
+/// unreachable control plane is returned as `error` with the instance list
+/// intact, so the console can still render the page and say what is wrong.
+///
+/// This never writes, never creates the placement table and never mutates a
+/// placement row — unlike [`resolve_view_home`], which may bootstrap one.
+pub fn instance_report(spec: &str) -> Result<InstanceReport, String> {
+    let book = expand_store_spec(spec)?;
+    let mut instances: Vec<InstanceSummary> = book
+        .instances
+        .iter()
+        .enumerate()
+        .map(|(i, inst)| InstanceSummary {
+            name: inst.name.clone(),
+            uri: inst.uri.clone(),
+            control: i == 0,
+            placed_views: None,
+        })
+        .collect();
+    if book.instances.len() == 1 {
+        return Ok(InstanceReport {
+            instances,
+            placement: HashMap::new(),
+            error: None,
+        });
+    }
+    let ctl = book.control();
+    let read = (|| -> Result<Vec<(String, String)>, String> {
+        let mut c = Client::connect(&ctl.uri, NoTls)
+            .map_err(|e| format!("cannot reach the control instance {} ({e})", ctl.name))?;
+        match c.query(
+            &format!("SELECT view, instance FROM {PG_PLACEMENT_TABLE}"),
+            &[],
+        ) {
+            Ok(rows) => Ok(rows
+                .iter()
+                .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
+                .collect()),
+            // No table yet = nothing placed anywhere.
+            Err(e) if is_undefined_table(&e) => Ok(Vec::new()),
+            Err(e) => Err(format!("postgres read {PG_PLACEMENT_TABLE}: {e}")),
+        }
+    })();
+    match read {
+        Ok(rows) => {
+            let mut placement = HashMap::with_capacity(rows.len());
+            let mut counts: HashMap<String, i64> = HashMap::new();
+            for (view, instance) in rows {
+                *counts.entry(instance.clone()).or_insert(0) += 1;
+                placement.insert(view, instance);
+            }
+            for inst in &mut instances {
+                inst.placed_views = Some(counts.get(&inst.name).copied().unwrap_or(0));
+            }
+            Ok(InstanceReport {
+                instances,
+                placement,
+                error: None,
+            })
+        }
+        Err(e) => Ok(InstanceReport {
+            instances,
+            placement: HashMap::new(),
+            error: Some(e),
+        }),
+    }
+}
+
 /// Placed-view count per instance name, for least-loaded placement.
 fn placement_counts(book: &PgBook) -> Result<HashMap<String, i64>, String> {
     let ctl = book.control();
     let mut c = Client::connect(&ctl.uri, NoTls)
         .map_err(|e| format!("postgres connect {}: {e}", ctl.name))?;
     match c.query(
-        &format!(
-            "SELECT instance, COUNT(*) FROM {PG_PLACEMENT_TABLE} GROUP BY instance"
-        ),
+        &format!("SELECT instance, COUNT(*) FROM {PG_PLACEMENT_TABLE} GROUP BY instance"),
         &[],
     ) {
         Ok(rows) => Ok(rows
@@ -1281,10 +1368,7 @@ pub fn set_pool_profile(
     idle_secs: Option<u64>,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
-    let apply = |slot: &std::sync::atomic::AtomicUsize,
-                 v: Option<usize>,
-                 env: &str,
-                 def: usize| {
+    let apply = |slot: &std::sync::atomic::AtomicUsize, v: Option<usize>, env: &str, def: usize| {
         match v {
             Some(v) => slot.store(v.min(POOL_LANE_CAP), Relaxed),
             // Force env resolution now so no later engine open can observe the
@@ -1294,9 +1378,19 @@ pub fn set_pool_profile(
             }
         }
     };
-    apply(&P_WARM_W, write_warm, "GROVEFS_PG_WRITE_POOL", PG_WRITE_POOL_SIZE);
+    apply(
+        &P_WARM_W,
+        write_warm,
+        "GROVEFS_PG_WRITE_POOL",
+        PG_WRITE_POOL_SIZE,
+    );
     apply(&P_MAX_W, write_max, "GROVEFS_PG_WRITE_POOL_MAX", 0);
-    apply(&P_WARM_R, read_warm, "GROVEFS_PG_READ_POOL", PG_READ_POOL_SIZE);
+    apply(
+        &P_WARM_R,
+        read_warm,
+        "GROVEFS_PG_READ_POOL",
+        PG_READ_POOL_SIZE,
+    );
     apply(&P_MAX_R, read_max, "GROVEFS_PG_READ_POOL_MAX", 0);
     match idle_secs {
         Some(s) => P_IDLE_SECS.store(s, Relaxed),
@@ -1452,7 +1546,10 @@ pub fn view_pool_set(
                 "DELETE FROM {}.ctrl WHERE k = ANY($1)",
                 quoted_schema(&schema)
             ),
-            &[&POOL_CTRL_KEYS.iter().map(|k| k.to_string()).collect::<Vec<_>>()],
+            &[&POOL_CTRL_KEYS
+                .iter()
+                .map(|k| k.to_string())
+                .collect::<Vec<_>>()],
         )
         .map_err(|e| format!("postgres pool inherit: {e}"))?;
         return Ok(PgPoolSettings::default());
@@ -1486,7 +1583,9 @@ pub fn view_pool_set(
     ] {
         let Some(v) = v else { continue };
         c.execute(
-            &format!("INSERT INTO {ctrl} (k,v) VALUES ($1,$2) ON CONFLICT(k) DO UPDATE SET v=EXCLUDED.v"),
+            &format!(
+                "INSERT INTO {ctrl} (k,v) VALUES ($1,$2) ON CONFLICT(k) DO UPDATE SET v=EXCLUDED.v"
+            ),
             &[&k.to_string(), &v],
         )
         .map_err(|e| format!("postgres pool set {k}: {e}"))?;
@@ -3840,11 +3939,13 @@ pub fn reference_picture(spec: &str) -> Result<PgPicture, String> {
         // A database that never opened a view has no ledger table yet: that
         // is "nothing booked", not an error (the same rule the local scanner
         // applies to a missing `refs.db`).
-        match c.query(&format!("SELECT data_ref, holders FROM {PG_REFS_TABLE}"), &[]) {
+        match c.query(
+            &format!("SELECT data_ref, holders FROM {PG_REFS_TABLE}"),
+            &[],
+        ) {
             Ok(rows) => {
                 for r in rows {
-                    *booked.entry(r.get::<_, String>(0)).or_insert(0) +=
-                        r.get::<_, i64>(1);
+                    *booked.entry(r.get::<_, String>(0)).or_insert(0) += r.get::<_, i64>(1);
                 }
             }
             Err(e) if is_undefined_table(&e) => {}
@@ -4400,20 +4501,23 @@ fn import_into(
             .get(0);
         if dangling != 0 {
             return Err(format!(
-                "import rejected: {dangling} node(s) point at a missing or non-directory parent"
+                "import rejected: {} point at a missing or non-directory parent",
+                crate::cli_style::plural(dangling as usize, "node", "nodes")
             ));
         }
         if let Some(cn) = claimed_nodes {
             if cn != nodes {
                 return Err(format!(
-                    "import rejected: header declares {cn} node(s), file carries {nodes}"
+                    "import rejected: header declares {}, file carries {nodes}",
+                    crate::cli_style::plural(cn as usize, "node", "nodes")
                 ));
             }
         }
         if let Some(cb) = claimed_blobs {
             if cb != blobs.len() as i64 {
                 return Err(format!(
-                    "import rejected: header declares {cb} blob reference(s), file carries {}",
+                    "import rejected: header declares {}, file carries {}",
+                    crate::cli_style::plural(cb as usize, "blob reference", "blob references"),
                     blobs.len()
                 ));
             }
@@ -4517,7 +4621,12 @@ pub struct PgMoveReport {
 /// with the original home) and a retry after a failed cutover both idempotent.
 /// The CLI must refuse locally-mounted views first; mounts on other machines
 /// are the operator's job to quiesce (a stale copy is the failure mode).
-pub fn move_view(spec: &str, view: &str, target: &str, keep_source: bool) -> Result<PgMoveReport, String> {
+pub fn move_view(
+    spec: &str,
+    view: &str,
+    target: &str,
+    keep_source: bool,
+) -> Result<PgMoveReport, String> {
     let book = expand_store_spec(spec)?;
     if book.instances.len() <= 1 {
         return Err("view move needs a multi-instance store (a `file:` registry, or a comma list naming at least two databases) — a single-instance view already lives on its only home".into());
@@ -4545,7 +4654,8 @@ pub fn move_view(spec: &str, view: &str, target: &str, keep_source: bool) -> Res
     //    guard runs before this; nothing here re-checks it.
     let dump = std::env::temp_dir().join(format!(
         ".grovefs-move-{}-{}.jsonl",
-        schema, std::process::id()
+        schema,
+        std::process::id()
     ));
     let stats = export_view(spec, view, &dump, true, None)?;
     // 2) The copy on the target. An existing schema there is a rollback point
@@ -4560,7 +4670,8 @@ pub fn move_view(spec: &str, view: &str, target: &str, keep_source: bool) -> Res
                 .get(0);
             if n != stats.nodes {
                 return Err(format!(
-                    "instance '{target}' already holds schema {schema} with {n} node(s) while the source has {} — refusing to switch to a mismatched copy (drop one side first)",
+                    "instance '{target}' already holds schema {schema} with {} while the source has {} — refusing to switch to a mismatched copy (drop one side first)",
+                    crate::cli_style::plural(n as usize, "node", "nodes"),
                     stats.nodes
                 ));
             }
@@ -4981,7 +5092,10 @@ mod shard_tests {
             control_store("postgres://a@h/db1,postgres://a@h/db2").unwrap(),
             "postgres://a@h/db1"
         );
-        assert_eq!(control_store("postgres://a@h/db1").unwrap(), "postgres://a@h/db1");
+        assert_eq!(
+            control_store("postgres://a@h/db1").unwrap(),
+            "postgres://a@h/db1"
+        );
     }
 
     /// A fork/graft pair on a SINGLE-instance store never refuses and yields
@@ -5002,8 +5116,7 @@ mod shard_tests {
     #[test]
     fn route_multi_refuses_an_undecided_route() {
         // Port 1 on loopback: no server listens there, so connect fails fast.
-        let spec =
-            "postgres://grove:pw@127.0.0.1:1/db1,postgres://grove:pw@127.0.0.1:1/db2";
+        let spec = "postgres://grove:pw@127.0.0.1:1/db1,postgres://grove:pw@127.0.0.1:1/db2";
         let err = route_multi(spec, &["x", "x"]).unwrap_err();
         assert!(err.contains("cannot reach the control instance"), "{err}");
     }
@@ -5037,8 +5150,7 @@ mod shard_tests {
     /// downgrade to SQLite or to the first inline URI.
     #[test]
     fn expand_store_spec_refuses_an_unreadable_registry() {
-        let err = expand_store_spec("file:/nonexistent/grovefs-registry-nosuch.conf")
-            .unwrap_err();
+        let err = expand_store_spec("file:/nonexistent/grovefs-registry-nosuch.conf").unwrap_err();
         assert!(err.contains("cannot read"), "{err}");
     }
 
@@ -5049,7 +5161,11 @@ mod shard_tests {
     fn expand_store_spec_reports_bad_registry_lines() {
         let dir = std::env::temp_dir();
         let probe = |tag: &str, text: &str| {
-            let path = dir.join(format!("grovefs_reg_bad_{}_{}.conf", std::process::id(), tag));
+            let path = dir.join(format!(
+                "grovefs_reg_bad_{}_{}.conf",
+                std::process::id(),
+                tag
+            ));
             std::fs::write(&path, text).unwrap();
             let r = expand_store_spec(&format!("file:{}", path.display()));
             let _ = std::fs::remove_file(&path);
@@ -5075,9 +5191,7 @@ mod shard_tests {
         assert_eq!(book.names(), "pg1, pg2");
         assert_eq!(book.control().uri, "postgres://a@h/db1");
         assert_eq!(
-            expand_store_spec("postgres://a@h/db")
-                .unwrap()
-                .names(),
+            expand_store_spec("postgres://a@h/db").unwrap().names(),
             "pg1"
         );
     }
@@ -5232,8 +5346,8 @@ mod shard_tests {
 #[cfg(test)]
 mod pool_tests {
     use super::{
-        parse_lane_spec, redact_uri, quoted_schema, reap_lane, LaneBounds, POOL_LANE_CAP,
-        PG_POOL_IDLE_SECS, PG_READ_POOL_SIZE, PG_WRITE_POOL_SIZE,
+        instance_report, parse_lane_spec, quoted_schema, reap_lane, redact_uri, LaneBounds,
+        PG_POOL_IDLE_SECS, PG_READ_POOL_SIZE, PG_WRITE_POOL_SIZE, POOL_LANE_CAP,
     };
 
     /// The defaults every measurement in USAGE/docs was taken against must not
@@ -5365,5 +5479,60 @@ mod pool_tests {
             redact_uri("postgres://h/db?options=-c%20a@b"),
             "postgres://h/db?options=-c%20a@b"
         );
+    }
+
+    /// The console's instance snapshot: names, control flag and — the point of
+    /// the `store.info` field — the FULL URI, password included. Redaction is
+    /// for logs and refusals, not for the Super-only deployment page.
+    #[test]
+    fn instance_report_keeps_credentials_and_orders_the_book() {
+        let dir =
+            std::env::temp_dir().join(format!("grovefs-instance-report-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("instances.conf");
+        std::fs::write(
+            &path,
+            "# the first entry carries the control plane\n\
+             main  = postgres://grove:secret-main@127.0.0.1:5432/grovefs\n\
+             team1 = postgres://grove:secret-team@127.0.0.1:5432/team1\n",
+        )
+        .unwrap();
+        let spec = format!("file:{}", path.display());
+        let report = instance_report(&spec).unwrap();
+        assert_eq!(report.instances.len(), 2);
+        assert_eq!(report.instances[0].name, "main");
+        assert!(report.instances[0].control);
+        assert_eq!(
+            report.instances[0].uri,
+            "postgres://grove:secret-main@127.0.0.1:5432/grovefs"
+        );
+        assert_eq!(report.instances[1].name, "team1");
+        assert!(!report.instances[1].control);
+        // No control plane is reachable in this unit test, so placement is
+        // reported as unreadable rather than as an empty (healthy) map.
+        assert!(report.placement.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A single URI is the identity routing case: one instance, no placement
+    /// query, no `placed_views` to report.
+    #[test]
+    fn instance_report_single_spec_skips_placement() {
+        let report = instance_report("postgres://u:p@h/db").expect("a single URI is a valid book");
+        assert_eq!(report.instances.len(), 1);
+        assert!(report.instances[0].control);
+        assert_eq!(report.instances[0].uri, "postgres://u:p@h/db");
+        assert_eq!(report.instances[0].placed_views, None);
+        assert!(report.placement.is_empty());
+        assert!(report.error.is_none());
+    }
+
+    /// A registry the process cannot read is an error, not a silent downgrade
+    /// to one instance — the message has to name the file.
+    #[test]
+    fn instance_report_missing_registry_names_the_path() {
+        let path = std::env::temp_dir().join("grovefs-no-such-instances.conf");
+        let err = instance_report(&format!("file:{}", path.display())).unwrap_err();
+        assert!(err.contains("grovefs-no-such-instances.conf"), "{err}");
     }
 }

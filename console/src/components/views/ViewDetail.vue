@@ -44,7 +44,7 @@ const catalog = useCatalogStore()
 const session = useSessionStore()
 const ui = useUiStore()
 const { api, soft } = useOps()
-const { openView, openKeysOfView, openAuditOfView } = useNav()
+const { openView, openKeysOfView, openAccountsOfView, openAuditOfView } = useNav()
 
 const stats = ref<ViewStats | null>(null)
 const pending = ref(false)
@@ -62,12 +62,23 @@ const treeText = computed(() => {
   return s.tree ? t('physical tree') : s.forkTree ? t('fork tree') : t('none of its own')
 })
 
+/** The instance that hosts this view, and its raw connection string. `stats`
+    answers the name; `catalog.storage` carries the URI and the control flag. */
+const home = computed(() => {
+  const s = stats.value
+  const st = catalog.storage
+  if (!s || !st) return null
+  const name = s.instance ?? catalog.instanceOf(s.name)
+  return { name, inst: st.instances.find((i) => i.name === name) ?? null }
+})
+
 async function load(): Promise<void> {
   const name = catalog.sel
   if (!name) {
     stats.value = null
     return
   }
+  void catalog.loadStorage()
   pending.value = true
   error.value = ''
   try {
@@ -226,6 +237,27 @@ function doExport(): void {
         </div>
       </div>
 
+      <div v-if="home" class="home-inst">
+        <h3 class="det-h">{{ t('Home instance') }}</h3>
+        <KvList>
+          <KvRow label="instance" :value="home.name ?? t('hash routed')" mono />
+          <KvRow
+            label="control plane"
+            :value="home.inst ? (home.inst.control ? t('yes') : t('no')) : null"
+          />
+          <KvRow label="connection">
+            <span class="uri">{{ home.inst?.uri ?? '—' }}</span>
+          </KvRow>
+        </KvList>
+        <p class="muted">
+          {{
+            t(
+              'The schema holding this view’s tree lives on this instance. The connection string is shown in full — it contains the database password.',
+            )
+          }}
+        </p>
+      </div>
+
       <template v-if="stats.definition">
         <h3 class="det-h">{{ t('Definition') }}</h3>
         <pre>{{ stats.definition }}</pre>
@@ -235,6 +267,16 @@ function doExport(): void {
         <button type="button" @click="doExport">{{ t('Export dump') }}</button>
         <button type="button" @click="openAuditOfView(stats.name)">
           {{ t('this view’s calls') }}
+        </button>
+        <button
+          v-if="session.can('apikey.create')"
+          type="button"
+          @click="openKeysOfView(stats.name)"
+        >
+          {{ t('Keys of this view…') }}
+        </button>
+        <button type="button" @click="openAccountsOfView(stats.name)">
+          {{ t('Accounts…') }}
         </button>
         <button v-if="session.can('fork.create')" type="button" @click="forkOpen = true">
           {{ t('Fork…') }}

@@ -180,6 +180,76 @@ impl StoreKind {
     }
 }
 
+/// The `storage` block of `store.info`: what the backend is, which instances
+/// exist, and where each view is placed.
+///
+/// Only a PostgreSQL book can have more than one entry. SQLite is one embedded
+/// store and treedb is one tree server, so both report a SINGLE logical
+/// instance — inventing a grid of one-database "instances" would misdescribe
+/// the deployment an operator is looking at.
+///
+/// URIs are returned VERBATIM (credentials included): `store.info` is
+/// Super-only, and this page exists so an operator can verify the real
+/// connection string. `redact_uri` still guards logs, refusals and the CLI.
+fn storage_snapshot(store: &StoreKind) -> serde_json::Value {
+    use serde_json::json;
+    match store {
+        StoreKind::Pg(spec) => match crate::pg_store::instance_report(spec) {
+            Ok(report) => json!({
+                "backend": "postgres",
+                "instances": report
+                    .instances
+                    .iter()
+                    .map(|i| json!({
+                        "name": i.name,
+                        "control": i.control,
+                        "uri": i.uri,
+                        "placedViews": i.placed_views,
+                    }))
+                    .collect::<Vec<_>>(),
+                "placement": report.placement,
+                "instanceError": report.error,
+            }),
+            // An unreadable registry still names the deployment: keep one row
+            // from the raw spec so the page renders and the error is visible.
+            Err(e) => json!({
+                "backend": "postgres",
+                "instances": [{
+                    "name": "postgres",
+                    "control": true,
+                    "uri": spec,
+                    "placedViews": null,
+                }],
+                "placement": {},
+                "instanceError": e,
+            }),
+        },
+        StoreKind::Sqlite => json!({
+            "backend": "sqlite",
+            "instances": [{
+                "name": "local",
+                "control": true,
+                "uri": null,
+                "placedViews": null,
+            }],
+            "placement": {},
+            "instanceError": null,
+        }),
+        #[cfg(feature = "treedb")]
+        StoreKind::Treedb(addr) => json!({
+            "backend": "treedb",
+            "instances": [{
+                "name": "treedb",
+                "control": true,
+                "uri": format!("treedb://{addr}"),
+                "placedViews": null,
+            }],
+            "placement": {},
+            "instanceError": null,
+        }),
+    }
+}
+
 /// Everything a connection thread needs to serve a node. Wrapped in `Arc` so the
 /// accept loop hands one to each spawned thread and the HA background threads
 /// share the same cache / role / peer view.
@@ -285,8 +355,10 @@ struct MetaRuntime {
     /// behavior every existing test relies on).
     engine_idle_ms: u64,
     /// `--audit-retention DUR`, as spelled by the operator; `None` = the audit
-    /// table is append-only (the behavior before the flag existed).
-    audit_retention: Option<String>,
+    /// table is append-only (the behavior before the flag existed). A Mutex
+    /// because `audit.retention.set` changes it at RUNTIME — the reaper
+    /// re-reads it every pass, so a new window needs no restart.
+    audit_retention: Mutex<Option<String>>,
     /// The account-key store that gates the CONTROL port, when
     /// `--control-listen` is set. Deliberately separate from [`Self::keys`]: the
     /// mount gate (`--require-api-key`) and the governance gate are two
@@ -717,7 +789,9 @@ impl MetaServer {
                 match crate::treedb_store::parse_addr(&u) {
                     Ok(addr) => self.store = StoreKind::Treedb(addr),
                     Err(e) => {
-                        self.store_unavailable = Some(format!("`{u}` is not a valid --meta-store treedb address: {e}"));
+                        self.store_unavailable = Some(format!(
+                            "`{u}` is not a valid --meta-store treedb address: {e}"
+                        ));
                         self.store = StoreKind::Sqlite;
                     }
                 }
@@ -871,8 +945,8 @@ impl MetaServer {
             })?;
             if book.instances.len() > 1 {
                 println!(
-                    "meta-server: {} PG instance(s) [{}] — control plane on '{}', view homes recorded in grovefs_control.view_placement (`view create` balances; `--pg-instance` pins)",
-                    book.instances.len(),
+                    "meta-server: {} [{}] — control plane on '{}', view homes recorded in grovefs_control.view_placement (`view create` balances; `--pg-instance` pins)",
+                    crate::cli_style::plural(book.instances.len(), "PG instance", "PG instances"),
                     book.names(),
                     book.control().name
                 );
@@ -899,7 +973,7 @@ impl MetaServer {
         // SQLite store from the local `meta/views` dir — one system of record per
         // backend, never a local file the PG deployment would ignore.
         let control = crate::mcp::control_store_for(&self.base, self.store.control_uri())
-        .map_err(io::Error::other)?;
+            .map_err(io::Error::other)?;
         let rt = Arc::new(MetaRuntime {
             base: self.base.clone(),
             token: self.token.clone(),
@@ -920,7 +994,7 @@ impl MetaServer {
             bases: Arc::new(Mutex::new(HashMap::new())),
             defs: Arc::new(Mutex::new(HashMap::new())),
             engine_idle_ms: self.engine_idle_ms,
-            audit_retention: self.audit_retention.clone(),
+            audit_retention: Mutex::new(self.audit_retention.clone()),
             ctl_keys,
             web_auth,
             xfer_owner: Mutex::new(HashMap::new()),
@@ -974,34 +1048,50 @@ impl MetaServer {
             let crt = rt.clone();
             thread::spawn(move || gov_accept(cl, crt));
             // Audit retention. The console deployment has a default window
-            // (main.rs hands us `7d` when `--control-listen` is on), because an
+            // (main.rs hands us `90d` when `--control-listen` is on), because an
             // append-only table that only ever grows is not a usable audit
-            // trail. The pass runs ONCE AT START so a restart trims a backlog
-            // immediately, then every hour (bounded 5min..1h) so the table
-            // never holds much more than the window. The hourly cadence is
-            // indexed (`mcp_calls_ts`), so the DELETE is a range scan rather
-            // than a full-table sweep.
-            if let Some(window) = rt.audit_retention.clone() {
+            // trail. The pass runs ONCE AT START (when a window is set) so a
+            // restart trims a backlog immediately, then wakes on a fixed tick
+            // and RE-READS the window every time — `audit.retention.set` from
+            // the console takes effect on the next tick without a restart, and
+            // `never` disarms the sweep live. The DELETE is indexed
+            // (`mcp_calls_ts`), so each pass is a range scan, not a sweep.
+            {
                 let ar = rt.clone();
-                let nap = crate::apikeys::duration_secs(&window)
-                    .ok()
-                    .flatten()
-                    .map(|s| (s / 24).clamp(300, 3_600))
-                    .unwrap_or(3_600);
-                let every = if nap >= 3600 {
-                    format!("~{}h", nap / 3600)
-                } else {
-                    format!("{}min", nap / 60)
-                };
-                println!(
-                    "meta-server: audit rows older than --audit-retention {window} are swept at start and every {every} (`grovefs apikey purge --before {window}` runs the same cut on demand)",
-                );
+                let had_window = ar.audit_retention.lock().is_some();
+                if had_window {
+                    let w = ar.audit_retention.lock().clone().unwrap_or_default();
+                    println!(
+                        "meta-server: audit rows older than --audit-retention {w} are swept at start; the window is live-editable (`audit.retention.set` / the console's Audit page), and `grovefs apikey purge --before {w}` runs the same cut on demand",
+                    );
+                }
                 thread::spawn(move || {
-                    // Trim a backlog before the first nap: an operator who
-                    // restarts with a shorter window expects it applied now.
-                    reap_audit(&ar, &window);
+                    let mut window_started = Instant::now();
+                    if had_window {
+                        // Trim a backlog before the first nap: an operator who
+                        // restarts with a shorter window expects it applied now.
+                        let w = ar.audit_retention.lock().clone().unwrap_or_default();
+                        reap_audit(&ar, &w);
+                    }
                     loop {
-                        thread::sleep(std::time::Duration::from_secs(nap as u64));
+                        thread::sleep(std::time::Duration::from_secs(60));
+                        let window = match ar.audit_retention.lock().clone() {
+                            Some(w) => w,
+                            None => continue,
+                        };
+                        // Tick floor 5 min: a `10m` window must not delete on
+                        // every wake; a long window keeps the historical ~/24
+                        // cadence (never more often than needed, never less
+                        // often than hourly at the default).
+                        let every = crate::apikeys::duration_secs(&window)
+                            .ok()
+                            .flatten()
+                            .map(|s| (s / 24).clamp(300, 3_600) as u64)
+                            .unwrap_or(3_600);
+                        if window_started.elapsed() < std::time::Duration::from_secs(every) {
+                            continue;
+                        }
+                        window_started = Instant::now();
                         reap_audit(&ar, &window);
                     }
                 });
@@ -1019,7 +1109,7 @@ impl MetaServer {
             let malformed: Vec<&String> = addrs.iter().filter(|a| !a.contains(':')).collect();
             if !malformed.is_empty() {
                 eprintln!(
-                    "meta HA: WARNING --witness entry(ies) {malformed:?} are not host:port; they will be probed as unreachable arbiters (fail-safe), which is almost certainly a misconfiguration rather than a partition"
+                    "meta HA: WARNING --witness entries {malformed:?} are not host:port; they will be probed as unreachable arbiters (fail-safe), which is almost certainly a misconfiguration rather than a partition"
                 );
             }
             let n = addrs.len();
@@ -1140,7 +1230,7 @@ fn serve_on_meta_full(
         // Plain LAN-trusted test server: keep engines resident (no sweeper),
         // exactly the pre-eviction behavior.
         engine_idle_ms: 0,
-        audit_retention: None,
+        audit_retention: Mutex::new(None),
         ctl_keys: None,
         web_auth: None,
         xfer_owner: Mutex::new(HashMap::new()),
@@ -1176,7 +1266,8 @@ fn serve_runtime(listener: TcpListener, rt: Arc<MetaRuntime>) {
             let gone = evict_idle(&sw);
             if gone > 0 {
                 println!(
-                    "meta-server: evicted {gone} idle engine(s) (>{}s idle, no sessions)",
+                    "meta-server: evicted {} (>{}s idle, no sessions)",
+                    crate::cli_style::plural(gone as usize, "idle engine", "idle engines"),
                     sw.engine_idle_ms / 1000
                 );
             }
@@ -1187,7 +1278,8 @@ fn serve_runtime(listener: TcpListener, rt: Arc<MetaRuntime>) {
                 // as what it is: the floor of the sweep interval, not the TTL that
                 // necessarily fired.
                 println!(
-                    "meta-server: reaped {shed} idle PG pool connection(s) back to their warm floor (process window {}s, per-view overrides honored)",
+                    "meta-server: reaped {} back to their warm floor (process window {}s, per-view overrides honored)",
+                    crate::cli_style::plural(shed as usize, "idle PG pool connection", "idle PG pool connections"),
                     crate::pg_store::pool_idle_ms() / 1000
                 );
             }
@@ -1353,22 +1445,31 @@ fn gov_login(rt: &Arc<MetaRuntime>, a: &serde_json::Value) -> Result<serde_json:
 /// only when rows actually went (a sweep that prints every ~hour would bury the
 /// startup lines that matter). A refusal is reported because the next pass will
 /// hit the same wall — an operator wants to know the table is not being trimmed.
-fn reap_audit(rt: &Arc<MetaRuntime>, window: &str) {
+/// Returns how many rows actually went, so `audit.retention.set` can report the
+/// real cut instead of re-counting AFTER the delete (which always reads zero).
+fn reap_audit(rt: &Arc<MetaRuntime>, window: &str) -> usize {
     let Some(keys) = rt.ctl_keys.as_ref() else {
-        return;
+        return 0;
     };
     let Ok(cutoff) = crate::apikeys::cutoff_from_age(window) else {
         eprintln!(
             "meta-server: --audit-retention '{window}' is not a duration (use 45m, 24h, 90d…); no audit sweep is running"
         );
-        return;
+        return 0;
     };
     match keys.purge_calls_older_than(&cutoff) {
-        Ok(0) => {}
-        Ok(n) => println!(
-            "meta-server: audit retention '{window}' dropped {n} mcp_calls row(s) older than {cutoff}"
-        ),
-        Err(e) => eprintln!("meta-server: audit retention sweep failed: {e}"),
+        Ok(0) => 0,
+        Ok(n) => {
+            println!(
+                "meta-server: audit retention '{window}' dropped {} older than {cutoff}",
+                crate::cli_style::plural(n, "mcp_calls row", "mcp_calls rows")
+            );
+            n
+        }
+        Err(e) => {
+            eprintln!("meta-server: audit retention sweep failed: {e}");
+            0
+        }
     }
 }
 
@@ -1419,7 +1520,9 @@ fn handle_gov_conn(mut sock: TcpStream, rt: &Arc<MetaRuntime>) -> io::Result<()>
             Err(e)
                 if matches!(
                     e.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::UnexpectedEof
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::UnexpectedEof
                 ) =>
             {
                 return Ok(());
@@ -1529,28 +1632,28 @@ fn gov_one(
     let pinned = sess.as_ref().map(|p| p.authed.clone());
     let authed = match pinned {
         Some(a) => a,
-        None => match keys
-            .authenticate_admin(req.get("k").and_then(|v| v.as_str()).unwrap_or(""))
-        {
-            Ok(a) => {
-                if want_pin {
-                    *sess = Some(GovSession {
-                        authed: a.clone(),
-                        check: Instant::now() + crate::apikeys::KEY_RECHECK,
-                        served: 0,
-                    });
+        None => {
+            match keys.authenticate_admin(req.get("k").and_then(|v| v.as_str()).unwrap_or("")) {
+                Ok(a) => {
+                    if want_pin {
+                        *sess = Some(GovSession {
+                            authed: a.clone(),
+                            check: Instant::now() + crate::apikeys::KEY_RECHECK,
+                            served: 0,
+                        });
+                    }
+                    a
                 }
-                a
+                Err(e) => {
+                    // An unauthenticated attempt is audited too (keyless), so a wrong
+                    // or revoked credential is visible in `apikey calls` instead of
+                    // only in the operator's terminal.
+                    let _ = keys.log_call(None, "control", op, false, &e);
+                    gov_reply(sock, serde_json::Value::Null, Some(&e))?;
+                    return Ok(false);
+                }
             }
-            Err(e) => {
-                // An unauthenticated attempt is audited too (keyless), so a wrong
-                // or revoked credential is visible in `apikey calls` instead of
-                // only in the operator's terminal.
-                let _ = keys.log_call(None, "control", op, false, &e);
-                gov_reply(sock, serde_json::Value::Null, Some(&e))?;
-                return Ok(false);
-            }
-        },
+        }
     };
     // Whether this socket may carry another request, decided BEFORE the op runs
     // because every reply below owes the caller that answer. `served` counts the
@@ -1581,13 +1684,7 @@ fn gov_one(
                 if account.is_empty() { "-" } else { account }
             ),
         };
-        let _ = keys.log_call(
-            Some(&authed),
-            "control",
-            "login",
-            out.is_ok(),
-            &detail,
-        );
+        let _ = keys.log_call(Some(&authed), "control", "login", out.is_ok(), &detail);
         return match out {
             Ok(v) => {
                 gov_reply_pinned(sock, v, None, keep)?;
@@ -1718,7 +1815,9 @@ fn seed_if_manifest(
     let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
     let (dirs, files) = crate::mcp::seed_tree_from_text(meta, be, text, uid, gid)?;
     Ok(format!(
-        "\napplied seed manifest: {dirs} dir(s) and {files} file(s) created; names that already existed were left alone"
+        "\napplied seed manifest: {} and {} created; names that already existed were left alone",
+        crate::cli_style::plural(dirs as usize, "dir", "dirs"),
+        crate::cli_style::plural(files as usize, "file", "files")
     ))
 }
 
@@ -1750,14 +1849,15 @@ fn free_unbooked(rep_refs: &[String], droot: &Path) -> String {
         }
         Err(e) => {
             return format!(
-                "cannot open data root {} to free {} released object(s): {e} — the tree is gone and its bookings are released, so those bytes are unreferenced now; free them through the data-server or a mount",
+                "cannot open data root {} to free {}: {e} — the tree is gone and its bookings are released, so those bytes are unreferenced now; free them through the data-server or a mount",
                 droot.display(),
-                rep_refs.len()
+                crate::cli_style::plural(rep_refs.len(), "released object", "released objects")
             )
         }
     }
     format!(
-        "{freed} object(s) freed from {}, {missing} not found under that data root (they live on another store?), {failed} could not be freed (striped keys move through a data-server)",
+        "{} freed from {}, {missing} not found under that data root (they live on another store?), {failed} could not be freed (striped keys move through a data-server)",
+        crate::cli_style::plural(freed as usize, "object", "objects"),
         droot.join("blocks").display()
     )
 }
@@ -1780,10 +1880,16 @@ enum Gate {
     Bases(&'static [&'static str]),
     /// (Re)defines the view named by `name` from the text in `text`: must govern
     /// what the name already is (if anything) and what the new text is OVER.
-    Define { name: &'static str, text: &'static str },
+    Define {
+        name: &'static str,
+        text: &'static str,
+    },
     /// Forks the base in `base` under the name in `name`: must govern the base,
     /// and the name if it already exists.
-    Create { base: &'static str, name: &'static str },
+    Create {
+        base: &'static str,
+        name: &'static str,
+    },
     /// Must have staged the transfer handle named by this arg (an admin may
     /// finish anyone's transfer).
     Handle(&'static str),
@@ -1852,14 +1958,25 @@ fn gates(op: &str) -> Result<Vec<Gate>, String> {
         | "apikey.secret" => vec![Gate::Key("id")],
         // Trimming the audit trail is the one verb that destroys OTHER keys'
         // history, so it cannot be delegated to the account whose actions it
-        // records. It is also deliberately absent from the console's whitelist:
-        // `grovefs apikey purge` on a CLI, never a button.
+        // records. SUPER only — but since the layout-v3/retention work the
+        // console DOES expose it (the Audit page's purge-now button): the
+        // admin who owns the deployment is allowed to trim its trail from the
+        // UI, and only that account.
         "apikey.purge" => vec![Gate::Super(
             "it deletes audit rows belonging to every credential in the deployment",
         )],
+        // The retention WINDOW is a policy knob, not history destruction:
+        // reading it is part of the store overview, changing it decides when
+        // OTHER credentials' rows die, so both are super-only.
+        "audit.retention.get" => vec![Gate::Super(
+            "the retention window governs every credential's audit rows",
+        )],
+        "audit.retention.set" => vec![Gate::Super(
+            "it decides when audit rows belonging to every credential in the deployment die",
+        )],
         other => {
             return Err(format!(
-                "control op '{other}' has no access rule (unknown, or added to the dispatcher \n                     without one) — refusing. Known ops: info, whoami, login, def.list/get/put/remove, \n                     stamp, physical.list/has, fork.has/create/drop/graft, view.create/stats/export/import, \n                     view.rm_base, refs.rebuild, gc.scan/apply, apikey.create/list/revoke/delete/rotate/set_ro/update/secret/calls/purge, \n                     account.list/create/passwd/role/disable/delete, grant.list/add/remove"
+                "control op '{other}' has no access rule (unknown, or added to the dispatcher \n                     without one) — refusing. Known ops: info, whoami, login, def.list/get/put/remove, \n                     stamp, physical.list/has, fork.has/create/drop/graft, view.create/stats/export/import, \n                     view.rm_base, refs.rebuild, gc.scan/apply, apikey.create/list/revoke/delete/rotate/set_ro/update/secret/calls/purge, \n                     audit.retention.get/set, \n                     account.list/create/passwd/role/disable/delete, grant.list/add/remove"
             ));
         }
     };
@@ -1962,8 +2079,9 @@ fn authorize(
             Gate::Define { name, text } => {
                 let name = req_str(a, name)?;
                 let text = req_str(a, text)?;
-                let def = crate::layout::LayoutRules::parse_def(&text)
-                    .map_err(|e| format!("cannot govern '{name}': the new definition is unreadable: {e}"))?;
+                let def = crate::layout::LayoutRules::parse_def(&text).map_err(|e| {
+                    format!("cannot govern '{name}': the new definition is unreadable: {e}")
+                })?;
                 let parent = match def {
                     crate::layout::ViewDef::Derived(b, _) | crate::layout::ViewDef::Fork(b) => b,
                     crate::layout::ViewDef::Alias(r) => r,
@@ -2148,7 +2266,6 @@ fn control_dispatch(
                 // `null` means rows are kept until an operator purges them by
                 // hand, which is the fact the console's audit page should say
                 // out loud rather than leave as a silently growing table.
-                "auditRetention": rt.audit_retention,
                 // Registry instances as the overview shows them: NAMES plus
                 // each one's placed-view count (never URIs — those embed
                 // passwords, and this reply crosses the governance wire).
@@ -2189,6 +2306,11 @@ fn control_dispatch(
                 // backend's directory "metadata root": under SQLite the base
                 // holds the trees; under PG/treedb it holds no trees at all.
                 "backendLayout": rt.store.backend_layout(),
+                // Live value: `audit.retention.set` moves it without a restart.
+                "auditRetention": rt.audit_retention.lock().clone(),
+                // What the metadata store IS (sqlite / one PG / a PG book /
+                // treedb) and where each view lives inside it.
+                "storage": storage_snapshot(&rt.store),
             }))
         }
         // A delegated caller's list is its own definitions: the same lens/fork
@@ -2770,6 +2892,40 @@ fn control_dispatch(
                 "dryRun": dry,
             }))
         }
+        // The audit-retention window, live: `store.info` shows the same value,
+        // `audit.retention.set` moves it, and the background reaper picks the
+        // new value up on its next tick (no restart). `never`/`0` disarms the
+        // sweep; a duration (`90d`) both sets the window AND cuts immediately
+        // against the new cutoff — an operator who shortens retention means
+        // "trim to that now", the same contract as the startup pass.
+        "audit.retention.get" => Ok(json!({
+            "retention": rt.audit_retention.lock().clone(),
+        })),
+        "audit.retention.set" => {
+            let w = req_str(a, "retention")?;
+            let eff = match w.trim() {
+                "never" | "0" => None,
+                other => {
+                    let secs = crate::apikeys::duration_secs(other)
+                        .map_err(|e| format!("retention: {e}"))?
+                        .ok_or_else(|| "retention: expected a duration (45m, 24h, 90d) or 'never'".to_string())?;
+                    if secs < 60 {
+                        return Err("retention: shorter than a minute is not a retention window".to_string());
+                    }
+                    Some(other.to_string())
+                }
+            };
+            *rt.audit_retention.lock() = eff.clone();
+            let trimmed = match &eff {
+                // Reap right now against the new cutoff and report how many rows
+                // actually went — `never` only stops the sweeps, it deletes
+                // nothing that already sits in the table (disarming is not
+                // destroying), so it reports zero.
+                Some(window) => reap_audit(rt, window),
+                None => 0,
+            };
+            Ok(json!({ "retention": eff, "trimmedNow": trimmed }))
+        }
         // The console's own plane: sign-in identity, accounts and their base-view
         // delegation, and the per-view detail page. Every one of these is judged
         // by `gates` above, exactly like the view verbs.
@@ -2777,7 +2933,7 @@ fn control_dispatch(
         | "account.disable" | "account.delete" | "grant.list" | "grant.add" | "grant.remove"
         | "view.stats" => web_dispatch(rt, who, op, a),
         other => Err(format!(
-            "unknown control op '{other}' (known: info, store.info, whoami, def.list/get/put/remove, stamp, physical.list/has, fork.has/create/drop/graft, view.create/stats/export/import, view.rm_base, refs.rebuild, gc.scan/apply, apikey.create/list/revoke/delete/rotate/set_ro/update/calls/purge, account.list/create/passwd/role/disable/delete, grant.list/add/remove)"
+            "unknown control op '{other}' (known: info, store.info, whoami, def.list/get/put/remove, stamp, physical.list/has, fork.has/create/drop/graft, view.create/stats/export/import, view.rm_base, refs.rebuild, gc.scan/apply, apikey.create/list/revoke/delete/rotate/set_ro/update/calls/purge, audit.retention.get/set, account.list/create/passwd/role/disable/delete, grant.list/add/remove)"
         )),
     }
 }
@@ -2937,7 +3093,9 @@ fn web_dispatch(
             let cur = s
                 .get(&account)?
                 .ok_or_else(|| format!("no web account '{account}'"))?;
-            if cur.role == Role::Admin.as_str() && cur.disabled_at.is_none() && s.active_admins()? <= 1
+            if cur.role == Role::Admin.as_str()
+                && cur.disabled_at.is_none()
+                && s.active_admins()? <= 1
             {
                 return Err(format!(
                     "'{account}' is the only enabled administrator — it cannot be deleted out of \n                     the last lock on the deployment"
@@ -2973,7 +3131,10 @@ fn web_dispatch(
                 "deleted": true,
                 "liveKeys": keys,
                 "note": if keys > 0 {
-                    format!("{keys} api key(s) still minted by this account are NOT revoked — revoke them explicitly if they should stop working")
+                    format!(
+                        "{} still minted by this account are NOT revoked — revoke them explicitly if they should stop working",
+                        crate::cli_style::plural(keys as usize, "api key", "api keys")
+                    )
                 } else {
                     "its grants are gone; it minted no live api keys".to_string()
                 },
@@ -3026,7 +3187,8 @@ fn web_dispatch(
             // Removing the delegation an active session relies on takes effect on
             // that session's NEXT call (the principal is re-read per request), so
             // there is nothing to expire and nothing to invalidate here.
-            let removed = s.ungrant(&account, &base)? || (base != named && s.ungrant(&account, &named)?);
+            let removed =
+                s.ungrant(&account, &base)? || (base != named && s.ungrant(&account, &named)?);
             Ok(json!({"account": account, "base": base, "removed": removed}))
         }
         // The per-view page. Deliberately built from the CONTROL plane's own
@@ -3067,7 +3229,9 @@ fn web_dispatch(
                 names.dedup();
                 for n in names {
                     if n != view
-                        && webauth::resolve_base(rt.control.as_ref(), &n).ok().as_deref()
+                        && webauth::resolve_base(rt.control.as_ref(), &n)
+                            .ok()
+                            .as_deref()
                             == Some(view.as_str())
                     {
                         family.push(n);
@@ -3075,19 +3239,35 @@ fn web_dispatch(
                 }
                 family.sort();
             }
-            let keys = rt
-                .ctl_keys
-                .as_ref()
-                .and_then(|k| {
-                    k.list().ok().map(|rows| {
-                        rows.iter()
-                            .filter(|r| r.view.as_deref() == Some(view.as_str()))
-                            .count()
-                    })
-                });
+            let keys = rt.ctl_keys.as_ref().and_then(|k| {
+                k.list().ok().map(|rows| {
+                    rows.iter()
+                        .filter(|r| r.view.as_deref() == Some(view.as_str()))
+                        .count()
+                })
+            });
             let sessions = rt.subs.lock().get(&view).map(|m| m.len()).unwrap_or(0);
-            let resident = rt.cache.lock().contains_key(base.as_deref().unwrap_or(&view))
+            let resident = rt
+                .cache
+                .lock()
+                .contains_key(base.as_deref().unwrap_or(&view))
                 || rt.views.lock().contains_key(&view);
+            // Which instance hosts this view's schema. Read-only by
+            // construction: the placement map, never `resolve_view_home`
+            // (whose migration bootstrap can WRITE a row). A multi-instance
+            // view with no row is hash-routed, and `null` is the honest answer.
+            let instance = match &rt.store {
+                StoreKind::Pg(spec) => match crate::pg_store::instance_report(spec) {
+                    Ok(report) if report.instances.len() == 1 => {
+                        Some(report.instances[0].name.clone())
+                    }
+                    Ok(report) => report.placement.get(&view).cloned(),
+                    Err(_) => None,
+                },
+                StoreKind::Sqlite => Some("local".to_string()),
+                #[cfg(feature = "treedb")]
+                StoreKind::Treedb(_) => Some("treedb".to_string()),
+            };
             Ok(json!({
                 "name": view,
                 "kind": kind,
@@ -3100,9 +3280,12 @@ fn web_dispatch(
                 "keys": keys,
                 "sessions": sessions,
                 "resident": resident,
+                "instance": instance,
             }))
         }
-        other => Err(format!("control_dispatch routed an unknown account op '{other}'")),
+        other => Err(format!(
+            "control_dispatch routed an unknown account op '{other}'"
+        )),
     }
 }
 
@@ -3340,8 +3523,9 @@ fn view_import_put(
         .len();
     if have != offset {
         return Err(format!(
-            "upload '{handle}' is at {have} byte(s) but this chunk starts at {offset} — the \
-             previous chunk did not land; restart the import"
+            "upload '{handle}' is at {} but this chunk starts at {offset} — the \
+             previous chunk did not land; restart the import",
+            crate::cli_style::plural(have as usize, "byte", "bytes")
         ));
     }
     let mut f = std::fs::OpenOptions::new()
@@ -3399,19 +3583,19 @@ fn view_import_commit(
             ));
         }
     }
-    let st = match &rt.store {
-        StoreKind::Sqlite => crate::meta::import_view(&rt.base, &view, &path, replace)?,
-        StoreKind::Pg(uri) => crate::pg_store::import_view(uri, &view, &path, replace)?,
-        #[cfg(feature = "treedb")]
-        // No dump reader for treedb (see `view_export_stage`): the tree can only
-        // be created empty and written through a mount.
-        StoreKind::Treedb(_) => {
-            return Err(
+    let st =
+        match &rt.store {
+            StoreKind::Sqlite => crate::meta::import_view(&rt.base, &view, &path, replace)?,
+            StoreKind::Pg(uri) => crate::pg_store::import_view(uri, &view, &path, replace)?,
+            #[cfg(feature = "treedb")]
+            // No dump reader for treedb (see `view_export_stage`): the tree can only
+            // be created empty and written through a mount.
+            StoreKind::Treedb(_) => return Err(
                 "view export/import is not implemented for a treedb store — create the base with \
-                 `view create` and write it through a mount".to_string(),
-            )
-        }
-    };
+                 `view create` and write it through a mount"
+                    .to_string(),
+            ),
+        };
     if let Some(base) = &as_fork {
         if let Err(e) = rt.control.put_def(&view, &format!("fork {base}\n")) {
             let rollback = drop_imported_tree(rt, &view);
@@ -3512,10 +3696,10 @@ fn view_rm_base(
             let rep = crate::pg_store::PgEngine::remove_view(uri, view)?;
             let bytes = free_unbooked(&rep.unbooked_refs, &droot);
             format!(
-                "removed base view '{view}' from {}: {} node(s) gone, {} object(s) no longer held by any view{}; {bytes}",
+                "removed base view '{view}' from {}: {} gone, {} no longer held by any view{}; {bytes}",
                 crate::pg_store::redact_uri(uri),
-                rep.entries,
-                rep.unbooked,
+                crate::cli_style::plural(rep.entries as usize, "node", "nodes"),
+                crate::cli_style::plural(rep.unbooked as usize, "object", "objects"),
                 if rep.still_held > 0 {
                     format!(", {} still held by other views", rep.still_held)
                 } else {
@@ -3535,9 +3719,9 @@ fn view_rm_base(
             }
             let bytes = free_unbooked(&refs, &droot);
             format!(
-                "removed base view '{view}': {} node(s) gone, {} blob reference(s) dropped, {stayed} still held by other views; {bytes}",
-                rm.nodes,
-                rm.blob_refs.len()
+                "removed base view '{view}': {} gone, {} dropped, {stayed} still held by other views; {bytes}",
+                crate::cli_style::plural(rm.nodes as usize, "node", "nodes"),
+                crate::cli_style::plural(rm.blob_refs.len(), "blob reference", "blob references")
             )
         }
         #[cfg(feature = "treedb")]
@@ -3549,7 +3733,7 @@ fn view_rm_base(
             crate::treedb_store::TreedbStore::drop_view(addr, view)
                 .map_err(|e| format!("cannot drop treedb view '{view}' at {addr}: {e}"))?;
             format!(
-                "removed base view '{view}' from treedb at {addr}; content objects are not touched — they belong to the data server(s)"
+                "removed base view '{view}' from treedb at {addr}; content objects are not touched — they belong to the data servers"
             )
         }
     };
@@ -3564,9 +3748,13 @@ fn refs_rebuild(rt: &Arc<MetaRuntime>) -> Result<serde_json::Value, String> {
         StoreKind::Pg(uri) => {
             let rep = crate::pg_store::rebuild_ledger(uri)?;
             Ok(json!(format!(
-                "refs ledger rebuilt in {}: {} tree(s), {} content key(s), {} holder unit(s); {} row(s) corrected, {} row(s) deleted",
+                "refs ledger rebuilt in {}: {}, {}, {}; {} corrected, {} deleted",
                 crate::pg_store::redact_uri(uri),
-                rep.trees, rep.refs, rep.holders, rep.rows_fixed, rep.rows_deleted
+                crate::cli_style::plural(rep.trees as usize, "tree", "trees"),
+                crate::cli_style::plural(rep.refs as usize, "content key", "content keys"),
+                crate::cli_style::plural(rep.holders as usize, "holder unit", "holder units"),
+                crate::cli_style::plural(rep.rows_fixed as usize, "row", "rows"),
+                crate::cli_style::plural(rep.rows_deleted as usize, "row", "rows")
             )))
         }
         StoreKind::Sqlite => {
@@ -3582,7 +3770,8 @@ fn refs_rebuild(rt: &Arc<MetaRuntime>) -> Result<serde_json::Value, String> {
         // reach. Refusing beats rewriting rows the engine owns.
         StoreKind::Treedb(_) => Err(
             "`refs rebuild` has nothing to do for a treedb store: holder counts are maintained \
-             inside the engine, never in a separate ledger".to_string(),
+             inside the engine, never in a separate ledger"
+                .to_string(),
         ),
     }
 }
@@ -3611,7 +3800,8 @@ fn gc_picture(rt: &Arc<MetaRuntime>) -> Result<crate::gc::Picture, String> {
         #[cfg(feature = "treedb")]
         StoreKind::Treedb(_) => Err(
             "gc audit is not implemented for a treedb store — it would report every object as \
-             garbage, which is worse than refusing".to_string(),
+             garbage, which is worse than refusing"
+                .to_string(),
         ),
     }
 }
@@ -3722,7 +3912,12 @@ fn gc_audit(
     if apply && (!sessions.is_empty() || !mounts.is_empty()) {
         let mut live: Vec<String> = sessions
             .iter()
-            .map(|(v, n)| format!("{v} ({n} live session(s) on this server)"))
+            .map(|(v, n)| {
+                format!(
+                    "{v} ({} on this server)",
+                    crate::cli_style::plural(*n, "live session", "live sessions")
+                )
+            })
             .collect();
         live.extend(mounts.iter().cloned());
         return Err(format!(
@@ -3749,8 +3944,8 @@ fn gc_audit(
     // deployment's bytes, and deleting there would kill another store.
     if aud.objects > 0 && !pic.refs.keys.is_empty() && aud.matched == 0 && !force {
         return Err(format!(
-            "gc: the data server(s) {} share no object with any view tree on this server ({} \
-             object(s), {} referenced key(s)) — wrong --data-servers? Nothing was deleted; pass \
+            "gc: no object of the data servers {} appears in any view tree on this server ({} \
+             objects, {} referenced keys) — wrong --data-servers? Nothing was deleted; pass \
              --force only if this is expected",
             servers.join(","),
             aud.objects,
@@ -3977,17 +4172,16 @@ fn store_for(rt: &MetaRuntime, view: &str) -> io::Result<Arc<MetaStore>> {
             MetaStore::open_sqlite(&rt.base, view, readonly)
                 .map_err(|e| io::Error::other(e.to_string()))?
         }
-        StoreKind::Pg(uri) => MetaStore::open_pg(uri, view, false)
-            .map_err(|e| {
-                // The URI carries the PG password and this error travels back to
-                // the caller (and into the audit `detail` column), so report it
-                // redacted — the account and host are what identify the home,
-                // the secret never is.
-                io::Error::other(format!(
-                    "pg open for view='{view}' uri='{}': {e}",
-                    crate::pg_store::redact_uri(uri)
-                ))
-            })?,
+        StoreKind::Pg(uri) => MetaStore::open_pg(uri, view, false).map_err(|e| {
+            // The URI carries the PG password and this error travels back to
+            // the caller (and into the audit `detail` column), so report it
+            // redacted — the account and host are what identify the home,
+            // the secret never is.
+            io::Error::other(format!(
+                "pg open for view='{view}' uri='{}': {e}",
+                crate::pg_store::redact_uri(uri)
+            ))
+        })?,
         #[cfg(feature = "treedb")]
         // Opening a treedb store resolves the view id and, for a writable
         // handle, creates the tree when it is missing — which `M_OPEN` must
@@ -4001,11 +4195,14 @@ fn store_for(rt: &MetaRuntime, view: &str) -> io::Result<Arc<MetaStore>> {
             if !known.iter().any(|v| v == view) {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
-                    format!("no base tree '{view}' in treedb at {addr} — create it (`view create`)"),
+                    format!(
+                        "no base tree '{view}' in treedb at {addr} — create it (`view create`)"
+                    ),
                 ));
             }
-            MetaStore::open_treedb(addr, view, false)
-                .map_err(|e| io::Error::other(format!("treedb open for view='{view}' at {addr}: {e}")))?
+            MetaStore::open_treedb(addr, view, false).map_err(|e| {
+                io::Error::other(format!("treedb open for view='{view}' at {addr}: {e}"))
+            })?
         }
     };
     let engine = Arc::new(store);
@@ -5008,10 +5205,23 @@ fn handle_control_conn(
             M_PUSH => {
                 let mut i = 0usize;
                 let view = proto::get_key(&body, &mut i).unwrap_or_default();
+                // Layout v3: a family-nested tree's home travels with the
+                // frame (appended between the name and the image). An old
+                // peer omits it — or the "key" decodes into snapshot bytes
+                // that can never pass `valid_push_rel` — so the receiver
+                // falls back to resolving `f(name)` with no rel.
+                let mut j = i;
+                let rel = match proto::get_key(&body, &mut j) {
+                    Ok(r) if valid_push_rel(&view, &r) => {
+                        i = j;
+                        Some(r)
+                    }
+                    _ => None,
+                };
                 let snap = body[i..].to_vec();
                 // Only a standby installs pushes; a node that has promoted (or a
                 // plain primary) is authoritative and rejects the stale copy.
-                if ha.role() == Role::Standby && install_snapshot(&rt, &view, &snap).is_ok() {
+                if ha.role() == Role::Standby && install_snapshot(&rt, &view, &rel, &snap).is_ok() {
                     proto::send_response(writer, 0, 0, &[])?;
                 } else {
                     proto::send_response(
@@ -5054,28 +5264,47 @@ fn handle_control_conn(
     }
 }
 
-/// Atomically replace `<base>/meta/<view>/<view>.db` with a replicated snapshot
+/// Atomically replace the view tree's db (`meta/<view>/<view>.db`, or since
+/// layout v3 `meta/<base>/<view>/<view>.db` when the frame carries a family
+/// rel) with a replicated snapshot
 /// and drop every cached engine so the next read opens the fresh copy (derived
 /// views built on any base are re-resolved too — a snapshot swap is rare and
 /// a full evict is the cheap, correct hammer). The snapshot is
 /// a complete `VACUUM INTO` image (self-contained, rollback-journal), so the old
 /// WAL/shm side files are removed rather than left to shadow it.
 ///
-/// The target stays `f(name)`: a standby is told a VIEW NAME and nothing else,
-/// because it does not hold the definitions that would be needed to resolve a
-/// genealogy. `valid_view_name` is the whole of that trust boundary — it is what
-/// keeps the peer from steering a write outside the tree's own directory, and it
-/// now also refuses the two reserved slot names, so a replicated snapshot can
-/// never overwrite the definitions directory or the control plane.
-fn install_snapshot(rt: &MetaRuntime, view: &str, snap: &[u8]) -> io::Result<()> {
+/// The standby does not hold definitions, so a name-only frame resolves
+/// `f(name)` at the top level — which is why a v3 sender APPENDS the tree's
+/// relative home (`tree_home_rel_dir`) after the view name, and why that rel
+/// passes [`valid_push_rel`] before it steers anything: every segment is a
+/// legal view name and the last one IS the view, so a peer can name a family
+/// home but can never escape `meta/` or point the write at the reserved
+/// slots. A frame without a (valid) rel — an old primary, or a pre-v3 push of
+/// a top-level tree — keeps the pure `f(name)` behavior.
+fn install_snapshot(
+    rt: &MetaRuntime,
+    view: &str,
+    rel: &Option<String>,
+    snap: &[u8],
+) -> io::Result<()> {
     if !crate::layout::valid_view_name(view) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "bad view name"));
     }
     if let Err(msg) = crate::meta::layout_guard(&rt.base) {
         return Err(io::Error::other(msg));
     }
-    let path = crate::meta::ensure_view_db_path(&rt.base, view)?;
-    let dir = crate::meta::view_dir(&rt.base, view);
+    let dir = match rel.as_deref().filter(|r| valid_push_rel(view, r)) {
+        Some(r) => {
+            let d = crate::meta::meta_dir(&rt.base).join(r);
+            std::fs::create_dir_all(&d)?;
+            d
+        }
+        None => {
+            crate::meta::ensure_view_db_path(&rt.base, view)?;
+            crate::meta::view_dir(&rt.base, view)
+        }
+    };
+    let path = dir.join(format!("{view}.db"));
     // The staging file sits in the tree's OWN directory: rename is only atomic
     // within one filesystem, and a per-tree directory is now that unit.
     let tmp = dir.join(format!("{view}.db.push.tmp"));
@@ -5085,9 +5314,29 @@ fn install_snapshot(rt: &MetaRuntime, view: &str, snap: &[u8]) -> io::Result<()>
     drop(f);
     std::fs::rename(&tmp, &path)?; // same-fs rename is atomic
     rt.evict(); // force a reopen of the fresh copy (and any derived lens) on next access
-    let _ = std::fs::remove_file(crate::meta::view_db_with_ext(&rt.base, view, "-wal"));
-    let _ = std::fs::remove_file(crate::meta::view_db_with_ext(&rt.base, view, "-shm"));
+    let _ = std::fs::remove_file(format!("{}.db-wal", path.display()));
+    let _ = std::fs::remove_file(format!("{}.db-shm", path.display()));
     Ok(())
+}
+
+/// A replication frame's relative tree home: `""` (top level), or path
+/// segments that are each a legal view name — the LAST one equal to the view
+/// itself, the middle ones additionally allowed to be the `forks/` separator
+/// (that is the grouped layout's real shape). The last-segment equality is
+/// what makes a forged rel both useless (it can only plant
+/// `<x>/<view>/<view>.db`-shaped homes, which is the layout's invariant
+/// anyway) and easy to refuse; `..`, dots, slashes and the WRITE-relevant
+/// reserved slots (`views`, `_control`) all die on `valid_view_name`.
+fn valid_push_rel(view: &str, rel: &str) -> bool {
+    if rel.is_empty() {
+        return true;
+    }
+    let segs: Vec<&str> = rel.split('/').collect();
+    segs.last().copied() == Some(view)
+        && segs[..segs.len() - 1]
+            .iter()
+            .all(|s| *s == crate::meta::FORKS_SUBDIR || crate::layout::valid_view_name(s))
+        && crate::layout::valid_view_name(view)
 }
 
 /// Names of the view trees currently on disk. Goes through the one enumerator,
@@ -5159,8 +5408,12 @@ fn push_snapshot_now(rt: &MetaRuntime, view: &str) {
     };
     let _ = conn.set_read_timeout(Some(SYNC_REPL_ACK_TIMEOUT));
     let _ = conn.set_write_timeout(Some(SYNC_REPL_ACK_TIMEOUT));
-    let mut body = Vec::with_capacity(base.len() + 2 + snap.len());
+    // Layout v3: the tree's family home ("") for a top-level tree, so a
+    // standby nests a replicated fork beside its base instead of at the top.
+    let rel = crate::meta::tree_home_rel_dir(&rt.base, &base);
+    let mut body = Vec::with_capacity(base.len() + 2 + rel.len() + 2 + snap.len());
     proto::put_key(&mut body, &base);
+    proto::put_key(&mut body, &rel);
     body.extend_from_slice(&snap);
     if proto::send_request(&mut conn, M_PUSH, &body).is_err() {
         eprintln!("meta sync-repl: M_PUSH send to {peer} failed; degraded to async for this op");
@@ -5500,6 +5753,8 @@ fn start_replicator(rt: Arc<MetaRuntime>) {
                     };
                     let mut body = Vec::with_capacity(view.len() + 2 + snap.len());
                     proto::put_key(&mut body, &view);
+                    // v3: same rel-append as the sync path (see push_snapshot_now).
+                    proto::put_key(&mut body, &crate::meta::tree_home_rel_dir(&rt.base, &view));
                     body.extend_from_slice(&snap);
                     if proto::send_request(&mut conn, M_PUSH, &body).is_err() {
                         break;
@@ -5601,7 +5856,7 @@ fn start_promotion_watchdog(rt: Arc<MetaRuntime>, ha: Arc<HaState>) {
                 if res.fenced(q) {
                     eprintln!("meta HA: promotion refused (a quorum of {q}/{} arbiters holds {} >= candidate {candidate}); fail-safe refusing to promote (a peer is provably ahead)", addrs.len(), res.prev_max);
                 } else {
-                    eprintln!("meta HA: promotion deferred (advanced only {}/{} arbiter(s), need quorum {q}); fail-safe refusing to promote (cannot prove exclusive arbiter authority), will retry after any incumbent lease expires", res.advances, addrs.len());
+                    eprintln!("meta HA: promotion deferred (advanced only {}/{} arbiters, need quorum {q}); fail-safe refusing to promote (cannot prove exclusive arbiter authority), will retry after any incumbent lease expires", res.advances, addrs.len());
                 }
                 continue;
             }
@@ -6196,6 +6451,58 @@ mod ha_tests {
         }
     }
 
+    /// Layout v3 `M_PUSH`: the rel field rides between the view name and the
+    /// image, and a receiver must survive BOTH framings — a v3 peer's rel, and
+    /// an old peer whose first snapshot bytes would decode as a nonsense
+    /// "key" that fails `valid_push_rel` and falls back to name-only install.
+    #[test]
+    fn push_frames_parse_with_and_without_a_family_rel() {
+        let image: Vec<u8> = b"SQLite format 3\x00rest of a plausible snapshot".to_vec();
+        // v3 nested frame: rel "team/lab"
+        let mut body = Vec::new();
+        proto::put_key(&mut body, "lab");
+        proto::put_key(&mut body, "team/lab");
+        body.extend_from_slice(&image);
+        let mut i = 0usize;
+        let view = proto::get_key(&body, &mut i).unwrap();
+        let mut j = i;
+        let rel = match proto::get_key(&body, &mut j) {
+            Ok(r) if valid_push_rel(&view, &r) => {
+                i = j;
+                Some(r)
+            }
+            _ => None,
+        };
+        assert_eq!((view.as_str(), rel.as_deref()), ("lab", Some("team/lab")));
+        assert_eq!(&body[i..], &image[..]);
+        // old frame: no rel — the image's leading bytes must NOT be consumed
+        let mut body = Vec::new();
+        proto::put_key(&mut body, "team");
+        body.extend_from_slice(&image);
+        let mut i = 0usize;
+        let view = proto::get_key(&body, &mut i).unwrap();
+        let mut j = i;
+        let rel = match proto::get_key(&body, &mut j) {
+            Ok(r) if valid_push_rel(&view, &r) => {
+                i = j;
+                Some(r)
+            }
+            _ => None,
+        };
+        assert_eq!(rel, None);
+        assert_eq!(&body[i..], &image[..], "the whole image survives untouched");
+        // rel gate: escape shapes and wrong last segments die
+        assert!(valid_push_rel("lab", ""));
+        assert!(valid_push_rel("lab", "team/lab"));
+        assert!(valid_push_rel("lab", "team/forks/lab"));
+        assert!(!valid_push_rel("lab", "team"));
+        assert!(!valid_push_rel("lab", "../lab"));
+        assert!(!valid_push_rel("lab", "_control/lab"));
+        assert!(!valid_push_rel("lab", "views/lab"));
+        assert!(!valid_push_rel("lab", "team//lab"));
+        assert!(!valid_push_rel("lab", "/lab"));
+    }
+
     #[test]
     fn write_ops_are_gated_reads_are_not() {
         // The standby's read-only gate keys off exactly this classification.
@@ -6375,7 +6682,7 @@ mod ha_tests {
             witness: Some(waddr),
             store: StoreKind::Sqlite,
             engine_idle_ms: 0,
-            audit_retention: None,
+            audit_retention: Mutex::new(None),
             ctl_keys: None,
             web_auth: None,
             xfer_owner: Mutex::new(HashMap::new()),
@@ -6544,7 +6851,7 @@ mod ha_tests {
             witness: None,
             store: StoreKind::Sqlite,
             engine_idle_ms: 60_000,
-            audit_retention: None,
+            audit_retention: Mutex::new(None),
             ctl_keys: None,
             web_auth: None,
             xfer_owner: Mutex::new(HashMap::new()),

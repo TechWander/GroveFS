@@ -4,6 +4,7 @@
 //! backend abstraction, and the remote wire protocol can be unit-tested without
 //! mounting anything.
 //!
+//! - [`cli_style`]    : terminal-aware rendering (colour, width, tables) for the CLI
 //! - [`backend`]      : pluggable object storage (local disk; remote via [`remote`])
 //! - [`meta`]         : per-view tree (isolation + custom hierarchy)
 //! - [`pg_store`]     : optional PostgreSQL metadata backend (drop-in for [`meta`])
@@ -26,6 +27,9 @@ pub mod apikeys;
 pub mod backend;
 #[cfg(feature = "fuse-bridge")]
 pub mod bwlimit;
+/// Terminal output formatting shared by every CLI command (and `du`): one
+/// palette, one set of status markers, and tables sized to the real terminal.
+pub mod cli_style;
 #[cfg(feature = "native")]
 pub mod control;
 /// The REMOTE control plane: governance (`ControlStore`) over the framed
@@ -58,6 +62,14 @@ pub mod mcp;
 pub mod meta;
 #[cfg(feature = "native")]
 pub mod pg_store;
+pub mod platform;
+pub mod remote;
+/// Reversible at-rest wrapping for the recoverable copy of an API credential
+/// (`api_keys.secret_enc`). Server-side only, like the key store that uses it:
+/// a client build authenticates with a digest and never unwraps anything.
+#[cfg(feature = "native")]
+pub mod secretbox;
+pub mod stats;
 /// EXPERIMENTAL third metadata backend: the `treedb` engine over its own
 /// binary protocol. Its own feature, deliberately outside `native`, so the
 /// default build never compiles a line of it. It is a tagged git dependency
@@ -65,23 +77,15 @@ pub mod pg_store;
 /// carries the why beside the feature gate.
 #[cfg(feature = "treedb")]
 pub mod treedb_store;
-pub mod platform;
-pub mod remote;
-pub mod stats;
-/// Reversible at-rest wrapping for the recoverable copy of an API credential
-/// (`api_keys.secret_enc`). Server-side only, like the key store that uses it:
-/// a client build authenticates with a digest and never unwraps anything.
-#[cfg(feature = "native")]
-pub mod secretbox;
-/// Sign-in accounts for the governance web console and their delegation to
-/// base views. Server-side state: it lives in the control plane, so a
-/// `meta-server --control-listen` gates web logins against the same rows for
-/// either metadata backend.
-#[cfg(feature = "native")]
-pub mod webauth;
 /// The WEB CONSOLE gateway (`grovefs web`): a static single-page app plus an
 /// HTTP shim that turns a cookie session into the `account`/`ip` attribution the
 /// control plane authorizes and audits by. Its own feature, on top of `native`,
 /// because an HTTP server belongs to neither a mount nor a client build.
 #[cfg(feature = "web")]
 pub mod web;
+/// Sign-in accounts for the governance web console and their delegation to
+/// base views. Server-side state: it lives in the control plane, so a
+/// `meta-server --control-listen` gates web logins against the same rows for
+/// either metadata backend.
+#[cfg(feature = "native")]
+pub mod webauth;

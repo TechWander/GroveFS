@@ -257,6 +257,42 @@ pub fn is_view_db(name: &str) -> bool {
 // view again. It buys nothing for the CONTENT bytes, which are
 // content-addressed and shared across views in `<data-dir>/blocks/` — a tree
 // directory is a metadata unit, not a restorable data unit.
+//
+// ================== on-disk layout v3: family placement =====================
+//
+// Layout v3 keeps v2's node-kind separation and adds GENEALOGY to the
+// placement: a fork's tree and a derived/alias definition live INSIDE the
+// directory of the base view they belong to, so `ls meta/` reads as a forest
+// of families instead of an anonymous pile. The old objection (the path would
+// depend on a definition the HA standby does not hold) is answered by making
+// placement FINDABLE FROM THE FILESYSTEM: every tree db is still its own
+// directory's namesake (`<name>/<name>.db`), so the resolvers below scan for
+// that shape instead of consulting a definition, and `M_PUSH` carries the
+// resolved relative home so a standby installs a replicated fork beside its
+// base rather than at the top level. Definitions moved with their family stay
+// discoverable through [`find_def_slot`]; nothing re-derives a path from a
+// name alone any more.
+//
+// ```text
+// <base>/meta/
+//   <view>/              base tree, unchanged
+//     <view>.db
+//     <fork>/            NESTED (the default): a fork's whole family dir
+//       <fork>.db         sits inside its base directory
+//     <derived>.layout    a derived/alias definition file likewise
+//     forks/             GROUPED (opt-in): the same members under
+//       <fork>/...       reserved separator slots instead of loose
+//     views/
+//       <derived>.layout
+//   views/               top-level definition slots (flat policy, and every
+//                        pre-v3 definition that was never re-homed)
+//   _control/  .xfer/    unchanged
+// ```
+//
+// The policy is one line in `meta/.family` (`flat` | `nested` | `grouped`;
+// absent means `nested`). Placement decides where NEW members land; every
+// READ resolves by scanning, so a store with pre-v3 (flat) members keeps
+// working untouched and a policy flip never orphans an existing tree.
 
 /// The metadata half of a store root. Naming it (rather than only spelling it in
 /// [`meta_dir`]) is what [`control_dir_for_db`] needs to recognize a `meta/`.
@@ -269,10 +305,18 @@ pub const DEFS_SUBDIR: &str = "views";
 pub const CONTROL_SUBDIR: &str = "_control";
 /// The export/import spool (dot-prefixed, so it is never a tree).
 pub const XFER_SUBDIR: &str = ".xfer";
+/// The grouped-family separator slot inside a base view's directory: with
+/// policy `grouped`, fork family dirs live under `<base>/meta/<B>/forks/`
+/// instead of loose beside the base tree. Reserved as a view name so a fork
+/// literally called `forks` can never be ambiguous with the separator.
+pub const FORKS_SUBDIR: &str = "forks";
 /// Names that address a layout slot and can therefore never be a view name.
 /// [`crate::layout::valid_view_name`] refuses these, which is what lets
 /// [`is_view_tree_dir`] answer by node kind alone.
-pub const RESERVED_VIEW_NAMES: &[&str] = &[DEFS_SUBDIR, CONTROL_SUBDIR];
+pub const RESERVED_VIEW_NAMES: &[&str] = &[DEFS_SUBDIR, CONTROL_SUBDIR, FORKS_SUBDIR];
+/// The one-line family-placement marker inside `meta/` (dot-prefixed, so it
+/// is never a tree and never trips [`legacy_flat_entries`]).
+pub const FAMILY_POLICY_FILE: &str = ".family";
 /// The files one tree owns: main db, WAL, shared-memory sidecar.
 pub const TREE_DB_EXTS: &[&str] = &["", "-wal", "-shm"];
 
@@ -333,26 +377,227 @@ pub fn xfer_dir(base: &Path) -> PathBuf {
     meta_dir(base).join(XFER_SUBDIR)
 }
 
-/// The home of ONE physical view tree: `<base>/meta/<view>`.
+/// Where a NEW family member (fork tree, derived/alias definition) of one base
+/// view lands. `Flat` keeps the v2 top-level placement; `Nested` (the default)
+/// puts the member directly inside the base's directory; `Grouped` puts it
+/// under the base's reserved `forks/` / `views/` separator slots so a base with
+/// many members still lists cleanly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FamilyLayout {
+    Flat,
+    Nested,
+    Grouped,
+}
+
+impl FamilyLayout {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "flat" => Some(Self::Flat),
+            "nested" => Some(Self::Nested),
+            "grouped" => Some(Self::Grouped),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Flat => "flat",
+            Self::Nested => "nested",
+            Self::Grouped => "grouped",
+        }
+    }
+}
+
+/// The store's current placement policy, read from `meta/.family` on every
+/// call (it is one stat + one tiny read beside paths this module already
+/// touched; caching would add a staleness class to save nanoseconds).
+/// An absent or unparseable marker means `Nested` — the v3 default.
+pub fn family_policy(base: &Path) -> FamilyLayout {
+    match std::fs::read_to_string(meta_dir(base).join(FAMILY_POLICY_FILE)) {
+        Ok(t) => FamilyLayout::parse(&t).unwrap_or(FamilyLayout::Nested),
+        Err(_) => FamilyLayout::Nested,
+    }
+}
+
+/// Record the placement policy for NEW family members. Never moves anything
+/// that already exists — reads resolve by scanning regardless of policy.
+pub fn set_family_policy(base: &Path, mode: FamilyLayout) -> std::io::Result<()> {
+    std::fs::create_dir_all(meta_dir(base))?;
+    std::fs::write(
+        meta_dir(base).join(FAMILY_POLICY_FILE),
+        format!("{}\n", mode.as_str()),
+    )
+}
+
+/// The home of ONE physical view tree. Resolves first — a base tree lives at
+/// `<base>/meta/<view>`, a family-nested fork at `<base>/meta/<parent>/<view>`
+/// or `<base>/meta/<parent>/forks/<view>` — and falls back to the top-level
+/// shape for a tree that does not exist yet (the `view create` case).
 pub fn view_dir(base: &Path, view: &str) -> PathBuf {
-    meta_dir(base).join(view)
+    find_view_db(base, view)
+        .unwrap_or_else(|| meta_dir(base).join(view).join(format!("{view}.db")))
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| meta_dir(base).join(view))
+}
+
+/// Where a tree db that does not exist yet would be FRESHLY placed, given its
+/// base view (`None` = a new top-level base tree). Creation sites —
+/// [`fork_view_with`] in the engine, the import/rename arms — pass the family
+/// context here so the v3 placement decision has exactly one implementation.
+pub fn new_tree_db_path(base: &Path, view: &str, parent: Option<&str>) -> PathBuf {
+    let m = meta_dir(base);
+    // The parent resolves through the same scan: a base created before v3 (or
+    // re-homed by hand) nests at wherever it ACTUALLY lives, not at a
+    // recomputed top-level guess.
+    match (parent.map(|p| view_dir(base, p)), family_policy(base)) {
+        (Some(pd), FamilyLayout::Nested) => pd.join(view).join(format!("{view}.db")),
+        (Some(pd), FamilyLayout::Grouped) => {
+            pd.join(FORKS_SUBDIR).join(view).join(format!("{view}.db"))
+        }
+        _ => m.join(view).join(format!("{view}.db")),
+    }
+}
+
+/// [`new_tree_db_path`] plus `create_dir_all` of its directory.
+pub fn ensure_tree_db_path(
+    base: &Path,
+    view: &str,
+    parent: Option<&str>,
+) -> std::io::Result<PathBuf> {
+    let path = new_tree_db_path(base, view, parent);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    Ok(path)
 }
 
 /// The same location spelled the way an operator reads it in a message or a
-/// JSON field: `meta/<view>/<view>.db`, relative to the store root. Built from
-/// the same constants as [`view_db_path`], and a test asserts the two agree —
-/// a pretty string that quietly drifts from the real path is how documentation
-/// starts lying.
-pub fn tree_home_rel(view: &str) -> String {
-    format!("{META_SUBDIR}/{view}/{view}.db")
+/// JSON field — resolved, so a family-nested fork reports
+/// `meta/<parent>/<view>/<view>.db` and not a top-level guess. Built from the
+/// same scan as [`view_db_path`]; a pretty string that quietly drifts from the
+/// real path is how documentation starts lying. Falls back to the fresh
+/// top-level spelling for a tree that does not exist yet.
+pub fn tree_home_rel(base: &Path, view: &str) -> String {
+    let real = view_db_path(base, view);
+    match real.strip_prefix(base) {
+        Ok(rel) => rel
+            .iter()
+            .map(|c| c.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/"),
+        Err(_) => real.display().to_string(),
+    }
 }
 
-/// The tree's SQLite db: `<base>/meta/<view>/<view>.db`. The stem repeats the
-/// directory name on purpose — an enumerator that finds `lab/lab.db` learns the
-/// view name from the FILE as well as the directory, so a half-moved or
-/// hand-planted tree cannot silently change identity.
+/// The store-relative DIRECTORY of a tree's home (no file name), for the
+/// `M_PUSH` replication frame: `""` for a top-level tree, `<parent>/<fork>`
+/// or `<parent>/forks/<fork>` for a family member. An empty string is also
+/// what an old-format push omits — the receiver then falls back to `f(name)`.
+pub fn tree_home_rel_dir(base: &Path, view: &str) -> String {
+    let dir = view_dir(base, view);
+    match dir.strip_prefix(meta_dir(base)) {
+        Ok(rel) => rel
+            .iter()
+            .map(|c| c.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/"),
+        Err(_) => String::new(),
+    }
+}
+
+/// A definition slot THIS STORE HOLDS for `name`, found by scanning: the
+/// top-level `meta/views/<name>.layout`, a family-nested
+/// `meta/<base>/<name>.layout`, or a grouped `meta/<base>/views/<name>.layout`
+/// (both separator spellings are probed regardless of the current policy —
+/// the policy decides NEW placement only). `None` = no definition file for
+/// this name anywhere in the store.
+pub fn find_def_slot(base: &Path, name: &str) -> Option<PathBuf> {
+    let m = meta_dir(base);
+    let top = m.join(DEFS_SUBDIR).join(format!("{name}.layout"));
+    if top.is_file() {
+        return Some(top);
+    }
+    let rd = std::fs::read_dir(&m).ok()?;
+    for ent in rd.flatten() {
+        let dir = ent.path();
+        let Some(bname) = dir.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
+            continue;
+        };
+        if !is_view_tree_dir(&bname) || !dir.is_dir() {
+            continue;
+        }
+        let cand = dir.join(format!("{name}.layout"));
+        if cand.is_file() {
+            return Some(cand);
+        }
+        let cand = dir.join(DEFS_SUBDIR).join(format!("{name}.layout"));
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+/// Where a NEW definition for `name` lands: beside its base tree's home
+/// (`parent` = the base view the definition names), or at the top-level
+/// `meta/views/` when there is no family or the policy is `flat`.
+pub fn new_def_slot(base: &Path, name: &str, parent: Option<&str>) -> PathBuf {
+    match (parent, family_policy(base)) {
+        (Some(p), FamilyLayout::Nested) => view_dir(base, p).join(format!("{name}.layout")),
+        (Some(p), FamilyLayout::Grouped) => view_dir(base, p)
+            .join(DEFS_SUBDIR)
+            .join(format!("{name}.layout")),
+        _ => defs_dir(base).join(format!("{name}.layout")),
+    }
+}
+
+/// The tree db THIS STORE ACTUALLY HOLDS for `view`, found by scanning
+/// instead of by recomputing one formula. A name is a tree when exactly one
+/// directory contains a namesake `<name>.db` inside it: the top level
+/// (`meta/<name>/<name>.db`, a base tree), directly in a base's directory
+/// (`meta/<B>/<name>/<name>.db`, nested) or under its `forks/` separator
+/// (`meta/<B>/forks/<name>/<name>.db`, grouped). `None` = this store holds no
+/// such tree.
+pub fn find_view_db(base: &Path, view: &str) -> Option<PathBuf> {
+    let m = meta_dir(base);
+    let top = m.join(view).join(format!("{view}.db"));
+    if top.is_file() {
+        return Some(top);
+    }
+    let rd = std::fs::read_dir(&m).ok()?;
+    for ent in rd.flatten() {
+        let dir = ent.path();
+        let Some(bname) = dir.file_name().and_then(|n| n.to_str()).map(str::to_string) else {
+            continue;
+        };
+        if !is_view_tree_dir(&bname) || !dir.is_dir() {
+            continue;
+        }
+        // nested member: meta/<B>/<view>/<view>.db
+        let cand = dir.join(view).join(format!("{view}.db"));
+        if cand.is_file() {
+            return Some(cand);
+        }
+        // grouped member: meta/<B>/forks/<view>/<view>.db
+        let cand = dir.join(FORKS_SUBDIR).join(view).join(format!("{view}.db"));
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+/// The tree's SQLite db. Resolves through [`find_view_db`]; a name this store
+/// does not hold yields the FRESH top-level location (which is what a
+/// `view create` of a new base view wants, and a missing fork must be
+/// refused by its reader before any path is trusted — the same
+/// `is_file() ? open : Err` arms the engine and the server already run).
+/// The stem repeats the directory name on purpose — an enumerator that finds
+/// `lab/lab.db` learns the view name from the FILE as well as the directory,
+/// so a half-moved or hand-planted tree cannot silently change identity.
 pub fn view_db_path(base: &Path, view: &str) -> PathBuf {
-    view_dir(base, view).join(format!("{view}.db"))
+    find_view_db(base, view).unwrap_or_else(|| meta_dir(base).join(view).join(format!("{view}.db")))
 }
 
 /// The same tree db with a SQLite sidecar suffix (`""`, `"-wal"`, `"-shm"`).
@@ -385,19 +630,72 @@ pub fn is_view_tree_dir(name: &str) -> bool {
 /// empty or half-created directory is reported as absent rather than as a
 /// corrupt view, which is what makes a failed `view create` or an interrupted
 /// migration visible as "no such view" instead of as a mountable garbage name.
+///
+/// Since layout v3 the walk descends one family layer: a base directory's
+/// nested member (`meta/<B>/<F>/<F>.db`) and its grouped members
+/// (`meta/<B>/forks/<F>/<F>.db`) enumerate exactly like top-level trees —
+/// names are unique across the store (creation refuses duplicates), so the
+/// result stays a flat, sorted name list.
 pub fn list_view_trees(base: &Path) -> Vec<String> {
-    let mut out = Vec::new();
+    let mut out: Vec<String> = Vec::new();
+    let push = |name: String, out: &mut Vec<String>| {
+        if !out.contains(&name) {
+            out.push(name);
+        }
+    };
     if let Ok(rd) = std::fs::read_dir(meta_dir(base)) {
         for ent in rd.flatten() {
-            let name = match ent.path().file_name().and_then(|n| n.to_str()) {
+            let dir = ent.path();
+            let name = match dir.file_name().and_then(|n| n.to_str()) {
                 Some(n) => n.to_string(),
                 None => continue,
             };
-            if !is_view_tree_dir(&name) {
+            if !is_view_tree_dir(&name) || !dir.is_dir() {
                 continue;
             }
-            if view_db_path(base, &name).is_file() {
-                out.push(name);
+            if dir.join(format!("{name}.db")).is_file() {
+                push(name.clone(), &mut out);
+            }
+            // Family layer: subdirectories of a base directory. A nested
+            // member sits directly here (`<F>/<F>.db`); the grouped spelling
+            // adds one more level behind the `forks` separator. `views` and
+            // `_control` are reserved, so definition files and control stores
+            // cannot enter the walk.
+            if let Ok(rd2) = std::fs::read_dir(&dir) {
+                for e2 in rd2.flatten() {
+                    let d2 = e2.path();
+                    let Some(x) = d2.file_name().and_then(|n| n.to_str()).map(str::to_string)
+                    else {
+                        continue;
+                    };
+                    if !d2.is_dir() {
+                        continue;
+                    }
+                    // The grouped separator is not a tree name (reserved), so
+                    // it is recognized BEFORE the tree-name filter.
+                    if x == FORKS_SUBDIR {
+                        if let Ok(rd3) = std::fs::read_dir(&d2) {
+                            for e3 in rd3.flatten() {
+                                let d3 = e3.path();
+                                let Some(y) =
+                                    d3.file_name().and_then(|n| n.to_str()).map(str::to_string)
+                                else {
+                                    continue;
+                                };
+                                if is_view_tree_dir(&y)
+                                    && d3.is_dir()
+                                    && d3.join(format!("{y}.db")).is_file()
+                                {
+                                    push(y, &mut out);
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    if is_view_tree_dir(&x) && d2.join(format!("{x}.db")).is_file() {
+                        push(x, &mut out);
+                    }
+                }
             }
         }
     }
@@ -454,9 +752,10 @@ pub fn layout_guard(base: &Path) -> Result<(), String> {
         return Ok(());
     }
     Err(format!(
-        "{} still uses the flat pre-v2 metadata layout ({} top-level db file(s), e.g. {}); no grovefs command reads that layout any more — stop every meta-server and mount on this store, then run `grovefs layout --meta-dir {} migrate`",
+        "{} still uses the flat pre-v2 metadata layout ({} top-level {}, e.g. {}); no grovefs command reads that layout any more — stop every meta-server and mount on this store, then run `grovefs layout --meta-dir {} migrate`",
         meta_dir(base).display(),
         flat.len(),
+        if flat.len() == 1 { "db file" } else { "db files" },
         meta_dir(base).join(&flat[0]).display(),
         base.display(),
     ))
@@ -754,7 +1053,7 @@ mod tests {
     fn the_operator_facing_tree_home_matches_the_real_path() {
         let base = Path::new("/srv/grovefs");
         for view in ["team", "a-b_c1"] {
-            let rel = tree_home_rel(view);
+            let rel = tree_home_rel(base, view);
             let real = view_db_path(base, view);
             assert_eq!(
                 real,
@@ -762,7 +1061,10 @@ mod tests {
                 "`{rel}` in a message has to resolve to the file the code opens"
             );
         }
-        assert_eq!(tree_home_rel("team"), "meta/team/team.db");
+        assert_eq!(
+            tree_home_rel(Path::new("/srv/grovefs"), "team"),
+            "meta/team/team.db"
+        );
     }
 
     /// Which ledger a given db writes bookkeeping into. The import scratch file
@@ -798,6 +1100,7 @@ mod tests {
         for n in [
             DEFS_SUBDIR,
             CONTROL_SUBDIR,
+            FORKS_SUBDIR,
             ".xfer",
             ".team.import-4-5",
             "", // .
@@ -807,6 +1110,104 @@ mod tests {
         ] {
             assert!(!is_view_tree_dir(n), "'{n}' must not read as a view tree");
         }
+    }
+
+    /// v3: a family member resolves by SCANNING — no definition read, no name
+    /// arithmetic — and the one enumerator already sees it. This is what keeps
+    /// the HA standby (no defs) and `view rm`/`gc`/ledger tooling correct on a
+    /// nested store without teaching any of them the genealogy.
+    #[test]
+    fn a_family_member_resolves_inside_its_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let m = meta_dir(base);
+        std::fs::create_dir_all(m.join("team")).unwrap();
+        std::fs::write(m.join("team/team.db"), b"x").unwrap();
+        // nested fork: meta/team/lab/lab.db
+        std::fs::create_dir_all(m.join("team/lab")).unwrap();
+        std::fs::write(m.join("team/lab/lab.db"), b"x").unwrap();
+        // grouped fork: meta/photos/forks/studio/studio.db
+        std::fs::create_dir_all(m.join("photos/forks/studio")).unwrap();
+        std::fs::write(m.join("photos/photos.db"), b"x").unwrap();
+        std::fs::write(m.join("photos/forks/studio/studio.db"), b"x").unwrap();
+        assert_eq!(find_view_db(base, "lab"), Some(m.join("team/lab/lab.db")));
+        assert_eq!(
+            find_view_db(base, "studio"),
+            Some(m.join("photos/forks/studio/studio.db"))
+        );
+        assert_eq!(view_db_path(base, "lab"), m.join("team/lab/lab.db"));
+        assert_eq!(
+            view_db_with_ext(base, "lab", "-wal"),
+            m.join("team/lab/lab.db-wal")
+        );
+        assert_eq!(view_dir(base, "lab"), m.join("team/lab"));
+        let trees = list_view_trees(base);
+        assert_eq!(trees, ["lab", "photos", "studio", "team"]);
+        // def slots move with the family, both separator spellings
+        std::fs::write(m.join("team/lab.layout"), b"fork team\n").unwrap();
+        assert_eq!(find_def_slot(base, "lab"), Some(m.join("team/lab.layout")));
+        // grouped def separator: meta/photos/views/lens.layout (the separator
+        // dir exists on disk only once a grouped def lands, mirror how
+        // `new_def_slot` creates it lazily)
+        std::fs::create_dir_all(m.join("photos/views")).unwrap();
+        std::fs::write(m.join("photos/views/lens.layout"), b"base photos\nhide a\n").unwrap();
+        assert_eq!(
+            find_def_slot(base, "lens"),
+            Some(m.join("photos/views/lens.layout"))
+        );
+        // a name the store does not hold resolves to nothing
+        assert_eq!(find_view_db(base, "ghost"), None);
+        assert_eq!(find_def_slot(base, "ghost"), None);
+        // the pretty rel lands on the REAL file, family path included
+        assert_eq!(tree_home_rel(base, "lab"), "meta/team/lab/lab.db");
+        assert_eq!(tree_home_rel_dir(base, "lab"), "team/lab");
+        assert_eq!(tree_home_rel_dir(base, "team"), "team");
+    }
+
+    /// v3: the policy decides where NEW members land; it never re-reads or
+    /// moves what exists, and the marker file is invisible to both the flat
+    /// guard and the tree enumerator (dot-prefixed).
+    #[test]
+    fn the_family_policy_decides_fresh_placement_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        std::fs::create_dir_all(meta_dir(base).join("team")).unwrap();
+        std::fs::write(meta_dir(base).join("team/team.db"), b"x").unwrap();
+        assert_eq!(family_policy(base), FamilyLayout::Nested);
+        assert_eq!(
+            new_tree_db_path(base, "lab", Some("team")),
+            meta_dir(base).join("team/lab/lab.db")
+        );
+        assert_eq!(
+            new_def_slot(base, "lens", Some("team")),
+            meta_dir(base).join("team/lens.layout")
+        );
+        set_family_policy(base, FamilyLayout::Grouped).unwrap();
+        assert_eq!(family_policy(base), FamilyLayout::Grouped);
+        assert_eq!(
+            new_tree_db_path(base, "lab", Some("team")),
+            meta_dir(base).join("team/forks/lab/lab.db")
+        );
+        assert_eq!(
+            new_def_slot(base, "lens", Some("team")),
+            meta_dir(base).join("team/views/lens.layout")
+        );
+        set_family_policy(base, FamilyLayout::Flat).unwrap();
+        assert_eq!(
+            new_tree_db_path(base, "lab", Some("team")),
+            meta_dir(base).join("lab/lab.db")
+        );
+        assert_eq!(
+            new_def_slot(base, "lens", Some("team")),
+            defs_dir(base).join("lens.layout")
+        );
+        // no family (a new BASE view) always lands top-level, any policy
+        assert_eq!(
+            new_tree_db_path(base, "solo", None),
+            meta_dir(base).join("solo/solo.db")
+        );
+        assert!(legacy_flat_entries(base).is_empty());
+        assert_eq!(list_view_trees(base), vec!["team".to_string()]);
     }
 
     /// What counts as "still flat" — the one signal that decides whether the
@@ -875,7 +1276,13 @@ mod tests {
         // Not a db, a directory, a definition, a sidecar, an import scratch file,
         // or an empty stem: none of them is a tree.
         for n in [
-            "views", "team.layout", "team.db-wal", "team.db-shm", ".team.import-4-5", "db", ".db",
+            "views",
+            "team.layout",
+            "team.db-wal",
+            "team.db-shm",
+            ".team.import-4-5",
+            "db",
+            ".db",
             "team.DB",
         ] {
             assert!(!is_view_db(n), "'{n}' must not look like a view tree");

@@ -15,13 +15,12 @@
   place in the console where a capability is hidden rather than refused, because
   here the refusal would arrive on every page load, not on one verb.
 */
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useCatalogStore } from '@/stores/catalog'
 import { useOps } from '@/composables/useOps'
 import { useSessionStore } from '@/stores/session'
 import { useUiStore } from '@/stores/ui'
 import { t } from '@/i18n'
-import type { PgLedgerRow } from '@/types'
 import PanelBox from '@/components/layout/PanelBox.vue'
 import FieldRow from '@/components/layout/FieldRow.vue'
 import ActionButton from '@/components/ui/ActionButton.vue'
@@ -31,19 +30,50 @@ const session = useSessionStore()
 const ui = useUiStore()
 const { api, soft } = useOps()
 
+/* `pgInstance` pins the target when the form is opened FROM an instance card;
+   the field stays editable so the operator can still change their mind. */
+const props = defineProps<{ pgInstance?: string }>()
+const emit = defineEmits<{ created: [name: string] }>()
+
 const name = ref('')
-const instance = ref('')
-const instances = ref<PgLedgerRow[]>([])
+const instance = ref(props.pgInstance ?? '')
+watch(
+  () => props.pgInstance,
+  (v) => {
+    if (v) instance.value = v
+  },
+)
+
+/* The instance a new base may land on. The instance BOOK is a PostgreSQL
+   thing: SQLite and treedb report exactly one logical store, so a picker there
+   would be a choice with one button — noise that also mislabels the backend.
+   Show the SELECT only when there is genuinely more than one instance to pick
+   from; with one instance the create call simply omits `pg_instance` and the
+   server places it. */
+const instances = ref<{ name: string; views: number | null; control: boolean }[]>([])
+const isPg = computed(() => catalog.storage?.backend === 'postgres')
+const showInstanceField = computed(() => isPg.value && instances.value.length > 1)
 
 onMounted(async () => {
-  // A failing or ACL-refused store.info leaves the list empty, which hides
-  // the row: creating with auto placement stays possible either way.
+  // Placement ledger first (per-instance counts come from the control plane);
+  // if it cannot be read, fall back to the storage snapshot's own counts, and
+  // failing or ACL-refused calls leave the list empty, which hides the row:
+  // creating with auto placement stays possible either way.
   const r = await soft('store.info', {})
-  const list = r.ok ? r.r?.pgInstances?.instances : undefined
-  if (Array.isArray(list)) instances.value = list
+  if (!r.ok) return
+  const ledger = r.r?.pgInstances?.instances
+  if (Array.isArray(ledger)) {
+    instances.value = ledger
+    return
+  }
+  const st = r.r?.storage
+  if (st?.backend === 'postgres' && Array.isArray(st.instances))
+    instances.value = st.instances.map((i: { name: string; placedViews: number | null; control: boolean }) => ({
+      name: i.name,
+      views: i.placedViews ?? null,
+      control: i.control,
+    }))
 })
-
-const selectable = computed(() => instances.value.length > 1)
 
 // The auto option IS least-loaded placement, so say which instance that
 // currently means — the same fewest-views-then-registry-order rule the
@@ -51,7 +81,7 @@ const selectable = computed(() => instances.value.length > 1)
 // was unreachable at snapshot time) falls back to the plain wording.
 const autoLabel = computed(() => {
   const known = instances.value.filter((i) => i.views !== null)
-  if (known.length === 0 || !selectable.value) return t('auto — least loaded')
+  if (known.length === 0 || !showInstanceField.value) return t('auto — least loaded')
   const min = Math.min(...known.map((i) => i.views as number))
   const winner = known.find((i) => (i.views as number) === min)
   return winner
@@ -62,12 +92,13 @@ const autoLabel = computed(() => {
 async function create(): Promise<void> {
   const view = name.value.trim()
   const args: Record<string, unknown> = { view }
-  if (selectable.value && instance.value) args.pg_instance = instance.value
+  if (showInstanceField.value && instance.value) args.pg_instance = instance.value
   const r = await api('view.create', args)
   // A created view may have taken a name that already had a definition, and the
   // server's own note about that IS the answer — shown, not swallowed.
   ui.toast(typeof r === 'string' ? r : t('view created'))
   catalog.sel = view
+  emit('created', view)
   ui.reload()
 }
 </script>
@@ -83,7 +114,7 @@ async function create(): Promise<void> {
     <FieldRow for="new-base-name" label="name">
       <input id="new-base-name" v-model="name" placeholder="project-x" />
     </FieldRow>
-    <FieldRow v-if="selectable" for="new-base-pg" label="PG instance">
+    <FieldRow v-if="showInstanceField" for="new-base-pg" label="PG instance">
       <select id="new-base-pg" v-model="instance">
         <option value="">{{ autoLabel }}</option>
         <option v-for="i in instances" :key="i.name" :value="i.name">

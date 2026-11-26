@@ -240,7 +240,10 @@ impl GovConn {
             )
         })?;
         let _ = sock.set_nodelay(true);
-        let reader = BufReader::new(sock.try_clone().map_err(|e| format!("control socket: {e}"))?);
+        let reader = BufReader::new(
+            sock.try_clone()
+                .map_err(|e| format!("control socket: {e}"))?,
+        );
         Ok(Self {
             reader,
             writer: sock,
@@ -300,11 +303,7 @@ impl GovPool {
     /// socket is the only one that has to present the credential.
     fn checkout(&self, addr: &str) -> Result<(GovConn, bool), String> {
         loop {
-            let candidate = self
-                .idle
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .pop();
+            let candidate = self.idle.lock().unwrap_or_else(|e| e.into_inner()).pop();
             match candidate {
                 Some(c) if c.idle_since.elapsed() < POOL_IDLE => return Ok((c, false)),
                 // Aged out: closed here rather than written into. Nothing was
@@ -556,7 +555,7 @@ fn as_str_list(v: &Value, what: &str) -> Result<Vec<String>, String> {
 }
 
 /// A count from a stats reply. Missing or negative is a protocol error, never
-/// a zero: reporting "0 shared object(s)" for a reply the client did not
+/// a zero: reporting "0 shared objects" for a reply the client did not
 /// understand would read as a successful fork that copied nothing.
 fn count_field(v: &Value, what: &str) -> Result<i64, String> {
     v.get(what)
@@ -781,7 +780,14 @@ mod tests {
     /// without anyone deciding it should.
     #[test]
     fn a_one_shot_request_is_the_classic_envelope() {
-        let body = request_body(Some("abc:secret"), false, "view.list", json!({"x": 1}), None).unwrap();
+        let body = request_body(
+            Some("abc:secret"),
+            false,
+            "view.list",
+            json!({"x": 1}),
+            None,
+        )
+        .unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["k"], json!("abc:secret"));
         assert_eq!(v["op"], json!("view.list"));
@@ -798,7 +804,8 @@ mod tests {
     #[test]
     fn a_pinned_request_carries_the_attribution_the_acl_needs() {
         let actor = ("rootops".to_string(), "10.0.0.7".to_string());
-        let body = request_body(Some("abc:secret"), true, "whoami", json!({}), Some(&actor)).unwrap();
+        let body =
+            request_body(Some("abc:secret"), true, "whoami", json!({}), Some(&actor)).unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["pin"], json!(true));
         assert_eq!(v["account"], json!("rootops"));
@@ -809,7 +816,10 @@ mod tests {
         // the next reconnect.
         let body = request_body(None, true, "whoami", json!({}), Some(&actor)).unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
-        assert!(v.get("k").is_none(), "a reused request presents no secret: {v}");
+        assert!(
+            v.get("k").is_none(),
+            "a reused request presents no secret: {v}"
+        );
         assert_eq!(v["account"], json!("rootops"));
     }
 
@@ -824,9 +834,16 @@ mod tests {
         assert_eq!(r.out.unwrap(), json!({"a": 1}));
         assert!(r.keep, "the server said it pinned us");
 
-        let r = reply_of(0, br#"{"ok":false,"e":"not permitted","pinned":true}"#, "h:1");
+        let r = reply_of(
+            0,
+            br#"{"ok":false,"e":"not permitted","pinned":true}"#,
+            "h:1",
+        );
         assert_eq!(r.out.unwrap_err(), "not permitted");
-        assert!(r.keep, "a governance refusal is an answer, not a broken socket");
+        assert!(
+            r.keep,
+            "a governance refusal is an answer, not a broken socket"
+        );
 
         let r = reply_of(0, br#"{"ok":true,"r":7}"#, "h:1");
         assert_eq!(r.out.unwrap(), json!(7));
@@ -873,10 +890,13 @@ mod tests {
                     // One thread per accepted socket, requests served in order:
                     // the shape the real handler has for a pinned caller.
                     while let Ok((_op, body)) = proto::recv_request(&mut sock) {
-                        let req: Value =
-                            serde_json::from_slice(&body).unwrap_or(Value::Null);
+                        let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
                         if req.get("pin").and_then(Value::as_bool) == Some(true)
-                            && req.get("k").and_then(Value::as_str).unwrap_or("").is_empty()
+                            && req
+                                .get("k")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .is_empty()
                         {
                             k2.fetch_add(1, Ordering::SeqCst);
                         }
@@ -917,7 +937,11 @@ mod tests {
                 "the reply must be the answer to THIS call"
             );
         }
-        assert_eq!(fake.conns.load(Ordering::SeqCst), 1, "three calls, one socket");
+        assert_eq!(
+            fake.conns.load(Ordering::SeqCst),
+            1,
+            "three calls, one socket"
+        );
         assert_eq!(fake.requests.load(Ordering::SeqCst), 3);
         assert_eq!(
             fake.keyless.load(Ordering::SeqCst),
@@ -989,7 +1013,10 @@ mod tests {
         let ctl = ControlClient::pooled(&addr, "abc:secret", 1);
         assert_eq!(ctl.call("info", json!({})).unwrap(), json!("info"));
         let e = ctl.call("view.rm", json!({"view": "x"})).unwrap_err();
-        assert!(e.contains("not per-view governance"), "the server's words: {e}");
+        assert!(
+            e.contains("not per-view governance"),
+            "the server's words: {e}"
+        );
         // Third call lands on the SAME socket: it got no reply if the refusal
         // threw the connection away, so the count below is the claim.
         assert_eq!(ctl.call("whoami", json!({})).unwrap(), json!("whoami"));
@@ -998,7 +1025,11 @@ mod tests {
             1,
             "a refusal must not cost the gateway a reconnect"
         );
-        assert_eq!(hits.load(Ordering::SeqCst), 3, "three requests, one connection");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            3,
+            "three requests, one connection"
+        );
     }
 
     /// Both paths must describe an unreachable plane in the one sentence the

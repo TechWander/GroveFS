@@ -180,8 +180,8 @@ mod tests {
             "-1.00aa",
             "+1.00aa",
             " 1.00aa",
-            "1.00",      // short signature
-            "1.0zz",     // non-hex
+            "1.00",         // short signature
+            "1.0zz",        // non-hex
             "007.deadbeef", // leading zeros parse but signature won't match
         ] {
             assert_ne!(verify(K, bad, 0), Verdict::Valid, "accepted {bad:?}");

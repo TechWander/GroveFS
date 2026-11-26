@@ -15,6 +15,8 @@ import { defineStore } from 'pinia'
 export interface KindFilter {
   q: string
   kind: string
+  /** A metadata instance name, or `all`. Set by a Storage card / deep link. */
+  instance: string
 }
 
 export interface KeyFilter {
@@ -28,11 +30,17 @@ export interface AccountFilter {
   q: string
   role: string
   state: string
+  /** Only accounts delegated this base view (`all` = everyone). */
+  view: string
 }
 
 export interface AuditFilter {
   q: string
   window: string
+  /** Inclusive `YYYY-MM-DD` bounds, read only when `window === 'custom'`.
+      Empty string = open end. */
+  from: string
+  to: string
   plane: string
   op: string
   verdict: string
@@ -47,12 +55,14 @@ export interface AuditFilter {
 }
 
 const fresh = {
-  views: (): KindFilter => ({ q: '', kind: 'all' }),
+  views: (): KindFilter => ({ q: '', kind: 'all', instance: 'all' }),
   keys: (): KeyFilter => ({ q: '', state: 'all', scope: 'all', view: 'all' }),
-  accounts: (): AccountFilter => ({ q: '', role: 'all', state: 'all' }),
+  accounts: (): AccountFilter => ({ q: '', role: 'all', state: 'all', view: 'all' }),
   audit: (): AuditFilter => ({
     q: '',
     window: 'all',
+    from: '',
+    to: '',
     plane: 'all',
     op: 'all',
     verdict: 'all',

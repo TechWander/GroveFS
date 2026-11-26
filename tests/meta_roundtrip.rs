@@ -401,7 +401,10 @@ fn genuine_meta_arms_data_but_rogue_meta_does_not() {
         })
         .expect("genuine meta should accept M_OPEN");
     let genuine = good.data_access_capability();
-    assert!(!genuine.is_empty(), "a --data-access-key meta must mint one");
+    assert!(
+        !genuine.is_empty(),
+        "a --data-access-key meta must mint one"
+    );
     assert_eq!(
         dac::verify(KEY, &genuine, dac::now_secs()),
         dac::Verdict::Valid,
@@ -410,13 +413,15 @@ fn genuine_meta_arms_data_but_rogue_meta_does_not() {
 
     // Replay it on the data plane: opens and performs real read/write.
     let b = (0..100)
-        .find_map(|_| match RemoteBackend::new_with_dac(&data_addr, "", "", &genuine) {
-            Ok(c) => Some(c),
-            Err(_) => {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-                None
-            }
-        })
+        .find_map(
+            |_| match RemoteBackend::new_with_dac(&data_addr, "", "", &genuine) {
+                Ok(c) => Some(c),
+                Err(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    None
+                }
+            },
+        )
         .expect("a genuine-meta capability should open the honest data plane");
     b.create("obj").unwrap();
     b.write("obj", 0, b"real-data").unwrap();

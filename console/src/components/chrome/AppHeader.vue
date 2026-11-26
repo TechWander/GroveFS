@@ -17,6 +17,7 @@ import { useUiStore } from '@/stores/ui'
 import { t } from '@/i18n'
 import BrandMark from './BrandMark.vue'
 import LangToggle from './LangToggle.vue'
+import ThemeToggle from './ThemeToggle.vue'
 import NavIcon from './NavIcon.vue'
 
 const session = useSessionStore()
@@ -52,6 +53,8 @@ async function signOut(): Promise<void> {
         type="button"
         :class="{ on: current === p.name }"
         :aria-current="current === p.name ? 'page' : undefined"
+        :title="t(p.label)"
+        :aria-label="t(p.label)"
         @click="go(p.name)"
       >
         <span class="idx" aria-hidden="true">{{ String(i + 1).padStart(2, '0') }}</span>
@@ -60,6 +63,7 @@ async function signOut(): Promise<void> {
       </button>
     </nav>
     <div class="who">
+      <ThemeToggle />
       <LangToggle />
       <span id="who-account">{{ session.account }}</span>
       <span id="who-role" :class="['badge', session.role === 'admin' ? 'admin' : '']">

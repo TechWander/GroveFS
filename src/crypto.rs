@@ -177,8 +177,16 @@ mod tests {
         let hex = key_to_hex(&key);
         assert_eq!(hex.len(), KEY_BYTES * 2);
         assert_eq!(key_from_hex(&hex), Some(key));
-        assert_eq!(key_from_hex(&format!("  {hex}\n")), Some(key), "file whitespace");
-        assert_eq!(key_from_hex(&hex[..62]), None, "31 bytes is refused, not zero-padded");
+        assert_eq!(
+            key_from_hex(&format!("  {hex}\n")),
+            Some(key),
+            "file whitespace"
+        );
+        assert_eq!(
+            key_from_hex(&hex[..62]),
+            None,
+            "31 bytes is refused, not zero-padded"
+        );
         assert_eq!(key_from_hex("nope"), None);
         assert_eq!(from_hex("0zz0"), None);
     }

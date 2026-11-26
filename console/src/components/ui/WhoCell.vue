@@ -31,7 +31,7 @@ const initials = computed(() =>
 </script>
 
 <template>
-  <span v-if="!props.name" class="muted">{{ t('unassigned') }}</span>
+  <span v-if="!props.name" class="muted unassigned">{{ t('unassigned') }}</span>
   <div v-else class="who-cell">
     <span :class="['avatar', { off: props.off }]">{{ initials }}</span>
     <div>

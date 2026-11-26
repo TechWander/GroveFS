@@ -241,10 +241,16 @@ fn unexpected(what: &str, r: &Reply) -> String {
 
 impl Fail {
     fn code(code: u16, msg: Vec<u8>) -> Fail {
-        Fail { code: Some(code), msg: String::from_utf8_lossy(&msg).into_owned() }
+        Fail {
+            code: Some(code),
+            msg: String::from_utf8_lossy(&msg).into_owned(),
+        }
     }
     fn db(msg: impl Into<String>) -> Fail {
-        Fail { code: None, msg: msg.into() }
+        Fail {
+            code: None,
+            msg: msg.into(),
+        }
     }
 
     /// treedb 的富 errno → grovefs 那 6 个 `MetaError` 变体。这张表就是
@@ -356,9 +362,14 @@ impl TreedbStore {
         let key = auth_key().map_err(io::Error::other)?;
         let mut c = Client::connect_auth(addr, CONNECT_TIMEOUT_MS, key.as_deref())
             .map_err(|e| io::Error::other(format!("treedb connect {addr}: {e}")))?;
-        match c.call(&Op::DropView { name: view.as_bytes().to_vec() }) {
+        match c.call(&Op::DropView {
+            name: view.as_bytes().to_vec(),
+        }) {
             Ok(Reply::Ok) => Ok(true),
-            Ok(Reply::Err { code: errno::ENOENT, .. }) => Ok(false),
+            Ok(Reply::Err {
+                code: errno::ENOENT,
+                ..
+            }) => Ok(false),
             Ok(Reply::Err { code, msg }) => Err(io::Error::other(format!(
                 "treedb DropView '{view}': errno {code} ({})",
                 String::from_utf8_lossy(&msg)
@@ -474,7 +485,10 @@ impl TreedbStore {
     fn lookup_view_id(&self) -> Result<Option<u32>, Fail> {
         let want = self.view.as_bytes();
         match self.xcall(&Op::ListViews) {
-            Ok(Reply::Views(v)) => Ok(v.into_iter().find(|(n, _, _)| n == want).map(|(_, id, _)| id)),
+            Ok(Reply::Views(v)) => Ok(v
+                .into_iter()
+                .find(|(n, _, _)| n == want)
+                .map(|(_, id, _)| id)),
             Ok(r) => Err(Fail::db(format!("treedb ListViews: {r:?}"))),
             Err(e) => Err(e),
         }
@@ -483,7 +497,9 @@ impl TreedbStore {
     /// `CreateView`，名字已存在就退回查 id —— 这正是 grovefs「同一个 view 第二次
     /// open」的常见路径，不是错误。
     fn resolve_or_create_view(&self) -> Result<u32, Fail> {
-        let op = Op::CreateView { name: self.view.as_bytes().to_vec() };
+        let op = Op::CreateView {
+            name: self.view.as_bytes().to_vec(),
+        };
         match self.xcall(&op) {
             Ok(Reply::View { id, root }) => {
                 // 引擎的 root ino 恒 1，grovefs 的 `ROOT_INO` 也是 1。不是 1 就说明
@@ -495,7 +511,10 @@ impl TreedbStore {
                 }
                 Ok(id)
             }
-            Ok(Reply::Err { code: errno::EEXIST, .. }) => self
+            Ok(Reply::Err {
+                code: errno::EEXIST,
+                ..
+            }) => self
                 .lookup_view_id()?
                 .ok_or_else(|| Fail::db("treedb: CreateView said EEXIST but ListViews has no row")),
             Ok(other) => Err(Fail::db(unexpected("treedb CreateView", &other))),
@@ -510,7 +529,10 @@ impl TreedbStore {
     /// 写路径的统一闸门：只读档不碰引擎。
     fn gate_write(&self) -> Result<(), Fail> {
         if self.readonly {
-            Err(Fail::code(errno::EROFS, "readonly store".as_bytes().to_vec()))
+            Err(Fail::code(
+                errno::EROFS,
+                "readonly store".as_bytes().to_vec(),
+            ))
         } else {
             Ok(())
         }
@@ -528,9 +550,20 @@ impl TreedbStore {
     /// 字节，索性不带 `link`（treedb 仓 `DESIGN.md` §4.2），所以这一页里的 symlink
     /// 还得各取一次属性。数据目录里 symlink 罕见，这个补丁通常整页为空。
     fn page(&self, parent: i64, offset: u64, limit: u32) -> Result<Vec<NodeInfo>, Fail> {
-        let op = Op::ReadDirPlus { view: self.vid(), parent: parent as u64, offset, limit };
+        let op = Op::ReadDirPlus {
+            view: self.vid(),
+            parent: parent as u64,
+            offset,
+            limit,
+        };
         let (inos, kinds, names, attrs) = match Self::val(self.xcall(&op)?)? {
-            Reply::DirentsPlus { inos, kinds, names, attrs, .. } => (inos, kinds, names, attrs),
+            Reply::DirentsPlus {
+                inos,
+                kinds,
+                names,
+                attrs,
+                ..
+            } => (inos, kinds, names, attrs),
             other => return Err(Fail::db(unexpected("treedb ReadDirPlus", &other))),
         };
         // 四条数组同长是引擎侧的承诺（少一项就是整页错位，那比一个零属性糟得多），
@@ -555,7 +588,10 @@ impl TreedbStore {
                 continue;
             }
             let kind = Kind::from_code(kinds[i]).map_err(|e| {
-                Fail::db(format!("treedb DirentsPlus: kind byte {} at row {i}: {e}", kinds[i]))
+                Fail::db(format!(
+                    "treedb DirentsPlus: kind byte {} at row {i}: {e}",
+                    kinds[i]
+                ))
             })?;
             let kind = kind_of(kind);
             if matches!(kind, NodeKind::Symlink) {
@@ -604,7 +640,10 @@ impl TreedbStore {
         for chunk in inos.chunks(ATTR_BATCH) {
             let ops: Vec<Op> = chunk
                 .iter()
-                .map(|&ino| Op::Getattr { view: self.vid(), ino })
+                .map(|&ino| Op::Getattr {
+                    view: self.vid(),
+                    ino,
+                })
                 .collect();
             for r in self.xpipe(&ops)? {
                 if let Ok(n) = Self::want_node(r) {
@@ -635,14 +674,36 @@ impl TreedbStore {
     }
 
     /// 建一条 inode。`Reply::Node` 已带全属性，所以 `*_with_attr` 不必二次读。
-    fn create(&self, parent: i64, name: &str, is_dir: bool, mode: u32, uid: u32, gid: u32) -> Result<Node, Fail> {
+    fn create(
+        &self,
+        parent: i64,
+        name: &str,
+        is_dir: bool,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Node, Fail> {
         self.gate_write()?;
         let v = self.vid();
         let name = name.as_bytes().to_vec();
         let op = if is_dir {
-            Op::Mkdir { view: v, parent: parent as u64, name, mode, uid, gid }
+            Op::Mkdir {
+                view: v,
+                parent: parent as u64,
+                name,
+                mode,
+                uid,
+                gid,
+            }
         } else {
-            Op::Create { view: v, parent: parent as u64, name, mode, uid, gid }
+            Op::Create {
+                view: v,
+                parent: parent as u64,
+                name,
+                mode,
+                uid,
+                gid,
+            }
         };
         Self::want_node(self.xcall(&op)?)
     }
@@ -672,10 +733,18 @@ impl TreedbStore {
         self.gate_write()?;
         let v = self.vid();
         let n = name.as_bytes().to_vec();
-        match self.xcall(&Op::Unlink { view: v, parent: parent as u64, name: n.clone() }) {
+        match self.xcall(&Op::Unlink {
+            view: v,
+            parent: parent as u64,
+            name: n.clone(),
+        }) {
             Ok(r) => Self::want_freed(r),
             Err(f) if f.code == Some(errno::EISDIR) => {
-                Self::want_freed(self.xcall(&Op::Rmdir { view: v, parent: parent as u64, name: n })?)
+                Self::want_freed(self.xcall(&Op::Rmdir {
+                    view: v,
+                    parent: parent as u64,
+                    name: n,
+                })?)
             }
             Err(f) => Err(f),
         }
@@ -710,7 +779,11 @@ impl TreedbStore {
 
 impl MetaProvider for TreedbStore {
     fn lookup(&self, parent: i64, name: &str) -> Option<NodeInfo> {
-        let op = Op::Lookup { view: self.vid(), parent: parent as u64, name: name.as_bytes().to_vec() };
+        let op = Op::Lookup {
+            view: self.vid(),
+            parent: parent as u64,
+            name: name.as_bytes().to_vec(),
+        };
         self.xcall(&op)
             .ok()
             .and_then(|r| Self::want_node(r).ok())
@@ -718,7 +791,10 @@ impl MetaProvider for TreedbStore {
     }
 
     fn getattr(&self, ino: i64) -> Option<NodeInfo> {
-        let op = Op::Getattr { view: self.vid(), ino: ino as u64 };
+        let op = Op::Getattr {
+            view: self.vid(),
+            ino: ino as u64,
+        };
         self.xcall(&op)
             .ok()
             .and_then(|r| Self::want_node(r).ok())
@@ -826,7 +902,12 @@ impl MetaProvider for TreedbStore {
 
     /// 没有 `Link` op：一个 inode 只有一条路径。回 EPERM，与 `ln` 在只读名字空间
     /// 上失败同样可见，绝不返回「成功了但其实又建了一条 dentry」。
-    fn link_node(&self, _src_ino: i64, _new_parent: i64, _new_name: &str) -> Result<i64, MetaError> {
+    fn link_node(
+        &self,
+        _src_ino: i64,
+        _new_parent: i64,
+        _new_name: &str,
+    ) -> Result<i64, MetaError> {
         Err(Fail::code(errno::EPERM, b"treedb has no hardlinks".to_vec()).to_meta())
     }
 
@@ -854,7 +935,9 @@ impl MetaProvider for TreedbStore {
         // 应答里的 GC 线索与 SQLite/PG 档的 `Ok(Some(key))` 同位：调用方拿它去
         // `backend.remove(key)`。判定在引擎侧与删 dentry 同 op 完成，所以没有
         // 「先 unlink 再问引用数」那个窗口。
-        self.xcall(&op).and_then(Self::want_freed).map_err(|f| f.to_meta())
+        self.xcall(&op)
+            .and_then(Self::want_freed)
+            .map_err(|f| f.to_meta())
     }
 
     fn set_mode(&self, ino: i64, mode: u32) {

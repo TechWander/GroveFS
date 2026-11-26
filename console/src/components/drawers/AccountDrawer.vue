@@ -17,6 +17,8 @@
 import { computed, ref } from 'vue'
 import type { AccountRow, GrantRow, KeyRow } from '@/types'
 import { useCatalogStore } from '@/stores/catalog'
+import { useUiStore } from '@/stores/ui'
+import { useNav } from '@/composables/useNav'
 import { t } from '@/i18n'
 import BaseDrawer from '@/components/overlay/BaseDrawer.vue'
 import DrawerSection from '@/components/overlay/DrawerSection.vue'
@@ -39,7 +41,16 @@ const props = defineProps<{
 const emit = defineEmits<{ close: [] }>()
 
 const catalog = useCatalogStore()
+const ui = useUiStore()
+const { openKeysOf } = useNav()
 const pwOpen = ref(false)
+
+/** The credential registry is the keys page's job; hand over with the owner
+    filter already applied instead of duplicating a second list here. */
+function keysOfThisAccount(): void {
+  ui.closeDrawer()
+  void openKeysOf(props.row.account)
+}
 
 /** Every non-base name that resolves through one of this account's delegations. */
 const reach = computed(() =>
@@ -128,6 +139,11 @@ const reach = computed(() =>
         :empty="'no keys you can see'"
       />
       <p v-else class="muted">{{ t('no keys in its name') }}</p>
+      <p v-if="props.keys?.length">
+        <button type="button" class="link" @click="keysOfThisAccount">
+          {{ t('All keys in this account’s name…') }}
+        </button>
+      </p>
     </DrawerSection>
 
     <template v-if="props.isSelf" #left>{{ t('this is you') }}</template>

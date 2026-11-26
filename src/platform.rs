@@ -288,12 +288,16 @@ pub fn bind_listener(addr: &str) -> std::io::Result<std::net::TcpListener> {
     };
     if rc != 0 {
         let e = std::io::Error::last_os_error();
-        unsafe { libc::close(fd); }
+        unsafe {
+            libc::close(fd);
+        }
         return Err(e);
     }
     if unsafe { libc::listen(fd, 128) } != 0 {
         let e = std::io::Error::last_os_error();
-        unsafe { libc::close(fd); }
+        unsafe {
+            libc::close(fd);
+        }
         return Err(e);
     }
     Ok(unsafe { std::net::TcpListener::from_raw_fd(fd) })

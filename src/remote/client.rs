@@ -126,12 +126,7 @@ impl RemoteBackend {
     /// a capability it can verify, so data access becomes contingent on having
     /// passed a genuine meta admission (see [`crate::remote::dac`]). An empty
     /// `dac` (a meta-server without the feature) is the unchanged pre-DAC path.
-    pub fn new_with_dac(
-        addr: &str,
-        token: &str,
-        api_key: &str,
-        dac: &str,
-    ) -> io::Result<Self> {
+    pub fn new_with_dac(addr: &str, token: &str, api_key: &str, dac: &str) -> io::Result<Self> {
         let this = Self {
             addr: addr.to_string(),
             token: token.to_string(),
@@ -226,10 +221,10 @@ impl RemoteBackend {
                     s.set_read_timeout(Some(self.connect_timeout))?;
                     s.set_write_timeout(Some(self.connect_timeout))?;
                     s.set_nodelay(true)?; // LAN: avoid Nagle delaying small request frames
-                    // Pooled sockets live long between ops; a vanished client
-                    // (power cut, link down) must surface as a read error on
-                    // the SERVER side too — the server's accept loop enables
-                    // keepalive, and this mirrors it on the client end.
+                                          // Pooled sockets live long between ops; a vanished client
+                                          // (power cut, link down) must surface as a read error on
+                                          // the SERVER side too — the server's accept loop enables
+                                          // keepalive, and this mirrors it on the client end.
                     crate::remote::enable_tcp_keepalive(&s);
                     let mut body = Vec::new();
                     proto::put_key(&mut body, &self.token);

@@ -2,6 +2,7 @@ import { createRouter, createWebHashHistory } from 'vue-router'
 import type { Component } from 'vue'
 import OverviewPage from '@/pages/OverviewPage.vue'
 import ViewsPage from '@/pages/ViewsPage.vue'
+import StoragePage from '@/pages/StoragePage.vue'
 import KeysPage from '@/pages/KeysPage.vue'
 import AccountsPage from '@/pages/AccountsPage.vue'
 import AuditPage from '@/pages/AuditPage.vue'
@@ -29,7 +30,7 @@ export interface PageMeta {
   /** Dictionary key of the nav label (English text doubles as the key). */
   label: string
   /** Which inline `<svg>` the nav button draws — see `NavIcon.vue`. */
-  icon: 'overview' | 'views' | 'keys' | 'accounts' | 'audit'
+  icon: 'overview' | 'views' | 'storage' | 'keys' | 'accounts' | 'audit'
   component: Component
 }
 
@@ -42,6 +43,13 @@ export const PAGES: PageMeta[] = [
     component: OverviewPage,
   },
   { name: 'views', path: '/views', label: 'Views', icon: 'views', component: ViewsPage },
+  {
+    name: 'storage',
+    path: '/storage',
+    label: 'Storage',
+    icon: 'storage',
+    component: StoragePage,
+  },
   { name: 'keys', path: '/keys', label: 'Keys', icon: 'keys', component: KeysPage },
   {
     name: 'accounts',
@@ -67,4 +75,8 @@ export const routes = [
 export const router = createRouter({
   history: createWebHashHistory(),
   routes,
+  /* The header is sticky, so a reader can switch pages from halfway down a
+     long audit table. A new destination starts at its own top, not at the old
+     page's scroll offset. */
+  scrollBehavior: () => ({ top: 0 }),
 })

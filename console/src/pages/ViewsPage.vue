@@ -15,6 +15,7 @@
 */
 import { useCatalogStore } from '@/stores/catalog'
 import { usePageLoad } from '@/composables/usePageLoad'
+import { useNav } from '@/composables/useNav'
 import { useUiStore } from '@/stores/ui'
 import PageHead from '@/components/layout/PageHead.vue'
 import ActionButton from '@/components/ui/ActionButton.vue'
@@ -24,6 +25,11 @@ import ViewDetail from '@/components/views/ViewDetail.vue'
 
 const catalog = useCatalogStore()
 const ui = useUiStore()
+const { consumeQuery } = useNav()
+
+/* Apply `?instance=` / `?view=` before the first render: a card clicked on the
+   Storage page lands here with the filter already set, not one frame later. */
+consumeQuery()
 
 function refresh(): void {
   ui.reload()
@@ -31,9 +37,10 @@ function refresh(): void {
 
 /* `loadViews` keeps its own error (three pages share the list, and a refusal in
    one must not blank the other two), so the page reads the failure from the
-   store rather than from this hook. */
+   store rather than from this hook. `loadStorage` is soft: a delegated account
+   cannot read `store.info`, and the list simply has no instance column for it. */
 const { pending } = usePageLoad(async () => {
-  await catalog.loadViews(true)
+  await Promise.all([catalog.loadViews(true), catalog.loadStorage(true)])
 })
 </script>
 

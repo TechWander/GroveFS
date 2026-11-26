@@ -52,7 +52,10 @@ use std::sync::Arc;
 
 use crate::apikeys::{ApiKeyStore, AuthedKey};
 use crate::control::{schema_name_for, view_from_schema_name, PgPool};
-use crate::layout::{canon, valid_view_name, LayoutMeta, LayoutRules, ViewDef};
+use crate::layout::{
+    canon, valid_view_name, view_name_error as valid_view_name_error, LayoutMeta, LayoutRules,
+    ViewDef,
+};
 use crate::meta::{MetaEngine, MetaProvider, NodeKind, ROOT_INO};
 
 /// Protocol revision we advertise when the client does not name one.
@@ -292,10 +295,19 @@ pub trait ControlStore: Send + Sync {
     /// File stores check the db file; the PG store never warns (a missing
     /// schema is reported by the op that needs it, not by a pre-flight note).
     fn base_tree_missing_note(&self, view: &str) -> Result<Option<String>, String>;
+    /// The store-relative path of `view`'s tree home (`meta/<B>/<F>/<F>.db`
+    /// since layout v3), for operator-facing lines. Backends whose trees are
+    /// not directories under a base (PG schemas) return "" and their callers
+    /// print the schema name instead.
+    fn tree_home_rel(&self, _view: &str) -> String {
+        String::new()
+    }
 }
 
-/// The local-file control plane: `<base>/meta/views/<name>.layout` slots plus
-/// the physical `<base>/meta/<view>/<view>.db` trees (the SQLite system of
+/// The local-file control plane: the `<name>.layout` definition slots — top
+/// level under `meta/views/` and, since layout v3, inside a base view's
+/// family directory — plus the physical `<base>/meta/.../<view>.db` trees
+/// (the SQLite system of
 /// record, unchanged in meaning since layout v2 moved each tree into a directory
 /// of its own).
 pub struct FileControlStore {
@@ -313,8 +325,25 @@ impl FileControlStore {
         crate::meta::defs_dir(&self.base)
     }
 
+    /// The definition slot for an existing name resolves by scan (a def that
+    /// moved into its base's family directory is still found); a fresh one
+    /// falls back to the top-level `meta/views/` spelling here — the
+    /// family-aware fresh placement is [`put_def`]'s decision via
+    /// [`crate::meta::new_def_slot`].
     fn slot(&self, name: &str) -> PathBuf {
-        self.def_dir().join(format!("{name}.layout"))
+        crate::meta::find_def_slot(&self.base, name)
+            .unwrap_or_else(|| self.def_dir().join(format!("{name}.layout")))
+    }
+
+    /// The base view a definition body names (`alias`/`fork`/`base`), which is
+    /// the family directory a FRESH definition slot lands in. An unparseable
+    /// body places at the top level — writing a definition never refuses on
+    /// parse grounds (the ops that read it report the malformation).
+    fn def_parent(&self, text: &str) -> Option<String> {
+        match LayoutRules::parse_def(text) {
+            Ok(ViewDef::Alias(b)) | Ok(ViewDef::Fork(b)) | Ok(ViewDef::Derived(b, _)) => Some(b),
+            Err(_) => None,
+        }
     }
 
     fn db(&self, name: &str) -> PathBuf {
@@ -338,22 +367,45 @@ impl ControlStore for FileControlStore {
         format!("{} (local files)", self.base.display())
     }
 
+    fn tree_home_rel(&self, view: &str) -> String {
+        crate::meta::tree_home_rel(&self.base, view)
+    }
+
     fn list_defs(&self) -> Result<Vec<(String, String)>, String> {
-        let dir = self.def_dir();
+        // v3: definitions live at the top level AND inside base family
+        // directories (`meta/<B>/<n>.layout`, `meta/<B>/views/<n>.layout`).
+        // Enumerate exactly those slots; a tree directory's other contents
+        // (sidecars, scratch) are not definitions, and names are unique
+        // across the store so first-seen wins.
         let mut out = Vec::new();
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            for ent in rd.flatten() {
-                let p = ent.path();
-                if p.extension().and_then(|e| e.to_str()) != Some("layout") {
-                    continue;
+        let mut seen: Vec<String> = Vec::new();
+        let collect = |dir: &Path, out: &mut Vec<(String, String)>, seen: &mut Vec<String>| {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for ent in rd.flatten() {
+                    let p = ent.path();
+                    if p.extension().and_then(|e| e.to_str()) != Some("layout") {
+                        continue;
+                    }
+                    let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
+                        continue;
+                    };
+                    if seen.iter().any(|s| s == stem) {
+                        continue;
+                    }
+                    let text = std::fs::read_to_string(&p)
+                        .map_err(|e| format!("cannot read {}: {e}", p.display()))?;
+                    seen.push(stem.to_string());
+                    out.push((stem.to_string(), text));
                 }
-                let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
-                    continue;
-                };
-                let text = std::fs::read_to_string(&p)
-                    .map_err(|e| format!("cannot read {}: {e}", p.display()))?;
-                out.push((stem.to_string(), text));
             }
+            Ok(())
+        };
+        collect(&self.def_dir(), &mut out, &mut seen).map_err(|e: String| e)?;
+        for b in crate::meta::list_view_trees(&self.base) {
+            let bd = crate::meta::view_dir(&self.base, &b);
+            collect(&bd, &mut out, &mut seen).map_err(|e: String| e)?;
+            collect(&bd.join(crate::meta::DEFS_SUBDIR), &mut out, &mut seen)
+                .map_err(|e: String| e)?;
         }
         Ok(out)
     }
@@ -369,9 +421,23 @@ impl ControlStore for FileControlStore {
     }
 
     fn put_def(&self, name: &str, text: &str) -> Result<(), String> {
-        let dir = self.def_dir();
-        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        std::fs::write(self.slot(name), text).map_err(|e| e.to_string())
+        // An existing slot is updated IN PLACE wherever it lives (flipping the
+        // family policy never re-homes a definition); a fresh one lands inside
+        // the base it names, per the store's family policy.
+        let p = match crate::meta::find_def_slot(&self.base, name) {
+            Some(p) => p,
+            None => {
+                let parent = self.def_parent(text);
+                // A member of a base whose tree is gone stays at the top
+                // level — the family dir would dangle.
+                let anchor = parent.filter(|b| crate::meta::find_view_db(&self.base, b).is_some());
+                crate::meta::new_def_slot(&self.base, name, anchor.as_deref())
+            }
+        };
+        if let Some(dir) = p.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(&p, text).map_err(|e| e.to_string())
     }
 
     fn remove_def(&self, name: &str) -> Result<bool, String> {
@@ -591,11 +657,12 @@ impl ControlStore for PgControlStore {
         // say so instead of a wrong instance count (the pool's own URI is
         // always printable).
         let shard_note = match crate::pg_store::store_uris(&self.spec) {
-            Ok(uris) if uris.len() > 1 => {
-                format!(", view trees placed across {} instance(s)", uris.len())
-            }
+            Ok(uris) if uris.len() > 1 => format!(
+                ", view trees placed across {}",
+                crate::cli_style::plural(uris.len(), "instance", "instances")
+            ),
             Ok(_) if !self.shards.lock().is_empty() => {
-                ", view trees placed across multiple instance(s)".to_string()
+                ", view trees placed across multiple instances".to_string()
             }
             Ok(_) => String::new(),
             Err(e) => format!(", instance registry unreadable: {e}"),
@@ -652,10 +719,7 @@ impl ControlStore for PgControlStore {
         // view's schema exists on exactly one of them, and `view list` must
         // show every tree, not only the control instance's.
         let mut out: Vec<String> = Vec::new();
-        for (i, uri) in crate::pg_store::store_uris(&self.spec)?
-            .iter()
-            .enumerate()
-        {
+        for (i, uri) in crate::pg_store::store_uris(&self.spec)?.iter().enumerate() {
             let pool = if i == 0 {
                 Arc::clone(&self.pool)
             } else {
@@ -871,9 +935,7 @@ fn check_derived_definition(
     rules_text: &str,
 ) -> Result<LayoutRules, String> {
     if !valid_view_name(name) {
-        return Err(format!(
-            "invalid view name '{name}' (must be one safe path element)"
-        ));
+        return Err(valid_view_name_error(name));
     }
     if !valid_view_name(base) {
         return Err(format!("invalid base view name '{base}'"));
@@ -931,10 +993,10 @@ pub fn define_view(
     }
     store.put_def(name, &format!("base {base}\n{rules_text}"))?;
     out.push(OutLine::Info(format!(
-        "defined derived view '{name}' over base '{base}': {} hide, {} only, {} reloc rule(s)",
+        "defined derived view '{name}' over base '{base}': {} hide, {} only, {}",
         r.hide.len(),
         r.only.len(),
-        r.reloc.len()
+        crate::cli_style::plural(r.reloc.len(), "reloc rule", "reloc rules")
     )));
     out.push(OutLine::Note(format!(
         "note: mounts of '{name}' are read-only (virtual shape) — write to base view '{base}'"
@@ -1215,8 +1277,9 @@ pub fn fork_view_seeded(
     }
     Ok(vec![
         OutLine::Info(format!(
-            "forked view '{name}' from base '{base}': {} entries, {} shared object(s)",
-            stats.nodes, stats.blobs
+            "forked view '{name}' from base '{base}': {} entries, {}",
+            stats.nodes,
+            crate::cli_style::plural(stats.blobs as usize, "shared object", "shared objects")
         )),
         OutLine::Note(format!(
             "note: '{name}' is an independent metadata tree — mkdir/rename/unlink are writable, content writes (write/truncate) are refused with EROFS; deletes remove only this view's names and never touch '{base}'"
@@ -1445,12 +1508,11 @@ pub fn graft_view(
     };
     let mut out = vec![
         OutLine::Info(format!(
-            "grafted {} entr{} ({} director{}) from '{src_name}' into '{name}' at {where_to}: {} shared object(s), {} skipped",
-            st.nodes,
-            if st.nodes == 1 { "y" } else { "ies" },
+            "grafted {} ({} director{}) from '{src_name}' into '{name}' at {where_to}: {}, {} skipped",
+            crate::cli_style::plural(st.nodes as usize, "entry", "entries"),
             st.dirs,
             if st.dirs == 1 { "y" } else { "ies" },
-            st.blobs,
+            crate::cli_style::plural(st.blobs as usize, "shared object", "shared objects"),
             st.skipped
         )),
         OutLine::Note(
@@ -1479,8 +1541,12 @@ fn entry_line(e: &ViewEntry) -> String {
             e.name, e.real_view
         ),
         _ => format!(
-            "view '{}' -> base '{}': {} hide, {} only, {} reloc rule(s) (read-only)",
-            e.name, e.real_view, e.hide, e.only, e.reloc
+            "view '{}' -> base '{}': {} hide, {} only, {} (read-only)",
+            e.name,
+            e.real_view,
+            e.hide,
+            e.only,
+            crate::cli_style::plural(e.reloc, "reloc rule", "reloc rules")
         ),
     }
 }
@@ -1530,9 +1596,9 @@ pub fn list_views_text(store: &dyn ControlStore) -> Result<Vec<OutLine>, String>
             )
         } else {
             format!(
-                "no alias/fork/lens definitions in {} — the {} base view(s) below each map to their own tree",
+                "no alias/fork/lens definitions in {} — the {} below each map to their own tree",
                 store.describe(),
-                bare.len()
+                crate::cli_style::plural(bare.len(), "base view", "base views")
             )
         }));
     }
@@ -1543,7 +1609,7 @@ pub fn list_views_text(store: &dyn ControlStore) -> Result<Vec<OutLine>, String>
         // The tree's home is backend-specific — a SQLite db file or a PG schema.
         let home = match store.backend() {
             "postgres" => format!("own schema {}", schema_name_for(p)),
-            _ => format!("own tree {}", crate::meta::tree_home_rel(p)),
+            _ => format!("own tree {}", store.tree_home_rel(p)),
         };
         out.push(OutLine::Info(format!(
             "base view '{p}' -> {home} (read-write; deletes free a shared object only when no view holds it)"
@@ -1561,7 +1627,7 @@ pub fn list_views_text(store: &dyn ControlStore) -> Result<Vec<OutLine>, String>
 /// base still holds stay, bytes no view holds anymore become freeable.
 pub fn remove_view(store: &dyn ControlStore, name: &str) -> Result<Vec<OutLine>, String> {
     if !valid_view_name(name) {
-        return Err(format!("invalid view name '{name}'"));
+        return Err(valid_view_name_error(name));
     }
     let def = store
         .get_def(name)?
@@ -1588,10 +1654,10 @@ pub fn remove_view(store: &dyn ControlStore, name: &str) -> Result<Vec<OutLine>,
 pub fn preview_rules(rules_text: &str) -> Result<Vec<OutLine>, String> {
     let r = LayoutRules::parse(rules_text).map_err(|e| format!("bad layout rules: {e}"))?;
     let mut out = vec![OutLine::Info(format!(
-        "rules OK: {} hide, {} only, {} reloc rule(s)",
+        "rules OK: {} hide, {} only, {}",
         r.hide.len(),
         r.only.len(),
-        r.reloc.len()
+        crate::cli_style::plural(r.reloc.len(), "reloc rule", "reloc rules")
     ))];
     for h in &r.hide {
         out.push(OutLine::Info(format!("hide {h}")));
@@ -1830,7 +1896,7 @@ pub fn describe_view(store: &dyn ControlStore, name: &str) -> Result<Value, Stri
                 "name": name, "kind": "fork", "base": base,
                 "backend": store.backend(),
                 "mount": "structure read-write / content read-only (independent tree; deletes touch only this view)",
-                "own_tree": crate::meta::tree_home_rel(name),
+                "own_tree": store.tree_home_rel(name),
                 "definition": text,
             }),
             None => {
@@ -3592,9 +3658,10 @@ mod tests {
             json!({"name": "docsonly", "base": "team", "rules": "# cut\nonly /docs"}),
         );
         assert!(text(&d).contains(
-            "defined derived view 'docsonly' over base 'team': 0 hide, 1 only, 0 reloc rule(s)"
+            "defined derived view 'docsonly' over base 'team': 0 hide, 1 only, 0 reloc rules"
         ));
-        assert!(home.join("meta/views/docsonly.layout").is_file());
+        // v3: a fresh definition lands inside its base's family dir.
+        assert!(home.join("meta/team/docsonly.layout").is_file());
         // name == base is the same refusal the CLI prints.
         let same = call(
             12,
@@ -3626,7 +3693,7 @@ mod tests {
         assert_eq!(vv["hide"], 1);
         assert_eq!(vv["would_replace_existing_definition"], false);
         assert_eq!(vv["base_view_db_present"], true);
-        assert!(!home.join("meta/views/newsafe.layout").exists());
+        assert!(!home.join("meta/team/newsafe.layout").exists());
         // alias, then list sees BOTH governance shapes plus the physical tree.
         let a = call(13, "alias_view", json!({"name": "public", "real": "team"}));
         assert!(text(&a).contains("defined pure alias 'public' -> real view 'team'"));
@@ -3646,7 +3713,7 @@ mod tests {
         assert!(
             text(&rot).contains("rotated public name for real view 'team': 'public' -> 'public2'")
         );
-        assert!(!home.join("meta/views/public.layout").exists());
+        assert!(!home.join("meta/team/public.layout").exists());
         // remove both definitions; data (team.db) untouched.
         for (i, n) in [(16, "docsonly"), (17, "public2")] {
             let r = call(i, "remove_view", json!({"name": n}));
@@ -3712,7 +3779,7 @@ mod tests {
             t.contains("grafted 2 entries (1 directory) from 'base' into 'lab' at /"),
             "{t}"
         );
-        assert!(t.contains("1 shared object(s)"), "{t}");
+        assert!(t.contains("1 shared object"), "{t}");
         let lab = open_tree(&home, "lab");
         let by = lab.lookup(crate::meta::ROOT_INO, "by_target").unwrap();
         let f = lab
@@ -3798,11 +3865,9 @@ mod tests {
         );
         // Fork the real tree: 3 entries (root+docs+a.md), 1 shared blob.
         let f = call(31, "fork_view", json!({"name": "lab", "base": "base"}));
-        assert!(
-            text(&f).contains("forked view 'lab' from base 'base': 3 entries, 1 shared object(s)")
-        );
+        assert!(text(&f).contains("forked view 'lab' from base 'base': 3 entries, 1 shared object"));
         assert_eq!(
-            std::fs::read_to_string(home.join("meta/views/lab.layout")).unwrap(),
+            std::fs::read_to_string(home.join("meta/base/lab.layout")).unwrap(),
             "fork base\n"
         );
         assert!(crate::meta::view_db_path(&home, "lab").is_file());
@@ -3817,7 +3882,8 @@ mod tests {
         let d = call(33, "get_view", json!({"name": "lab"}));
         let dv: Value = serde_json::from_str(&text(&d)).unwrap();
         assert_eq!(dv["kind"], "fork");
-        assert_eq!(dv["own_tree"], "meta/lab/lab.db");
+        // v3: the fork's own tree sits inside its base's family directory.
+        assert_eq!(dv["own_tree"], "meta/base/lab/lab.db");
         assert!(dv["mount"].as_str().unwrap().contains("content read-only"));
         // A fork is a tree identity, not a public name: aliasing it is refused.
         let a = call(34, "alias_view", json!({"name": "pub", "real": "lab"}));
@@ -3946,7 +4012,7 @@ mod tests {
         let simpaths = paths(&sim);
         assert!(simpaths.contains(&"/docs".to_string()));
         assert!(!simpaths.contains(&"/photos".to_string()));
-        assert!(!home.join("meta/views/safe2.layout").exists());
+        assert!(!home.join("meta/team/safe2.layout").exists());
         // (4) get_view echoes the EXACT rules text for read-modify-write.
         let g = call(24, "get_view", json!({"name": "safe"}));
         let pg: Value = serde_json::from_str(&text(&g)).unwrap();
@@ -4048,7 +4114,7 @@ mod tests {
                                       "arguments":{"name":"docs","base":"team","rules":"only /docs"}}}))
             .unwrap();
         assert_ne!(d["result"]["isError"], true);
-        assert!(home.join("meta/views/docs.layout").is_file());
+        assert!(home.join("meta/team/docs.layout").is_file());
 
         let calls = store.recent_calls(50).unwrap();
         let define = calls

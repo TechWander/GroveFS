@@ -46,6 +46,13 @@ function applyDocumentLang(): void {
   document.title = lang.value === 'zh' ? 'GroveFS 控制台' : 'GroveFS console'
 }
 
+/** The skip link must not touch `location.hash`: the router owns it, and a
+    literal `#main` would be read as the route `/main`. Focus the landmark
+    instead — keyboard readers land in the page without a network detour. */
+function skipToMain(): void {
+  document.getElementById('main')?.focus()
+}
+
 watch(lang, applyDocumentLang, { immediate: true })
 
 watch(
@@ -79,9 +86,16 @@ onMounted(() => void session.boot())
   <LoginCard v-else-if="session.status === 'anonymous'" />
 
   <template v-else>
+    <a class="skip-link" href="#main" @click.prevent="skipToMain">{{ t('Skip to content') }}</a>
     <AppHeader />
-    <main>
-      <RouterView />
+    <main id="main" tabindex="-1">
+      <RouterView v-slot="{ Component, route }">
+        <Transition name="page" mode="out-in">
+          <div :key="route.path" class="page">
+            <component :is="Component" />
+          </div>
+        </Transition>
+      </RouterView>
     </main>
   </template>
 

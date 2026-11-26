@@ -86,7 +86,7 @@ footer{border-top:1px solid var(--line);margin-top:80px;padding-top:20px;color:v
     <li><a href="#s11">1.1 本机部署（四进程同机）</a></li>
     <li><a href="#s12">1.2 SQLite 分布式部署</a></li>
     <li><a href="#s13">1.3 PostgreSQL 分布式部署</a></li>
-    <li><a href="#s14">1.4 存量存储根升级到 v2 布局</a></li>
+    <li><a href="#s14">1.4 存量存储根升级（v1 扁平 → 一树一目录，本版报 v3）</a></li>
   </ol>
   <h2>第二部分 · 命令演示</h2>
   <ol>
@@ -146,9 +146,11 @@ footer{border-top:1px solid var(--line);margin-top:80px;padding-top:20px;color:v
 ├─ blocks/&lt;2hex&gt;/&lt;key&gt;   <span class="cmt"># 文件字节：按 key 哈希分 256 个桶目录，key 是 UUID</span>
 └─ meta/
    ├─ &lt;视图名&gt;/            <span class="cmt"># 每个物理视图一棵权威树，自成一个目录（ls meta/ 列出的就是树）</span>
-   │   └─ &lt;视图名&gt;.db       <span class="cmt"># 树本体：node/ctrl/locks 三张表（-wal/-shm 同目录，随 checkpoint 出没）</span>
+   │   ├─ &lt;视图名&gt;.db       <span class="cmt"># 树本体：node/ctrl/locks 三张表（-wal/-shm 同目录，随 checkpoint 出没）</span>
+   │   ├─ &lt;fork&gt;/&lt;fork&gt;.db  <span class="cmt"># v3 nested 默认：该基视图的 fork 树嵌在本目录里（grouped 则收进 &lt;视图名&gt;/forks/）</span>
+   │   └─ &lt;名&gt;.layout       <span class="cmt"># v3 nested 默认：该基视图的派生/别名定义（纯文本，可 git diff）</span>
    ├─ _control/             <span class="cmt"># 控制面，不是树：refs.db 跨视图持有账本 · api_keys.db 密钥与审计 · store.key</span>
-   ├─ views/&lt;名&gt;.layout    <span class="cmt"># 派生/别名/fork 的定义文本（纯文本，可手改可 git diff）</span>
+   ├─ views/&lt;名&gt;.layout    <span class="cmt"># 仅 flat 布局（v2 顶层平铺）用这集中目录；nested 下通常为空，读取一律扫描</span>
    └─ .xfer/                <span class="cmt"># export/import 的服务端暂存区（点开头，永不是树）</span></code></pre>
 
 <h4>部署步骤（建视图 → 声明拓扑的 manager → 两个服务注册 → 挂载）</h4>
@@ -179,7 +181,7 @@ $G mount --view team -m /mnt/team --manager 127.0.0.1:50055 --roster-key-file /d
 <p>本机部署（四进程同机）的特点：</p>
 <table>
   <tr><th>维度</th><th>本机部署的行为</th></tr>
-  <tr><td>元数据</td><td>内嵌 SQLite，一视图一棵独立树目录 <code>meta/&lt;名&gt;/&lt;名&gt;.db</code>，无需安装任何数据库；打开它的<b>只有 meta-server 进程</b>，客户端一个字节都不持有</td></tr>
+  <tr><td>元数据</td><td>内嵌 SQLite，一视图一棵独立树目录 <code>meta/&lt;名&gt;/&lt;名&gt;.db</code>（v3 默认 <code>nested</code>：基视图的 fork/派生/别名嵌在该目录内），无需安装任何数据库；打开它的<b>只有 meta-server 进程</b>，客户端一个字节都不持有</td></tr>
   <tr><td>写入模型</td><td>单写者（同一时刻一个写事务）；读走 WAL 可并行</td></tr>
   <tr><td>挂载坐标</td><td>两个地址都从 <code>--manager</code> 的签名 roster 解析。不给 <code>--manager</code>/<code>--roster-key-file</code> → 退出码 1（<code>a mount resolves its cluster coordinates from the deployment's manager …</code>），不猜地址、不降级成直连本地目录</td></tr>
   <tr><td>准入</td><td>由<b>服务端</b>把关：不带 <code>--token</code> 时任何能连上这两个端口的本地进程都能挂任何视图，所以最小自觉是把 <code>--listen</code> 绑在 <code>127.0.0.1</code>；再往里才是挂载点自己的 OS 权限</td></tr>
@@ -346,15 +348,15 @@ $G mount --view team -m /mnt/team --manager 10.0.0.5:50055 --deployment prod --r
   <tr><td>写入模型</td><td>单写者</td><td>每视图 8 写（SERIALIZABLE）+ 4 读连接，不相交行并行提交，冲突由 SSI 透明重试</td></tr>
   <tr><td>高可用</td><td>原生主备（--role/--peer/--witness，快照转发）</td><td>交给 PG 自身（流复制 / PITR），GroveFS 不管</td></tr>
   <tr><td>视图规模上限</td><td>一视图一文件一引擎，fd/内存线性涨</td><td>一视图 12 条连接；<code>--engine-idle-secs</code> 驱逐空闲视图后按「最近活跃视图数」计，扩容用多实例注册表（2.3.6）</td></tr>
-  <tr><td>控制面落点</td><td><code>meta/views/*.layout</code>、<code>meta/_control/api_keys.db</code> 本地文件</td><td>全部在 <code>grovefs_control</code>，任意可达节点带同一 <code>--meta-store</code> 即可治理，无本地文件要同步</td></tr>
+  <tr><td>控制面落点</td><td>各基视图目录的 <code>.layout</code>（nested 默认；flat 在 <code>meta/views/</code>）、<code>meta/_control/api_keys.db</code> 本地文件</td><td>全部在 <code>grovefs_control</code>，任意可达节点带同一 <code>--meta-store</code> 即可治理，无本地文件要同步</td></tr>
   <tr><td>独有命令</td><td>目录零拷贝 <code>import</code>、离线 <code>gc</code> 扫本机 blocks、原生 HA</td><td>无（同名命令不同壳：--meta-dir 换 --meta-store）</td></tr>
 </table>
 
-<h3 id="s14">1.4 存量存储根升级到 v2 布局（一棵树一个目录）</h3>
-<p>本版 GroveFS 的元数据布局是 <b>v2</b>：每棵物理视图树自成一个目录 <code>meta/&lt;视图名&gt;/&lt;视图名&gt;.db</code>，控制面集中到 <code>meta/_control/</code>，派生/别名定义在 <code>meta/views/*.layout</code>——<b>目录名就是类型</b>，<code>ls meta/</code> 列出的就是树（1.1 的存储根图就是这个形态）。老的 <b>v1 扁平</b>形态（<code>meta/</code> 下平铺 <code>team.db</code>/<code>refs.db</code>）<b>没有命令读它</b>：换新二进制后，任何要读视图树的命令都会拒绝并指名迁移动词。</p>
+<h3 id="s14">1.4 存量存储根升级：v1 扁平 → 一树一目录（本版报 v3）</h3>
+<p>本版 GroveFS 报的元数据布局是 <b>v3</b>：在 v2 的「每棵物理视图树自成一个目录 <code>meta/&lt;视图名&gt;/&lt;视图名&gt;.db</code>、控制面集中到 <code>meta/_control/</code>」之上，加了一层<b>家族归属摆放</b>——基视图<b>新建</b>的 fork/派生/别名默认落进基视图自己的目录（<code>nested</code>；<code>flat</code> 才集中到 <code>meta/views/*.layout</code>）。<b>本节要把老的 v1 扁平形态迁到的，是这层摆放底下的每树一目录形态</b>：<code>migrate</code> 只重组已有的扁平树，不移动任何已是家族成员的文件（详见 §13.1）。<b>目录名就是类型</b>，<code>ls meta/</code> 列出的就是树（1.1 的存储根图就是这个形态）。老的 <b>v1 扁平</b>形态（<code>meta/</code> 下平铺 <code>team.db</code>/<code>refs.db</code>）<b>没有命令读它</b>：换新二进制后，任何要读视图树的命令都会拒绝并指名迁移动词。</p>
 <p><b>为什么不做双读过渡</b>：v1 在 v2 的枚举器下看着像个空店——账本会把持有者记成零，<code>gc --apply</code> 于是回收全店字节。所以只有一条路：先迁，再起服务。</p>
 <pre><code><span class="cmt"># 0) 停掉这个存储根上的挂载与本机 grovefs 进程（迁移有两道静默门：/proc/mounts 与进程 cmdline/env）</span>
-<span class="cmt"># 1) 看形态：v1 扁平还是 v2，并列出树清单</span>
+<span class="cmt"># 1) 看形态：v1 扁平还是 v3，并列出树清单</span>
 $ grovefs layout --meta-dir /data/gfs show
 <span class="out">metadata root:  /data/gfs
 layout:         v1 FLAT (pre-v2) — no command reads this shape; migrate it
@@ -397,7 +399,8 @@ $ grovefs layout --meta-dir /data/gfs migrate
 <span class="cmt"># 4) 复核形态 + 看目录</span>
 $ grovefs layout --meta-dir /data/gfs show
 <span class="out">metadata root:  /data/gfs
-layout:         v2 — one directory per view tree, control plane in meta/_control
+layout:         v3 — one directory per view tree, control plane in meta/_control
+family mode:    nested — new family members land inside their base's directory (meta/.family)
 view trees:     3
   alice                    /data/gfs/meta/alice/alice.db
   lab                      /data/gfs/meta/lab/lab.db
@@ -409,7 +412,7 @@ transfer spool /data/gfs/meta/.xfer (0 entr(y|ies))</span>
 $ ls /data/gfs/meta
 <span class="out">alice  _control  lab  team  views</span></code></pre>
 <div class="note"><b>为什么「10 个文件」只搬了 4 个</b>：<code>-wal</code>/<code>-shm</code> 是每个 <code>.db</code> 的旁挂文件，迁移时先对该 <code>.db</code> 做一次 checkpoint，WAL 里的内容被折进主库、旁挂文件随之消失——它们的内容已经随主库一起搬走了，所以不必再单独搬。只有主 <code>.db</code> 缺失才是硬错误（那时报 <code>No such file or directory</code> 并中止）。</div>
-<p><b>迁移不管账本、也不管别人的副本</b>：跨视图账本只记内容 key、不记路径，所以搬完不用重写；但<b>持有同一份 <code>meta/</code> 的每台机器都要各自迁一遍</b>——HA 备机，以及靠手工同步 <code>meta/views/</code> 的那台机（见 1.3 的形态差异表与 2.3 的巡检段）。PG 后端没有本地文件，这一步不适用。</p>
+<p><b>迁移不管账本、也不管别人的副本</b>：跨视图账本只记内容 key、不记路径，所以搬完不用重写；但<b>持有同一份 <code>meta/</code> 的每台机器都要各自迁一遍</b>——HA 备机，以及靠手工同步定义文件的那台机（v3 <code>nested</code> 下定义散在各基视图目录，得同步整个 <code>meta/</code>；见 1.3 的形态差异表与 2.3 的巡检段）。PG 后端没有本地文件，这一步不适用。</p>
 
 <div class="chnav"><span>第一部分完</span><a href="#p2">进入第二部分 ↓</a></div>
 </section>
@@ -471,7 +474,7 @@ fusermount -u /mnt/alice                <span class="cmt"># 等价写法</span><
 <tr><td><b>创建命令</b></td><td><code>view --meta-dir D create --view V</code></td><td><code>view define --name D --base B --rules F</code></td><td><code>view alias --name A --real R</code></td><td><code>view fork --name F --base B</code></td></tr>
 <tr><td><b>目录可改</b></td><td>能</td><td>不能（只读）</td><td>能</td><td>能</td></tr>
 <tr><td><b>内容可写</b></td><td>能</td><td>不能（EROFS）</td><td>能</td><td>不能（EROFS）</td></tr>
-<tr><td><b>落盘</b></td><td><code>meta/V/V.db</code></td><td><code>meta/views/D.layout</code></td><td><code>meta/views/A.layout</code>（仅一行）</td><td><code>meta/F/F.db</code> + <code>meta/views/F.layout</code></td></tr>
+<tr><td><b>落盘</b>（nested 默认）</td><td><code>meta/V/V.db</code></td><td><code>meta/B/D.layout</code></td><td><code>meta/R/A.layout</code>（仅一行）</td><td><code>meta/B/F/F.db</code> + <code>meta/B/F.layout</code></td></tr>
 <tr><td><b>典型用途</b></td><td>真正存数据</td><td>团队共享一份只读形状</td><td>隐藏存储真名 / 换公开名</td><td>在基数据上做可整理的独立分支</td></tr>
 </table>
 
@@ -529,7 +532,7 @@ $G view --meta-dir /data/gfs graft --name picks --src team --map plan.tsv
 <span class="out"># note: bytes were not copied — every grafted name holds the same object as its source; the object is freed only when no view names it anymore</span>
 <span class="cmt"># report.txt 接进根目录并改名为 季度报告.txt；note.md 原名接入；可加 --dest DIR 指定落点、--skip-existing 跳过同名</span></code></pre>
 
-<div class="ok">验收：<code>$G view --meta-dir /data/gfs list</code> 一次列出全部形态——派生（base + 规则计数）、别名（→ 真实视图）、fork（→ 基视图）与未定义的裸基视图（逐字输出见 2.1.6）；<code>ls /data/gfs/meta/views/</code> 里是四份纯文本 <code>.layout</code>（<code>docsonly.layout</code>、<code>lab.layout</code>、<code>picks.layout</code>、<code>pub2.layout</code>——别名轮换掉的名字不留残档），而 <code>lab.db</code>/<code>picks.db</code> 是 fork 各自的树。</div>
+<div class="ok">验收：<code>$G view --meta-dir /data/gfs list</code> 一次列出全部形态——派生（base + 规则计数）、别名（→ 真实视图）、fork（→ 基视图）与未定义的裸基视图（逐字输出见 2.1.6）；<b>v3 <code>nested</code> 默认下这些家族成员都嵌在基视图目录里</b>——<code>ls /data/gfs/meta/team/</code> 见四份纯文本 <code>.layout</code>（<code>docsonly.layout</code>、<code>lab.layout</code>、<code>picks.layout</code>、<code>pub2.layout</code>——别名轮换掉的名字不留残档）加 <code>lab/lab.db</code>、<code>picks/picks.db</code> 两棵 fork 树，而 <code>meta/views/</code> 为空（改成 <code>flat</code> 才会把定义集中到那里）。</div>
 
 <h4 id="s21-auth">2.1.4 授权边界（四进程同机）</h4>
 <p>准入由<b>服务端</b>把关，不再是「挂载点权限就是全部」：<code>mount</code> 得先过 meta-server 与 data-server 两道门。同机起步常什么门都不开——这时任何能连上 <code>127.0.0.1:50110</code> / <code>127.0.0.1:50100</code> 的本地进程都能挂上任何视图，所以最小自觉是把 <code>--listen</code> 绑在回环地址上。OS 层还有一层：</p>
@@ -710,13 +713,13 @@ $G mount --view docsonly -m /mnt/lens \
 ls /mnt/lens        <span class="out"># docs            ← 服务端渲染的形状</span>
 
 <span class="cmt"># 改规则热生效：替换 .layout 后，已挂载的派生连接 ≤2s 内换形，免重挂</span>
-printf 'only /docs\nhide /docs/internal\n' | tee /data/cluster/meta/views/docsonly.layout
+printf 'only /docs\nhide /docs/internal\n' | tee /data/cluster/meta/team/docsonly.layout   <span class="cmt"># nested：定义在基视图目录（flat 下才是 meta/views/）</span>
 <span class="cmt"># （或重新跑一条 view define 同名覆盖）</span>
 
 <span class="cmt"># 分发面差异一览（对照 2.1.3 的四进程同机形态）：</span>
 <span class="cmt"># ① docsonly → 客户机只给名；② pub → 全树可写，真名 team 同时不可直挂（服务端同拒）</span>
 <span class="cmt"># ③ lab → 结构可写/内容 EROFS；删名只影响 fork 自己；④ graft 接枝字节零复制</span></code></pre>
-<p>SQLite 档 <code>view</code> 操作的是服务端本地文件，所以要在 meta-server 所在机器执行；HA 部署下 <code>meta/views/</code> 与整个 <code>meta/_control/</code> 要手工同步到备机（PG 档无此负担，定义在共享库里——见 2.3.5）。</p>
+<p>SQLite 档 <code>view</code> 操作的是服务端本地文件，所以要在 meta-server 所在机器执行；HA 部署下整个 <code>meta/</code>（v3 <code>nested</code>：各基视图目录下的 <code>.layout</code> 与 fork 子目录，加 <code>meta/_control/</code>）要手工同步到备机（PG 档无此负担，定义在共享库里——见 2.3.5）。</p>
 
 <h4 id="s22-conf">2.2.5 配置文件：客户机挂载瘦身 + 挂载也交给 systemd</h4>
 <pre><code><span class="cmt"># node2/node3：写一次引导文件，之后挂载只剩「这次挂哪个视图到哪儿」</span>
@@ -984,7 +987,7 @@ $G web --control-server 127.0.0.1:50130 --api-key-file /etc/grovefs/control.key 
 <span class="cmt"># 停人用 disable（可逆、授权原样保留），删号用 account rm</span>
 <span class="cmt"># ⚠ account rm 不撤销该号铸过的 api key——否则一个删号会静默停掉一个在跑的生产挂载</span>
 $G web --control-server 127.0.0.1:50130 --api-key-file /etc/grovefs/control.key account disable --account bob</code></pre>
-<p><b>审计台账的保留期是部署要自己决定的那件事</b>：控制台每一点、每个治理调用、每次挂载握手都在控制面库里落一行（PG 档 <code>grovefs_control.mcp_calls</code>，SQLite 档 <code>meta/_control/api_keys.db</code>），而开着控制口的服务端<b>默认带 7d 窗口</b>（把 <code>--audit-retention never</code> 说出口才是全部保留）。两条路：给 <code>meta-server</code> 追加 <code>--audit-retention 365d</code>（必须与 <code>--control-listen</code> 同时给；后台按窗口 1/24（5min..1h）扫、开机先扫一刀再睡），或把它当成例行巡检——先 <code>$G apikey --control-server 127.0.0.1:50130 --api-key-file /etc/grovefs/control.key purge --before 365d --dry-run</code> 数一下会掉多少行，确认后再去掉 <code>--dry-run</code>。<b>控制台里没有这个按钮</b>，也不是漏了：purge 是 SUPERUSER 动词，被这张表记录的账号不该是有权修剪它的人；表现在多大，审计页顶部那句话会直接讲出来。</p>
+<p><b>审计台账的保留期是部署要自己决定的那件事</b>：控制台每一点、每个治理调用、每次挂载握手都在控制面库里落一行（PG 档 <code>grovefs_control.mcp_calls</code>，SQLite 档 <code>meta/_control/api_keys.db</code>），而开着控制口的服务端<b>默认带 90d 窗口</b>（把 <code>--audit-retention never</code> 说出口才是全部保留）。两条路：给 <code>meta-server</code> 追加 <code>--audit-retention 365d</code>（必须与 <code>--control-listen</code> 同时给；后台按窗口 1/24（5min..1h）扫、开机先扫一刀再睡），或把它当成例行巡检——先 <code>$G apikey --control-server 127.0.0.1:50130 --api-key-file /etc/grovefs/control.key purge --before 365d --dry-run</code> 数一下会掉多少行，确认后再去掉 <code>--dry-run</code>。控制台<b>审计页</b>带一块保留窗口面板：超管能在页面上直接改保留期（<code>audit.retention.set</code>，免重启）并一键立即清理（先 <code>--dry-run</code> 预览再执行）——两个动词都是 SUPERUSER 门，被这张表记录的普通账号看不到这些控件，能修剪履历的仍只限部署最高权限；表现在多大，面板顶部那句话会直接讲出来。</p>
 <div class="warn"><b>四件容易做错的事</b>：① <b>降级或删除唯一在职的 admin 会被拒</b>——先建第二个 admin 并验证能登进去再动第一个；② <code>account passwd</code> 不踢掉已开的会话（那是网关的会话表），要立即停人是 <code>disable</code>；③ 口令只能从 <code>--password-file</code> / <code>--password-stdin</code> 进去，两者互斥且不存在 <code>--password</code>；④ 页面能点的动词是写死的 32 个白名单，<code>gc.scan</code>、<code>gc.apply</code>、<code>refs rebuild</code>、<code>view rm --base</code>、<code>fork graft</code> 五个保留在 CLI——它们的 dry-run 报告与逐步确认是调用的一部分，想跑这些就回到 §2.2.6 / §2.3.7。</div>
 <div class="ok">验收：浏览器打开 <code>https://gfs-console.internal/</code> 能看到登录页；拿 <code>rootops</code> 登录→总览页把八个部署数排成<b>每行 4 个、共两行</b>的统计卡（过期密钥非零时那张转琥珀色），卡下方的「本部署」事实表报出后端+describe 行、元数据根、服务端角色、命名空间（基视图/定义拆开）、凭据（live/expired 拆开）、账号数与活动量；拿 <code>bob</code> 登录→视图页只列 <code>team</code> 一棵，选中一棵基视图时右侧多出它的<b>谱系面板</b>（它的别名/透镜/fork 与逐层向下的子名字），能建 fork、能在密钥页给自己那棵铸一把 <code>mount</code> key 并就地改它的备注与有效期，而“Accounts”页只剩“改自己的口令”；故意输错口令五次→第六次回 <code>429</code> 带 <code>retryAfter</code>；审计页里每一行都带 <code>account=&lt;人&gt;@&lt;ip&gt;</code>，并能按时间窗、平面、事件类型、成败与关键字五个维度检索。五页共用<b>同一套设计系统</b>（字号阶梯与间距令牌、卡片化面板、抽屉与可折叠详情），文案全部过词典、中/英一键切换；密钥页的 key 列是入库的头尾指纹而非明文，这条取舍写在页面上；把某把 key 的副本读回只在属主（或超级账号）那里成功，跨账号被拒。部署为 PG 多实例注册表时，视图页的「新建基视图」表单给出<b>目标实例下拉</b>（清单来自 <code>store.info</code> 的 <code>pgInstances</code>，默认「自动」点名当前最少负载的实例），单实例或非 PG 档不显示这一行；总览页在 PG 档另列出<b>实例账本</b>（每实例放置视图数、控制面标记与哈希路由存量），与非 PG 档改称「本机锚点（--meta-dir）」的锚点行一起，把「树到底住在哪」说成横幅同一句话；端到端断言见 <code>web</code> 套件（189 条）。</div>
 

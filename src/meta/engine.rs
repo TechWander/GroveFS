@@ -208,7 +208,10 @@ pub struct ForkStats {
 }
 
 /// Seed an INDEPENDENT metadata tree `name` as a point-in-time copy of the
-/// physical view `base_view`'s tree (`<base>/meta/<name>/<name>.db`). Content bytes
+/// physical view `base_view`'s tree. Since layout v3 the fork's home is
+/// decided by the store's family policy — `meta/<base>/<name>/<name>.db`
+/// (nested, the default), `meta/<base>/forks/<name>/<name>.db` (grouped) or
+/// `meta/<name>/<name>.db` (flat). Content bytes
 /// are SHARED, not copied: every distinct `data_ref` in the copy is booked once
 /// against the new view in the cross-view ledger, so a delete in either tree
 /// frees a blob only when its last name in the last holding view disappears.
@@ -228,7 +231,7 @@ pub fn fork_view(base: &Path, base_view: &str, name: &str) -> Result<ForkStats, 
 }
 
 /// [`fork_view`] with an explicit seeding choice. `seed == false` creates the
-/// fork's OWN tree at `meta/<name>/<name>.db` (schema + root only) and copies
+/// fork's OWN tree (schema + root only, at the family-policy home) and copies
 /// no rows, so the caller can place a curated subset later with [`ForkGraft`].
 /// The definition still says `fork <base>`, so mount semantics are identical
 /// (structure writable, content EROFS) and deletes stay local to the fork.
@@ -239,8 +242,17 @@ pub fn fork_view_with(
     seed: bool,
 ) -> Result<ForkStats, String> {
     layout_guard(base)?;
+    // The store's one-name rule (a tree dir holds exactly its namesake db)
+    // makes a self-fork unrepresentable even when both names resolve to the
+    // same tree home — refuse it explicitly, as the top-level layout did.
+    if name == base_view {
+        return Err(format!("fork target '{name}' is the base view itself"));
+    }
     let src_path = view_db_path(base, base_view);
-    let dst_path = ensure_view_db_path(base, name)
+    // v3: the fork lands inside its base's family dir per the store policy;
+    // a name that already resolves anywhere (an older flat sibling included)
+    // is refused rather than shadowed by a second tree of the same name.
+    let dst_path = ensure_tree_db_path(base, name, Some(base_view))
         .map_err(|e| format!("cannot create tree home for fork '{name}': {e}"))?;
     // A fresh fork must not be handed a directory an earlier interrupted
     // attempt left a db in — `MetaEngine::open` would silently adopt it.
@@ -909,7 +921,8 @@ pub fn export_view(
             out.display()
         ));
     }
-    let def_path = defs_dir(base).join(format!("{view}.layout"));
+    let def_path =
+        find_def_slot(base, view).unwrap_or_else(|| defs_dir(base).join(format!("{view}.layout")));
     let definition = std::fs::read_to_string(&def_path).ok();
     let kind = match definition.as_deref() {
         Some(t) if t.lines().any(|l| l.trim_start().starts_with("fork ")) => "fork",
@@ -995,8 +1008,32 @@ pub struct ViewImportStats {
     pub replaced: bool,
 }
 
-/// Import a metadata tree written by [`export_view`] as
-/// `<base>/meta/<view>/<view>.db`.
+/// The base view named by a `fork <base>` line inside an export header's
+/// `definition` field ([`export_view`] embeds the def verbatim). Used by
+/// [`import_view`] to place a fork export inside its family (layout v3)
+/// without needing to ship the definition file itself.
+fn header_def_fork_base(header: &Value) -> Option<String> {
+    let text = header.get("definition")?.as_str()?;
+    for line in text.lines() {
+        let l = line.trim();
+        // Whitespace-terminated verb, exactly like `LayoutRules::parse_def`.
+        let mut it = l.split_whitespace();
+        if it.next() != Some("fork") {
+            continue;
+        }
+        if let Some(base) = it.next() {
+            if it.next().is_none() && crate::layout::valid_view_name(base) {
+                return Some(base.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Import a metadata tree written by [`export_view`]. A fresh tree lands at
+/// its family-policy home — inside the base named by a `fork <base>`
+/// definition when that base exists here, otherwise at the top level — and
+/// pre-v3 (flat) members resolve by scan, so mixed stores import cleanly.
 /// The target must not be governed by a definition; an existing tree is only
 /// overwritten with `replace` (and every mount/meta-server using the store must
 /// be stopped first). Rows are inserted in ONE transaction with their original
@@ -1010,10 +1047,6 @@ pub fn import_view(
     replace: bool,
 ) -> Result<ViewImportStats, String> {
     layout_guard(base)?;
-    let home = view_dir(base, view);
-    std::fs::create_dir_all(&home)
-        .map_err(|e| format!("cannot create {}: {e}", home.display()))?;
-    let dst = view_db_path(base, view);
     let f = File::open(input).map_err(|e| format!("cannot open {}: {e}", input.display()))?;
     let mut rdr = BufReader::new(f);
     let mut header_line = String::new();
@@ -1053,6 +1086,22 @@ pub fn import_view(
     let claimed_nodes = header["nodes"].as_i64();
     let claimed_blobs = header["blobs"].as_i64();
     let kind = header["kind"].as_str().unwrap_or("physical").to_string();
+    // v3 placement needs the genealogy BEFORE the tree exists: an import of a
+    // fork export carries `definition` in its header, and when this store
+    // holds that base the member lands inside its family per policy. The
+    // definition file itself is not imported (it is governance, re-created
+    // with `view def`); only the tree is placed. A name that already resolves
+    // (flat member included) keeps its existing home — `--replace` overwrites
+    // in place, it never re-homes.
+    let parent: Option<String> =
+        header_def_fork_base(&header).filter(|b| *b != view && find_view_db(base, b).is_some());
+    let dst = if find_view_db(base, view).is_none() {
+        new_tree_db_path(base, view, parent.as_deref())
+    } else {
+        view_db_path(base, view)
+    };
+    let home = dst.parent().unwrap_or(&meta_dir(base)).to_path_buf();
+    std::fs::create_dir_all(&home).map_err(|e| format!("cannot create {}: {e}", home.display()))?;
     let replaced = dst.exists();
     if replaced && !replace {
         return Err(format!(
@@ -1213,20 +1262,23 @@ pub fn import_view(
                 .map_err(|e| format!("cannot validate the imported tree: {e}"))?;
             if dangling != 0 {
                 return Err(format!(
-                "import rejected: {dangling} node(s) point at a missing or non-directory parent"
-            ));
+                    "import rejected: {} point at a missing or non-directory parent",
+                    crate::cli_style::plural(dangling as usize, "node", "nodes")
+                ));
             }
             if let Some(c) = claimed_nodes {
                 if c != nodes {
                     return Err(format!(
-                        "import rejected: header declares {c} node(s), file carries {nodes}"
+                        "import rejected: header declares {}, file carries {nodes}",
+                        crate::cli_style::plural(c as usize, "node", "nodes")
                     ));
                 }
             }
             if let Some(c) = claimed_blobs {
                 if c != blobs.len() as i64 {
                     return Err(format!(
-                        "import rejected: header declares {c} blob reference(s), file carries {}",
+                        "import rejected: header declares {}, file carries {}",
+                        crate::cli_style::plural(c as usize, "blob reference", "blob references"),
                         blobs.len()
                     ));
                 }
@@ -1402,7 +1454,7 @@ pub fn remove_base_view(base: &Path, view: &str) -> Result<BaseViewRemoval, Stri
             db.display()
         ));
     }
-    if defs_dir(base).join(format!("{view}.layout")).is_file() {
+    if find_def_slot(base, view).is_some() {
         return Err(format!(
             "'{view}' is governed by a view definition — remove the definition first (`grovefs view rm --name {view}`) before removing a base tree of the same name"
         ));
@@ -3125,10 +3177,11 @@ impl MetaStore {
         if let Err(msg) = layout_guard(base) {
             return Err(rusqlite::Error::InvalidParameterName(msg));
         }
-        let path = ensure_view_db_path(base, view)
-            .map_err(|e| rusqlite::Error::InvalidParameterName(format!(
+        let path = ensure_view_db_path(base, view).map_err(|e| {
+            rusqlite::Error::InvalidParameterName(format!(
                 "cannot create tree home for '{view}': {e}"
-            )))?;
+            ))
+        })?;
         MetaEngine::open_ex(&path, readonly).map(MetaStore::Sqlite)
     }
 
@@ -3460,9 +3513,19 @@ mod tests {
     /// read (measured: 4x the create rate at 16 concurrent writers).
     #[test]
     fn read_pool_keeps_the_idle_floor_small_and_the_burst_ceiling_wide() {
-        assert_eq!(READ_POOL_SIZE, 1, "idle floor: ~3 fds per warm reader per view");
-        assert_eq!(READ_POOL_RETAIN, 8, "measured plateau: flat past ~8 readers");
-        assert_eq!(retain_for(0), 0, "`0` is the explicit opt-out, not a small pool");
+        assert_eq!(
+            READ_POOL_SIZE, 1,
+            "idle floor: ~3 fds per warm reader per view"
+        );
+        assert_eq!(
+            READ_POOL_RETAIN, 8,
+            "measured plateau: flat past ~8 readers"
+        );
+        assert_eq!(
+            retain_for(0),
+            0,
+            "`0` is the explicit opt-out, not a small pool"
+        );
         assert_eq!(retain_for(1), READ_POOL_RETAIN);
         assert_eq!(
             retain_for(16),
@@ -4414,8 +4477,19 @@ mod tests {
         {
             let _e = tree(dir.path(), "base");
         }
-        std::fs::create_dir_all(crate::meta::view_dir(dir.path(), "copy")).unwrap();
-        std::fs::write(crate::meta::view_db_path(dir.path(), "copy"), b"not a tree").unwrap();
+        // The conflicting db must sit where the fork would newly land (the
+        // family-policy home), not at a hardcoded top level.
+        std::fs::create_dir_all(
+            crate::meta::new_tree_db_path(dir.path(), "copy", Some("base"))
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            crate::meta::new_tree_db_path(dir.path(), "copy", Some("base")),
+            b"not a tree",
+        )
+        .unwrap();
         assert!(fork_view(dir.path(), "base", "copy").is_err());
         assert!(fork_view(dir.path(), "base", "base").is_err());
     }

@@ -220,10 +220,7 @@ impl Announcement {
         b.push(self.role.as_u8());
         proto::put_key(&mut b, &self.deployment);
         proto::put_key(&mut b, &self.addr);
-        proto::put_u64(
-            &mut b,
-            self.member_id.unwrap_or(proto::NO_MEMBER_ID),
-        );
+        proto::put_u64(&mut b, self.member_id.unwrap_or(proto::NO_MEMBER_ID));
         proto::put_u64(&mut b, self.ttl);
         b
     }
@@ -522,7 +519,11 @@ pub fn check_dialable(addr: &str) -> Result<String, String> {
 pub fn read_hex_key_file(path: &Path) -> Result<Vec<u8>, String> {
     let raw = std::fs::read(path).map_err(|e| format!("{}: cannot read: {e}", path.display()))?;
     if raw.len() > KEY_FILE_MAX {
-        return Err(format!("{}: not a key file ({} bytes)", path.display(), raw.len()));
+        return Err(format!(
+            "{}: not a key file ({} bytes)",
+            path.display(),
+            raw.len()
+        ));
     }
     let text = String::from_utf8_lossy(&raw);
     crate::crypto::key_from_hex(&text)
@@ -736,7 +737,11 @@ mod tests {
             assert_eq!(Role::from_u8(v), Some(r));
             assert_eq!(r.name(), n);
             assert_eq!(Role::parse(n), Some(r));
-            assert_eq!(Role::parse(&n.to_uppercase()), Some(r), "case-insensitive flag");
+            assert_eq!(
+                Role::parse(&n.to_uppercase()),
+                Some(r),
+                "case-insensitive flag"
+            );
         }
         assert_eq!(Role::from_u8(3), None);
         assert_eq!(Role::parse("both"), None);

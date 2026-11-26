@@ -73,7 +73,7 @@ rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 # instead, so this is only pulled in under `fuse-bridge` (or `native`).
 libc = { version = "0.2", optional = true }
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "wrap_help"] }
 # Fast in-process locks for the attribute/handle caches
 parking_lot = "0.12"
 # Stable hashes for inode<->key maps (DoS-resistant)

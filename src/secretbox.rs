@@ -165,7 +165,11 @@ mod tests {
         let key = random_key();
         let other = random_key();
         let blob = seal(&key, "deadbeefdeadbeef:0123456789abcdef0123456789abcdef");
-        assert_eq!(unseal(&other, &blob), None, "the wrong master opens nothing");
+        assert_eq!(
+            unseal(&other, &blob),
+            None,
+            "the wrong master opens nothing"
+        );
 
         let mut parts: Vec<String> = blob.split('.').map(str::to_string).collect();
         let mut ct = parts[2].clone();
@@ -173,10 +177,18 @@ mod tests {
         let flipped = if ct.as_bytes()[0] == b'0' { b'1' } else { b'0' };
         ct.replace_range(0..1, &char::from(flipped).to_string());
         parts[2] = ct;
-        assert_eq!(unseal(&key, &parts.join(".")), None, "a edited ciphertext fails its MAC");
+        assert_eq!(
+            unseal(&key, &parts.join(".")),
+            None,
+            "a edited ciphertext fails its MAC"
+        );
 
         parts[0] = "sbx2".to_string();
-        assert_eq!(unseal(&key, &parts.join(".")), None, "an unknown version is not this format");
+        assert_eq!(
+            unseal(&key, &parts.join(".")),
+            None,
+            "an unknown version is not this format"
+        );
 
         assert_eq!(unseal(&key, "garbage"), None);
         assert_eq!(unseal(&key, "sbx1.ae.b.c.d.e"), None);
@@ -191,8 +203,16 @@ mod tests {
         let hex = key_to_hex(&key);
         assert_eq!(hex.len(), KEY_BYTES * 2);
         assert_eq!(key_from_hex(&hex), Some(key));
-        assert_eq!(key_from_hex(&format!("  {hex}\n")), Some(key), "file whitespace");
-        assert_eq!(key_from_hex(&hex[..62]), None, "31 bytes is refused, not zero-padded");
+        assert_eq!(
+            key_from_hex(&format!("  {hex}\n")),
+            Some(key),
+            "file whitespace"
+        );
+        assert_eq!(
+            key_from_hex(&hex[..62]),
+            None,
+            "31 bytes is refused, not zero-padded"
+        );
         assert_eq!(key_from_hex(&format!("{hex}00")), None);
         assert_eq!(key_from_hex("nope"), None);
     }

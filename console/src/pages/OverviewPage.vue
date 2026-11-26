@@ -196,31 +196,16 @@ const baseLabel = computed(() =>
             <b>{{ store.role || '—' }}</b>
             <span class="muted">{{ t('the process this console is talking to') }}</span>
           </StatLine>
-          <StatLine label="namespace">
-            <b>{{ t('${n} base view(s)', { n: store.views }) }}</b>
-            <span class="muted">{{ t('· ${n} definition(s)', { n: store.definitions }) }}</span>
-          </StatLine>
-          <StatLine label="credentials">
-            <b>{{ t('${n} live', { n: store.liveKeys }) }}</b>
-            <span class="muted">
-              {{
-                t('· ${n} expired · a revocation or expiry lands on the NEXT call', {
-                  n: store.expiredKeys || 0,
-                })
-              }}
-            </span>
-          </StatLine>
-          <StatLine label="governance accounts">
-            <b>{{ store.accounts ?? '—' }}</b>
-            <span class="muted">
-              {{ t('· the first owner was created by `meta-server --admin-user`') }}
-            </span>
-          </StatLine>
-          <StatLine label="activity on this server">
-            <b>{{ t('${n} mount session(s)', { n: store.liveSessions }) }}</b>
-            <span class="muted">
-              {{ t('· ${n} tree(s) open in memory', { n: store.residentEngines }) }}
-            </span>
+          <!-- The cards above already carry every counter this page knows. What
+               stays here is the substrate an operator quotes in a ticket — where
+               the bytes live, which process answered, and how long the trail is
+               kept — so the panel does not repeat the row of figures it sits
+               under. -->
+          <StatLine label="audit trail">
+            <b v-if="store.auditRetention">
+              {{ t('rows older than ${w} are swept', { w: store.auditRetention }) }}
+            </b>
+            <b v-else>{{ t('every row is kept until an operator purges it') }}</b>
           </StatLine>
         </div>
         <!-- A PG deployment's real question is WHERE each tree lives, and the

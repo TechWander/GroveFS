@@ -37,8 +37,24 @@ const rows = computed(() => {
   return catalog.views.filter(
     (v) =>
       (filters.vFilter.kind === 'all' || v.kind === filters.vFilter.kind) &&
+      (filters.vFilter.instance === 'all' ||
+        catalog.instanceOf(v.name) === filters.vFilter.instance) &&
       (!q || v.name.toLowerCase().includes(q)),
   )
+})
+
+/* The instance chips exist only where a choice exists: one logical instance is
+   a fact about the row, not a filter the operator has to set. */
+const instanceChips = computed(() => {
+  const names = catalog.storage?.instances.map((i) => i.name) ?? []
+  return [
+    { v: 'all', t: 'all instances', n: catalog.views.length },
+    ...names.map((name) => ({
+      v: name,
+      t: name,
+      n: catalog.views.filter((v) => catalog.instanceOf(v.name) === name).length,
+    })),
+  ]
 })
 
 const below = (name: string, kind: string): number =>
@@ -59,6 +75,11 @@ const below = (name: string, kind: string): number =>
         :aria-label="t('filter by name…')"
       />
       <ChipGroup v-model="filters.vFilter.kind" :items="KIND_CHIPS" />
+      <ChipGroup
+        v-if="(catalog.storage?.instances.length ?? 0) > 1"
+        v-model="filters.vFilter.instance"
+        :items="instanceChips"
+      />
     </div>
 
     <ul id="view-list" class="list">
@@ -87,6 +108,9 @@ const below = (name: string, kind: string): number =>
           :text="String(below(v.name, v.kind))"
           :title="t('names derived directly from it')"
         />
+        <span v-if="catalog.storage" class="inst" :title="t('metadata instance hosting this view')">
+          {{ catalog.instanceOf(v.name) ?? 'hash' }}
+        </span>
         <span class="kind">{{ kindName(v.kind) }}</span>
       </li>
     </ul>

@@ -1204,9 +1204,7 @@ impl fuser::Filesystem for GroveFS {
         // lock — read-heavy mounts open/close constantly and must not serialize on
         // this map's exclusive lock. A concurrent double-release is safe: only the
         // `remove` that actually returns `true` pushes.
-        if self.written_inos.read().contains(&ino.0)
-            && self.written_inos.write().remove(&ino.0)
-        {
+        if self.written_inos.read().contains(&ino.0) && self.written_inos.write().remove(&ino.0) {
             self.meta.touch_mtime(ino.0 as i64);
         }
         // Intentionally keep the ino->key entry: with writeback cache the kernel

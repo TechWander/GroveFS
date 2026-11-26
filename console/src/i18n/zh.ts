@@ -35,6 +35,7 @@ export const ZH: Readonly<Record<string, string>> = {
   // The header's <nav> is labelled for a screen reader; the hand-written page
   // had no landmark at all here.
   'Sections of the console': '控制台分区',
+  'Skip to content': '跳到正文',
 
   /* shared */
   Cancel: '取消',
@@ -359,6 +360,13 @@ export const ZH: Readonly<Record<string, string>> = {
   'last hour': '最近 1 小时',
   'last 24 hours': '最近 24 小时',
   'last 7 days': '最近 7 天',
+  'last 30 days': '最近 30 天',
+  'last 180 days': '最近 180 天',
+  'last 360 days': '最近 360 天',
+  'custom range': '自定义区间',
+  'time range': '时间范围',
+  from: '起',
+  to: '止',
   'only ok': '仅看成功',
   unknown: '未知',
   unassigned: '未指定',
@@ -377,6 +385,9 @@ export const ZH: Readonly<Record<string, string>> = {
   '${n} view(s) point at an instance the registry no longer defines — their mount is refused until the registry or placement is fixed':
     '${n} 个视图指向注册表已不再定义的实例 — 在修正注册表或放置前其挂载会被拒绝',
   'the process this console is talking to': '本控制台正在对话的进程',
+  'audit trail': '审计留痕',
+  'rows older than ${w} are swept': '早于 ${w} 的行会被清理',
+  'every row is kept until an operator purges it': '全部保留，直到操作员手动清除',
   namespace: '命名空间',
   '${n} base view(s)': '${n} 个基视图',
   'the trees mounts open': '挂载打开的树',
@@ -571,4 +582,89 @@ export const ZH: Readonly<Record<string, string>> = {
   '· ${n} definition(s)': '· ${n} 个定义',
   '· ${n} derived name(s)': '· ${n} 个派生名字',
   '· ${n} tree(s) open in memory': '· ${n} 棵树在内存中打开',
+
+  /* 存储页：后端、实例与置放 */
+  Storage: '存储',
+  Metadata: '元数据',
+  'Where the namespace physically lives — the backend, its instances and the placement of each view.':
+    '命名空间实际存放的位置 — 后端、实例，以及每个视图的置放。',
+  'Embedded SQLite': '嵌入式 SQLite',
+  'base directory': '库目录',
+  views: '视图',
+  'resident engines': '常驻引擎',
+  'resident views': '常驻视图',
+  'One database file per view under <base>/meta/. High availability ships VACUUM INTO snapshots between nodes — there is no instance to place a view on.':
+    '每个视图在 <base>/meta/ 下各有一个数据库文件。高可用通过节点间 VACUUM INTO 快照完成 — 没有可供置放视图的实例。',
+  'Experimental tree engine': '实验性树引擎',
+  address: '地址',
+  'local SQLite': '本地 SQLite',
+  'Trees live in the treedb server; definitions, keys and accounts stay in the local SQLite control plane. This backend is experimental and runs as a single instance.':
+    '树存放在 treedb 服务中；定义、密钥与账号仍在本地 SQLite 控制平面。该后端为实验性，单实例运行。',
+  '${n} view(s) across ${i} instance(s)': '${n} 个视图，分布在 ${i} 个实例',
+  'keys, definitions, accounts, audit and placement live here':
+    '密钥、定义、账号、审计与置放表都在此实例',
+  connection: '连接串',
+  'contains credentials': '含凭据',
+  'placed views': '已置放视图',
+  'on this instance': '此实例上',
+  'no view is placed here yet': '尚无视图置放在此实例',
+  'open the filtered list for the rest': '打开筛选列表查看其余视图',
+  'Open these views': '查看这些视图',
+  'New base here': '在此新建 base',
+  '${n} view(s) have no placement row and route by name hash.':
+    '${n} 个视图没有置放记录，按名称哈希路由。',
+  Placement: '置放规则',
+  'A new view lands on the instance with the fewest placed views unless the caller names one. A view’s tree lives on exactly one instance; forks and grafts cannot cross instances.':
+    '新视图默认落在已置放视图最少的实例，除非调用方指定实例。一个视图的树只存在于一个实例；fork 与 graft 不能跨实例。',
+  'Instance details are an administrator’s view.': '实例详情仅管理员可见。',
+  Show: '显示',
+  Hide: '隐藏',
+  close: '关闭',
+  Capacity: '容量',
+  'live sessions': '在线会话',
+  'audit retention': '审计保留',
+  'all instances': '全部实例',
+  'metadata instance hosting this view': '承载该视图的元数据实例',
+  'Home instance': '宿主实例',
+  instance: '实例',
+  'hash routed': '哈希路由',
+  yes: '是',
+  no: '否',
+  'The schema holding this view’s tree lives on this instance. The connection string is shown in full — it contains the database password.':
+    '承载该视图树的 schema 位于此实例。连接串完整展示 — 其中包含数据库密码。',
+  'Keys of this view…': '该视图的密钥…',
+  'Accounts…': '相关账号…',
+  'open this key': '打开该密钥',
+  'All keys in this account’s name…': '该账号名下的全部密钥…',
+  'delegated view': '委派视图',
+  'clear this filter': '清除该筛选',
+  describe: '描述',
+  /* 存储页改版：统计条、负载计与新交互 */
+  retry: '重试',
+  instances: '实例',
+  placed: '已置放',
+  unplaced: '未置放',
+  'view(s) here': '个视图在此',
+  'Refresh failed — showing the last loaded snapshot.': '刷新失败 — 正显示上次加载的快照。',
+  /* 审计保留面板：窗口设置与立即清理 */
+  'Audit retention': '审计保留',
+  'retention window': '保留窗口',
+  'rows older than this are swept; “never” keeps them until purged by hand':
+    '早于此窗口的行会被清理；“never” 则保留，直到手动清除',
+  'use a duration like 45m, 24h, 90d, or `never`': '请用 45m、24h、90d 这类时长，或 `never`',
+  'window set to ${w}; ${n} row(s) older than that were trimmed now':
+    '窗口已设为 ${w}；早于该窗口的 ${n} 行已立即清理',
+  'sweep disarmed — rows are kept until an operator purges them':
+    '已停用自动清理 — 记录将保留，直到操作员手动清除',
+  '${n} row(s) are older than ${b} (nothing deleted yet)': '早于 ${b} 的记录有 ${n} 行（尚未删除）',
+  'deleted ${n} row(s) older than ${b}': '已删除早于 ${b} 的 ${n} 行记录',
+  'currently: rows older than ${w} are swept': '当前：早于 ${w} 的行会被清理',
+  'currently: every row is kept until an operator purges it': '当前：全部保留，直到操作员手动清除',
+  'preview cut': '预览清理量',
+  'count rows older than the drafted window, delete nothing': '统计早于所填窗口的行数，不做删除',
+  'purge now': '立即清理',
+  'delete rows older than the drafted window': '删除早于所填窗口的记录',
+  'save window': '保存窗口',
+  'apply the retention policy (a duration also trims now)':
+    '应用保留策略（设为时长会同时立即清理）',
 }

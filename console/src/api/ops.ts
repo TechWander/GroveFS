@@ -48,6 +48,9 @@ export type Op =
   | 'apikey.set_ro'
   | 'apikey.update'
   | 'apikey.calls'
+  | 'apikey.purge'
+  | 'audit.retention.get'
+  | 'audit.retention.set'
   | 'account.list'
   | 'account.create'
   | 'account.passwd'
@@ -90,6 +93,9 @@ export interface OpResult {
   'apikey.set_ro': unknown
   'apikey.update': unknown
   'apikey.calls': AuditRow[]
+  'apikey.purge': PurgeResult
+  'audit.retention.get': Retention
+  'audit.retention.set': Retention & { trimmedNow: number }
   'account.list': AccountRow[]
   'account.create': CreatedAccount
   'account.passwd': unknown
@@ -126,6 +132,20 @@ export interface GrantedBase {
   account: string
   base: string
   asNamed?: boolean
+}
+
+/** `apikey.purge` — the cut the server actually made (or would have made). */
+export interface PurgeResult {
+  before: string
+  cutoff: string
+  older: number
+  deleted: number
+  dryRun: boolean
+}
+
+/** The audit-retention window; `null` = rows are kept until purged by hand. */
+export interface Retention {
+  retention: string | null
 }
 
 export type { ImportResult, MintKeyArgs }

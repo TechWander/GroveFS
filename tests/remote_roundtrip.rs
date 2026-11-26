@@ -479,13 +479,15 @@ fn data_server_dac_gate_admits_valid_and_refuses_forgery() {
     // A capability a genuine meta minted: connects and performs data ops.
     let valid = dac::issue(key, 0);
     let good = (0..50)
-        .find_map(|_| match RemoteBackend::new_with_dac(&addr, "T", "", &valid) {
-            Ok(c) => Some(c),
-            Err(_) => {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-                None
-            }
-        })
+        .find_map(
+            |_| match RemoteBackend::new_with_dac(&addr, "T", "", &valid) {
+                Ok(c) => Some(c),
+                Err(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    None
+                }
+            },
+        )
         .expect("a valid capability should open the data session");
     good.create("obj").unwrap();
     good.write("obj", 0, b"genuine").unwrap();
@@ -524,15 +526,17 @@ fn data_server_dac_gate_admits_valid_and_refuses_forgery() {
 #[test]
 fn dac_absent_on_server_leaves_behavior_unchanged() {
     let (addr, _d) = spawn_server_auth(""); // no token, no dac
-    // Non-empty garbage capability on a server that does not verify it: accepted.
+                                            // Non-empty garbage capability on a server that does not verify it: accepted.
     let c = (0..50)
-        .find_map(|_| match RemoteBackend::new_with_dac(&addr, "", "", "0.deadbeef") {
-            Ok(c) => Some(c),
-            Err(_) => {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-                None
-            }
-        })
+        .find_map(
+            |_| match RemoteBackend::new_with_dac(&addr, "", "", "0.deadbeef") {
+                Ok(c) => Some(c),
+                Err(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    None
+                }
+            },
+        )
         .expect("a non-verify server must ignore the capability field");
     c.create("obj").unwrap();
     c.write("obj", 0, b"ok").unwrap();

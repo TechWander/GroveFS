@@ -42,15 +42,15 @@ const props = withDefaults(
 )
 
 const ui = useUiStore()
-const { openView, openAccount } = useNav()
+const { openView, openAccountsOf } = useNav()
 
 const COLS: Column<KeyRow>[] = [
   { id: 'label', label: 'label', cls: 'nowrap' },
   { id: 'key', label: 'key' },
   { id: 'note', label: 'note', cls: 'wrap' },
   { id: 'plane', label: 'plane', field: 'scope', cls: 'mono' },
-  { id: 'view', label: 'view' },
-  { id: 'mode', label: 'mode' },
+  { id: 'view', label: 'view', cls: 'nowrap' },
+  { id: 'mode', label: 'mode', cls: 'nowrap' },
   { id: 'owner', label: 'owner' },
   { id: 'state', label: 'state', cls: 'nowrap' },
   { id: 'last', label: 'last used', cls: 'muted nowrap' },
@@ -98,7 +98,7 @@ const open = (r: KeyRow): void => ui.openDrawer({ kind: 'key', row: r })
         type="button"
         class="mini mono"
         :title="t('open this view')"
-        @click="openView(String(row.view))"
+        @click.stop="row.view && openView(row.view)"
       >
         {{ row.view }}
       </button>
@@ -114,13 +114,18 @@ const open = (r: KeyRow): void => ui.openDrawer({ kind: 'key', row: r })
     </template>
 
     <template #cell-owner="{ row }">
-      <WhoCell
-        :name="row.owner"
-        :sub="row.created_by ? t('minted by ${who}', { who: row.created_by }) : null"
-        :off="!!row.revoked_at"
-        :go="!!row.owner"
-        @navigate="row.owner && openAccount(row.owner)"
-      />
+      <button
+        type="button"
+        class="linky"
+        :title="t('open this account')"
+        @click.stop="row.owner && openAccountsOf(row.owner)"
+      >
+        <WhoCell
+          :name="row.owner"
+          :sub="row.created_by ? t('minted by ${who}', { who: row.created_by }) : null"
+          :off="!!row.revoked_at"
+        />
+      </button>
     </template>
 
     <template #cell-state="{ row }">

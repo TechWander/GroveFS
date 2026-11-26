@@ -28,6 +28,43 @@ export function useNav() {
 
   const to = (page: string): Promise<void> => router.push('/' + page).then(() => undefined)
 
+  /** A jump that carries a FILTER with it: the landing page reads the query
+      once (see `consumeQuery`), applies it to its filter store and then strips
+      it, so a refresh never re-pins a filter the operator has since cleared. */
+  const goTo = (page: string, query: Record<string, string> = {}): Promise<void> =>
+    router.push({ path: '/' + page, query }).then(() => undefined)
+
+  /** Read the query keys this console knows, apply them, and strip them from
+      the URL. Called by the three list pages at setup time. */
+  const consumeQuery = (): void => {
+    const route = router.currentRoute.value
+    const q = route.query
+    let touched = false
+    const take = (key: string): string | null => {
+      const v = q[key]
+      if (typeof v !== 'string' || !v) return null
+      touched = true
+      return v
+    }
+    const view = take('view')
+    const instance = take('instance')
+    const owner = take('owner')
+    const search = take('q')
+    if (view) {
+      catalog.sel = view
+      filters.keyFilter.view = view
+      filters.accFilter.view = view
+    }
+    if (instance) filters.vFilter.instance = instance
+    if (owner) filters.keyFilter.q = owner
+    if (search) {
+      // `q` means the search box of whichever list landed here.
+      if (route.name === 'accounts') filters.accFilter.q = search
+      else if (route.name === 'keys') filters.keyFilter.q = search
+    }
+    if (touched) void router.replace({ path: route.path, query: {} })
+  }
+
   /** Choose a view INSIDE the views page: the picker's stripe and the detail
       pane both follow `catalog.sel`, and a record pane left open on the row you
       just switched away from is a lie — so it closes. This is the old `pickView`. */
@@ -40,7 +77,36 @@ export function useNav() {
       always what that name looks like. */
   const openView = (name: string): Promise<void> => {
     catalog.sel = name
+    filters.vFilter.instance = 'all'
     return to('views')
+  }
+
+  /** From a view (or a storage card) to the keys bound to it. */
+  const openKeysOfView = (view: string): Promise<void> => {
+    filters.keyFilter.view = view
+    filters.keyFilter.q = ''
+    return goTo('keys', { view })
+  }
+
+  /** From a view to the accounts delegated it. */
+  const openAccountsOfView = (view: string): Promise<void> => {
+    filters.accFilter.view = view
+    filters.accFilter.q = ''
+    return goTo('accounts', { view })
+  }
+
+  /** From a key's owner to that account (the accounts page matches by name). */
+  const openAccountsOf = (account: string): Promise<void> => {
+    filters.accFilter.q = account
+    filters.accFilter.view = 'all'
+    return to('accounts')
+  }
+
+  /** The views that live on one metadata instance. */
+  const openInstance = (instance: string): Promise<void> => {
+    filters.vFilter.instance = instance
+    filters.vFilter.q = ''
+    return goTo('views', { instance })
   }
 
   /** An account's keys are not a separate list — they are the keys page with
@@ -66,14 +132,6 @@ export function useNav() {
     return to('audit')
   }
 
-  /** A view's keys are the keys page with the view binding selected. */
-  const openKeysOfView = (name: string): Promise<void> => {
-    filters.keyFilter.view = name
-    filters.keyFilter.q = ''
-    filters.keyFilter.state = 'all'
-    return to('keys')
-  }
-
   /** An account mentioned anywhere — a key's owner, a call's actor — is the
       accounts page searched to that name. */
   const openAccount = (name: string): Promise<void> => {
@@ -85,12 +143,17 @@ export function useNav() {
 
   return {
     to,
+    goTo,
+    consumeQuery,
     pickView,
     openView,
     openKeysOf,
+    openKeysOfView,
+    openAccountsOf,
+    openAccountsOfView,
+    openInstance,
     openAuditOfKey,
     openAuditOfView,
-    openKeysOfView,
     openAccount,
   }
 }

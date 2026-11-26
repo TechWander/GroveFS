@@ -25,42 +25,48 @@
 :root {
   color-scheme: light;
 
-  /* ---- surfaces & line: warm paper, not blue-grey ---- */
-  --bg: #f2eee5;
-  --bg-2: #fbf9f3;
-  --bg-subtle: #f6f1e6;
-  --bg-sunken: #e8e1d2;
-  --line: #ded6c6;
-  --line-soft: #eae3d5;
-  --line-strong: #c9bfad;
+  /* ---- surfaces & line: a neutral instrument canvas, not warm paper ----
+     The console is a working surface: a faint green-grey canvas holds white
+     cards, and the only saturated colour on screen means "you can act here"
+     or a state that needs a decision. */
+  --bg: #f4f6f2;
+  --bg-2: #ffffff;
+  --bg-subtle: #f7f9f6;
+  --bg-sunken: #ecefe9;
+  --line: #e2e6df;
+  --line-soft: #eef1ec;
+  --line-strong: #cfd6cc;
 
   /* ---- ink ---- */
-  --fg: #17211c;
-  --fg-dim: #5b665e;
-  --fg-faint: #899187;
+  --fg: #101c16;
+  --fg-dim: #55635a;
+  /* Faint is still text, not decoration: at 4.5:1 on the canvas it clears the
+     contrast floor for the 11–12px labels, table headers and micro captions it
+     carries. */
+  --fg-faint: #6d7a71;
 
   /* ---- accent: pine ---- */
-  --accent: #14624a;
-  --accent-hover: #0e4d39;
-  --accent-soft: #e4efe8;
-  --accent-line: #b5cec0;
+  --accent: #0f6b4f;
+  --accent-hover: #0b5740;
+  --accent-soft: #e3f0e8;
+  --accent-line: #b7d3c5;
 
   /* ---- state ---- */
-  --ok: #2f7446;
-  --ok-soft: #e7f0e3;
-  --ok-line: #b9d2b2;
-  --warn: #8c6210;
-  --warn-soft: #f7eed8;
-  --warn-line: #ddc593;
-  --err: #a6402b;
-  --err-soft: #f7e7e1;
-  --err-line: #dbb4a7;
+  --ok: #26724a;
+  --ok-soft: #e7f1e9;
+  --ok-line: #b9d5c0;
+  --warn: #8a5a0b;
+  --warn-soft: #f8efdc;
+  --warn-line: #dfc79a;
+  --err: #a63a2a;
+  --err-soft: #f9e9e4;
+  --err-line: #e0b8ac;
 
   /* ---- view kinds ---- */
-  --k-base: #14624a;
-  --k-fork: #4a4a8c;
-  --k-alias: #176a6a;
-  --k-lens: #916210;
+  --k-base: #0f6b4f;
+  --k-fork: #4b4b8c;
+  --k-alias: #136c6c;
+  --k-lens: #8a5f10;
 
   /* ---- type ladder ---- */
   --fs-page: clamp(1.75rem, 1.4rem + 1.1vw, 2.25rem);
@@ -79,30 +85,97 @@
   --sp-6: 1.75rem;
   --sp-7: 2.5rem;
 
-  /* ---- radius: printed plate, not a bubble ---- */
-  --r-xs: 3px;
-  --r-sm: 5px;
-  --r-md: 8px;
-  --r-lg: 12px;
+  /* ---- radius: instruments, not bubbles ---- */
+  --r-xs: 6px;
+  --r-sm: 8px;
+  --r-md: 12px;
+  --r-lg: 16px;
 
-  /* ---- elevation: warm ink, low contrast, plate-offset on hover ---- */
-  --shadow-xs: 0 1px 0 rgba(23, 33, 28, 0.05);
-  --shadow-sm: 0 1px 0 rgba(23, 33, 28, 0.04), 0 8px 22px -18px rgba(23, 33, 28, 0.4);
-  --shadow-md: 0 2px 0 rgba(23, 33, 28, 0.04), 0 22px 48px -24px rgba(23, 33, 28, 0.45);
-  --shadow-lg: -20px 0 56px rgba(23, 33, 28, 0.18);
-  --ring: 0 0 0 3px rgba(20, 98, 74, 0.18);
+  /* ---- elevation: soft distance, never a drop shadow ---- */
+  --shadow-xs: 0 1px 2px rgba(16, 28, 22, 0.05);
+  --shadow-sm: 0 1px 2px rgba(16, 28, 22, 0.05), 0 10px 24px -20px rgba(16, 28, 22, 0.35);
+  --shadow-md: 0 1px 2px rgba(16, 28, 22, 0.05), 0 18px 40px -26px rgba(16, 28, 22, 0.35);
+  --shadow-lg: -20px 0 56px rgba(16, 28, 22, 0.16);
+  --ring: 0 0 0 3px rgba(15, 107, 79, 0.18);
 
   /* ---- motion ---- */
-  --ease: cubic-bezier(0.2, 0.7, 0.3, 1);
-  --dur: 0.16s;
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+  --dur: 0.2s;
 
-  --font-display:
-    'Iowan Old Style', 'Palatino Linotype', Palatino, 'Songti SC', 'Noto Serif CJK SC', Georgia,
-    serif;
   --font-ui:
     system-ui, -apple-system, 'Segoe UI', Roboto, 'PingFang SC', 'Hiragino Sans GB',
     'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif;
+  --font-display: var(--font-ui);
+  /* The sign-in drawing keeps the old archival voice; nothing else does. */
+  --font-serif:
+    'Iowan Old Style', 'Palatino Linotype', Palatino, 'Songti SC', 'Noto Serif CJK SC', Georgia,
+    serif;
   --mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace;
+}
+
+/* ---- dark theme ----
+   The same instrument, inked for a dark room. One attribute on the root
+   (`<html data-theme="dark">`, set by theme.ts) swaps the whole ladder, so no
+   component knows the theme exists — they all read tokens. The hue stays a
+   green-black so the pine accent keeps meaning "you can act here" and moss
+   still reads healthy; a neutral grey canvas would flatten the state colours
+   the operator relies on. `color-scheme` flips native form controls and the
+   scrollbar to match. */
+:root[data-theme='dark'] {
+  color-scheme: dark;
+
+  --bg: #0f1512;
+  --bg-2: #171f1a;
+  --bg-subtle: #131a16;
+  --bg-sunken: #0b100e;
+  --line: #263029;
+  --line-soft: #1d2622;
+  --line-strong: #37453c;
+
+  --fg: #e6ece7;
+  --fg-dim: #9aab9f;
+  --fg-faint: #7b8b80;
+
+  --accent: #35b183;
+  --accent-hover: #4cc596;
+  --accent-soft: #14312a;
+  --accent-line: #265c48;
+
+  --ok: #4bb377;
+  --ok-soft: #132a1d;
+  --ok-line: #2c563c;
+  --warn: #d8a24a;
+  --warn-soft: #2c230f;
+  --warn-line: #5a4a22;
+  --err: #e07a63;
+  --err-soft: #2c1512;
+  --err-line: #5a2c24;
+
+  --k-base: #35b183;
+  --k-fork: #9a9ade;
+  --k-alias: #4fb8b8;
+  --k-lens: #d0a24a;
+
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4), 0 12px 28px -20px rgba(0, 0, 0, 0.7);
+  --shadow-md: 0 1px 2px rgba(0, 0, 0, 0.4), 0 18px 40px -26px rgba(0, 0, 0, 0.8);
+  --shadow-lg: -20px 0 56px rgba(0, 0, 0, 0.5);
+  --ring: 0 0 0 3px rgba(53, 177, 131, 0.32);
+}
+
+/* The canvas, header and selection are the three places that hardcoded a light
+   value instead of a token; override them for dark rather than re-plumbing the
+   gradient shorthand everywhere. */
+:root[data-theme='dark'] body {
+  background:
+    radial-gradient(64rem 30rem at 12% -18%, #1a241e 0%, rgba(26, 36, 30, 0) 62%),
+    var(--bg);
+}
+:root[data-theme='dark'] header {
+  background: rgba(20, 27, 23, 0.9);
+}
+:root[data-theme='dark'] ::selection {
+  background: #235240;
 }
 
 * {
@@ -146,27 +219,30 @@
 body {
   margin: 0;
   background:
-    radial-gradient(72rem 34rem at 18% -12%, #fcfaf3 0%, rgba(252, 250, 243, 0) 62%),
-    repeating-linear-gradient(
-      180deg,
-      rgba(23, 33, 28, 0.022) 0,
-      rgba(23, 33, 28, 0.022) 1px,
-      transparent 1px,
-      transparent 32px
-    ),
+    radial-gradient(64rem 30rem at 12% -18%, #ffffff 0%, rgba(255, 255, 255, 0) 62%),
     var(--bg);
   color: var(--fg);
   font: var(--fs-body) / 1.6 var(--font-ui);
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
+  transition:
+    background-color var(--dur) var(--ease),
+    color var(--dur) var(--ease);
 }
 
 h1,
 h2,
 h3 {
   margin: 0 0 var(--sp-2);
-  font-weight: 650;
-  line-height: 1.3;
+  font-weight: 680;
+  letter-spacing: -0.02em;
+  line-height: 1.25;
+  /* A two-line heading breaks where the sense breaks, not where the column
+     happens to run out. Progressive: browsers without it keep normal wrapping. */
+  text-wrap: balance;
+}
+p {
+  text-wrap: pretty;
 }
 h2 {
   font-size: var(--fs-section);
@@ -281,7 +357,7 @@ td,
 .login-caption-zh {
   margin: 0.55rem 0 0;
   color: #f4ecd6;
-  font-family: var(--font-display);
+  font-family: var(--font-serif);
   font-size: clamp(1.2rem, 2.4vw, 1.65rem);
   font-weight: 600;
   letter-spacing: 0.08em;
@@ -344,7 +420,7 @@ td,
 }
 .login-card h2 {
   margin: 0.4rem 0 var(--sp-5);
-  font-family: var(--font-display);
+  font-family: var(--font-serif);
   font-size: 2rem;
   font-weight: 600;
   letter-spacing: -0.02em;
@@ -408,6 +484,34 @@ td,
   right: var(--sp-4);
 }
 
+/* Theme toggle: a square icon stamp, the same quiet affordance as the language
+   toggle but sized for a glyph instead of a word. */
+.theme-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--r-xs);
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--fg-dim);
+  width: 1.8rem;
+  height: 1.8rem;
+  padding: 0;
+  cursor: pointer;
+  transition:
+    color var(--dur) var(--ease),
+    border-color var(--dur) var(--ease),
+    background var(--dur) var(--ease);
+}
+.theme-btn:hover {
+  color: var(--accent);
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+}
+.theme-btn svg {
+  display: block;
+}
+
 /* ================================================================ chrome ==== */
 
 /* A masthead: a 3px pine spine, paper, and tabs whose active state is a rule
@@ -421,47 +525,49 @@ header {
   display: flex;
   align-items: stretch;
   gap: var(--sp-5);
-  height: 4.25rem;
-  padding: 0 var(--sp-6);
-  background: rgba(242, 238, 229, 0.9);
-  -webkit-backdrop-filter: blur(14px) saturate(120%);
-  backdrop-filter: blur(14px) saturate(120%);
+  height: 3.9rem;
+  padding: 0 clamp(1rem, 3vw, 2rem);
+  background: rgba(255, 255, 255, 0.92);
+  -webkit-backdrop-filter: blur(14px) saturate(130%);
+  backdrop-filter: blur(14px) saturate(130%);
   border-bottom: 1px solid var(--line);
 }
 header::before {
   content: '';
   position: absolute;
   inset: 0 0 auto 0;
-  height: 3px;
-  background: var(--accent);
+  height: 2px;
+  background: linear-gradient(90deg, var(--accent), #2f8f6b 55%, transparent);
 }
 .brand {
   display: inline-flex;
   align-items: center;
-  gap: 0.65rem;
+  gap: 0.6rem;
   flex: none;
-  padding-right: var(--sp-5);
+  padding-right: var(--sp-4);
   border-right: 1px solid var(--line);
   font-family: var(--font-display);
-  font-size: 1.35rem;
-  font-weight: 600;
-  letter-spacing: -0.01em;
+  font-size: 1.2rem;
+  font-weight: 700;
+  letter-spacing: -0.025em;
 }
 .brand .logo {
   flex: none;
   border-radius: var(--r-xs);
 }
 
-/* Tabs. The active underline is pinned to the header's bottom border so the
-   current page looks marked on the paper, not raised above it. */
+/* Tabs, as pills on the bar. The current page is a filled chip AND
+   `aria-current`, because the tint alone is not an announcement. */
 nav {
   display: flex;
-  align-items: stretch;
-  gap: 0;
+  align-items: center;
+  gap: 2px;
   flex: 0 1 auto;
   min-width: 0;
   overflow-x: auto;
   scrollbar-width: none;
+  scroll-snap-type: x proximity;
+  padding: 0 var(--sp-1);
 }
 nav::-webkit-scrollbar {
   display: none;
@@ -471,16 +577,17 @@ nav button {
   display: inline-flex;
   align-items: center;
   gap: 0.42rem;
-  height: auto;
-  padding: 0 0.85rem;
+  height: 2.2rem;
+  padding: 0 0.72rem;
   border: 0;
-  border-radius: 0;
+  border-radius: var(--r-sm);
   background: transparent;
   color: var(--fg-dim);
   font-family: inherit;
   font-size: var(--fs-label);
   white-space: nowrap;
   cursor: pointer;
+  scroll-snap-align: start;
   transition:
     color var(--dur) var(--ease),
     background var(--dur) var(--ease);
@@ -494,11 +601,11 @@ nav button .idx {
 }
 nav button svg {
   flex: none;
-  opacity: 0.6;
+  opacity: 0.65;
   transition: opacity var(--dur) var(--ease);
 }
 nav button:hover {
-  background: rgba(251, 249, 243, 0.7);
+  background: var(--bg-subtle);
   color: var(--fg);
 }
 nav button:hover svg,
@@ -507,9 +614,9 @@ nav button:hover .idx {
   color: var(--fg);
 }
 nav button.on {
-  background: transparent;
-  color: var(--fg);
-  font-weight: 600;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 650;
 }
 nav button.on svg {
   opacity: 1;
@@ -518,14 +625,9 @@ nav button.on svg {
 nav button.on .idx {
   color: var(--accent);
 }
-nav button.on::after {
-  content: '';
-  position: absolute;
-  left: 0.85rem;
-  right: 0.85rem;
-  bottom: 0;
-  height: 2px;
-  background: var(--accent);
+nav button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 
 .who {
@@ -560,12 +662,58 @@ nav button.on::after {
 /* ================================================================ layout ==== */
 
 main {
-  padding: var(--sp-6) var(--sp-6) calc(var(--sp-7) + var(--sp-4));
-  max-width: 1600px;
-  margin: 0 auto;
+  /* Full-bleed like a modern console (Vercel/Supabase): the viewport IS the
+     canvas, and the clamp() padding above is the only margin. A 1180px cap
+     wasted half a 2560px screen and squeezed the instance grid. */
+  padding: var(--sp-6) clamp(1rem, 3.5vw, 2.5rem) calc(var(--sp-7) + var(--sp-4));
+  max-width: none;
+  margin: 0;
+}
+/* `main` takes focus from the skip link, but a ring around the whole page is
+   not the announcement — the skip link that was just focused is. */
+main:focus {
+  outline: none;
+}
+/* The one keyboard affordance that has to sit above the chrome: a skip link
+   parked off-screen until it is focused. It targets `#main` by script, because
+   a literal `#main` would be read by the hash router as a route. */
+.skip-link {
+  position: fixed;
+  top: var(--sp-2);
+  left: var(--sp-2);
+  z-index: 60;
+  transform: translateY(-200%);
+  padding: 0.55rem 0.9rem;
+  border-radius: var(--r-sm);
+  background: var(--accent);
+  color: #fbf9f3;
+  font: 600 var(--fs-label) / 1 var(--font-ui);
+  text-decoration: none;
+  transition: transform var(--dur) var(--ease);
+}
+.skip-link:focus-visible {
+  transform: none;
 }
 .page {
   display: block;
+}
+/* A page arrives; it does not blink into place. Short enough to stay out of
+   the way of a reader who is already scanning, and the reduced-motion block at
+   the end of this file flattens it for anyone who asked for stillness. */
+.page-enter-active {
+  transition:
+    opacity 0.18s var(--ease),
+    transform 0.18s var(--ease);
+}
+.page-leave-active {
+  transition: opacity 0.1s var(--ease);
+}
+.page-enter-from {
+  opacity: 0;
+  transform: translateY(6px);
+}
+.page-leave-to {
+  opacity: 0;
 }
 
 /* One serif title and a rule: the page opens like a section of a printed
@@ -1308,13 +1456,37 @@ label.check input {
 
 /* ================================================================ tables ==== */
 
+/* A table that is wider than its frame has to SAY so. The four gradient layers
+   are the classic scroll-shadow: two opaque "covers" travel with the content
+   (local) and hide a shadow at each end once that end is reached, while two
+   soft ink shadows stay pinned to the frame (scroll). On a table that fits,
+   covers sit over both shadows and nothing shows; on a phone the left/right
+   fade is the only affordance telling a reader the row continues. */
 .tbl-wrap {
   overflow-x: auto;
   -webkit-overflow-scrolling: touch;
   border: 1px solid var(--line);
   border-radius: var(--r-md);
-  background: var(--bg-2);
+  background-color: var(--bg-2);
+  background-image:
+    linear-gradient(to right, var(--bg-2) 40%, rgba(251, 249, 243, 0)),
+    linear-gradient(to left, var(--bg-2) 40%, rgba(251, 249, 243, 0)),
+    linear-gradient(to right, rgba(23, 33, 28, 0.18), rgba(23, 33, 28, 0)),
+    linear-gradient(to left, rgba(23, 33, 28, 0.18), rgba(23, 33, 28, 0));
+  background-position:
+    left center,
+    right center,
+    left center,
+    right center;
+  background-size:
+    2.6rem 100%,
+    2.6rem 100%,
+    1.5rem 100%,
+    1.5rem 100%;
+  background-repeat: no-repeat;
+  background-attachment: local, local, scroll, scroll;
   box-shadow: var(--shadow-sm);
+  overscroll-behavior-x: contain;
 }
 table {
   border-collapse: collapse;
@@ -1342,9 +1514,9 @@ th {
   color: var(--fg-faint);
   font-family: var(--mono);
   font-weight: 500;
-  font-size: 0.65625rem;
+  font-size: 0.6875rem;
   text-transform: uppercase;
-  letter-spacing: 0.12em;
+  letter-spacing: 0.11em;
   white-space: nowrap;
   background: var(--bg-subtle);
   border-bottom: 1px solid var(--line-strong);
@@ -2012,6 +2184,12 @@ pre.plain {
   color: var(--fg-faint);
   font-size: var(--fs-micro);
 }
+/* "unassigned" is one word, not three stacked characters: a narrow owner
+   column must not hyphen-less-wrap it down the cell. */
+.who-cell .nm,
+.unassigned {
+  white-space: nowrap;
+}
 
 /* An unselected detail pane is a deliberate empty state, not a stray
    sentence floating at the top of the column. */
@@ -2303,6 +2481,43 @@ details.help > .body {
   border-left-color: var(--ok);
 }
 
+/* The overview's figures land one after another, a 20 ms beat apart: the eye
+   follows the row instead of taking eight plates at once. `backwards` (not
+   `both`) is deliberate — once the run is over the animation stops applying,
+   so the hover lift on a link card keeps working. */
+@media (prefers-reduced-motion: no-preference) {
+  .cards .card {
+    animation: card-in 0.26s var(--ease) backwards;
+  }
+  .cards .card:nth-child(2) {
+    animation-delay: 0.02s;
+  }
+  .cards .card:nth-child(3) {
+    animation-delay: 0.04s;
+  }
+  .cards .card:nth-child(4) {
+    animation-delay: 0.06s;
+  }
+  .cards .card:nth-child(5) {
+    animation-delay: 0.08s;
+  }
+  .cards .card:nth-child(6) {
+    animation-delay: 0.1s;
+  }
+  .cards .card:nth-child(7) {
+    animation-delay: 0.12s;
+  }
+  .cards .card:nth-child(8) {
+    animation-delay: 0.14s;
+  }
+}
+
+@keyframes card-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
 @keyframes fade-in {
   from {
     opacity: 0;
@@ -2557,6 +2772,341 @@ details.help > .body {
   }
   .drawer .df .left {
     display: none;
+  }
+}
+
+/* ============================================================== storage ==== */
+
+.storage-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(6.5rem, 1fr));
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-5);
+}
+.sstat {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  padding: var(--sp-3) var(--sp-4);
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-xs);
+}
+.sstat-n {
+  font-size: 1.6rem;
+  font-weight: 680;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+}
+.sstat-l {
+  color: var(--fg-faint);
+  font-family: var(--mono);
+  font-size: 0.625rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.sstat.warn {
+  border-color: var(--warn-line);
+  background: var(--warn-soft);
+}
+.sstat.warn .sstat-n {
+  color: var(--warn);
+}
+/* A refresh that failed while a snapshot is already on screen: a quiet strip,
+   not a page replacement, so the deployment never looks like it vanished. */
+.banner-warn {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+  margin: 0 0 var(--sp-4);
+  padding: 0.6rem 0.9rem;
+  background: var(--warn-soft);
+  border: 1px solid var(--warn-line);
+  border-left: 3px solid var(--warn);
+  border-radius: var(--r-sm);
+  color: var(--fg);
+  font-size: var(--fs-label);
+}
+.banner-warn .link {
+  margin-left: auto;
+}
+.inst-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  align-items: start;
+  gap: var(--sp-4);
+  margin-bottom: var(--sp-5);
+}
+.inst-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  min-width: 0;
+  padding: var(--sp-4);
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-xs);
+  overflow: hidden;
+  transition:
+    box-shadow var(--dur) var(--ease),
+    transform var(--dur) var(--ease),
+    border-color var(--dur) var(--ease);
+}
+/* A hairline spine at the top of every card, lit on hover and on the control
+   plane: the card gains emphasis from an accent line, not a heavier shadow. */
+.inst-card::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 3px;
+  background: linear-gradient(90deg, var(--accent), transparent 70%);
+  opacity: 0;
+  transition: opacity var(--dur) var(--ease);
+}
+.inst-card:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-sm);
+}
+.inst-card:hover::before {
+  opacity: 0.55;
+}
+/* The control plane is a different KIND of instance, not a worse one: the
+   border says "this one owns the namespace book" without shouting. */
+.inst-card.control {
+  border-color: var(--accent-line);
+}
+.inst-card.control::before {
+  opacity: 1;
+}
+.inst-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+}
+.inst-head h3 {
+  margin: 0;
+  font-size: 1.0625rem;
+  letter-spacing: -0.01em;
+}
+.inst-uri {
+  min-width: 0;
+  padding: 0.6rem 0.7rem;
+  background: var(--bg-subtle);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-sm);
+}
+.inst-uri-label {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  margin-bottom: 0.35rem;
+  color: var(--fg-faint);
+  font-family: var(--mono);
+  font-size: 0.625rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.inst-uri-label .cred {
+  color: var(--warn);
+}
+.inst-uri code {
+  display: block;
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  line-height: 1.5;
+  color: var(--fg);
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+.inst-uri code.masked {
+  letter-spacing: 0.15em;
+  color: var(--fg-faint);
+}
+.inst-uri-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-top: 0.45rem;
+}
+.inst-load {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+}
+.inst-meter {
+  display: inline-flex;
+  gap: 3px;
+  flex: none;
+}
+.seg {
+  width: 0.7rem;
+  height: 0.5rem;
+  border-radius: 2px;
+  background: var(--bg-sunken);
+  border: 1px solid var(--line-soft);
+  transition: background var(--dur) var(--ease);
+}
+.seg.on {
+  background: var(--accent);
+  border-color: var(--accent-line);
+}
+.inst-count {
+  color: var(--fg-dim);
+  font-size: var(--fs-label);
+}
+.inst-count b {
+  color: var(--fg);
+  font-size: 1.05rem;
+  font-variant-numeric: tabular-nums;
+}
+.inst-views {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  min-height: 1.6rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.inst-views li {
+  padding: 0.1rem 0.45rem;
+  background: var(--bg-subtle);
+  border: 1px solid var(--line-soft);
+  border-radius: 999px;
+  font-size: 0.75rem;
+}
+.inst-views li.more {
+  border-style: dashed;
+  color: var(--fg-dim);
+  font-variant-numeric: tabular-nums;
+}
+.inst-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-top: auto;
+  padding-top: var(--sp-2);
+}
+.unplaced {
+  margin: 0 0 var(--sp-4);
+  font-size: var(--fs-label);
+}
+.unplaced summary {
+  cursor: pointer;
+  color: var(--fg-dim);
+}
+.unplaced summary:hover {
+  color: var(--fg);
+}
+.unplaced .mono {
+  display: block;
+  max-height: 11rem;
+  margin-top: 0.35rem;
+  padding: var(--sp-2);
+  overflow: auto;
+  background: var(--bg-subtle);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-sm);
+  font-size: 0.72rem;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+/* A name that is also a door: no button chrome, but still a target. */
+.linky {
+  display: inline;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.linky:hover {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.uri {
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+.home-inst {
+  margin: var(--sp-4) 0;
+  padding: var(--sp-4);
+  background: var(--bg-subtle);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-md);
+}
+/* The instance a view lives on, in list rows. */
+.inst {
+  padding: 0.02rem 0.4rem;
+  background: var(--bg-subtle);
+  border: 1px solid var(--line-soft);
+  border-radius: 999px;
+  color: var(--fg-dim);
+  font-family: var(--mono);
+  font-size: 0.6875rem;
+}
+
+/* Six destinations need room. Below 1024px the ordinal is noise; below 820px
+   the bar becomes two rows so the tabs scroll instead of squeezing the brand;
+   below 480px the icons alone remain, with the label as a tooltip. */
+@media (max-width: 1024px) {
+  nav button .idx {
+    display: none;
+  }
+}
+@media (max-width: 820px) {
+  header {
+    flex-wrap: wrap;
+    height: auto;
+    gap: 0.4rem 0.9rem;
+    padding: 0.55rem clamp(1rem, 3vw, 2rem);
+  }
+  .brand {
+    border-right: 0;
+    padding-right: 0;
+  }
+  nav {
+    order: 3;
+    width: 100%;
+    padding: 0;
+  }
+  .who {
+    margin-left: auto;
+  }
+}
+@media (max-width: 480px) {
+  /* Six destinations on a 320px bar: one equal cell each beats a horizontal
+     scroller nobody knows to swipe. Labels live in `title`/`aria-label`. */
+  nav {
+    display: grid;
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    gap: 2px;
+    overflow: visible;
+  }
+  nav button > span:not(.idx) {
+    display: none;
+  }
+  nav button {
+    justify-content: center;
+    min-width: 0;
+    padding: 0;
+  }
+  .inst-grid {
+    grid-template-columns: 1fr;
+  }
+  .inst-uri code {
+    font-size: 0.72rem;
   }
 }
 

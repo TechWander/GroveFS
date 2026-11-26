@@ -85,6 +85,11 @@ if [ -x "$BIN" ]; then
   # 放行今后任何叫 `--test` 的臆造参数。所以这里也按行剥离:含 `cargo test` 的行整行不看。
   # 已知代价同配方行:与 cargo 命令同行书写的 grovefs 臆造参数不再被这条规则抓到。
   sed -i '/cargo test/d' "$dtxt"
+  # 同理适用于**引擎 treedb 的命令行**:`treedb-server --dir`、`treedb-backup --primary/--out`、
+  # `treedb-pitr --archive/--to-seq`、`treedb-standby --promote` 等都是别家二进制的接口,不是
+  # grovefs 的。这里也按行剥离(含 `treedb-` 的行整段不看):这些行同时出现的 grovefs 参数只有
+  # `--meta-store`/`--dry-run`,二者在别处文档里反复出现、核覆盖不受影响;代价同 cargo 行。
+  sed -i '/treedb-/d' "$dtxt"
   # 同一个道理适用于**数据库工具自己的命令行**(`pg_dump -Fc --format=…`、
   # `pg_restore --clean`、`psql -c …`)。这里不能整行删——`pg_dump` 在散文里也大量出现,
   # 那些行同时带着真的 grovefs 参数(实测整行删会一并弄丢 18 处 `--meta-store`)。所以只把

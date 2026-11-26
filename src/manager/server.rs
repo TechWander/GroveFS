@@ -117,9 +117,7 @@ pub enum Denial {
     },
     /// The deployment exists but declares no metadata service, so there is
     /// nothing a mount could dial.
-    NoMeta {
-        deployment: String,
-    },
+    NoMeta { deployment: String },
     /// `--require-registered` and some declared address has no live claim.
     NotRegistered {
         deployment: String,
@@ -467,9 +465,7 @@ impl Manager {
     /// what lets `manager define` stay a separate command.
     fn reload_if_changed(&self) {
         let path = decl_path(&self.state_dir);
-        let mtime = std::fs::metadata(&path)
-            .and_then(|m| m.modified())
-            .ok();
+        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
         let Some(mtime) = mtime else { return };
         let mut inner = self.inner.lock();
         if Some(mtime) == inner.file_mtime {
@@ -560,11 +556,7 @@ impl Manager {
             });
         }
         let key = (a.deployment.clone(), a.role, a.addr.clone());
-        let first_seen = inner
-            .live
-            .get(&key)
-            .map(|l| l.first_seen)
-            .unwrap_or(now);
+        let first_seen = inner.live.get(&key).map(|l| l.first_seen).unwrap_or(now);
         inner.live.insert(
             key,
             Live {
@@ -832,7 +824,10 @@ mod tests {
         let (_, f1) = define_deployment(&dir, "prod", &["m1:1".into()], &["d1:1".into()]).unwrap();
         assert_eq!(f1.epoch, 1);
         let (_, f2) = define_deployment(&dir, "prod", &["m1:1".into()], &["d1:1".into()]).unwrap();
-        assert_eq!(f2.epoch, 1, "re-declaring the same topology is not a change");
+        assert_eq!(
+            f2.epoch, 1,
+            "re-declaring the same topology is not a change"
+        );
         let (_, f3) = define_deployment(
             &dir,
             "prod",
@@ -884,9 +879,8 @@ mod tests {
         }
         // And the forms that ARE dialable, including a bracketed IPv6 host.
         for good in ["10.0.0.1:50053", "[fd00::5]:50053", "h.example:1"] {
-            define_deployment(&dir, "prod", &[good.to_string()], &[]).unwrap_or_else(|e| {
-                panic!("{good:?} refused: {e}")
-            });
+            define_deployment(&dir, "prod", &[good.to_string()], &[])
+                .unwrap_or_else(|e| panic!("{good:?} refused: {e}"));
         }
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -965,7 +959,8 @@ mod tests {
         let e = m.build_roster("prod", 1_000).unwrap_err().to_string();
         assert!(e.contains("m1:1") && e.contains("d1:1"), "{e}");
 
-        m.record(&ann(Role::Meta, "prod", "m1:1", None), 1_000).unwrap();
+        m.record(&ann(Role::Meta, "prod", "m1:1", None), 1_000)
+            .unwrap();
         // Data still never registered → refused, naming only d1:1.
         let e = m.build_roster("prod", 1_001).unwrap_err().to_string();
         assert!(e.contains("d1:1") && !e.contains("m1:1"), "{e}");
@@ -1019,7 +1014,10 @@ mod tests {
             // A near-miss on port is not a match either.
             (Role::Data, "d1:2"),
         ] {
-            let text = m.record(&ann(role, "prod", addr, None), 1_000).unwrap_err().to_string();
+            let text = m
+                .record(&ann(role, "prod", addr, None), 1_000)
+                .unwrap_err()
+                .to_string();
             assert!(text.contains(addr), "{addr}: {text}");
             assert!(
                 text.contains("registration can never ADD an address"),
@@ -1027,8 +1025,12 @@ mod tests {
             );
         }
         // And the declared ones are accepted.
-        assert!(m.record(&ann(Role::Data, "prod", "d1:1", Some(1)), 1_000).is_ok());
-        assert!(m.record(&ann(Role::Meta, "prod", "m1:1", None), 1_000).is_ok());
+        assert!(m
+            .record(&ann(Role::Data, "prod", "d1:1", Some(1)), 1_000)
+            .is_ok());
+        assert!(m
+            .record(&ann(Role::Meta, "prod", "m1:1", None), 1_000)
+            .is_ok());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1094,7 +1096,10 @@ mod tests {
             .get(&("prod".to_string(), Role::Meta, "m1:1".to_string()))
             .unwrap();
         assert_eq!(l.first_seen, 1_000);
-        assert_eq!(l.last_seen, 1_030, "the heartbeat stamp moves with each claim");
+        assert_eq!(
+            l.last_seen, 1_030,
+            "the heartbeat stamp moves with each claim"
+        );
         assert_eq!(l.expires_at, 1_120, "the TTL rolls forward on each claim");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1111,7 +1116,10 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1200));
         define_deployment(&dir, "lab", &["m9:1".into()], &[]).unwrap();
         m.reload_if_changed();
-        assert_eq!(m.build_roster("lab", 1).expect("reloaded").meta, vec!["m9:1"]);
+        assert_eq!(
+            m.build_roster("lab", 1).expect("reloaded").meta,
+            vec!["m9:1"]
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

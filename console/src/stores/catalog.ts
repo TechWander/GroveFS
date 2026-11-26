@@ -3,7 +3,7 @@ import { defineStore } from 'pinia'
 import { useOps } from '@/composables/useOps'
 import { messageOf } from '@/utils/error'
 import { mergeViews } from '@/utils/views'
-import type { ViewRow } from '@/types'
+import type { StoreInfo, ViewRow } from '@/types'
 
 /*
   The namespace list, shared by three pages (key bindings, delegations, the
@@ -14,7 +14,7 @@ import type { ViewRow } from '@/types'
 */
 
 export const useCatalogStore = defineStore('catalog', () => {
-  const { api } = useOps()
+  const { api, soft } = useOps()
 
   const views = ref<ViewRow[]>([])
   const pending = ref(false)
@@ -27,6 +27,34 @@ export const useCatalogStore = defineStore('catalog', () => {
 
   const baseNames = computed(() => views.value.filter((v) => v.kind === 'base').map((v) => v.name))
   const byName = computed(() => new Map(views.value.map((v) => [v.name, v])))
+
+  /* The deployment's storage picture, read once per session. `store.info` is
+     Super-only, so a delegated account gets `null` and the list simply omits
+     the instance column — never a fabricated "local". */
+  const storage = ref<StoreInfo['storage'] | null>(null)
+  const storagePending = ref(false)
+
+  async function loadStorage(force = false): Promise<void> {
+    if (storage.value && !force) return
+    if (storagePending.value) return
+    storagePending.value = true
+    try {
+      const res = await soft('store.info', {})
+      if (res.ok) storage.value = res.r?.storage ?? null
+    } finally {
+      storagePending.value = false
+    }
+  }
+
+  /** Which instance hosts a view. A single logical instance answers for every
+      name; a multi-instance view with no placement row is hash-routed, and
+      `null` is the honest answer (the list renders it as `hash`). */
+  function instanceOf(view: string): string | null {
+    const s = storage.value
+    if (!s) return null
+    if (s.placement[view]) return s.placement[view]
+    return s.instances.length === 1 ? s.instances[0].name : null
+  }
 
   /** `force` re-reads even a populated list; a page that needs the namespace at
       its freshest (the views page, right after a create) asks for it. */
@@ -49,7 +77,21 @@ export const useCatalogStore = defineStore('catalog', () => {
     views.value = []
     sel.value = null
     error.value = ''
+    storage.value = null
   }
 
-  return { views, pending, error, sel, baseNames, byName, loadViews, reset }
+  return {
+    views,
+    pending,
+    error,
+    sel,
+    baseNames,
+    byName,
+    storage,
+    storagePending,
+    loadViews,
+    loadStorage,
+    instanceOf,
+    reset,
+  }
 })

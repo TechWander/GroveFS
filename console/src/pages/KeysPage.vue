@@ -21,6 +21,7 @@ import { useOps } from '@/composables/useOps'
 import { usePageLoad } from '@/composables/usePageLoad'
 import { useCatalogStore } from '@/stores/catalog'
 import { useFilterStore } from '@/stores/filters'
+import { useNav } from '@/composables/useNav'
 import { useUiStore } from '@/stores/ui'
 import type { ChipItem } from '@/components/ui/chips'
 import { KEY_BUCKETS, keyBucket, type KeyBucket } from '@/utils/keys'
@@ -40,6 +41,10 @@ const catalog = useCatalogStore()
 const filters = useFilterStore()
 const ui = useUiStore()
 const { api } = useOps()
+const { consumeQuery } = useNav()
+
+/* `?view=` from a view's detail pane pre-selects the binding filter. */
+consumeQuery()
 
 const rows = ref<KeyRow[]>([])
 

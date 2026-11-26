@@ -43,6 +43,7 @@ import ChipGroup from '@/components/ui/ChipGroup.vue'
 import ActionButton from '@/components/ui/ActionButton.vue'
 import LoadingHint from '@/components/ui/LoadingHint.vue'
 import AuditTable from '@/components/audit/AuditTable.vue'
+import AuditRetentionPanel from '@/components/audit/AuditRetentionPanel.vue'
 
 const filters = useFilterStore()
 const catalog = useCatalogStore()
@@ -132,13 +133,26 @@ const mintChips = computed<ChipItem[]>(() =>
   })),
 )
 
-const windowChips = computed<ChipItem[]>(() =>
+const windowOptions = computed(() =>
   WINDOWS.map(([v, label]) => ({
     v,
     t: label,
-    n: rows.value.filter((r) => withinWindow(r.ts, v)).length,
+    n: rows.value.filter((r) => withinWindow(r.ts, v, f.from, f.to)).length,
   })),
 )
+
+/* A 30-day question over a 50-row load answers "nothing happened". When the
+   chosen window can outrun what is loaded, raise the load once — the wider
+   read is what the operator meant by picking it. */
+const WIDE = new Set(['30d', '180d', '360d', 'custom'])
+function setWindow(ev: Event): void {
+  const w = (ev.target as HTMLSelectElement).value
+  f.window = w
+  if (WIDE.has(w) && filters.auditLimit < 1000) {
+    filters.auditLimit = 1000
+    ui.reload()
+  }
+}
 
 const verdictChips = computed<ChipItem[]>(() =>
   (
@@ -156,7 +170,7 @@ const verdictChips = computed<ChipItem[]>(() =>
 
 const hit = computed(() =>
   rows.value.filter((r) => {
-    if (!withinWindow(r.ts, f.window)) return false
+    if (!withinWindow(r.ts, f.window, f.from, f.to)) return false
     if (f.plane !== 'all' && r.method !== f.plane) return false
     if (f.op !== 'all' && r.tool !== f.op) return false
     if (f.key !== 'all' && r.key_id !== f.key) return false
@@ -223,9 +237,21 @@ const kept = computed(() => {
       </template>
 
       <template #opts>
-        <FldRow :label="'time'">
-          <ChipGroup v-model="f.window" :items="windowChips" />
+        <FldRow :label="'time range'" for="audit-window">
+          <select id="audit-window" :value="f.window" @change="setWindow">
+            <option v-for="w in windowOptions" :key="w.v" :value="w.v">
+              {{ t(w.t) }} · {{ w.n }}
+            </option>
+          </select>
         </FldRow>
+        <template v-if="f.window === 'custom'">
+          <FldRow :label="'from'" for="audit-from">
+            <input id="audit-from" v-model="f.from" type="date" />
+          </FldRow>
+          <FldRow :label="'to'" for="audit-to">
+            <input id="audit-to" v-model="f.to" type="date" />
+          </FldRow>
+        </template>
         <FldRow :label="'result'">
           <ChipGroup v-model="f.verdict" :items="verdictChips" />
         </FldRow>
@@ -274,6 +300,14 @@ const kept = computed(() => {
       :empty="rows.length ? 'no calls match the filter' : 'no governance calls yet'"
     />
 
+    <!-- The retention window and the on-demand cut are Super-only ops, so the
+         panel appears exactly when the session can route them. It sits UNDER the
+         table it governs: the admin reads what is there, then decides the window. -->
+    <AuditRetentionPanel
+      v-if="session.can('audit.retention.set') && session.can('apikey.purge')"
+      :current="retention ?? null"
+    />
+
     <p class="muted">
       {{
         session.isSuper
@@ -286,7 +320,10 @@ const kept = computed(() => {
       }}
     </p>
 
-    <p class="muted">
+    <!-- The key-attribution sentence answers a question only a reader who has
+         just filtered by key is asking; on the unfiltered page it was the last
+         of two paragraphs and pushed the table's end into a wall of text. -->
+    <p v-if="f.key !== 'all'" class="muted">
       {{
         t(
           'A row’s key is the credential that signed the call. From this console that is always the gateway’s own admin key, because the gateway holds one and forwards what you click: filtering by key finds the door, searching by account finds who walked through it.',

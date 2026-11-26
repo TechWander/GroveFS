@@ -13,8 +13,10 @@
 //!
 //! For 15k files this typically runs in <50 ms vs ~25 s via FUSE.
 
+use crate::cli_style as ui;
 use std::collections::{BTreeSet, HashMap};
 use std::io;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -62,23 +64,23 @@ pub fn run(opts: &DuOpts) -> io::Result<()> {
     if lost > 0 {
         // Numbers that quietly omit something are the failure mode this
         // command exists to avoid, so the gap is announced, not folded in.
-        eprintln!(
-            "warning: {lost} of {} object(s) are not in the data source and count as 0 bytes \
+        ui::warn(&format!(
+            "{lost} of {} objects are not in the data source and count as 0 bytes \
              (objects on other storage roots need their own --data-servers/--data-dir)",
             refs.len()
-        );
+        ));
     }
     if damaged > 0 {
         // A damaged striped object is bytes that ARE present but not in the
         // contiguous run the size depends on — a different problem from a plain
         // miss, and one a bare shorter total would hide. Announce it on its own
         // line so "content is corrupt" is never mistaken for "pass --data-dir".
-        eprintln!(
-            "warning: {damaged} of {} object(s) are damaged striped objects and are excluded \
+        ui::warn(&format!(
+            "{damaged} of {} objects are damaged striped objects and are excluded \
              from the total (their true size is unknown); first: {}",
             refs.len(),
             damaged_sample.unwrap_or_else(|| "(reason unavailable)".to_string())
-        );
+        ));
     }
 
     // 4. Build id→size map and id→node map.
@@ -138,12 +140,27 @@ pub fn run(opts: &DuOpts) -> io::Result<()> {
     );
     results.sort_by(|a, b| a.0.cmp(&b.0));
 
-    // 7. Print.
-    for (path, sz) in &results {
-        if opts.bytes {
-            println!("{}\t{}", sz, path);
-        } else {
-            println!("{}\t{}", human(*sz), path);
+    // 7. Print. A terminal gets the aligned report; a pipe keeps the historic
+    //    tab-separated (and still `sort`/`awk`-friendly) form byte for byte.
+    let aligned = !opts.bytes && std::io::stdout().is_terminal();
+    if aligned {
+        ui::heading(&format!("du · view '{}' · {}", opts.view, root_path));
+        let mut t = ui::Table::new(vec![
+            ui::Column::right("size").min(6),
+            ui::Column::left("path").min(8),
+        ])
+        .wrap_last(false);
+        for (path, sz) in &results {
+            t.row(vec![ui::Cell::new(human(*sz)), ui::Cell::new(path)]);
+        }
+        t.print();
+    } else {
+        for (path, sz) in &results {
+            if opts.bytes {
+                println!("{}\t{}", sz, path);
+            } else {
+                println!("{}\t{}", human(*sz), path);
+            }
         }
     }
     Ok(())
@@ -188,9 +205,14 @@ fn resolve_store(explicit: &Option<String>) -> Option<String> {
 /// (SQLSTATE 42P01 in disguise). A measuring tool must not be able to report "empty"
 /// for a name that does not exist.
 fn no_tree(view: &str, store: &str) -> io::Error {
+    if view.is_empty() {
+        return io::Error::other(format!(
+            "`--view` is required: `grovefs view list` shows the names in {store}"
+        ));
+    }
     io::Error::other(format!(
-        "no tree for view '{view}' in {store} — `grovefs view create --view {view}` makes one, \
-         and `grovefs view list` shows the names that exist"
+        "no tree for view '{view}' in {store} — `grovefs view list` shows the names that exist; \
+         create a base with `grovefs view create --view {view}`"
     ))
 }
 
@@ -474,7 +496,7 @@ fn resolve_sizes(
             }
             if let Some(why) = unconfirmed {
                 return Err(io::Error::other(format!(
-                    "object(s) under {} could not be read to confirm their size (first \
+                    "objects under {} could not be read to confirm their size (first \
                      failure: {why}); no total is reported rather than one that omits them",
                     root.display()
                 )));
@@ -673,7 +695,7 @@ fn resolve_remote(
             // this command exists to avoid. The data source's own reason is
             // quoted because it is the only part that says what went wrong.
             return Err(io::Error::other(format!(
-                "{unconfirmed} of {} object(s) could not be confirmed against the data \
+                "{unconfirmed} of {} objects could not be confirmed against the data \
                  source (first failure: {}); their sizes are unknown, so no total is \
                  reported",
                 refs.len(),

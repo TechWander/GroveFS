@@ -30,27 +30,6 @@ export function humanLeft(iso: string): string {
   return t('less than a minute')
 }
 
-/** Time windows are the FIRST filter for a log, and they are relative: an
-    operator asks "what happened in the last hour", not "what happened between
-    two timestamps I have to type". The absolute range a real audit export needs
-    belongs to the CLI (`grovefs apikey calls`), which has the same rows and a
-    machine to diff them in. */
-export const WIN_MS: Record<string, number> = {
-  '1h': 3_600_000,
-  '24h': 86_400_000,
-  '7d': 7 * 86_400_000,
-}
-
-export const WINDOWS: [string, string][] = [
-  ['all', 'all time'],
-  ['1h', 'last hour'],
-  ['24h', 'last 24 hours'],
-  ['7d', 'last 7 days'],
-]
-
-export function withinWindow(ts: string | undefined, win: string): boolean {
-  if (!win || win === 'all') return true
-  const t0 = Date.parse(String(ts ?? ''))
-  const span = WIN_MS[win]
-  return Number.isFinite(t0) && span !== undefined && Date.now() - t0 <= span
-}
+/** Time windows for the audit log live in `utils/audit.ts` — here only the
+    FORMATTING helpers belong; a second copy of the ladder drifted once already
+    in the hand-written file. */

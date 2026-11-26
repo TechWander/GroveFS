@@ -665,7 +665,10 @@ mod tests {
 
     #[test]
     fn key_shapes_match_the_sharded_backend() {
-        assert_eq!(layout_base("s2:1024:abcd-uuid"), Some("abcd-uuid".to_string()));
+        assert_eq!(
+            layout_base("s2:1024:abcd-uuid"),
+            Some("abcd-uuid".to_string())
+        );
         // The identity-pinned 4-field form (a `--member-id` stripe): the GC side
         // must read the SAME base the data plane names its chunk files by, or
         // every striped chunk of such a deployment looks orphaned (the drift a

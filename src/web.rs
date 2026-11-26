@@ -120,6 +120,14 @@ fn block_for(fails: u32) -> Duration {
 /// - `fork.graft` takes a plan FILE of per-path moves — a file upload with no
 ///   interesting UI until someone needs one.
 ///
+/// Retention is NOT absent any more, deliberately: an unbounded `mcp_calls`
+/// table is an operational failure the admin has to notice by accident, so the
+/// console exposes the window (`audit.retention.get/set`) and an
+/// apply-against-the-current-window cut (`apikey.purge`, gated `Super` and
+/// audited like every call). Setting a shorter window trims immediately — the
+/// same cut `--audit-retention` performs at startup, from the page instead of
+/// the CLI.
+///
 /// Present and worth naming: `view.create` (standing up a base view is exactly
 /// what a management page is for, and the server requires an administrator),
 /// `def.put`/`fork.create` (a delegated account's own lens and fork work), and
@@ -152,6 +160,9 @@ const ALLOWED_OPS: &[&str] = &[
     "apikey.set_ro",
     "apikey.update",
     "apikey.calls",
+    "apikey.purge",
+    "audit.retention.get",
+    "audit.retention.set",
     "account.list",
     "account.create",
     "account.passwd",
@@ -353,7 +364,10 @@ pub fn serve(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         attempts: Mutex::new(HashMap::new()),
     });
 
-    println!("grovefs web: management console on http://{}/", gw.cfg.listen);
+    println!(
+        "grovefs web: management console on http://{}/",
+        gw.cfg.listen
+    );
     println!(
         "  control plane : {} (backend {})",
         gw.cfg.control.addr(),
@@ -363,9 +377,13 @@ pub fn serve(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         "  sign-in       : accounts of that server's web store; the first owner comes from its \n                    --admin-user flag"
     );
     println!(
-        "  sessions      : {}h idle window, {} worker thread(s)",
+        "  sessions      : {}h idle window, {}",
         gw.cfg.session_ttl.as_secs() / 3600,
-        gw.cfg.workers.max(1)
+        crate::cli_style::plural(
+            gw.cfg.workers.max(1) as usize,
+            "worker thread",
+            "worker threads"
+        )
     );
     if !gw.cfg.is_loopback() {
         println!(
@@ -414,7 +432,11 @@ impl Gateway {
         let ip = self.client_ip(&rq);
         let reply = match (method, path) {
             (Method::Get | Method::Head, "/") | (Method::Get | Method::Head, "/index.html") => {
-                Reply::body(200, "text/html; charset=utf-8", INDEX_HTML.as_bytes().to_vec())
+                Reply::body(
+                    200,
+                    "text/html; charset=utf-8",
+                    INDEX_HTML.as_bytes().to_vec(),
+                )
             }
             (Method::Get, "/app.css") => {
                 Reply::body(200, "text/css; charset=utf-8", APP_CSS.as_bytes().to_vec())
@@ -424,14 +446,14 @@ impl Gateway {
                 "application/javascript; charset=utf-8",
                 APP_JS.as_bytes().to_vec(),
             ),
-            (Method::Get, "/favicon.svg") => Reply::body(
-                200,
-                "image/svg+xml",
-                FAVICON_SVG.as_bytes().to_vec(),
-            ),
+            (Method::Get, "/favicon.svg") => {
+                Reply::body(200, "image/svg+xml", FAVICON_SVG.as_bytes().to_vec())
+            }
             // Browsers request /favicon.ico by default even when a `link rel=icon`
             // points at the SVG; a 204 keeps that miss out of the console.
-            (Method::Get, "/favicon.ico") => Reply::body(204, "text/plain; charset=utf-8", Vec::new()),
+            (Method::Get, "/favicon.ico") => {
+                Reply::body(204, "text/plain; charset=utf-8", Vec::new())
+            }
             (Method::Post, "/api/login") => self.login(&mut rq, &ip),
             (Method::Post, "/api/logout") => self.logout(&mut rq),
             (Method::Get, "/api/session") => self.session(&rq, &ip),
@@ -440,9 +462,11 @@ impl Gateway {
             (Method::Post, "/api/import") => self.import(&mut rq, &query, &ip),
             (m, other) if other.starts_with("/api/") => Reply::error(
                 405,
-                format!("{other} is not a console route for {m:?} (routes: POST /api/login, \
+                format!(
+                    "{other} is not a console route for {m:?} (routes: POST /api/login, \
                         POST /api/logout, GET /api/session, POST /api/call, GET /api/export, \
-                        POST /api/import)"),
+                        POST /api/import)"
+                ),
             ),
             (m, other) => Reply::error(404, format!("no console page at {m:?} {other}")),
         };
@@ -1077,13 +1101,25 @@ mod tests {
         }
     }
 
-    /// The four verbs deliberately left out of the browser's reach. If someone
+    /// The verbs deliberately left out of the browser's reach. If someone
     /// adds one back, this fails and the argument above has to be re-read.
+    /// `apikey.purge` USED to be on this list — the retention UI overrode that
+    /// call — which is why it is asserted PRESENT below instead.
     #[test]
     fn destructive_ops_are_not_routable() {
-        for op in ["gc.scan", "gc.apply", "refs.rebuild", "view.rm_base", "fork.graft", "login"] {
+        for op in [
+            "gc.scan",
+            "gc.apply",
+            "refs.rebuild",
+            "view.rm_base",
+            "fork.graft",
+            "login",
+        ] {
             assert!(!allowed_op(op), "{op} must stay out of the console");
         }
+        assert!(allowed_op("apikey.purge"));
+        assert!(allowed_op("audit.retention.get"));
+        assert!(allowed_op("audit.retention.set"));
     }
 
     #[test]
@@ -1170,6 +1206,10 @@ mod tests {
         let a = temp_path("export");
         let b = temp_path("export");
         assert_ne!(a, b);
-        assert!(a.file_name().unwrap().to_string_lossy().starts_with("grovefs-web-"));
+        assert!(a
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("grovefs-web-"));
     }
 }

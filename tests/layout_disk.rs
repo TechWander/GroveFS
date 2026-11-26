@@ -104,19 +104,22 @@ fn flatten(home: &Path) {
 }
 
 #[test]
-fn a_v2_store_reports_itself_as_trees_not_as_files() {
+fn a_current_store_reports_itself_as_trees_not_as_files() {
     let dir = tempfile::tempdir().unwrap();
     let home = populated(dir.path());
     let (ok, o, e) = gv(&["layout", "--home", home.to_str().unwrap(), "show"]);
     assert!(ok, "layout show: {o}{e}");
+    // Since layout v3 a per-tree store reads as v3 with a family mode; the
+    // version label moved off the old `v2` when family placement landed.
     assert!(
-        o.contains("layout:         v2"),
-        "a current store must read as v2:\n{o}"
+        o.contains("layout:         v3"),
+        "a current store must read as v3:\n{o}"
     );
     assert!(
-        o.contains("view trees:     1"),
-        "one physical tree:\n{o}"
+        o.contains("family mode:"),
+        "and name the family policy:\n{o}"
     );
+    assert!(o.contains("view trees:     1"), "one physical tree:\n{o}");
     assert!(
         o.contains(&format!("{}", home.join("meta/v/v.db").display())),
         "the tree is named by its own path:\n{o}"
@@ -129,7 +132,10 @@ fn a_v2_store_reports_itself_as_trees_not_as_files() {
         .filter(|en| !en.path().is_dir())
         .map(|en| en.file_name().to_string_lossy().into_owned())
         .collect();
-    assert!(loose.is_empty(), "stray files directly under meta/: {loose:?}");
+    assert!(
+        loose.is_empty(),
+        "stray files directly under meta/: {loose:?}"
+    );
 }
 
 #[test]
@@ -200,7 +206,10 @@ fn a_missing_metadata_root_is_refused_before_it_can_decide_anything() {
 
     // The audit refuses instead of reporting an empty store.
     let (ok, _o, e) = gv(&["gc", "--meta-dir", t, "--data-dir", h, "--older-than", "0"]);
-    assert!(!ok, "a missing metadata root must not read as an empty store");
+    assert!(
+        !ok,
+        "a missing metadata root must not read as an empty store"
+    );
     assert!(e.contains("no metadata directory"), "{e}");
 
     // And the apply that would have reclaimed the whole data root refuses too,
@@ -215,13 +224,23 @@ fn a_missing_metadata_root_is_refused_before_it_can_decide_anything() {
         "0",
         "--apply",
     ]);
-    assert!(!ok, "a missing metadata root must not reclaim anything: {e}");
-    assert_eq!(before, objects(&home.join("blocks")), "the bytes must be untouched");
+    assert!(
+        !ok,
+        "a missing metadata root must not reclaim anything: {e}"
+    );
+    assert_eq!(
+        before,
+        objects(&home.join("blocks")),
+        "the bytes must be untouched"
+    );
 
     // The ledger recount refuses as well — and does not TURN the typo into a
     // store by creating the metadata root it just found missing.
     let (ok, _o, e) = gv(&["refs", "--meta-dir", t, "rebuild"]);
-    assert!(!ok, "a recount over a path that is not a store must refuse: {e}");
+    assert!(
+        !ok,
+        "a recount over a path that is not a store must refuse: {e}"
+    );
     assert!(e.contains("no metadata directory"), "{e}");
     assert!(
         !typo.join("meta").exists(),
@@ -248,7 +267,10 @@ fn migrate_completes_in_one_pass_even_with_sidecars_it_folds_away() {
     let (ok, o, e) = gv(&["layout", "--home", h, "migrate"]);
     assert!(ok, "one pass has to finish the job: {o}{e}");
     assert!(o.contains("migrated"), "{o}");
-    assert!(home.join("meta/v/v.db").is_file(), "the db is in its tree dir");
+    assert!(
+        home.join("meta/v/v.db").is_file(),
+        "the db is in its tree dir"
+    );
     assert!(!home.join("meta/v.db").exists(), "the flat db is gone");
     for sfx in ["-wal", "-shm"] {
         assert!(
@@ -261,14 +283,17 @@ fn migrate_completes_in_one_pass_even_with_sidecars_it_folds_away() {
         );
     }
     assert!(
-        o.contains("sidecar(s) needed no move"),
+        o.contains("sidecar") && o.contains("needed no move"),
         "the summary has to explain why it moved fewer files than the plan:\n{o}"
     );
 
-    // After: the store reads as v2, the view is back, and the bytes are the same.
+    // After: the store reads as v3, the view is back, and the bytes are the same.
     let (ok, o, e) = gv(&["layout", "--home", h, "show"]);
     assert!(ok, "show after migrate: {o}{e}");
-    assert!(o.contains("layout:         v2") && o.contains("view trees:     1"), "{o}");
+    assert!(
+        o.contains("layout:         v3") && o.contains("view trees:     1"),
+        "{o}"
+    );
     let (ok, o, e) = gv(&["view", "--home", h, "list"]);
     assert!(ok, "the trees are readable again: {o}{e}");
     assert!(o.contains('v'), "the view is listed:\n{o}");
@@ -305,7 +330,13 @@ fn migrate_refuses_a_store_that_a_grovefs_process_is_using() {
     let addr = srv.local_addr().unwrap();
     drop(srv);
     let child = Command::new(env!("CARGO_BIN_EXE_grovefs"))
-        .args(["data-server", "--data-dir", h, "--listen", &addr.to_string()])
+        .args([
+            "data-server",
+            "--data-dir",
+            h,
+            "--listen",
+            &addr.to_string(),
+        ])
         .env("GROVEFS_CONFIG", "/nonexistent/grovefs.conf")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -329,5 +360,185 @@ fn migrate_refuses_a_store_that_a_grovefs_process_is_using() {
         "and say why in the direction of a fix: {e}"
     );
     // Nothing was moved by the refusal.
-    assert!(home.join("meta/v.db").is_file(), "the refusal touched the store");
+    assert!(
+        home.join("meta/v.db").is_file(),
+        "the refusal touched the store"
+    );
+}
+
+/* ───────────────────────── layout v3: family placement ─────────────────────────
+
+A fork, a derived lens and a pure alias all belong to ONE base view, so since
+v3 they land INSIDE that base's directory instead of scattered at the top
+level. The policy (`nested` default, `grouped` separators, `flat` legacy) only
+decides where NEW members go — every read resolves by scanning, so flipping it
+never orphans an existing tree. These three tests pin the placement the
+feature is FOR, and the compatibility that makes it safe to adopt. */
+
+/// One `define` needs a rules file; a lone `only` line is the smallest valid one.
+fn rules(dir: &Path, name: &str, body: &str) -> String {
+    let p = dir.join(name);
+    fs::write(&p, body).unwrap();
+    p.to_str().unwrap().to_string()
+}
+
+/// v3 default (`nested`): a fork's tree db, a lens's definition and an alias's
+/// definition all land inside `meta/<base>/`, not at the top level beside the
+/// base — which is the whole point of the归属 change.
+#[test]
+fn family_members_land_inside_their_base_view() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = populated(dir.path());
+    let h = home.to_str().unwrap();
+    let meta = home.join("meta");
+
+    let (ok, o, e) = gv(&["view", "--home", h, "fork", "--name", "lab", "--base", "v"]);
+    assert!(ok, "fork: {o}{e}");
+    assert!(
+        meta.join("v/lab/lab.db").is_file(),
+        "the fork tree nests inside its base"
+    );
+    assert!(
+        meta.join("v/lab.layout").is_file(),
+        "the fork definition nests inside its base too"
+    );
+    assert!(!meta.join("lab").exists(), "no top-level fork dir");
+
+    let r = rules(dir.path(), "lens.rules", "only /sub\n");
+    let (ok, o, e) = gv(&[
+        "view", "--home", h, "define", "--name", "lens", "--base", "v", "--rules", &r,
+    ]);
+    assert!(ok, "define: {o}{e}");
+    assert!(
+        meta.join("v/lens.layout").is_file(),
+        "the lens definition lands inside the base dir"
+    );
+    assert!(
+        !meta.join("views/lens.layout").exists(),
+        "not at the top-level defs slot"
+    );
+
+    let (ok, o, e) = gv(&["view", "--home", h, "alias", "--name", "pub", "--real", "v"]);
+    assert!(ok, "alias: {o}{e}");
+    assert!(
+        meta.join("v/pub.layout").is_file(),
+        "the alias definition lands inside the base dir"
+    );
+
+    // The enumerator descends the family layer, so every member is still listed.
+    let (ok, o, e) = gv(&["view", "--home", h, "list", "--json"]);
+    assert!(ok, "list --json: {o}{e}");
+    for name in ["v", "lab", "lens", "pub"] {
+        assert!(o.contains(name), "`view list` must carry {name}:\n{o}");
+    }
+
+    // `layout show` reads v3 + nested and reports the fork by its REAL home.
+    let (ok, o, e) = gv(&["layout", "--home", h, "show"]);
+    assert!(ok, "show: {o}{e}");
+    assert!(
+        o.contains("v3") && o.contains("nested"),
+        "v3 + nested:\n{o}"
+    );
+    assert!(
+        o.contains(&meta.join("v/lab/lab.db").display().to_string()),
+        "the tree list shows the nested home:\n{o}"
+    );
+}
+
+/// `grouped` keeps the归属 but adds a separator so a base with many members
+/// still lists cleanly: trees under `<base>/forks/`, defs under `<base>/views/`.
+#[test]
+fn grouped_policy_separates_family_members() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = populated(dir.path());
+    let h = home.to_str().unwrap();
+    let meta = home.join("meta");
+    let (ok, o, e) = gv(&["layout", "--home", h, "set-family", "grouped"]);
+    assert!(ok, "set-family grouped: {o}{e}");
+
+    let (ok, o, e) = gv(&["view", "--home", h, "fork", "--name", "lab", "--base", "v"]);
+    assert!(ok, "fork: {o}{e}");
+    assert!(
+        meta.join("v/forks/lab/lab.db").is_file(),
+        "grouped fork tree lands behind the base's forks/ separator"
+    );
+
+    let r = rules(dir.path(), "lens.rules", "only /sub\n");
+    let (ok, o, e) = gv(&[
+        "view", "--home", h, "define", "--name", "lens", "--base", "v", "--rules", &r,
+    ]);
+    assert!(ok, "define: {o}{e}");
+    assert!(
+        meta.join("v/views/lens.layout").is_file(),
+        "grouped lens def lands behind the base's views/ separator"
+    );
+
+    // The separators are reserved names, so `forks`/`views` never read as trees.
+    let (ok, o, _e) = gv(&["view", "--home", h, "list", "--json"]);
+    assert!(ok, "list: {o}");
+    assert!(
+        o.contains("lab") && o.contains("lens"),
+        "members still listed:\n{o}"
+    );
+}
+
+/// The compatibility promise: a store whose members are at the TOP level (the
+/// pre-v3 `flat` shape) keeps reading under a `nested` policy, because every
+/// read resolves by scanning; and after the flip only NEW members nest. Flipping
+/// never moves — and never orphans — what already exists.
+#[test]
+fn a_flat_store_still_reads_after_the_policy_flips_to_nested() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = populated(dir.path());
+    let h = home.to_str().unwrap();
+    let meta = home.join("meta");
+
+    // Build the family the pre-v3 way: top-level fork dir + top-level def slot.
+    let (ok, o, e) = gv(&["layout", "--home", h, "set-family", "flat"]);
+    assert!(ok, "set-family flat: {o}{e}");
+    let (ok, o, e) = gv(&["view", "--home", h, "fork", "--name", "old", "--base", "v"]);
+    assert!(ok, "fork: {o}{e}");
+    assert!(
+        meta.join("old/old.db").is_file(),
+        "a flat fork lands at the top level"
+    );
+    let r = rules(dir.path(), "oldlens.rules", "only /sub\n");
+    let (ok, o, e) = gv(&[
+        "view", "--home", h, "define", "--name", "oldlens", "--base", "v", "--rules", &r,
+    ]);
+    assert!(ok, "define: {o}{e}");
+    assert!(
+        meta.join("views/oldlens.layout").is_file(),
+        "a flat def lands at the top-level defs slot"
+    );
+
+    // Flip to the v3 default. Nothing about the existing members moves or is
+    // re-homed — but the enumerator must still find them, and a fresh member
+    // must nest.
+    let (ok, o, e) = gv(&["layout", "--home", h, "set-family", "nested"]);
+    assert!(ok, "set-family nested: {o}{e}");
+    assert!(
+        meta.join("old/old.db").is_file(),
+        "the flip must not disturb the existing flat fork"
+    );
+    assert!(
+        meta.join("views/oldlens.layout").is_file(),
+        "nor re-home the existing flat def"
+    );
+
+    let (ok, o, e) = gv(&["view", "--home", h, "list", "--json"]);
+    assert!(ok, "list after flip: {o}{e}");
+    for name in ["v", "old", "oldlens"] {
+        assert!(
+            o.contains(name),
+            "a top-level member resolves under the nested policy: {name}\n{o}"
+        );
+    }
+
+    let (ok, o, e) = gv(&["view", "--home", h, "fork", "--name", "new", "--base", "v"]);
+    assert!(ok, "second fork: {o}{e}");
+    assert!(
+        meta.join("v/new/new.db").is_file(),
+        "a member created AFTER the flip nests, proving the policy is live"
+    );
 }

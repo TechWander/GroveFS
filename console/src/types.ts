@@ -46,6 +46,26 @@ export interface InfoResult {
   role?: string
 }
 
+/** One metadata-store instance, as `store.info.storage` reports it.
+    `uri` is the FULL connection string, credentials included — the reply is
+    Super-only and this page exists so an operator can verify what is really
+    configured. */
+export interface StoreInstance {
+  name: string
+  control: boolean
+  uri: string | null
+  placedViews: number | null
+}
+
+/** Which backend carries the trees, and (under PostgreSQL) which instance
+    carries each view. SQLite and treedb report one logical instance. */
+export interface StorageInfo {
+  backend: 'sqlite' | 'postgres' | 'treedb'
+  instances: StoreInstance[]
+  placement: Record<string, string>
+  instanceError: string | null
+}
+
 /** `store.info` — the administrator's deployment snapshot. */
 export interface StoreInfo {
   backend?: string
@@ -66,6 +86,8 @@ export interface StoreInfo {
   residentViews?: number
   /** `null` means rows are kept until an operator purges them by hand. */
   auditRetention?: string | null
+  /** Backend + instance book + placement (Super only). */
+  storage?: StorageInfo
   /** Registry instances with their placed-view counts; `null` on a non-PG backend. */
   pgInstances?: PgLedger | null
   /** The banner's own words on where trees live and what `base` holds here. */
@@ -113,6 +135,9 @@ export interface ViewStats {
   keys?: number | null
   sessions?: number
   resident?: boolean
+  /** Instance whose schema holds this view's tree; `null` = hash-routed
+      (multi-instance) or not resolvable. */
+  instance?: string | null
 }
 
 export type Stamp = string | Record<string, string | number> | null | undefined

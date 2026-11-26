@@ -20,6 +20,7 @@ import { useOps } from '@/composables/useOps'
 import { usePageLoad } from '@/composables/usePageLoad'
 import { useCatalogStore } from '@/stores/catalog'
 import { useFilterStore } from '@/stores/filters'
+import { useNav } from '@/composables/useNav'
 import { useSessionStore } from '@/stores/session'
 import { useUiStore } from '@/stores/ui'
 import type { ChipItem } from '@/components/ui/chips'
@@ -44,6 +45,11 @@ const filters = useFilterStore()
 const session = useSessionStore()
 const ui = useUiStore()
 const { soft } = useOps()
+const { consumeQuery } = useNav()
+
+/* `?view=` lands here from a view's detail pane: show only the accounts
+   delegated that base, before the first render. */
+consumeQuery()
 
 const accounts = ref<AccountRow[]>([])
 const grants = ref<GrantRow[]>([])
@@ -101,6 +107,7 @@ const hit = computed(() => {
   return accounts.value.filter((a) => {
     if (f.role !== 'all' && a.role !== f.role) return false
     if (f.state !== 'all' && stateOf(a) !== f.state) return false
+    if (f.view !== 'all' && !grantsOf(a.account).some((g) => g.base_view === f.view)) return false
     if (q) {
       const hay = [
         a.account,
@@ -164,6 +171,16 @@ const grantHit = computed(() => {
         </FldRow>
         <FldRow :label="'state'">
           <ChipGroup v-model="filters.accFilter.state" :items="stateChips" />
+        </FldRow>
+        <FldRow v-if="filters.accFilter.view !== 'all'" :label="'delegated view'">
+          <button
+            type="button"
+            class="mini"
+            :title="t('clear this filter')"
+            @click="filters.accFilter.view = 'all'"
+          >
+            {{ filters.accFilter.view }} ×
+          </button>
         </FldRow>
       </template>
     </FilterBar>

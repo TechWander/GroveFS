@@ -355,10 +355,10 @@ impl DataServer {
     pub fn serve(&self) -> io::Result<()> {
         let listener = crate::platform::bind_listener(&self.listen)?;
         println!(
-            "data-server listening on {} (host {}, {} data root(s): {})",
+            "data-server listening on {} (host {}, {}, {})",
             self.listen,
             node_hostname(),
-            self.roots.len(),
+            crate::cli_style::plural(self.roots.len(), "data root", "data roots"),
             self.roots
                 .iter()
                 .map(|r| r.display().to_string())
@@ -406,7 +406,15 @@ pub fn serve_on_auth(
     token: &str,
     fence: Arc<Fence>,
 ) {
-    serve_auth_keys(listener, backend, token, fence, None, proto::NO_MEMBER_ID, None)
+    serve_auth_keys(
+        listener,
+        backend,
+        token,
+        fence,
+        None,
+        proto::NO_MEMBER_ID,
+        None,
+    )
 }
 
 /// Accept loop that additionally REQUIRES a Data-Access Capability on every
@@ -473,8 +481,7 @@ fn serve_auth_keys(
                 let keys = keys.clone();
                 let dac_key = data_access_key.clone();
                 thread::spawn(move || {
-                    if let Err(e) =
-                        handle_conn(s, backend, &token, fence, keys, member_id, dac_key)
+                    if let Err(e) = handle_conn(s, backend, &token, fence, keys, member_id, dac_key)
                     {
                         // A client hanging up is normal; log only real protocol errors.
                         if e.kind() != io::ErrorKind::UnexpectedEof {
