@@ -1348,25 +1348,38 @@ USAGE EXAMPLES
     /// under `--prefix`. Run it where the store lives (local `--home`, or the
     /// meta/data servers' root — same operational envelope as `grovefs
     /// view`). Re-running is an INCREMENTAL import: names already
-    /// in the view are skipped. Symlinks and special files are skipped (counted,
-    /// never followed). Timestamps, mode and owner are preserved from the
-    /// source. The target must be a PHYSICAL view — importing into a derived
-    /// (virtual) name is refused, since virtual views mount read-only. Live
+    /// in the view are skipped, and unchanged directories are pruned from the
+    /// walk via a saved watermark (or `--since`; `--full` forces a rescan).
+    /// Nothing is ever deleted from the view. Symlinks and special files are
+    /// skipped (counted, never followed). Timestamps, mode and owner are
+    /// preserved from the source. The target must be a PHYSICAL view — importing
+    /// into a derived (virtual) name is refused, since virtual views mount
+    /// read-only. `--meta-store` selects the deployment's metadata backend —
+    /// local SQLite (default), PostgreSQL (`postgres://…`, nodes go into the
+    /// view schema's `node` table) or treedb (`treedb://host:port,…`, nodes go
+    /// through the engine's POSIX metadata ops onto the instance the name is
+    /// placed on) — while the BYTES always land in `--data-dir` under the same
+    /// `blocks/<bucket>/<key>` layout a mounted write uses. Live
     /// `meta-server` mounts converge within their attr/dentry TTL (≤2s, no
-    /// remount); a PostgreSQL deployment is REFUSED outright — under
-    /// `--meta-store postgres://…`
-    /// the authoritative tree is a PG schema, so the
-    /// bytes move through a mounted path (rsync into the mount), not through
-    /// this command. `--meta-store` (or `GROVEFS_META_STORE`) declares the
-    /// deployment's backend, and a `postgres://…` URI is refused rather than
-    /// served as a local import the deployment never sees.
+    /// remount).
     #[command(after_help = r#"EXAMPLES
   Zero-copy import on the store host:
     grovefs import --home ~/grove --view alice --source /srv/legacy
 
   Preview an import under a prefix:
     grovefs import --meta-dir /meta --view alice \
-      --source /srv/legacy --prefix inbox/2026 --dry-run"#)]
+      --source /srv/legacy --prefix inbox/2026 --dry-run
+
+  Incremental re-run (only new files/ dirs are registered):
+    grovefs import --home ~/grove --view alice --source /srv/legacy
+
+  PostgreSQL deployment:
+    grovefs import --meta-store postgres://grove@127.0.0.1/grovefs \
+      --view alice --source /srv/legacy --data-dir /srv/grove/data
+
+  treedb deployment (data objects still go to --data-dir):
+    grovefs import --meta-store treedb://127.0.0.1:7777,10.0.0.2:7777 \
+      --view alice --source /srv/legacy --data-dir /srv/grove/data"#)]
     Import {
         /// Metadata root holding `meta/<view>/<view>.db` — same option name and
         /// directory as `meta-server --meta-dir`; falls back to `--home`.
@@ -1385,18 +1398,34 @@ USAGE EXAMPLES
         /// Existing directory to mirror in.
         #[arg(long)]
         source: PathBuf,
-        /// Metadata backend of the deployment this import would write into. The
-        /// command produces a LOCAL SQLite tree (`meta/<view>/<view>.db` plus hardlinks
-        /// or copies under `blocks/`), so a `postgres://…` store —
-        /// given here or through `GROVEFS_META_STORE` — is REFUSED with the
-        /// alternative named (rsync/cp through a mounted path), never silently
-        /// served as a SQLite import the deployment's meta-server cannot see.
+        /// Metadata backend of the deployment this import writes into. With no
+        /// store (or a plain path) the tree is a LOCAL SQLite view db
+        /// (`meta/<view>/<view>.db` plus hardlinks/copies under `blocks/`). A
+        /// `--meta-store postgres://…` records nodes in that PG schema's `node`
+        /// table and a `--meta-store treedb://host:port,…` writes them through
+        /// the treedb engine's POSIX metadata ops into the view tree the
+        /// deployment routes the name to. In every case the BYTES land in the
+        /// `--data-dir` root under the same `blocks/<bucket>/<key>` layout a
+        /// mounted write uses, so run it on the storage node beside the
+        /// data-server (a live meta-server converges on the new tree within ~2s).
         #[arg(long = "meta-store", value_name = "URI")]
         store: Option<String>,
         /// In-view destination directory; defaults to the source dir's name
         /// at the view root.
         #[arg(long)]
         prefix: Option<String>,
+        /// Incremental prune watermark (unix seconds): skip already-present
+        /// source directories whose `mtime` predates it rather than rescanning
+        /// them. New/renamed entries always bump a parent dir `mtime`, so this
+        /// cannot miss an addition. Defaults to the watermark saved by the last
+        /// successful import of this view+source+prefix; pass `--full` to ignore
+        /// it and walk everything.
+        #[arg(long = "since", value_name = "EPOCH_SECS")]
+        since: Option<u64>,
+        /// Ignore any saved watermark and rescan the whole source tree (the
+        /// name-skip rule still keeps already-imported files).
+        #[arg(long)]
+        full: bool,
         /// Only report what would be imported; touch nothing.
         #[arg(long)]
         dry_run: bool,
@@ -6705,6 +6734,8 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             view,
             source,
             prefix,
+            since,
+            full,
             dry_run,
         } => {
             let md = std::fs::metadata(&source)
@@ -6713,36 +6744,15 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("import --source must be a directory".into());
             }
             let mbase = db_path.unwrap_or_else(|| base.clone());
-            // `import` writes a LOCAL SQLite tree, so it is only sound where the
-            // deployment's backend IS SQLite. The backend is `--meta-store`, or
-            // the `GROVEFS_META_STORE` env behind it (the same flag > env chain
-            // as every other control-plane command). Refusing
-            // beats the alternative — standing up `meta/<view>/<view>.db` plus
-            // `blocks/` beside a root whose running meta-server serves the
-            // cluster, printing a success about a tree nothing ever reads: the
-            // same refuse-not-downgrade rule `Cmd::View` applies to the other
-            // file-level physical ops.
             let imp_store = resolve_store(store);
-            refuse_treedb_store(imp_store.as_deref(), "grovefs import")?;
-            if let Some(u) = imp_store.as_deref() {
-                if grovefs::pg_store::is_pg_store(u) {
-                    return Err(
-                        "import operates on a local SQLite view db; under a PostgreSQL deployment (--meta-store postgres://…, or GROVEFS_META_STORE) a base tree is a PG schema (create one with `view create`) and its bytes move through a mounted path — drop --meta-store for a local store"
-                            .into(),
-                    );
-                }
-            }
-            // Import writes the authoritative tree directly — that is only
-            // sound for a PHYSICAL view. A derived name is served through its
-            // base's db; writing a separate tree directory under the virtual
-            // name would create a shadow tree nothing ever reads.
+            // Import writes the authoritative PHYSICAL tree directly, so a
+            // governed name (derived / alias / fork) must not be an import
+            // target — it would make a shadow tree nothing ever reads. Defs
+            // live in the local control home for SQLite and treedb; for PG this
+            // is best-effort (its defs are in the database), which is why the
+            // engine still refuses to mount a virtual name as writable.
             let slot = grovefs::meta::find_def_slot(&mbase, &view); // v3: family dirs included
             if let Some(slot) = slot {
-                // Resolve the slot so BOTH governance shapes are covered: a
-                // derived name would write a shadow `<view>.db` nothing reads,
-                // and an alias name is not a storage identity at all — the
-                // server resolves it to the real view, whose db import would
-                // bypass here lives under a different name.
                 let target = grovefs::layout::LayoutRules::parse_def_file(&slot)
                     .map(|d| match d {
                         grovefs::layout::ViewDef::Alias(real) => format!(
@@ -6771,31 +6781,33 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             });
             let prefix = format!("/{}", prefix.trim_matches('/'));
             if dry_run {
-                // Literally touch nothing: not even the view DB is opened.
-                let mut st = ImportStats::default();
-                count_walk(&source, &mut st)?;
+                // Literally touch nothing: not even a store is opened. The
+                // source-side tally is backend-agnostic.
+                let mut st = grovefs::import::ImportStats::default();
+                grovefs::import::count_walk(&source, &mut st)?;
                 ui::info(&format!(
                     "dry run: view '{view}' under {} would mirror {} and {} \
                      (symlinks/special files and names already in the view are skipped \
                      on the real run)",
                     prefix,
-                    ui::plural(st.dirs as usize, "dir", "dirs"),
-                    ui::plural(st.files as usize, "file", "files")
+                    ui::plural(st.dirs, "dir", "dirs"),
+                    ui::plural(st.files, "file", "files")
                 ));
                 return Ok(());
             }
-            grovefs::meta::layout_guard(&mbase)?;
-            let mp = meta_path(&mbase, &view);
-            // A view DB that is absent here gets created by MetaEngine::open below,
-            // which stands up a new physical BASE view as a side effect of the import.
-            let created_base = !mp.exists();
-            if let Some(dir) = mp.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            let meta = MetaEngine::open(&mp)?;
+            // Open the target view's metadata store for THIS deployment's
+            // backend (SQLite / PostgreSQL / treedb), creating a new BASE view
+            // when the name owns no tree yet — the same "the store owns its
+            // tree" contract as `view create`. Under treedb the placement comes
+            // from the shared find_tree_home / plan_placement helpers, so the
+            // name lands on the SAME engine instance the meta-server routes it
+            // to (the engine is shared state, so the running server sees the
+            // nodes on its next read).
+            let (meta, created_base) = open_import_store(imp_store.as_deref(), &mbase, &view)?;
             // Same multi-root contract as `data-server --data-dir`: a
             // comma-separated --data-dir registers imported objects onto the
-            // disk their key hashes to, colocated with the running server.
+            // disk their key hashes to, colocated with the running server, using
+            // the identical `blocks/<bucket>/<key>` path a mounted write uses.
             let roots: Vec<PathBuf> = droot
                 .to_string_lossy()
                 .split(',')
@@ -6807,30 +6819,50 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("import --data-dir: no usable path".into());
             }
             let backend = backend::open_local_roots(&roots)?;
+            // Incremental prune: an explicit --since wins; otherwise reuse the
+            // watermark saved by the last successful import of this stream
+            // (unless --full forces a rescan). Name-skip still guarantees
+            // idempotence even on a full walk.
+            let abs_src = std::fs::canonicalize(&source).unwrap_or_else(|_| source.clone());
+            let wm_key = grovefs::import::watermark_key(&view, &abs_src, &prefix);
+            let since = if full {
+                None
+            } else {
+                since.or_else(|| grovefs::import::load_watermark(&mbase, &wm_key))
+            };
             let mut dirs: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
             dirs.insert("/".to_string(), meta::ROOT_INO);
-            ensure_dir_soft(&meta, &prefix, &mut dirs)?;
-            let mut st = ImportStats::default();
-            import_walk(
+            grovefs::import::ensure_dir_soft(&meta, &prefix, &mut dirs)?;
+            let mut st = grovefs::import::ImportStats::default();
+            grovefs::import::ingest(
                 &meta,
                 backend.as_ref(),
                 &source,
                 &prefix,
                 &mut dirs,
                 &mut st,
+                since,
             )?;
-            if created_base {
+            if created_base == Some(true) {
                 ui::info(&format!(
                     "created BASE view '{view}' (target was absent); imported {}",
-                    ui::plural((st.linked + st.copied) as usize, "object", "objects")
+                    ui::plural(st.linked + st.copied, "object", "objects")
                 ));
+            }
+            // Persist the watermark so the next run prunes unchanged subtrees.
+            if let Some(w) = st.watermark {
+                if let Err(e) = grovefs::import::save_watermark(&mbase, &wm_key, w) {
+                    ui::warn(&format!(
+                        "import: could not save the incremental watermark: {e}"
+                    ));
+                }
             }
             ui::success(&format!(
                 "imported into view '{view}' under {}: {}, {} \
                  ({} hardlinked zero-copy, {} copied), {} skipped, {} failed",
                 prefix,
-                ui::plural(st.dirs as usize, "dir", "dirs"),
-                ui::plural((st.linked + st.copied) as usize, "object", "objects"),
+                ui::plural(st.dirs, "dir", "dirs"),
+                ui::plural(st.linked + st.copied, "object", "objects"),
                 st.linked,
                 st.copied,
                 st.skipped,
@@ -6839,7 +6871,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             if st.failed > 0 {
                 return Err(format!(
                     "{} failed to import",
-                    ui::plural(st.failed as usize, "entry", "entries")
+                    ui::plural(st.failed, "entry", "entries")
                 )
                 .into());
             }
@@ -6905,181 +6937,58 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Tallies for `grovefs import`.
-#[derive(Default)]
-struct ImportStats {
-    dirs: usize,
-    files: usize,
-    linked: usize,
-    copied: usize,
-    skipped: usize,
-    failed: usize,
-}
-
-/// ensure_dir variant that REUSES pre-existing nodes instead of failing —
-/// what makes a re-run of `grovefs import` an incremental no-op over the
-/// already-mirrored parts of the tree.
-fn ensure_dir_soft(
-    meta: &MetaEngine,
-    path: &str,
-    dirs: &mut std::collections::HashMap<String, i64>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut cur_ino = meta::ROOT_INO;
-    let mut cur_path = String::from("/");
-    for comp in path.trim_matches('/').split('/').filter(|c| !c.is_empty()) {
-        let next_path = if cur_path == "/" {
-            format!("/{comp}")
-        } else {
-            format!("{cur_path}/{comp}")
-        };
-        if let Some(&ino) = dirs.get(&next_path) {
-            cur_ino = ino;
-            cur_path = next_path;
-            continue;
-        }
-        let ino = match meta.lookup(cur_ino, comp) {
-            Some(node) => node.id,
-            None => meta.create_node(
-                cur_ino,
-                comp,
-                true,
-                None,
-                0o0755,
-                unsafe { libc::getuid() },
-                unsafe { libc::getgid() },
-            )?,
-        };
-        dirs.insert(next_path.clone(), ino);
-        cur_ino = ino;
-        cur_path = next_path;
+/// Open the metadata store `grovefs import` writes into, for THIS deployment's
+/// backend, creating the target view's tree when it is absent — the same "the
+/// store owns its tree" contract as `view create`. Returns the store plus
+/// `Some(true)` when a brand-new BASE view tree was created (SQLite / treedb;
+/// `None` when the answer cannot be decided cheaply, e.g. PG). Under treedb the
+/// placement comes from the shared `find_tree_home` / `plan_placement` helpers,
+/// so the name lands on the SAME engine instance the meta-server routes it to —
+/// the engine holds the tree, so a running server sees the imported nodes on its
+/// very next read (no stale window beyond the dentry/attr TTL).
+fn open_import_store(
+    store: Option<&str>,
+    mbase: &Path,
+    view: &str,
+) -> Result<(grovefs::meta::MetaStore, Option<bool>), Box<dyn std::error::Error>> {
+    let uri = store.unwrap_or("");
+    if grovefs::pg_store::is_pg_store(uri) {
+        // open_pg builds the view's schema and its `node` table if absent; the
+        // per-import "created" answer is not worth a second round trip, so the
+        // INFO line about a newly created base view is simply skipped here.
+        let meta = grovefs::meta::MetaStore::open_pg(uri, view, false)?;
+        return Ok((meta, None));
     }
-    Ok(())
-}
-
-/// Pure source-side tally for `import --dry_run`: counts what WOULD be
-/// mirrored, without opening the store at all — "touch nothing", literally.
-fn count_walk(src: &Path, st: &mut ImportStats) -> Result<(), Box<dyn std::error::Error>> {
-    for e in std::fs::read_dir(src)? {
-        let e = e?;
-        let ty = e.file_type()?;
-        if ty.is_dir() {
-            st.dirs += 1;
-            count_walk(&e.path(), st)?;
-        } else if ty.is_file() {
-            st.files += 1;
-        } else {
-            st.skipped += 1;
+    #[cfg(feature = "treedb")]
+    if grovefs::treedb_store::is_treedb_store(uri) {
+        let addrs = grovefs::treedb_store::parse_addrs(uri)
+            .map_err(|e| format!("import --meta-store: {e}"))?;
+        if addrs.is_empty() {
+            return Err("import --meta-store: no treedb addresses given".into());
         }
+        let home = grovefs::treedb_store::find_tree_home(&addrs, view)
+            .map_err(|e| format!("import --meta-store: {e}"))?;
+        let created = home.is_none();
+        let addr = home.unwrap_or_else(|| grovefs::treedb_store::plan_placement(&addrs, view));
+        let meta = grovefs::meta::MetaStore::open_treedb(&addr, view, false)?;
+        return Ok((meta, Some(created)));
     }
-    Ok(())
-}
-
-/// Recursively mirror the existing tree at `src` into view path `in_view`
-/// (the data half of `Cmd::Import`). Dirs become nodes; regular files become
-/// objects via `StorageBackend::import_at` (hard link first, copy fallback),
-/// keeping their timestamps/mode/owner. Names that already exist are skipped;
-/// symlinks/special files are skipped too (and never followed, which also
-/// rules out symlink loops). Per-entry failures are counted and reported, not
-/// fatal — one unreadable file must not abort a bulk import.
-fn import_walk(
-    meta: &MetaEngine,
-    backend: &dyn backend::StorageBackend,
-    src: &Path,
-    in_view: &str,
-    dirs: &mut std::collections::HashMap<String, i64>,
-    st: &mut ImportStats,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use std::os::unix::fs::MetadataExt;
-    let mut entries: Vec<_> = std::fs::read_dir(src)?
-        .filter_map(|e| match e {
-            Ok(e) => Some(e),
-            Err(err) => {
-                ui::warn(&format!(
-                    "import: cannot read an entry under {}: {err}",
-                    src.display()
-                ));
-                st.failed += 1;
-                None
-            }
-        })
-        .collect();
-    entries.sort_by_key(|e| e.file_name()); // stable order across re-runs
-    for e in entries {
-        let name = e.file_name().to_string_lossy().into_owned();
-        if name.is_empty() || name == "." || name == ".." {
-            continue;
-        }
-        let child = if in_view == "/" {
-            format!("/{name}")
-        } else {
-            format!("{in_view}/{name}")
-        };
-        let ty = e.file_type()?;
-        if ty.is_dir() {
-            st.dirs += 1;
-            ensure_dir_soft(meta, &child, dirs)?;
-            import_walk(meta, backend, &e.path(), &child, dirs, st)?;
-        } else if ty.is_file() {
-            let parent_ino = *dirs
-                .get(in_view)
-                .ok_or_else(|| format!("import: missing dir node for {in_view}"))?;
-            if meta.lookup(parent_ino, &name).is_some() {
-                st.skipped += 1; // incremental re-run: keep whatever is there
-                continue;
-            }
-            let fm = match std::fs::metadata(e.path()) {
-                Ok(fm) => fm,
-                Err(err) => {
-                    ui::warn(&format!("import: {}: {err}", e.path().display()));
-                    st.failed += 1;
-                    continue;
-                }
-            };
-            let key = backend.new_key(&uuid::Uuid::new_v4().to_string());
-            let imported = match backend.import_at(&key, &e.path()) {
-                Ok(v) => v,
-                Err(err) => {
-                    ui::warn(&format!("import: {}: {err}", e.path().display()));
-                    st.failed += 1;
-                    continue;
-                }
-            };
-            match meta.create_node(
-                parent_ino,
-                &name,
-                false,
-                Some(&key),
-                (fm.mode() & 0o7777) as u32,
-                fm.uid(),
-                fm.gid(),
-            ) {
-                Ok(ino) => {
-                    // Keep the file's own clock, not "import happened now".
-                    meta.set_times(ino, Some(fm.atime() as i64), Some(fm.mtime() as i64));
-                    match imported {
-                        backend::Imported::Hardlinked => st.linked += 1,
-                        backend::Imported::Copied => st.copied += 1,
-                    }
-                }
-                Err(meta::MetaError::Exists) => {
-                    // Lost a race against a concurrent writer: drop the object
-                    // we just materialized so nothing dangles, count as skipped.
-                    let _ = backend.remove(&key);
-                    st.skipped += 1;
-                }
-                Err(err) => {
-                    let _ = backend.remove(&key);
-                    ui::warn(&format!("import: {child}: {err}"));
-                    st.failed += 1;
-                }
-            }
-        } else {
-            // symlink / fifo / socket / device: not representable as a plain
-            // object today — counted, never followed.
-            st.skipped += 1;
-        }
+    #[cfg(not(feature = "treedb"))]
+    if uri.starts_with("treedb://") {
+        return Err(format!(
+            "import --meta-store '{uri}': this build cannot drive the treedb engine directly \
+             (not compiled with `--features treedb`); import against the local SQLite \
+             deployment or mount the view and copy the tree in"
+        )
+        .into());
     }
-    Ok(())
+    // Everything else — no store, or a plain-path spec the `view` verbs also
+    // treat as local (the same `is_pg_store` funnel as `rollback_imported_tree`
+    // and the meta-server's store selection) — is the LOCAL SQLite deployment:
+    // meta/<view>/<view>.db plus hardlinks/copies under blocks/.
+    let created = !meta_path(mbase, view).exists();
+    let meta = grovefs::meta::MetaStore::open_sqlite(mbase, view, false)?;
+    Ok((meta, Some(created)))
 }
 
 // ---- Detached (background) mounts ------------------------------------------

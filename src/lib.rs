@@ -49,6 +49,12 @@ pub mod du;
 pub mod fs_impl;
 #[cfg(feature = "native")]
 pub mod gc;
+/// Directory-ingest for `grovefs import` (mirror an existing tree into a view,
+/// SQLite / PostgreSQL / treedb). Native-gated: the ingest writes bytes through
+/// the on-disk [`backend`] roots and needs `libc` ids, both of which are the
+/// server-side stack.
+#[cfg(feature = "native")]
+pub mod import;
 pub mod layout;
 /// The MOUNT BOOTSTRAP (`grovefs manager`): a deployment's declared meta/data
 /// addresses, handed to a client as a signed roster so `mount` needs one address
