@@ -197,17 +197,23 @@
   height: 10px;
 }
 ::-webkit-scrollbar-thumb {
-  background: #c6bcaa;
+  background: var(--line-strong);
   border-radius: 8px;
   border: 2px solid transparent;
   background-clip: content-box;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #aa9f8b;
+  background: var(--fg-faint);
   background-clip: content-box;
 }
 ::-webkit-scrollbar-track {
   background: transparent;
+}
+/* Standard scrollbars (Firefox) follow the tokens too, so a thumb reads as the
+   same cool green-grey on both engines and both themes — the old hardcoded warm
+   beige sat wrong on the dark green-black canvas. */
+* {
+  scrollbar-color: var(--line-strong) transparent;
 }
 
 /* `hidden` must beat every author `display` rule below (the sign-in card, the
@@ -1918,6 +1924,11 @@ pre.plain {
   max-height: min(66vh, 34rem);
   overflow-y: auto;
   overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+/* A 22rem picker reads better with a slimmer bar than the page default. */
+#view-list::-webkit-scrollbar {
+  width: 8px;
 }
 /* The collapse control is a narrow-screen affordance only — a wide layout has
    room for the picker beside the detail, so nothing to hide. */
