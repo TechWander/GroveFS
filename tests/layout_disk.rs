@@ -424,7 +424,9 @@ fn family_members_land_inside_their_base_view() {
         "not at the top-level defs slot"
     );
 
-    let (ok, o, e) = gv(&["view", "--home", h, "alias", "--name", "bias_pub", "--real", "v"]);
+    let (ok, o, e) = gv(&[
+        "view", "--home", h, "alias", "--name", "bias_pub", "--real", "v",
+    ]);
     assert!(ok, "alias: {o}{e}");
     assert!(
         meta.join("v/bias_pub.layout").is_file(),
@@ -434,12 +436,18 @@ fn family_members_land_inside_their_base_view() {
     // Kind prefixes are governance: an unprefixed alias/lens is refused.
     let (ok, _o, e) = gv(&["view", "--home", h, "alias", "--name", "pub", "--real", "v"]);
     assert!(!ok, "unprefixed alias must be refused");
-    assert!(e.contains("bias_<alias>"), "refusal names the convention: {e}");
+    assert!(
+        e.contains("bias_<alias>"),
+        "refusal names the convention: {e}"
+    );
     let (ok, _o, e) = gv(&[
         "view", "--home", h, "define", "--name", "docs", "--base", "v", "--rules", &r,
     ]);
     assert!(!ok, "unprefixed lens must be refused");
-    assert!(e.contains("lens_<name>"), "refusal names the convention: {e}");
+    assert!(
+        e.contains("lens_<name>"),
+        "refusal names the convention: {e}"
+    );
 
     // The enumerator descends the family layer, so every member is still listed.
     let (ok, o, e) = gv(&["view", "--home", h, "list", "--json"]);

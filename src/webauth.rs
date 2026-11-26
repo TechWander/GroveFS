@@ -400,6 +400,11 @@ impl WebAuthStore {
     pub fn open_for(base: &std::path::Path, store_uri: Option<&str>) -> Result<Self, String> {
         match store_uri {
             Some(u) if crate::pg_store::is_pg_store(u) => Self::open_pg(u),
+            // treedb serves trees only; web accounts stay in the LOCAL SQLite,
+            // exactly like the api keys beside them (see
+            // [`crate::apikeys::ApiKeyStore::open_for`] for the same arm).
+            #[cfg(feature = "treedb")]
+            Some(u) if crate::treedb_store::is_treedb_store(u) => Self::open(base),
             Some(u) if u.contains("://") => Err(format!(
                 "`{u}` is not a --meta-store scheme GroveFS supports: web accounts live in a local SQLite file or PostgreSQL (`postgres://…`)"
             )),

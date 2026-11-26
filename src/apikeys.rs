@@ -838,8 +838,14 @@ impl ApiKeyStore {
             // ([`crate::pg_store::is_pg_store`]); the pool binds the registry's
             // FIRST entry, where the control schema lives.
             Some(u) if crate::pg_store::is_pg_store(u) => Self::open_pg(u, base),
+            // A treedb tree store keeps the control plane (keys included) in
+            // the LOCAL SQLite beside its meta-server — the same local file a
+            // SQLite deployment reads. Refusing the scheme here would lock a
+            // treedb deployment out of its own `--require-api-key` boot.
+            #[cfg(feature = "treedb")]
+            Some(u) if crate::treedb_store::is_treedb_store(u) => Self::open(base),
             Some(u) if u.contains("://") => Err(format!(
-                "`{u}` is not a --meta-store scheme GroveFS supports: credentials live in a local SQLite file or PostgreSQL (`postgres://…`); a `treedb://` tree store keeps its keys in the LOCAL SQLite beside its meta-server's --meta-dir, so mint them without --meta-store"
+                "`{u}` is not a --meta-store scheme GroveFS supports: credentials live in a local SQLite file or PostgreSQL (`postgres://…`)"
             )),
             _ => Self::open(base),
         }
@@ -1670,6 +1676,26 @@ pub const KEY_RECHECK: std::time::Duration = std::time::Duration::from_millis(10
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "treedb")]
+    #[test]
+    fn treedb_uri_routes_keys_to_the_local_file() {
+        // The treedb tier's control plane is local SQLite by design (only the
+        // trees live in the engine), so `open_for` must NOT refuse the scheme —
+        // this is the gate a `--require-api-key` treedb meta-server boots
+        // through. An unknown scheme keeps being refused, word for word.
+        let base = tempfile::tempdir().expect("tempdir");
+        let s = ApiKeyStore::open_for(base.path(), Some("treedb://127.0.0.1:7777,127.0.0.1:7778"))
+            .expect("treedb uri must open the local store");
+        let (id, key) = s.create("treedb-era").expect("mint");
+        assert!(s.authenticate(&key).is_ok());
+        assert!(!id.is_empty());
+        assert!(base.path().join("meta/_control/api_keys.db").exists());
+        drop(s);
+        let e = ApiKeyStore::open_for(base.path(), Some("mysql://h/db")).err();
+        let e = e.expect("an unknown scheme must stay refused");
+        assert!(e.contains("not a --meta-store scheme"), "{e}");
+    }
 
     fn store() -> ApiKeyStore {
         let dir = tempfile::tempdir().unwrap();

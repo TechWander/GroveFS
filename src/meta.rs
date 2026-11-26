@@ -592,6 +592,56 @@ pub fn fork_def_slot(base: &Path, name: &str) -> PathBuf {
     view_dir(base, name).join(format!("{name}.layout"))
 }
 
+/// The tree-home DIRECTORY a name gets under the treedb backend, where trees
+/// live INSIDE the engine and the local db scan has nothing to resolve with.
+/// A base sits at the plain `meta/<view>` fallback; a fork sits inside its
+/// parent's home (`meta/<B>/<F>`, `meta/<B>/<P>/<F>` for a fork of a fork) —
+/// the same nesting [`fork_def_slot`] spells for SQLite, computed from the
+/// definitions on disk instead of from db files. `parent` is the base the
+/// fork def names; `None` (a stray def with no tree) falls back to the flat
+/// own-directory spelling. The directory is NOT created here.
+pub fn treedb_fork_home(base: &Path, name: &str, parent: Option<&str>) -> PathBuf {
+    match parent {
+        Some(p) => treedb_tree_home(base, p, 0).join(name),
+        None => meta_dir(base).join(name),
+    }
+}
+
+/// The home of ONE name under the treedb placement: `meta/<name>` unless the
+/// name's own def rides inside its namesake directory (`meta/<...>/<name>/
+/// <name>.layout`), which marks it as a fork whose home nests further.
+/// `depth` bounds the walk: a corrupt def cycle must not outlive the stack.
+fn treedb_tree_home(base: &Path, name: &str, depth: u32) -> PathBuf {
+    let flat = meta_dir(base).join(name);
+    if depth > 16 {
+        return flat;
+    }
+    let Some(p) = find_def_slot(base, name) else {
+        return flat; // a base view has no def file at all
+    };
+    // Only the namesake-inside-own-directory shape is a tree home; `views/`
+    // sidecars and family `<name>.layout` files are defs, not homes.
+    if p.file_stem().and_then(|s| s.to_str()) != Some(name) {
+        return flat;
+    }
+    let Some(leaf) = p.parent() else { return flat };
+    if leaf.file_name().and_then(|n| n.to_str()) != Some(name) {
+        return flat; // meta/views/<name>.layout or meta/<name>.…: no lineage
+    }
+    let Some(lineage) = leaf.parent() else {
+        return flat;
+    };
+    if lineage == meta_dir(base) {
+        return flat; // flat own-directory spelling — a top-level fork/base
+    }
+    match lineage.file_name().and_then(|n| n.to_str()) {
+        Some(parent) if parent != DEFS_SUBDIR && parent != FORKS_SUBDIR => {
+            treedb_tree_home(base, parent, depth + 1).join(name)
+        }
+        _ => flat,
+    }
+}
+
 /// The tree db THIS STORE ACTUALLY HOLDS for `view`, found by scanning
 /// instead of by recomputing one formula. A name is a tree when exactly one
 /// directory contains a namesake `<name>.db` inside it: the top level
@@ -740,6 +790,68 @@ pub fn list_view_trees(base: &Path) -> Vec<String> {
         }
     }
     out.sort();
+    out
+}
+
+/// The base list under the treedb backend. There are no local `*.db` trees, so
+/// [`list_view_trees`] (which keys on a db file) finds nothing; the def-home
+/// MARKER directories that `view.create` leaves behind (`meta/<B>/`) ARE the
+/// bases here. This returns exactly the top-level bases (a nested member dir is
+/// not a base), which is what `view list` reports as physical trees when it has
+/// no engine to ask. The same `is_view_tree_dir` gate the SQLite walk uses
+/// filters `_control`, `views` and dot entries.
+pub fn list_def_homes(base: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(meta_dir(base)) {
+        for ent in rd.flatten() {
+            let dir = ent.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            if let Some(n) = dir.file_name().and_then(|n| n.to_str()) {
+                if is_view_tree_dir(n) {
+                    out.push(n.to_string());
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Every `*.layout` definition file under `meta/`, at any family depth,
+/// as `(stem, path)` sorted by stem. The treedb `list_defs` enumerator: a
+/// fork's def lives inside its own def-home (`meta/<B>/<F>/<F>.layout`) and a
+/// member of that fork one level deeper, so the SQLite one-layer walk (keyed on
+/// db files that this backend does not have) cannot reach them. `_control`, the
+/// top-level `views` def dir and dot entries are pruned; within the def tree a
+/// name is unique across the store, so the stems stay a flat key space.
+pub fn list_def_files(base: &Path) -> Vec<(String, PathBuf)> {
+    let mut out = Vec::new();
+    fn walk(dir: &Path, out: &mut Vec<(String, PathBuf)>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for ent in rd.flatten() {
+            let p = ent.path();
+            let name = match p.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            if p.is_dir() {
+                if name.starts_with('.') || name == "_control" {
+                    continue;
+                }
+                walk(&p, out);
+            } else if p.extension().and_then(|e| e.to_str()) == Some("layout") {
+                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                    out.push((stem.to_string(), p));
+                }
+            }
+        }
+    }
+    walk(&meta_dir(base), &mut out);
+    out.sort_by(|a, b| a.0.cmp(&b.0));
     out
 }
 
@@ -1150,6 +1262,35 @@ mod tests {
         ] {
             assert!(!is_view_tree_dir(n), "'{n}' must not read as a view tree");
         }
+    }
+
+    /// treedb placement: with no db files anywhere, the tree home derives from
+    /// the def-file nesting — a fork inside its parent's home, a fork of a fork
+    /// one deeper, a stray def at the flat own-directory spelling.
+    #[test]
+    fn the_treedb_def_home_nests_by_lineage() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let m = meta_dir(base);
+        // A base the server created carries its def-home marker, no db.
+        std::fs::create_dir_all(m.join("big")).unwrap();
+        assert_eq!(treedb_fork_home(base, "fk", Some("big")), m.join("big/fk"));
+        // The fork's own def (inside its home) extends the lineage.
+        std::fs::create_dir_all(m.join("big/fk")).unwrap();
+        std::fs::write(m.join("big/fk/fk.layout"), b"fork big\n").unwrap();
+        assert_eq!(
+            treedb_fork_home(base, "sub", Some("fk")),
+            m.join("big/fk/sub")
+        );
+        assert_eq!(
+            treedb_fork_home(base, "sub", Some("big")),
+            m.join("big/sub")
+        );
+        // Stray def with no tree: flat, like the SQLite fallback.
+        assert_eq!(treedb_fork_home(base, "orphan", None), m.join("orphan"));
+        // Reading the slot back needs no db either: the fork dir is a plain
+        // meta/ entry, so the same scan finds it again.
+        assert_eq!(find_def_slot(base, "fk"), Some(m.join("big/fk/fk.layout")));
     }
 
     /// v3: a family member resolves by SCANNING — no definition read, no name

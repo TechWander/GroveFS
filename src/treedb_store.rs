@@ -106,8 +106,7 @@ pub fn parse_addr(uri: &str) -> Result<String, String> {
         .ok_or_else(|| format!("not a {SCHEME} uri"))?;
     if rest.contains('/') || rest.contains('?') || rest.contains('#') {
         return Err(format!(
-            "{SCHEME} takes HOST:PORT only (got '{rest}'); a treedb instance is one address, \
-             multi-instance placement is not wired yet"
+            "{SCHEME} takes HOST:PORT items (got '{rest}'); a multi-instance set is a comma list of bare host:port, not a path or query"
         ));
     }
     if rest.is_empty() {
@@ -319,6 +318,165 @@ pub struct TreedbStore {
     epoch: Arc<AtomicI64>,
     /// 同 SQLite 本地档：数据面不被 fence 门控，恒 0。
     fence: Arc<AtomicU64>,
+}
+
+/// `treedb://` URI → 地址**表**。单地址 `treedb://host:port` 原样一条；逗号列表
+/// `treedb://h1:p1,h2:p2` 展开成多实例路由集（顺序即注册表顺序，放置按它取模）。
+/// 每一项都过一次 [`parse_addr`]，坏项整串拒绝 —— 半张路由表比没有路由表更糟。
+pub fn parse_addrs(uri: &str) -> Result<Vec<String>, String> {
+    let rest = uri
+        .strip_prefix(SCHEME)
+        .ok_or_else(|| format!("not a {SCHEME} uri"))?;
+    let mut out = Vec::new();
+    for part in rest.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue; // 尾逗号 / 连续逗号：容忍空白，不容忍坏地址
+        }
+        let a = parse_addr(&format!("{SCHEME}{part}"))?;
+        if !out.contains(&a) {
+            out.push(a);
+        }
+    }
+    if out.is_empty() {
+        out.push(DEFAULT_ADDR.to_string());
+    }
+    Ok(out)
+}
+
+/// FNV-1a，与 PG 档哈希回退同一枚硬币（见 `pg_store` 的 unplaced 路由）：同一视图
+/// 名在任何进程、任何重启下都落同一台实例，无需放置账本也能重算。
+fn fnv1a(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// 新视图（或 fork 树）落在哪台：按视图名哈希取模。单实例集恒回唯一项，所以
+/// 这是旧形状的自然退化而非特判。已存在的视图**不问这里** —— 引擎自己的
+/// `ListViews` 才是权威（[`find_tree_home`]），哈希只回答「还没有的地方放哪」。
+pub fn plan_placement(addrs: &[String], view: &str) -> String {
+    let i = (fnv1a(view) as usize).wrapping_rem(addrs.len().max(1));
+    addrs[i].clone()
+}
+
+/// 这台引擎已经持有 `view` 的那一项地址；`Ok(None)` = 全**可达**表都没有这棵树。
+/// 逐台 `ListViews`：treedb 没有放置表，引擎的清单就是唯一的真账 —— 哈希只决定
+/// 新建落点，从不决定读取路径，所以「手工在某台建过树」也不会读丢。
+/// 故障隔离：某台读不到**不连坐**其余实例——只要有一台**可达**且持有这棵树就返回
+/// 它（对齐「kill 一个实例,其余实例上的视图仍可正常读写」）。只有在**没有任何可达
+/// 实例**报告持有、且确有实例不可达时才 Err：此时「找不到」不能等价于「不存在」,
+/// 否则 `store_for` 会在另一台上按可写句柄把一棵本已存在的树当新的重建。全部可达
+/// 且无人持有 = 真 `None`。同名出现在两台可达 = 部署被旁路写坏,报 Err（对齐 PG 档
+/// dangling 的 REFUSED 纪律）。
+pub fn find_tree_home(addrs: &[String], view: &str) -> Result<Option<String>, String> {
+    let mut hits: Vec<&String> = Vec::new();
+    let mut down: Vec<&String> = Vec::new();
+    for a in addrs {
+        match TreedbStore::list_views(a) {
+            Ok(vs) => {
+                if vs.iter().any(|v| v == view) {
+                    hits.push(a);
+                }
+            }
+            Err(e) => {
+                let _ = e;
+                down.push(a);
+            }
+        }
+    }
+    match hits.len() {
+        1 => Ok(Some(hits[0].clone())),
+        0 if down.is_empty() => Ok(None),
+        0 => Err(format!(
+            "view '{view}' is not on any reachable treedb instance, but {} could not be read ({} of {}) — refusing to treat an unreadable engine as a missing tree",
+            down.len(),
+            down.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
+            addrs.len(),
+        )),
+        _ => Err(format!(
+            "view '{view}' exists on multiple treedb instances ({}) — one tree per name is the contract; reconcile by hand",
+            hits.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+        )),
+    }
+}
+
+/// 全表的视图名并集（排序去重）：`view list` 的 physical 半边。某台读不到就报错，
+/// 不把半个清单当全数交给调用方 —— 与删除守卫同一条「证据缺失即拒绝」。
+pub fn list_views_all(addrs: &[String]) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for a in addrs {
+        for v in TreedbStore::list_views(a).map_err(|e| format!("treedb list views at {a}: {e}"))? {
+            if !out.contains(&v) {
+                out.push(v);
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// 同一台实例内的树复制：`view fork` 在 treedb 档的种子。源树逐目录 `readdir`
+/// 走一遍（`NodeInfo` 自带 kind/data_ref/link_target/mode/uid/gid），目标树按同样
+/// 的父 ino 形状重建。跨实例在调用处就拒绝（基与 fork 必须同机，同 PG 档的
+/// graft 守卫）；硬链接本来就没有（`link_node` 回 EPERM），树里也就不可能有。
+pub fn copy_tree(base: &str, dest: &str, addr: &str) -> io::Result<crate::meta::ForkStats> {
+    let src = TreedbStore::open(addr, base, true)?;
+    let dst = TreedbStore::open(addr, dest, false)?;
+    // 引擎的 root ino 恒 1（`resolve_or_create_view` 里已验），与 ROOT_INO 同值。
+    let root = crate::meta::ROOT_INO;
+    let mut st = crate::meta::ForkStats { nodes: 0, blobs: 0 };
+    let mut keys: Vec<String> = Vec::new();
+    let mut stack: Vec<(i64, i64)> = vec![(root, root)];
+    while let Some((s_ino, d_ino)) = stack.pop() {
+        for e in src.readdir(s_ino) {
+            match e.kind {
+                crate::meta::NodeKind::Dir => {
+                    let n = dst
+                        .create_node(d_ino, &e.name, true, None, e.mode, e.uid, e.gid)
+                        .map_err(|m| {
+                            io::Error::other(format!("fork seed mkdir {dest}/{}: {m}", e.name))
+                        })?;
+                    st.nodes += 1;
+                    stack.push((e.id, n));
+                }
+                crate::meta::NodeKind::Symlink => {
+                    let t = e.link_target.clone().unwrap_or_default();
+                    dst.create_symlink(d_ino, &e.name, &t, e.uid, e.gid)
+                        .map_err(|m| {
+                            io::Error::other(format!("fork seed symlink {dest}/{}: {m}", e.name))
+                        })?;
+                    st.nodes += 1;
+                }
+                _ => {
+                    if let Some(k) = e.data_ref.as_deref().filter(|k| !k.is_empty()) {
+                        // 与 SQLite/PG 档同义：distinct 内容键 = 新树与基共持的对象。
+                        if !keys.iter().any(|x| x == k) {
+                            keys.push(k.to_string());
+                        }
+                    }
+                    dst.create_node(
+                        d_ino,
+                        &e.name,
+                        false,
+                        e.data_ref.as_deref(),
+                        e.mode,
+                        e.uid,
+                        e.gid,
+                    )
+                    .map_err(|m| {
+                        io::Error::other(format!("fork seed create {dest}/{}: {m}", e.name))
+                    })?;
+                    st.nodes += 1;
+                }
+            }
+        }
+    }
+    st.blobs = keys.len() as i64;
+    Ok(st)
 }
 
 impl TreedbStore {
@@ -1087,14 +1245,14 @@ impl TreedbStore {
 
 // ---- managed instance registry (the console's treedb plane) ---------------
 //
-// treedb 仍是 EXPERIMENTAL，而且与 PG 档不同：每个 meta-server **只路由一个
-// treedb 服务**（`StoreKind::Treedb(addr)` 装的就是那一个 host:port），引擎侧没有
-// 放置表，grovefs 也没有服务端 treedb 搬迁。因此这里的注册表面向网页端是一份
-// **已知 treedb 服务器的清单（inventory），不是路由器**：
+// treedb 仍是 EXPERIMENTAL。`StoreKind::Treedb(addrs)` 装的是 `--meta-store`
+// 逗号列表展开出的**路由集**：新树按名字哈希落其中一台（[`plan_placement`]），
+// 已存在的树逐台问引擎（[`find_tree_home`]）；grovefs 仍没有服务端 treedb 搬迁。
+// 注册表文件本身面向网页端：
 //
 // - 控制面（view 定义、api key、web 账号）留在**本地 SQLite**，所以没有哪一条
-//   注册表记录是 PG 意义上的 `control`——每张卡片 `control:false`；地址等于本
-//   meta-server 所配置 `--meta-store` 的那一条是 **serving**（本机树的落点）。
+//   注册表记录是 PG 意义上的 `control`——每张卡片 `control:false`；地址属于本
+//   meta-server serving 集合的那些是 **serving**（本机新树的候选落点）。
 // - 注册/编辑/删除都在网页端完成；删除守卫**如实拒绝**而非假装迁移：serving 记录
 //   删不掉（要换它得改 `--meta-store` 重启），其余记录只要该服务器还报有视图就
 //   删不掉（没有搬迁通道），空清单且非 serving 才允许遗忘。
@@ -1160,14 +1318,15 @@ pub fn treedb_registry(base: &std::path::Path) -> Result<Vec<(String, String)>, 
     Ok(out)
 }
 
-/// 原子重写注册表：tmp + rename。注释头写明这是清单而非路由器，免得后来者以为
-/// 加一行就能让新视图落过去。
+/// 原子重写注册表：tmp + rename。注释头写清楚路由语义只覆盖 `--meta-store` 里的
+/// 地址，其余条目是清单，免得后来者以为加一行就能让新视图落过去。
 fn write_treedb_registry(base: &std::path::Path, insts: &[(String, String)]) -> Result<(), String> {
     let path = treedb_registry_path(base);
     let mut text = "# GroveFS-managed treedb instance registry — edited by the web console's\n\
-        # storage page (`storage.*`, admin only). treedb is EXPERIMENTAL: this file is\n\
-        # an INVENTORY of known servers, not a router — the meta-server still routes to\n\
-        # the one --meta-store address; the control plane stays in local SQLite.\n"
+        # storage page (`storage.*`, admin only). treedb is EXPERIMENTAL: the meta-server\n\
+        # routes new trees by name hash across the `--meta-store` address set only; other\n\
+        # lines here are inventory. Existing trees always resolve by engine listing.\n\
+        # The control plane stays in local SQLite.\n"
         .to_string();
     for (name, addr) in insts {
         text.push_str(&format!("{name} = {addr}\n"));
@@ -1191,7 +1350,7 @@ pub fn adopt_treedb_spec(base: &std::path::Path, addr: &str) -> Result<bool, Str
 }
 
 /// `storage.add`（treedb 档）：校验名字 + 试连列视图，然后追加。**登记**这台服务器，
-/// 但不开始把新视图路由过去（treedb 多实例放置尚未接通）。
+/// 但放置集由启动时的 `--meta-store` 定死，新增行不会开始接收新视图（那是重启级改动）。
 pub fn treedb_add(base: &std::path::Path, name: &str, addr: &str) -> Result<String, String> {
     let name = name.trim();
     if !valid_treedb_name(name) {
@@ -1210,16 +1369,16 @@ pub fn treedb_add(base: &std::path::Path, name: &str, addr: &str) -> Result<Stri
     insts.push((name.to_string(), addr.clone()));
     write_treedb_registry(base, &insts)?;
     Ok(format!(
-        "instance '{name}' registered at {addr} ({views} view(s) reported); treedb is inventory-only — this server does not receive new views yet"
+        "instance '{name}' registered at {addr} ({views} view(s) reported); placement targets come from --meta-store at start — this row is inventory until the server is restarted with it"
     ))
 }
 
-/// `storage.update`（treedb 档）：把一条名字指到新的 `host:port`。serving 条目的地址
-/// 由 `--meta-store` 在启动时定死，不能从网页端就地改（会让运行中的服务器与记录分
-/// 叉）；那是一次重启级别的改动。renaming 走 add + 手工 + remove，不在此。
+/// `storage.update`（treedb 档）：把一条名字指到新的 `host:port`。serving 集合里
+/// 的地址由 `--meta-store` 在启动时定死，不能从网页端就地改（会让运行中的服务器与
+/// 记录分叉）；那是一次重启级别的改动。renaming 走 add + 手工 + remove，不在此。
 pub fn treedb_update(
     base: &std::path::Path,
-    serving: &str,
+    serving: &[String],
     name: &str,
     addr: &str,
 ) -> Result<String, String> {
@@ -1233,9 +1392,9 @@ pub fn treedb_update(
             name.trim()
         ));
     }
-    if insts[idx].1 == serving.trim() {
+    if serving.iter().any(|s| *s == insts[idx].1) {
         return Err(format!(
-            "instance '{}' is the address this meta-server routes to (from --meta-store) — re-point it by restarting with a different --meta-store, not from the console",
+            "instance '{}' is an address this meta-server routes to (from --meta-store) — re-point it by restarting with a different --meta-store, not from the console",
             name.trim()
         ));
     }
@@ -1249,19 +1408,23 @@ pub fn treedb_update(
     ))
 }
 
-/// `storage.remove`（treedb 档）：跑守卫后删行。serving 记录删不掉；只要目标服务器还
-/// 报有视图就删不掉（没有搬迁通道，删了就是把树孤立）；证据读不到也拒绝。空清单
-/// 且非 serving 才允许遗忘，删后重读验证文件确已生效。
-pub fn treedb_remove(base: &std::path::Path, serving: &str, name: &str) -> Result<String, String> {
+/// `storage.remove`（treedb 档）：跑守卫后删行。serving 集合内的记录删不掉；只要目标
+/// 服务器还报有视图就删不掉（没有搬迁通道，删了就是把树孤立）；证据读不到也拒绝。
+/// 空清单且非 serving 才允许遗忘，删后重读验证文件确已生效。
+pub fn treedb_remove(
+    base: &std::path::Path,
+    serving: &[String],
+    name: &str,
+) -> Result<String, String> {
     let insts = treedb_registry(base)?;
     let name = name.trim();
     let Some((_, addr)) = insts.iter().find(|(n, _)| n == name) else {
         return Err(format!("instance '{name}' is not in the registry"));
     };
     let addr = addr.clone();
-    if addr == serving.trim() {
+    if serving.contains(&addr) {
         return Err(format!(
-            "instance '{name}' is the address this meta-server routes to (treedb at {addr}) — its trees are the ones served here, and grovefs ships no server-side treedb move; retire it by restarting with a different --meta-store"
+            "instance '{name}' is an address this meta-server routes to (treedb at {addr}) — its trees are the ones served here, and grovefs ships no server-side treedb move; retire it by restarting with a different --meta-store"
         ));
     }
     // 证据缺失即拒绝：读不到清单 = 无法证明它是空的，那就不能遗忘它。
@@ -1271,7 +1434,7 @@ pub fn treedb_remove(base: &std::path::Path, serving: &str, name: &str) -> Resul
     if !views.is_empty() {
         let shown: Vec<&str> = views.iter().take(20).map(String::as_str).collect();
         return Err(format!(
-            "instance '{name}' (treedb at {addr}) still hosts {} ({}) — treedb relocation is not wired (EXPERIMENTAL single-instance routing), so every view must be dropped on that server by hand before it can be forgotten; the guard REFUSES rather than strand a tree",
+            "instance '{name}' (treedb at {addr}) still hosts {} ({}) — treedb relocation is not wired (no server-side move), so every view must be dropped on that server by hand before it can be forgotten; the guard REFUSES rather than strand a tree",
             crate::cli_style::plural(views.len(), "view", "views"),
             shown.join(", ")
         ));
@@ -1292,7 +1455,7 @@ pub fn treedb_remove(base: &std::path::Path, serving: &str, name: &str) -> Resul
 /// 与 PG 档同规则：报 blocked，而非给一张看着干净的预览。
 pub fn treedb_preview(
     base: &std::path::Path,
-    serving: &str,
+    serving: &[String],
     name: &str,
 ) -> Result<serde_json::Value, String> {
     use serde_json::json;
@@ -1300,12 +1463,12 @@ pub fn treedb_preview(
     let Some((_, addr)) = insts.iter().find(|(n, _)| n == name.trim()) else {
         return Err(format!("instance '{name}' is not in the registry"));
     };
-    let is_serving = addr == serving.trim();
-    let note = "treedb is EXPERIMENTAL: control plane stays in local SQLite; this registry is inventory, not a router (no server-side move yet)";
+    let is_serving = serving.contains(addr);
+    let note = "treedb is EXPERIMENTAL: control plane stays in local SQLite; new trees hash across the --meta-store address set; there is no server-side move yet";
     match TreedbStore::list_views(addr) {
         Ok(views) => {
             let block = if is_serving {
-                "this is the address the meta-server routes to — its trees are served here, and treedb has no server-side move"
+                "this address is in the set the meta-server routes to — its trees are served here, and treedb has no server-side move"
             } else if !views.is_empty() {
                 "treedb relocation is not wired — drop these views on the server by hand first"
             } else {
@@ -1404,9 +1567,10 @@ mod registry_tests {
     fn update_refuses_serving_and_unknown() {
         let d = dir("upd");
         adopt_treedb_spec(&d, "127.0.0.1:7777").unwrap();
-        let err = treedb_update(&d, "127.0.0.1:7777", "primary", "127.0.0.1:9999").unwrap_err();
+        let serving = ["127.0.0.1:7777".to_string()];
+        let err = treedb_update(&d, &serving, "primary", "127.0.0.1:9999").unwrap_err();
         assert!(err.contains("routes to"), "{err}");
-        let err = treedb_update(&d, "127.0.0.1:7777", "ghost", "127.0.0.1:9999").unwrap_err();
+        let err = treedb_update(&d, &serving, "ghost", "127.0.0.1:9999").unwrap_err();
         assert!(err.contains("not in the registry"), "{err}");
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -1416,14 +1580,59 @@ mod registry_tests {
     fn remove_refuses_the_serving_instance() {
         let d = dir("rm");
         adopt_treedb_spec(&d, "127.0.0.1:7777").unwrap();
-        let err = treedb_remove(&d, "127.0.0.1:7777", "primary").unwrap_err();
+        let serving = ["127.0.0.1:7777".to_string()];
+        let err = treedb_remove(&d, &serving, "primary").unwrap_err();
         assert!(err.contains("routes to"), "{err}");
-        let err = treedb_remove(&d, "127.0.0.1:7777", "ghost").unwrap_err();
+        let err = treedb_remove(&d, &serving, "ghost").unwrap_err();
         assert!(err.contains("not in the registry"), "{err}");
-        // 非 serving 但读不到清单 → 证据缺失拒绝，而不是放行。
-        adopt_treedb_spec(&d, "127.0.0.1:7778").unwrap();
-        let err = treedb_remove(&d, "127.0.0.1:7777", "primary2").unwrap_err();
-        assert!(err.contains("not in the registry"), "{err}");
+        // 非 serving 但读不到清单 → 证据缺失拒绝，而不是放行（端口 1 无监听，
+        // 与 `add_validates_name_before_connecting` 同一先例；adopt 插首位，所以
+        // 这个名字命中的第一条就是它）。
+        adopt_treedb_spec(&d, "127.0.0.1:1").unwrap();
+        let err = treedb_remove(&d, &serving, "primary").unwrap_err();
+        assert!(err.contains("cannot read the view list"), "{err}");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 多实例路由集：逗号列表展开、去重、保序；坏项整串拒绝；新树落点按名字
+    /// 哈希确定且可重算（无账本持久化的前提就是这条确定性）。
+    #[test]
+    fn parse_addrs_and_plan_placement() {
+        let a = parse_addrs("treedb://127.0.0.1:7777,10.0.0.2:7777").unwrap();
+        assert_eq!(a, vec!["127.0.0.1:7777", "10.0.0.2:7777"]);
+        // 去重 + 空白容忍。
+        let b = parse_addrs("treedb:// 127.0.0.1:7777 ,127.0.0.1:7777,").unwrap();
+        assert_eq!(b, vec!["127.0.0.1:7777"]);
+        assert!(parse_addrs("treedb://127.0.0.1:7777,not-an-addr").is_err());
+        // 单实例退化：所有名字都落唯一项。
+        let one = parse_addrs("treedb://127.0.0.1:7777").unwrap();
+        assert_eq!(plan_placement(&one, "anything"), "127.0.0.1:7777");
+        // 确定性 + 真正分散：同一名字永远同机，且 24 个名字两台都有份。
+        let (mut hits0, mut hits1) = (0, 0);
+        for i in 0..24 {
+            let name = format!("view{i}");
+            let h = plan_placement(&a, &name);
+            assert_eq!(h, plan_placement(&a, &name));
+            if h == a[0] {
+                hits0 += 1;
+            } else {
+                hits1 += 1;
+            }
+        }
+        assert!(
+            hits0 > 0 && hits1 > 0,
+            "placement must spread: {hits0}/{hits1}"
+        );
+    }
+
+    /// 故障隔离降级：一台读不到不连坐其余实例。两台端口皆无监听（1、2），
+    /// 没有任何可达实例报告持有 → 不能当成「不存在」（否则 `store_for` 会在幸存
+    /// 实例上把一棵本已存在的树当新的重建），而是 Err 指名不可读的那几台。
+    #[test]
+    fn find_tree_home_refuses_when_nothing_is_reachable() {
+        let addrs = vec!["127.0.0.1:1".to_string(), "127.0.0.1:2".to_string()];
+        let err = find_tree_home(&addrs, "anything").unwrap_err();
+        assert!(err.contains("not on any reachable"), "{err}");
+        assert!(err.contains("could not be read"), "{err}");
     }
 }

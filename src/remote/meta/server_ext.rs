@@ -121,9 +121,12 @@ impl HaState {
 pub enum StoreKind {
     Sqlite,
     Pg(String),
-    /// `treedb://host:port` — the address only, parsed once at `with_store()`.
+    /// `treedb://host:port[,host:port…]` — the parsed address TABLE, resolved
+    /// once at `with_store()`. New trees hash across this list; existing trees
+    /// resolve by asking every engine (`find_tree_home`), never by recomputing
+    /// the hash.
     #[cfg(feature = "treedb")]
-    Treedb(String),
+    Treedb(Vec<String>),
 }
 
 impl StoreKind {
@@ -173,7 +176,7 @@ impl StoreKind {
             }
             #[cfg(feature = "treedb")]
             StoreKind::Treedb(_) => {
-                "one tree per view in the treedb server; <base> holds definitions and keys only"
+                "one tree per view in a treedb server (a comma-list --meta-store spreads new trees over the instances by name hash, existing ones resolve by engine listing); <base> holds definitions and keys only"
                     .to_string()
             }
         }
@@ -254,11 +257,12 @@ fn storage_snapshot(store: &StoreKind, base: &Path) -> serde_json::Value {
             "pendingControl": null,
         }),
         #[cfg(feature = "treedb")]
-        StoreKind::Treedb(addr) => {
-            // treedb is inventory-only: read the managed registry and, per entry,
-            // ask the engine for its LIVE view list. No row is `control` (the
-            // control plane is local SQLite); the entry whose address equals the
-            // configured --meta-store is `serving` (this server's trees).
+        StoreKind::Treedb(addrs) => {
+            // treedb's registry lists every ROUTED address (a comma-list
+            // --meta-store routes new trees across them by name hash; reads
+            // resolve per engine). No row is `control` (the control plane is
+            // local SQLite); a row whose address is in the serving set is
+            // `serving` (this server's trees).
             let insts = crate::treedb_store::treedb_registry(base).unwrap_or_default();
             let rows = insts
                 .iter()
@@ -267,7 +271,7 @@ fn storage_snapshot(store: &StoreKind, base: &Path) -> serde_json::Value {
                     json!({
                         "name": name,
                         "control": false,
-                        "serving": a == addr,
+                        "serving": addrs.iter().any(|s| s == a),
                         "uri": format!("treedb://{a}"),
                         "placedViews": views.as_ref().map(|v| v.len()),
                         "viewNames": views,
@@ -286,7 +290,10 @@ fn storage_snapshot(store: &StoreKind, base: &Path) -> serde_json::Value {
                 "pendingControl": null,
                 "experimental": true,
                 "controlPlane": "local SQLite",
-                "routingNote": "treedb routes to one --meta-store address; other entries are inventory, not placement targets",
+                "routingNote": format!(
+                    "treedb routes new trees by name hash across {} serving address(es); other entries are inventory, not placement targets",
+                    addrs.len()
+                ),
             })
         }
     }
@@ -828,8 +835,10 @@ impl MetaServer {
             Some(u) if crate::treedb_store::is_treedb_store(&u) => {
                 // A malformed address is refused exactly like an unknown scheme:
                 // `serve()` reports it, the server never starts on a default.
-                match crate::treedb_store::parse_addr(&u) {
-                    Ok(addr) => self.store = StoreKind::Treedb(addr),
+                // The URI is a comma LIST since multi-instance placement landed:
+                // one item keeps the historical single-engine shape exactly.
+                match crate::treedb_store::parse_addrs(&u) {
+                    Ok(addrs) => self.store = StoreKind::Treedb(addrs),
                     Err(e) => {
                         self.store_unavailable = Some(format!(
                             "`{u}` is not a valid --meta-store treedb address: {e}"
@@ -936,16 +945,24 @@ impl MetaServer {
                 );
             }
         }
-        // treedb keeps the SAME adoption idea but a smaller promise: it routes to
-        // ONE engine address (there is no placement table or server-side move yet),
-        // so the registry is the console's INVENTORY of known treedb servers. We
-        // only guarantee the address this server actually serves shows up as a
-        // row, so the storage page always tells the truth about where trees live.
+        // treedb keeps the SAME adoption idea with a real routing table now: a
+        // comma-list --meta-store routes NEW trees by name hash across its
+        // instances, while every read asks the engines themselves. The registry
+        // still mirrors those serving addresses for the console, plus any
+        // operator-added inventory rows.
         #[cfg(feature = "treedb")]
-        if let StoreKind::Treedb(addr) = &store {
-            if crate::treedb_store::adopt_treedb_spec(&self.base, addr).map_err(io::Error::other)? {
+        if let StoreKind::Treedb(addrs) = &store {
+            let mut seeded = false;
+            for addr in addrs {
+                if crate::treedb_store::adopt_treedb_spec(&self.base, addr)
+                    .map_err(io::Error::other)?
+                {
+                    seeded = true;
+                }
+            }
+            if seeded {
                 println!(
-                    "meta-server: treedb inventory {} seeded with the serving address (treedb is EXPERIMENTAL — control plane stays in local SQLite, no server-side move yet)",
+                    "meta-server: treedb registry {} seeded with the serving address(es) (treedb is EXPERIMENTAL — control plane stays in local SQLite, no server-side move yet)",
                     crate::treedb_store::treedb_registry_path(&self.base).display()
                 );
             }
@@ -1069,8 +1086,18 @@ impl MetaServer {
         // definitions/aliases/forks from the shared `grovefs_control` schema, a
         // SQLite store from the local `meta/views` dir — one system of record per
         // backend, never a local file the PG deployment would ignore.
-        let control = crate::mcp::control_store_for(&self.base, store.control_uri())
+        let mut control = crate::mcp::control_store_for(&self.base, store.control_uri())
             .map_err(io::Error::other)?;
+        #[cfg(feature = "treedb")]
+        if matches!(store, StoreKind::Treedb(_)) {
+            // The SAME local file plane, but defs place as if trees lived in the
+            // engine: there are no local db files for the tree-home scan, so a
+            // fork def would otherwise fall flat and a member def would never
+            // anchor inside its base (see `FileControlStore::with_engine_trees`).
+            control = std::sync::Arc::new(
+                crate::mcp::FileControlStore::new(&self.base).with_engine_trees(),
+            );
+        }
         let rt = Arc::new(MetaRuntime {
             base: self.base.clone(),
             token: self.token.clone(),
@@ -2489,12 +2516,56 @@ fn control_dispatch(
                     "view '{name}' already has a definition — this call would overwrite it"
                 ));
             }
-            let st = rt.control.create_fork_tree(&base, &name, seed)?;
+            let st = match &rt.store {
+                #[cfg(feature = "treedb")]
+                // A treedb fork is an ENGINE-side tree copy: the file store's
+                // `fork_view_with` scans local db files, and under this backend
+                // the trees are not there. The fork seeds on its BASE's
+                // instance (the same cross-instance refusal the PG tier's
+                // graft gate encodes); `physical_tree_exists` above already
+                // proved the base lives somewhere in the routing set.
+                StoreKind::Treedb(addrs) => {
+                    // An engine-side duplicate is the honest refusal here (the
+                    // file store's own duplicate gates all key on local db
+                    // files, which this backend has none of).
+                    if crate::treedb_store::find_tree_home(addrs, &name)?.is_some() {
+                        return Err(format!(
+                            "view '{name}' already exists in treedb — remove it first"
+                        ));
+                    }
+                    if seed {
+                        let home = crate::treedb_store::find_tree_home(addrs, &base)?
+                            .ok_or_else(|| format!("no base tree '{base}' in the treedb instances"))?;
+                        crate::treedb_store::copy_tree(&base, &name, &home)
+                            .map_err(|e| format!("treedb fork seed: {e}"))?
+                    } else {
+                        let home = crate::treedb_store::plan_placement(addrs, &name);
+                        // A writable open creates the (empty) view — the same
+                        // "the store owns its tree" contract as `view create`.
+                        let dst = crate::treedb_store::TreedbStore::open(&home, &name, false)
+                            .map_err(|e| format!("treedb fork create: {e}"))?;
+                        drop(dst);
+                        crate::meta::ForkStats { nodes: 0, blobs: 0 }
+                    }
+                }
+                _ => rt.control.create_fork_tree(&base, &name, seed)?,
+            };
             if with_def {
                 // Tree first, definition second, and the tree goes back if the
                 // definition cannot be written: the reverse order is what strands
                 // a name that resolves to a missing tree.
                 if let Err(e) = rt.control.put_def(&name, &text) {
+                    #[cfg(feature = "treedb")]
+                    if let StoreKind::Treedb(addrs) = &rt.store {
+                        // Roll the engine tree back, directory-free by the same
+                        // scan that found it; the file arm's rollback would
+                        // unlink local db files that never existed here.
+                        if let Ok(Some(home)) = crate::treedb_store::find_tree_home(addrs, &name) {
+                            let _ = crate::treedb_store::TreedbStore::drop_view(&home, &name);
+                        }
+                        rt.evict();
+                        return Err(format!("cannot record the fork definition for '{name}': {e}"));
+                    }
                     rt.control.destroy_fork_tree(&name);
                     rt.evict();
                     return Err(format!("cannot record the fork definition for '{name}': {e}"));
@@ -2510,6 +2581,19 @@ fn control_dispatch(
         }
         "fork.drop" => {
             let name = req_str(a, "name")?;
+            #[cfg(feature = "treedb")]
+            if let StoreKind::Treedb(addrs) = &rt.store {
+                // The def is already gone (remove_def runs first); drop the
+                // engine tree on whichever instance actually holds it. No tree
+                // anywhere is not an error — the file arm only fails on a real
+                // unlink failure, not on a tree that is already gone.
+                if let Some(home) = crate::treedb_store::find_tree_home(addrs, &name)? {
+                    crate::treedb_store::TreedbStore::drop_view(&home, &name)
+                        .map_err(|e| format!("cannot drop treedb view '{name}' at {home}: {e}"))?;
+                }
+                rt.evict();
+                return Ok(serde_json::Value::Null);
+            }
             rt.control.drop_fork_tree(&name)?;
             rt.evict();
             Ok(serde_json::Value::Null)
@@ -2613,19 +2697,28 @@ fn control_dispatch(
                     format!("created BASE view '{view}' at {}{note}", mp.display())
                 }
                 #[cfg(feature = "treedb")]
-                StoreKind::Treedb(addr) => {
+                StoreKind::Treedb(addrs) => {
                     // No duplicate probe here: the `physical_tree_exists` gate
-                    // above already asked THIS engine, so a name that exists in
-                    // treedb was refused before reaching this branch. (It used to
-                    // be re-checked here because that gate only looked at local
-                    // db files — two lists answering one question, the pattern
-                    // this funnel removes.)
-                    let eng = crate::meta::MetaStore::open_treedb(addr, &view, false)
+                    // above already asked EVERY engine, so a name that exists
+                    // anywhere was refused before reaching this branch. (It used
+                    // to be re-checked here because that gate only looked at
+                    // local db files — two lists answering one question, the
+                    // pattern this funnel removes.)
+                    let home = crate::treedb_store::plan_placement(addrs, &view);
+                    let eng = crate::meta::MetaStore::open_treedb(&home, &view, false)
                         .map_err(|e| format!("view create: {e}"))?;
+                    // The def-home marker: trees live in the engine, but the
+                    // base still gets its `meta/<view>/` directory — family
+                    // (fork/bias/lens) defs slot inside it, and the placement
+                    // scan reads existence from it.
+                    std::fs::create_dir_all(crate::meta::view_dir(&rt.base, &view))
+                        .map_err(|e| {
+                            format!("cannot create def home for '{view}': {e}")
+                        })?;
                     // Like PG: the bytes belong to the data servers, so there is
                     // no local root a manifest `touch` line could write into.
                     let note = seed_if_manifest(&eng, None, manifest)?;
-                    format!("created BASE view '{view}' in treedb at {addr}{note}")
+                    format!("created BASE view '{view}' in treedb at {home}{note}")
                 }
             };
             rt.evict();
@@ -3054,14 +3147,14 @@ fn control_dispatch(
                     return Err("this deployment's metadata lives in local SQLite files — there is no instance registry to manage".to_string())
                 }
                 #[cfg(feature = "treedb")]
-                StoreKind::Treedb(addr) => {
-                    // treedb's registry is inventory-only (see `treedb_store`): the
-                    // server routes to ONE --meta-store address, there is no
-                    // placement table and no server-side move. Add/update/preview/
-                    // remove act on that inventory (serving = the configured addr);
-                    // set_control/relocate are REFUSED because the engine cannot
-                    // honor them — the honest experimental boundary, not a stub.
-                    let serving = addr.clone();
+                StoreKind::Treedb(addrs) => {
+                    // The registry now MIRRORS a routing table: every --meta-store
+                    // address is serving (new trees hash across them, reads
+                    // resolve per engine), inventory rows are probe-protected
+                    // additions. Add/update/remove act on the file; set_control/
+                    // relocate are REFUSED because the engine cannot honor them —
+                    // the honest experimental boundary, not a stub.
+                    let serving: &[String] = addrs;
                     let name = req_str(a, "instance").unwrap_or_default();
                     return match op {
                         "storage.add" => {
@@ -3079,7 +3172,7 @@ fn control_dispatch(
                                 .strip_prefix(crate::treedb_store::SCHEME)
                                 .unwrap_or(uri.as_str());
                             let msg =
-                                crate::treedb_store::treedb_update(&rt.base, &serving, &name, addr)?;
+                                crate::treedb_store::treedb_update(&rt.base, serving, &name, addr)?;
                             Ok(json!({ "ok": true, "msg": msg }))
                         }
                         "storage.remove" => {
@@ -3088,11 +3181,11 @@ fn control_dispatch(
                             // removable instance is by construction viewless — the
                             // "no active mounts" check is subsumed (a view cannot be
                             // mounted here if it is not even on this server).
-                            let msg = crate::treedb_store::treedb_remove(&rt.base, &serving, &name)?;
+                            let msg = crate::treedb_store::treedb_remove(&rt.base, serving, &name)?;
                             Ok(json!({ "ok": true, "msg": msg }))
                         }
                         "storage.preview" => {
-                            crate::treedb_store::treedb_preview(&rt.base, &serving, &name)
+                            crate::treedb_store::treedb_preview(&rt.base, serving, &name)
                         }
                         "storage.set_control" => Err(
                             "treedb has no in-engine control plane to hand over — the control plane (view definitions, api keys, web accounts) is LOCAL SQLITE for every treedb deployment, so there is nothing to designate. storage.set_control applies to a PostgreSQL store only"
@@ -3899,12 +3992,19 @@ fn drop_imported_tree(rt: &Arc<MetaRuntime>, view: &str) -> String {
             ),
         },
         #[cfg(feature = "treedb")]
-        StoreKind::Treedb(addr) => {
-            match crate::treedb_store::TreedbStore::drop_view(addr, view) {
-                Ok(_) => "the imported tree was removed again".to_string(),
-                Err(e) => format!(
-                    "the imported tree could NOT be removed ({e}) — drop view '{view}' in treedb at {addr} by hand"
-                ),
+        StoreKind::Treedb(addrs) => {
+            match crate::treedb_store::find_tree_home(addrs, view)
+                .ok()
+                .flatten()
+            {
+                Some(home) => match crate::treedb_store::TreedbStore::drop_view(&home, view) {
+                    Ok(_) => "the imported tree was removed again".to_string(),
+                    Err(e) => format!(
+                        "the imported tree could NOT be removed ({e}) — drop view '{view}' in treedb at {home} by hand"
+                    ),
+                },
+                // Nothing to undo: the copy never landed on any instance.
+                None => "nothing to roll back".to_string(),
             }
         }
     }
@@ -3988,15 +4088,21 @@ fn view_rm_base(
             )
         }
         #[cfg(feature = "treedb")]
-        StoreKind::Treedb(addr) => {
+        StoreKind::Treedb(addrs) => {
             // treedb keeps the holder count inside the tree itself, so there is
             // no separate ledger to consult and nothing to report about refs
             // that other views still hold: dropping a view frees exactly its own
             // rows. The BYTES are a data server's business, as under PG.
-            crate::treedb_store::TreedbStore::drop_view(addr, view)
-                .map_err(|e| format!("cannot drop treedb view '{view}' at {addr}: {e}"))?;
+            let home = crate::treedb_store::find_tree_home(addrs, view)?
+                .ok_or_else(|| format!("no base tree '{view}' in the treedb instances"))?;
+            crate::treedb_store::TreedbStore::drop_view(&home, view)
+                .map_err(|e| format!("cannot drop treedb view '{view}' at {home}: {e}"))?;
+            // The base's def-home marker goes with it once nothing remains
+            // inside: member defs were refused above unless they were removed,
+            // so an empty directory here is only noise.
+            let _ = std::fs::remove_dir(crate::meta::view_dir(&rt.base, view));
             format!(
-                "removed base view '{view}' from treedb at {addr}; content objects are not touched — they belong to the data servers"
+                "removed base view '{view}' from treedb at {home}; content objects are not touched — they belong to the data servers"
             )
         }
     };
@@ -4252,7 +4358,7 @@ fn gc_audit(
         StoreKind::Sqlite => rt.base.display().to_string(),
         StoreKind::Pg(_) => "PostgreSQL (one schema per view; the URI is never echoed)".to_string(),
         #[cfg(feature = "treedb")]
-        StoreKind::Treedb(addr) => format!("treedb://{addr} (one tree per view)"),
+        StoreKind::Treedb(addrs) => format!("treedb://{} (one tree per view)", addrs.join(",")),
     };
     let cand = |c: &crate::gc::Judged| {
         json!({
@@ -4478,19 +4584,23 @@ fn store_for(rt: &MetaRuntime, view: &str) -> io::Result<Arc<MetaStore>> {
         // So existence is confirmed against the engine's own list first; the
         // result is cached per view like every other backend, so this costs one
         // `ListViews` per cold view, not one per mount.
-        StoreKind::Treedb(addr) => {
-            let known = crate::treedb_store::TreedbStore::list_views(addr)
-                .map_err(|e| io::Error::other(format!("treedb list views at {addr}: {e}")))?;
-            if !known.iter().any(|v| v == view) {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "no base tree '{view}' in treedb at {addr} — create it (`view create`)"
-                    ),
-                ));
-            }
-            MetaStore::open_treedb(addr, view, false).map_err(|e| {
-                io::Error::other(format!("treedb open for view='{view}' at {addr}: {e}"))
+        StoreKind::Treedb(addrs) => {
+            // The engine list is the only ledger: `find_tree_home` answers
+            // existence and placement in the same per-instance sweep, so a cold
+            // mount costs one `ListViews` per serving address, not one per op.
+            let home = crate::treedb_store::find_tree_home(addrs, view)
+                .map_err(io::Error::other)?
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!(
+                            "no base tree '{view}' in the treedb instances ({}) — create it (`view create`)",
+                            addrs.join(", ")
+                        ),
+                    )
+                })?;
+            MetaStore::open_treedb(&home, view, false).map_err(|e| {
+                io::Error::other(format!("treedb open for view='{view}' at {home}: {e}"))
             })?
         }
     };
@@ -4543,10 +4653,10 @@ fn load_aliases(store: &dyn crate::mcp::ControlStore) -> io::Result<HashMap<Stri
 /// there would serve a live tree under a name its caller believes it cloned.
 fn physical_tree_exists(rt: &MetaRuntime, name: &str) -> Result<bool, String> {
     #[cfg(feature = "treedb")]
-    if let StoreKind::Treedb(addr) = &rt.store {
-        return crate::treedb_store::TreedbStore::list_views(addr)
-            .map(|vs| vs.iter().any(|v| v == name))
-            .map_err(|e| e.to_string());
+    if let StoreKind::Treedb(addrs) = &rt.store {
+        // A duplicated name (Err) answers "exists" too — the caller is refusing
+        // a create or reporting a listing, and either way the name IS taken.
+        return crate::treedb_store::find_tree_home(addrs, name).map(|o| o.is_some());
     }
     rt.control.has_physical(name)
 }
@@ -4556,8 +4666,8 @@ fn physical_tree_exists(rt: &MetaRuntime, name: &str) -> Result<bool, String> {
 /// be asked under `treedb://`.
 fn physical_tree_list(rt: &MetaRuntime) -> Result<Vec<String>, String> {
     #[cfg(feature = "treedb")]
-    if let StoreKind::Treedb(addr) = &rt.store {
-        return crate::treedb_store::TreedbStore::list_views(addr).map_err(|e| e.to_string());
+    if let StoreKind::Treedb(addrs) = &rt.store {
+        return crate::treedb_store::list_views_all(addrs);
     }
     rt.control.list_physical()
 }
@@ -5156,8 +5266,9 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
                 // server never reads: a treedb base tree is made through the
                 // server's own governance port.
                 #[cfg(feature = "treedb")]
-                StoreKind::Treedb(addr) => format!(
-                    "a treedb base view is a tree inside the engine at {addr}: create it against this meta-server (`grovefs view --control-server <host:port> --api-key <admin-key> create --view {view}`)"
+                StoreKind::Treedb(addrs) => format!(
+                    "a treedb base view is a tree inside the engine(s) at {}: create it against this meta-server (`grovefs view --control-server <host:port> --api-key <admin-key> create --view {view}`)",
+                    addrs.join(", ")
                 ),
                 _ if rt.control.backend() == "postgres" => format!(
                     "a PG base view is a schema: create it first with `grovefs view --meta-store postgres://… --meta-dir {root} create --view {view}`, or restore the schema from a dump"

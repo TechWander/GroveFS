@@ -312,13 +312,29 @@ pub trait ControlStore: Send + Sync {
 /// of its own).
 pub struct FileControlStore {
     base: PathBuf,
+    /// Trees live inside a treedb engine, so the local db scan cannot resolve
+    /// a tree home: fresh def slots place by the FAMILY THE DEF TEXT NAMES
+    /// (see [`crate::meta::treedb_fork_home`]). Only the meta-server sets this
+    /// on a treedb deployment; every SQLite path keeps the scan semantics.
+    #[cfg(feature = "treedb")]
+    engine_trees: bool,
 }
 
 impl FileControlStore {
     pub fn new(base: &Path) -> Self {
         Self {
             base: base.to_path_buf(),
+            #[cfg(feature = "treedb")]
+            engine_trees: false,
         }
+    }
+
+    /// Same store, treedb-tree placement: definitions derive family slots from
+    /// def text instead of from local db files (the trees are in the engine).
+    #[cfg(feature = "treedb")]
+    pub fn with_engine_trees(mut self) -> Self {
+        self.engine_trees = true;
+        self
     }
 
     fn def_dir(&self) -> PathBuf {
@@ -378,6 +394,19 @@ impl ControlStore for FileControlStore {
         // Enumerate exactly those slots; a tree directory's other contents
         // (sidecars, scratch) are not definitions, and names are unique
         // across the store so first-seen wins.
+        #[cfg(feature = "treedb")]
+        if self.engine_trees {
+            // No local db files to key the family walk on, so reach every def
+            // by a recursive scan of `meta/` (see `list_def_files`): a fork's
+            // own def and its nested members all come back in one pass.
+            let mut out = Vec::new();
+            for (stem, path) in crate::meta::list_def_files(&self.base) {
+                let text = std::fs::read_to_string(&path)
+                    .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+                out.push((stem, text));
+            }
+            return Ok(out);
+        }
         let mut out = Vec::new();
         let mut seen: Vec<String> = Vec::new();
         let collect = |dir: &Path, out: &mut Vec<(String, String)>, seen: &mut Vec<String>| {
@@ -433,14 +462,33 @@ impl ControlStore for FileControlStore {
                 // The fork tree is created BEFORE its def on every path
                 // (fork_view_seeded, fork.create), so view_dir resolves the
                 // real nested home; a stray def without a tree falls back to
-                // the flat own-directory spelling.
-                Ok(ViewDef::Fork(_)) => crate::meta::fork_def_slot(&self.base, name),
+                // the flat own-directory spelling. Under treedb there is no
+                // local db to scan, so the lineage comes from the def text.
+                Ok(ViewDef::Fork(b)) => {
+                    #[cfg(feature = "treedb")]
+                    if self.engine_trees {
+                        crate::meta::treedb_fork_home(&self.base, name, Some(&b))
+                            .join(format!("{name}.layout"))
+                    } else {
+                        crate::meta::fork_def_slot(&self.base, name)
+                    }
+                    #[cfg(not(feature = "treedb"))]
+                    crate::meta::fork_def_slot(&self.base, name)
+                }
                 _ => {
                     let parent = self.def_parent(text);
                     // A member of a base whose tree is gone stays at the top
-                    // level — the family dir would dangle.
-                    let anchor =
-                        parent.filter(|b| crate::meta::find_view_db(&self.base, b).is_some());
+                    // level — the family dir would dangle. Under treedb the
+                    // base's def home doubles as its marker: if that directory
+                    // exists (a fork def or a member def already nested it),
+                    // the base is real and the anchor holds.
+                    let anchor = parent.filter(|b| {
+                        #[cfg(feature = "treedb")]
+                        if self.engine_trees {
+                            return crate::meta::view_dir(&self.base, b).exists();
+                        }
+                        crate::meta::find_view_db(&self.base, b).is_some()
+                    });
                     crate::meta::new_def_slot(&self.base, name, anchor.as_deref())
                 }
             },
@@ -458,7 +506,21 @@ impl ControlStore for FileControlStore {
         }
         std::fs::remove_file(&p)
             .map(|()| true)
-            .map_err(|e| format!("cannot remove {}: {e}", p.display()))
+            .map_err(|e| format!("cannot remove {}: {e}", p.display()))?;
+        // A fork def under treedb sits inside the name's def-home directory
+        // (`meta/<B>/<F>/<F>.layout`); with the def gone that directory is
+        // noise — take it while it is empty, exactly like the file arm's
+        // tree-directory cleanup (an alien same-named top-level dir is NOT
+        // this shape, so it is left alone).
+        #[cfg(feature = "treedb")]
+        if self.engine_trees
+            && p.parent().and_then(|l| l.file_name()) == Some(std::ffi::OsStr::new(name))
+            && p.parent().and_then(|l| l.parent())
+                != Some(crate::meta::meta_dir(&self.base).as_path())
+        {
+            let _ = std::fs::remove_dir(p.parent().unwrap());
+        }
+        Ok(true)
     }
 
     fn stamp(&self, name: &str) -> Option<String> {
@@ -3397,6 +3459,43 @@ mod tests {
         Arc::new(FileControlStore::new(p))
     }
 
+    /// The treedb def plane: defs place by lineage off the def TEXT (there are
+    /// no local db files), and `list_defs` must reach every one of them by the
+    /// recursive scan — a fork inside its own def-home, a bias/lens member
+    /// directly in the base dir — while `get_def` reads each back.
+    #[cfg(feature = "treedb")]
+    #[test]
+    fn engine_tree_defs_enumerate_at_every_depth() {
+        let base = db();
+        // The base's def-home marker, exactly as `view.create` leaves it.
+        std::fs::create_dir_all(crate::meta::meta_dir(&base).join("alpha")).unwrap();
+        let store = FileControlStore::new(&base).with_engine_trees();
+        store.put_def("fk1", "fork alpha\n").unwrap();
+        store.put_def("bias_pub", "alias alpha\n").unwrap();
+        store
+            .put_def("lens_docs", "base alpha\nonly /docs\n")
+            .unwrap();
+        let mut got: Vec<String> = store
+            .list_defs()
+            .unwrap()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec!["bias_pub", "fk1", "lens_docs"],
+            "all three resolve under alpha"
+        );
+        // A fork travels with its own tree home (`meta/alpha/fk1/fk1.layout`);
+        // the alias and the lens sit directly in the base dir.
+        let fk = crate::meta::find_def_slot(&base, "fk1").unwrap();
+        assert_eq!(fk.parent().unwrap().file_name().unwrap(), "fk1");
+        let lens = crate::meta::find_def_slot(&base, "lens_docs").unwrap();
+        assert_eq!(lens.parent().unwrap().file_name().unwrap(), "alpha");
+        assert_eq!(store.get_def_raw("fk1").unwrap().unwrap(), "fork alpha\n");
+    }
+
     /// Seed a physical view the way layout v2 stores it: an EMPTY tree db in its
     /// own directory. Empty is enough for `has_physical` and enough to make an
     /// actual open fail, which is exactly the split several tests below assert.
@@ -3760,7 +3859,11 @@ mod tests {
         assert_eq!(np2["result"]["isError"], true);
         assert!(text(&np2).contains("'lens_<name>'"), "{}", text(&np2));
         // alias, then list sees BOTH governance shapes plus the physical tree.
-        let a = call(13, "alias_view", json!({"name": "bias_public", "real": "team"}));
+        let a = call(
+            13,
+            "alias_view",
+            json!({"name": "bias_public", "real": "team"}),
+        );
         assert!(text(&a).contains("defined pure alias 'bias_public' -> real view 'team'"));
         let l = call(14, "list_views", json!({}));
         let parsed: Value = serde_json::from_str(&text(&l)).unwrap();
@@ -3776,11 +3879,8 @@ mod tests {
             "alias_view",
             json!({"name": "bias_public2", "real": "team", "retire": "bias_public"}),
         );
-        assert!(
-            text(&rot).contains(
-                "rotated public name for real view 'team': 'bias_public' -> 'bias_public2'"
-            )
-        );
+        assert!(text(&rot)
+            .contains("rotated public name for real view 'team': 'bias_public' -> 'bias_public2'"));
         assert!(!home.join("meta/team/bias_public.layout").exists());
         // remove both definitions; data (team.db) untouched.
         for (i, n) in [(16, "lens_docsonly"), (17, "bias_public2")] {
@@ -3966,7 +4066,11 @@ mod tests {
             json!({"name": "lens_docs", "base": "base", "rules": "only /docs"}),
         );
         assert!(text(&dv2).contains("defined derived view 'lens_docs' over base 'base'"));
-        let f2 = call(36, "fork_view", json!({"name": "lab2", "base": "lens_docs"}));
+        let f2 = call(
+            36,
+            "fork_view",
+            json!({"name": "lab2", "base": "lens_docs"}),
+        );
         assert_eq!(f2["result"]["isError"], true);
         assert!(text(&f2).contains("is governed by a definition"));
         // Re-forking an existing name is refused before any tree is copied.
@@ -4066,7 +4170,11 @@ mod tests {
             json!({"name": "lens_safe", "base": "team", "rules": "hide /photos/private"}),
         );
         assert!(text(&d).contains("defined derived view 'lens_safe'"));
-        let lens = call(22, "list_view_tree", json!({"view": "lens_safe", "depth": 10}));
+        let lens = call(
+            22,
+            "list_view_tree",
+            json!({"view": "lens_safe", "depth": 10}),
+        );
         let pl: Value = serde_json::from_str(&text(&lens)).unwrap();
         assert_eq!(pl["kind"], "derived");
         assert_eq!(pl["rendered_from"], "team"); // walked the base THROUGH the lens
@@ -4096,8 +4204,16 @@ mod tests {
             .unwrap()
             .contains("hide /photos/private"));
         // (5) a real listing under an alias resolves to the FULL real tree.
-        call(25, "alias_view", json!({"name": "bias_pub", "real": "team"}));
-        let a = call(26, "list_view_tree", json!({"view": "bias_pub", "depth": 10}));
+        call(
+            25,
+            "alias_view",
+            json!({"name": "bias_pub", "real": "team"}),
+        );
+        let a = call(
+            26,
+            "list_view_tree",
+            json!({"view": "bias_pub", "depth": 10}),
+        );
         let pa: Value = serde_json::from_str(&text(&a)).unwrap();
         assert_eq!(pa["kind"], "alias");
         assert!(paths(&a).contains(&"/photos/private/x.jpg".to_string()));
