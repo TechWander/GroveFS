@@ -49,21 +49,97 @@ export interface InfoResult {
 /** One metadata-store instance, as `store.info.storage` reports it.
     `uri` is the FULL connection string, credentials included — the reply is
     Super-only and this page exists so an operator can verify what is really
-    configured. */
+    configured. Under treedb `control` is always false (its control plane is
+    local SQLite) and `serving` marks the one address this meta-server routes
+    to; `viewNames` is the card's live list, `null` when the engine is
+    unreachable. */
 export interface StoreInstance {
   name: string
   control: boolean
   uri: string | null
   placedViews: number | null
+  serving?: boolean
+  viewNames?: string[] | null
 }
 
 /** Which backend carries the trees, and (under PostgreSQL) which instance
-    carries each view. SQLite and treedb report one logical instance. */
+    carries each view. SQLite reports one logical instance; treedb reports an
+    inventory whose `routingNote` says it is not a router. */
 export interface StorageInfo {
   backend: 'sqlite' | 'postgres' | 'treedb'
   instances: StoreInstance[]
   placement: Record<string, string>
   instanceError: string | null
+  /** The console may EDIT this registry (a server-adopted `file:` book). An
+      operator-owned registry or a non-managed backend reports false. */
+  managed?: boolean
+  /** A staged PG control handover (`@control-pending=`) awaiting the next start. */
+  pendingControl?: string | null
+  /** treedb only: the honest experimental flags the panel must surface. */
+  experimental?: boolean
+  controlPlane?: string
+  routingNote?: string
+}
+
+/** One placed view of PG's preview: what deleting this instance would strand.
+    `nodes` / `distinctRefs` are counted live off the instance's schema; a view
+    whose schema is NOT here yet (`hasSchema` false) still blocks the delete. */
+export interface PreviewViewRow {
+  view: string
+  hasSchema: boolean
+  nodes: number
+  distinctRefs: number
+}
+
+/** One instance row of the `grovefs_refs` consistency scan (PG). `error` means
+    the instance could not be read → it is UNVERIFIED, never treated as clean. */
+export interface PreviewRefsRow {
+  instance: string
+  holderRows?: number
+  zeroRows?: number
+  missingViews?: string[]
+  error?: string
+}
+
+/** `storage.preview` — the deletion preview the dialog shows before a confirm.
+    PG and treedb answer with DIFFERENT shapes and the dialog keys off `isPg`
+    (the payload carries no trustworthy `backend` for PG):
+      · PG     — `views` is an array of {@link PreviewViewRow} objects, the
+        affected names sit in `placedViews`, and `refs` carries the shared
+        `grovefs_refs` consistency scan.
+      · treedb — `views` is an array of view-name STRINGS (`null` when the
+        engine is unreachable), counted in `viewCount`; `note` states the
+        inventory-only limit.
+    `canDelete` is the server's own verdict; `blockReason` is its sentence when
+    false (never paraphrased on the client). */
+export interface StoragePreview {
+  backend?: 'postgres' | 'treedb'
+  instance: string
+  uri?: string | null
+  managed?: boolean
+  control?: boolean
+  serving?: boolean
+  views?: PreviewViewRow[] | string[] | null
+  placedViews?: string[]
+  placedCount?: number | null
+  viewCount?: number | null
+  canDelete: boolean
+  blockReason?: string | null
+  refs?: { instances?: PreviewRefsRow[]; unverified?: string[]; error?: string }
+  note?: string
+  [k: string]: unknown
+}
+
+/** `storage.relocate` — one view's move. `move` mirrors the server's
+    `PgMoveReport` (`relocate()` in `pg_store.rs`), `evicted` is how many
+    cached engines THIS meta-server dropped so the next op re-opens on the
+    target, and `note` states what a single server cannot see about mounts on
+    OTHER machines. */
+export interface RelocateResult {
+  ok: boolean
+  move: { view: string; nodes: number; blobs: number; from: string; to: string; sourceDropped: boolean }
+  evicted: number
+  note: string
 }
 
 /** `store.info` — the administrator's deployment snapshot. */

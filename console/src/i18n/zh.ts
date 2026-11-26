@@ -646,6 +646,79 @@ export const ZH: Readonly<Record<string, string>> = {
   unplaced: '未置放',
   'view(s) here': '个视图在此',
   'Refresh failed — showing the last loaded snapshot.': '刷新失败 — 正显示上次加载的快照。',
+  /* 存储页：实例增删改查与守卫流程 */
+  serving: '主控服务',
+  'the address this meta-server routes its trees to': '本元数据服务器将树路由到的地址',
+  experimental: '实验性',
+  'treedb is an EXPERIMENTAL backend': 'treedb 是实验性后端',
+  'control plane: local SQLite': '控制平面：本地 SQLite',
+  'the control plane URI moves by handover, not edit': '控制平面连接串需通过交接（handover）变更，不可直接编辑',
+  'the serving address changes with a restart, not here': '服务地址随 --meta-store 重启生效，不在此处更改',
+  'Edit URI': '编辑连接串',
+  Relocate: '迁移视图',
+  'move this instance’s views onto another': '将此实例上的视图迁移到其他实例',
+  'nothing to relocate': '没有需要迁移的视图',
+  'Set as control': '设为控制平面',
+  'Edit ${name}': '编辑 ${name}',
+  'connection string': '连接串',
+  'views placed on this name now resolve here; the database must already hold their schemas':
+    '置放在此名称下的视图将解析到新地址；目标数据库必须已包含它们的 schema',
+  'treedb routes to one --meta-store address; this only updates the inventory record':
+    'treedb 只路由到单一 --meta-store 地址；此处仅更新清单记录',
+  'Register an instance': '注册实例',
+  'the placement identity — later views are balanced onto this name':
+    '置放标识 — 后续视图会均衡落到此名称',
+  'the meta-server dials it once before saving; an unreachable URI is refused':
+    '元数据服务器保存前会拨号一次；不可达的连接串会被拒绝',
+  'treedb routes to one --meta-store address; this records an inventory entry':
+    'treedb 只路由到单一 --meta-store 地址；此处登记一条清单记录',
+  Register: '注册',
+  cancel: '取消',
+  'Delete instance ${name}': '删除实例 ${name}',
+  'this instance carries the control plane — promote another first':
+    '此实例承载控制平面 — 请先提升其他实例',
+  'this is the address the meta-server routes to': '这正是元数据服务器路由到的地址',
+  'Deleting removes the registry line only; content bytes live on the data servers and are never touched here.':
+    '删除仅移除注册表中的一行；内容字节位于数据服务器，此处绝不触碰。',
+  'views placed here': '置放在此的视图',
+  nodes: '节点数',
+  'distinct refs': '去重引用数',
+  'schema not found on this instance': '此实例上未找到该 schema',
+  'the engine could not be reached, so its views could not be verified':
+    '引擎不可达，故无法核对其视图',
+  'no view is placed here': '尚无视图置放在此',
+  'grovefs_refs consistency': 'grovefs_refs 一致性',
+  'zero-holder rows (GC candidates)': '零持有者行（GC 候选）',
+  holders: '持有者',
+  zero: '零引用',
+  'dangling routes': '悬空路由',
+  'unverified instances (control plane was unreachable):': '未验证实例（控制平面不可达）：',
+  'the guard refuses this removal': '守卫拒绝了此次删除',
+  'Relocate ${name}': '迁移 ${name}',
+  Done: '完成',
+  'every view has moved off this instance — it can now be deleted.':
+    '所有视图都已迁出此实例 — 现在可以删除它了。',
+  'Move each placed view onto another instance. A view mounted on this host must be unmounted first.':
+    '将每个已置放视图迁移到其他实例。挂在本机上的视图必须先卸载。',
+  ' (control)': '（控制面）',
+  Move: '迁移',
+  'Make ${name} the control plane': '将 ${name} 设为控制平面',
+  'Stage handover': '登记交接',
+  'This stages a handover of grovefs_control — keys, definitions, accounts, audit and the placement ledger — to ${name}.':
+    '这将登记一次 grovefs_control 的交接 — 密钥、定义、账号、审计与置放表 — 迁往 ${name}。',
+  'Nothing moves yet: the copy runs the next time the meta-server starts, before any request is served. Restart it to finish, and the control badge moves then.':
+    '目前尚未搬迁：副本会在元数据服务器下次启动、处理任何请求之前执行。请重启以完成，届时控制面标记随之迁移。',
+  'The current plane must be reachable and hold no foreign-key constraints, or the server refuses and explains why.':
+    '当前控制平面必须可达且不含外键约束，否则服务器会拒绝并说明原因。',
+  'A control-plane handover to ${name} is staged — restart the meta-server to apply it.':
+    '已登记向 ${name} 的控制平面交接 — 请重启元数据服务器以生效。',
+  'treedb is EXPERIMENTAL: the control plane (definitions, keys, accounts) stays in local SQLite and this registry is inventory, not a router.':
+    'treedb 为实验性：控制平面（定义、密钥、账号）仍在本地 SQLite，此注册表是清单而非路由器。',
+  'No instances are registered yet.': '尚未注册任何实例。',
+  'Register instance': '注册实例',
+  'This registry is owned by a --meta-store file the operator edits by hand — the page is read-only here.':
+    '此注册表由操作员手编的 --meta-store 文件所有 — 本页在此为只读。',
+  'control plane: ${where}': '控制平面：${where}',
   /* 审计保留面板：窗口设置与立即清理 */
   'Audit retention': '审计保留',
   'retention window': '保留窗口',

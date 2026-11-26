@@ -28,6 +28,11 @@ const props = defineProps<{
   confirm?: string
   confirmVars?: Vars
   confirmVariant?: 'primary' | 'danger'
+  /** Hold the verb inert while its preconditions are unmet (e.g. a delete
+      preview whose server-side guard refused). The button stays VISIBLE so the
+      operator sees the action they wanted is blocked here, next to the reason —
+      not after a click that only 400s. */
+  confirmDisabled?: boolean
   /** Dictionary key of the cancel button; it is always there, like the old
       `modal()` put it first in every footer. */
   cancel?: string
@@ -135,7 +140,7 @@ onBeforeUnmount(() => {
               v-if="props.confirm"
               type="button"
               :class="props.confirmVariant || 'primary'"
-              :disabled="busy"
+              :disabled="busy || props.confirmDisabled"
               :aria-busy="busy ? 'true' : undefined"
               @click="submit"
             >

@@ -1,36 +1,36 @@
 <script setup lang="ts">
 /*
-  Where the trees actually live.
+  Where the trees actually live — and, on a server-managed registry, how an
+  operator changes that from the browser instead of editing a text file.
 
   Every other page reads the namespace as one list. This one shows the
-  deployment underneath it: the backend, the PostgreSQL book (one card per
-  named instance, the first carrying the control plane) and the placement map
-  that says which instance holds which view.
+  deployment underneath it: the backend, its instances (one card each) and the
+  placement that says which instance holds which view.
 
-  The shapes are deliberately different per backend. SQLite is one embedded
-  store per view, treedb is one experimental tree server, and only PostgreSQL
-  can have several instances — rendering a one-item "grid" for the first two
-  would describe the deployment as something it is not.
+  The card grid is now SHARED between PostgreSQL and treedb, because the two
+  differ in what a card MEANS and the card itself says so (see `InstanceCard`):
+  PG's first instance carries the control plane and its URI is a handover, not an
+  edit; treedb's cards all say `experimental`, none carries the control plane
+  (that is local SQLite) and the one matching `--meta-store` is `serving`.
 
-  Connection strings are shown VERBATIM, credentials included. `store.info` is
-  Super-only and this page exists so an operator can verify what is configured;
-  a masked string cannot be verified. The Hide toggle is a shoulder-surfing
-  affordance, not a security boundary.
+  Write verbs (register / edit URI / relocate / set control / delete) appear only
+  when the registry is SERVER-MANAGED (a `file:` book the meta-server adopted at
+  start) — an operator-owned registry stays read-only and says why. Each write
+  runs the SAME guard the CLI does, so the delete path is preview → confirm and
+  every refusal is the server's own sentence, printed not paraphrased.
 
-  Two hard-won rules live in the load path below:
-    · a refresh that FAILS must not erase a deployment already on screen. The
-      grid stays, with a quiet banner — the alternative (an error replacing the
-      whole page) makes a transient blip look like the instances vanished, which
-      is exactly the "PG cards disappeared after I created a view" scare;
-    · after a create, ONE reload runs. `NewBasePanel` already bumps `ui.reload()`;
-      calling `run()` here too fetched the snapshot twice back to back.
+  Two hard-won rules still live in the load path:
+    · a refresh that FAILS must not erase a deployment already on screen — the
+      grid stays under a quiet banner, because an error replacing the whole page
+      is exactly the "PG cards disappeared" scare;
+    · after a create ONE reload runs (`ui.reload()` bumps the nonce); re-calling
+      `load()` here too fetched the snapshot twice back to back.
 */
 import { computed, ref } from 'vue'
-import type { StoreInfo } from '@/types'
+import type { StoreInfo, StoreInstance } from '@/types'
 import { useOps } from '@/composables/useOps'
 import { usePageLoad } from '@/composables/usePageLoad'
 import { useCatalogStore } from '@/stores/catalog'
-import { useNav } from '@/composables/useNav'
 import { useSessionStore } from '@/stores/session'
 import { useUiStore } from '@/stores/ui'
 import { t } from '@/i18n'
@@ -41,15 +41,19 @@ import KvList from '@/components/layout/KvList.vue'
 import KvRow from '@/components/layout/KvRow.vue'
 import StateBadge from '@/components/ui/StateBadge.vue'
 import ActionButton from '@/components/ui/ActionButton.vue'
-import CopyButton from '@/components/ui/CopyButton.vue'
 import LoadingHint from '@/components/ui/LoadingHint.vue'
 import NewBasePanel from '@/components/views/NewBasePanel.vue'
+import InstanceCard from '@/components/storage/InstanceCard.vue'
+import AddInstancePanel from '@/components/storage/AddInstancePanel.vue'
+import EditUriModal from '@/components/storage/EditUriModal.vue'
+import RemovePreviewModal from '@/components/storage/RemovePreviewModal.vue'
+import RelocateModal from '@/components/storage/RelocateModal.vue'
+import SetControlModal from '@/components/storage/SetControlModal.vue'
 
 const { api } = useOps()
 const catalog = useCatalogStore()
 const session = useSessionStore()
 const ui = useUiStore()
-const { openInstance } = useNav()
 
 const info = ref<StoreInfo | null>(null)
 const names = ref<string[]>([])
@@ -57,10 +61,13 @@ const names = ref<string[]>([])
 const hidden = ref<Set<string>>(new Set())
 /** The instance a new base is being created on (null = form closed). */
 const createOn = ref<string | null>(null)
-
-/** Segments in an instance's load meter — a class-only gauge, because the
-    gateway's `style-src 'self'` CSP forbids a runtime inline `style` width. */
-const SEGS = 8
+/** The register-instance form. */
+const showAdd = ref(false)
+/** The four guarded dialogs, each keyed to the instance it acts on. */
+const editTarget = ref<StoreInstance | null>(null)
+const removeTarget = ref<StoreInstance | null>(null)
+const relocateTarget = ref<StoreInstance | null>(null)
+const setControlTarget = ref<StoreInstance | null>(null)
 
 async function load(): Promise<void> {
   const [snapshot, physical] = await Promise.all([api('store.info', {}), api('physical.list', {})])
@@ -73,12 +80,21 @@ const { pending, error } = usePageLoad(load)
 const storage = computed(() => info.value?.storage ?? null)
 const backend = computed(() => storage.value?.backend ?? info.value?.backend ?? 'sqlite')
 const isPg = computed(() => backend.value === 'postgres')
+const isTreedb = computed(() => backend.value === 'treedb')
 const instances = computed(() => storage.value?.instances ?? [])
+const managed = computed(() => storage.value?.managed === true)
+const pendingControl = computed(() => storage.value?.pendingControl ?? null)
 const multi = computed(() => instances.value.length > 1)
 
-/** The views placed on each instance, in namespace order. */
+/** The views resolved onto one card. PG reads the placement ledger; treedb
+    carries a live `viewNames` list on the snapshot (`null` = unreachable, shown
+    as an empty head — the card's guard still re-checks on any verb). */
 const perInstance = computed(() => {
   const map = new Map<string, string[]>()
+  if (isTreedb.value) {
+    for (const inst of instances.value) map.set(inst.name, inst.viewNames ?? [])
+    return map
+  }
   for (const inst of instances.value) map.set(inst.name, [])
   for (const view of names.value) {
     const home = catalog.instanceOf(view)
@@ -86,26 +102,28 @@ const perInstance = computed(() => {
   }
   return map
 })
+const viewsFor = (name: string): string[] => perInstance.value.get(name) ?? []
 
-/** Names with no placement row (a multi-instance view is hash-routed). */
+/** Names with no placement row (a multi-instance PG view is hash-routed). */
 const unplaced = computed(() =>
-  multi.value ? names.value.filter((v) => !storage.value?.placement[v]) : [],
+  isPg.value && multi.value ? names.value.filter((v) => !storage.value?.placement[v]) : [],
 )
 
-/** The busiest instance sets the meter's full length, so the bars read as a
-    comparison across cards rather than eight near-empty gauges. */
+/** The busiest card sets the meter's full length, so the bars compare across
+    the grid rather than each filling alone. */
 const maxCount = computed(() => {
   let m = 0
   for (const list of perInstance.value.values()) m = Math.max(m, list.length)
   return m
 })
-function filledFor(name: string): number {
-  const c = (perInstance.value.get(name) ?? []).length
-  if (!maxCount.value) return 0
-  return c === 0 ? 0 : Math.max(1, Math.round((c / maxCount.value) * SEGS))
-}
-/** Views that landed on some instance (the rest hash-route by name). */
 const placedTotal = computed(() => names.value.length - unplaced.value.length)
+
+/** Every instance a relocated view could move onto (the source excluded). */
+const relocateTargets = computed(() =>
+  relocateTarget.value
+    ? instances.value.filter((i) => i.name !== relocateTarget.value?.name)
+    : [],
+)
 
 function toggleHidden(name: string): void {
   const next = new Set(hidden.value)
@@ -113,16 +131,10 @@ function toggleHidden(name: string): void {
   else next.add(name)
   hidden.value = next
 }
-
-function visibleUri(uri: string | null): string {
-  return uri ?? '—'
-}
-
 function refresh(): void {
   ui.reload()
 }
-/** The panel already fired `ui.reload()` for the new view; all that is left
-    here is to close the form. Re-running `load()` would double the fetch. */
+/** NewBasePanel already fired `ui.reload()`; only close the form here. */
 function created(): void {
   createOn.value = null
 }
@@ -172,28 +184,22 @@ function created(): void {
         </p>
       </PanelBox>
 
-      <!-- ── treedb: experimental tree server, control plane still local ── -->
-      <PanelBox v-else-if="backend === 'treedb'" :title="'Experimental tree engine'">
-        <KvList>
-          <KvRow label="address" :value="instances[0]?.uri ?? null" mono />
-          <KvRow label="control plane" :value="t('local SQLite')" />
-          <KvRow label="views" :value="info.views ?? names.length" />
-          <KvRow label="definitions" :value="info.definitions" />
-        </KvList>
-        <p class="muted">
-          {{
-            t(
-              'Trees live in the treedb server; definitions, keys and accounts stay in the local SQLite control plane. This backend is experimental and runs as a single instance.',
-            )
-          }}
-        </p>
-      </PanelBox>
+      <!-- ── PostgreSQL / treedb: the instance grid ── -->
+      <template v-else-if="isPg || isTreedb">
+        <!-- treedb is honest about its limits up front, not buried in a card. -->
+        <div v-if="isTreedb" class="exp-banner">
+          <StateBadge tone="warn" :label="t('experimental')" />
+          <span>
+            {{
+              storage?.routingNote ??
+              t(
+                'treedb is EXPERIMENTAL: the control plane (definitions, keys, accounts) stays in local SQLite and this registry is inventory, not a router.',
+              )
+            }}
+          </span>
+        </div>
 
-      <!-- ── PostgreSQL: the instance book ── -->
-      <template v-else-if="isPg">
-        <!-- One number per fact: how many instances, how many views, how many
-             placed, how many still hash-routed. The backend's `describe` string
-             said the same in prose, so it is gone from here. -->
+        <!-- One number per fact: instances, views, placed, still hash-routed. -->
         <div class="storage-stats">
           <div class="sstat">
             <span class="sstat-n">{{ instances.length }}</span>
@@ -203,7 +209,7 @@ function created(): void {
             <span class="sstat-n">{{ names.length }}</span>
             <span class="sstat-l">{{ t('views') }}</span>
           </div>
-          <div class="sstat">
+          <div v-if="isPg" class="sstat">
             <span class="sstat-n">{{ placedTotal }}</span>
             <span class="sstat-l">{{ t('placed') }}</span>
           </div>
@@ -215,97 +221,63 @@ function created(): void {
 
         <p v-if="storage?.instanceError" class="err">{{ storage.instanceError }}</p>
 
-        <div class="inst-grid">
-          <article
-            v-for="inst in instances"
-            :key="inst.name"
-            class="inst-card"
-            :class="{ control: inst.control }"
-          >
-            <header class="inst-head">
-              <h3 class="mono">{{ inst.name }}</h3>
-              <StateBadge
-                v-if="inst.control"
-                tone="admin"
-                :label="t('control plane')"
-                :title="t('keys, definitions, accounts, audit and placement live here')"
-              />
-            </header>
-
-            <div class="inst-uri">
-              <div class="inst-uri-label">
-                <span>{{ t('connection') }}</span>
-                <span class="cred">{{ t('contains credentials') }}</span>
-              </div>
-              <code v-if="!hidden.has(inst.name)">{{ visibleUri(inst.uri) }}</code>
-              <code v-else class="masked">{{ '••••••••••••••••••••' }}</code>
-              <div class="inst-uri-actions">
-                <button
-                  type="button"
-                  class="mini"
-                  :aria-pressed="hidden.has(inst.name)"
-                  @click="toggleHidden(inst.name)"
-                >
-                  {{ hidden.has(inst.name) ? t('Show') : t('Hide') }}
-                </button>
-                <CopyButton v-if="inst.uri" :text="inst.uri" />
-              </div>
-            </div>
-
-            <!-- One load line per card: the count of views this instance holds,
-                 with a gauge showing it against the busiest instance. The old
-                 card printed two near-identical counts here. -->
-            <div class="inst-load">
-              <div class="inst-meter" :aria-hidden="true">
-                <span
-                  v-for="i in SEGS"
-                  :key="i"
-                  :class="['seg', i <= filledFor(inst.name) ? 'on' : '']"
-                ></span>
-              </div>
-              <span class="inst-count">
-                <b>{{ (perInstance.get(inst.name) ?? []).length }}</b>
-                {{ t('view(s) here') }}
-              </span>
-            </div>
-
-            <!-- A registry's first card can hold the whole pre-migration
-                 namespace; show the head of the list and hand the rest to the
-                 filtered Views page rather than growing the card to a column. -->
-            <ul class="inst-views">
-              <li v-for="v in (perInstance.get(inst.name) ?? []).slice(0, 8)" :key="v" class="mono">
-                {{ v }}
-              </li>
-              <li v-if="!(perInstance.get(inst.name) ?? []).length" class="muted">
-                {{ t('no view is placed here yet') }}
-              </li>
-              <li
-                v-else-if="(perInstance.get(inst.name) ?? []).length > 8"
-                class="more"
-                :title="t('open the filtered list for the rest')"
-              >
-                +{{ (perInstance.get(inst.name) ?? []).length - 8 }}
-              </li>
-            </ul>
-
-            <div class="inst-actions">
-              <button type="button" @click="openInstance(inst.name)">
-                {{ t('Open these views') }}
-              </button>
-              <button
-                v-if="session.can('view.create')"
-                type="button"
-                class="primary"
-                @click="createOn = inst.name"
-              >
-                {{ t('New base here') }}
-              </button>
-            </div>
-          </article>
+        <!-- A staged PG control handover stays visible until the restart lands
+             it, so the operator knows the badge is about to move and why. -->
+        <div v-if="isPg && pendingControl" class="banner-warn">
+          {{
+            t('A control-plane handover to ${name} is staged — restart the meta-server to apply it.', {
+              name: pendingControl,
+            })
+          }}
         </div>
 
-        <!-- The unplaced set can be the whole pre-migration namespace. It is a
-             fact, not a headline: one line, expandable when someone asks. -->
+        <!-- The register form appears in place, not on a separate screen. -->
+        <AddInstancePanel v-if="showAdd && managed" :is-pg="isPg" @close="showAdd = false" />
+
+        <div v-if="!instances.length" class="muted">
+          {{ t('No instances are registered yet.') }}
+        </div>
+
+        <div class="inst-grid">
+          <InstanceCard
+            v-for="inst in instances"
+            :key="inst.name"
+            :inst="inst"
+            :backend="isPg ? 'postgres' : 'treedb'"
+            :managed="managed"
+            :views="viewsFor(inst.name)"
+            :max-count="maxCount"
+            :can-hide="!!inst.uri"
+            :hidden="hidden.has(inst.name)"
+            @addbase="createOn = $event"
+            @edit="editTarget = $event"
+            @relocate="relocateTarget = $event"
+            @setcontrol="setControlTarget = $event"
+            @remove="removeTarget = $event"
+            @toggle="toggleHidden"
+          />
+        </div>
+
+        <!-- Managed registry: offer the register verb (Super). The grid above is
+             read-only without it, matching the server's own refusal. -->
+        <div v-if="managed && session.can('storage.add')" class="inst-toolbar">
+          <ActionButton
+            v-if="!showAdd"
+            :action="() => (showAdd = true)"
+            :label="'Register instance'"
+            variant="primary"
+          />
+        </div>
+        <p v-else-if="!managed && (isPg || isTreedb)" class="muted">
+          {{
+            t(
+              'This registry is owned by a --meta-store file the operator edits by hand — the page is read-only here.',
+            )
+          }}
+        </p>
+
+        <!-- PG: the unplaced set can be the whole pre-migration namespace. It is
+             a fact, not a headline: one line, expandable when someone asks. -->
         <details v-if="unplaced.length" class="unplaced">
           <summary>
             {{
@@ -327,13 +299,16 @@ function created(): void {
           <button type="button" class="link" @click="createOn = null">{{ t('close') }}</button>
         </p>
 
-        <BarRow :title="'Placement'" />
-        <p class="muted">
+        <BarRow v-if="isPg" :title="'Placement'" />
+        <p v-if="isPg" class="muted">
           {{
             t(
               'A new view lands on the instance with the fewest placed views unless the caller names one. A view’s tree lives on exactly one instance; forks and grafts cannot cross instances.',
             )
           }}
+        </p>
+        <p v-else-if="isTreedb" class="muted">
+          {{ t('control plane: ${where}', { where: storage?.controlPlane ?? t('local SQLite') }) }}
         </p>
       </template>
 
@@ -359,5 +334,43 @@ function created(): void {
         {{ t('Instance details are an administrator’s view.') }}
       </p>
     </template>
+
+    <!-- The guarded write dialogs, mounted only for the instance they act on. -->
+    <EditUriModal v-if="editTarget" :inst="editTarget" :is-pg="isPg" @close="editTarget = null" />
+    <RemovePreviewModal
+      v-if="removeTarget"
+      :inst="removeTarget"
+      :is-pg="isPg"
+      @close="removeTarget = null"
+    />
+    <RelocateModal
+      v-if="relocateTarget"
+      :inst="relocateTarget"
+      :views="viewsFor(relocateTarget.name)"
+      :targets="relocateTargets"
+      @close="relocateTarget = null"
+    />
+    <SetControlModal
+      v-if="setControlTarget"
+      :inst="setControlTarget"
+      @close="setControlTarget = null"
+    />
   </div>
 </template>
+
+<style scoped>
+.exp-banner {
+  display: flex;
+  gap: var(--sp-2);
+  align-items: center;
+  margin: 0 0 var(--sp-4);
+  padding: var(--sp-2) var(--sp-3);
+  border-left: 3px solid var(--warn);
+  background: var(--bg-subtle);
+  border-radius: var(--r-sm);
+  font-size: 0.8125rem;
+}
+.inst-toolbar {
+  margin: var(--sp-3) 0;
+}
+</style>

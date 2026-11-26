@@ -8,7 +8,9 @@ import type {
   KeyRow,
   KeySecret,
   MintKeyArgs,
+  RelocateResult,
   StoreInfo,
+  StoragePreview,
   ViewStats,
 } from '@/types'
 
@@ -60,6 +62,12 @@ export type Op =
   | 'grant.list'
   | 'grant.add'
   | 'grant.remove'
+  | 'storage.add'
+  | 'storage.update'
+  | 'storage.remove'
+  | 'storage.preview'
+  | 'storage.set_control'
+  | 'storage.relocate'
 
 /** A call whose refusal is worth rendering INLINE instead of as a toast: the
     overview page loads several things at once, and a page that is part answer
@@ -105,6 +113,16 @@ export interface OpResult {
   'grant.list': GrantRow[]
   'grant.add': GrantedBase
   'grant.remove': unknown
+  // The storage plane (Super): the managed-registry CRUD + its guards. `add` /
+  // `update` / `remove` / `set_control` answer `{ok,msg}` (the msg is the
+  // server's own sentence, shown verbatim); `preview` is a StoragePreview; a
+  // no-op is refused server-side, so there is no `ok:false` shape to model.
+  'storage.add': { ok: boolean; msg: string }
+  'storage.update': { ok: boolean; msg: string }
+  'storage.remove': { ok: boolean; msg: string }
+  'storage.preview': StoragePreview
+  'storage.set_control': { ok: boolean; msg: string; restartRequired: boolean }
+  'storage.relocate': RelocateResult
 }
 
 /** `fork.create` — the metadata tree that was copied. */

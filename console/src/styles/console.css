@@ -3017,6 +3017,46 @@ details.help > .body {
   line-height: 1.7;
   overflow-wrap: anywhere;
 }
+/* The badge row on a card head — control / serving / experimental share one
+   line and wrap rather than crowding the instance name. */
+.inst-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  justify-content: flex-end;
+}
+/* treedb is experimental, and the card says so with a quiet tag, not a colour
+   that would read as a state verdict next to the good/admin badges. */
+.exp-tag {
+  padding: 0.1rem 0.4rem;
+  border: 1px solid var(--warn);
+  border-radius: 999px;
+  color: var(--warn);
+  font-size: 0.625rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+/* The serving treedb address is this server's own trees: emphasis without the
+   control-plane accent, because for treedb those are different facts. */
+.inst-card.serving {
+  border-color: var(--good-line, var(--accent-line));
+}
+.inst-card.is-treedb .inst-uri-label {
+  color: var(--fg-dim);
+}
+.inst-note {
+  margin: 0;
+  color: var(--fg-faint);
+  font-size: 0.72rem;
+}
+/* The guarded write verbs, quieter than the everyday Open / New base row. */
+.inst-admin {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  padding-top: var(--sp-2);
+  border-top: 1px solid var(--line-soft);
+}
 /* A name that is also a door: no button chrome, but still a target. */
 .linky {
   display: inline;
