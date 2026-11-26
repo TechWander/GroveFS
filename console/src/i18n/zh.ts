@@ -764,6 +764,14 @@ export const ZH: Readonly<Record<string, string>> = {
   '${n} is not in the namespace this page loaded — it was deleted, or it was never created. Create the view first, then delegate it.': '${n} 不在本页加载的命名空间中 — 它要么已被删除，要么从未创建。请先创建视图，再授予权限。',
   'open that page': '打开该页面',
   'host:port only — treedb takes no username or password, because the address is the identity (engine authentication is the server-wide GROVEFS_TREEDB_KEY_FILE, not a per-instance field)': '仅 host:port — treedb 不接受用户名或密码，因为地址本身就是身份（引擎认证用的是服务器全局的 GROVEFS_TREEDB_KEY_FILE，而不是每实例字段）',
+  'one db file per view under <base>/meta/':
+    '每个视图一个 db 文件，放在 <base>/meta/ 下',
+  'one schema per view in PostgreSQL; instances come from the registry the server was started with; <base> holds no trees':
+    '每个视图一个 PostgreSQL schema；实例来自服务器启动时指定的注册表；<base> 不存放任何树',
+  'one schema per view in PostgreSQL; <base> holds no trees':
+    '每个视图一个 PostgreSQL schema；<base> 不存放任何树',
+  'one tree per view in a treedb server (a comma-list --meta-store spreads new trees over the instances by name hash, existing ones resolve by engine listing); <base> holds definitions and keys only':
+    '每个视图一棵树，存在 treedb 服务器上（逗号分隔的 --meta-store 会按名称哈希把新树分散到各实例，已存在的树以引擎侧清单为准解析）；<base> 只存放定义与密钥',
   'treedb authenticates the address, not a password: see the note below the card': 'treedb 认证的是地址，不是口令：见卡片下方小字',
   'no credentials': '无需凭据',
   'treedb routes new trees by name hash across ${n} serving address(es); other entries are inventory, not placement targets': 'treedb 按名称哈希把新树路由到 ${n} 个在服地址；其余条目只是清单，不是落位目标',

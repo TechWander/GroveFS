@@ -394,3 +394,33 @@ unknown 档说「不从那个名字推断任何东西」。
 `primary`/`standby` 两个词进字典（译作「主（Primary）」「备（Standby）」），与留在英文的
 API 名词（`admin`、`mount`）区分开：节点角色决定这里是否接受写，它是要据此动手的运维判据，
 不是接口名字。
+### 9.1 同一页剩下的那句英文：`backendLayout` 透传，以及正文字面量里的 `/`
+
+改完两行角色、部署上真机之后，截图里紧挨着的 `tree engine` 行仍然印着整句英文：
+`store.backendLayout` 是后端 `backend_layout()`（`src/remote/meta/server_ext.rs`）下发的四种
+固定句式之一，前端 `{{ store.backendLayout }}` 原样渲染。它与 §8.3 的 `routingNote` 同源同罪，
+且 i18n 门同样查不出来——那句字符串从不经过 `t()`。
+
+归属规矩照旧：**服务端持有事实，控制台持有操作员读到的句子**。差别在于这句里没有可提取的数字，
+形状本身就是全部信息，所以按形状查字典整句替换：四种形状各一条 `LAYOUT_*` 测试，
+`sqlite`/`postgres`（带 `file:` 注册表与不带走两条）/`treedb`；都不匹配时退回服务端原文，
+绝不编造。`--meta-store`、`<base>` 是命令与路径，按惯例留在译文原形。
+
+本轮踩到的新坑，记下来是给下一个写这种表的人：JS 正则**字面量**里的 `/` 就是定界符，
+`/^one db file per view under <base\\/meta\\/>/` 实际被解析成正文
+`^one db file per view under <base\\/meta\\/` 加一段名为 `meta` 的标志位，
+于是该分支永远返回 false——`t()`、typecheck、eslint、i18n 门四道全是绿的。
+`node -e` 复现时还要当心 shell 把 `\\/` 吃掉一层，看起来像“转义与构造函数不一致”。
+规矩：**这类形状别把路径写进字面量正文**，锚定到 `/` 出现之前即可（四种形状的
+60 字符前缀互不相同，足够唯一）；真要匹配 `/`，改用 `new RegExp(…)` 并另写断言。
+
+因此这一行多了两道离仓校验（量具在 `.tmpedit/`，随仓 `.gitignore` 的 `/.*/` 规则不入库）：
+`layout_check.py` 从 `server_ext.rs` 里取出服务端能下发的全部形状，逐一按代码自身的分支顺序
+问“谁会接住它”，并要求字面量正文不含 `/`；`layout_render.mjs` 更狠，直接从**已构建的**
+`src/webui/app.js` 里把压缩后的四个分支读回来评测，防止“源码修好而产物没重建”。
+注入旧写法（带 `\\/` 的那版）后两道都变红，说明它们不是装饰。
+
+同一个区域还剩一处英文：`control plane` 行把 `store.describe` 原样接在值后面。那句**是**逐部署
+信息（`<路径> (local files)`、`remote control plane at <addr> (backend <x>)`、
+`treedb <addr> view=<n> id=<i> conns=<k>`），不是可查表的句式，所以不在本轮范围；若要双语化，
+做法与 `routingNote` 相同——拆出常量外壳与变量，外壳进字典。

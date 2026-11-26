@@ -153,6 +153,45 @@ const ENGINE_NOTE: Record<Engine, string> = {
 const engineNote = computed(() => t(ENGINE_NOTE[engine.value]))
 
 /*
+  The layout line under the engine.
+
+  `backend_layout()` on the server answers "which file, or which schema, holds a
+  tree here", and it is a fixed sentence per backend — no deployment-specific
+  fact inside it. Rendering the field directly (as this row used to) left a
+  Chinese page carrying one full English sentence, and the i18n audit could not
+  see the gap: the string never reaches `t()` on the wire. Same split as the
+  Storage banner's `routingNote` — the server owns the fact, the dictionary owns
+  the sentence — with one difference: this sentence carries no number to lift
+  out, so a recognized shape is answered from the dictionary alone.
+
+  The tests anchor on the SHAPE, not the whole string, because a shape belongs to
+  exactly one backend: if the server ever rewords the tail, the sentence still
+  describes the same placement, and a shape none of these match falls back to the
+  server's own text rather than to a translation we guessed.
+*/
+/* The bodies below carry no `/`: inside a regex LITERAL an unescaped `/` ends the
+   pattern wherever it sits, and an escaped one does not reliably survive it
+   either, so a path in the shape would silently truncate the expression. Each
+   test therefore stops before any path; the shape it identifies is unique
+   without it. */
+const LAYOUT_SQLITE = /^one db file per view under <base>/
+const LAYOUT_PG_REGISTRY = /^one schema per view in PostgreSQL; instances from registry .+; <base> holds no trees$/
+const LAYOUT_PG = /^one schema per view in PostgreSQL; <base> holds no trees$/
+const LAYOUT_TREEDB = /^one tree per view in a treedb server/
+const backendLayoutText = computed(() => {
+  const raw = store.value?.backendLayout
+  if (!raw) return ''
+  if (LAYOUT_SQLITE.test(raw)) return t('one db file per view under <base>/meta/')
+  if (LAYOUT_PG_REGISTRY.test(raw))
+    return t('one schema per view in PostgreSQL; instances come from the registry the server was started with; <base> holds no trees')
+  if (LAYOUT_PG.test(raw))
+    return t('one schema per view in PostgreSQL; <base> holds no trees')
+  if (LAYOUT_TREEDB.test(raw))
+    return t('one tree per view in a treedb server (a comma-list --meta-store spreads new trees over the instances by name hash, existing ones resolve by engine listing); <base> holds definitions and keys only')
+  return raw
+})
+
+/*
   Two roles, two lines.
 
   `store.info.role` is the NODE's place in an HA pair; `info.role` (the `whoami`
@@ -337,7 +376,7 @@ const nodeRoleNote = computed(() => {
                which is why they are never merged into one "backend" value. -->
           <StatLine label="tree engine">
             <b>{{ engineText }}</b>
-            <span v-if="store.backendLayout" class="muted">· {{ store.backendLayout }}</span>
+            <span v-if="store.backendLayout" class="muted">· {{ backendLayoutText }}</span>
           </StatLine>
           <StatLine label="control plane">
             <b>{{ info.backend || '—' }}</b>
