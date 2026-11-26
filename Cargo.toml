@@ -98,7 +98,7 @@ postgres = { version = "0.19", default-features = false, optional = true }
 # sibling clone. Anonymous https on purpose: an SSH URL would make `cargo fetch`
 # prompt for credentials on machines that only have a key for the private
 # remotes. The engine core needs only `libc` + `thiserror` + std, and the pinned
-# tag v0.3.7 keeps its PG migration shim behind an off-by-default
+# tag v0.10.0 keeps its PG migration shim behind an off-by-default
 # `postgres-compat` feature, so nothing else enters our graph (the earlier pin
 # v0.3.0 still carried `postgres`/`rusqlite(bundled)`/`sha2`/`uuid`/`chrono`/
 # `tracing` unconditionally; upstream gated it afterwards).
@@ -135,7 +135,26 @@ postgres = { version = "0.19", default-features = false, optional = true }
 # checkpoint error during SIGTERM shutdown is reported (exit 1) rather than
 # swallowed, a backlogged worker drops EPOLLIN instead of spinning a core, and
 # unlink/rmdir on a non-dir parent answer ENOTDIR instead of ENOENT.
-treedb = { git = "https://github.com/TechWander/treedb.git", tag = "v0.3.7", optional = true }
+#
+# Why v0.3.7 -> v0.10.0 (protocol 5 -> 9, 46 ops / 25 replies, SNAP_VERSION 4):
+# the engine grew the three things this deployment was asking for — a mandatory
+# per-connection version handshake (v0.8.0, so cross-generation mixing fails
+# closed instead of reading garbage), access authentication riding the same gate
+# (`--auth-key-file`, the CHAP-style two-round proof we wire via
+# `GROVEFS_TREEDB_KEY_FILE`), and transport encryption on top (v0.10.0:
+# `SecureBegin`/`SecureOk` negotiate a ChaCha20-Poly1305 record layer after
+# auth, so the meta<->engine wire and the replica line are no longer plaintext).
+# Two removals happened in between (M4, v0.6.0: the 14 dedicated control-plane
+# ops are gone — we never called them, keys/defs live on the generic table face
+# since M1) and the `Client` surface kept its shape (`connect_auth(addr,
+# timeout_ms, Option<&Key>)` is exactly what `src/treedb_store.rs` already
+# calls; with a key set it now also runs SecureBegin, so every pooled
+# connection comes up encrypted unless the server declines). Operator-side
+# constraint, same kind as the 2 -> 3 bump: SNAP_VERSION 3 -> 4 means engine
+# data dirs written by the v0.3.7 pin need `treedb-migrate` before the v0.10.0
+# server opens them, and an old-protocol server refuses the new client at
+# VersionBegin (by design: no silent cross-generation reads).
+treedb = { git = "https://github.com/TechWander/treedb.git", tag = "v0.10.0", optional = true }
 # Opt-in per-stage latency telemetry (src/stats.rs): high-dynamic-range histograms
 # for offline bottleneck diagnosis. Pure-Rust, zero deps. Only touched when
 # `--stats` / `GROVEFS_STATS=1` is on; the disabled path costs one atomic load.

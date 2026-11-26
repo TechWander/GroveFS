@@ -29,8 +29,10 @@
 //! （28 ms vs 24 ms，在噪声里）。这项收益的单位是往返，本机测试恰好把它藏起来，所以
 //! 两个数都要写。
 //!
-//! 本层不调用的那些不是白做的：`Key*`/`Audit*`/`Def*`/`Place*`/`Table*`/`Row*` 是给控制面
-//! 搬进来准备的（现在还在本地 SQLite，迁法见 treedb 仓 `DESIGN.md` §10 阶段 C 4）；`Lock*`
+//! 本层不调用的那些不是白做的：控制面（api_key/审计）在 treedb 档还在走 meta 侧的
+//! 本地 SQLite，搬进引擎通用表（`Table*`/`Row*`）的路线见 treedb 仓 `DESIGN.md` §10
+//! 阶段 C 4 —— 那四组专用 op `Key*`/`Audit*`/`Def*`/`Place*` 已在 M4（引擎 v0.6.0）
+//! 从内核删掉，接口面只剩通用表；`Lock*`
 //! 只有整 inode 形状，给不了 POSIX 记录锁；`WalFetch`/`SnapFetch` 是异步副本，不是
 //! 这里要的同步提升。
 //!
@@ -42,10 +44,12 @@
 //!   加上硬链接正反两面与本夹具自检共 49 条 = 39 OK + 10 SKIP，那 10 条全部是
 //!   硬链接，其余每一格都过（配方 `.build-bin/test_treedb_matrix.sh`，板上
 //!   `FEATURES_TREEDB=1` 走 `treedbmatrix` 那一行；结论在 treedb 仓 `DESIGN.md` §10 阶段 C 1）。
-//! - **引擎的认证面已接，入口是环境变量**：`GROVEFS_TREEDB_KEY_FILE=/path` 给密钥
+//! - **引擎的认证与加密面已接，入口是环境变量**：`GROVEFS_TREEDB_KEY_FILE=/path` 给密钥
 //!   文件路径（与 `GROVEFS_JOIN_KEY_FILE` / `GROVEFS_ROSTER_KEY_FILE` 同规：密钥字节
-//!   永远不进 argv），设了就对每条连接跑 v5 双向握手（`Client::connect_auth`），
-//!   没设就不握手。读不动密钥时**每次 open 都失败**，不降级成不认证。为什么不走
+//!   永远不进 argv），设了就对每条连接跑双向握手并协商记录层（`Client::connect_auth`
+//!   在 v9 默认接着发 `SecureBegin`：认证之后整条线是 ChaCha20-Poly1305 AEAD 记录，
+//!   引擎拒了加密就算建连失败，不静默降级），没设就不握手、线保持明文。
+//!   读不动密钥时**每次 open 都失败**，不降级成不认证。为什么不走
 //!   `treedb://` URI 参数：`serve()` 解析完就把 `StoreKind::Treedb` 的 payload 定成了
 //!   裸 `host:port`，`server_ext.rs` 里有十处操作者可见的文案在插 `{addr}`；要带
 //!   query 就得改那个文件——而它是另一个主题正在动的地方。
