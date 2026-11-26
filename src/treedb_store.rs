@@ -1084,3 +1084,351 @@ impl TreedbStore {
         )
     }
 }
+
+// ---- managed instance registry (the console's treedb plane) ---------------
+//
+// treedb 仍是 EXPERIMENTAL，而且与 PG 档不同：每个 meta-server **只路由一个
+// treedb 服务**（`StoreKind::Treedb(addr)` 装的就是那一个 host:port），引擎侧没有
+// 放置表，grovefs 也没有服务端 treedb 搬迁。因此这里的注册表面向网页端是一份
+// **已知 treedb 服务器的清单（inventory），不是路由器**：
+//
+// - 控制面（view 定义、api key、web 账号）留在**本地 SQLite**，所以没有哪一条
+//   注册表记录是 PG 意义上的 `control`——每张卡片 `control:false`；地址等于本
+//   meta-server 所配置 `--meta-store` 的那一条是 **serving**（本机树的落点）。
+// - 注册/编辑/删除都在网页端完成；删除守卫**如实拒绝**而非假装迁移：serving 记录
+//   删不掉（要换它得改 `--meta-store` 重启），其余记录只要该服务器还报有视图就
+//   删不掉（没有搬迁通道），空清单且非 serving 才允许遗忘。
+// - 与 PG 档一致，证据缺失即拒绝：读不到某服务器的视图清单 = 无法证明它是空的，
+//   于是拒绝删除，而不是放行。
+
+/// 受管 treedb 注册表在 `--meta-dir` 下的文件名。
+pub const TREEDB_REGISTRY_FILE: &str = "treedb_instances.conf";
+
+/// 本 base 下受管注册表的路径。
+pub fn treedb_registry_path(base: &std::path::Path) -> std::path::PathBuf {
+    base.join(TREEDB_REGISTRY_FILE)
+}
+
+/// 与 PG 档同一套实例名规则：1-24 个 `[A-Za-z0-9_-]`。放置行、日志、卡片都按
+/// 这个名字引用一台服务器，绝不用 URI。
+fn valid_treedb_name(name: &str) -> bool {
+    let n = name.trim();
+    !n.is_empty()
+        && n.len() <= 24
+        && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// 拨一次并列出视图，用来证明一个 `host:port` 真的是活的 treedb 服务器（走与
+/// 其它连接相同的 `GROVEFS_TREEDB_KEY_FILE` 认证）。返回视图数，省得调用方
+/// 再拨一次。错误串只点名地址与引擎原文。
+fn probe_treedb_addr(addr: &str) -> Result<usize, String> {
+    let a = addr.trim();
+    if a.is_empty() {
+        return Err("a treedb instance address is HOST:PORT (got empty)".to_string());
+    }
+    a.parse::<std::net::SocketAddr>()
+        .map_err(|e| format!("treedb address '{a}': {e}"))?;
+    let views = TreedbStore::list_views(a)
+        .map_err(|e| format!("cannot reach a treedb server at {a}: {e}"))?;
+    Ok(views.len())
+}
+
+/// 读注册表：按文件顺序返回 `(name, addr)`。文件不存在 = 空清单（serving 条目在
+/// 启动时由 [`adopt_treedb_spec`] 收养进来）。
+pub fn treedb_registry(base: &std::path::Path) -> Result<Vec<(String, String)>, String> {
+    let path = treedb_registry_path(base);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((name, addr)) = line.split_once('=') else {
+            return Err(format!(
+                "bad line '{line}' in {} (expected `name = host:port`)",
+                path.display()
+            ));
+        };
+        out.push((name.trim().to_string(), addr.trim().to_string()));
+    }
+    Ok(out)
+}
+
+/// 原子重写注册表：tmp + rename。注释头写明这是清单而非路由器，免得后来者以为
+/// 加一行就能让新视图落过去。
+fn write_treedb_registry(
+    base: &std::path::Path,
+    insts: &[(String, String)],
+) -> Result<(), String> {
+    let path = treedb_registry_path(base);
+    let mut text = "# GroveFS-managed treedb instance registry — edited by the web console's\n\
+        # storage page (`storage.*`, admin only). treedb is EXPERIMENTAL: this file is\n\
+        # an INVENTORY of known servers, not a router — the meta-server still routes to\n\
+        # the one --meta-store address; the control plane stays in local SQLite.\n"
+        .to_string();
+    for (name, addr) in insts {
+        text.push_str(&format!("{name} = {addr}\n"));
+    }
+    let tmp = path.with_extension("conf.tmp");
+    std::fs::write(&tmp, &text).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("cannot replace {}: {e}", path.display()))
+}
+
+/// 确保本机 serving 地址在册：首次启动时收养，把它作为 `primary` 插到最前。已有
+/// 文件保持为准（网页端编辑跨重启存活）。返回是否真的写了文件（供 banner 判新）。
+pub fn adopt_treedb_spec(base: &std::path::Path, addr: &str) -> Result<bool, String> {
+    let addr = addr.trim();
+    let mut insts = treedb_registry(base)?;
+    if insts.iter().any(|(_, a)| a == addr) {
+        return Ok(false);
+    }
+    insts.insert(0, ("primary".to_string(), addr.to_string()));
+    write_treedb_registry(base, &insts)?;
+    Ok(true)
+}
+
+/// `storage.add`（treedb 档）：校验名字 + 试连列视图，然后追加。**登记**这台服务器，
+/// 但不开始把新视图路由过去（treedb 多实例放置尚未接通）。
+pub fn treedb_add(base: &std::path::Path, name: &str, addr: &str) -> Result<String, String> {
+    let name = name.trim();
+    if !valid_treedb_name(name) {
+        return Err(format!(
+            "instance name '{name}' must be 1-24 chars of [A-Za-z0-9_-]"
+        ));
+    }
+    let mut insts = treedb_registry(base)?;
+    if insts.iter().any(|(n, _)| n == name) {
+        return Err(format!(
+            "instance '{name}' already exists — edit it instead (storage.update)"
+        ));
+    }
+    let views = probe_treedb_addr(addr)?;
+    let addr = addr.trim().to_string();
+    insts.push((name.to_string(), addr.clone()));
+    write_treedb_registry(base, &insts)?;
+    Ok(format!(
+        "instance '{name}' registered at {addr} ({views} view(s) reported); treedb is inventory-only — this server does not receive new views yet"
+    ))
+}
+
+/// `storage.update`（treedb 档）：把一条名字指到新的 `host:port`。serving 条目的地址
+/// 由 `--meta-store` 在启动时定死，不能从网页端就地改（会让运行中的服务器与记录分
+/// 叉）；那是一次重启级别的改动。renaming 走 add + 手工 + remove，不在此。
+pub fn treedb_update(
+    base: &std::path::Path,
+    serving: &str,
+    name: &str,
+    addr: &str,
+) -> Result<String, String> {
+    let mut insts = treedb_registry(base)?;
+    let Some(idx) = insts.iter().position(|(n, _)| n == name.trim()) else {
+        return Err(format!("instance '{name}' is not in the registry"));
+    };
+    if insts[idx].1 == addr.trim() {
+        return Err(format!(
+            "instance '{}' already uses this address — nothing to change",
+            name.trim()
+        ));
+    }
+    if insts[idx].1 == serving.trim() {
+        return Err(format!(
+            "instance '{}' is the address this meta-server routes to (from --meta-store) — re-point it by restarting with a different --meta-store, not from the console",
+            name.trim()
+        ));
+    }
+    probe_treedb_addr(addr)?;
+    insts[idx].1 = addr.trim().to_string();
+    write_treedb_registry(base, &insts)?;
+    Ok(format!("instance '{}' now points at {}", name.trim(), addr.trim()))
+}
+
+/// `storage.remove`（treedb 档）：跑守卫后删行。serving 记录删不掉；只要目标服务器还
+/// 报有视图就删不掉（没有搬迁通道，删了就是把树孤立）；证据读不到也拒绝。空清单
+/// 且非 serving 才允许遗忘，删后重读验证文件确已生效。
+pub fn treedb_remove(
+    base: &std::path::Path,
+    serving: &str,
+    name: &str,
+) -> Result<String, String> {
+    let insts = treedb_registry(base)?;
+    let name = name.trim();
+    let Some((_, addr)) = insts.iter().find(|(n, _)| n == name) else {
+        return Err(format!("instance '{name}' is not in the registry"));
+    };
+    let addr = addr.clone();
+    if addr == serving.trim() {
+        return Err(format!(
+            "instance '{name}' is the address this meta-server routes to (treedb at {addr}) — its trees are the ones served here, and grovefs ships no server-side treedb move; retire it by restarting with a different --meta-store"
+        ));
+    }
+    // 证据缺失即拒绝：读不到清单 = 无法证明它是空的，那就不能遗忘它。
+    let views = TreedbStore::list_views(&addr)
+        .map_err(|e| format!("cannot read the view list of treedb at {addr} to guard the removal: {e}"))?;
+    if !views.is_empty() {
+        let shown: Vec<&str> = views.iter().take(20).map(String::as_str).collect();
+        return Err(format!(
+            "instance '{name}' (treedb at {addr}) still hosts {} ({}) — treedb relocation is not wired (EXPERIMENTAL single-instance routing), so every view must be dropped on that server by hand before it can be forgotten; the guard REFUSES rather than strand a tree",
+            crate::cli_style::plural(views.len(), "view", "views"),
+            shown.join(", ")
+        ));
+    }
+    let kept: Vec<(String, String)> = insts.into_iter().filter(|(n, _)| n != name).collect();
+    write_treedb_registry(base, &kept)?;
+    if treedb_registry(base)?.iter().any(|(n, _)| n == name) {
+        return Err(format!(
+            "'{name}' is still in the registry after the rewrite — {} did not persist",
+            treedb_registry_path(base).display()
+        ));
+    }
+    Ok(format!(
+        "instance '{name}' removed (it hosted no views)"
+    ))
+}
+
+/// `storage.preview`（treedb 档）：删除前的预览卡片——视图清单、数量、serving/control
+/// 标志、canDelete 与拒绝理由，以及那条固定免责（控制面在本地 SQLite）。读不到清单
+/// 与 PG 档同规则：报 blocked，而非给一张看着干净的预览。
+pub fn treedb_preview(
+    base: &std::path::Path,
+    serving: &str,
+    name: &str,
+) -> Result<serde_json::Value, String> {
+    use serde_json::json;
+    let insts = treedb_registry(base)?;
+    let Some((_, addr)) = insts.iter().find(|(n, _)| n == name.trim()) else {
+        return Err(format!("instance '{name}' is not in the registry"));
+    };
+    let is_serving = addr == serving.trim();
+    let note = "treedb is EXPERIMENTAL: control plane stays in local SQLite; this registry is inventory, not a router (no server-side move yet)";
+    match TreedbStore::list_views(addr) {
+        Ok(views) => {
+            let block = if is_serving {
+                "this is the address the meta-server routes to — its trees are served here, and treedb has no server-side move"
+            } else if !views.is_empty() {
+                "treedb relocation is not wired — drop these views on the server by hand first"
+            } else {
+                ""
+            };
+            Ok(json!({
+                "backend": "treedb",
+                "managed": true,
+                "instance": name.trim(),
+                "uri": format!("{SCHEME}{addr}"),
+                "serving": is_serving,
+                "control": false,
+                "views": views,
+                "viewCount": views.len(),
+                "canDelete": !is_serving && views.is_empty(),
+                "blockReason": block,
+                "note": note,
+            }))
+        }
+        Err(e) => Ok(json!({
+            "backend": "treedb",
+            "managed": true,
+            "instance": name.trim(),
+            "uri": format!("{SCHEME}{addr}"),
+            "serving": is_serving,
+            "control": false,
+            "views": serde_json::Value::Null,
+            "viewCount": serde_json::Value::Null,
+            "canDelete": false,
+            "blockReason": format!("cannot reach treedb at {addr} to verify it hosts no views: {e}"),
+            "note": note,
+        })),
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    fn dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "grovefs-treedb-reg-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// 收养把一个空目录变成含 serving 条目的清单，且**幂等**：地址已在册就不再写。
+    #[test]
+    fn adopt_seeds_the_serving_address_once() {
+        let d = dir("adopt");
+        assert!(treedb_registry(&d).unwrap().is_empty());
+        assert!(adopt_treedb_spec(&d, "127.0.0.1:7777").unwrap());
+        let insts = treedb_registry(&d).unwrap();
+        assert_eq!(insts, vec![("primary".to_string(), "127.0.0.1:7777".to_string())]);
+        // 再收养同一地址不写文件（不重复插行）。
+        assert!(!adopt_treedb_spec(&d, "127.0.0.1:7777").unwrap());
+        assert_eq!(treedb_registry(&d).unwrap().len(), 1);
+        // 换一个地址收养 → 追加，serving 判定靠地址匹配而非位置。
+        assert!(adopt_treedb_spec(&d, "127.0.0.1:7778").unwrap());
+        assert_eq!(treedb_registry(&d).unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn registry_path_is_under_base() {
+        let d = dir("path");
+        assert_eq!(
+            treedb_registry_path(&d),
+            d.join(TREEDB_REGISTRY_FILE)
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 名字校验：非法名不拨号即拒；重名拒。没有 treedb 服务器在听，所以合法名 +
+    /// 新地址会卡在试连那一步——错误文案点名 `cannot reach`。
+    #[test]
+    fn add_validates_name_before_connecting() {
+        let d = dir("add");
+        adopt_treedb_spec(&d, "127.0.0.1:1").unwrap();
+        let err = treedb_add(&d, "bad name!", "127.0.0.1:1").unwrap_err();
+        assert!(err.contains("1-24 chars"), "{err}");
+        let err = treedb_add(&d, "primary", "127.0.0.1:1").unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
+        let err = treedb_add(&d, "ok1", "not-an-addr").unwrap_err();
+        assert!(err.contains("treedb address"), "{err}");
+        // 合法名 + 无监听地址 → 试连失败，没写任何东西。
+        let err = treedb_add(&d, "ok2", "127.0.0.1:1").unwrap_err();
+        assert!(err.contains("cannot reach"), "{err}");
+        assert_eq!(treedb_registry(&d).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// serving 条目的地址不能就地改；未知名字也拒。两条守卫都在拨号之前，离线可测。
+    #[test]
+    fn update_refuses_serving_and_unknown() {
+        let d = dir("upd");
+        adopt_treedb_spec(&d, "127.0.0.1:7777").unwrap();
+        let err = treedb_update(&d, "127.0.0.1:7777", "primary", "127.0.0.1:9999").unwrap_err();
+        assert!(err.contains("routes to"), "{err}");
+        let err = treedb_update(&d, "127.0.0.1:7777", "ghost", "127.0.0.1:9999").unwrap_err();
+        assert!(err.contains("not in the registry"), "{err}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// serving 记录删不掉——守卫在拨号之前触发，离线可断言。
+    #[test]
+    fn remove_refuses_the_serving_instance() {
+        let d = dir("rm");
+        adopt_treedb_spec(&d, "127.0.0.1:7777").unwrap();
+        let err = treedb_remove(&d, "127.0.0.1:7777", "primary").unwrap_err();
+        assert!(err.contains("routes to"), "{err}");
+        let err = treedb_remove(&d, "127.0.0.1:7777", "ghost").unwrap_err();
+        assert!(err.contains("not in the registry"), "{err}");
+        // 非 serving 但读不到清单 → 证据缺失拒绝，而不是放行。
+        adopt_treedb_spec(&d, "127.0.0.1:7778").unwrap();
+        let err = treedb_remove(&d, "127.0.0.1:7777", "primary2").unwrap_err();
+        assert!(err.contains("not in the registry"), "{err}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}

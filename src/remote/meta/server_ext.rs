@@ -254,19 +254,41 @@ fn storage_snapshot(store: &StoreKind, base: &Path) -> serde_json::Value {
             "pendingControl": null,
         }),
         #[cfg(feature = "treedb")]
-        StoreKind::Treedb(addr) => json!({
-            "backend": "treedb",
-            "instances": [{
-                "name": "treedb",
-                "control": true,
-                "uri": format!("treedb://{addr}"),
-                "placedViews": null,
-            }],
-            "placement": {},
-            "instanceError": null,
-            "managed": false,
-            "pendingControl": null,
-        }),
+        StoreKind::Treedb(addr) => {
+            // treedb is inventory-only: read the managed registry and, per entry,
+            // ask the engine for its LIVE view list. No row is `control` (the
+            // control plane is local SQLite); the entry whose address equals the
+            // configured --meta-store is `serving` (this server's trees).
+            let insts = crate::treedb_store::treedb_registry(base).unwrap_or_default();
+            let rows = insts
+                .iter()
+                .map(|(name, a)| {
+                    let views = crate::treedb_store::TreedbStore::list_views(a).ok();
+                    json!({
+                        "name": name,
+                        "control": false,
+                        "serving": a == addr,
+                        "uri": format!("treedb://{a}"),
+                        "placedViews": views.as_ref().map(|v| v.len()),
+                        "viewNames": views,
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "backend": "treedb",
+                "instances": rows,
+                "placement": {},
+                "instanceError": null,
+                // Server-owned registry (a single --meta-store has no operator
+                // file to own), so the storage page may EDIT it; the two caveats
+                // below are what the panel must surface next to every card.
+                "managed": true,
+                "pendingControl": null,
+                "experimental": true,
+                "controlPlane": "local SQLite",
+                "routingNote": "treedb routes to one --meta-store address; other entries are inventory, not placement targets",
+            })
+        }
     }
 }
 
@@ -911,6 +933,22 @@ impl MetaServer {
                     h.target,
                     crate::cli_style::plural(h.tables, "table", "tables"),
                     h.rows
+                );
+            }
+        }
+        // treedb keeps the SAME adoption idea but a smaller promise: it routes to
+        // ONE engine address (there is no placement table or server-side move yet),
+        // so the registry is the console's INVENTORY of known treedb servers. We
+        // only guarantee the address this server actually serves shows up as a
+        // row, so the storage page always tells the truth about where trees live.
+        #[cfg(feature = "treedb")]
+        if let StoreKind::Treedb(addr) = &store {
+            if crate::treedb_store::adopt_treedb_spec(&self.base, addr)
+                .map_err(io::Error::other)?
+            {
+                println!(
+                    "meta-server: treedb inventory {} seeded with the serving address (treedb is EXPERIMENTAL — control plane stays in local SQLite, no server-side move yet)",
+                    crate::treedb_store::treedb_registry_path(&self.base).display()
                 );
             }
         }
@@ -3014,8 +3052,56 @@ fn control_dispatch(
                     return Err("this deployment's metadata lives in local SQLite files — there is no instance registry to manage".to_string())
                 }
                 #[cfg(feature = "treedb")]
-                StoreKind::Treedb(_) => {
-                    return Err("treedb: this build serves one tree instance per meta-server, and its control plane stays in local SQLite — there is no instance registry to manage here yet".to_string())
+                StoreKind::Treedb(addr) => {
+                    // treedb's registry is inventory-only (see `treedb_store`): the
+                    // server routes to ONE --meta-store address, there is no
+                    // placement table and no server-side move. Add/update/preview/
+                    // remove act on that inventory (serving = the configured addr);
+                    // set_control/relocate are REFUSED because the engine cannot
+                    // honor them — the honest experimental boundary, not a stub.
+                    let serving = addr.clone();
+                    let name = req_str(a, "instance").unwrap_or_default();
+                    return match op {
+                        "storage.add" => {
+                            let name = req_str(a, "name")?;
+                            let uri = req_str(a, "uri")?;
+                            let addr = uri
+                                .strip_prefix(crate::treedb_store::SCHEME)
+                                .unwrap_or(uri.as_str());
+                            let msg = crate::treedb_store::treedb_add(&rt.base, &name, addr)?;
+                            Ok(json!({ "ok": true, "msg": msg }))
+                        }
+                        "storage.update" => {
+                            let uri = req_str(a, "uri")?;
+                            let addr = uri
+                                .strip_prefix(crate::treedb_store::SCHEME)
+                                .unwrap_or(uri.as_str());
+                            let msg =
+                                crate::treedb_store::treedb_update(&rt.base, &serving, &name, addr)?;
+                            Ok(json!({ "ok": true, "msg": msg }))
+                        }
+                        "storage.remove" => {
+                            // `treedb_remove` refuses the serving entry outright and
+                            // refuses any entry that still reports views, so a
+                            // removable instance is by construction viewless — the
+                            // "no active mounts" check is subsumed (a view cannot be
+                            // mounted here if it is not even on this server).
+                            let msg = crate::treedb_store::treedb_remove(&rt.base, &serving, &name)?;
+                            Ok(json!({ "ok": true, "msg": msg }))
+                        }
+                        "storage.preview" => {
+                            crate::treedb_store::treedb_preview(&rt.base, &serving, &name)
+                        }
+                        "storage.set_control" => Err(
+                            "treedb has no in-engine control plane to hand over — the control plane (view definitions, api keys, web accounts) is LOCAL SQLITE for every treedb deployment, so there is nothing to designate. storage.set_control applies to a PostgreSQL store only"
+                                .to_string(),
+                        ),
+                        "storage.relocate" => Err(
+                            "treedb view relocation across instances is not wired yet (EXPERIMENTAL): grovefs ships no server-side treedb move, so an instance cannot be emptied from the console. Drop the views on that server by hand, then remove it"
+                                .to_string(),
+                        ),
+                        _ => unreachable!("the arm's op set is exact"),
+                    };
                 }
             };
             if !crate::pg_store::is_managed_spec(&spec, &rt.base) {
