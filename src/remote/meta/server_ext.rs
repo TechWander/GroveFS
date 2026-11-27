@@ -7,7 +7,8 @@
 
 use super::*;
 use crate::meta::{MetaEngine, MetaStore};
-use std::sync::atomic::AtomicBool;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 /// One cached physical tree: the engine plus the stamp of its last resolve.
 type CachedTree = (Arc<MetaStore>, Arc<AtomicU64>);
@@ -6548,17 +6549,96 @@ fn max_epoch_on_disk(rt: &MetaRuntime) -> i64 {
     max
 }
 
+/// One of the [`DNS_MAX_INFLIGHT`] resolver seats. Released when the OS call
+/// returns — not when our caller stops waiting — so a resolver that never answers
+/// keeps holding its seat and further lookups get refused instead of minting one
+/// thread per write.
+struct DnsSlot;
+
+/// Peer names currently inside `getaddrinfo`.
+static DNS_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+impl DnsSlot {
+    fn try_acquire() -> Option<Self> {
+        loop {
+            let cur = DNS_INFLIGHT.load(Ordering::Relaxed);
+            if cur >= DNS_MAX_INFLIGHT {
+                return None;
+            }
+            // CAS, not `fetch_add` then undo: the cap is the invariant, and a
+            // load-check-then-act counter is observably above it under a burst.
+            if DNS_INFLIGHT
+                .compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Some(DnsSlot);
+            }
+        }
+    }
+}
+
+impl Drop for DnsSlot {
+    fn drop(&mut self) {
+        DNS_INFLIGHT.fetch_sub(1, Ordering::Release);
+    }
+}
+
+/// Resolve a `host:port` peer without ever waiting on the resolver.
+///
+/// Numeric literals short-circuit — the deployment shape the docs push, and free
+/// here in the literal sense: no thread, no seat, no budget spent. Anything else
+/// runs `getaddrinfo` on a detached thread we stop waiting for after
+/// [`DNS_RESOLVE_BUDGET`], because `std` gives the resolver no deadline of its own
+/// and a hostname peer used to be an unbounded stall sitting on a meta worker
+/// BEFORE the connect budget could even start running. Refused (over the cap) and
+/// timed out both take the same verdict as every other budget on this path: "we
+/// have no address for this peer right now", never "this peer fenced us".
+fn resolve_bounded(peer: &str) -> io::Result<SocketAddr> {
+    if let Ok(sa) = peer.parse::<SocketAddr>() {
+        return Ok(sa);
+    }
+    let Some(slot) = DnsSlot::try_acquire() else {
+        stats::count(stats::Counter::HaNameStall, 1);
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("peer name lookup deferred ({DNS_MAX_INFLIGHT} already stuck in the resolver)"),
+        ));
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let host = peer.to_string();
+    thread::spawn(move || {
+        let _slot = slot;
+        let resolved = host
+            .to_socket_addrs()
+            .and_then(|mut it| {
+                it.next().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "peer did not resolve")
+                })
+            })
+            .map_err(|e| io::Error::new(e.kind(), format!("peer {host} did not resolve ({e})")));
+        let _ = tx.send(resolved);
+    });
+    match rx.recv_timeout(DNS_RESOLVE_BUDGET) {
+        Ok(r) => r,
+        Err(_) => {
+            stats::count(stats::Counter::HaNameStall, 1);
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("peer name lookup exceeded {DNS_RESOLVE_BUDGET:?} (deploy an IP literal)"),
+            ))
+        }
+    }
+}
+
 /// Connect to a `host:port` peer under an explicit budget. A bare
 /// `TcpStream::connect` runs the OS SYN-retry schedule — minutes on a FILTERED port
 /// (as opposed to a refused one) — which is tolerable on a background thread and
-/// fatal on the write path. Resolving the name is still unbounded (`std` gives the
-/// resolver no deadline), which is why peer/witness addresses are deployed as IPs;
-/// recorded as a residual in `docs/adr/0005-write-path-blocking-budget.md`.
+/// fatal on the write path. Name resolution is bounded separately by
+/// [`resolve_bounded`], so a hostname peer costs at most [`DNS_RESOLVE_BUDGET`] +
+/// `budget`; an IP literal costs only `budget`. See
+/// `docs/adr/0005-write-path-blocking-budget.md`.
 fn connect_bounded(peer: &str, budget: Duration) -> io::Result<TcpStream> {
-    let sock = peer
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "peer did not resolve"))?;
+    let sock = resolve_bounded(peer)?;
     TcpStream::connect_timeout(&sock, budget)
 }
 
@@ -6692,16 +6772,12 @@ fn witness_probe_one(
     ttl: Duration,
     timeout: Duration,
 ) -> io::Result<(i64, bool)> {
-    // Bound `connect` too: bare `TcpStream::connect` has no timeout and can hang
-    // on a blackholed arbiter for the OS default, so resolve first then use
-    // `connect_timeout`. All three timeouts share `timeout` so one probe is
-    // hard-capped no matter where it stalls.
-    let sock = addr.to_socket_addrs()?.next().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("arbiter {addr} did not resolve"),
-        )
-    })?;
+    // Bound every hop of this probe: `resolve_bounded` caps the lookup, a bare
+    // `TcpStream::connect` has no timeout and can hang on a blackholed arbiter for
+    // the OS default, and the read/write timeouts cover the round-trip itself. The
+    // fan-out additionally stops waiting at its own deadline, so a probe that
+    // overshoots is simply a vote we did not get.
+    let sock = resolve_bounded(addr)?;
     let mut conn = TcpStream::connect_timeout(&sock, timeout)?;
     conn.set_read_timeout(Some(timeout))?;
     conn.set_write_timeout(Some(timeout))?;
@@ -8184,6 +8260,58 @@ mod ha_tests {
         );
         assert_eq!(ha.role(), Role::Primary, "a degrade is not a demotion");
         drop(busy);
+    }
+
+    #[test]
+    fn peer_name_resolution_is_bounded_and_capped() {
+        // A hostname peer/witness could park a meta worker inside `getaddrinfo` for
+        // as long as the resolver felt like: `std` gives it no deadline, and the
+        // stall sits BEFORE any connect budget starts running. Two guarantees here:
+        // the wait is bounded, and the number of lookups stuck at once is capped —
+        // so a dead resolver costs degrades, not one thread per write.
+        // (1) Numeric literals never enter the resolver: no thread, no seat.
+        let v4 = resolve_bounded("127.0.0.1:50110").unwrap();
+        assert_eq!(v4.to_string(), "127.0.0.1:50110");
+        assert_eq!(resolve_bounded("[::1]:50110").unwrap().port(), 50110);
+        assert_eq!(DNS_INFLIGHT.load(Ordering::SeqCst), 0);
+        // (2) A real name goes through the bounded path and hands its seat back.
+        let lh = resolve_bounded("localhost:50110").expect("`localhost` resolves from /etc/hosts");
+        assert!(lh.ip().is_loopback(), "got {lh}");
+        for _ in 0..200 {
+            if DNS_INFLIGHT.load(Ordering::SeqCst) == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            DNS_INFLIGHT.load(Ordering::SeqCst),
+            0,
+            "the lookup thread owns the seat, and it released it"
+        );
+        // (3) Over the cap we refuse at once. This is the anti-thread-storm half, and
+        // it must not queue behind a lookup that is stuck.
+        let seats: Vec<DnsSlot> = (0..DNS_MAX_INFLIGHT * 4)
+            .filter_map(|_| DnsSlot::try_acquire())
+            .collect();
+        assert_eq!(seats.len(), DNS_MAX_INFLIGHT, "the cap is the cap");
+        let started = Instant::now();
+        let e = resolve_bounded("stalled.invalid:50110").unwrap_err();
+        let refused = started.elapsed();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e}");
+        assert!(
+            refused < Duration::from_millis(50),
+            "over the cap must not wait: {refused:?}"
+        );
+        drop(seats);
+        // (4) With a seat free the wait is bounded by the budget, whatever the
+        // resolver decides to do.
+        let started = Instant::now();
+        let _ = resolve_bounded("stalled.invalid:50110");
+        assert!(
+            started.elapsed() <= DNS_RESOLVE_BUDGET + Duration::from_millis(300),
+            "a name cannot hold the caller past its budget: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

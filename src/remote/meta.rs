@@ -265,6 +265,23 @@ const SYNC_PUSH_CONNECT: Duration = WITNESS_PROBE_TIMEOUT;
 #[cfg(feature = "native")]
 const SYNC_PUSH_SLOT_WAIT: Duration = Duration::from_millis(200);
 
+/// How long a peer/witness NAME LOOKUP may take before the caller treats the
+/// address as unreachable. `std` hands `getaddrinfo` no deadline, and because the
+/// lookup precedes `connect_timeout` it is NOT covered by any connect budget: a
+/// hostname plus a dead resolver used to be an unbounded stall sitting on a meta
+/// worker. One replication tick is generous for a real resolver (LAN answers land in the
+/// tens of ms) and keeps the added worst case off the latency-critical path.
+#[cfg(feature = "native")]
+const DNS_RESOLVE_BUDGET: Duration = Duration::from_millis(500);
+
+/// How many name lookups may sit in the OS resolver at once, process-wide. The
+/// lookup runs on its own thread precisely because it cannot be interrupted; this
+/// cap is what stops a permanently stuck resolver from minting one thread per
+/// write. Two lets a peer and an arbiter list still make progress while anything
+/// beyond that degrades like every other over-budget path ([`DNS_RESOLVE_BUDGET`]).
+#[cfg(feature = "native")]
+const DNS_MAX_INFLIGHT: usize = 2;
+
 #[cfg(feature = "native")]
 fn err_code(e: &MetaError) -> i32 {
     match e {

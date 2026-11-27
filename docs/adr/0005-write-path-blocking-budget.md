@@ -5,12 +5,12 @@
 | 状态 | 已实施（2026-11-27；收口的是 `f7592c9` 引入 epoll 时明确记下的前置条件） |
 | 日期 | 2026-11-27 |
 | 前序 | `f7592c9`（挂载面/治理面改走 epoll 事件循环）在 `src/remote/meta/epoll.rs` 头部写下过一句前提：**本层的请求处理本身就是阻塞的**——引擎往返、`--witness` 的仲裁器同步投票、`--sync-repl` 的推备库。前一项的边界由 `DISPATCH_WAIT=50ms` + 满队列即断连兜住；后两项当时仍是**无界**的。本份就是把它们改成有界，并把"阻塞可以接受"从口头假设变成可测契约 |
-| 实现 | `src/remote/server.rs`（`Fence::lease` 拆成 `decide`/`promote`，新增模块级 `enum Verdict`）、`src/remote/meta.rs`（`PROOF_JOIN_WAIT`/`SYNC_PUSH_CONNECT`/`SYNC_PUSH_SLOT_WAIT`）、`src/remote/meta/server_ext.rs`（`HaState` 单飞三字段 + `proof_done`、`fenced_for_write` 单飞循环 + 抽出 `arbiter_reproof`、`witness_quorum` 提前收口、`connect_bounded`、`push_snapshot_now` 有界化、replicator 连接改有界）、`src/stats.rs`（三枚计数器） |
-| 验收 | `ha_tests::witness_quorum_decides_before_the_slowest_arbiter_answers`、`ha_tests::fenced_for_write_proves_at_the_arbiter_once_per_burst`、`ha_tests::sync_push_degrades_instead_of_queueing_behind_a_slow_standby`、`remote::server::tests::lease_renew_answers_without_draining_writes`（§6 数字即这四条跑出来的）；drain 语义未回归由既有 `remote::server::tests::claim_drains_inflight_writes_before_promoting` 钉住；e2e `.build-bin/test_ha.sh` **pass=33 / fail=0**（2026-11-27，段 7 RPO=0 / 段 8 分区降级 / 段 9 过期主被仲裁者挡成 standby / 段 10 仲裁宕机 fail-safe 冻写 + 恢复后恰好一主 / 段 11 三仲裁宕 1 不冻、宕 2 才 fail-safe）——单飞与提前收口都没碰零窗口 fencing 的语义 |
+| 实现 | `src/remote/server.rs`（`Fence::lease` 拆成 `decide`/`promote`，新增模块级 `enum Verdict`）、`src/remote/meta.rs`（`PROOF_JOIN_WAIT`/`SYNC_PUSH_CONNECT`/`SYNC_PUSH_SLOT_WAIT`/`DNS_RESOLVE_BUDGET`/`DNS_MAX_INFLIGHT`）、`src/remote/meta/server_ext.rs`（`HaState` 单飞三字段 + `proof_done`、`fenced_for_write` 单飞循环 + 抽出 `arbiter_reproof`、`witness_quorum` 提前收口、`connect_bounded` + `resolve_bounded`/`DnsSlot`（解析预算与全局封顶）、`push_snapshot_now` 有界化、replicator 连接改有界）、`src/stats.rs`（四枚计数器） |
+| 验收 | `ha_tests::witness_quorum_decides_before_the_slowest_arbiter_answers`、`ha_tests::fenced_for_write_proves_at_the_arbiter_once_per_burst`、`ha_tests::sync_push_degrades_instead_of_queueing_behind_a_slow_standby`、`remote::server::tests::lease_renew_answers_without_draining_writes`、`ha_tests::peer_name_resolution_is_bounded_and_capped`（§6 数字即这五条跑出来的）；drain 语义未回归由既有 `remote::server::tests::claim_drains_inflight_writes_before_promoting` 钉住；e2e `.build-bin/test_ha.sh` **pass=33 / fail=0**（2026-11-27，段 7 RPO=0 / 段 8 分区降级 / 段 9 过期主被仲裁者挡成 standby / 段 10 仲裁宕机 fail-safe 冻写 + 恢复后恰好一主 / 段 11 三仲裁宕 1 不冻、宕 2 才 fail-safe）——单飞与提前收口都没碰零窗口 fencing 的语义 |
 
 ## 1. 决策
 
-**写路径上每一次可能阻塞后端的调用，都必须有一个写死的预算，且超预算的后果是"降级"而不是"失败"或"无等"。** 四处，各自的预算与超支后果：
+**写路径上每一次可能阻塞后端的调用，都必须有一个写死的预算，且超预算的后果是"降级"而不是"失败"或"无等"。** 五处，各自的预算与超支后果：
 
 | 调用 | 预算 | 超了会怎样 | 绝不 |
 | --- | --- | --- | --- |
@@ -18,6 +18,7 @@
 | `witness_quorum`（meta 侧同步重证明扇出） | 一个探测窗口 `WITNESS_PROBE_TIMEOUT=1s`，且**多数派到齐即返回** | 迟到的仲裁器被丢弃，本轮少采纳它的 `prev_max` | 让整轮等最慢那台 |
 | `fenced_for_write` 的并发 burst | 单飞：一人扇出，其余 join `PROOF_JOIN_WAIT=1250ms` | join 超时判"本轮没有新证明"（同仲裁器报错的判词） | 每个写各起一轮 `n` 线程扇出 |
 | `push_snapshot_now`（`--sync-repl`） | 推送槽 `try_lock_for(SYNC_PUSH_SLOT_WAIT=200ms)` + `connect_bounded(SYNC_PUSH_CONNECT=1s)` | 该 op 降级为 async 并 warn，计一次 `HaSyncPushDegrade` | 让全局锁横跨一次网络往返 |
+| peer/witness 名字解析（`resolve_bounded`） | `DNS_RESOLVE_BUDGET=500ms`，且全进程同时最多 `DNS_MAX_INFLIGHT=2` 次在飞 | 这一跳按"没有地址"处理：同步推降级 async、仲裁少一票，计一次 `ha peer name lookups stalled` | 为每笔写各起一条不可中断的解析线程 |
 
 **为什么"单飞"而不是"跳过"**：一个线程做扇出、其余人 join 它的判决，每个写仍然只依赖"至多一个探测窗口那么新"的证明——安全性判词与原来逐写复证完全一致，消失的只是线程风暴。若改成"别人在证我就直接放行"，那才是真正的语义退化。
 
@@ -39,21 +40,22 @@ epoll 之后，一条 worker = 一个同时在飞的后端调用，而 worker �
 
 **`witness_quorum`：按票到达判决。** `classify` 的 `fenced(q)`（`ahead ≥ q`）与 `leased(q)`（`advances + held ≥ q`）对已收票数**单调**，早判决不会被迟到票推翻。早退 `leased`/`won` 的健全性靠仲裁器集合的多数派交集（对端能顶到更高 epoch，自己必然也推进过多数，交集那台必答 `prev > epoch`）——这与提升路径本来就是同一个论证。放弃的只是迟到票对 `prev_max` 的贡献，下一轮纠正。探测线程**故意 detach**：join 正是要摆脱的那个迟到者，每跳自身已有界（connect/read/write 全取 `timeout`）。
 
-**`connect_bounded`：`to_socket_addrs` + `connect_timeout`。** 域名解析仍拿不到 deadline（`std` 不给 resolver 超时），所以 **peer/witness 地址部署时用 IP**——这条残差写进了函数 doc，不假装已解决。后台 replicator 那处 `TcpStream::connect` 同步换成 `connect_bounded(_, CONTROL_TIMEOUT)`，保持它原有的宽松预算。
+**`resolve_bounded`：解析与握手分开预算，解析席位数全局封顶。** `std` 不给 `getaddrinfo` 任何 deadline，而它在 `connect_timeout` **之前**——所以连接预算写得再小，也拦不住一个卡死的 resolver 把 meta worker 停在解析上。做法是把解析丢到一条线程、调用方最多等 `DNS_RESOLVE_BUDGET`；线程持有一枚 `DnsSlot`，席位由 CAS 循环分配（`DNS_MAX_INFLIGHT`=2，计数器在任何采样时刻都不越界），且**由解析线程归还、不由等待方归还**——resolver 不返回，席位就一直被占，后来的调用立刻按不可达回绝，这正是"不为每笔写 mint 一条线程"的那一半。IP 字面量走 `parse::<SocketAddr>()` 短路：不起线程、不占席、不花预算。`connect_bounded` = `resolve_bounded` + `connect_timeout`，于是一个域名备机最坏 `DNS_RESOLVE_BUDGET` + `budget`，IP 备机最坏 `budget`。后台 replicator 那处 `TcpStream::connect` 同步换成 `connect_bounded(_, CONTROL_TIMEOUT)`，保持它原有的宽松预算。
 
 ## 4. 可观测
 
-三枚新计数器（`src/stats.rs`，`stats` 报告的"非计时计数器"段）：
+四枚新计数器（`src/stats.rs`，`stats` 报告的"非计时计数器"段）：
 
 - `ha arbiter proofs joined` —— 有写 join 了别人的证明（单飞真的在生效；healthy 集群里应该只在租约失效的瞬间跳）
 - `ha writes without a fresh proof` —— join 预算耗尽，该写是在**没有新鲜证明**的情况下放行的（§6 的那次抖动会把它顶起来）
 - `ha sync-repl pushes degraded` —— 因槽忙/connect 超预算而把某个 op 降级为 async 的次数（RPO=0 的承诺实际打了多少折扣）
+- `ha peer name lookups stalled` —— 解析超预算、或席位坐满被当场回绝的次数：备机/仲裁者填的是域名而名字服务不对劲时，这条就是那条故障的名字
 
-三条都只增不减，与既有的 `ha fencing demotions` / `ha quorum refusals` 并列；日志侧沿用既有那句 `meta sync-repl: ... degraded to async for this op`，新增的"槽忙"分支也走同一措辞，运维的 grep 不用改。
+四条都只增不减，与既有的 `ha fencing demotions` / `ha quorum refusals` 并列；日志侧沿用既有那句 `meta sync-repl: ... degraded to async for this op`，新增的"槽忙"分支也走同一措辞，运维的 grep 不用改。
 
 ## 5. 负空间（这份决策没有解决的）
 
-- **DNS 解析仍无界**：`connect_bounded` 只 bound 了 TCP 握手。缓解是部署约定（witness/peer 用 IP），不是代码保证。
+- **解析线程不可中断**：我们等的是 `DNS_RESOLVE_BUDGET`，不是 `getaddrinfo` 真正的结束。一个永久卡死的 resolver 会长期占住那 2 个席位，让域名 peer 一直走降级分支——这是有意的取舍（宁可降级，也不放无界阻塞上 worker），但**地址写成 IP 字面量才是根治**：那条路径根本不碰解析器。
 - **`dispatch_meta` 的引擎往返仍在 worker 上**：本份不动后端调用本身，兜住它的是 `Pool::send` 的 50ms 背压 + 断连重拨。treedb/SQLite/PG 各自慢不慢，是另一档事。
 - **数据面 `dispatch` 的磁盘阻塞**：`write_gate()` 持 SHARED 横跨 backend 写，这是**特性**（正是它让 claim 能 drain），代价是慢盘会拉长一次真升主的 drain。本份只取消续约那一侧的 drain。
 - **多个迟到者仍可能各起一轮**：若一轮扇出结束时既没 fence 也没 lease（低于多数、或全体无声），后续 burst 会再起一轮。这是有意的——单飞的边界是"一次 burst 一次扇出"，不是"仲裁器不可达时只试一次"，后者归异步 fail-safe。
@@ -68,5 +70,6 @@ epoll 之后，一条 worker = 一个同时在飞的后端调用，而 worker �
 - **单飞**（`fenced_for_write_proves_at_the_arbiter_once_per_burst`）：手写仲裁者对每个 `OP_FENCE` 睡 400 ms，8 线程 Barrier 同放。改后仲裁者侧**接受连接数 = 1**、burst 墙钟 **401.06 ms**；把同样的 burst 换成"每写一轮扇出"，接受连接数 = **8**、墙钟 429.70 ms——墙钟接近是因为 8 轮本来就并行，省下的不是延迟而是 **8 条 worker 与 8n 条探测线程**（n 为仲裁器数）。
 - **推送槽降级**（`sync_push_degrades_instead_of_queueing_behind_a_slow_standby`）：主线程占住 `standby_push`，子线程调 `push_snapshot_now` 在 **210.98 ms** 返回（预算 `SYNC_PUSH_SLOT_WAIT=200ms`），并打出 `push slot busy >200ms ... degraded to async`；改前它会等到持有者释放（无上限）。role 仍是 Primary——降级不是自降级。
 - **connect 预算**（一次性探针）：`192.0.2.1:9`（TEST-NET-1，SYN 被静默丢弃，正是"端口被过滤的备机"形状）。`connect_bounded(_, 1s)` **1.0001 s** 返回 `TimedOut`；裸 `TcpStream::connect` 观测 8 s 仍停在 SYN-SENT，按本机 `tcp_syn_retries=6` 的退避序列约 **127 s** 才会失败。这 127s 过去是发生在**持有全局推送锁**的时候。
+- **名字解析**（一次性注入探针，取完即删）：把 resolver 注入 5s 停顿。单次 `resolve_bounded` 在 **500.16 ms** 回 `TimedOut`（预算 500 ms，注入 5 s）；IP 字面量 **14.6 µs** 且 `DNS_INFLIGHT` 恒 0；8 线程 Barrier 同放一轮，墙钟 **500.44 ms**，其中 7 笔在 11–120 µs 内被回绝、1 笔等满预算，整轮只起了 **2** 条解析线程，`DNS_INFLIGHT` 全程不越 2。同一时刻若让解析无界，这 8 笔会各自停在 `getaddrinfo` 里、各占一条 meta worker。
 
-单测计数：`ha_tests::` 14 passed / 0 failed（含新增 3 条），`remote::server::` 侧 Fence 9 条全绿（含新增 1 条）；`cargo test --release --features treedb` 全量 **414 passed / 0 failed / 4 ignored**（上一笔为 410/0/4，+4 即本轮新增）。
+单测计数：`ha_tests::` 15 passed / 0 failed（含新增 4 条），`remote::server::` 侧 Fence 9 条全绿（含新增 1 条）；`cargo test --release --features treedb` 全量 **415 passed / 0 failed / 4 ignored**（改动前为 410/0/4，+5 即这轮新增）。
