@@ -23,6 +23,7 @@ description: Keeps GroveFS documentation (README.md, README.en.md, USAGE.md, USA
 2. **版本前后对比**——「改造前基线 55.34s」「从 55s 降到 2.5s」「N=1 行为与旧版完全一致」「无账本行的历史库退回单视图旧行为」。要表达性能，只写**当前实测值 + 测量条件**。
 3. **变更动词**——新增了 / 现已 / 已落地 / 已覆盖 / 现已支持 / gained / now also / fall back to the old。改成陈述句：「X 覆盖 Y」「X 是 Z 的唯一路径」。
 4. **一次性迁移指引**——升级后要重挂 / 重铸 key 之类的临时动作。写成当前版本的要求（「定义替换 ≤2s 热生效」），不写「以前要怎么改」。
+5. **会随版本漂移的源码清单条数**——网关路由白名单（`src/web.rs::ALLOWED_OPS`）这类「数字长在源码数组里」的量不要抄进散文：这一条在本仓库红过三轮（28→29→30→31，每次都是加了 op 忘改文档），散文里只写名单在哪、哪些动词故意不路由，条数交给现算的断言。
 
 ## 必须保留（别误删）
 
@@ -61,7 +62,7 @@ description: Keeps GroveFS documentation (README.md, README.en.md, USAGE.md, USA
    重写一节最容易改出「目录点下去没反应」，标签配平衡量不出来）、新增用字校验（抓自己打错的汉字）、
    **mount 示例经 manager 引导**（`scripts/mountcheck.py`：挂载坐标只能来自 `--manager`（或 `GROVEFS_MANAGER` env、续行/变量间接），手敲的 `--meta-server`/`--data-servers` 已从 mount 移除——示例里少一个 `--manager` 就是一条被 clap 拒绝或 fail-closed 拒挂的命令）、
    **套件断言数对账**（`scripts/suitenumbers.py`：文档里每句「X 套件 N 条断言」的真值只取
-   `.build-bin/logs/<最近一次整板>/<stage>.log` 的 `SUMMARY: pass=` 行——改套件不会让文档变红，
+   `.build-bin/logs/<整板>/<stage>.log` 的 `SUMMARY: pass=/fail=` 行，且每个套件各取其最近一次 `fail=0` 的实跑——红板的 `pass` 只数到中断处，拿它当真值会把失败套件的总数改小，所以最新板上未绿的套件会被点名（不影响退出码，但那些数字未被最新板复验）；`BOARD_LOG_DIR` 可指向某一次整板或整个 logs 目录——改套件不会让文档变红，
    这在本仓库反复发生过；没跑过整板这一项自己跳过并说明，绝不拿记忆里的数当真相；名字不挨着也算（README 那条超长清单里每个「(…; 42 assertions)」归给行内它前面最近的套件名）；而闸门自己也要证明拉得响——`--selftest` 把六份文档里每个复述的数字 +1 注入临时副本，三条归属规则必须都红）。
    退出码 0 才算收工。
 

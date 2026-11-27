@@ -8,8 +8,16 @@ misfired repeatedly in this repo - see the note at the bottom). So the truth is
 never typed by hand: it is parsed from the per-stage logs of the last real board
 run (`run_all.sh` writes `.build-bin/logs/<timestamp>/<stage>.log`).
 
+A `SUMMARY: pass=N` line from a run that then went red is NOT a suite total - it
+is the number of assertions reached before the run stopped - so the truth for
+each suite is its `pass` in the NEWEST board run where that suite came out
+`fail=0`. Suites that are red on the newest board are listed as unverified
+rather than compared, so a half-finished run can never silently redefine a
+documented count (nor let one pass by being compared against its own abort).
+
 usage: suitenumbers.py [REPO_ROOT] [--selftest]
-  BOARD_LOG_DIR=<dir>   compare against a specific run instead of the newest
+  BOARD_LOG_DIR=<dir>   compare against one specific run instead of scanning
+                        `.build-bin/logs/*` for the newest GREEN run per suite
   --selftest            bump every restated number in a throwaway copy of the
                         docs and prove each of the three rules turns red
 Exit code: 0 = every restated number matches; 1 = at least one drift.
@@ -25,40 +33,74 @@ ROOT = argv[0] if argv else "."
 FILES = ["README.md", "README.en.md", "USAGE.md", "USAGE.en.md",
          "docs/docs.html", "docs/deploy.html"]
 
-base = os.environ.get("BOARD_LOG_DIR") or ""
-if not base:
-    root_logs = os.path.join(ROOT, ".build-bin", "logs")
-    if not os.path.isdir(root_logs):
-        print("skip: no board run found (%s 不存在；先跑 .build-bin/run_all.sh)" % root_logs)
+def is_run(d):
+    return os.path.isdir(d) and any(f.endswith(".log") for f in os.listdir(d))
+
+
+# BOARD_LOG_DIR may name ONE run directory or the logs root (the default); the
+# logs root is what the `--selftest` pass below reuses, so injection is judged
+# against exactly the same truth set as the real comparison.
+src = os.environ.get("BOARD_LOG_DIR") or os.path.join(ROOT, ".build-bin", "logs")
+if not os.path.isdir(src):
+    print("skip: no board run found (%s 不存在；先跑 .build-bin/run_all.sh)" % src)
+    sys.exit(0)
+if is_run(src):
+    runs = [src]
+else:
+    runs = [os.path.join(src, d) for d in sorted(os.listdir(src)) if is_run(os.path.join(src, d))]
+    if not runs:
+        print("skip: no board run found (%s 下没有整板目录)" % src)
         sys.exit(0)
-    base = os.path.join(root_logs, sorted(os.listdir(root_logs))[-1])
-if not os.path.isdir(base):
-    sys.exit("BOARD_LOG_DIR is not a directory: %s" % base)
 
-truth, stages, unit = {}, [], None
-for name in sorted(os.listdir(base)):
-    if not name.endswith(".log"):
-        continue
-    stage = name[:-4]
-    stages.append(stage)
-    txt = io.open(os.path.join(base, name), encoding="utf-8",
-                  errors="replace").read()
-    m = re.search(r"SUMMARY: pass=(\d+) fail=(\d+)", txt)
-    if m:
-        truth[stage] = int(m.group(1))
-        continue
-    m = re.search(r"SUMMARY \w+: (\d+) passed", txt)
-    if m:
-        truth[stage] = int(m.group(1))
-        continue
-    m = re.search(r"test result: ok\. (\d+) passed", txt)
-    if m and stage == "unit":
-        unit = int(m.group(1))
 
-print("board run: %s" % base)
+def read_run(d):
+    """-> {stage: (pass, fail)} plus the unit lib-test total."""
+    got, lib = {}, None
+    for name in sorted(os.listdir(d)):
+        if not name.endswith(".log"):
+            continue
+        txt = io.open(os.path.join(d, name), encoding="utf-8",
+                      errors="replace").read()
+        m = re.search(r"SUMMARY: pass=(\d+) fail=(\d+)", txt)
+        if not m:
+            m = re.search(r"SUMMARY \w+: (\d+) passed(?:, (\d+) failed)?", txt)
+        if m:
+            got[name[:-4]] = (int(m.group(1)), int(m.group(2) or 0))
+            continue
+        m = re.search(r"test result: ok\. (\d+) passed", txt)
+        if m and name[:-4] == "unit":
+            lib = int(m.group(1))
+    return got, lib
+
+
+# Walk runs oldest -> newest: a suite's truth is its `pass` in the newest run
+# where it came out `fail=0`; a later RED run never redefines the total.
+truth, stages, unit, red_newest = {}, [], None, {}
+newest = runs[-1]
+for run in runs:
+    got, lib = read_run(run)
+    unit = lib if lib is not None else unit
+    for stage, (p, f) in got.items():
+        if stage not in stages:
+            stages.append(stage)
+        if f == 0:
+            truth[stage] = p
+        elif run == newest:
+            red_newest[stage] = (p, f)
+
+print("board runs: %d   比对基准: 每套件最近一次 fail=0 的实跑%s"
+      % (len(runs), "(BOARD_LOG_DIR 指定单次)" if len(runs) == 1 else ""))
+print("newest run: %s" % newest)
 print("stages: %d   suites with a SUMMARY: %d   assertions: %d%s"
       % (len(stages), len(truth), sum(truth.values()),
          "   unit lib tests: %s" % unit if unit else ""))
+if red_newest:
+    print("最新板上未绿的套件(%d): %s"
+          % (len(red_newest),
+             ", ".join("%s pass=%d fail=%d" % (s, p, f)
+                       for s, (p, f) in sorted(red_newest.items()))))
+    print("  -> 红板的 pass 只数到中断处,不是总数: 上述套件的文档计数取自它们最"
+          "后一次 GREEN 的实跑,未被最新板复验。")
 
 EXTRA = ["forksrv", "gcremote", "pg_parallel"]
 NAMES = "|".join(sorted([re.escape(s) for s in truth] + EXTRA))
@@ -185,14 +227,15 @@ def _selftest(base):
 
 
 if SELFTEST:
-    sys.exit(_selftest(base))
+    sys.exit(_selftest(src))
 
 print("drift: %d" % len(bad))
 for b in bad:
     print("  " + b)
 for u in sorted(set(unverified)):
     print("  note: " + u)
-print("判据: 文档里每句「X 套件 N 条断言」都必须等于该套件最近一次实跑的输出；"
+print("判据: 文档里每句「X 套件 N 条断言」都必须等于该套件最近一次 GREEN 实跑的 pass 数"
+      "(红板的 pass 只数到中断处); "
       "名字不挨着也算(归给行内它前面最近的那个套件名)；\n"
       "      改套件计数的那次改动必须同时改文档并重跑整板。")
 sys.exit(1 if bad else 0)

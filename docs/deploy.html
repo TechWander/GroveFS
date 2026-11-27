@@ -149,7 +149,7 @@ footer{border-top:1px solid var(--line);margin-top:80px;padding-top:20px;color:v
    │   ├─ &lt;视图名&gt;.db       <span class="cmt"># 树本体：node/ctrl/locks 三张表（-wal/-shm 同目录，随 checkpoint 出没）</span>
    │   ├─ &lt;fork&gt;/&lt;fork&gt;.db  <span class="cmt"># v3 nested 默认：该基视图的 fork 树嵌在本目录里（grouped 则收进 &lt;视图名&gt;/forks/）</span>
    │   └─ &lt;名&gt;.layout       <span class="cmt"># v3 nested 默认：该基视图的派生/别名定义（纯文本，可 git diff）</span>
-   ├─ _control/             <span class="cmt"># 控制面，不是树：refs.db 跨视图持有账本 · api_keys.db 密钥与审计 · store.key</span>
+   ├─ _control/             <span class="cmt"># 控制面，不是树：refs.db 跨视图持有账本 · api_keys.db 密钥与审计 · web_accounts.db 网页账号与基视图授权（两张表同在一个库）· store.key</span>
    ├─ views/&lt;名&gt;.layout    <span class="cmt"># 仅 flat 布局（v2 顶层平铺）用这集中目录；nested 下通常为空，读取一律扫描</span>
    └─ .xfer/                <span class="cmt"># export/import 的服务端暂存区（点开头，永不是树）</span></code></pre>
 
@@ -340,7 +340,7 @@ $G view --meta-store postgres://grove:pw@10.0.0.9:5432/grovefs create --view tea
 <span class="cmt"># ===== 客户机：与 SQLite 后端一字不差（线协议不变，坐标同样只从 manager 解析）=====</span>
 $G mount --view team -m /mnt/team --manager 10.0.0.5:50055 --deployment prod --roster-key-file /etc/grovefs/roster.key</code></pre>
 
-<div class="warn"><b>三条硬规则</b>：① 视图必须显式创建（两种后端同一纪律），且 PG 下视图名 ≤ 25 字节（PG 标识符 63 字符上限，hex 编码翻倍；中文约 8 个字）；② <code>--meta-store</code> 与自研 HA 的 <code>--role/--peer/--witness</code> <b>互斥</b>，同时给启动即失败——PG 档的高可用交给 PG 自身的流复制 / PITR；③ 连接串别进命令行（argv 在 <code>ps</code> 里全网可见），生产做法见 2.3.2 的 env 文件。</div>
+<div class="warn"><b>三条硬规则</b>：① 视图必须显式创建（三档后端同一纪律），且 PG 下视图名 ≤ 25 字节（PG 标识符 63 字符上限，hex 编码翻倍；中文约 8 个字）；② <code>--meta-store</code> 与自研 HA 的 <code>--role/--peer/--witness</code> <b>互斥</b>，同时给启动即失败——PG 档的高可用交给 PG 自身的流复制 / PITR，treedb 档从引擎自己的 WAL 与快照恢复；③ 连接串别进命令行（argv 在 <code>ps</code> 里全网可见），生产做法见 2.3.2 的 env 文件。</div>
 
 <p>PG 档与 SQLite 档的形态差异（选型时对照）：</p>
 <table>
@@ -349,8 +349,9 @@ $G mount --view team -m /mnt/team --manager 10.0.0.5:50055 --deployment prod --r
   <tr><td>高可用</td><td>原生主备（--role/--peer/--witness，快照转发）</td><td>交给 PG 自身（流复制 / PITR），GroveFS 不管</td></tr>
   <tr><td>视图规模上限</td><td>一视图一文件一引擎，fd/内存线性涨</td><td>一视图 12 条连接；<code>--engine-idle-secs</code> 驱逐空闲视图后按「最近活跃视图数」计，扩容用多实例注册表（2.3.6）</td></tr>
   <tr><td>控制面落点</td><td>各基视图目录的 <code>.layout</code>（nested 默认；flat 在 <code>meta/views/</code>）、<code>meta/_control/api_keys.db</code> 本地文件</td><td>全部在 <code>grovefs_control</code>，任意可达节点带同一 <code>--meta-store</code> 即可治理，无本地文件要同步</td></tr>
-  <tr><td>独有命令</td><td>目录零拷贝 <code>import</code>、离线 <code>gc</code> 扫本机 blocks、原生 HA</td><td>无（同名命令不同壳：--meta-dir 换 --meta-store）</td></tr>
+  <tr><td>独有命令</td><td>离线 <code>gc</code> 扫本机 blocks、原生 HA</td><td>无（同名命令不同壳：--meta-dir 换 --meta-store）</td></tr>
 </table>
+<div class="note"><b>第三种后端：treedb（实验性，需 <code>--features treedb</code> 构建）</b>。它不改变本页的三套演示，但选型时要把它算进去，因为它的<b>落点是混合的</b>：树进引擎（按视图名哈希落多个实例，fork 的新树种在<b>基所在那个实例</b>上），而控制面——lens / 别名 / fork 定义、apikey、网页账号与审计——留在服务端本地 <code>--meta-dir</code> 的 <code>meta/_control/</code>，<b>不进引擎</b>。寻址旋钮同为 <code>--meta-store treedb://host:port[,host:port]</code>，但只有 <code>meta-server</code> 驱动引擎：离线 <code>view</code>/<code>mcp</code>/<code>refs</code>/<code>gc</code> 带上这个 URI 会被当场拒，所以这一档的治理一律走 <code>--control-server H:P --api-key '&lt;id&gt;:&lt;secret&gt;'</code>（2.4 的治理口形状）。目录零拷贝 <code>grovefs import --meta-store treedb://… --source DIR</code> 可跑：节点经引擎的 POSIX 元数据 ops 入库，字节仍硬链进执行机的 <code>--data-dir/blocks/</code>。这一档没有实例注册表与放置概念（逗号列表就是全部，<code>--pg-instance</code> / <code>view move</code> 属 PG），也拒绝 <code>--role standby / --peer / --witness</code>，且经治理口跑的 <code>view export</code>/<code>view import</code>、<code>gc</code>、<code>refs rebuild</code> 各引原文拒绝；该档建出来的 fork 树在引擎里、<code>view list</code> 列得出，但 <code>M_OPEN</code> 仍按本地文件树判定 fork 名，所以它现在挂不上。逐档存储分布与完整路径见 <a href="docs.html#case-backend-paths">docs.html §6.9</a> 与 <a href="docs.html#vg-shape">§8.3</a>。</div>
 
 <h3 id="s14">1.4 存量存储根升级：v1 扁平 → 一树一目录（本版报 v3）</h3>
 <p>本版 GroveFS 报的元数据布局是 <b>v3</b>：在 v2 的「每棵物理视图树自成一个目录 <code>meta/&lt;视图名&gt;/&lt;视图名&gt;.db</code>、控制面集中到 <code>meta/_control/</code>」之上，加了一层<b>家族归属摆放</b>——基视图<b>新建</b>的 fork/派生/别名默认落进基视图自己的目录（<code>nested</code>；<code>flat</code> 才集中到 <code>meta/views/*.layout</code>）。<b>本节要把老的 v1 扁平形态迁到的，是这层摆放底下的每树一目录形态</b>：<code>migrate</code> 只重组已有的扁平树，不移动任何已是家族成员的文件（详见 §13.1）。<b>目录名就是类型</b>，<code>ls meta/</code> 列出的就是树（1.1 的存储根图就是这个形态）。老的 <b>v1 扁平</b>形态（<code>meta/</code> 下平铺 <code>team.db</code>/<code>refs.db</code>）<b>没有命令读它</b>：换新二进制后，任何要读视图树的命令都会拒绝并指名迁移动词。</p>
@@ -471,10 +472,10 @@ fusermount -u /mnt/alice                <span class="cmt"># 等价写法</span><
 <table>
 <tr><th></th><th>基视图</th><th>派生视图</th><th>纯别名</th><th>fork</th></tr>
 <tr><td><b>本质</b></td><td>真实物理树</td><td>基树 + 规则（不建树）</td><td>名字 → 真实视图（不建树）</td><td>独立物理树（目录项从基树复制）</td></tr>
-<tr><td><b>创建命令</b></td><td><code>view --meta-dir D create --view V</code></td><td><code>view define --name D --base B --rules F</code></td><td><code>view alias --name A --real R</code></td><td><code>view fork --name F --base B</code></td></tr>
+<tr><td><b>创建命令</b></td><td><code>view --meta-dir D create --view V</code></td><td><code>view define --name lens_D --base B --rules F</code></td><td><code>view alias --name bias_A --real R</code></td><td><code>view fork --name F --base B</code></td></tr>
 <tr><td><b>目录可改</b></td><td>能</td><td>不能（只读）</td><td>能</td><td>能</td></tr>
 <tr><td><b>内容可写</b></td><td>能</td><td>不能（EROFS）</td><td>能</td><td>不能（EROFS）</td></tr>
-<tr><td><b>落盘</b>（nested 默认）</td><td><code>meta/V/V.db</code></td><td><code>meta/B/D.layout</code></td><td><code>meta/R/A.layout</code>（仅一行）</td><td><code>meta/B/F/F.db</code> + <code>meta/B/F.layout</code></td></tr>
+<tr><td><b>落盘</b>（nested 默认）</td><td><code>meta/V/V.db</code></td><td><code>meta/B/lens_D.layout</code></td><td><code>meta/R/bias_A.layout</code>（仅一行）</td><td><code>meta/B/F/F.db</code> + <code>meta/B/F.layout</code></td></tr>
 <tr><td><b>典型用途</b></td><td>真正存数据</td><td>团队共享一份只读形状</td><td>隐藏存储真名 / 换公开名</td><td>在基数据上做可整理的独立分支</td></tr>
 </table>
 
@@ -483,23 +484,23 @@ fusermount -u /mnt/alice                <span class="cmt"># 等价写法</span><
 <span class="cmt"># 只显示 /docs 子树</span>
 only /docs
 EOF
-$G view --meta-dir /data/gfs define --name docsonly --base team --rules docsonly.rules
-<span class="cmt"># 输出: defined derived view 'docsonly' over base 'team': 0 hide, 1 only, 0 reloc rule(s)</span>
-<span class="out"># note: mounts of 'docsonly' are read-only (virtual shape) — write to base view 'team'</span>
-$G mount --view docsonly -m /mnt/lens --manager 127.0.0.1:50055 --roster-key-file /data/gfs/manager/roster.key &amp;
+$G view --meta-dir /data/gfs define --name lens_docsonly --base team --rules docsonly.rules
+<span class="cmt"># 输出: defined derived view 'lens_docsonly' over base 'team': 0 hide, 1 only, 0 reloc rule(s)</span>
+<span class="out"># note: mounts of 'lens_docsonly' are read-only (virtual shape) — write to base view 'team'</span>
+$G mount --view lens_docsonly -m /mnt/lens --manager 127.0.0.1:50055 --roster-key-file /data/gfs/manager/roster.key &amp;
 <span class="cmt"># 只给派生名，不带 --layout：只读契约由 M_OPEN 握手从服务端带回来</span>
-<span class="out"># derived view 'docsonly' over base 'team': read-only lens</span>
-<span class="out"># mounting view 'docsonly' at /mnt/lens (fully remote: no local store, read-only)</span>
+<span class="out"># derived view 'lens_docsonly' over base 'team': read-only lens</span>
+<span class="out"># mounting view 'lens_docsonly' at /mnt/lens (fully remote: no local store, read-only)</span>
 ls /mnt/lens            <span class="out"># docs            ← 只有 docs，其余子树连存在性都不泄露</span>
 echo x > /mnt/lens/docs/new.md
 <span class="out"># bash: Read-only file system   ← 派生一律只读（硬契约）；写走基名 /mnt/team</span></code></pre>
 
 <p><b>② 纯别名（公开名，全树可写）</b>：挂别名 = 挂真实视图；别名存在期间，真实名 <code>team</code> 从此不可直挂（meta-server 拒）。定义可以在基视图正挂着的时候下，不用先卸载。</p>
-<pre><code>$G view --meta-dir /data/gfs alias --name pub --real team
-<span class="out"># defined pure alias 'pub' -> real view 'team'</span>
+<pre><code>$G view --meta-dir /data/gfs alias --name bias_pub --real team
+<span class="out"># defined pure alias 'bias_pub' -> real view 'team'</span>
 <span class="out"># note: 'team' is no longer a mount entry point while this definition exists (the meta-server refuses a mount of the real name); alias mounts show the FULL tree and are WRITABLE</span>
-$G mount --view pub -m /mnt/pub --manager 127.0.0.1:50055 --roster-key-file /data/gfs/manager/roster.key &amp;
-<span class="out"># alias view 'pub' resolves to real view 'team' (full tree, writable)</span>
+$G mount --view bias_pub -m /mnt/pub --manager 127.0.0.1:50055 --roster-key-file /data/gfs/manager/roster.key &amp;
+<span class="out"># alias view 'bias_pub' resolves to real view 'team' (full tree, writable)</span>
 echo hello > /mnt/pub/docs/note.md      <span class="cmt"># 可写；写入即落在 team 的同一棵树上</span>
 cat /mnt/lens/docs/note.md              <span class="out"># hello   ← 从只读透镜 /mnt/lens 立刻读到同一份</span>
 
@@ -508,8 +509,8 @@ $G mount --view team -m /mnt/t --manager 127.0.0.1:50055 --roster-key-file /data
 <span class="out"># error: view 'team' is governed by an alias — mount the alias name instead (`grovefs view list` shows it)</span>
 
 <span class="cmt"># 公开名泄露后一条命令原子轮换：先写新名再删旧名，真实名全程被治理、无裸露窗口</span>
-$G view --meta-dir /data/gfs alias --name pub2 --real team --retire pub
-<span class="out"># rotated public name for real view 'team': 'pub' -> 'pub2' (gapless — 'team' stayed governed throughout, 'pub' no longer resolves)</span></code></pre>
+$G view --meta-dir /data/gfs alias --name bias_pub2 --real team --retire bias_pub
+<span class="out"># rotated public name for real view 'team': 'bias_pub' -> 'bias_pub2' (gapless — 'team' stayed governed throughout, 'bias_pub' no longer resolves)</span></code></pre>
 
 <p><b>③ fork（独立树：结构可写、内容只读、字节零复制）</b>：目录项复制一份，字节经跨视图账本共享；在 fork 里删名字只摘自己的，基树分毫不动。</p>
 <pre><code>$G view --meta-dir /data/gfs fork --name lab --base team
@@ -532,7 +533,7 @@ $G view --meta-dir /data/gfs graft --name picks --src team --map plan.tsv
 <span class="out"># note: bytes were not copied — every grafted name holds the same object as its source; the object is freed only when no view names it anymore</span>
 <span class="cmt"># report.txt 接进根目录并改名为 季度报告.txt；note.md 原名接入；可加 --dest DIR 指定落点、--skip-existing 跳过同名</span></code></pre>
 
-<div class="ok">验收：<code>$G view --meta-dir /data/gfs list</code> 一次列出全部形态——派生（base + 规则计数）、别名（→ 真实视图）、fork（→ 基视图）与未定义的裸基视图（逐字输出见 2.1.6）；<b>v3 <code>nested</code> 默认下这些家族成员都嵌在基视图目录里</b>——<code>ls /data/gfs/meta/team/</code> 见四份纯文本 <code>.layout</code>（<code>docsonly.layout</code>、<code>lab.layout</code>、<code>picks.layout</code>、<code>pub2.layout</code>——别名轮换掉的名字不留残档）加 <code>lab/lab.db</code>、<code>picks/picks.db</code> 两棵 fork 树，而 <code>meta/views/</code> 为空（改成 <code>flat</code> 才会把定义集中到那里）。</div>
+<div class="ok">验收：<code>$G view --meta-dir /data/gfs list</code> 一次列出全部形态——派生（base + 规则计数）、别名（→ 真实视图）、fork（→ 基视图）与未定义的裸基视图（逐字输出见 2.1.6）；<b>v3 <code>nested</code> 默认下这些家族成员都嵌在基视图目录里</b>——<code>ls /data/gfs/meta/team/</code> 见四份纯文本 <code>.layout</code>（<code>lens_docsonly.layout</code>、<code>lab.layout</code>、<code>picks.layout</code>、<code>bias_pub2.layout</code>——别名轮换掉的名字不留残档）加 <code>lab/lab.db</code>、<code>picks/picks.db</code> 两棵 fork 树，而 <code>meta/views/</code> 为空（改成 <code>flat</code> 才会把定义集中到那里）。</div>
 
 <h4 id="s21-auth">2.1.4 授权边界（四进程同机）</h4>
 <p>准入由<b>服务端</b>把关，不再是「挂载点权限就是全部」：<code>mount</code> 得先过 meta-server 与 data-server 两道门。同机起步常什么门都不开——这时任何能连上 <code>127.0.0.1:50110</code> / <code>127.0.0.1:50100</code> 的本地进程都能挂上任何视图，所以最小自觉是把 <code>--listen</code> 绑在回环地址上。OS 层还有一层：</p>
@@ -558,10 +559,10 @@ $G mount --view team -m /mnt/team</code></pre>
 
 <h4 id="s21-ops">2.1.6 清点、用量与删除</h4>
 <pre><code>$G view --meta-dir /data/gfs list                    <span class="cmt"># 清点：全部定义 + 裸基视图（接 2.1.3 的最终状态）</span>
-<span class="out"># view 'docsonly' -> base 'team': 0 hide, 1 only, 0 reloc rule(s) (read-only)</span>
+<span class="out"># view 'lens_docsonly' -> base 'team': 0 hide, 1 only, 0 reloc rule(s) (read-only)</span>
 <span class="out"># fork 'lab' of base 'team' (independent tree: structure writable, content refused EROFS; deletes touch only this view)</span>
 <span class="out"># fork 'picks' of base 'team' (independent tree: structure writable, content refused EROFS; deletes touch only this view)</span>
-<span class="out"># alias 'pub2' -> real view 'team' (full tree, writable; 'team' not mountable by its own name)</span>
+<span class="out"># alias 'bias_pub2' -> real view 'team' (full tree, writable; 'team' not mountable by its own name)</span>
 <span class="out"># base view 'alice' -> own tree meta/alice/alice.db (read-write; deletes free a shared object only when no view holds it)</span>
 <span class="out"># base view 'team' -> own tree meta/team/team.db (read-write; deletes free a shared object only when no view holds it)</span>
 <span class="out"># view keys: `grovefs apikey --meta-dir /data/gfs list [--view NAME]` (add --view to see only that view's keys)</span>
@@ -571,8 +572,8 @@ $G du --view team --meta-dir /data/gfs --data-dir /data/gfs --total
 <span class="out"># 19B	/</span>
 
 <span class="cmt"># 删除规则：派生/别名只删定义；fork 连自己的树一起删；只有删基视图才回收字节</span>
-$G view --meta-dir /data/gfs rm --name docsonly      <span class="cmt"># 删派生定义，数据分毫不动</span>
-$G view --meta-dir /data/gfs rm --name pub2          <span class="cmt"># 删别名，team 真名恢复可挂</span>
+$G view --meta-dir /data/gfs rm --name lens_docsonly      <span class="cmt"># 删派生定义，数据分毫不动</span>
+$G view --meta-dir /data/gfs rm --name bias_pub2          <span class="cmt"># 删别名，team 真名恢复可挂</span>
 $G view --meta-dir /data/gfs rm --name lab           <span class="cmt"># 删 fork：定义 + 自己的树 + 重算账本；基树与共享字节不动</span>
 $G view --meta-dir /data/gfs rm --name picks         <span class="cmt"># 同上——接了枝的 fork 也只是一棵自己的树</span>
 $G view --meta-dir /data/gfs rm --name team --base   <span class="cmt"># 删基视图：删树 + 回收无人持有的字节（有守卫：被定义治理/仍被指向/还挂着都会拒）</span></code></pre>
@@ -701,25 +702,43 @@ $G mount --view team -m /mnt/team --manager 10.0.0.5:50055 --deployment prod --r
 cat > docsonly.rules <<'EOF'
 only /docs
 EOF
-$G view --meta-dir /data/cluster define --name docsonly --base team --rules docsonly.rules
-$G view --meta-dir /data/cluster alias  --name pub --real team
+$G view --meta-dir /data/cluster define --name lens_docsonly --base team --rules docsonly.rules
+$G view --meta-dir /data/cluster alias  --name bias_pub --real team
 $G view --meta-dir /data/cluster fork   --name lab --base team
 printf 'raw/logs/2026\tarchive-2026\n' > plan.tsv
 $G view --meta-dir /data/cluster graft --name lab --src team --map plan.tsv --dest archive
 
 <span class="cmt"># node2/node3 上：挂派生名，无需规则文件；M_OPEN 握手带只读标志</span>
-$G mount --view docsonly -m /mnt/lens \
+$G mount --view lens_docsonly -m /mnt/lens \
      --manager 10.0.0.5:50055 --deployment prod --roster-key-file /etc/grovefs/roster.key
 ls /mnt/lens        <span class="out"># docs            ← 服务端渲染的形状</span>
 
 <span class="cmt"># 改规则热生效：替换 .layout 后，已挂载的派生连接 ≤2s 内换形，免重挂</span>
-printf 'only /docs\nhide /docs/internal\n' | tee /data/cluster/meta/team/docsonly.layout   <span class="cmt"># nested：定义在基视图目录（flat 下才是 meta/views/）</span>
+printf 'only /docs\nhide /docs/internal\n' | tee /data/cluster/meta/team/lens_docsonly.layout   <span class="cmt"># nested：定义在基视图目录（flat 下才是 meta/views/）</span>
 <span class="cmt"># （或重新跑一条 view define 同名覆盖）</span>
 
 <span class="cmt"># 分发面差异一览（对照 2.1.3 的四进程同机形态）：</span>
-<span class="cmt"># ① docsonly → 客户机只给名；② pub → 全树可写，真名 team 同时不可直挂（服务端同拒）</span>
+<span class="cmt"># ① lens_docsonly → 客户机只给名；② bias_pub → 全树可写，真名 team 同时不可直挂（服务端同拒）</span>
 <span class="cmt"># ③ lab → 结构可写/内容 EROFS；删名只影响 fork 自己；④ graft 接枝字节零复制</span></code></pre>
 <p>SQLite 档 <code>view</code> 操作的是服务端本地文件，所以要在 meta-server 所在机器执行；HA 部署下整个 <code>meta/</code>（v3 <code>nested</code>：各基视图目录下的 <code>.layout</code> 与 fork 子目录，加 <code>meta/_control/</code>）要手工同步到备机（PG 档无此负担，定义在共享库里——见 2.3.5）。</p>
+<p><b>不想登存储机也能定制形状</b>：给 <code>meta-server</code> 加 <code>--control-listen HOST:PORT</code>，治理命令就把 <code>--meta-dir</code> 换成 <code>--control-server</code> + 一把<b>账号密钥</b>，真实读写由那个持有存储的进程代做——管理机上既没有数据库 URI，也不必能访问 <code>--meta-dir</code>。这条路上跑的是与网页管理台同一批服务端 op：<code>def.put</code>（建/改透镜与别名）、<code>fork.create</code>、<code>fork.graft</code>、<code>view.create</code>，规则文件与接枝计划都在管理机上读成文本随请求发出，守卫仍在服务端判一次。每次调用以 <code>method=control</code> 落控制面审计表（PG 档 <code>grovefs_control.mcp_calls</code>，SQLite 档 <code>meta/_control/api_keys.db</code>），<code>apikey calls</code> 逐条数得出来。</p>
+<pre><code><span class="cmt"># 服务端 ExecStart 追加: --control-listen 0.0.0.0:50130（只跑治理动词，不托管挂载）</span>
+<span class="cmt"># 第一把 admin 账号密钥只能在持盘主机铸——治理口上还没有任何凭据可问</span>
+$G apikey --meta-dir /data/cluster create --label ops --for admin --owner rootops
+<span class="out"># key:   &lt;id&gt;:&lt;secret&gt;   ← 明文只打印这一次，盘上只有摘要</span>
+
+<span class="cmt"># 换到任意一台管理机：密钥进 env，不进 argv</span>
+export GROVEFS_CONTROL_KEY='&lt;id&gt;:&lt;secret&gt;'
+$G view --control-server 10.0.0.5:50130 define --name lens_docsonly --base team --rules docsonly.rules
+$G view --control-server 10.0.0.5:50130 alias  --name bias_pub --real team
+$G view --control-server 10.0.0.5:50130 fork   --name lab --base team
+$G view --control-server 10.0.0.5:50130 graft  --name lab --src team --map plan.tsv --dest archive
+$G view --control-server 10.0.0.5:50130 list
+$G apikey --control-server 10.0.0.5:50130 calls --limit 5   <span class="cmt"># 上面每一笔都在审计里，归到铸造者</span>
+<span class="cmt"># 三条拒因原文：不带 key → 点名 "needs an admin account key" 并给出服务端主机的铸造命令；</span>
+<span class="cmt"># scope 是 mount/any 的 key → "this api key is scoped to 'mount', not 'admin'"；</span>
+<span class="cmt"># 远程与本地 flag 并用（--meta-dir / --meta-store）→ 拒绝，治理口管的是它那台机器持有的存储</span></code></pre>
+<div class="note"><b>哪些动词故意留在这条路之外</b>：网页管理台的路由白名单是 <code>src/web.rs::ALLOWED_OPS</code>，逐条列在里面、条数随版本涨，<b>不抄进散文</b>；<code>gc.scan</code>、<code>gc.apply</code>、<code>refs.rebuild</code>、<code>view.rm_base</code>、<code>fork.graft</code> 五个不过网关——它们的 dry-run 报告与逐步确认是调用本身的一部分，要跑就回到 §2.2.6 / §2.3.7 的 CLI。治理口上这一批 op 全可用（<code>fork.graft</code> 也在），只是它只认 admin 账号密钥、没有匿名模式。</div>
 
 <h4 id="s22-conf">2.2.5 配置文件：客户机挂载瘦身 + 挂载也交给 systemd</h4>
 <pre><code><span class="cmt"># node2/node3：写一次引导文件，之后挂载只剩「这次挂哪个视图到哪儿」</span>
@@ -825,7 +844,7 @@ journalctl -u grovefs-meta -n 20 --no-pager | grep -i 'store\|listen'
 <p class="cmt"><code>GROVEFS_META_STORE</code> 有双重身份：既是 systemd <code>${VAR}</code> 展开的来源，也是 GroveFS 自己的 <code>--meta-store</code> env 回退（<code>view</code>/<code>apikey</code>/<code>mcp</code>/<code>meta-server</code>/<code>data-server</code>/<code>du</code> 未给 flag 时读它）——显式展开与省略参数取到同一份值。PG 下 meta-server 不需要 <code>--meta-dir</code>：权威树与控制面都在库里，服务端本地不落权威数据。</p>
 
 <h4 id="s23-view">2.3.3 建基视图：一视图一个 schema</h4>
-<pre><code><span class="cmt"># node1 上：显式建 schema（挂载不会建；两种后端同一纪律）</span>
+<pre><code><span class="cmt"># node1 上：显式建 schema（挂载不会建；三档后端同一纪律）</span>
 $G view --meta-store postgres://grove:pw@10.0.0.9:5432/grovefs create --view team
 
 <span class="cmt"># 看 PG 里到底建了什么</span>
@@ -853,18 +872,18 @@ $G apikey --meta-store postgres://grove:pw@10.0.0.9:5432/grovefs calls     <span
 <h4 id="s23-kinds">2.3.5 四种视图：定义进 grovefs_control，其余语义不变</h4>
 <pre><code><span class="cmt"># node1 上：同一套 define/alias/fork/graft，寻址换 --meta-store</span>
 $G view --meta-store postgres://grove:pw@10.0.0.9:5432/grovefs \
-     define --name docsonly --base team --rules docsonly.rules
-$G view --meta-store postgres://grove:pw@10.0.0.9:5432/grovefs alias --name pub --real team
+     define --name lens_docsonly --base team --rules docsonly.rules
+$G view --meta-store postgres://grove:pw@10.0.0.9:5432/grovefs alias --name bias_pub --real team
 $G view --meta-store postgres://grove:pw@10.0.0.9:5432/grovefs fork  --name lab --base team
 $G view --meta-store postgres://grove:pw@10.0.0.9:5432/grovefs graft --name lab --src team --map plan.tsv
 
 <span class="cmt"># 验证：定义在库里（本地没有 .layout 文件）</span>
 sudo -u postgres psql -d grovefs -c "SELECT name, kind FROM grovefs_control.view_defs;"
-<span class="out"># docsonly | derived   pub | alias   lab | fork</span>
+<span class="out"># lens_docsonly | derived   bias_pub | alias   lab | fork</span>
 
-<span class="cmt"># 客户机：与 2.2.4 逐字相同 —— mount --view docsonly 只读、pub 全树可写、lab 结构可写内容 EROFS</span>
+<span class="cmt"># 客户机：与 2.2.4 逐字相同 —— mount --view lens_docsonly 只读、bias_pub 全树可写、lab 结构可写内容 EROFS</span>
 <span class="cmt"># 改定义同样热生效（PG 看行的 xmin，≤2s 换形）</span></code></pre>
-<p>PG 档与 SQLite 档在视图家族上的两点差异：① 顶层 <code>grovefs import</code>（目录零拷贝登记）<b>拒绝</b>——它只能产出本地 SQLite 树，存量数据改走挂载点灌入（挂上视图后直接 <code>cp/rsync</code>）；② 就地扫本机 <code>blocks/</code> 的离线 <code>gc</code> 同样拒绝，改走 2.3.7 的治理面形态。</p>
+<p>PG 档与 SQLite 档在视图家族上的分别只有一条：就地扫本机 <code>blocks/</code> 的离线 <code>gc</code> 在 PG 档<b>拒绝</b>，改走 2.3.7 的治理面形态。顶层 <code>grovefs import</code>（目录零拷贝登记）两档都可用——PG 下节点写进该视图的 schema、字节仍硬链进执行机的 <code>--data-dir/blocks/</code>，所以它跑在持数据根的 node1 上而不是客户机上；字节不在本机时才改走挂载点灌入（挂上视图后直接 <code>cp/rsync</code>）。treedb 档的树在引擎里、定义在本地：<code>define</code>/<code>alias</code>/<code>fork</code> 的形状不变（fork 的新树由引擎侧复制），<code>graft</code> 则在该档被拒——它按本地 SQLite 找源树，命令形状相同而能力面逐动词不同（见 docs.html §14.9.2）。</p>
 
 <h4 id="s23-scale">2.3.6 多实例扩容与视图搬家（连接数封顶时）</h4>
 <p>每个活跃视图占 PG 档 12 条连接（8 写 + 4 读，<code>--engine-idle-secs 300</code> 默认回收空闲视图的连接，容量按「最近活跃视图数」计）。当活跃集仍要封顶 <code>max_connections</code> 时，扩容答案是<b>多实例注册表 + 视图放置</b>：把不同视图放到不同 PG 实例（一个视图的树永远只落在一个实例上），容量随实例数线性增长。示例：加入 <b>db2</b>（10.0.0.11，同规格 PG，max_connections=200），把热点视图 team1 挪过去。</p>
@@ -916,11 +935,11 @@ $G view --meta-store postgres://grove:pw@10.0.0.9:5432/grovefs rm --name team --
 <div class="ok">验收：第一个挂载建立后 <code>\dn</code> 多出 <code>grovefs_v_&lt;hex&gt;</code>；<code>ls /data/cluster/meta</code> 里<b>没有</b> <code>team.db</code>（权威树在 PG，不在文件里）；客户机读写与 2.2 的验收逐字相同。</div>
 
 <h3 id="s24">2.4 网页管理台 · 账号、基视图授权与反代 TLS</h3>
-<div class="scene"><b>示例环境</b>：沿用 2.2 的 SQLite 部署（node1 = 10.0.0.5 持盘，data <code>50100</code> / meta <code>50110</code>），给治理面留一个端口 <code>50130</code>；管理台网关与 nginx 同在 node1，网关只听 <code>127.0.0.1:8787</code>；运维从自己的工作站经 HTTPS 进入。<b>PG 档（2.3）一字不差照抄</b>——账号与授权只是换地方存（控制库里的表而不是 <code>meta/_control/web_accounts.db</code>），命令形状与页面能力完全相同。</div>
+<div class="scene"><b>示例环境</b>：沿用 2.2 的 SQLite 部署（node1 = 10.0.0.5 持盘，data <code>50100</code> / meta <code>50110</code>），给治理面留一个端口 <code>50130</code>；管理台网关与 nginx 同在 node1，网关只听 <code>127.0.0.1:8787</code>；运维从自己的工作站经 HTTPS 进入。<b>PG 档（2.3）一字不差照抄</b>——账号与授权只是换地方存（控制库里的表，而不是 SQLite 档的 <code>meta/_control/web_accounts.db</code>；treedb 档与 SQLite 档同路），命令形状与页面能力完全相同。</div>
 <p>管理台是一个<b>独立子命令</b> <code>grovefs web</code>，而不是 meta-server 多开的一个网页入口：它是治理口前面的 HTTP 网关，自己不存账号、不存视图、不存审计，所以也不新增一套权限判定——“这个账号能碰哪棵树”仍然只在服务端一处。登录不产生能力，只<b>限制并归属</b>能力：一个会话只能以一个账号行动，每次调用以 <code>account@ip</code> 落审计。</p>
 
 <h4 id="s24-one">2.4.1 一次性配置（node1，root）</h4>
-<p>第一个管理员<b>只能由持有存储的进程放置</b>：两面 flag 挂在 <code>meta-server</code> 上，且只在账号表为空时生效，所以 unit 文件反复读同一个 flag 的重启是幂等的，而换一个 <code>--admin-user</code> 会拒绝启动而不是悄悄多一个管理员。口令只有 <code>--admin-password-file</code>，没有 <code>--admin-password</code>（argv 对本机所有进程可见、会进 shell history；策略：至少 10 个字符，且不得等于账号名）。</p>
+<p>第一个管理员<b>只能由持有存储的进程放置</b>：两面 flag 挂在 <code>meta-server</code> 上，且只在账号表为空时生效，所以 unit 文件反复读同一个 flag 的重启是幂等的，而换一个 <code>--admin-user</code> 会拒绝启动而不是悄悄多一个管理员。口令只有 <code>--admin-password-file</code>，没有 <code>--admin-password</code>（argv 对本机所有进程可见、会进 shell history；策略：至少 10 个字符，且不得等于账号名）。账号表住在持有存储的那一侧，三档各自的位置与定义、密钥同构：SQLite 与 treedb 档是 <code>&lt;meta-dir&gt;/meta/_control/web_accounts.db</code>（账号与授权是同一库里的两张表），PG 档是 <code>grovefs_control.web_accounts</code> / <code>web_grants</code> 两张表。播种完成后，建普通账号与划基视图授权都转给管理员（页面 <b>Accounts</b> 页或下面的 <code>web account create</code> / <code>grant add</code>），两面安装期 flag 不再参与。</p>
 <pre><code>sudo install -d -m 700 /etc/grovefs
 <span class="cmt"># ① 安装期管理员的口令（只在表空时被读一次；事后改这个文件不会改任何口令）</span>
 sudo sh -c 'umask 077; printf "%s\n" "RootOps-pw-2026" > /etc/grovefs/web-owner.pw'
@@ -988,8 +1007,8 @@ $G web --control-server 127.0.0.1:50130 --api-key-file /etc/grovefs/control.key 
 <span class="cmt"># ⚠ account rm 不撤销该号铸过的 api key——否则一个删号会静默停掉一个在跑的生产挂载</span>
 $G web --control-server 127.0.0.1:50130 --api-key-file /etc/grovefs/control.key account disable --account bob</code></pre>
 <p><b>审计台账的保留期是部署要自己决定的那件事</b>：控制台每一点、每个治理调用、每次挂载握手都在控制面库里落一行（PG 档 <code>grovefs_control.mcp_calls</code>，SQLite 档 <code>meta/_control/api_keys.db</code>），而开着控制口的服务端<b>默认带 90d 窗口</b>（把 <code>--audit-retention never</code> 说出口才是全部保留）。两条路：给 <code>meta-server</code> 追加 <code>--audit-retention 365d</code>（必须与 <code>--control-listen</code> 同时给；后台按窗口 1/24（5min..1h）扫、开机先扫一刀再睡），或把它当成例行巡检——先 <code>$G apikey --control-server 127.0.0.1:50130 --api-key-file /etc/grovefs/control.key purge --before 365d --dry-run</code> 数一下会掉多少行，确认后再去掉 <code>--dry-run</code>。控制台<b>审计页</b>带一块保留窗口面板：超管能在页面上直接改保留期（<code>audit.retention.set</code>，免重启）并一键立即清理（先 <code>--dry-run</code> 预览再执行）——两个动词都是 SUPERUSER 门，被这张表记录的普通账号看不到这些控件，能修剪履历的仍只限部署最高权限；表现在多大，面板顶部那句话会直接讲出来。</p>
-<div class="warn"><b>四件容易做错的事</b>：① <b>降级或删除唯一在职的 admin 会被拒</b>——先建第二个 admin 并验证能登进去再动第一个；② <code>account passwd</code> 不踢掉已开的会话（那是网关的会话表），要立即停人是 <code>disable</code>；③ 口令只能从 <code>--password-file</code> / <code>--password-stdin</code> 进去，两者互斥且不存在 <code>--password</code>；④ 页面能点的动词是写死的 32 个白名单，<code>gc.scan</code>、<code>gc.apply</code>、<code>refs rebuild</code>、<code>view rm --base</code>、<code>fork graft</code> 五个保留在 CLI——它们的 dry-run 报告与逐步确认是调用的一部分，想跑这些就回到 §2.2.6 / §2.3.7。</div>
-<div class="ok">验收：浏览器打开 <code>https://gfs-console.internal/</code> 能看到登录页；拿 <code>rootops</code> 登录→总览页把八个部署数排成<b>每行 4 个、共两行</b>的统计卡（过期密钥非零时那张转琥珀色），卡下方的「本部署」事实表报出后端+describe 行、元数据根、服务端角色、命名空间（基视图/定义拆开）、凭据（live/expired 拆开）、账号数与活动量；拿 <code>bob</code> 登录→视图页只列 <code>team</code> 一棵，选中一棵基视图时右侧多出它的<b>谱系面板</b>（它的别名/透镜/fork 与逐层向下的子名字），能建 fork、能在密钥页给自己那棵铸一把 <code>mount</code> key 并就地改它的备注与有效期，而“Accounts”页只剩“改自己的口令”；故意输错口令五次→第六次回 <code>429</code> 带 <code>retryAfter</code>；审计页里每一行都带 <code>account=&lt;人&gt;@&lt;ip&gt;</code>，并能按时间窗、平面、事件类型、成败与关键字五个维度检索。五页共用<b>同一套设计系统</b>（字号阶梯与间距令牌、卡片化面板、抽屉与可折叠详情），文案全部过词典、中/英一键切换；密钥页的 key 列是入库的头尾指纹而非明文，这条取舍写在页面上；把某把 key 的副本读回只在属主（或超级账号）那里成功，跨账号被拒。部署为 PG 多实例注册表时，视图页的「新建基视图」表单给出<b>目标实例下拉</b>（清单来自 <code>store.info</code> 的 <code>pgInstances</code>，默认「自动」点名当前最少负载的实例），单实例或非 PG 档不显示这一行；总览页在 PG 档另列出<b>实例账本</b>（每实例放置视图数、控制面标记与哈希路由存量），与非 PG 档改称「本机锚点（--meta-dir）」的锚点行一起，把「树到底住在哪」说成横幅同一句话；端到端断言见 <code>web</code> 套件（189 条）。</div>
+<div class="warn"><b>四件容易做错的事</b>：① <b>降级或删除唯一在职的 admin 会被拒</b>——先建第二个 admin 并验证能登进去再动第一个；② <code>account passwd</code> 不踢掉已开的会话（那是网关的会话表），要立即停人是 <code>disable</code>；③ 口令只能从 <code>--password-file</code> / <code>--password-stdin</code> 进去，两者互斥且不存在 <code>--password</code>；④ 页面能点的动词是一份写死的白名单（逐条列在 <code>src/web.rs::ALLOWED_OPS</code>，条数不抄进散文），<code>gc.scan</code>、<code>gc.apply</code>、<code>refs.rebuild</code>、<code>view.rm_base</code>、<code>fork.graft</code> 五个不过路由，留在 CLI——它们的 dry-run 报告与逐步确认是调用的一部分，想跑这些就回到 §2.2.6 / §2.3.7。</div>
+<div class="ok">验收：浏览器打开 <code>https://gfs-console.internal/</code> 能看到登录页；拿 <code>rootops</code> 登录→总览页把八个部署数排成<b>每行 4 个、共两行</b>的统计卡（过期密钥非零时那张转琥珀色），卡下方的「本部署」事实表报出后端+describe 行、元数据根、服务端角色、命名空间（基视图/定义拆开）、凭据（live/expired 拆开）、账号数与活动量；拿 <code>bob</code> 登录→视图页只列 <code>team</code> 一棵，选中一棵基视图时右侧多出它的<b>谱系面板</b>（它的别名/透镜/fork 与逐层向下的子名字），能建 fork、能在密钥页给自己那棵铸一把 <code>mount</code> key 并就地改它的备注与有效期，而“Accounts”页只剩“改自己的口令”；故意输错口令五次→第六次回 <code>429</code> 带 <code>retryAfter</code>；审计页里每一行都带 <code>account=&lt;人&gt;@&lt;ip&gt;</code>，并能按时间窗、平面、事件类型、成败与关键字五个维度检索。五页共用<b>同一套设计系统</b>（字号阶梯与间距令牌、卡片化面板、抽屉与可折叠详情），文案全部过词典、中/英一键切换；密钥页的 key 列是入库的头尾指纹而非明文，这条取舍写在页面上；把某把 key 的副本读回只在属主（或超级账号）那里成功，跨账号被拒。部署为 PG 多实例注册表时，视图页的「新建基视图」表单给出<b>目标实例下拉</b>（清单来自 <code>store.info</code> 的 <code>pgInstances</code>，默认「自动」点名当前最少负载的实例），单实例或非 PG 档不显示这一行；总览页在 PG 档另列出<b>实例账本</b>（每实例放置视图数、控制面标记与哈希路由存量），与非 PG 档改称「本机锚点（--meta-dir）」的锚点行一起，把「树到底住在哪」说成横幅同一句话；端到端断言见 <code>web</code> 套件（183 条断言）。</div>
 
 <div class="chnav"><span>全页完</span><a href="#p1">回到第一部分 ↑</a></div>
 </section>
