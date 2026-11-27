@@ -7,6 +7,7 @@
 
 use super::*;
 use crate::meta::{MetaEngine, MetaStore};
+use std::sync::atomic::AtomicBool;
 
 /// One cached physical tree: the engine plus the stamp of its last resolve.
 type CachedTree = (Arc<MetaStore>, Arc<AtomicU64>);
@@ -65,6 +66,19 @@ struct HaState {
     /// lose the lease or get fenced. A primary admits a write if this is still in
     /// the future — no arbiter round-trip on the hot path.
     lease_deadline: Mutex<Instant>,
+    /// Arbiter re-proof single-flight. `fenced_for_write` runs once per write whose
+    /// cached lease has lapsed, so a burst of writes arriving while the arbiters are
+    /// slow used to mean one full fan-out PER WRITE — `n` probe threads each, every
+    /// one of them holding a meta worker for the whole probe window. The first
+    /// arriver takes the slot and does the round-trip; the rest join its verdict on
+    /// `proof_cv`. Not a skip: every write is still admitted only on a proof at most
+    /// one probe window old.
+    proof_running: AtomicBool,
+    /// Paired with [`HaState::proof_running`] so a woken follower re-reads the
+    /// published verdict rather than the flag (the leader sets role/lease BEFORE it
+    /// touches this mutex, which is what makes the check-then-wait raceless).
+    proof_mu: Mutex<()>,
+    proof_cv: parking_lot::Condvar,
 }
 
 impl HaState {
@@ -76,6 +90,9 @@ impl HaState {
             // No lease yet: the first write (or the startup register) must prove
             // authority at the arbiter before the local fast path is trusted.
             lease_deadline: Mutex::new(Instant::now()),
+            proof_running: AtomicBool::new(false),
+            proof_mu: Mutex::new(()),
+            proof_cv: parking_lot::Condvar::new(),
         })
     }
     fn role(&self) -> Role {
@@ -97,6 +114,14 @@ impl HaState {
     /// through the synchronous arbiter proof.
     fn lease_clear(&self) {
         *self.lease_deadline.lock() = Instant::now();
+    }
+    /// Release the single-flight slot and wake everyone joined on it. Takes
+    /// `proof_mu` around the flag clear so a follower holding that mutex cannot
+    /// miss the notification.
+    fn proof_done(&self) {
+        let _g = self.proof_mu.lock();
+        self.proof_running.store(false, Ordering::SeqCst);
+        self.proof_cv.notify_all();
     }
 }
 
@@ -625,6 +650,12 @@ impl MetaRuntime {
     /// not fail every single write. Sustained unreachability is still handled by
     /// the async fail-safe in the replicator ([`WITNESS_FENCE_GRACE`]), which
     /// self-demotes after the grace window. Returns `true` only on a proven fence.
+    ///
+    /// Latency of this call is bounded twice over: one probe window for the leader
+    /// ([`WITNESS_PROBE_TIMEOUT`], and the fan-out returns as soon as a majority has
+    /// answered rather than when the slowest arbiter gives up) and [`PROOF_JOIN_WAIT`]
+    /// for anyone joining it. That budget is what makes a blocking call acceptable on
+    /// a worker thread at all — see `docs/adr/0005-write-path-blocking-budget.md`.
     fn fenced_for_write(&self) -> bool {
         let (Some(ha), Some(w)) = (&self.ha, &self.witness) else {
             return false;
@@ -635,11 +666,78 @@ impl MetaRuntime {
         if ha.lease_valid() {
             return false; // live lease proves exclusive authority, no round-trip
         }
-        let mine = ha.epoch.load(Ordering::SeqCst);
         let addrs = split_addrs(w);
         let q = quorum_size(addrs.len());
+        // Single-flight: one thread does the fan-out, the rest join its verdict.
+        // Unbounded per-write fan-out is how one slow witness used to occupy every
+        // meta worker at once (`n` probe threads per write, per write) and turn a
+        // blip into a node-wide mount failure. Joining is NOT skipping: a write is
+        // still admitted only on a proof at most one probe window old, and a join
+        // that expires yields the same "no fresh proof" verdict a probe error does.
+        let deadline = Instant::now() + PROOF_JOIN_WAIT;
+        let mut joined = false;
+        loop {
+            // Verdict first, slot second — and re-read on EVERY round. A leader
+            // publishes role/lease before it releases the slot, so anything it proved
+            // is visible here; re-checking is what stops a woken follower from
+            // winning the freed slot and firing a second fan-out for the same burst.
+            if ha.lease_valid() {
+                if joined {
+                    stats::count(stats::Counter::HaProofJoin, 1);
+                }
+                return false;
+            }
+            if ha.role() != Role::Primary {
+                if joined {
+                    stats::count(stats::Counter::HaProofJoin, 1);
+                }
+                return true; // the leader proved the fence; this op refuses as well
+            }
+            if ha
+                .proof_running
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                let fenced = self.arbiter_reproof(ha, &addrs, q);
+                ha.proof_done();
+                return fenced;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                // A stuck leader, not a slow arbiter (the leader bounds itself).
+                stats::count(stats::Counter::HaProofStale, 1);
+                return false;
+            }
+            let mut guard = ha.proof_mu.lock();
+            if !ha.proof_running.load(Ordering::SeqCst) {
+                drop(guard);
+                if joined {
+                    // A proof finished while we were queued and proved NEITHER a
+                    // fence nor a lease (below quorum, or every arbiter silent).
+                    // Re-proving inside the same burst is what we are here to stop:
+                    // the arbiters are no more reachable for us now than they were
+                    // a moment ago, and the async tick owns that case.
+                    stats::count(stats::Counter::HaProofStale, 1);
+                    return false;
+                }
+                continue; // we never waited: still this burst's first prover
+            }
+            let expired = ha.proof_cv.wait_for(&mut guard, left);
+            joined = true;
+            if expired.timed_out() {
+                stats::count(stats::Counter::HaProofStale, 1);
+                return false;
+            }
+        }
+    }
+
+    /// The arbiter round-trip itself, run by whoever holds the single-flight slot.
+    /// Applies the verdict to `ha` and reports whether we are fenced; the caller
+    /// owns releasing the slot ([`HaState::proof_done`]).
+    fn arbiter_reproof(&self, ha: &Arc<HaState>, addrs: &[String], q: usize) -> bool {
+        let mine = ha.epoch.load(Ordering::SeqCst);
         let res = witness_quorum(
-            &addrs,
+            addrs,
             &self.token,
             mine,
             WITNESS_LEASE,
@@ -6450,12 +6548,27 @@ fn max_epoch_on_disk(rt: &MetaRuntime) -> i64 {
     max
 }
 
+/// Connect to a `host:port` peer under an explicit budget. A bare
+/// `TcpStream::connect` runs the OS SYN-retry schedule — minutes on a FILTERED port
+/// (as opposed to a refused one) — which is tolerable on a background thread and
+/// fatal on the write path. Resolving the name is still unbounded (`std` gives the
+/// resolver no deadline), which is why peer/witness addresses are deployed as IPs;
+/// recorded as a residual in `docs/adr/0005-write-path-blocking-budget.md`.
+fn connect_bounded(peer: &str, budget: Duration) -> io::Result<TcpStream> {
+    let sock = peer
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "peer did not resolve"))?;
+    TcpStream::connect_timeout(&sock, budget)
+}
+
 /// Synchronous replication push (L2). Called from the primary's dispatch
 /// thread AFTER `dispatch_meta` committed a mutating op and BEFORE the client
-/// sees its response. Serializes on `rt.standby_push` (concurrent writers
-/// queue), takes a consistent snapshot via `VACUUM INTO`, and issues a
-/// dedicated `M_PUSH` on a fresh control socket; the standby's existing
-/// install-snapshot-then-ACK path (`handle_control_conn` -> `M_PUSH`) does
+/// sees its response. Serializes on `rt.standby_push` (concurrent writers queue up
+/// to `SYNC_PUSH_SLOT_WAIT`, then degrade to async), takes a consistent snapshot
+/// via `VACUUM INTO`, and issues a dedicated `M_PUSH` on a fresh control socket;
+/// the standby's existing install-snapshot-then-ACK path
+/// (`handle_control_conn` -> `M_PUSH`) does
 /// fsync + atomic rename before it replies, so a status-0 response *is* the
 /// durability witness (RPO=0 for this op).
 ///
@@ -6486,14 +6599,26 @@ fn push_snapshot_now(rt: &MetaRuntime, view: &str) {
             Err(_) => return,
         };
     // Serialize pushes: the standby must see a coherent snapshot sequence and
-    // the control protocol is a strict request/response stream.
-    let _g = rt.standby_push.lock();
-    let mut conn = match TcpStream::connect(&peer) {
+    // the control protocol is a strict request/response stream. BOUNDED, because
+    // the guard spans the whole peer round-trip: an unbounded `lock()` here turns
+    // one slow standby into a node-wide write stall — every mutating op on every
+    // view queues behind it, each one holding a meta worker. Losing the slot costs
+    // THIS op its RPO=0, the same honest degradation every other push failure makes,
+    // and the periodic replicator closes the gap on its next tick.
+    let Some(_g) = rt.standby_push.try_lock_for(SYNC_PUSH_SLOT_WAIT) else {
+        eprintln!(
+            "meta sync-repl: push slot busy >{SYNC_PUSH_SLOT_WAIT:?} (a prior snapshot is still in flight); degraded to async for this op"
+        );
+        stats::count(stats::Counter::HaSyncPushDegrade, 1);
+        return;
+    };
+    let mut conn = match connect_bounded(&peer, SYNC_PUSH_CONNECT) {
         Ok(c) => c,
         Err(e) => {
             eprintln!(
                 "meta sync-repl: peer {peer} unreachable ({e}); degraded to async for this op"
             );
+            stats::count(stats::Counter::HaSyncPushDegrade, 1);
             return;
         }
     };
@@ -6688,6 +6813,20 @@ fn classify(replies: &[(i64, bool)], epoch: i64) -> Quorum {
 /// token stores — neither freezes writes (B) nor lets a stale primary resurrect
 /// (C). `n == 1` short-circuits to a single in-line probe (no threads, identical
 /// to the pre-quorum behavior).
+///
+/// The round ends on the FIRST of: a decided majority, every probe settled, or
+/// `timeout` — not on the slowest arbiter. Decided means `fenced(q) || leased(q)`,
+/// and both predicates are monotone in the votes received (each reply can only
+/// increase a bucket), so an early verdict can never be revoked by a late one.
+/// Soundness of stopping early on `leased`/`won` is quorum intersection, the same
+/// argument the promotion path relies on: a peer holding a higher epoch had to
+/// advance a majority itself, so at least one arbiter is shared and would answer
+/// `prev > epoch` here, keeping us below `leased`. What an early exit does give up
+/// is a straggler's contribution to `prev_max` — a lower adopted epoch after a
+/// fence, which the next quorum round (or a refused claim at that arbiter) corrects.
+/// Deliberately detached probe threads: a `thread::scope` join would block on
+/// exactly the straggler we are trying to stop waiting for, and each probe bounds
+/// itself (connect, read and write all take `timeout`).
 fn witness_quorum(
     addrs: &[String],
     token: &str,
@@ -6701,16 +6840,35 @@ fn witness_quorum(
             Err(_) => classify(&[], epoch),
         };
     }
-    let replies: Vec<(i64, bool)> = std::thread::scope(|s| {
-        let handles: Vec<_> = addrs
-            .iter()
-            .map(|a| s.spawn(|| witness_probe_one(a, token, epoch, ttl, timeout).ok()))
-            .collect();
-        handles
-            .into_iter()
-            .filter_map(|h| h.join().ok().flatten())
-            .collect()
-    });
+    let q = quorum_size(addrs.len());
+    let (tx, rx) = std::sync::mpsc::channel::<(i64, bool)>();
+    let deadline = Instant::now() + timeout;
+    for a in addrs {
+        let (tx, a, token) = (tx.clone(), a.clone(), token.to_string());
+        thread::spawn(move || {
+            // An errored probe sends nothing: it is a vote we did not get, which is
+            // how it was already counted when the caller joined every thread.
+            if let Ok(v) = witness_probe_one(&a, &token, epoch, ttl, timeout) {
+                let _ = tx.send(v);
+            }
+        });
+    }
+    drop(tx);
+    let mut replies: Vec<(i64, bool)> = Vec::with_capacity(addrs.len());
+    while replies.len() < addrs.len() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(v) => {
+                replies.push(v);
+                let res = classify(&replies, epoch);
+                if res.fenced(q) || res.leased(q) {
+                    return res;
+                }
+            }
+            // Deadline reached, or every probe settled without reaching a majority.
+            Err(_) => break,
+        }
+    }
     classify(&replies, epoch)
 }
 
@@ -6801,7 +6959,7 @@ fn start_replicator(rt: Arc<MetaRuntime>) {
                     eprintln!("meta HA: cannot form lease quorum ({}/{} reachable, need {q}); within grace, holding primary", res.reachable, addrs.len());
                 }
             }
-            let mut conn = match TcpStream::connect(&peer) {
+            let mut conn = match connect_bounded(&peer, CONTROL_TIMEOUT) {
                 Ok(c) => c,
                 Err(_) => continue, // peer down: nothing to ship this cycle
             };
@@ -7821,6 +7979,211 @@ mod ha_tests {
             9,
             "must adopt the witness epoch"
         );
+    }
+
+    /// A `MetaRuntime` shaped like one half of an HA pair over an empty tree dir,
+    /// for the tests that exercise the WRITE-PATH blocking surface (arbiter proof,
+    /// sync-repl push slot) rather than the metadata itself.
+    fn test_rt(
+        base: &std::path::Path,
+        ha: Option<Arc<HaState>>,
+        peer: Option<String>,
+        witness: Option<String>,
+        sync_repl: bool,
+    ) -> MetaRuntime {
+        MetaRuntime {
+            base: base.to_path_buf(),
+            token: String::new(),
+            data_access_key: None,
+            data_access_ttl: 0,
+            keys: None,
+            cache: Arc::new(Mutex::new(HashMap::new())),
+            views: Arc::new(Mutex::new(HashMap::new())),
+            bases: Arc::new(Mutex::new(HashMap::new())),
+            defs: Arc::new(Mutex::new(HashMap::new())),
+            control: crate::mcp::control_store_for(base, None)
+                .expect("file control store is infallible"),
+            subs: Arc::new(Mutex::new(HashMap::new())),
+            ha,
+            peer,
+            forward: Mutex::new(Vec::new()),
+            sync_repl,
+            standby_push: Mutex::new(()),
+            witness,
+            store: StoreKind::Sqlite,
+            engine_idle_ms: 0,
+            audit_retention: Mutex::new(None),
+            ctl_keys: None,
+            web_auth: None,
+            xfer_owner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[test]
+    fn witness_quorum_decides_before_the_slowest_arbiter_answers() {
+        // A re-proof runs on a meta WORKER, so its wall clock is the budget that
+        // matters. Joining every probe thread used to stretch the round to the full
+        // timeout because of ONE blackholed arbiter, even after the majority had
+        // already granted the lease.
+        use crate::backend::{self, StorageBackend};
+        use crate::remote::server::{serve_on_auth, Fence};
+
+        let dir = tempfile::Builder::new()
+            .prefix("yf_qearly_")
+            .tempdir()
+            .unwrap();
+        let mut addrs = Vec::new();
+        for _ in 0..2 {
+            let backend: Arc<dyn StorageBackend> =
+                Arc::from(backend::open_local(dir.path()).unwrap());
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            addrs.push(listener.local_addr().unwrap().to_string());
+            std::thread::spawn(move || {
+                serve_on_auth(listener, backend, "", Arc::new(Fence::new_in_memory()))
+            });
+        }
+        // The third arbiter never answers: the kernel backlog completes its
+        // `accept`, so `connect` succeeds and only the read times out — the exact
+        // shape of a filtered or wedged witness.
+        let dead = TcpListener::bind("127.0.0.1:0").unwrap();
+        addrs.push(dead.local_addr().unwrap().to_string());
+
+        let timeout = Duration::from_millis(1500);
+        let started = Instant::now();
+        let res = witness_quorum(&addrs, "", 5, WITNESS_LEASE, timeout);
+        let elapsed = started.elapsed();
+        let q = quorum_size(addrs.len());
+        assert!(
+            res.leased(q),
+            "two granting arbiters are a quorum of three: {res:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(900),
+            "the round must end when the majority answers, not when the straggler 
+             gives up: {elapsed:?} of a {timeout:?} budget"
+        );
+    }
+
+    #[test]
+    fn fenced_for_write_proves_at_the_arbiter_once_per_burst() {
+        // One slow arbiter plus a burst of expired-lease writes used to mean one
+        // fan-out PER WRITE — each opening its own connection to the witness and
+        // each parking a worker. The single-flight slot makes it ONE round-trip
+        // whose verdict everybody joins.
+        let dir = tempfile::Builder::new()
+            .prefix("yf_proof1_")
+            .tempdir()
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let waddr = listener.local_addr().unwrap().to_string();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let counted = accepts.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                counted.fetch_add(1, Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut writer = stream;
+                    while let Ok((op, body)) = proto::recv_request(&mut reader) {
+                        if op == proto::OP_OPEN {
+                            let _ = proto::send_response(&mut writer, 0, 0, &[]);
+                            continue;
+                        }
+                        if op == proto::OP_FENCE {
+                            // Hold the proof open long enough that the whole burst
+                            // arrives while it is still in flight.
+                            thread::sleep(Duration::from_millis(400));
+                            let mut i = 0usize;
+                            let _sent = proto::read_u64(&body, &mut i).unwrap_or(0);
+                            // prev = 0 < our epoch: this claim ADVANCES the token.
+                            let mut d = Vec::new();
+                            d.extend_from_slice(&0u64.to_be_bytes());
+                            d.push(1u8); // granted
+                            let _ = proto::send_response(&mut writer, 0, 0, &d);
+                        }
+                        break;
+                    }
+                });
+            }
+        });
+
+        let ha = HaState::new(Role::Primary);
+        ha.epoch.store(5, Ordering::SeqCst);
+        let rt = Arc::new(test_rt(
+            dir.path(),
+            Some(ha.clone()),
+            Some("127.0.0.1:1".to_string()),
+            Some(waddr),
+            false,
+        ));
+
+        let start = Arc::new(std::sync::Barrier::new(9));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let rt = rt.clone();
+            let start = start.clone();
+            handles.push(std::thread::spawn(move || {
+                start.wait();
+                rt.fenced_for_write()
+            }));
+        }
+        let started = Instant::now();
+        start.wait(); // release the burst together, so it really does overlap
+        for h in handles {
+            assert!(!h.join().unwrap(), "an advancing arbiter must not fence us");
+        }
+        let elapsed = started.elapsed();
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "one fan-out per burst, not one per write"
+        );
+        assert!(
+            ha.lease_valid(),
+            "the joined verdict must establish the cached lease"
+        );
+        assert_eq!(ha.role(), Role::Primary);
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "the burst was served off one proof, not eight: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn sync_push_degrades_instead_of_queueing_behind_a_slow_standby() {
+        // The push slot is held across an entire peer round-trip. Waiting on it
+        // without bound makes one slow standby a node-wide write stall — every
+        // mutating op on every view queues there, each one holding a meta worker.
+        // The bounded wait degrades THIS op to async, which is the same honest
+        // degradation a refused peer or an ACK timeout already makes.
+        let dir = tempfile::Builder::new()
+            .prefix("yf_pushslot_")
+            .tempdir()
+            .unwrap();
+        let ha = HaState::new(Role::Primary);
+        let rt = Arc::new(test_rt(
+            dir.path(),
+            Some(ha.clone()),
+            Some("127.0.0.1:1".to_string()),
+            None,
+            true,
+        ));
+        // Pretend a previous snapshot is still being shipped.
+        let busy = rt.standby_push.lock();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let rt2 = rt.clone();
+        std::thread::spawn(move || {
+            push_snapshot_now(&rt2, "v1");
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(SYNC_PUSH_SLOT_WAIT + Duration::from_millis(700))
+                .is_ok(),
+            "a busy push slot must degrade, not queue until the holder releases it"
+        );
+        assert_eq!(ha.role(), Role::Primary, "a degrade is not a demotion");
+        drop(busy);
     }
 
     #[test]

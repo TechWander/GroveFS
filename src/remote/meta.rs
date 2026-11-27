@@ -235,6 +235,36 @@ const WITNESS_LEASE_SLACK: Duration = Duration::from_millis(500);
 #[cfg(feature = "native")]
 const WITNESS_PROBE_TIMEOUT: Duration = Duration::from_millis(1000);
 
+/// How long a write waits for someone else's in-flight arbiter re-proof before it
+/// stops waiting ([`fenced_for_write`], taken only when the local lease has
+/// already expired).
+/// One probe window plus a spawn allowance: the leader is bounded by
+/// [`WITNESS_PROBE_TIMEOUT`] itself, so a follower that exceeds this has hit a
+/// stuck worker, not a slow arbiter, and must not queue up behind it. Timing out
+/// here NEVER means "fenced" — it means "no fresh proof this round", the same
+/// verdict a transient arbiter error already yields.
+#[cfg(feature = "native")]
+const PROOF_JOIN_WAIT: Duration = Duration::from_millis(1250);
+
+/// Connect budget for the SYNCHRONOUS replication push (`--sync-repl`). A bare
+/// `TcpStream::connect` runs the OS SYN-retry schedule (minutes) when a standby's
+/// port is filtered rather than refused, and that call sits ON the write path
+/// while the global push slot is held — so one blackholed peer used to be able to
+/// occupy every meta worker at once. Same value as [`WITNESS_PROBE_TIMEOUT`]: the
+/// failure mode is identical, and exceeding it degrades this op to async exactly
+/// like every other push failure.
+#[cfg(feature = "native")]
+const SYNC_PUSH_CONNECT: Duration = WITNESS_PROBE_TIMEOUT;
+
+/// How long a mutating op waits for the (single) in-flight snapshot push before
+/// degrading itself to async. The push owns `rt.standby_push` across a whole
+/// `VACUUM INTO` + transfer + ACK, so an unbounded `lock()` here serializes every
+/// writer on the node behind one peer's round-trip. A short bounded wait keeps
+/// RPO=0 for the common case (pushes are fast) while a slow peer costs other
+/// views their push for ONE tick, which is what the async replicator is for.
+#[cfg(feature = "native")]
+const SYNC_PUSH_SLOT_WAIT: Duration = Duration::from_millis(200);
+
 #[cfg(feature = "native")]
 fn err_code(e: &MetaError) -> i32 {
     match e {

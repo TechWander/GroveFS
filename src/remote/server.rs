@@ -52,6 +52,13 @@ fn node_hostname() -> String {
     std::env::var("HOSTNAME").unwrap_or_else(|_| "<unknown>".to_string())
 }
 
+/// What [`Fence::lease`] should do after reading the token under the SHARED gate:
+/// answer straight away (no token change), or upgrade to EXCLUSIVE and drain.
+enum Verdict {
+    Answer((u64, u64, bool)),
+    Promote,
+}
+
 /// Monotonic fencing token held by the witness (the `data-server`).
 ///
 /// A node folds its HA epoch in via [`Fence::claim`]; the arbiter hands back the
@@ -74,7 +81,9 @@ fn node_hostname() -> String {
 /// ops hold it SHARED across their epoch check AND the backend write, so they
 /// run concurrently with each other (no throughput loss); a promotion claim
 /// takes it EXCLUSIVE, so it waits for every in-flight write to drain before
-/// folding a higher epoch. Because the witness and the storage live in this one
+/// folding a higher epoch. A RENEW (`sent == cur`) stays SHARED — it moves no
+/// token, so draining for it would only stall the cluster's routine heartbeats
+/// (see [`Fence::lease`]). Because the witness and the storage live in this one
 /// process, that drain is exactly what makes a fenced-then-promoted primary's
 /// writes never physically overlap a stale epoch's writes on the same object —
 /// closing the torn-write window at its implementation root, not just bounding
@@ -158,10 +167,11 @@ impl Fence {
 
     /// Lease-aware claim: fold `sent` into the monotonic token AND hold a
     /// time-bounded, NON-OVERLAPPING lease of `ttl_ms` for the resulting holder.
-    /// Returns `(prev, granted_until_ms, granted)`.
+    /// Returns `(prev, granted_until_ms, granted)`, same tuple as before.
     ///
-    /// Rules, all decided under the exclusive gate so the token and the lease
-    /// move together (and a promotion still drains in-flight writes):
+    /// Rules:
+    /// - `sent < cur` (stale) and `sent == cur` (renew) are decided under the gate
+    ///   SHARED (upgradable read); only a real PROMOTION takes it EXCLUSIVE.
     /// - `sent > cur` (promotion): grant ONLY if no live incumbent lease blocks
     ///   it — `cur == 0` (cold start) or the arbiter clock is already at/past
     ///   `lease_until_ms`. Otherwise refuse (`granted = false`) and hand back the
@@ -169,10 +179,60 @@ impl Fence {
     ///   non-overlap guarantee: the arbiter physically cannot hand a lease to a
     ///   second node while the first is live, so a holder can trust a locally
     ///   cached lease instead of re-proving per write.
-    /// - `sent == cur` (renew, or the very first grant at epoch 0): extend.
-    /// - `sent < cur` (stale): refuse, surface the incumbent token + expiry.
+    ///
+    /// Why the renew must NOT drain: a live primary re-claims its epoch at every
+    /// witness once per `REPL_INTERVAL` (500 ms), and each of those is a
+    /// `sent == cur` call. Taking the EXCLUSIVE gate for them meant every routine
+    /// heartbeat had to wait for all in-flight data-plane writes to land before
+    /// answering — a periodic, cluster-wide write stall whose length was the
+    /// slowest open write on the node. The token does not move on a renew, so
+    /// there is nothing for a write to be linearized against: the shared gate
+    /// still excludes a concurrent promotion (which needs EXCLUSIVE), so `cur`
+    /// cannot move between our load and our store, and two concurrent renews
+    /// both extend their own epoch, which is idempotent. A promotion keeps the
+    /// full drain, and still persists the advanced token before answering.
     pub fn lease(&self, sent: u64, ttl_ms: u64) -> (u64, u64, bool) {
-        let _gate = self.gate.write();
+        let gate = self.gate.upgradable_read();
+        match self.decide(&gate, sent, ttl_ms) {
+            // Non-promotion verdicts need no drain: answer under the shared gate.
+            Verdict::Answer(v) => v,
+            Verdict::Promote => {
+                // Upgrading instead of drop-then-write keeps us first in line: no
+                // peer promotion can fold a different epoch between reading `cur`
+                // here and taking the gate exclusively (other readers cannot
+                // promote, they would need the same exclusive gate). `promote`
+                // re-reads anyway, which costs nothing and keeps it correct alone.
+                let _gate = parking_lot::RwLockUpgradableReadGuard::upgrade(gate);
+                self.promote(sent, ttl_ms)
+            }
+        }
+    }
+
+    /// The `sent <= cur` half of [`Fence::lease`] — no token change, so no drain.
+    /// `_gate` is only carried to make the holding of the shared lock explicit at
+    /// the call site; it is what excludes a concurrent [`Fence::promote`].
+    fn decide(
+        &self,
+        _gate: &parking_lot::RwLockUpgradableReadGuard<'_, ()>,
+        sent: u64,
+        ttl_ms: u64,
+    ) -> Verdict {
+        let cur = self.cur.load(Ordering::SeqCst);
+        if sent > cur {
+            return Verdict::Promote;
+        }
+        let held_until = self.lease_until_ms.load(Ordering::SeqCst);
+        if sent < cur {
+            return Verdict::Answer((cur, held_until, false));
+        }
+        let until = now_ms() + ttl_ms;
+        self.lease_until_ms.store(until, Ordering::SeqCst);
+        Verdict::Answer((cur, until, true))
+    }
+
+    /// The `sent > cur` half, run under the EXCLUSIVE gate: drain in-flight
+    /// writes, enforce non-overlap, fold, persist, then grant.
+    fn promote(&self, sent: u64, ttl_ms: u64) -> (u64, u64, bool) {
         let now = now_ms();
         let cur = self.cur.load(Ordering::SeqCst);
         let held_until = self.lease_until_ms.load(Ordering::SeqCst);
@@ -180,11 +240,11 @@ impl Fence {
             return (cur, held_until, false);
         }
         if sent == cur {
+            // A concurrent promotion already folded our epoch: this is a renew.
             let until = now + ttl_ms;
             self.lease_until_ms.store(until, Ordering::SeqCst);
             return (cur, until, true);
         }
-        // Promotion: enforce non-overlap against a still-live incumbent lease.
         if cur != 0 && now < held_until {
             return (cur, held_until, false);
         }
@@ -962,6 +1022,64 @@ mod tests {
         // A stale lower epoch is fenced outright.
         let (prev, _, granted) = f.lease(4, 60_000);
         assert_eq!((prev, granted), (5, false), "stale epoch fenced");
+    }
+
+    /// The renew path must NOT drain: a live primary re-claims its own epoch at
+    /// every witness once per `REPL_INTERVAL` (500 ms), and each of those is a
+    /// `sent == cur` call. Holding the exclusive gate for them meant a routine
+    /// heartbeat stalled the node's entire write surface for as long as its slowest
+    /// open write. A promotion keeps the drain; a renew and a stale verdict answer
+    /// while that same write is still in flight.
+    #[test]
+    fn lease_renew_answers_without_draining_writes() {
+        use std::sync::mpsc;
+        use std::sync::Arc;
+        use std::time::Duration;
+        let f = Arc::new(Fence::new_in_memory());
+        assert!(f.lease(5, 0).2, "cold grant at epoch 5");
+        // `ttl_ms` is 0 throughout so the lease window never blocks the promotion
+        // asserted at the end; the drain behaviour under test is independent of it.
+
+        // An in-flight data-plane write: the SHARED gate, as `handle_conn` holds it
+        // across its epoch check plus the backend dispatch.
+        let held = f.write_gate();
+
+        let (tx, rx) = mpsc::channel();
+        let f2 = f.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(f2.lease(5, 0));
+        });
+        let (prev, _, granted) = rx
+            .recv_timeout(Duration::from_millis(300))
+            .expect("a same-epoch renew must answer while a write is in flight");
+        assert_eq!((prev, granted), (5, true), "renew grants its own epoch");
+
+        let (tx, rx) = mpsc::channel();
+        let f3 = f.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(f3.lease(4, 0));
+        });
+        let (prev, _, granted) = rx
+            .recv_timeout(Duration::from_millis(300))
+            .expect("a stale verdict reads the token, it does not wait for writes");
+        assert_eq!((prev, granted), (5, false), "stale epoch fenced");
+
+        // The half that must NOT regress: a real promotion still drains.
+        let (tx, rx) = mpsc::channel();
+        let f4 = f.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(f4.lease(6, 0));
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(120)).is_err(),
+            "promotion must still wait for the in-flight write to drain"
+        );
+        drop(held);
+        let (prev, _, granted) = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("promotion proceeds once the write lands");
+        assert_eq!((prev, granted), (5, true), "won after the drain");
+        assert_eq!(f.peek(), 6);
     }
 
     /// With a zero-length lease the incumbent expires immediately, so the next
