@@ -302,7 +302,10 @@ fn storage_snapshot(store: &StoreKind, base: &Path) -> serde_json::Value {
 /// Everything a connection thread needs to serve a node. Wrapped in `Arc` so the
 /// accept loop hands one to each spawned thread and the HA background threads
 /// share the same cache / role / peer view.
-struct MetaRuntime {
+///
+/// `pub(super)` only because the sibling [`epoll`] module names it in its step-function
+/// signature; nothing outside `remote::meta` can see it.
+pub(super) struct MetaRuntime {
     base: PathBuf,
     token: String,
     /// Shared HMAC key for minting the Data-Access Capability
@@ -1373,6 +1376,195 @@ fn serve_on_meta_full(
     serve_runtime(listener, rt);
 }
 
+/// Hand one plane's listener to the epoll event loops.
+///
+/// `Ok(handles)` means the loops took it over (they hold their own `try_clone` of the fd,
+/// so the caller's `TcpListener` may drop — the socket stays open while a dup lives); the
+/// handles are the loops themselves, and the caller MUST join them: an accept loop used to
+/// be this function's caller's own infinite loop, so returning early would let a
+/// `meta-server` main exit while its sockets are still open. `Err` means the caller must
+/// serve it the old way. `GROVEFS_META_THREADS=1` is the operator's escape hatch back to
+/// thread-per-connection, for A/B-ing the two planes on one host.
+#[cfg(all(feature = "native", target_os = "linux"))]
+fn epoll_takeover(
+    listener: &TcpListener,
+    from_gov: bool,
+    rt: Arc<MetaRuntime>,
+) -> io::Result<Vec<thread::JoinHandle<()>>> {
+    if std::env::var("GROVEFS_META_THREADS").ok().as_deref() == Some("1") {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "GROVEFS_META_THREADS=1",
+        ));
+    }
+    let step: super::epoll::Step = Arc::new(meta_epoll_step);
+    let joins = super::epoll::spawn(listener, from_gov, rt, step)?;
+    let plane = if from_gov { "control" } else { "mount" };
+    println!(
+        "meta-server: {plane} plane on epoll ({} loops, {} backend workers; GROVEFS_META_THREADS=1 for the thread-per-connection shape)",
+        super::epoll::LOOPS,
+        super::epoll::worker_count()
+    );
+    Ok(joins)
+}
+
+/// The epoll plane's per-frame step: run the SAME handler body the thread plane runs
+/// (`meta_open` / `meta_work` / `control_step` / `gov_one`), but write the response into
+/// the connection's frame queue instead of onto its socket.
+///
+/// Nothing here blocks on I/O toward the client — the socket is owned by the loop, and a
+/// connection that cannot drain is retired by it rather than waited on here. Blocking
+/// toward the BACKEND is what a worker is for, which is why this runs on the pool.
+#[cfg(all(feature = "native", target_os = "linux"))]
+fn meta_epoll_step(
+    rt: &Arc<MetaRuntime>,
+    h: &super::epoll::Handle,
+    op: u8,
+    body: &[u8],
+) -> io::Result<()> {
+    use super::epoll::ConnRole;
+    let role = match h.role() {
+        Some(r) => r,
+        // The loop retired this connection while its frame was in flight: the client is
+        // gone, and there is nothing to answer.
+        None => return Ok(()),
+    };
+    let mut sink = h.sink();
+    match role {
+        ConnRole::Handshake => {
+            if h.gov_plane() {
+                h.set_role(ConnRole::Gov);
+                let mut sess: Option<GovSession> = None;
+                let keep = gov_one(&mut sink, rt, &mut sess, op, body)?;
+                sink.finish()?;
+                if let Some(s) = sess {
+                    h.put_session(s);
+                }
+                if !keep {
+                    h.kill();
+                }
+                return Ok(());
+            }
+            match op {
+                M_OPEN => {
+                    let sess = meta_open(&mut sink, rt, body)?;
+                    sink.finish()?;
+                    match sess {
+                        // `meta_open` answers one way or the other; a refusal means the
+                        // handshake failed and the socket is done, exactly as on a thread.
+                        Some(s) => {
+                            h.set_role(ConnRole::Work);
+                            h.put_session(s);
+                        }
+                        None => h.kill(),
+                    }
+                }
+                M_PING | M_PUSH => {
+                    h.set_role(ConnRole::Peer);
+                    let ha = match &rt.ha {
+                        // A non-HA node never expects control traffic; ignore it.
+                        None => {
+                            h.kill();
+                            return Ok(());
+                        }
+                        Some(x) => x.clone(),
+                    };
+                    let keep = control_step(&mut sink, rt, &ha, op, body)?;
+                    sink.finish()?;
+                    if !keep {
+                        h.kill();
+                    }
+                }
+                _ => {
+                    proto::send_response(&mut sink, E_DB, 0, &[])?;
+                    sink.finish()?;
+                    h.kill();
+                }
+            }
+        }
+        ConnRole::Work => {
+            let mut sess = match h.take_session::<MetaSession>() {
+                Some(s) => s,
+                None => {
+                    h.kill();
+                    return Ok(());
+                }
+            };
+            if op == M_SUBSCRIBE {
+                // A derived subscriber registers under its own name AND its physical base,
+                // as `serve_subscriber` did on the thread plane; the connection then goes
+                // send-only (`ConnRole::Push`), which is what that thread's blocking
+                // `recv_request` loop was standing in for.
+                let view = sess.view.clone();
+                h.put_session(sess);
+                epoll_register_subscriber(rt, h, &view);
+                return Ok(());
+            }
+            let keep = meta_work(&mut sink, rt, &mut sess, op, body)?;
+            sink.finish()?;
+            h.put_session(sess);
+            if !keep {
+                h.kill();
+            }
+        }
+        ConnRole::Peer => {
+            let ha = match &rt.ha {
+                None => {
+                    h.kill();
+                    return Ok(());
+                }
+                Some(x) => x.clone(),
+            };
+            let keep = control_step(&mut sink, rt, &ha, op, body)?;
+            sink.finish()?;
+            if !keep {
+                h.kill();
+            }
+        }
+        ConnRole::Gov => {
+            let mut sess: Option<GovSession> = h.take_session();
+            let keep = gov_one(&mut sink, rt, &mut sess, op, body)?;
+            sink.finish()?;
+            match sess {
+                Some(s) => h.put_session(s),
+                // A session that ended (revoked, or its last pinned request) takes the
+                // socket with it; the caller was answered before either happened.
+                None => h.kill(),
+            }
+            if !keep {
+                h.kill();
+            }
+        }
+        // A subscriber sends no requests; the loop drops its frames before dispatching.
+        ConnRole::Push => {}
+    }
+    Ok(())
+}
+
+/// Register an epoll-plane subscriber: ack first, then hand the connection's queue to
+/// every bucket. The order is the reverse of `serve_subscriber`'s (register, ack) and
+/// deliberately so — on the thread plane a concurrent broadcast could land an event frame
+/// BEFORE the subscribe ack, and the client would read the event as its handshake reply.
+/// Here both go through one FIFO queue, so the ack is always first.
+#[cfg(all(feature = "native", target_os = "linux"))]
+fn epoll_register_subscriber(rt: &Arc<MetaRuntime>, h: &super::epoll::Handle, view: &str) {
+    let buckets = subscribe_buckets(rt, view);
+    let mut sink = h.sink();
+    let _ = proto::send_response(&mut sink, 0, 0, &[]);
+    if sink.finish().is_err() {
+        return;
+    }
+    let id = NEXT_SUB.fetch_add(1, Ordering::Relaxed);
+    h.note_sub(id, buckets.clone());
+    let sink = Arc::new(Mutex::new(SubSink::Fd(h.clone())));
+    let mut reg = rt.subs.lock();
+    for b in &buckets {
+        reg.entry(b.clone())
+            .or_default()
+            .insert(id, Arc::clone(&sink));
+    }
+}
+
 fn serve_runtime(listener: TcpListener, rt: Arc<MetaRuntime>) {
     // One ticker carries two jobs: engine eviction (an idle view releases its
     // WHOLE pool) and pool reaping (a burst above the warm floor is shed back).
@@ -1420,6 +1612,35 @@ fn serve_runtime(listener: TcpListener, rt: Arc<MetaRuntime>) {
             }
         });
     }
+    // The epoll plane owns both directions of a connection (read, frame split, write,
+    // lifetime), so the per-connection thread disappears: an idle mount, a subscriber
+    // waiting for an invalidation and a half-open peer cost a buffer, not an OS thread
+    // with an 8 MiB stack. On failure (or `GROVEFS_META_THREADS=1`, or a non-Linux host)
+    // fall through to the historical shape below, which stays supported.
+    //
+    // The join is not ceremony: `serve_runtime` is the meta-server's foreground service,
+    // and the caller's `for stream in listener.incoming()` loop is what used to keep the
+    // process alive. Ownership of the sockets moves to the loop threads, so this thread
+    // parks on them. If they ever do return (a loop that could not start, an exit we did
+    // not expect) the ORIGINAL listener is still open — `spawn` only ever dup'd it — so
+    // falling through resumes service on the historical shape instead of letting the
+    // process go quietly deaf.
+    #[cfg(all(feature = "native", target_os = "linux"))]
+    if let Ok(joins) = epoll_takeover(&listener, false, rt.clone()) {
+        for j in joins {
+            let _ = j.join();
+        }
+        eprintln!(
+            "meta-server: mount plane event loops exited; resuming thread-per-connection accept"
+        );
+    }
+    accept_loop_meta(listener, rt);
+}
+
+/// The thread-per-connection mount plane: one thread per accepted socket, for as long as
+/// that socket lives. Kept for `GROVEFS_META_THREADS=1`, for non-Linux builds, and as the
+/// fallback if the event loops cannot start.
+fn accept_loop_meta(listener: TcpListener, rt: Arc<MetaRuntime>) {
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
@@ -1465,6 +1686,27 @@ fn serve_runtime(listener: TcpListener, rt: Arc<MetaRuntime>) {
 // the process that opened it, and it is re-checked against the store on the
 // same [`crate::apikeys::KEY_RECHECK`] tick a live mount is.
 fn gov_accept(listener: TcpListener, rt: Arc<MetaRuntime>) {
+    // Same two planes here, and the governance port is served by its own loops: an admin
+    // call that waits on the control store must not be able to delay a mount's frames.
+    // As on the mount plane this thread parks on the loops for the life of the process —
+    // it is the thread `serve_on_meta_auth` spawned to BE the accept loop.
+    #[cfg(all(feature = "native", target_os = "linux"))]
+    if let Ok(joins) = epoll_takeover(&listener, true, rt.clone()) {
+        for j in joins {
+            let _ = j.join();
+        }
+        eprintln!(
+            "meta-server: control plane event loops exited; resuming thread-per-connection accept"
+        );
+    }
+    accept_loop_gov(listener, rt);
+}
+
+/// The thread-per-connection governance plane (see [`accept_loop_meta`]). A pinned admin
+/// session is held open BETWEEN requests by design, so each one carries a thread until
+/// [`GOV_PINNED_IDLE`] or keepalive ends it; the epoll plane enforces the same bound in
+/// its sweep instead.
+fn accept_loop_gov(listener: TcpListener, rt: Arc<MetaRuntime>) {
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
@@ -1491,7 +1733,7 @@ fn gov_accept(listener: TcpListener, rt: Arc<MetaRuntime>) {
 /// One governance response: `STATUS 0` with an `{ok,r}` / `{ok:false,e}`
 /// envelope in the body. Failures are NEVER a transport-level status, so a
 /// caller can tell "the op said no" from "the server went away".
-fn gov_reply(s: &mut TcpStream, result: serde_json::Value, err: Option<&str>) -> io::Result<()> {
+fn gov_reply<W: Write>(s: &mut W, result: serde_json::Value, err: Option<&str>) -> io::Result<()> {
     gov_reply_pinned(s, result, err, false)
 }
 
@@ -1499,8 +1741,8 @@ fn gov_reply(s: &mut TcpStream, result: serde_json::Value, err: Option<&str>) ->
 /// another request on this socket?". `pinned` is only ever ADDED when true, so
 /// the envelope a one-shot caller parses — and every caller built before
 /// sessions existed — is byte-identical to the old one, and silence means no.
-fn gov_reply_pinned(
-    s: &mut TcpStream,
+fn gov_reply_pinned<W: Write>(
+    s: &mut W,
     result: serde_json::Value,
     err: Option<&str>,
     pinned: bool,
@@ -1679,8 +1921,8 @@ fn handle_gov_conn(mut sock: TcpStream, rt: &Arc<MetaRuntime>) -> io::Result<()>
 /// The order of the gates is the one this handler has always had and it matters:
 /// credential first (nothing is audited as anybody until somebody is proven),
 /// then the sign-in case, then the console account's delegations, then the op.
-fn gov_one(
-    sock: &mut TcpStream,
+fn gov_one<W: Write>(
+    sock: &mut W,
     rt: &Arc<MetaRuntime>,
     sess: &mut Option<GovSession>,
     op_code: u8,
@@ -5046,13 +5288,57 @@ enum Event {
     Inode { ino: i64 },
 }
 
-/// Per-view set of event-sink sockets (write halves), keyed by a connection id
-/// so each subscriber thread can unregister exactly its own handle on EOF.
-/// Each sink is a per-subscriber `Arc<Mutex<TcpStream>>` shared across every
+/// Where a subscriber's event frames go.
+///
+/// Two planes, two answers, one registry: `broadcast` runs on op threads and on the
+/// replicator, and it must not care whether the subscriber's socket is owned by a
+/// dedicated thread (which may block on it) or by an epoll loop (which must never be
+/// driven from here).
+enum SubSink {
+    /// Thread plane: write the socket directly, under the 2s bound below.
+    Tcp(TcpStream),
+    /// Epoll plane: append to the connection's frame queue; its loop owns the socket.
+    #[cfg(all(feature = "native", target_os = "linux"))]
+    Fd(super::epoll::Handle),
+}
+
+impl SubSink {
+    /// Push one event. An error means this subscriber is done, and `broadcast` prunes it.
+    fn send_event(&mut self, ev: &Event) -> io::Result<()> {
+        match self {
+            SubSink::Tcp(s) => send_event(s, ev),
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            SubSink::Fd(h) => {
+                let mut f = h.sink();
+                send_event(&mut f, ev)?;
+                // A `false` from the queue push (connection gone, or its write queue blew
+                // past its bound) already retired it inside the loop; report the failure so
+                // the registry entry goes with it.
+                f.finish()
+            }
+        }
+    }
+}
+
+/// Per-view set of event sinks (write halves), keyed by a connection id
+/// so each subscriber can unregister exactly its own handle when its connection ends —
+/// at EOF on the thread plane, when its fd is retired on the epoll plane ([`subs_remove`]).
+/// Each sink is a per-subscriber `Arc<Mutex<SubSink>>` shared across every
 /// bucket it registered under (its own view + physical base), so concurrent
 /// broadcasts serialize only against the SAME socket (preserving frame
 /// atomicity), never against the whole registry.
-type Subscribers = Arc<Mutex<HashMap<String, HashMap<u64, Arc<Mutex<TcpStream>>>>>>;
+type Subscribers = Arc<Mutex<HashMap<String, HashMap<u64, Arc<Mutex<SubSink>>>>>>;
+
+/// Drop one subscriber's sink from every bucket it registered under. The mirror of the
+/// removal `serve_subscriber` used to run after its blocking read returned EOF.
+pub(super) fn subs_remove(rt: &MetaRuntime, id: u64, buckets: &[String]) {
+    let mut reg = rt.subs.lock();
+    for b in buckets {
+        if let Some(map) = reg.get_mut(b) {
+            map.remove(&id);
+        }
+    }
+}
 
 /// Monotonic id handed to each subscriber connection.
 static NEXT_SUB: AtomicU64 = AtomicU64::new(1);
@@ -5075,7 +5361,7 @@ fn broadcast(subs: &Subscribers, view: &str, events: &[Event]) {
     if events.is_empty() {
         return;
     }
-    let sinks: Vec<(u64, Arc<Mutex<TcpStream>>)> = {
+    let sinks: Vec<(u64, Arc<Mutex<SubSink>>)> = {
         let reg = subs.lock();
         match reg.get(view) {
             Some(map) => map.iter().map(|(id, s)| (*id, Arc::clone(s))).collect(),
@@ -5086,7 +5372,7 @@ fn broadcast(subs: &Subscribers, view: &str, events: &[Event]) {
     for (id, sink) in sinks {
         let mut s = sink.lock();
         for ev in events {
-            if send_event(&mut s, ev).is_err() {
+            if s.send_event(ev).is_err() {
                 // A sink that can't be drained (write-timeout on a subscriber
                 // that stopped reading, or a dropped socket) is pruned; count it
                 // so a slow/leaky subscriber shows up as a growing signal.
@@ -5157,7 +5443,7 @@ fn broadcast_derived_display(rt: &MetaRuntime, phys: &str, events: &[Event]) {
     }
 }
 
-fn send_event(s: &mut TcpStream, ev: &Event) -> io::Result<()> {
+fn send_event<W: Write>(s: &mut W, ev: &Event) -> io::Result<()> {
     match ev {
         Event::Entry { parent, name } => {
             let mut d = Vec::new();
@@ -5254,7 +5540,7 @@ fn serve_subscriber(
     // One shared per-subscriber sink across every bucket it registers under, so
     // concurrent broadcasts to THIS socket serialize (frame atomicity) while
     // other views' delivery stays independent of the global registry lock.
-    let sink = Arc::new(Mutex::new(handle));
+    let sink = Arc::new(Mutex::new(SubSink::Tcp(handle)));
     for b in buckets {
         subs.lock()
             .entry(b.clone())
@@ -5283,31 +5569,45 @@ fn serve_subscriber(
     result
 }
 
-fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
-    stream.set_nodelay(true)?;
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut writer = stream;
+/// What one established mount session carries between requests.
+///
+/// Under the thread-per-connection plane these were plain locals of
+/// `handle_meta_conn`'s work loop; under the epoll plane a connection is served by
+/// whichever worker picks up its next frame, so the same three facts have to live on
+/// the connection instead of on a stack. Nothing here is secret beyond what the
+/// handshake already evaluated: it is the resolved view, the credential the caller
+/// authenticated as (when the server demands keys at all) and the two live-credential
+/// verdicts that `KEY_RECHECK` refreshes.
+struct MetaSession {
+    view: String,
+    authed: Option<crate::apikeys::AuthedKey>,
+    /// Re-read from the store on the recheck tick, so `apikey set-ro` hot-swaps this
+    /// mount's write verdict without a reconnect.
+    key_ro: bool,
+    next_key_check: Instant,
+}
 
-    // First frame distinguishes a client from a peer's replication control
-    // connection: clients always open with `M_OPEN { view, token, uid, api_key }`;
-    // the peer opens directly with `M_PING`/`M_PUSH` (never bound to a view).
-    let (op, body) = proto::recv_request(&mut reader)?;
-    if op == M_PING || op == M_PUSH {
-        return handle_control_conn(&mut reader, &mut writer, rt, op, body);
-    }
-    if op != M_OPEN {
-        proto::send_response(&mut writer, E_DB, 0, &[])?;
-        return Ok(());
-    }
+/// Run the `M_OPEN` handshake and write its ack (or the refusal) to `w`.
+///
+/// `Some(session)` means the caller was admitted and the ack is out; `None` means a
+/// refusal was answered and the connection is done — the same verdict the single
+/// threaded handler expressed with `return Ok(())`. Every gate, in this order, is the
+/// one this handshake has always had: cluster token, per-caller credential, alias, view
+/// binding, explicit creation, resolution.
+fn meta_open<W: Write>(
+    w: &mut W,
+    rt: &MetaRuntime,
+    body: &[u8],
+) -> io::Result<Option<MetaSession>> {
     let mut i = 0usize;
-    let mut view = proto::get_key(&body, &mut i).unwrap_or_default();
-    let presented = proto::get_key(&body, &mut i).unwrap_or_default();
+    let mut view = proto::get_key(body, &mut i).unwrap_or_default();
+    let presented = proto::get_key(body, &mut i).unwrap_or_default();
     // Optional presenting uid appended by the client handshake (older clients
     // omit it -> uid 0, recorded as such in the call audit).
-    let uid = proto::read_u32(&body, &mut i).unwrap_or(0);
+    let uid = proto::read_u32(body, &mut i).unwrap_or(0);
     // Optional api key appended by newer clients (an old client omits it, so it
     // only fails when this server actually demands one).
-    let api_key = proto::get_key(&body, &mut i).unwrap_or_default();
+    let api_key = proto::get_key(body, &mut i).unwrap_or_default();
     // The name the client mounted, kept alongside the post-alias real name so a
     // view-bound key can be checked against either (bind to the tree or to its
     // public alias).
@@ -5315,13 +5615,8 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
     // Enforce the shared secret when one is configured; an empty server token
     // means no auth at all (trusted LAN).
     if !rt.token.is_empty() && presented != rt.token {
-        proto::send_response(
-            &mut writer,
-            E_AUTH,
-            0,
-            b"meta-server rejected the access token",
-        )?;
-        return Ok(());
+        proto::send_response(w, E_AUTH, 0, b"meta-server rejected the access token")?;
+        return Ok(None);
     }
     // Per-caller credential gate (`--require-api-key`), checked right after the
     // cluster token and BEFORE any view/alias resolution: it decides WHO may
@@ -5349,8 +5644,8 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
                     false,
                     &format!("view='{view}': {e}"),
                 );
-                proto::send_response(&mut writer, E_AUTH, 0, e.as_bytes())?;
-                return Ok(());
+                proto::send_response(w, E_AUTH, 0, e.as_bytes())?;
+                return Ok(None);
             }
         }
     }
@@ -5371,7 +5666,7 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
         view = real.clone();
     } else if aliases.values().any(|r| r == &view) {
         proto::send_response(
-            &mut writer,
+            w,
             E_AUTH,
             0,
             format!(
@@ -5379,7 +5674,7 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
             )
             .as_bytes(),
         )?;
-        return Ok(());
+        return Ok(None);
     }
     // View binding (`apikey create --view NAME`): a bound key may only open the
     // physical view it names — or an alias that resolves to it, and equally the
@@ -5402,7 +5697,7 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
                     );
                 }
                 proto::send_response(
-                    &mut writer,
+                    w,
                     E_AUTH,
                     0,
                     format!(
@@ -5410,7 +5705,7 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
                     )
                     .as_bytes(),
                 )?;
-                return Ok(());
+                return Ok(None);
             }
         }
     }
@@ -5427,7 +5722,7 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
     // refusal is `E_DB` (a data-plane fact, not a credential one) WITH a
     // readable payload, which the client prints instead of a bare EIO; it is
     // also recorded in the API-key audit log when a key store is configured.
-    let why = match view_exists(&rt, &view) {
+    let why = match view_exists(rt, &view) {
         Ok(true) => String::new(),
         Ok(false) => {
             // Fill the placeholders with the concrete store root and the real
@@ -5487,8 +5782,8 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
                 &format!("view='{view}': {why}"),
             );
         }
-        proto::send_response(&mut writer, E_DB, 0, why.as_bytes())?;
-        return Ok(());
+        proto::send_response(w, E_DB, 0, why.as_bytes())?;
+        return Ok(None);
     }
     // Validate the view resolves (physical db or a parseable derived-view
     // definition) before acking. We deliberately do NOT hold this provider for
@@ -5497,7 +5792,7 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
     // the swap (see the loop below). We only keep the paging capability it
     // reports (a stable property of the store kind — SQLite/PG page, a derived
     // lens does not) as one ack byte, dropping the provider Arc immediately.
-    let paged_cap = match view_provider(&rt, &view) {
+    let paged_cap = match view_provider(rt, &view) {
         Ok(e) => {
             let c = e.supports_paged_readdir() as u8;
             drop(e);
@@ -5510,8 +5805,8 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
             // behavior; there is no reason to hide a server-side reason from
             // the operator who just tried to mount.
             let why = format!("view '{view}' cannot be opened on this meta-server: {e}");
-            proto::send_response(&mut writer, E_DB, 0, why.as_bytes())?;
-            return Ok(());
+            proto::send_response(w, E_DB, 0, why.as_bytes())?;
+            return Ok(None);
         }
     };
     // Handshake ack. Echo this node's current fencing epoch in `val` (0 when HA
@@ -5579,40 +5874,179 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
         };
         proto::put_key(&mut ack, &crate::remote::dac::issue(key, expiry));
     }
-    proto::send_response(&mut writer, 0, open_epoch, &ack)?;
+    proto::send_response(w, 0, open_epoch, &ack)?;
+    let key_ro = authed.as_ref().map(|a| a.ro).unwrap_or(false);
+    let next_key_check = Instant::now() + crate::apikeys::KEY_RECHECK;
+    Ok(Some(MetaSession {
+        view,
+        authed,
+        key_ro,
+        next_key_check,
+    }))
+}
 
+/// Answer ONE metadata request on an established session, writing exactly one response
+/// frame to `w`. `Ok(false)` means the connection is finished (a credential that died
+/// between requests); `Ok(true)` means the caller was answered and may send another.
+///
+/// The gates run in the order this loop always had — live credential, read-only key,
+/// standby role, zero-window fence, provider re-resolve, derived-view fence — and the
+/// re-resolve per op is what lets a live mount observe a freshly replicated snapshot.
+fn meta_work<W: Write>(
+    w: &mut W,
+    rt: &MetaRuntime,
+    s: &mut MetaSession,
+    op: u8,
+    body: &[u8],
+) -> io::Result<bool> {
+    if let (Some(store), Some(a)) = (&rt.keys, &s.authed) {
+        if Instant::now() >= s.next_key_check {
+            let live = store.live_state(&a.id, crate::apikeys::Scope::Mount);
+            match live {
+                None => {
+                    // The real cause, in the handshake's own words: a mount
+                    // cut off by an elapsed `--ttl` must not be told its key
+                    // was revoked (one repair is `apikey update --ttl`, the
+                    // other is re-minting). This sentence is also what the
+                    // client prints on stderr and what the audit row stores.
+                    let why = store.dead_reason(&a.id, crate::apikeys::Scope::Mount);
+                    let _ = store.log_call(
+                        Some(a),
+                        "meta",
+                        "M_OPEN",
+                        false,
+                        &format!("view='{}': {why}", s.view),
+                    );
+                    let _ = proto::send_response(w, E_AUTH, 0, why.as_bytes());
+                    return Ok(false);
+                }
+                // Still live: adopt the CURRENT ro flag (an `apikey set-ro`
+                // lands here, on the same ≤1s tick that carries a revoke).
+                Some(state) => s.key_ro = state.ro,
+            }
+            s.next_key_check = Instant::now() + crate::apikeys::KEY_RECHECK;
+        }
+    }
+    // Read-only credential: refuse a write-intent op from an `--ro` key.
+    // Uses E_NOTPERM (not E_ROFS) so the client's `err_from_code` maps to
+    // `MetaError::OpNotPermitted` → `EPERM` at the FUSE reply, distinct
+    // from an HA-standby's E_ROFS failover signal.
+    if is_write_op(op) && s.key_ro {
+        proto::send_response(w, E_NOTPERM, 0, &[])?;
+        return Ok(true);
+    }
+    // Read-only gate: a HA standby (or a demoted ex-primary) refuses
+    // write-intent ops. Reads + subscriptions are still served from the
+    // replicated snapshot; the client treats E_ROFS as a failover signal.
+    if rt.role() == Role::Standby && is_write_op(op) {
+        proto::send_response(w, E_ROFS, 0, &[])?;
+        return Ok(true);
+    }
+    // Zero-window fencing (only with --witness): a write-intent op on a
+    // primary synchronously re-proves exclusive authority at the arbiter, so
+    // a just-fenced ex-primary refuses on its very NEXT write rather than
+    // within one async replicator tick. No-op when no witness is configured.
+    if is_write_op(op) && rt.fenced_for_write() {
+        proto::send_response(w, E_ROFS, 0, &[])?;
+        return Ok(true);
+    }
+    // Re-resolve the provider each op: cheap while cached, and picks up a
+    // freshly installed snapshot after a replication push evicted the old one.
+    let engine = match view_provider(rt, &s.view) {
+        Ok(e) => e,
+        Err(_) => {
+            proto::send_response(w, E_DB, 0, &[])?;
+            return Ok(true);
+        }
+    };
+    // Derived-view read-only gate: a virtual view is a server-defined
+    // PRESENTATION over the base tree — writes belong to the original
+    // (physical) view only. Evaluated after the per-op re-resolve so the
+    // name→base map is fresh (a `view define`/`rm` in flight converges
+    // within this same ≤TTL window as the shape itself). Current clients
+    // never reach it (the mount is kernel read-only from the handshake
+    // flag); it stands as the authoritative gate for old or rogue clients.
+    // Deliberately E_NOTPERM (→ EPERM at FUSE), never E_ROFS, which the
+    // client reads as an HA failover signal.
+    if is_write_op(op) && rt.is_derived(&s.view) {
+        proto::send_response(w, E_NOTPERM, 0, &[])?;
+        return Ok(true);
+    }
+    let (status, val, data, events) = dispatch_meta(&*engine, op, body);
+    // Synchronous replication (L2): commit the op to the standby BEFORE
+    // acking the client. If the push/ACK window is exceeded we fall through
+    // and emit a warn so operators see the degraded RPO honestly. Non-HA
+    // or standby roles skip this entirely (their `rt.sync_repl` is false).
+    if rt.sync_repl && status == 0 && is_write_op(op) && rt.role() == Role::Primary {
+        push_snapshot_now(rt, &s.view);
+    }
+    proto::send_response(w, status, val, &data)?;
+    if status == 0 && !events.is_empty() {
+        broadcast(&rt.subs, &s.view, &events);
+        // A lens write changed the PHYSICAL tree too; plain subscribers of
+        // the base view converge on the same push (coordinate mismatches
+        // in relocated spots simply miss, which is harmless).
+        let base = rt.physical_base(&s.view);
+        if base != s.view {
+            broadcast(&rt.subs, &base, &events);
+        }
+        // Push display-coordinate invalidations to derived subscribers
+        // whose lens renders relocated entries under synthesized dirs.
+        broadcast_derived_display(rt, &base, &events);
+        // Under HA, also queue the batch for relay to the standby's own
+        // subscribers so a client mounted to the standby converges too. The
+        // replicator drains this each cycle (<= one REPL_INTERVAL lag).
+        if rt.peer.is_some() && rt.role() == Role::Primary {
+            rt.forward.lock().push((s.view.clone(), events));
+        }
+    }
+    Ok(true)
+}
+
+/// Buckets a subscriber of `view` registers under: its own name plus, for a derived
+/// view, the physical base — so a plain write another client makes to the same tree
+/// still reaches this subscriber (the extra coordinates simply miss at the kernel).
+fn subscribe_buckets(rt: &MetaRuntime, view: &str) -> Vec<String> {
+    let base = rt.physical_base(view);
+    let mut buckets = vec![view.to_string()];
+    if base != view {
+        buckets.push(base);
+    }
+    buckets
+}
+
+/// Serve one mount-plane connection on a dedicated thread: the historical shape, kept
+/// as the fallback for `GROVEFS_META_THREADS=1` and for every non-Linux build. The
+/// epoll plane runs the same three bodies (`meta_open`, the subscriber registration,
+/// `meta_work`) through a frame queue instead of a socket.
+fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
+    stream.set_nodelay(true)?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut writer = stream;
+
+    // First frame distinguishes a client from a peer's replication control
+    // connection: clients always open with `M_OPEN { view, token, uid, api_key }`;
+    // the peer opens directly with `M_PING`/`M_PUSH` (never bound to a view).
+    let (op, body) = proto::recv_request(&mut reader)?;
+    if op == M_PING || op == M_PUSH {
+        return handle_control_conn(&mut reader, &mut writer, &rt, op, body);
+    }
+    if op != M_OPEN {
+        proto::send_response(&mut writer, E_DB, 0, &[])?;
+        return Ok(());
+    }
+    let mut sess = match meta_open(&mut writer, &rt, &body)? {
+        Some(s) => s,
+        None => return Ok(()),
+    };
     // Distinguish a subscriber (becomes an event sink, sends no requests) from a
     // work connection (metadata ops) by peeking the next frame.
     let (op, body) = proto::recv_request(&mut reader)?;
     if op == M_SUBSCRIBE {
-        // A derived-view subscriber registers BOTH under its own name (to get
-        // display-coordinate events from lens writes) and under its physical
-        // base (to see plain writes other clients make to the same tree; those
-        // events may name coordinates the lens does not show — a no-op miss at
-        // the kernel, never a stale hit).
-        let base = rt.physical_base(&view);
-        let mut buckets = vec![view.clone()];
-        if base != view {
-            buckets.push(base);
-        }
+        let buckets = subscribe_buckets(&rt, &sess.view);
         return serve_subscriber(reader, writer, &buckets, &rt.subs);
     }
     let mut pending = Some((op, body));
-
-    // Live-credential re-check (`--require-api-key`): at most one store lookup
-    // per `KEY_RECHECK` window for this session, so a revoke reaches an
-    // ESTABLISHED mount, bounded by the re-check window rather than the next
-    // handshake — and so does an elapsed `--ttl`, because `live_state` reports
-    // both as not live. The same tick refreshes the key's CURRENT `ro` flag, so
-    // `apikey set-ro` hot-swaps this mount's write verdict without a reconnect.
-    let mut next_key_check = Instant::now() + crate::apikeys::KEY_RECHECK;
-    // A read-only key (`apikey create --ro`) is refused every write-intent op
-    // here, server-side, so "read-only" holds even against a client that mounted
-    // without `-o ro` (the ack flag above already nudges honest clients to a
-    // read-only mount, but this gate is the authoritative one). Mutable
-    // because the re-check tick above re-reads it from the store.
-    let mut key_ro = authed.as_ref().map(|a| a.ro).unwrap_or(false);
-
     loop {
         let (op, body) = match pending.take() {
             Some(v) => v,
@@ -5626,119 +6060,98 @@ fn handle_meta_conn(stream: TcpStream, rt: Arc<MetaRuntime>) -> io::Result<()> {
                 }
             },
         };
-        if let (Some(store), Some(a)) = (&rt.keys, &authed) {
-            if Instant::now() >= next_key_check {
-                let live = store.live_state(&a.id, crate::apikeys::Scope::Mount);
-                match live {
-                    None => {
-                        // The real cause, in the handshake's own words: a mount
-                        // cut off by an elapsed `--ttl` must not be told its key
-                        // was revoked (one repair is `apikey update --ttl`, the
-                        // other is re-minting). This sentence is also what the
-                        // client prints on stderr and what the audit row stores.
-                        let why = store.dead_reason(&a.id, crate::apikeys::Scope::Mount);
-                        let _ = store.log_call(
-                            Some(a),
-                            "meta",
-                            "M_OPEN",
-                            false,
-                            &format!("view='{view}': {why}"),
-                        );
-                        let _ = proto::send_response(&mut writer, E_AUTH, 0, why.as_bytes());
-                        return Ok(());
-                    }
-                    // Still live: adopt the CURRENT ro flag (an `apikey set-ro`
-                    // lands here, on the same ≤1s tick that carries a revoke).
-                    Some(state) => key_ro = state.ro,
-                }
-                next_key_check = Instant::now() + crate::apikeys::KEY_RECHECK;
-            }
-        }
-        // Read-only credential: refuse a write-intent op from an `--ro` key.
-        // Uses E_NOTPERM (not E_ROFS) so the client's `err_from_code` maps to
-        // `MetaError::OpNotPermitted` → `EPERM` at the FUSE reply, distinct
-        // from an HA-standby's E_ROFS failover signal.
-        if is_write_op(op) && key_ro {
-            proto::send_response(&mut writer, E_NOTPERM, 0, &[])?;
-            continue;
-        }
-        // Read-only gate: a HA standby (or a demoted ex-primary) refuses
-        // write-intent ops. Reads + subscriptions are still served from the
-        // replicated snapshot; the client treats E_ROFS as a failover signal.
-        if rt.role() == Role::Standby && is_write_op(op) {
-            proto::send_response(&mut writer, E_ROFS, 0, &[])?;
-            continue;
-        }
-        // Zero-window fencing (only with --witness): a write-intent op on a
-        // primary synchronously re-proves exclusive authority at the arbiter, so
-        // a just-fenced ex-primary refuses on its very NEXT write rather than
-        // within one async replicator tick. No-op when no witness is configured.
-        if is_write_op(op) && rt.fenced_for_write() {
-            proto::send_response(&mut writer, E_ROFS, 0, &[])?;
-            continue;
-        }
-        // Re-resolve the provider each op: cheap while cached, and picks up a
-        // freshly installed snapshot after a replication push evicted the old one.
-        let engine = match view_provider(&rt, &view) {
-            Ok(e) => e,
-            Err(_) => {
-                proto::send_response(&mut writer, E_DB, 0, &[])?;
-                continue;
-            }
-        };
-        // Derived-view read-only gate: a virtual view is a server-defined
-        // PRESENTATION over the base tree — writes belong to the original
-        // (physical) view only. Evaluated after the per-op re-resolve so the
-        // name→base map is fresh (a `view define`/`rm` in flight converges
-        // within this same ≤TTL window as the shape itself). Current clients
-        // never reach it (the mount is kernel read-only from the handshake
-        // flag); it stands as the authoritative gate for old or rogue clients.
-        // Deliberately E_NOTPERM (→ EPERM at FUSE), never E_ROFS, which the
-        // client reads as an HA failover signal.
-        if is_write_op(op) && rt.is_derived(&view) {
-            proto::send_response(&mut writer, E_NOTPERM, 0, &[])?;
-            continue;
-        }
-        let (status, val, data, events) = dispatch_meta(&*engine, op, &body);
-        // Synchronous replication (L2): commit the op to the standby BEFORE
-        // acking the client. If the push/ACK window is exceeded we fall through
-        // and emit a warn so operators see the degraded RPO honestly. Non-HA
-        // or standby roles skip this entirely (their `rt.sync_repl` is false).
-        if rt.sync_repl && status == 0 && is_write_op(op) && rt.role() == Role::Primary {
-            push_snapshot_now(&rt, &view);
-        }
-        proto::send_response(&mut writer, status, val, &data)?;
-        if status == 0 && !events.is_empty() {
-            broadcast(&rt.subs, &view, &events);
-            // A lens write changed the PHYSICAL tree too; plain subscribers of
-            // the base view converge on the same push (coordinate mismatches
-            // in relocated spots simply miss, which is harmless).
-            let base = rt.physical_base(&view);
-            if base != view {
-                broadcast(&rt.subs, &base, &events);
-            }
-            // Push display-coordinate invalidations to derived subscribers
-            // whose lens renders relocated entries under synthesized dirs.
-            broadcast_derived_display(&rt, &base, &events);
-            // Under HA, also queue the batch for relay to the standby's own
-            // subscribers so a client mounted to the standby converges too. The
-            // replicator drains this each cycle (<= one REPL_INTERVAL lag).
-            if rt.peer.is_some() && rt.role() == Role::Primary {
-                rt.forward.lock().push((view.clone(), events));
-            }
+        if !meta_work(&mut writer, &rt, &mut sess, op, &body)? {
+            return Ok(());
         }
     }
 }
 
-/// Serve a replication / heartbeat control connection initiated by the peer.
-/// Frames are handled request/response on one socket: `M_PING { sender_epoch }`
-/// refreshes the standby's heartbeat and returns our epoch (or [`E_EPOCH`] if
-/// the sender is a stale ex-primary that must stand down); `M_PUSH { view,
+/// Answer ONE replication / heartbeat frame on a peer control connection. `Ok(false)`
+/// is the `_ =>` arm's "unknown op": the connection is answered once and finished, as it
+/// has always been. `M_PUSH` installs a snapshot, which BLOCKS on the db rename — under
+/// the epoll plane that is precisely what makes it a worker's job and not the loop's.
+fn control_step<W: Write>(
+    w: &mut W,
+    rt: &MetaRuntime,
+    ha: &Arc<HaState>,
+    op: u8,
+    body: &[u8],
+) -> io::Result<bool> {
+    match op {
+        M_PING => {
+            let mut i = 0usize;
+            let sender_epoch = get_i64(body, &mut i).unwrap_or(0);
+            let my_epoch = ha.epoch.load(Ordering::SeqCst);
+            match ha.role() {
+                Role::Standby => {
+                    // The primary is alive (it just pinged us); defer promotion.
+                    *ha.last_peer.lock() = Instant::now();
+                    if sender_epoch > my_epoch {
+                        ha.epoch.store(sender_epoch, Ordering::SeqCst);
+                    }
+                    proto::send_response(w, 0, ha.epoch.load(Ordering::SeqCst) as u64, &[])?;
+                }
+                Role::Primary => {
+                    // We are the primary (perhaps promoted). A peer pinging with
+                    // a lower epoch is a stale ex-primary: tell it to stand down.
+                    let status = if sender_epoch < my_epoch { E_EPOCH } else { 0 };
+                    proto::send_response(w, status, my_epoch as u64, &[])?;
+                }
+            }
+        }
+        M_PUSH => {
+            let mut i = 0usize;
+            let view = proto::get_key(body, &mut i).unwrap_or_default();
+            // Layout v3: a family-nested tree's home travels with the
+            // frame (appended between the name and the image). An old
+            // peer omits it — or the "key" decodes into snapshot bytes
+            // that can never pass `valid_push_rel` — so the receiver
+            // falls back to resolving `f(name)` with no rel.
+            let mut j = i;
+            let rel = match proto::get_key(body, &mut j) {
+                Ok(r) if valid_push_rel(&view, &r) => {
+                    i = j;
+                    Some(r)
+                }
+                _ => None,
+            };
+            let snap = body[i..].to_vec();
+            // Only a standby installs pushes; a node that has promoted (or a
+            // plain primary) is authoritative and rejects the stale copy.
+            if ha.role() == Role::Standby && install_snapshot(rt, &view, &rel, &snap).is_ok() {
+                proto::send_response(w, 0, 0, &[])?;
+            } else {
+                proto::send_response(w, E_EPOCH, ha.epoch.load(Ordering::SeqCst) as u64, &[])?;
+            }
+        }
+        M_FORWARD => {
+            // Relay from the primary: deliver to this node's own subscribers
+            // so standby-mounted clients converge (batched, <= one tick).
+            let mut i = 0usize;
+            let view = proto::get_key(body, &mut i).unwrap_or_default();
+            if let Ok(evs) = events_from(body, &mut i) {
+                broadcast(&rt.subs, &view, &evs);
+                broadcast_derived_display(rt, &view, &evs);
+            }
+            proto::send_response(w, 0, 0, &[])?;
+        }
+        _ => {
+            proto::send_response(w, E_DB, 0, &[])?;
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Serve a replication / heartbeat control connection initiated by the peer, on the
+/// thread plane. Frames are handled request/response on one socket: `M_PING {
+/// sender_epoch }` refreshes the standby's heartbeat and returns our epoch (or
+/// [`E_EPOCH`] if the sender is a stale ex-primary that must stand down); `M_PUSH { view,
 /// snapshot }` installs a replicated view db atomically (standby only).
 fn handle_control_conn(
     reader: &mut BufReader<TcpStream>,
     writer: &mut TcpStream,
-    rt: Arc<MetaRuntime>,
+    rt: &Arc<MetaRuntime>,
     first_op: u8,
     first_body: Vec<u8>,
 ) -> io::Result<()> {
@@ -5750,78 +6163,8 @@ fn handle_control_conn(
     let mut op = first_op;
     let mut body = first_body;
     loop {
-        match op {
-            M_PING => {
-                let mut i = 0usize;
-                let sender_epoch = get_i64(&body, &mut i).unwrap_or(0);
-                let my_epoch = ha.epoch.load(Ordering::SeqCst);
-                match ha.role() {
-                    Role::Standby => {
-                        // The primary is alive (it just pinged us); defer promotion.
-                        *ha.last_peer.lock() = Instant::now();
-                        if sender_epoch > my_epoch {
-                            ha.epoch.store(sender_epoch, Ordering::SeqCst);
-                        }
-                        proto::send_response(
-                            writer,
-                            0,
-                            ha.epoch.load(Ordering::SeqCst) as u64,
-                            &[],
-                        )?;
-                    }
-                    Role::Primary => {
-                        // We are the primary (perhaps promoted). A peer pinging with
-                        // a lower epoch is a stale ex-primary: tell it to stand down.
-                        let status = if sender_epoch < my_epoch { E_EPOCH } else { 0 };
-                        proto::send_response(writer, status, my_epoch as u64, &[])?;
-                    }
-                }
-            }
-            M_PUSH => {
-                let mut i = 0usize;
-                let view = proto::get_key(&body, &mut i).unwrap_or_default();
-                // Layout v3: a family-nested tree's home travels with the
-                // frame (appended between the name and the image). An old
-                // peer omits it — or the "key" decodes into snapshot bytes
-                // that can never pass `valid_push_rel` — so the receiver
-                // falls back to resolving `f(name)` with no rel.
-                let mut j = i;
-                let rel = match proto::get_key(&body, &mut j) {
-                    Ok(r) if valid_push_rel(&view, &r) => {
-                        i = j;
-                        Some(r)
-                    }
-                    _ => None,
-                };
-                let snap = body[i..].to_vec();
-                // Only a standby installs pushes; a node that has promoted (or a
-                // plain primary) is authoritative and rejects the stale copy.
-                if ha.role() == Role::Standby && install_snapshot(&rt, &view, &rel, &snap).is_ok() {
-                    proto::send_response(writer, 0, 0, &[])?;
-                } else {
-                    proto::send_response(
-                        writer,
-                        E_EPOCH,
-                        ha.epoch.load(Ordering::SeqCst) as u64,
-                        &[],
-                    )?;
-                }
-            }
-            M_FORWARD => {
-                // Relay from the primary: deliver to this node's own subscribers
-                // so standby-mounted clients converge (batched, <= one tick).
-                let mut i = 0usize;
-                let view = proto::get_key(&body, &mut i).unwrap_or_default();
-                if let Ok(evs) = events_from(&body, &mut i) {
-                    broadcast(&rt.subs, &view, &evs);
-                    broadcast_derived_display(&rt, &view, &evs);
-                }
-                proto::send_response(writer, 0, 0, &[])?;
-            }
-            _ => {
-                proto::send_response(writer, E_DB, 0, &[])?;
-                return Ok(());
-            }
+        if !control_step(writer, rt, &ha, op, &body)? {
+            return Ok(());
         }
         match proto::recv_request(reader) {
             Ok((o, b)) => {

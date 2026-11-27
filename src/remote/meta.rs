@@ -1269,3 +1269,11 @@ mod client_tests {
 mod server_ext;
 #[cfg(feature = "native")]
 pub use server_ext::*;
+
+// The event-loop alternative to `server_ext`'s thread-per-connection accept loops.
+// Linux-only and `native`-only: `libc` is an optional dependency that rides
+// `fuse-bridge`/`native`, so a remote-only (Windows `grovefs-win`) client build must not
+// see it — the same platform-layering constraint that keeps `server_ext` out of that
+// build. `server_ext` falls back to its thread loops wherever this is absent.
+#[cfg(all(feature = "native", target_os = "linux"))]
+mod epoll;
