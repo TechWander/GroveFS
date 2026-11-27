@@ -304,15 +304,23 @@ unknown 档说「不从那个名字推断任何东西」。
 ### 8.2 创建视图可选 treedb 实例，且默认落点由服务端回答
 
 - `view.create` 的实例字段从 `pg_instance` 规范为 `instance`（`pg_instance` 仍是 CLI 在发的别称，
-  两者同义），treedb 臂按名钉位；名字不在注册表、或地址不在本机 `--meta-store` 路由集合内，
-  都用服务端原文拒绝，**不静默回落**。
+  两者同义），treedb 臂按名钉位；名字不在注册表、或地址不在本机 `--meta-store` 路由集合内、
+  或点名的那台是只读副本（`Stats.replica`），都用服务端原文拒绝，**不静默改投别台**。
 - 新增纯读 op `view.plan`（`Gate::Super`，与 `view.create` 同级可见性）：`find_tree_home` 命中
-  已有树则 `exists: true`，否则 `plan_placement` 给出哈希落点，再经 `treedb_registry` 反查实例名。
-  它不 open、不写、不改任何东西。存在的全部理由：「不选的话默认落哪台」必须由拥有那条哈希规则
-  的一侧回答，前端复刻 FNV-1a 就是本仓反复消灭的「两张表回答同一个问题」。
+  已有树则 `exists: true`，否则 `plan_placement` 给出落点，再经 `treedb_registry` 反查实例名。
+  它不 open、不写、不改任何东西。存在的全部理由：「不选的话默认落哪台」必须由拥有那条规则
+  的一侧回答，前端复刻判据就是本仓反复消灭的「两张表回答同一个问题」——落点自 2026-11-27 起是
+  「最闲的可写引擎」（`docs/adr/0004-treedb-load-aware-placement.md`），要现读每台引擎的
+  `ListViews`/`Stats`，前端更不可能自己算；`view.plan` 的答复因此多了 `rule`/`detail` 与
+  每台一行 `load[]`，新建面板把「为什么是这台」原样播报，不复述判据。
 - `NewBasePanel` 的实例下拉按 `catalog.engine` 分流：treedb 只列 `store.info` 标为 `serving` 的行
   （清单里的非路由条目不是落点候选），PG 列全簿。视图名输入后按序列号防抖调 `view.plan`，
   auto 标签实时播报落点，`exists` 为真时把 `view.create` 即将收到的拒绝提前标红在表单里。
+- 同一轮把 treedb 的账本上了存储页：`store.info` 的实例行与 `storage.ledger`
+  （`placedTrees` 之外四类说不清：`unnamedHome`/`offServing`/`unreachable`/`duplicates`）
+  **同出一次并行 sweep**，
+  所以一台宕机不再让这个调用整体失败，只让那台少掉树数。总览页的 base views 因此改成
+  带下限措辞的读法——`viewsUnlistedFor` 非空时那个数是**下限**，卡片转 warn（口径见 ADR-0004 §4）。
 
 ### 8.3 treedb 不需要账号密码：这是设计，界面上要这么说
 
@@ -325,7 +333,7 @@ unknown 档说「不从那个名字推断任何东西」。
 当文案原样渲染，中文界面就会出现整句英文，而 i18n 门查不出来（模板里那句 `t('…')` 只是回退分支，
 服务端字段一有值就永远走不到）。规矩与 §8.1 的 `ENGINE_NOTE` 同源：**服务端持有事实，控制台持有
 操作员读到的句子**。`StoragePage.vue` 因此只从 `routingNote` 里取那个数字
-（`^treedb routes new trees by name hash across (\d+) serving address\(es\)`），措辞归字典；
+（`^treedb places new trees on the least-loaded writable engine among (\d+) serving address\(es\)`），措辞归字典；
 句式对不上时退回服务端原文，不编造。新增任何「后端 JSON 字段直接当文案渲染」的地方，都必须同步
 登记 zh.ts 译文并写明回退路径。
 

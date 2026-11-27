@@ -119,16 +119,19 @@ watch(name, async (v) => {
 // The auto option IS the engine's own rule, so say which instance that currently
 // means. PostgreSQL: the fewest-views-then-registry-order rule read off the same
 // ledger the balancer uses (missing counts fall back to the plain wording).
-// treedb: the hash's answer for the name typed, plus the honest statement of the
-// rule while the name is still empty.
+// treedb: the engine the load-aware pick chooses right now, with the grounds it
+// used, plus the honest statement of the rule while the name is still empty.
 const autoLabel = computed(() => {
   if (engine.value === 'treedb') {
     const p = plan.value
-    if (!p) return t('auto — by name hash across the serving instances')
+    if (!p) return t('auto — least loaded of the serving instances')
     const at = p.instance || p.addr || ''
-    return p.exists
-      ? t('auto — ${n} (a tree of this name is already there)', { n: at })
-      : t('auto — ${n} (this name hashes there)', { n: at })
+    if (p.exists) return t('auto — ${n} (a tree of this name is already there)', { n: at })
+    // The server already said WHICH engine and on what grounds; quote it. A
+    // rule other than the normal one (no writable engine reachable) is itself
+    // the news, so that sentence goes up instead of a fake count.
+    const why = p.rule === 'least loaded' ? (p.detail ?? '') : p.rule
+    return why ? t('auto — ${n} (${d})', { n: at, d: why }) : t('auto — ${n}', { n: at })
   }
   const known = instances.value.filter((i) => i.views !== null)
   if (known.length === 0 || !showInstanceField.value) return t('auto — least loaded')

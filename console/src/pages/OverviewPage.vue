@@ -187,7 +187,7 @@ const backendLayoutText = computed(() => {
   if (LAYOUT_PG.test(raw))
     return t('one schema per view in PostgreSQL; <base> holds no trees')
   if (LAYOUT_TREEDB.test(raw))
-    return t('one tree per view in a treedb server (a comma-list --meta-store spreads new trees over the instances by name hash, existing ones resolve by engine listing); <base> holds definitions and keys only')
+    return t('one tree per view in a treedb server (a comma-list --meta-store places new trees on the least-loaded writable instance, existing ones resolve by engine listing); <base> holds definitions and keys only')
   return raw
 })
 
@@ -271,7 +271,9 @@ const nodeRoleNote = computed(() => {
         <StatCard
           label="base views"
           :value="store.views"
-          :sub="'the trees mounts open'"
+          :sub="store.viewsUnlistedFor ? '${n} engine(s) did not answer — a lower bound' : 'the trees mounts open'"
+          :vars="{ n: store.viewsUnlistedFor || 0 }"
+          :tone="store.viewsUnlistedFor ? 'warn' : undefined"
           page="views"
         />
         <StatCard

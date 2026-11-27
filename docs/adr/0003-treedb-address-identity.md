@@ -36,7 +36,7 @@
 | --- | --- |
 | 存储页 · 实例卡（treedb 档） | URI 行旁一枚 `no credentials` 徽标（与「服务中」「实验性」同一色带但不同调），卡下一句小字：地址按现状信任；本部署若启用引擎认证，那是**一份服务器全局密钥文件** `GROVEFS_TREEDB_KEY_FILE`，不是按实例存储的凭据 |
 | 存储页 · 注册实例表单 | 地址字段 placeholder 为 `host:port`，hint 说明只接 `host:port`、地址即身份、引擎认证走服务器全局 env；服务端拨不通时回显 `probe_treedb_addr` 的原文，不改写 |
-| 视图页／存储页 · 新建基视图 | treedb 档的实例下拉只列 `store.info` 标为 `serving` 的行；hint 说明树会建在这台服务器上、后续写入始终跟随它，且**不询问用户名或密码**。落位预测由 `view.plan` 给出（同一份哈希规则、同一个函数），不是前端复刻 |
+| 视图页／存储页 · 新建基视图 | treedb 档的实例下拉只列 `store.info` 标为 `serving` 的行；hint 说明树会建在这台服务器上、后续写入始终跟随它，且**不询问用户名或密码**。落位预测由 `view.plan` 给出（同一份选点规则、同一个函数 `plan_placement`），不是前端复刻；那条规则本身是 ADR-0004 的题目，本份只钉住「预测必须来自服务端」这一契约 |
 
 PG 档不受影响：那里的 `connection string` 里 `user:pw@` 是真凭据，两档共用一个面板但字段名、placeholder 与 hint 都按 `catalog.engine` 分流。
 

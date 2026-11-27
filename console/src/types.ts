@@ -60,6 +60,24 @@ export interface StoreInstance {
   placedViews: number | null
   serving?: boolean
   viewNames?: string[] | null
+  /** treedb only: the engine answered `ListViews`/`Stats`. False means the
+      counts below are null because they are UNKNOWN, not because they are 0. */
+  reachable?: boolean
+  /** A read-only replica: it holds trees but refuses writes, so it is not a
+      placement target — the card must say so rather than show an idle meter. */
+  replica?: boolean
+  nodes?: number | null
+  writes?: number | null
+}
+
+/** treedb's placement ledger: how many trees have a home this server can NAME,
+    and the four distinct ways one can not. Buckets are disjoint server-side. */
+export interface TreedbLedger {
+  placedTrees: number
+  unnamedHome: string[]
+  offServing: string[]
+  unreachable: string[]
+  duplicates: string[]
 }
 
 /** Which backend carries the trees, and (under PostgreSQL) which instance
@@ -77,6 +95,8 @@ export interface StorageInfo {
   pendingControl?: string | null
   /** treedb only: the honest experimental flags the panel must surface. */
   experimental?: boolean
+  /** treedb only: the placement ledger behind the banner sentence. */
+  ledger?: TreedbLedger | null
   controlPlane?: string
   routingNote?: string
 }
@@ -158,6 +178,10 @@ export interface StoreInfo {
       plain single-writer node. Native HA exists for the SQLite arm only. */
   ha?: HaSnapshot | null
   views?: number
+  /** How many SERVING metadata engines were too quiet to be asked, so the count
+      above covers only the ones that answered. `null` when every engine spoke:
+      only a `treedb://a,b` deployment can have a gap here. */
+  viewsUnlistedFor?: number | null
   definitions?: number
   accounts?: number | null
   liveKeys?: number | null

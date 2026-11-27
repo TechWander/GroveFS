@@ -54,7 +54,7 @@ import SetControlModal from '@/components/storage/SetControlModal.vue'
 /* The two banner sentences, as dictionary keys: one for the shape the server
    reports per deployment, one for a treedb that named no serving address. */
 const ROUTING_NOTE =
-  'treedb routes new trees by name hash across ${n} serving address(es); other entries are inventory, not placement targets'
+  'treedb places new trees on the least-loaded writable engine among ${n} serving address(es); other entries are inventory, not placement targets'
 const NO_ROUTING_NOTE =
   'treedb is EXPERIMENTAL: the control plane (definitions, keys, accounts) stays in local SQLite and this registry is inventory, not a router.'
 
@@ -112,7 +112,7 @@ const multi = computed(() => instances.value.length > 1)
 const routingNoteText = computed(() => {
   const note = storage.value?.routingNote
   if (!note) return t(NO_ROUTING_NOTE)
-  const n = /^treedb routes new trees by name hash across (\d+) serving address\(es\)/.exec(note)
+  const n = /^treedb places new trees on the least-loaded writable engine among (\d+) serving address\(es\)/.exec(note)
   return n
     ? t(ROUTING_NOTE, { n: n[1] })
     : note
@@ -145,6 +145,55 @@ const viewsFor = (inst: StoreInstance): string[] => perInstance.value.get(instan
 const unplaced = computed(() =>
   isPg.value && multi.value ? names.value.filter((v) => !storage.value?.placement[v]) : [],
 )
+
+/*
+  treedb's ledger. There is no placement table under `treedb://`, so PG's
+  placed/unplaced pair does not transfer: a tree's home is whatever engine
+  reports holding it. The four buckets are instead the four ways that home
+  CANNOT BE NAMED — an address with no registry name, a registry row this server
+  does not route to, an engine that did not answer, and one name on two engines.
+  The server computes them from the SAME sweep the balancer reads, so the page
+  and the pick cannot disagree.
+*/
+const ledger = computed(() => (isTreedb.value ? (storage.value?.ledger ?? null) : null))
+const ledgerNotes = computed(() => {
+  const l = ledger.value
+  if (!l) return []
+  const out: { text: string; bad: boolean }[] = []
+  if (l.unnamedHome.length)
+    out.push({
+      text: t(
+        '${n} serving address(es) hold trees no registry name points at: ${list} — the console cannot show them and a named create cannot select them.',
+        { n: l.unnamedHome.length, list: l.unnamedHome.join(', ') },
+      ),
+      bad: false,
+    })
+  if (l.offServing.length)
+    out.push({
+      text: t(
+        '${n} registered instance(s) are inventory only — this server does not route to ${list}, so their trees are not readable here.',
+        { n: l.offServing.length, list: l.offServing.join(', ') },
+      ),
+      bad: false,
+    })
+  if (l.unreachable.length)
+    out.push({
+      text: t('${n} serving address(es) did not answer: ${list}.', {
+        n: l.unreachable.length,
+        list: l.unreachable.join(', '),
+      }),
+      bad: true,
+    })
+  if (l.duplicates.length)
+    out.push({
+      text: t(
+        '${n} view name(s) sit on two reachable engines (${list}) — one tree per name is the contract, and reads of these names are refused until it is reconciled.',
+        { n: l.duplicates.length, list: l.duplicates.join(', ') },
+      ),
+      bad: true,
+    })
+  return out
+})
 
 /** The busiest card sets the meter's full length, so the bars compare across
     the grid rather than each filling alone. */
@@ -253,13 +302,38 @@ function created(): void {
             <span class="sstat-n">{{ placedTotal }}</span>
             <span class="sstat-l">{{ t('placed') }}</span>
           </div>
+          <div v-if="isTreedb && ledger" class="sstat">
+            <span class="sstat-n">{{ ledger.placedTrees }}</span>
+            <span class="sstat-l">{{ t('placed') }}</span>
+          </div>
           <div v-if="unplaced.length" class="sstat warn">
             <span class="sstat-n">{{ unplaced.length }}</span>
             <span class="sstat-l">{{ t('unplaced') }}</span>
           </div>
+          <div v-if="ledger?.unnamedHome.length" class="sstat warn">
+            <span class="sstat-n">{{ ledger.unnamedHome.length }}</span>
+            <span class="sstat-l">{{ t('unnamed home(s)') }}</span>
+          </div>
+          <div v-if="ledger?.offServing.length" class="sstat warn">
+            <span class="sstat-n">{{ ledger.offServing.length }}</span>
+            <span class="sstat-l">{{ t('inventory only') }}</span>
+          </div>
+          <div v-if="ledger?.unreachable.length" class="sstat err">
+            <span class="sstat-n">{{ ledger.unreachable.length }}</span>
+            <span class="sstat-l">{{ t('unreachable') }}</span>
+          </div>
+          <div v-if="ledger?.duplicates.length" class="sstat err">
+            <span class="sstat-n">{{ ledger.duplicates.length }}</span>
+            <span class="sstat-l">{{ t('name clash(es)') }}</span>
+          </div>
         </div>
 
         <p v-if="storage?.instanceError" class="err">{{ storage.instanceError }}</p>
+        <div v-if="ledgerNotes.length" class="ledger-notes">
+          <p v-for="n in ledgerNotes" :key="n.text" :class="n.bad ? 'err' : 'muted'">
+            {{ n.text }}
+          </p>
+        </div>
 
         <!-- A staged PG control handover stays visible until the restart lands
              it, so the operator knows the badge is about to move and why. -->

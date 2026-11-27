@@ -131,9 +131,28 @@ export interface OpResult {
     OWNS the rule rather than by a copy of it in the browser. `instance` is null
     when the chosen address has no registry name; `exists` means the name is
     already a tree somewhere, so `view.create` would refuse it. */
+/** One serving engine as the balancer sees it right now — the same numbers
+    `plan_placement` compares before it picks a home. `reachable` false means the
+    engine did not answer, so its counts are UNKNOWN, not zero. */
+export interface EngineLoadRow {
+  addr: string
+  trees: number
+  nodes: number
+  writes: number
+  replica: boolean
+  reachable: boolean
+}
+
 export interface PlacementPlan {
   backend: string
+  /** The server's own words for the rule it just applied ("least loaded",
+      "already placed", "no writable engine reachable"). The console repeats it
+      instead of renaming the rule, so a change server-side cannot leave a stale
+      sentence in the browser. */
   rule: string
+  /** The grounds, as numbers ("3 trees / 410 nodes / 993 writes"). */
+  detail?: string | null
+  load?: EngineLoadRow[]
   addr: string | null
   instance: string | null
   exists: boolean

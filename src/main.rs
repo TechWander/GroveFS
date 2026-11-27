@@ -6969,7 +6969,8 @@ fn open_import_store(
         let home = grovefs::treedb_store::find_tree_home(&addrs, view)
             .map_err(|e| format!("import --meta-store: {e}"))?;
         let created = home.is_none();
-        let addr = home.unwrap_or_else(|| grovefs::treedb_store::plan_placement(&addrs, view));
+        let addr =
+            home.unwrap_or_else(|| grovefs::treedb_store::plan_placement(&addrs, view).addr);
         let meta = grovefs::meta::MetaStore::open_treedb(&addr, view, false)?;
         return Ok((meta, Some(created)));
     }

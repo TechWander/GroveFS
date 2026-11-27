@@ -63,7 +63,11 @@
 //! - **view 名 > 25 字节**：`layout::valid_view_name` 不卡长度，引擎卡（`VIEW_NAME_MAX`），
 //!   超了在 `view create` 处报错。
 //! - **HA / 快照 / GC 聚合**：`backup_to_bytes` 直接拒绝，`serve()` 里
-//!   `--role standby / --peer / --witness` 与这个后端互斥（同 PG）。
+//!   `--role standby / --peer / --witness` 与这个后端互斥（同 PG）。那三条说的是 grovefs
+//!   自己的**控制面**热备，别把它和引擎的 `treedb-standby` 混成一件：后者的 `host:port`
+//!   **可以**进 `--meta-store` 逗号列表（这是唯一能让只读副本被 grovefs 读到的形状），
+//!   内核靠 `EngineStats.replica` 把它排除于新树放置与账本计数，不靠命名约定
+//!   （判据与实测见 `docs/adr/0004-treedb-load-aware-placement.md`）。
 
 #![cfg(feature = "treedb")]
 
@@ -325,8 +329,9 @@ pub struct TreedbStore {
 }
 
 /// `treedb://` URI → 地址**表**。单地址 `treedb://host:port` 原样一条；逗号列表
-/// `treedb://h1:p1,h2:p2` 展开成多实例路由集（顺序即注册表顺序，放置按它取模）。
-/// 每一项都过一次 [`parse_addr`]，坏项整串拒绝 —— 半张路由表比没有路由表更糟。
+/// `treedb://h1:p1,h2:p2` 展开成多实例路由集（顺序即注册表顺序，也是负载选点
+/// 打平时的优先级）。每一项都过一次 [`parse_addr`]，坏项整串拒绝 —— 半张路由表
+/// 比没有路由表更糟。
 pub fn parse_addrs(uri: &str) -> Result<Vec<String>, String> {
     let rest = uri
         .strip_prefix(SCHEME)
@@ -359,12 +364,321 @@ fn fnv1a(s: &str) -> u64 {
     h
 }
 
-/// 新视图（或 fork 树）落在哪台：按视图名哈希取模。单实例集恒回唯一项，所以
-/// 这是旧形状的自然退化而非特判。已存在的视图**不问这里** —— 引擎自己的
-/// `ListViews` 才是权威（[`find_tree_home`]），哈希只回答「还没有的地方放哪」。
-pub fn plan_placement(addrs: &[String], view: &str) -> String {
+/// 纯粹的名字哈希落点：只在**问不到负载**时兜底（见 [`plan_placement`]）。
+/// 它不是策略而是退路 —— 挂失的引擎无论按什么规则选都建不成树，这里的
+/// 确定性只保证「兜底路径本身仍然可复现」。
+fn hash_home(addrs: &[String], view: &str) -> String {
     let i = (fnv1a(view) as usize).wrapping_rem(addrs.len().max(1));
     addrs[i].clone()
+}
+
+/// 一台实例的负载快照：一次连接里问 `ListViews` + `Stats` 两件事。treedb 没有
+/// 放置表，「哪台忙」只能问引擎自己 —— 这也是当前能拿到的唯一冷热信号。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstanceLoad {
+    pub addr: String,
+    /// 这台是否答上了查询。`false` 时 `names` 为空且**不参与选点**：把一个
+    /// 答不上来的引擎当最闲的，等于把新树放进一台不知道存不存在的机器。
+    pub reachable: bool,
+    /// 只读副本（`treedb-standby` 那一档）：树在它上有清单、写全被拒。放新树
+    /// 上去等于建一棵永远写不进的树，所以它是硬性排除项而非低权重项。
+    pub replica: bool,
+    /// 该实例当前的节点总数（结构存量，重启不丢）。
+    pub nodes: u64,
+    /// 该实例累计写 op 数。引擎重启归零，因此只能当次级键（见
+    /// [`pick_least_loaded`] 第 4 条）。
+    pub writes_total: u64,
+    /// 这台持有的视图名 —— 顺带取回，省掉 store.info 的第二轮 sweep。
+    pub names: Vec<String>,
+}
+
+impl InstanceLoad {
+    /// 这台的树数。用清单长度而不是 `Stats.views`：前者与 `view list`、与控制台
+    /// 上显示的数字是同一个来源，两处不一致时以能点名的那份为准。
+    pub fn trees(&self) -> u64 {
+        self.names.len() as u64
+    }
+}
+
+/// 落点 + 为什么。`how` 要进 `view create` 的报告行和 `view.plan` 的答复：
+/// 均衡规则一旦变成黑箱，运维就没法回答「这台为什么空着」。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Placement {
+    pub addr: String,
+    pub how: &'static str,
+    /// 选点依据的数字（`"3 trees / 410 nodes / 993 writes"`）。单实例集与
+    /// 兜底路径下为 `None` —— 前者没得比，后者的数字本来就不可信。
+    pub detail: Option<String>,
+}
+
+/// 纯选点：在 `loads` 里挑最闲一台的下标。判据按重要性排：
+/// 1. 副本与不可达的一律不候选 —— 放上去就是建一棵写不进的树，或者建到
+///    一台无从验证的机器上；
+/// 2. **树数**最少：与 PG 档 `place_new_view` 的「放置行数最少」同一口径，而
+///    且是重启后仍然成立的那个数；
+/// 3. **节点数**最少：同为存量口径，用来在两棵「树数相同但一大一小」的实例
+///    之间选小的一方 —— 单看树数会把一棵百万节点的树当成空实例；
+/// 4. **累计写 op** 最少：唯一带冷热含义的数，但引擎重启归零，只能当次级键，
+///    否则刚重启的实例会被判成最闲而被灌满；
+/// 5. serve set 顺序：前四项全等时保持稳定，同一份账必然算出同一个落点。
+fn pick_least_loaded(loads: &[InstanceLoad]) -> Option<usize> {
+    loads
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.reachable && !l.replica)
+        .min_by_key(|(i, l)| (l.trees(), l.nodes, l.writes_total, *i))
+        .map(|(i, _)| i)
+}
+
+/// 问一遍 serve set 的负载。某台答不上来记 `reachable: false` 而不是整轮失败 ——
+/// 一台挂了不该让 `view create` 连选点都做不了（对齐 [`find_tree_home`] 的故障隔离）。
+///
+/// 探测并行：一台黑洞主机要等满 [`CONNECT_TIMEOUT_MS`] 才判死，串行就是 N 个超时
+/// 相加；并行后整轮墙上时间 = 最慢那台。结果仍按 `addrs` 顺序返回，所以选点的
+/// 「平局取靠前一台」不依赖谁先答。
+pub fn engine_load(addrs: &[String]) -> Vec<InstanceLoad> {
+    if addrs.len() < 2 {
+        return addrs.iter().map(|a| probe_load(a)).collect();
+    }
+    std::thread::scope(|sc| {
+        let handles = addrs
+            .iter()
+            .map(|a| {
+                std::thread::Builder::new()
+                    .name("treedb-load".to_string())
+                    .spawn_scoped(sc, || probe_load(a))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                // 起不起得来线程是本地资源问题，不该把整轮探测变成 panic；
+                // 退回串行，慢一点但一定给出答案。
+                eprintln!("treedb load probe: thread spawn failed ({e}); probing serially");
+                e
+            })
+            .ok();
+        match handles {
+            Some(hs) => hs
+                .into_iter()
+                .zip(addrs.iter())
+                // 一条探测线程 panic 只让那一台记为不可达（`probe_load` 本身
+                // 不 panic，这里是给未知故障兜底），不能让整轮选点失效。
+                .map(|(h, a)| {
+                    h.join().unwrap_or_else(|_| InstanceLoad {
+                        addr: a.clone(),
+                        reachable: false,
+                        replica: false,
+                        nodes: 0,
+                        writes_total: 0,
+                        names: Vec::new(),
+                    })
+                })
+                .collect(),
+            None => addrs.iter().map(|a| probe_load(a)).collect(),
+        }
+    })
+}
+
+/// 单台探测，也是 store.info 逐项刷新的入口（改了引擎、没改路由时只重问一台）。
+/// 两问共用一条连接：`ListViews` 走只读档、`Stats` 走控制档，都不建树。
+pub fn probe_load(addr: &str) -> InstanceLoad {
+    let mut out = InstanceLoad {
+        addr: addr.to_string(),
+        reachable: false,
+        replica: false,
+        nodes: 0,
+        writes_total: 0,
+        names: Vec::new(),
+    };
+    let key = match auth_key() {
+        Ok(k) => k,
+        Err(_) => return out,
+    };
+    let mut c = match Client::connect_auth(addr, CONNECT_TIMEOUT_MS, key.as_deref()) {
+        Ok(c) => c,
+        Err(_) => return out,
+    };
+    let names = match c.call(&Op::ListViews) {
+        Ok(Reply::Views(v)) => v
+            .into_iter()
+            .map(|(n, _, _)| String::from_utf8_lossy(&n).into_owned())
+            .collect::<Vec<_>>(),
+        _ => return out,
+    };
+    // `Stats` 失败不推翻「这台可达」：清单已经拿到了。只把两个计数留在 0，
+    // 选点于是退化到按树数决定 —— 少一个键不会选错方向，只会粗一点。
+    let (nodes, writes, replica) = match c.call(&Op::Stats) {
+        Ok(Reply::Stats(s)) => (s.nodes, s.writes_total, s.replica),
+        _ => (0, 0, false),
+    };
+    out.reachable = true;
+    out.names = names;
+    out.nodes = nodes;
+    out.writes_total = writes;
+    out.replica = replica;
+    out
+}
+
+/// 新视图（或 fork 树）落在哪台：**负载感知**的最闲实例（判据见
+/// [`pick_least_loaded`]）。单实例集恒回唯一项，所以这是旧形状的自然退化而非特判。
+///
+/// 已存在的视图**不问这里** —— 引擎自己的 `ListViews` 才是权威
+/// （[`find_tree_home`]），本函数只回答「还没有的地方放哪」。这条分工是安全的
+/// 前提：改选点规则不会让任何一棵已存在的树读丢，因此可以随时换判据而不必先有
+/// `view move`（treedb 档目前没有服务端搬迁）。
+///
+/// 旧规则是纯名字哈希：`hash % N` 对「建树那一刻」之外的负载一无所知，一台
+/// 挂了三棵大视图、另一台空着，新树照样按哈希扔给前者 —— 多实例的写吞吐
+/// 天花板于是从来摊不平。哈希在这里剩下的唯一价值是「问不到负载时的兜底」。
+pub fn plan_placement(addrs: &[String], view: &str) -> Placement {
+    if addrs.len() == 1 {
+        return Placement {
+            addr: addrs[0].clone(),
+            how: "only instance",
+            detail: None,
+        };
+    }
+    let loads = engine_load(addrs);
+    if let Some(i) = pick_least_loaded(&loads) {
+        let l = &loads[i];
+        return Placement {
+            addr: l.addr.clone(),
+            // 把依据写成一行数字：报告行是运维在建之前唯一能看到分布的地方。
+            how: "least loaded",
+            detail: Some(format!(
+                "{} trees / {} nodes / {} writes",
+                l.trees(),
+                l.nodes,
+                l.writes_total
+            )),
+        };
+    }
+    // 没有一台可写（全不可达，或全是只读副本）：退回顾名字哈希。不在此处报错
+    // 是因为紧接着的 `TreedbStore::open` 会给出那台真实失败的原因，比这里编一个
+    // 更准；`how` 保留这条退路，让报告行不假装均衡过。
+    Placement {
+        addr: hash_home(addrs, view),
+        how: "no writable engine reachable",
+        detail: None,
+    }
+}
+
+/// 账本里的一行：一个被 sweep 过的地址。注册表名字可能没有（单条
+/// `--meta-store` 没有操作者文件时就是这样）—— 那时仍要报出地址，否则 Storage
+/// 页会少掉一台真在承载树的引擎。
+#[derive(Clone, Debug)]
+pub struct LedgerRow {
+    pub name: Option<String>,
+    pub addr: String,
+    /// 在 `--meta-store` 的路由集里：新树只落它，读取也只走它。
+    pub serving: bool,
+    pub load: InstanceLoad,
+}
+
+/// treedb 档的放置账本。treedb 没有放置表，所以这里数的不是「有没有行」而是
+/// 「这棵树的落点能不能被说清」：每个桶是一类**不同的**说不清，混成一桶就查不出
+/// 是配置漏了注册、还是引擎挂了、还是有人绕过服务器手建了树。
+#[derive(Clone, Debug, Default)]
+pub struct TreedbLedger {
+    /// 正常放置：路由集内、可达、有注册名、且不与别台重名的树数。
+    pub placed_trees: u64,
+    /// 路由集内的地址持有树，但注册表里没有任何名字指向它：控制台点不出这台，
+    /// `--pg-instance` 也选不了它。
+    pub unnamed_home: Vec<String>,
+    /// 注册表里有名、但本服务器不路由过去的实例：库存而非落点，它上面的树在这里
+    /// 根本读不到（`view create` 点名它会被拒）。
+    pub off_serving: Vec<String>,
+    /// 路由集内答不上来的地址：它们的树数**不可知**，不能当 0。
+    pub unreachable: Vec<String>,
+    /// 同一个名字落在两台**可写**实例上：违背「一名一树」，读取在
+    /// [`find_tree_home`] 处直接 Err。副本上的影子名不算冲突，从 `placed_trees`
+    /// 里也不重复计数。
+    pub duplicates: Vec<String>,
+}
+
+/// 一次 sweep 覆盖「注册表 ∪ serve set」，行与账本同出。拆成两个函数各 sweep 一遍
+/// 会造出两处互相矛盾的实例数 —— 一个规则两处实现的老毛病，一个入口挡掉。
+pub fn storage_census(base: &std::path::Path, addrs: &[String]) -> (Vec<LedgerRow>, TreedbLedger) {
+    let book = treedb_registry(base).unwrap_or_default();
+    // 探测顺序：先 serve set（选点与读取只看它），再补注册表里多出的库存行，
+    // 于是行序稳定，且「平局取靠前一台」与 `engine_load` 看到的是同一份顺序。
+    let mut probe: Vec<String> = addrs.to_vec();
+    for (_, a) in &book {
+        if !probe.iter().any(|x| x == a) {
+            probe.push(a.clone());
+        }
+    }
+    let loads = engine_load(&probe);
+    let rows: Vec<LedgerRow> = loads
+        .iter()
+        .map(|l| LedgerRow {
+            name: book
+                .iter()
+                .find(|(_, a)| a == &l.addr)
+                .map(|(n, _)| n.clone()),
+            addr: l.addr.clone(),
+            serving: addrs.iter().any(|s| s == &l.addr),
+            load: l.clone(),
+        })
+        .collect();
+
+    // 同名多机只在 serve set 内的**可写**可达实例之间判：`treedb-standby` 上每棵
+    // 树都是主机的影子，把它算成冲突会把「装了热备」误报成「部署被写坏」，而
+    // [`find_tree_home`] 也正是这么放行的 —— 一处判据两处不一致比判据本身更坑。
+    // 库存行上的同名属于另一个部署的读取路径，报出来只会把别人的树误当成本机的冲突。
+    let mut duplicates: Vec<String> = Vec::new();
+    {
+        let mut seen: Vec<String> = Vec::new();
+        for r in rows
+            .iter()
+            .filter(|r| r.serving && r.load.reachable && !r.load.replica)
+        {
+            for n in &r.load.names {
+                if seen.contains(n) && !duplicates.contains(n) {
+                    duplicates.push(n.clone());
+                } else if !seen.contains(n) {
+                    seen.push(n.clone());
+                }
+            }
+        }
+    }
+
+    let mut ledger = TreedbLedger {
+        duplicates,
+        ..Default::default()
+    };
+    for r in &rows {
+        if !r.serving {
+            if let Some(n) = &r.name {
+                ledger.off_serving.push(n.clone());
+            }
+            continue;
+        }
+        if !r.load.reachable {
+            ledger.unreachable.push(r.addr.clone());
+            continue;
+        }
+        if r.load.replica {
+            // 副本的树是主机的整台拷贝，主机那一行已经计过一次；再计会让「装了
+            // 热备」在账面上凭空翻倍。它作为实例行仍然可见，只是不持有放置。
+            continue;
+        }
+        let trees = r
+            .load
+            .names
+            .iter()
+            .filter(|n| !ledger.duplicates.contains(n))
+            .count();
+        if trees == 0 {
+            continue;
+        }
+        match &r.name {
+            // 有名字的地址才是「说得清的落点」；没名字的那台单列，数字不混进
+            // placed —— 否则账面上「都放置好了」，而控制台上一台都看不见。
+            Some(_) => ledger.placed_trees += trees as u64,
+            None => ledger.unnamed_home.push(r.addr.clone()),
+        }
+    }
+    (rows, ledger)
 }
 
 /// 这台引擎已经持有 `view` 的那一项地址；`Ok(None)` = 全**可达**表都没有这棵树。
@@ -374,8 +688,14 @@ pub fn plan_placement(addrs: &[String], view: &str) -> String {
 /// 它（对齐「kill 一个实例,其余实例上的视图仍可正常读写」）。只有在**没有任何可达
 /// 实例**报告持有、且确有实例不可达时才 Err：此时「找不到」不能等价于「不存在」,
 /// 否则 `store_for` 会在另一台上按可写句柄把一棵本已存在的树当新的重建。全部可达
-/// 且无人持有 = 真 `None`。同名出现在两台可达 = 部署被旁路写坏,报 Err（对齐 PG 档
-/// dangling 的 REFUSED 纪律）。
+/// 且无人持有 = 真 `None`。
+///
+/// 同名出现在多台可达实例上时分两种，必须分开：把 `treedb-standby` 接进 `--meta-store`
+/// 逗号列表后，主机上的**每一棵树**在副本上都有影子，这不是「部署被旁路写坏」，而是
+/// 装了热备的必然结果；此时写必须落主，副本只是拷贝。所以多命中时再问一次 `Stats`
+/// 判副本，可写者唯一就放行它。只有**两台以上都可写**才是真的契约违背（对齐 PG 档
+/// dangling 的 REFUSED 纪律）。多花的那一轮 `Stats` 只在多命中路径上，常见的「树在
+/// 一台」仍是一次 `ListViews` 就返回，不给 `store_for` 的快路径加往返。
 pub fn find_tree_home(addrs: &[String], view: &str) -> Result<Option<String>, String> {
     let mut hits: Vec<&String> = Vec::new();
     let mut down: Vec<&String> = Vec::new();
@@ -392,18 +712,54 @@ pub fn find_tree_home(addrs: &[String], view: &str) -> Result<Option<String>, St
             }
         }
     }
+    if hits.len() > 1 {
+        return resolve_duplicate_hits(view, &hits);
+    }
     match hits.len() {
         1 => Ok(Some(hits[0].clone())),
         0 if down.is_empty() => Ok(None),
-        0 => Err(format!(
+        _ => Err(format!(
             "view '{view}' is not on any reachable treedb instance, but {} could not be read ({} of {}) — refusing to treat an unreadable engine as a missing tree",
             down.len(),
             down.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
             addrs.len(),
         )),
+    }
+}
+
+/// 一个名字出现在多台可达实例上：按 `Stats.replica` 把它们分成主机与副本。
+/// 恰好一台可写 → 那就是家；零台可写（全副本，或第二轮反而全失联）→ 回一个说得出
+/// 原因的错误，绝不能挑一台副本去开可写句柄；两台以上可写 → 契约违背。
+fn resolve_duplicate_hits(view: &str, hits: &[&String]) -> Result<Option<String>, String> {
+    let join = |v: &[&String]| v.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
+    let mut primaries: Vec<&String> = Vec::new();
+    let mut replicas: Vec<&String> = Vec::new();
+    let mut silent: Vec<&String> = Vec::new();
+    for a in hits {
+        let l = probe_load(a);
+        if !l.reachable {
+            silent.push(a);
+        } else if l.replica {
+            replicas.push(a);
+        } else {
+            primaries.push(a);
+        }
+    }
+    match primaries.len() {
+        1 => Ok(Some(primaries[0].clone())),
+        0 => Err(format!(
+            "view '{view}' is reported only by instances that are not writable treedb primaries ({} of them are read-only replicas: {}) — a standby holds a whole-engine copy of its primary's trees, so this name must be resolved against the primary; point --meta-store at the primary{}",
+            replicas.len(),
+            join(&replicas),
+            if silent.is_empty() {
+                String::new()
+            } else {
+                format!("; {} also stopped answering on the second read", join(&silent))
+            }
+        )),
         _ => Err(format!(
-            "view '{view}' exists on multiple treedb instances ({}) — one tree per name is the contract; reconcile by hand",
-            hits.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+            "view '{view}' exists on multiple writable treedb instances ({}) — one tree per name is the contract; reconcile by hand",
+            join(&primaries)
         )),
     }
 }
@@ -1328,7 +1684,8 @@ fn write_treedb_registry(base: &std::path::Path, insts: &[(String, String)]) -> 
     let path = treedb_registry_path(base);
     let mut text = "# GroveFS-managed treedb instance registry — edited by the web console's\n\
         # storage page (`storage.*`, admin only). treedb is EXPERIMENTAL: the meta-server\n\
-        # routes new trees by name hash across the `--meta-store` address set only; other\n\
+        # places new trees on the least-loaded writable engine of the `--meta-store` address\n\
+        # set only; other\n\
         # lines here are inventory. Existing trees always resolve by engine listing.\n\
         # The control plane stays in local SQLite.\n"
         .to_string();
@@ -1696,7 +2053,7 @@ mod registry_tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// 多实例路由集：逗号列表展开、去重、保序；坏项整串拒绝；新树落点按名字
+    /// 多实例路由集：逗号列表展开、去重、保序；坏项整串拒绝；兜底落点按名字
     /// 哈希确定且可重算（无账本持久化的前提就是这条确定性）。
     #[test]
     fn parse_addrs_and_plan_placement() {
@@ -1706,15 +2063,22 @@ mod registry_tests {
         let b = parse_addrs("treedb:// 127.0.0.1:7777 ,127.0.0.1:7777,").unwrap();
         assert_eq!(b, vec!["127.0.0.1:7777"]);
         assert!(parse_addrs("treedb://127.0.0.1:7777,not-an-addr").is_err());
-        // 单实例退化：所有名字都落唯一项。
+        // 单实例退化：所有名字都落唯一项，而且不去探测网络（这一条必须不花
+        // 上一秒才能给 `view create` 用）。
         let one = parse_addrs("treedb://127.0.0.1:7777").unwrap();
-        assert_eq!(plan_placement(&one, "anything"), "127.0.0.1:7777");
-        // 确定性 + 真正分散：同一名字永远同机，且 24 个名字两台都有份。
+        let p = plan_placement(&one, "anything");
+        assert_eq!(
+            (p.addr.as_str(), p.how),
+            ("127.0.0.1:7777", "only instance")
+        );
+        assert_eq!(p.detail, None);
+        // 兜底哈希的确定性与真正分散（负载选点本身的判据由
+        // `pick_least_loaded_*` 三条单测覆盖，不靠网络）。
         let (mut hits0, mut hits1) = (0, 0);
         for i in 0..24 {
             let name = format!("view{i}");
-            let h = plan_placement(&a, &name);
-            assert_eq!(h, plan_placement(&a, &name));
+            let h = hash_home(&a, &name);
+            assert_eq!(h, hash_home(&a, &name));
             if h == a[0] {
                 hits0 += 1;
             } else {
@@ -1725,6 +2089,56 @@ mod registry_tests {
             hits0 > 0 && hits1 > 0,
             "placement must spread: {hits0}/{hits1}"
         );
+    }
+
+    fn load(addr: &str, trees: usize, nodes: u64, writes: u64) -> InstanceLoad {
+        InstanceLoad {
+            addr: addr.to_string(),
+            reachable: true,
+            replica: false,
+            nodes,
+            writes_total: writes,
+            names: (0..trees).map(|i| format!("{addr}-{i}")).collect(),
+        }
+    }
+
+    /// 主判据是树数：树数少的一方胜出，即使它节点更多。
+    #[test]
+    fn pick_least_loaded_prefers_fewest_trees() {
+        let loads = vec![load("a", 3, 10, 10), load("b", 1, 400, 400)];
+        assert_eq!(pick_least_loaded(&loads), Some(1));
+        // 树数相同时比节点：一台一棵百万文件的树不应该被认为是空实例。
+        let loads = vec![load("a", 2, 1_000_000, 5), load("b", 2, 20, 9)];
+        assert_eq!(pick_least_loaded(&loads), Some(1));
+        // 树、节点都相同时才比累计写 op。
+        let loads = vec![load("a", 2, 20, 900), load("b", 2, 20, 3)];
+        assert_eq!(pick_least_loaded(&loads), Some(1));
+    }
+
+    /// 副本与不可达的实例不是候选项 —— 它们不是「较忙」，而是根本不能接受新的
+    /// 可写树。一台只读副本看起来永远最闲（它自己的 writes_total 不涨），所以
+    /// 这条排除是判据能成立的前提而不是锦上添花。
+    #[test]
+    fn pick_least_loaded_excludes_replicas_and_dead_engines() {
+        let mut replica = load("r", 0, 0, 0);
+        replica.replica = true;
+        let mut down = load("d", 0, 0, 0);
+        down.reachable = false;
+        let loads = vec![replica, down, load("w", 7, 7000, 7000)];
+        assert_eq!(pick_least_loaded(&loads), Some(2));
+        // 全不候选 = 没有地方可放，交回调用方走兜底（不赌一台写不进的引擎）。
+        assert_eq!(pick_least_loaded(&loads[..2]), None);
+        assert_eq!(pick_least_loaded(&[]), None);
+    }
+
+    /// 平局取 serve set 里靠前的一台：同一份账算两次必须得同一个落点（否则
+    /// 「预览落点和真正落点」会打架）。
+    #[test]
+    fn pick_least_loaded_breaks_ties_by_serve_order() {
+        let loads = vec![load("x", 2, 20, 20), load("y", 2, 20, 20)];
+        assert_eq!(pick_least_loaded(&loads), Some(0));
+        let flipped = vec![loads[1].clone(), loads[0].clone()];
+        assert_eq!(pick_least_loaded(&flipped), Some(0));
     }
 
     /// 故障隔离降级：一台读不到不连坐其余实例。两台端口皆无监听（1、2），

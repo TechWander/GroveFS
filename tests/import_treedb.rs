@@ -63,7 +63,7 @@ fn open_treedb_store(view: &str) -> Option<(MetaStore, String)> {
             return None;
         }
     };
-    let addr = home.unwrap_or_else(|| grovefs::treedb_store::plan_placement(&addrs, view));
+    let addr = home.unwrap_or_else(|| grovefs::treedb_store::plan_placement(&addrs, view).addr);
     match MetaStore::open_treedb(&addr, view, false) {
         Ok(m) => Some((m, addr)),
         Err(e) => {

@@ -3423,6 +3423,28 @@ details.help > .body {
 .sstat.warn .sstat-n {
   color: var(--warn);
 }
+/* A hard ledger bucket (an engine that did not answer, a name on two engines) is
+   a fact to act on, not a shade of yellow, so it gets the error palette. */
+.sstat.err {
+  border-color: var(--err-line);
+  background: var(--err-soft);
+}
+.sstat.err .sstat-n {
+  color: var(--err);
+}
+/* The ledger's own sentences, stacked under the bucket counters. No negative
+   margin: an `instanceError` line may sit between the grid and this block, and a
+   pull-up would collide with it whenever an engine is down. */
+.ledger-notes {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin: 0 0 var(--sp-5);
+}
+.ledger-notes p {
+  margin: 0;
+  font-size: 0.8125rem;
+}
 /* A refresh that failed while a snapshot is already on screen: a quiet strip,
    not a page replacement, so the deployment never looks like it vanished. */
 .banner-warn {

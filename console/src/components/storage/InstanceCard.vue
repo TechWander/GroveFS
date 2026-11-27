@@ -70,6 +70,17 @@ const filled = computed(() => {
   return Math.max(1, Math.round((count.value / props.maxCount) * SEGS))
 })
 const isPg = computed(() => props.backend === 'postgres')
+/*
+  A treedb engine that did not answer has NO counts. Showing `0 view(s) here`
+  would read as "idle" — the exact lie this file's sibling helpers refuse
+  elsewhere ("an unreadable engine is not an empty one"), so the card shows an
+  em dash and says the count is unknown instead.
+*/
+const unknown = computed(() => props.backend === 'treedb' && props.inst.reachable === false)
+/* A replica carries trees and refuses every write, so it looks permanently idle
+   by tree count. It is NOT a placement target — say it on the card, because the
+   balancer's exclusion is otherwise invisible. */
+const isReplica = computed(() => props.backend === 'treedb' && props.inst.replica === true)
 const editable = computed(() => props.managed)
 // The control plane's URI (PG) and the serving address (treedb) are not editable
 // in place — each is the transaction of a different verb (a handover / a restart).
@@ -100,6 +111,18 @@ const canCreate = computed(() => session.can('view.create'))
           tone="good"
           :label="t('serving')"
           :title="t('the address this meta-server routes its trees to')"
+        />
+        <StateBadge
+          v-if="isReplica"
+          tone="warn"
+          :label="t('read-only replica')"
+          :title="t('it holds trees but refuses writes, so no new tree is placed here')"
+        />
+        <StateBadge
+          v-else-if="unknown"
+          tone="bad"
+          :label="t('unreachable')"
+          :title="t('the engine did not answer — its view count is unknown, not zero')"
         />
         <span v-if="props.backend === 'treedb'" class="exp-tag" :title="t('treedb is an EXPERIMENTAL backend')">
           {{ t('experimental') }}
@@ -134,10 +157,21 @@ const canCreate = computed(() => session.can('view.create'))
         <span v-for="i in SEGS" :key="i" :class="['seg', i <= filled ? 'on' : '']"></span>
       </div>
       <span class="inst-count">
-        <b>{{ count }}</b>
-        {{ t('view(s) here') }}
+        <b>{{ unknown ? '—' : count }}</b>
+        {{ unknown ? t('count unknown') : t('view(s) here') }}
       </span>
     </div>
+
+    <!-- The two numbers the balancer compares, on the card they apply to: an
+         operator deciding where a view SHOULD go needs the same grounds the
+         server used, not a third guess made in the browser. -->
+    <p
+      v-if="props.backend === 'treedb' && !unknown"
+      class="inst-note"
+      :title="t('what the placement rule compares before it picks a home')"
+    >
+      {{ t('${n} nodes · ${w} write op(s)', { n: inst.nodes ?? 0, w: inst.writes ?? 0 }) }}
+    </p>
 
     <ul class="inst-views">
       <li v-for="v in views.slice(0, 8)" :key="v" class="mono">{{ v }}</li>

@@ -176,7 +176,7 @@ impl StoreKind {
             }
             #[cfg(feature = "treedb")]
             StoreKind::Treedb(_) => {
-                "one tree per view in a treedb server (a comma-list --meta-store spreads new trees over the instances by name hash, existing ones resolve by engine listing); <base> holds definitions and keys only"
+                "one tree per view in a treedb server (a comma-list --meta-store places new trees on the least-loaded writable instance, existing ones resolve by engine listing); <base> holds definitions and keys only"
                     .to_string()
             }
         }
@@ -186,10 +186,10 @@ impl StoreKind {
 /// The `storage` block of `store.info`: what the backend is, which instances
 /// exist, and where each view is placed.
 ///
-/// Only a PostgreSQL book can have more than one entry. SQLite is one embedded
-/// store and treedb is one tree server, so both report a SINGLE logical
-/// instance — inventing a grid of one-database "instances" would misdescribe
-/// the deployment an operator is looking at.
+/// Only a PostgreSQL book and a comma-list `--meta-store treedb://a,b` have more
+/// than one entry; SQLite is one embedded store, and a single treedb URI names
+/// one instance. What every arm ships is what the deployment ACTUALLY addresses,
+/// so the page never draws a grid the operator does not run.
 ///
 /// URIs are returned VERBATIM (credentials included): `store.info` is
 /// Super-only, and this page exists so an operator can verify the real
@@ -199,7 +199,22 @@ impl StoreKind {
 /// the spec `serve()` adopted to `<base>/instances.conf` — an operator-owned
 /// `file:` registry (or a bare inline spec that was never adopted, e.g. on a
 /// node whose start refused) stays read-only to the storage page.
-fn storage_snapshot(store: &StoreKind, base: &Path) -> serde_json::Value {
+///
+/// The treedb arm also hands back the tree census its ONE sweep counted, so
+/// `store.info` cannot answer "how many base views" from a second walk of the
+/// engines that disagrees with the instance cards below it — and so a dark engine
+/// degrades that count into a labelled lower bound instead of failing the whole
+/// snapshot, which is the page an operator opens DURING that outage.
+struct StorageReport {
+    snap: serde_json::Value,
+    /// treedb only: `(every tree name a serving engine reported, the serving
+    /// addresses that did not answer)`. `None` on SQLite and PG, whose tree list
+    /// comes from the control store rather than from an engine an outage can
+    /// silence.
+    trees: Option<(Vec<String>, Vec<String>)>,
+}
+
+fn storage_snapshot(store: &StoreKind, base: &Path) -> StorageReport {
     use serde_json::json;
     let managed = match store {
         StoreKind::Pg(spec) => crate::pg_store::is_managed_spec(spec, base),
@@ -207,7 +222,8 @@ fn storage_snapshot(store: &StoreKind, base: &Path) -> serde_json::Value {
     };
     match store {
         StoreKind::Pg(spec) => match crate::pg_store::instance_report(spec) {
-            Ok(report) => json!({
+            Ok(report) => StorageReport {
+                snap: json!({
                 "backend": "postgres",
                 "instances": report
                     .instances
@@ -226,10 +242,13 @@ fn storage_snapshot(store: &StoreKind, base: &Path) -> serde_json::Value {
                 // for the next start.
                 "managed": managed,
                 "pendingControl": crate::pg_store::pending_control_note(base),
-            }),
+                }),
+                trees: None,
+            },
             // An unreadable registry still names the deployment: keep one row
             // from the raw spec so the page renders and the error is visible.
-            Err(e) => json!({
+            Err(e) => StorageReport {
+                snap: json!({
                 "backend": "postgres",
                 "instances": [{
                     "name": "postgres",
@@ -241,9 +260,12 @@ fn storage_snapshot(store: &StoreKind, base: &Path) -> serde_json::Value {
                 "instanceError": e,
                 "managed": managed,
                 "pendingControl": null,
-            }),
+                }),
+                trees: None,
+            },
         },
-        StoreKind::Sqlite => json!({
+        StoreKind::Sqlite => StorageReport {
+            snap: json!({
             "backend": "sqlite",
             "instances": [{
                 "name": "local",
@@ -255,34 +277,105 @@ fn storage_snapshot(store: &StoreKind, base: &Path) -> serde_json::Value {
             "instanceError": null,
             "managed": false,
             "pendingControl": null,
-        }),
+            }),
+            trees: None,
+        },
         #[cfg(feature = "treedb")]
         StoreKind::Treedb(addrs) => {
             // treedb's registry lists every ROUTED address (a comma-list
-            // --meta-store routes new trees across them by name hash; reads
-            // resolve per engine). No row is `control` (the control plane is
-            // local SQLite); a row whose address is in the serving set is
-            // `serving` (this server's trees).
-            let insts = crate::treedb_store::treedb_registry(base).unwrap_or_default();
-            let rows = insts
+            // --meta-store spreads new trees across them by load; reads resolve
+            // per engine). No row is `control` (the control plane is local
+            // SQLite); a row whose address is in the serving set is `serving`
+            // (this server's trees).
+            //
+            // ONE sweep answers rows and ledger together, and it is parallel:
+            // the serial per-row `list_views` this replaces meant a registry row
+            // pointing at a black-holed host stalled the whole snapshot for the
+            // full connect timeout, and the page would have shown a count that
+            // contradicted the ledger.
+            let (rows, ledger) = crate::treedb_store::storage_census(base, addrs);
+            // The same view -> instance-name map PG ships, so the console's
+            // generic "which instance holds this view" path and treedb's own
+            // `viewNames` lookup cannot ever disagree.
+            let mut placement = serde_json::Map::new();
+            // A replica's listing is its primary's shadow, so it must not answer
+            // "where does view X live" — and the first writable row wins rather
+            // than the last, because the standby is usually listed after the
+            // primary it copies (`find_tree_home` resolves the same way).
+            for r in rows
                 .iter()
-                .map(|(name, a)| {
-                    let views = crate::treedb_store::TreedbStore::list_views(a).ok();
-                    json!({
-                        "name": name,
-                        "control": false,
-                        "serving": addrs.iter().any(|s| s == a),
-                        "uri": format!("treedb://{a}"),
-                        "placedViews": views.as_ref().map(|v| v.len()),
-                        "viewNames": views,
-                    })
-                })
-                .collect::<Vec<_>>();
-            json!({
+                .filter(|r| r.serving && r.load.reachable && !r.load.replica)
+            {
+                if let Some(n) = &r.name {
+                    for v in &r.load.names {
+                        placement
+                            .entry(v.clone())
+                            .or_insert_with(|| serde_json::Value::String(n.clone()));
+                    }
+                }
+            }
+            // The census the rest of `store.info` reports as `views`: names from
+            // the SERVING set only (an inventory row is another deployment's
+            // tree), deduped exactly as `view list --physical` dedupes. A
+            // replica's names are its primary's, so they fold in rather than
+            // double the count.
+            let mut trees: Vec<String> = Vec::new();
+            for r in rows.iter().filter(|r| r.serving && r.load.reachable) {
+                for v in &r.load.names {
+                    if !trees.contains(v) {
+                        trees.push(v.clone());
+                    }
+                }
+            }
+            trees.sort();
+            let down: Vec<&str> = ledger.unreachable.iter().map(|s| s.as_str()).collect();
+            StorageReport {
+                snap: json!({
                 "backend": "treedb",
-                "instances": rows,
-                "placement": {},
-                "instanceError": null,
+                "instances": rows
+                    .iter()
+                    .map(|r| {
+                        // An unreadable engine reports NO count, not zero: "0
+                        // trees" and "could not ask" are different facts, and the
+                        // page must not turn an outage into an empty instance.
+                        let known = r.load.reachable;
+                        json!({
+                            "name": r.name,
+                            "control": false,
+                            "serving": r.serving,
+                            "uri": format!("treedb://{}", r.addr),
+                            "placedViews": known.then(|| r.load.trees() as usize),
+                            "viewNames": known.then(|| r.load.names.clone()),
+                            // What the balancer actually reads before picking a
+                            // home, shipped per row so an operator can see WHY a
+                            // new tree went where it went.
+                            "reachable": known,
+                            "replica": r.load.replica,
+                            "nodes": known.then_some(r.load.nodes),
+                            "writes": known.then_some(r.load.writes_total),
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+                "placement": placement,
+                "instanceError": if down.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String(format!(
+                        "{} serving treedb address(es) did not answer: {} — their tree counts are unknown, not zero",
+                        down.len(),
+                        down.join(", ")
+                    ))
+                },
+                // The ledger: which trees have a home this server can NAME, and
+                // the four distinct ways one can not. Buckets are disjoint by
+                // construction (see `TreedbLedger`).
+                "ledger": json!({
+                    "placedTrees": ledger.placed_trees,
+                    "unnamedHome": ledger.unnamed_home,
+                    "offServing": ledger.off_serving,
+                    "unreachable": ledger.unreachable,
+                    "duplicates": ledger.duplicates,
+                }),
                 // Server-owned registry (a single --meta-store has no operator
                 // file to own), so the storage page may EDIT it; the two caveats
                 // below are what the panel must surface next to every card.
@@ -291,10 +384,12 @@ fn storage_snapshot(store: &StoreKind, base: &Path) -> serde_json::Value {
                 "experimental": true,
                 "controlPlane": "local SQLite",
                 "routingNote": format!(
-                    "treedb routes new trees by name hash across {} serving address(es); other entries are inventory, not placement targets",
+                    "treedb places new trees on the least-loaded writable engine among {} serving address(es); other entries are inventory, not placement targets",
                     addrs.len()
                 ),
-            })
+                }),
+                trees: Some((trees, ledger.unreachable.clone())),
+            }
         }
     }
 }
@@ -949,7 +1044,7 @@ impl MetaServer {
             }
         }
         // treedb keeps the SAME adoption idea with a real routing table now: a
-        // comma-list --meta-store routes NEW trees by name hash across its
+        // comma-list --meta-store places NEW trees on its least loaded
         // instances, while every read asks the engines themselves. The registry
         // still mirrors those serving addresses for the console, plus any
         // operator-added inventory rows.
@@ -2669,7 +2764,20 @@ fn control_dispatch(
             // and the PG ledger subtracts its placed-row set from them to name
             // the hash-routed remainder (`unplaced`) apart from rows that point
             // at a retired instance (`dangling`).
-            let trees = physical_tree_list(rt)?;
+            //
+            // Under treedb this comes out of the SAME sweep the storage block
+            // below builds, and an address that did not answer no longer fails
+            // the call: the strict `physical_tree_list` belongs to `view list
+            // --physical` and the delete guards, where half a list must never be
+            // taken for the whole one, whereas a page that documents WHICH
+            // engines are missing is exactly what an operator opens while one is
+            // down. `trees_silent` travels with the count so it reads as a lower
+            // bound and not as a total.
+            let store_report = storage_snapshot(&rt.store, &rt.base);
+            let (trees, trees_silent): (Vec<String>, Vec<String>) = match store_report.trees {
+                Some(pair) => pair,
+                None => (rt.control.list_physical()?, Vec::new()),
+            };
             // The HA configuration, reported only when there IS one.
             //
             // `role` above is `Primary` on every plain node — that is what
@@ -2710,6 +2818,14 @@ fn control_dispatch(
                 "role": format!("{:?}", rt.role()),
                 "ha": ha,
                 "views": trees.len(),
+                // How many serving engines were too quiet to be asked: with this
+                // set nonzero, `views` above counts only what answered. A number
+                // an operator acts on has to say whether it is complete.
+                "viewsUnlistedFor": if trees_silent.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::from(trees_silent.len())
+                },
                 "definitions": rt.control.list_defs()?.len(),
                 "accounts": accounts,
                 "liveKeys": keys,
@@ -2765,7 +2881,7 @@ fn control_dispatch(
                 "auditRetention": rt.audit_retention.lock().clone(),
                 // What the metadata store IS (sqlite / one PG / a PG book /
                 // treedb) and where each view lives inside it.
-                "storage": storage_snapshot(&rt.store, &rt.base),
+                "storage": store_report.snap,
             }))
         }
         // A delegated caller's list is its own definitions: the same lens/fork
@@ -2858,7 +2974,7 @@ fn control_dispatch(
                         crate::treedb_store::copy_tree(&base, &name, &home)
                             .map_err(|e| format!("treedb fork seed: {e}"))?
                     } else {
-                        let home = crate::treedb_store::plan_placement(addrs, &name);
+                        let home = crate::treedb_store::plan_placement(addrs, &name).addr;
                         // A writable open creates the (empty) view — the same
                         // "the store owns its tree" contract as `view create`.
                         let dst = crate::treedb_store::TreedbStore::open(&home, &name, false)
@@ -3032,12 +3148,24 @@ fn control_dispatch(
                     // pattern this funnel removes.)
                     //
                     // An instance name pins the home exactly as `--pg-instance`
-                    // does for PG. Without one, the view's hash picks the server,
-                    // which is the only rule available and the one later reads
-                    // re-derive — but the operator is entitled to choose the disk
-                    // a tree lands on, and the Storage page now offers the names.
-                    let home = match pg_instance {
-                        None => crate::treedb_store::plan_placement(addrs, &view),
+                    // does for PG. Without one the pick is load-aware — the
+                    // least loaded writable engine — and it only ever decides
+                    // where a NEW tree goes, so reads still re-derive the home
+                    // from the engine's own list, never from this rule. The
+                    // operator keeps the right to choose the disk a tree lands
+                    // on, and the Storage page offers the names.
+                    let (home, home_note) = match pg_instance {
+                        None => {
+                            let p = crate::treedb_store::plan_placement(addrs, &view);
+                            (
+                                p.addr,
+                                match p.detail {
+                                    Some(d) => format!(" ({}: {d})", p.how),
+                                    None if p.how == "only instance" => String::new(),
+                                    None => format!(" ({})", p.how),
+                                },
+                            )
+                        }
                         Some(want) => {
                             let book = crate::treedb_store::treedb_registry(&rt.base)
                                 .unwrap_or_default();
@@ -3045,7 +3173,7 @@ fn control_dispatch(
                                 .iter()
                                 .find(|(n, _)| n == want)
                                 .map(|(_, addr)| addr.clone());
-                            match named {
+                            let addr: String = match named {
                                 None => return Err(format!(
                                     "no treedb instance named '{want}' — the registry defines {} (the Storage page lists them)",
                                     if book.is_empty() {
@@ -3057,8 +3185,29 @@ fn control_dispatch(
                                 Some(addr) if !addrs.iter().any(|x| x == &addr) => return Err(format!(
                                     "treedb instance '{want}' points at {addr}, which this server's --meta-store does not route to — it cannot hold a view later reads would find",
                                 )),
-                                Some(addr) => addr,
-                            }
+                                Some(addr) => {
+                                    // Naming a replica is a plausible typo — the
+                                    // Storage page shows the instance, and the
+                                    // engine does answer `ListViews` on it. But a
+                                    // tree created there takes no writes at all,
+                                    // so refuse while the reason is still
+                                    // explainable. An instance that does not
+                                    // answer is NOT refused here: the open below
+                                    // reports the real connection error, which
+                                    // beats inventing one from a stale guess.
+                                    let l = crate::treedb_store::probe_load(&addr);
+                                    if l.reachable && l.replica {
+                                        return Err(format!(
+                                            "treedb instance '{want}' is a read-only replica ({addr}) — a standby copies its primary's trees and creates none of its own; name the primary instead",
+                                        ));
+                                    }
+                                    addr
+                                }
+                            };
+                            // An operator-named home is its own reason: say so
+                            // instead of letting "least loaded" claim a pick it
+                            // did not make.
+                            (addr, format!(" (named '{want}')"))
                         }
                     };
                     let eng = crate::meta::MetaStore::open_treedb(&home, &view, false)
@@ -3074,16 +3223,17 @@ fn control_dispatch(
                     // Like PG: the bytes belong to the data servers, so there is
                     // no local root a manifest `touch` line could write into.
                     let note = seed_if_manifest(&eng, None, manifest)?;
-                    // Say WHICH instance the hash chose when nobody pinned one:
-                    // "in treedb" alone leaves the operator guessing where the
-                    // tree went, and the next question is always that one.
+                    // Say WHICH instance the pick chose and on what grounds when
+                    // nobody pinned one: "in treedb" alone leaves the operator
+                    // guessing where the tree went, and the next question is
+                    // always that one.
                     let on = crate::treedb_store::treedb_registry(&rt.base)
                         .unwrap_or_default()
                         .into_iter()
                         .find(|(_, addr)| addr == &home)
                         .map(|(n, _)| format!("instance '{n}' at {home}"))
                         .unwrap_or_else(|| home.clone());
-                    format!("created BASE view '{view}' in treedb on {on}{note}")
+                    format!("created BASE view '{view}' in treedb on {on}{home_note}{note}")
                 }
             };
             rt.evict();
@@ -3092,9 +3242,10 @@ fn control_dispatch(
         // "Then which instance does the default pick?" — answered by the SAME
         // function the create arm calls, so the console can NAME the instance
         // instead of guessing it from view counts. A count cannot predict
-        // treedb's rule (a name hash), and a second implementation of the rule
-        // in the front end is the two-lists-answering-one-question pattern this
-        // file keeps removing. Pure: nothing is opened, nothing is written.
+        // treedb's rule (which engine is least loaded right now), and a second
+        // implementation of the rule in the front end is the two-lists-answering-
+        // one-question pattern this file keeps removing. Pure: nothing is opened,
+        // nothing is written — `plan_placement` only reads engine stats.
         "view.plan" => {
             let view = req_str(a, "view")?;
             if !crate::layout::valid_view_name(&view) {
@@ -3105,23 +3256,45 @@ fn control_dispatch(
                 StoreKind::Treedb(addrs) => {
                     // A name the engine already serves is PLACED, so report
                     // where it lives rather than where a new name with the same
-                    // spelling would hash to.
-                    let (addr, exists) = match crate::treedb_store::find_tree_home(addrs, &view)? {
-                        Some(h) => (h, true),
-                        None => (crate::treedb_store::plan_placement(addrs, &view), false),
-                    };
+                    // spelling would be put.
+                    let (addr, exists, rule, detail) =
+                        match crate::treedb_store::find_tree_home(addrs, &view)? {
+                            Some(h) => (h, true, "already placed", None),
+                            None => {
+                                let p = crate::treedb_store::plan_placement(addrs, &view);
+                                (p.addr, false, p.how, p.detail)
+                            }
+                        };
                     let named = crate::treedb_store::treedb_registry(&rt.base)
                         .unwrap_or_default()
                         .into_iter()
                         .find(|(_, x)| x == &addr)
                         .map(|(n, _)| n);
+                    // The whole census travels with the answer: the create dialog
+                    // shows the distribution, which is the only way an operator
+                    // can see that the balance worked before creating anything.
+                    let load: Vec<serde_json::Value> = crate::treedb_store::engine_load(addrs)
+                        .into_iter()
+                        .map(|l| {
+                            json!({
+                                "addr": l.addr,
+                                "trees": l.trees(),
+                                "nodes": l.nodes,
+                                "writes": l.writes_total,
+                                "replica": l.replica,
+                                "reachable": l.reachable,
+                            })
+                        })
+                        .collect();
                     Ok(json!({
                         "backend": "treedb",
-                        "rule": "name hash",
+                        "rule": rule,
+                        "detail": detail,
                         "addr": addr,
                         "instance": named,
                         "exists": exists,
                         "serving": addrs.len(),
+                        "load": load,
                     }))
                 }
                 StoreKind::Pg(_) => Ok(json!({
