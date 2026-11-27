@@ -72,12 +72,18 @@ if [ -x "$BIN" ]; then
   # 识别按脚本 basename 而不是完整路径:散文里常只写短名(如「`pg_drop_views.sh --rebuild-ledger`
   # 的干跑预演」),写全路径的行只是多数情况。
   # 已知代价:与配方脚本同行的 grovefs 臆造参数不会被这条规则抓到(同一行才剥)。
-  for s in "$ROOT"/.bneck/*.sh; do [ -e "$s" ] && basename "$s"; done > "$recs"
+  # 配方目录可覆盖:`.bneck/` 是 gitignore 的 dot 目录,不随 git worktree 生成,
+  # 在 worktree 里跑时 glob 取不到文件,这条剥规则会**静默失效**——配方的
+  # `--yes`/`--list` 于是被读成文档臆造参数。所以允许指到主检出,并在空集时自报降级。
+  for s in "${GROVEFS_RECIPE_DIR:-$ROOT/.bneck}"/*.sh; do [ -e "$s" ] && basename "$s"; done > "$recs"
   if [ -s "$recs" ]; then
     for f in "${DOCS[@]}"; do sed '/<style>/,/<\/style>/d' "$f"; done \
       | grep -vF -f "$recs" > "$dtxt"
   else
     for f in "${DOCS[@]}"; do sed '/<style>/,/<\/style>/d' "$f"; done > "$dtxt"
+    printf '  [提示] 配方目录 %s 无 .sh,配方行剥离未生效,孤儿参数可能误报\n' \
+      "${GROVEFS_RECIPE_DIR:-$ROOT/.bneck}" >&2
+    printf '         加 GROVEFS_RECIPE_DIR=<主检出>/.bneck 重跑可消除\n' >&2
   fi
   # 同一条规矩用于**别家工具的命令行**:`cargo test --release --test meta_ledger -- --ignored
   # --nocapture` 里的 `--test`/`--ignored`/`--nocapture` 是 cargo 的接口。`--ignored`/`--nocapture`

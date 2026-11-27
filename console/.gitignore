@@ -1,6 +1,9 @@
 # Installed by `npm ci` / `npm install` — ~200 MB of third-party source that a
-# lockfile already describes. Never belongs in a commit.
-node_modules/
+# lockfile already describes. Never belongs in a commit. No trailing slash on
+# purpose: a secondary worktree may hold a SYMLINK here instead of the tree, and
+# `node_modules/` matches directories only, which leaves the link untracked and
+# one `git add -A` away from being committed.
+node_modules
 # `vite build` writes straight into ../src/webui (see vite.config.ts), so a
 # stray `dist/` here would only ever be the wreckage of a changed config.
 dist/
