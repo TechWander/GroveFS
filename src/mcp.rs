@@ -302,6 +302,15 @@ pub trait ControlStore: Send + Sync {
     fn tree_home_rel(&self, _view: &str) -> String {
         String::new()
     }
+    /// Which backend the VIEW TREES live in, which is the CONTROL-plane
+    /// [`Self::backend`] on every deployment that does not split them. Two
+    /// shapes do: `--control-plane postgres://…` with SQLite or treedb trees,
+    /// and a treedb run (control in local SQLite, trees in the engine). Any line
+    /// that describes where a tree IS must ask this, never `backend` — that is
+    /// what a registry sitting in one database and its trees in another means.
+    fn tree_backend(&self) -> &'static str {
+        self.backend()
+    }
 }
 
 /// The local-file control plane: the `<name>.layout` definition slots — top
@@ -385,7 +394,23 @@ impl ControlStore for FileControlStore {
     }
 
     fn tree_home_rel(&self, view: &str) -> String {
+        // Engine trees have no base-relative path to name; `tree_backend`
+        // below is what tells the caller to print the engine instead.
+        #[cfg(feature = "treedb")]
+        if self.engine_trees {
+            return String::new();
+        }
         crate::meta::tree_home_rel(&self.base, view)
+    }
+
+    fn tree_backend(&self) -> &'static str {
+        // The control plane of a treedb run IS this base's SQLite, so the two
+        // fields differ here without anybody passing `--control-plane`.
+        #[cfg(feature = "treedb")]
+        if self.engine_trees {
+            return "treedb";
+        }
+        "sqlite"
     }
 
     fn list_defs(&self) -> Result<Vec<(String, String)>, String> {
@@ -1720,9 +1745,13 @@ pub fn list_views_text(store: &dyn ControlStore) -> Result<Vec<OutLine>, String>
         out.push(OutLine::Info(entry_line(e)));
     }
     for p in bare {
-        // The tree's home is backend-specific — a SQLite db file or a PG schema.
-        let home = match store.backend() {
+        // The tree's home is backend-specific — a SQLite db file, a PostgreSQL
+        // schema or an engine tree — and it is keyed off `tree_backend`, the
+        // TREES, because on a `--control-plane` deployment the control plane is
+        // a different database from the one holding them.
+        let home = match store.tree_backend() {
             "postgres" => format!("own schema {}", schema_name_for(p)),
+            "treedb" => "tree inside the treedb engine".to_string(),
             _ => format!("own tree {}", store.tree_home_rel(p)),
         };
         out.push(OutLine::Info(format!(
@@ -3531,6 +3560,48 @@ mod tests {
                 .unwrap();
             m.create_node(priv_, "x.jpg", false, Some("k-priv-x"), 0o0644, 0, 0)
                 .unwrap();
+        }
+    }
+
+    /// The tree line of a listing names the TREES, not the registry: a plain run
+    /// prints the local file, and an engine run prints the engine instead of a
+    /// path it does not have. Answering either of those from `backend()` — the
+    /// CONTROL plane — is the shape that told an operator a file on their own
+    /// disk was a PostgreSQL schema, and printed nothing at all for a remote
+    /// SQLite store.
+    #[test]
+    fn list_views_text_labels_the_tree_by_the_tree_backend() {
+        let base = db();
+        seed_tree(&base, "va");
+        let plain = FileControlStore::new(&base);
+        assert_eq!(plain.backend(), "sqlite");
+        assert_eq!(plain.tree_backend(), "sqlite");
+        let text = list_views_text(&plain)
+            .unwrap()
+            .iter()
+            .map(|l| l.text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("base view 'va' -> own tree meta/va/va.db"),
+            "{text}"
+        );
+        #[cfg(feature = "treedb")]
+        {
+            let engine = FileControlStore::new(&base).with_engine_trees();
+            assert_eq!(engine.backend(), "sqlite");
+            assert_eq!(engine.tree_backend(), "treedb");
+            assert_eq!(engine.tree_home_rel("va"), "");
+            let text = list_views_text(&engine)
+                .unwrap()
+                .iter()
+                .map(|l| l.text())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                text.contains("base view 'va' -> tree inside the treedb engine"),
+                "{text}"
+            );
         }
     }
 

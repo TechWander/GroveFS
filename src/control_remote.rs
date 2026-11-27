@@ -573,6 +573,11 @@ pub struct RemoteControlStore {
     /// (`"postgres"`/`"sqlite"`) — surfaced in `view list` and
     /// tool JSON so an operator can tell what the server actually governs.
     backend: &'static str,
+    /// Where the server's VIEW TREES live, from the same probe's
+    /// `metadataBackend`. It differs from `backend` on a `--control-plane`
+    /// deployment (registry in PG, trees on the instance's own disk) and on a
+    /// treedb run, and `view list` must not call such a tree a schema.
+    tree_backend: &'static str,
 }
 
 impl RemoteControlStore {
@@ -593,9 +598,18 @@ impl RemoteControlStore {
             "sqlite" => "sqlite",
             _ => "remote",
         };
+        // Absent on a server predating the field: the control plane then FOLLOWS
+        // the tree backend, so the two are the same answer.
+        let tree_backend: &'static str = match info.get("metadataBackend").and_then(Value::as_str) {
+            Some("sqlite") => "sqlite",
+            Some("postgres") => "postgres",
+            Some("treedb") => "treedb",
+            _ => backend,
+        };
         Ok(Self {
             ctl: Arc::new(ctl),
             backend,
+            tree_backend,
         })
     }
 
@@ -607,6 +621,24 @@ impl RemoteControlStore {
 impl ControlStore for RemoteControlStore {
     fn backend(&self) -> &'static str {
         self.backend
+    }
+
+    fn tree_backend(&self) -> &'static str {
+        self.tree_backend
+    }
+
+    /// A base view's tree home is layout-independent — `meta/<view>/<view>.db`
+    /// under whatever base the server's banner names (`new_tree_db_path` only
+    /// nests a tree that has a PARENT, and a base never does) — so the path can
+    /// be spelled here without reading the server's filesystem. Backends whose
+    /// trees are not files keep the "" answer, which `list_views_text` renders
+    /// from `tree_backend` instead.
+    fn tree_home_rel(&self, view: &str) -> String {
+        if self.tree_backend == "sqlite" {
+            format!("meta/{view}/{view}.db")
+        } else {
+            String::new()
+        }
     }
 
     fn describe(&self) -> String {
