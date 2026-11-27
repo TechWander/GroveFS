@@ -84,4 +84,4 @@ description: Keeps GroveFS documentation (README.md, README.en.md, USAGE.md, USA
 - 只改文字与格式，**不改行为描述的事实**。拿不准某句是不是当前行为，去读源码或跑命令，不要靠猜补全。
 - 不为「读起来顺」删掉限制、拒因、单位、测量条件。
 - 不新增实测以外的数字，不给没跑过的命令贴「真实回显」。
-- **口径级删除/替换写进 `docs/adr/`，不写进正文**：六份文档只陈述当前行为；「以前有什么、为什么删、否决了什么、代价多大、现在哪条断言钉住它」进 ADR（现有 `0001-manager.md`、`0002-no-local-mount.md`、`0003-treedb-address-identity.md`、`0004-treedb-load-aware-placement.md`、`0005-write-path-blocking-budget.md`），正文只在相关章节留一句指向它。这样文档永远不描述不存在的开关，而动因不会被改写历史洗掉。
+- **口径级删除/替换写进 `docs/adr/`，不写进正文**：六份文档只陈述当前行为；「以前有什么、为什么删、否决了什么、代价多大、现在哪条断言钉住它」进 ADR（现有 `0001-manager.md`、`0002-no-local-mount.md`、`0003-treedb-address-identity.md`、`0004-treedb-load-aware-placement.md`、`0005-write-path-blocking-budget.md`、`0006-view-sharding.md`），正文只在相关章节留一句指向它。这样文档永远不描述不存在的开关，而动因不会被改写历史洗掉。

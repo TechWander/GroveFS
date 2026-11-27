@@ -34,6 +34,7 @@
 | 任意机器治理同一份元数据(不发数据库密码) | `meta-server --control-listen` + `view`/`apikey`/`refs --control-server --api-key` | §3.5.2 |
 | 在浏览器里管视图与密钥,并给账号划基视图(可建号/授权) | `grovefs web` + `web account` / `web grant` | §3.5.3 |
 | 主备高可用与真 fencing | `meta-server --role/--peer/--sync-repl/--witness` | §5.5、§11.8 |
+| 一台 meta-server 扛不住:把视图分到多个 meta-server 进程 | `meta-server --control-plane` + `--shard-ring/--shard-id` · `view move --to-meta` | §5.6 |
 | 回收账本不一致 / 审计谁在调用 | `refs rebuild` / `apikey calls` | §5.3、§3.5.1 |
 | 长命令瘦身(环境变量 + 配置文件) | `GROVEFS_*` / `~/.config/grovefs/grovefs.conf` | §1.1、§15.15 |
 
@@ -1412,7 +1413,7 @@ Admin scope also governs a `meta-server --control-listen` from any machine, with
 ```bash
 $ export GROVEFS_CONTROL_KEY='6e0f9e874f3c4bdc:8516e6eaf85045178490e81d995d92e6'
 $ grovefs view --control-server 10.0.0.5:50111 list
-no alias/fork/lens definitions in remote control plane at 10.0.0.5:50111 (backend sqlite) — the 1 base view(s) below each map to their own tree
+no alias/fork/lens definitions in remote control plane at 10.0.0.5:50111 (backend sqlite) — the 1 base view below each map to their own tree
 base view 'alice' -> own tree meta/alice/alice.db (read-write; deletes free a shared object only when no view holds it)
 view keys: `grovefs apikey --control-server 10.0.0.5:50111 --api-key <admin-key> list [--view NAME]` (add --view to see only that view's keys)
 
@@ -1951,6 +1952,72 @@ $Y meta-server --meta-dir /data/nodeB --listen 10.0.0.6:50111 --role standby --p
 - **诚实标注**:
   - 默认(async)**RPO ≈ 500ms**(主每 ~500ms 推一次快照),极端故障下最后 <500ms 内的写可能丢失;加 `--sync-repl` 可把这批写的 RPO 降到 0。
   - fencing 需要**仲裁者**:严格两节点、**不配 `--witness`** 时无法防脑裂(两半互断会各自认为自己是主 → 不封顶双写),这是 CAP/共识的硬边界,须部署第三方仲裁(witness 或第三节点)才能收敛。**配了 `--witness` 即 fail-safe**:仲裁者**多数派**不可达时冻结写而非盲写/盲升;primary 持一份不重叠的有界**租约**(仲裁者拒发重叠租约,多数活租约即独占证明),写由本地租约校验放行、每续租一次向全列表 fan-out,并对内容数据帧按 token 门控,把双写窗口收敛到**租约安全余量内**且保证收敛到单主。**多数派仲裁的可用性红利**:`--witness` 取逗号分隔的 N 个独立仲裁者(推荐奇数),权威需多数派 `N/2+1`——**宕少数仲裁者仍不冻结写**(仅失去多数才停写)、少数盘丢也不复活过期主,比单仲裁消除了 witness 这个单点可用性依赖(N=1 即单仲裁者、witness 本身成为可用性依赖:它挂→主备都停写)。
+
+---
+
+### 5.6 多 meta-server 分片(一台 PG 控制面,N 个 meta-server 进程)
+
+一台 `meta-server` 扛不住时,瓶颈常常不在元数据库,而在**这个进程本身**:每视图常驻的树引擎与它的连接池、挂载握手与逐 op 的元数据服务、还有它自己磁盘上的 `meta/`。分片把「哪个视图由哪个进程服务」记在控制面 PG 的一张表里(`grovefs_control.meta_placement`,读写按该库的 advisory lock 序列化),N 个 `meta-server` 进程各持一部分视图,客户端仍只连一个入口:被连上的那台若不服务该视图,就在 `M_OPEN` 上回 `E_SHARD` 加上 home 地址,客户端重拨到那一台。**放哪台是记录出来的,不是算出来的**——新视图落在创建它的那台,搬动只发生在人点名的时候。
+
+```bash
+# 两台各持本地 SQLite 树、共享同一台 PG 控制面。`--control-plane` 放视图定义/放置表/
+# api key/账号/审计;树落哪儿仍由 --meta-store 决定(这里不给 = 本地 SQLite)。
+$ grovefs meta-server --meta-dir /srv/gfsA --listen 0.0.0.0:50053 --control-listen 0.0.0.0:50054 \
+    --control-plane postgres://gfs:pw@10.0.0.9:5432/grovefs \
+    --shard-ring m1=10.0.0.1:50053,m2=10.0.0.2:50053 --shard-id m1 --token $TOK
+meta-server listening on 0.0.0.0:50053 (base /srv/gfsA, role Primary)
+meta-server: metadata backend sqlite — one db file per view under <base>/meta/
+meta-server: control plane is PostgreSQL (grovefs_control) — view definitions,
+                 api keys, accounts, audit and both placement tables live there; trees stay on sqlite
+meta-server: sharded across 2 meta-servers — this instance is 'm1' (10.0.0.1:50053), placement in grovefs_control.meta_placement (`M_OPEN` redirects a view it does not serve)
+
+# 第二台:同一份 --shard-ring 文本,只有 --meta-dir 与 --shard-id 不同
+$ grovefs meta-server --meta-dir /srv/gfsB --listen 0.0.0.0:50053 --control-listen 0.0.0.0:50054 \
+    --control-plane postgres://gfs:pw@10.0.0.9:5432/grovefs \
+    --shard-ring m1=10.0.0.1:50053,m2=10.0.0.2:50053 --shard-id m2 --token $TOK
+
+# 环里每台都进 manager 的 meta 列表;客户端仍只指一个入口
+$ grovefs manager define --name prod --meta 10.0.0.1:50053,10.0.0.2:50053 --data 10.0.0.3:50100,10.0.0.4:50100
+$ grovefs mount --view alice --manager 10.0.0.10:50055 --deployment prod --roster-key-file /etc/grovefs/roster.key -m /mnt/alice
+```
+
+- **环文本就是分片身份**:`--shard-ring` 的每一项是另一个 `meta-server` 进程,表里存的是**名字**,地址只是它当前指向哪台——重排环、改端口都不动一个字节。`--shard-id` 说本进程是哪一项(名字、环里的下标、或环里的某个地址);没给就用 `--advertise-addr` 找 carrying 该地址的那一项,两者都对不上就**启动失败**而不是猜。裸地址写法(`10.0.0.1:50053,10.0.0.2:50053`)按位置自动命名 `m1..mN`,只在顺序不变时稳定。**一个环条目也可以是一对 HA 主备**(`m1=10.0.0.1:50053+10.0.0.2:50053`):这就是分片与 §5.5 叠加的形状,`E_SHARD` 把整串交给客户端,挂载自己的故障转移逻辑接管,分片因此不需要一套新的故障转移代码。
+
+- **分片键是别名解析后的物理 base 视图名**:一个 base 套出的 lens / fork / alias 永远跟着同一棵树走,不会成为它的第二个放置。
+
+- **没有 `--shard-total` 这类一致性哈希**,是有意的:加一个节点若会改判既有视图的归属,被点到的那些实例手里并没有那棵树——SQLite 后端下是一个打不开的挂载,共享后端下是一个空 schema 被当成视图建出来。扩容因此是一条运维动作(`view move --to-meta`),只发生在人点名的视图上。
+
+- **客户端透明**:挂载命令没有任何分片参数。连到非 home 实例时它跟随那一次重定向(上限 3 跳,带环路检测:环与放置行互指时给出点名原因的错误,不是泛化的「连不上」)。代价实测是**一条主键读 + 一次额外握手**——同一实例同一后端上对照,自家视图的挂载 12.08 / 12.64 / 12.39 ms,需要被指引一次的视图 19.69 / 18.73 / 18.43 ms(loopback、两台 meta-server + 一台本机 PostgreSQL,三轮连跑,`tests/shard_routing.rs` 打印);这笔钱只在建立挂载时付一次。
+
+- **治理动词跨实例只拒绝、不代办**:
+```bash
+$ grovefs view --control-server 10.0.0.2:50054 --api-key "$KEY" create --view va
+error: view 'va' is placed on meta-server 'm1' (mount address 10.0.0.1:50053) — run `view create` 
+                             against THAT instance's own --control-listen port, or move the placement here 
+                             first (`view move --view va --to-meta m2`, against the control port you 
+                             are talking to)
+```
+  `view rm --name V --base` 同理。为什么必须拦:`--control-plane` 让**定义**从每台都可见,于是 `view_exists` 在远端也是真——不拦就会在同一个名字下建出第二棵树,而那是后面没有任何动词能修好的结果。删也是:peer 删掉行而树在别处活着,留下的是一棵再也解析不到放置的悬树。
+
+- **`view move --to-meta` 要在 TARGET 的控制端口上执行**:要为新家答复的那个进程才有权声明「这棵树我打得开」,它探测通过才写行。共享后端(PG / treedb)下这是一次**改行、零复制**;SQLite 树搬不动,当场拒绝并指向 export/import:
+```bash
+$ grovefs view --control-server 10.0.0.2:50054 --api-key "$KEY" move --view va --to-meta m2
+error: view 'va' has no tree on this host — a SQLite tree lives in one instance's 
+                 <base>/meta/ (m1), so move it with `view export` there and `view import` 
+                 here, then `view move --to-meta`
+```
+
+- **已建立的挂载跟着走**:行改写之后,旧实例在下一次清扫内丢掉这棵树(实测 4.691 / 4.701 / 4.707 s,贴着 `SHARD_SWEEP_MS`=5000ms 的上界);旧挂载的下一次 op 撞上 `E_SHARD` → 采纳新 home、清连接池、重握手并**重放那个 op**(被拒的 op 从未执行过,所以重放是安全的)。实测这一跳 71.5–83.7 ms,**不需要 remount**,`readdir` 同时看得见搬之前建的目录与搬之后建的目录——一棵树,两个实例先后服务过它。
+
+- **与 PG 多实例是两根不同的轴**:`--meta-store a,b,c` + `--pg-instance` / `view move --pg-instance`(§6.2)解决的是**单个 PostgreSQL 实例**的连接与容量瓶颈,作用在一个 meta-server 进程内部;分片解决的是**meta-server 进程**的服务能力瓶颈(常驻引擎池、握手、单机磁盘),作用在多个进程之间。两张表、两套行:`view_placement` 记 schema 在哪台 PG,`meta_placement` 记谁服务。两者可叠加。也别与 `--data-dir` 的数据条带(`ShardedBackend`,§5.2)混称——那分的是**内容字节**,与谁服务视图无关。
+
+- **treedb 作树后端时必须另给 `--control-plane`**:引擎不是控制面,放置表只能落在 PG。持有某视图的实例自然持有该引擎的连接——环条目就是进程,进程就是持连接者。
+
+- **故障域按三层读**:某台 meta-server 进程死 → 只有它的 home 视图受影响,别的入口会把客户端指回那台(不会自动散开:树在那台的磁盘或连接里,指错了就是空视图);控制面 PG 死 → 新的挂载建立全被拒(「哪台服务这个视图没有定论,拒绝猜」),**已建立的挂载继续服务**,清扫读不到表时保持现场不动,绝不在一次瞬时错误上丢掉活树;环里少了一个名字 → 指向已退役实例的行是错误而不是「按哈希自己顶上」,要么人搬走,要么把那台加回环。**不做再平衡、不复制树、不代理数据面**,因此也没有一条「两实例之间的内部连接」可观测——故障域是每个实例自己到 PG 的连接。
+
+- **可观测**:`store.info` 的 `shard` 块只在该进程真在环里时出现(`null` 就是「本进程服务所有视图」,与 §5.5 的 `ha` 块同形),给 `self`/`addr`/`ring`/`backend`/`controlPlane` 与每节点 `{name, addr, views, here}`;`controlPlane` 说清放置表是与树同库还是被 `--control-plane` 另指了一台。三枚计数器:`shard mounts redirected`、`shard management verbs refused`、`shard placement read/write errors`。块里外发的是节点名与地址(地址是客户端要被指引去的地方,不是秘密),**后端 URI 永不外发**——`backend` 是去 credential 的指纹。
+
+- 分片键为什么是 base 名、八行组合矩阵(分片 × 单实例 / × HA / × PG 多实例 / × 共享 PG / × SQLite 树 / × treedb / × 无 PG 控制面)与故障域的完整推导,见 `docs/adr/0006-view-sharding.md`。
 
 ---
 

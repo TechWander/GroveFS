@@ -37,6 +37,7 @@ One table covers every capability. The left column is **what you want to accompl
 | Govern the same metadata from any machine (never hand out the DB password) | `meta-server --control-listen` + `view`/`apikey`/`refs --control-server --api-key` | §3.5.2 |
 | Manage views and keys from a browser, and delegate base views to accounts (create accounts / grant) | `grovefs web` + `web account` / `web grant` | §3.5.3 |
 | Primary/standby HA with real fencing | `meta-server --role/--peer/--sync-repl/--witness` | §5.5, §11.8 |
+| One meta-server is not enough: spread views over several meta-server processes | `meta-server --control-plane` + `--shard-ring/--shard-id` · `view move --to-meta` | §5.6 |
 | Reconcile a broken ledger / audit who is calling | `refs rebuild` / `apikey calls` | §5.3, §3.5.1 |
 | Slim down long commands (env vars + config file) | `GROVEFS_*` / `~/.config/grovefs/grovefs.conf` | §1.1, §15.15 |
 
@@ -1427,7 +1428,7 @@ Any management machine (the secret into env, not into argv):
 ```bash
 $ export GROVEFS_CONTROL_KEY='6e0f9e874f3c4bdc:8516e6eaf85045178490e81d995d92e6'
 $ grovefs view --control-server 10.0.0.5:50111 list
-no alias/fork/lens definitions in remote control plane at 10.0.0.5:50111 (backend sqlite) — the 1 base view(s) below each map to their own tree
+no alias/fork/lens definitions in remote control plane at 10.0.0.5:50111 (backend sqlite) — the 1 base view below each map to their own tree
 base view 'alice' -> own tree meta/alice/alice.db (read-write; deletes free a shared object only when no view holds it)
 view keys: `grovefs apikey --control-server 10.0.0.5:50111 --api-key <admin-key> list [--view NAME]` (add --view to see only that view's keys)
 
@@ -1950,6 +1951,68 @@ $Y meta-server --meta-dir /data/nodeB --listen 10.0.0.6:50111 --role standby --p
 - **Honest annotations**:
   - The default (async) **RPO ≈ 500ms** (the primary pushes a snapshot every ~500ms), on an extreme failure the last <500ms of writes may be lost; adding `--sync-repl` drops those writes' RPO to 0.
   - Fencing needs **arbitrators**: with strictly two nodes and **no `--witness`**, split-brain cannot be prevented (both halves cut off from each other each think they're primary → unbounded dual-write), this is a hard CAP/consensus boundary, needing a third-party arbitrator (a witness or a third node) to converge. **With `--witness` it's fail-safe**: when the arbitrator **majority** is unreachable, writes freeze rather than blind-write/blind-promote; the primary holds a non-overlapping bounded **lease** (arbitrators refuse overlapping leases, a majority live lease is proof of exclusivity), writes pass on local lease validation with one fan-out to the whole list per renewal, and content data frames are gated by token, bounding the dual-write window **within the lease safety margin** and guaranteeing convergence to a single primary. **The availability dividend of majority arbitration**: `--witness` takes a comma-separated list of N independent arbitrators (odd recommended), authority needs a majority `N/2+1` — **downing a few arbitrators still doesn't freeze writes** (only losing the majority stops writes), losing a few disks doesn't revive a stale primary, eliminating the single-point availability dependency of the witness over a single arbitrator (N=1 is a single arbitrator, the witness itself being the availability dependency: it dies→both primary and standby stop writing).
+
+---
+
+### 5.6 Multi-meta-server sharding (one PG control plane, N meta-server processes)
+
+When one `meta-server` cannot carry the load, the bottleneck is usually not the metadata database but **the process itself**: the tree engine resident per view with its own connection pool, the mount handshakes and the per-op metadata service, and the `meta/` on its own disk. Sharding records "which process serves which view" in one table of the control-plane PG (`grovefs_control.meta_placement`, its reads and writes serialized by that database's advisory lock), so N `meta-server` processes each hold part of the view set while a client still dials one entrance: the instance that gets dialled and does NOT serve the view answers `M_OPEN` with `E_SHARD` plus the home address, and the client redials that one. **Placement is recorded, not computed** — a new view lands on the instance that created it, and it moves only when an operator names it.
+
+```bash
+# Two instances, each keeping its own SQLite trees, sharing one PG control plane.
+# `--control-plane` holds view definitions / the placement table / api keys /
+# accounts / audit; where the TREES live is still `--meta-store`'s call
+# (unset here = local SQLite under each --meta-dir).
+$ grovefs meta-server --meta-dir /srv/gfsA --listen 0.0.0.0:50053 --control-listen 0.0.0.0:50054 \
+    --control-plane postgres://gfs:pw@10.0.0.9:5432/grovefs \
+    --shard-ring m1=10.0.0.1:50053,m2=10.0.0.2:50053 --shard-id m1 --token $TOK
+meta-server listening on 0.0.0.0:50053 (base /srv/gfsA, role Primary)
+meta-server: metadata backend sqlite — one db file per view under <base>/meta/
+meta-server: control plane is PostgreSQL (grovefs_control) — view definitions,
+                 api keys, accounts, audit and both placement tables live there; trees stay on sqlite
+meta-server: sharded across 2 meta-servers — this instance is 'm1' (10.0.0.1:50053), placement in grovefs_control.meta_placement (`M_OPEN` redirects a view it does not serve)
+
+# The second one: the same --shard-ring text, only --meta-dir and --shard-id differ
+$ grovefs meta-server --meta-dir /srv/gfsB --listen 0.0.0.0:50053 --control-listen 0.0.0.0:50054 \
+    --control-plane postgres://gfs:pw@10.0.0.9:5432/grovefs \
+    --shard-ring m1=10.0.0.1:50053,m2=10.0.0.2:50053 --shard-id m2 --token $TOK
+
+# Every ring member goes into the manager's meta list; a client still names one entrance
+$ grovefs manager define --name prod --meta 10.0.0.1:50053,10.0.0.2:50053 --data 10.0.0.3:50100,10.0.0.4:50100
+$ grovefs mount --view alice --manager 10.0.0.10:50055 --deployment prod --roster-key-file /etc/grovefs/roster.key -m /mnt/alice
+```
+
+- **The ring text IS the shard identity**: every `--shard-ring` entry is another `meta-server` process, the rows store its **name**, and the address only says where that name points today — reordering the ring or moving a port copies nothing. `--shard-id` states which entry this process is (a name, a positional index, or one of its addresses); when unset, `--advertise-addr` selects the member carrying it, and when neither matches an entry the start **fails** rather than guessing which instance owns a view. Bare addresses (`10.0.0.1:50053,10.0.0.2:50053`) are auto-named `m1..mN`, stable only while the order holds. **One ring entry may itself be an HA pair** (`m1=10.0.0.1:50053+10.0.0.2:50053`): that is how sharding composes with §5.5 — `E_SHARD` hands the whole `a+b` string to the client, whose existing failover logic takes it from there, so sharding needs no failover code of its own.
+
+- **The shard key is the physical base view name after alias resolution**: the lens / fork / alias a base projects always ride the same tree, so a name can never become that tree's second placement.
+
+- **There is no `--shard-total` consistent hash**, deliberately: if adding a node re-decided where existing views live, the instances it names would not hold those trees — an unopenable mount under SQLite, an empty schema created as a view under a shared backend. Scaling out is therefore an operational verb (`view move --to-meta`), taken only on views an operator names.
+
+- **Transparent to the client**: the mount command takes no sharding flag. Dialed at a non-home instance it follows that one redirect (up to 3 hops, with loop detection: a ring and a placement row that point at each other produce an error naming the cause, not a generic "cannot connect"). Measured cost is **one primary-key read plus one extra handshake** — two mounts taken back to back on the same instance and backend: its own view 12.08 / 12.64 / 12.39 ms, a view that needed redirecting 19.69 / 18.73 / 18.43 ms (loopback, two meta-servers and one local PostgreSQL, three consecutive runs, printed by `tests/shard_routing.rs`), paid once when the mount is established.
+
+- **Management verbs across instances refuse; they never act on your behalf**:
+```bash
+$ grovefs view --control-server 10.0.0.2:50054 --api-key "$KEY" create --view va
+error: view 'va' is placed on meta-server 'm1' (mount address 10.0.0.1:50053) — run `view create` 
+                             against THAT instance's own --control-listen port, or move the placement here 
+                             first (`view move --view va --to-meta m2`, against the control port you 
+                             are talking to)
+```
+  `view rm --name V --base` answers the same way. Why the gate has to exist: `--control-plane` makes **definitions** visible from every instance, so `view_exists` is true remotely too — without the gate the same name would get a second tree behind it, which is the one outcome no later verb repairs. Deleting is the same: dropping the row where the tree lives elsewhere leaves a tree no mount can resolve a placement for.
+
+- **`view move --to-meta` runs against the TARGET's control port**: only the process that will have to answer for the tree may declare "I can open this one", so it probes before writing the row. On a shared backend (PG / treedb) that is a row rewrite with **no copy at all**; a SQLite tree cannot move this way and is refused on the spot, pointing at export/import.
+
+- **An established mount follows the move**: after the row flips, the old instance drops the tree on its next sweep (measured 4.691 / 4.701 / 4.707 s, right at the `SHARD_SWEEP_MS`=5000ms bound); the next op on the still-open mount meets `E_SHARD` → adopt the new home, clear the pool, re-handshake and **replay that op** (the refused op never executed, so replaying is safe). Measured 71.5–83.7 ms for that hop, **no remount needed**, and `readdir` then shows both the directory made before the move and the one made after — one tree, served by two instances in turn.
+
+- **PG multi-instance is a different axis**: `--meta-store a,b,c` with `--pg-instance` / `view move --pg-instance` (§6.2) relieves **one PostgreSQL instance** (its connections and capacity) and works inside a single meta-server process; sharding relieves **meta-server processes** (resident engine pools, handshakes, one machine's disk) and works across several. Two tables, two sets of rows: `view_placement` records which PG holds a schema, `meta_placement` records who serves it. They stack. Do not confuse either with the `--data-dir` content stripe (`ShardedBackend`, §5.2), which splits **bytes** and has nothing to do with who serves a view.
+
+- **treedb as a tree backend requires `--control-plane`**: the engine is not a control plane, so the placement table has to sit in PG. The instance holding a view is then by construction the one holding that engine connection — a ring entry is a process, and a process is what holds connections.
+
+- **Read the failure domains in three layers**: a meta-server process dies → only its home views are affected, and another entrance redirects clients back to that one (it does not spread: the tree is in that machine's disk or connections, and pointing elsewhere means an empty view); the control-plane PG dies → new mounts are refused ("which instance serves this view is undecided, refusing to guess") while **established mounts keep serving**, and a sweep that cannot read the table leaves the scene untouched rather than dropping a live tree over one transient error; a name missing from the ring → a row pointing at a retired instance is an error, not "hash it onto myself": either someone moves it or that instance comes back. **No rebalancing, no tree copying, no data-plane proxying** — so there is no "internal connection between two instances" to observe; the failure domain is each instance's own connection to PG.
+
+- **Observability**: the `shard` block of `store.info` appears only when this process really is in a ring (`null` means "this process serves every view", the same shape as the `ha` block of §5.5), reporting `self`/`addr`/`ring`/`backend`/`controlPlane` plus one `{name, addr, views, here}` per node — `controlPlane` says whether the placement table shares the database with the trees or was named apart by `--control-plane`. Three counters: `shard mounts redirected`, `shard management verbs refused`, `shard placement read/write errors`. The block ships node names and addresses (an address is where a client is being sent, not a secret) and never a backend URI — `backend` is a credential-free fingerprint.
+
+- Why the shard key is the base name, the eight-row combination matrix (sharding × single instance / × HA / × PG multi-instance / × shared PG / × SQLite trees / × treedb / × no PG control plane) and the failure-domain derivation are in `docs/adr/0006-view-sharding.md`.
 
 ---
 

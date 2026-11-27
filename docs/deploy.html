@@ -87,6 +87,7 @@ footer{border-top:1px solid var(--line);margin-top:80px;padding-top:20px;color:v
     <li><a href="#s12">1.2 SQLite 分布式部署</a></li>
     <li><a href="#s13">1.3 PostgreSQL 分布式部署</a></li>
     <li><a href="#s14">1.4 存量存储根升级（v1 扁平 → 一树一目录，本版报 v3）</a></li>
+    <li><a href="#s15">1.5 多 meta-server 分片（正交变体）</a></li>
   </ol>
   <h2>第二部分 · 命令演示</h2>
   <ol>
@@ -127,6 +128,7 @@ footer{border-top:1px solid var(--line);margin-top:80px;padding-top:20px;color:v
     <span>本机部署 = 1 台机器 · 3 个进程（两个服务 + 一次挂载）</span>
     <span>SQLite 分布式 = 1 台存储机 + N 台客户机</span>
     <span>PG 分布式 = 元数据进 PostgreSQL</span>
+    <span>分片 = 多个 meta-server 进程分服务视图（叠在任意一套之上）</span>
     <span>示例环境均为虚构内网 10.0.0.x</span>
   </div>
   <p class="lead">约定：下文 <code>$G</code> 指 GroveFS 可执行文件（<code>./target/release/grovefs</code> 或安装后的 <code>grovefs</code>）。三套部署使用<b>同一个二进制</b>，差别只在「元数据存哪、谁起服务」。端口约定：引导服务 <code>50055</code>、数据服务 <code>50100</code>、元数据服务 <code>50110</code>。所有示例 IP 为虚构内网地址，照抄时替换为自己的。</p>
@@ -414,6 +416,71 @@ $ ls /data/gfs/meta
 <span class="out">alice  _control  lab  team  views</span></code></pre>
 <div class="note"><b>为什么「10 个文件」只搬了 4 个</b>：<code>-wal</code>/<code>-shm</code> 是每个 <code>.db</code> 的旁挂文件，迁移时先对该 <code>.db</code> 做一次 checkpoint，WAL 里的内容被折进主库、旁挂文件随之消失——它们的内容已经随主库一起搬走了，所以不必再单独搬。只有主 <code>.db</code> 缺失才是硬错误（那时报 <code>No such file or directory</code> 并中止）。</div>
 <p><b>迁移不管账本、也不管别人的副本</b>：跨视图账本只记内容 key、不记路径，所以搬完不用重写；但<b>持有同一份 <code>meta/</code> 的每台机器都要各自迁一遍</b>——HA 备机，以及靠手工同步定义文件的那台机（v3 <code>nested</code> 下定义散在各基视图目录，得同步整个 <code>meta/</code>；见 1.3 的形态差异表与 2.3 的巡检段）。PG 后端没有本地文件，这一步不适用。</p>
+
+<h3 id="s15">1.5 多 meta-server 分片（三套部署之上的正交变体）</h3>
+<div class="scene">
+  <b>示例环境</b>：在 1.3 的四台机器上加一台。<br>
+  · <b>db1</b>（10.0.0.9）——同一台 PostgreSQL：<code>grovefs_control</code> 里除了视图定义、key、账号、审计，还多出一张 <code>meta_placement</code>（哪个视图由哪台 meta-server 服务）；<br>
+  · <b>node1a</b>（10.0.0.5）/ <b>node1b</b>（10.0.0.6）——<b>两个</b> meta-server 进程，各持一部分视图树（这里各自 <code>--meta-dir</code> 下的 SQLite 树，也可指同一个 PG / treedb 后端）；两台都进 manager 的 <code>--meta</code> 列表；<br>
+  · <b>node2</b>（10.0.0.7）——客户机，挂载命令<b>不带任何分片参数</b>；<br>
+  · 内容盘仍是 data-server，与分片无关。<br>
+  本页的三套部署（1.1–1.3）描述的是「元数据存在哪种后端」；<b>分片回答的是「几个 meta-server 进程来服务」</b>，所以它是叠在任意一套上的变体，不是第四套。
+</div>
+<pre><code>  ┌──────────── db1 (10.0.0.9) ─────────────┐
+  │  PostgreSQL · grovefs_control           │
+  │    view_defs / api_keys / web_* / audit │   ← 控制面:唯一权威
+  │    view_placement  ← 视图 schema 在哪台 PG │   ← 1.3 的那根轴
+  │    meta_placement  ← 视图由哪个进程服务    │   ← 本节的那根轴
+  └───────┬─────────────────────┬───────────┘
+          │ 5432                │ 5432
+  ┌───────┴────────┐    ┌───────┴────────┐        客户端只连一个入口,
+  │ node1a         │    │ node1b         │        连到非 home 那台时
+  │  meta-server   │◄───┤  meta-server   │   ┌──► 收 E_SHARD + home 地址,
+  │  :50110 (挂载) │    │  :50110 (挂载) │   │    重拨那一台(树不被代理)
+  │  :50111 (治理) │    │  :50111 (治理) │   │
+  │  meta/ 本地树  │    │  meta/ 本地树  │   │
+  └───────┬────────┘    └───────┬────────┘   │
+          └──────────┬──────────┘────────────┘
+              ┌──────┴───────┐
+              │ node2 客户机 │   ← mount --manager,没有 --shard-* 这类参数
+              └──────────────┘</code></pre>
+<h4>部署步骤</h4>
+<pre><code><span class="cmt"># ===== db1 上：与 1.3 完全相同（一个角色、一个库、GRANT CREATE,CONNECT）=====</span>
+
+<span class="cmt"># ===== node1a 上：--control-plane 指同一个库,--shard-ring 写全环,--shard-id 说自己 =====</span>
+$G meta-server --meta-dir /srv/gfsA --listen 0.0.0.0:50110 --control-listen 0.0.0.0:50111 \
+  --control-plane postgres://grove:pw@10.0.0.9:5432/grovefs \
+  --shard-ring m1=10.0.0.5:50110,m2=10.0.0.6:50110 --shard-id m1 --token "$TOK" &amp;
+<span class="out">meta-server: control plane is PostgreSQL (grovefs_control) — view definitions,
+                 api keys, accounts, audit and both placement tables live there; trees stay on sqlite
+meta-server: sharded across 2 meta-servers — this instance is 'm1' (10.0.0.5:50110), placement in grovefs_control.meta_placement (`M_OPEN` redirects a view it does not serve)</span>
+
+<span class="cmt"># ===== node1b 上：同一份 --shard-ring 文本,只有 --meta-dir 与 --shard-id 不同 =====</span>
+$G meta-server --meta-dir /srv/gfsB --listen 0.0.0.0:50110 --control-listen 0.0.0.0:50111 \
+  --control-plane postgres://grove:pw@10.0.0.9:5432/grovefs \
+  --shard-ring m1=10.0.0.5:50110,m2=10.0.0.6:50110 --shard-id m2 --token "$TOK" &amp;
+
+<span class="cmt"># ===== 治理 key 在共享控制面上铸一次,两台都能用 =====</span>
+$G apikey --meta-store postgres://grove:pw@10.0.0.9:5432/grovefs create --label ops --for admin --owner ops
+
+<span class="cmt"># ===== 视图在“哪家”建,就归谁服务(放置行写在树之前,别处再建同名一律被拒) =====</span>
+$G view --control-server 10.0.0.5:50111 --api-key "$KEY" create --view va
+$G view --control-server 10.0.0.6:50111 --api-key "$KEY" create --view vb
+$G view --control-server 10.0.0.6:50111 --api-key "$KEY" create --view va
+<span class="out">error: view 'va' is placed on meta-server 'm1' (mount address 10.0.0.5:50110) — run `view create`
+                             against THAT instance's own --control-listen port, or move the placement here
+                             first (`view move --view va --to-meta m2`, against the control port you
+                             are talking to)</span>
+
+<span class="cmt"># ===== 环里每台都进 manager 的 meta 列表;客户端只认一个入口 =====</span>
+$G --home /srv/mgr manager define --name prod --meta 10.0.0.5:50110,10.0.0.6:50110 --data 10.0.0.5:50100
+$G mount --view va --manager 10.0.0.5:50055 --deployment prod --roster-key-file /etc/grovefs/roster.key -m /mnt/va
+
+<span class="cmt"># ===== 搬家:在 TARGET 的治理口上执行(由它探测“这棵树我打得开”再写行) =====</span>
+$G view --control-server 10.0.0.6:50111 --api-key "$KEY" move --view va --to-meta m2
+<span class="cmt"># 共享后端(PG / treedb)下这是改行、零复制;SQLite 树搬不动,会拒绝并指向 export/import</span></code></pre>
+<div class="warn"><b>两个必须记住的对应关系</b>：① <b>治理口 ≠ 挂载口</b>——环里存的是 <code>--listen</code> 的地址（客户端要被指引去的地方），治理命令用的是 <code>--control-listen</code> 那个端口；被拒时提示指向「该实例自己的 <code>--control-listen</code>」，别把横幅上的挂载端口抄进 <code>--control-server</code>。② <b>分片 ≠ 高可用</b>——本节的多个进程各服务<b>不同</b>的视图，一个视图始终只有一个服务者；要一台挂了另一台顶上，那是 1.2 的 <code>--role/--peer/--witness</code>，两者可以叠成一个环条目 <code>m1=主+备</code>。</div>
+<div class="ok"><b>验收清单（逐条打勾）</b>：① 两台横幅都有 <code>control plane is PostgreSQL</code> 与 <code>sharded across 2 meta-servers</code>，且 <code>this instance is 'm1'/'m2'</code> 各不相同；② 环文本一致时两边 <code>view list</code> 都能看到全部视图定义，而每棵树的落点写的是本地文件（<code>own tree meta/va/va.db</code>）——控制面在 PG、树在本地，这一行必须说的是树；③ <code>psql -d grovefs -c "SELECT * FROM grovefs_control.meta_placement"</code> 每个 base 视图一行，<code>meta</code> 列是环里的名字；④ 在<b>非 home</b> 那台上 <code>view create</code> 同名视图被拒、<code>view rm --base</code> 同样被拒，两条拒因都进审计（<code>apikey calls</code> 可见）；⑤ 客户端从任意一台入口都能挂到<b>任何</b>视图（跨机时多一次重定向握手，实测 loopback 上自家 12.08/12.64/12.39 ms、需指引 19.69/18.73/18.43 ms，只在挂载建立时付一次）；⑥ <code>move --to-meta</code> 之后旧实例在下一轮清扫内放手（实测 4.691/4.701/4.707 s），<b>已建立的挂载不 remount</b> 也能继续用，且 <code>ls</code> 同时看得见搬之前与搬之后建的目录（实测跟上一跳 71.5–83.7 ms）；⑦ 关掉控制面 PG：新的挂载建立被拒并点名原因，已建立的挂载继续服务，重启 PG 后一切恢复；⑧ <code>grovefs stats</code> 的三枚计数器 <code>shard mounts redirected</code> / <code>shard management verbs refused</code> / <code>shard placement read/write errors</code> 随上述动作增长，本机不服务别人视图时 <code>residentEngines</code> 不变。机制与故障域推导见 <code>docs/adr/0006-view-sharding.md</code>。</div>
 
 <div class="chnav"><span>第一部分完</span><a href="#p2">进入第二部分 ↓</a></div>
 </section>
