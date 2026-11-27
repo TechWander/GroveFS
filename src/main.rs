@@ -780,6 +780,44 @@ enum Cmd {
         /// Unset (default) keeps this process exactly as it was.
         #[arg(long = "control-listen", value_name = "HOST:PORT")]
         control_listen: Option<String>,
+        /// Run the CONTROL plane in PostgreSQL (`--control-plane
+        /// postgres://user:pw@host:port/db`) while `--meta-store` decides where the
+        /// VIEW TREES live. Unset, the control plane FOLLOWS the tree backend — a
+        /// PG store keeps `grovefs_control` in that database, SQLite and treedb
+        /// keep it in this host's `--meta-dir`.
+        ///
+        /// This is the flag that makes a meta-server RING possible: several
+        /// `meta-server` processes can only route views between themselves by a
+        /// placement table every one of them can read. It also stands alone — one
+        /// process, definitions and keys in PG, trees on treedb — and `store.info`
+        /// reports the two planes separately for that reason. Refused together
+        /// with a PG `--meta-store` (which already has a remote control plane;
+        /// two would split `grovefs_control` across two databases).
+        #[arg(long = "control-plane", value_name = "URI")]
+        control_plane: Option<String>,
+        /// The meta-server ring this process belongs to:
+        /// `--shard-ring m1=10.0.0.1:50053,m2=10.0.0.2:50053`. Every entry is
+        /// ANOTHER `meta-server` process; `grovefs_control.meta_placement` records
+        /// which one serves which view, and a mount that arrives at the wrong one
+        /// is redirected to the right one (transparently — `grovefs mount` needs
+        /// no flag for it, it just follows the redirect once).
+        ///
+        /// What it does NOT do: copy trees, or balance an existing view. A new
+        /// view is placed on the instance that created it, and `view move
+        /// --to-meta NAME` (run against the TARGET's control port) re-homes one.
+        /// Names are what the rows store, so a ring may be reordered or a port
+        /// changed without moving a byte. Requires a PG control plane. Entries
+        /// may also be `m1=hostA:port+hostB:port` — one ring member that is an HA
+        /// primary/standby pair (`--peer`), which is how sharding and ADR-0005
+        /// compose instead of colliding.
+        #[arg(long = "shard-ring", value_name = "SPEC")]
+        shard_ring: Option<String>,
+        /// Which ring entry THIS process is: its name (`m1`), its position in
+        /// `--shard-ring` (`0`), or one of its addresses. Unset, `--advertise-addr`
+        /// selects the member that carries it; with neither, the start fails
+        /// rather than guessing which instance owns a view.
+        #[arg(long = "shard-id", value_name = "NAME|INDEX|HOST:PORT")]
+        shard_id: Option<String>,
         /// Seed the web console's FIRST owner at install time
         /// (`grovefs web --control-server` signs in against the accounts this
         /// process creates). Applied ONLY when the account store is empty:
@@ -1933,8 +1971,8 @@ enum ViewAction {
     /// keep resolving the same data servers through the manager. Refuses a view mounted on
     /// this machine; quiesce other machines yourself.
     #[command(
-        about = "Move a view's tree to another PostgreSQL instance.",
-        after_help = "EXAMPLES\n  grovefs view --meta-dir /meta move --view alice --pg-instance pg2"
+        about = "Move a view's tree to another PostgreSQL instance, or to another meta-server.",
+        after_help = "EXAMPLES\n  grovefs view --meta-dir /meta move --view alice --pg-instance pg2\n  grovefs view --control-server 10.0.0.2:50154 --api-key K move --view alice --to-meta m2"
     )]
     Move {
         /// View whose tree is moved to the target instance.
@@ -1942,8 +1980,19 @@ enum ViewAction {
         view: String,
         /// Target instance (registry name). A `--keep-source` move can be
         /// rolled back by re-running the command with the original home.
+        /// Required unless `--to-meta` names a meta-server instead.
         #[arg(long = "pg-instance", value_name = "NAME")]
-        pg_instance: String,
+        pg_instance: Option<String>,
+        /// Move which META-SERVER PROCESS serves the view (`--shard-ring`),
+        /// instead of which PostgreSQL database holds it. Point the command at
+        /// the TARGET's control port: the process that has to answer for the tree
+        /// is the one that probes it and writes the row, so a move onto an
+        /// instance that cannot open the view is refused before anything changes.
+        /// Nothing is copied — under a shared PG/treedb backend the tree is
+        /// already reachable from both, and a SQLite tree cannot move this way
+        /// (use `view export` / `view import`).
+        #[arg(long = "to-meta", value_name = "NODE")]
+        to_meta: Option<String>,
         /// Leave the source schema on its instance as a rollback point
         /// instead of dropping it (and unbooking its ledger holds) after the
         /// cutover succeeds.
@@ -4514,6 +4563,9 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             pg_read_pool_max,
             pg_pool_idle_secs,
             control_listen,
+            control_plane,
+            shard_ring,
+            shard_id,
             admin_user,
             admin_password_file,
             data_access_key,
@@ -4676,6 +4728,17 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             srv = srv.with_control_listen(control_listen);
+            // The control plane and the tree backend are two answers, and a ring
+            // needs the first to be somewhere every process can read. Env slots
+            // join the usual flag > env chain: a fleet that shards sets
+            // `GROVEFS_CONTROL_PLANE` once in a shared unit drop-in and gives each
+            // instance its own `--shard-id` on the command line.
+            let control_plane =
+                control_plane.or_else(|| std::env::var("GROVEFS_CONTROL_PLANE").ok());
+            let shard_ring = shard_ring.or_else(|| std::env::var("GROVEFS_SHARD_RING").ok());
+            let shard_id = shard_id.or_else(|| std::env::var("GROVEFS_SHARD_ID").ok());
+            srv = srv.with_control_plane(control_plane);
+            srv = srv.with_sharding(shard_ring, shard_id, advertise_addr.clone());
             srv = srv.with_admin_account(
                 admin.as_ref().map(|(a, _)| a.clone()),
                 admin.map(|(_, p)| p),
@@ -5471,6 +5534,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                     view,
                     pg_instance,
                     keep_source,
+                    to_meta,
                 } => {
                     // Move a tree between instances of a multi-instance store.
                     // This talks to the PostgreSQL instances DIRECTLY (snapshot,
@@ -5480,6 +5544,58 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                     if !grovefs::layout::valid_view_name(&view) {
                         return Err(grovefs::layout::view_name_error(&view).into());
                     }
+                    // Two moves wear this one verb, and the flag says which.
+                    // `--pg-instance` relocates the TREE between PostgreSQL
+                    // databases of one meta-server (a schema dump and rebuild);
+                    // `--to-meta` relocates the SERVING DUTY between
+                    // meta-server PROCESSES (one row, no copy). They answer
+                    // different bottlenecks, so exactly one is accepted.
+                    if let Some(target) = to_meta.as_deref() {
+                        if pg_instance.is_some() {
+                            return Err("view move takes --pg-instance (a PostgreSQL instance of \
+                 this store) or --to-meta (a meta-server in --shard-ring), not both \
+                 — they move different things"
+                                .into());
+                        }
+                        if keep_source {
+                            return Err(
+                                "--keep-source leaves the source SCHEMA behind as a rollback \
+                 point; a --to-meta move copies nothing, so there is no source to keep"
+                                    .into(),
+                            );
+                        }
+                        let rc = remote_ctl.as_ref().ok_or_else(|| -> Box<dyn std::error::Error> {
+                            "view move --to-meta must be pointed at the TARGET meta-server: pass \
+                 --control-server HOST:PORT --api-key <admin-key> of the instance the view moves \
+                 TO (it is the process that has to open that tree afterwards, so it is the one \
+                 that probes and writes the row)".into()
+                        })?;
+                        let r = rc
+                            .call(
+                                "view.move_meta",
+                                serde_json::json!({ "view": view, "to": target }),
+                            )
+                            .map_err(Box::<dyn std::error::Error>::from)?;
+                        ui::success(&format!(
+                            "{} (via {})",
+                            r.as_str().unwrap_or("moved"),
+                            rc.addr()
+                        ));
+                        ui::note(
+                            "nothing was copied: the placement row is the whole move, and the tree \
+                             stayed in the backend both instances reach",
+                        );
+                        ui::note(
+                            "a mount picks the new instance up on its NEXT connection — an \
+                             established socket keeps serving from where it is, so remount it (or \
+                             wait out the old instance's placement sweep) to see the cutover",
+                        );
+                        return Ok(());
+                    }
+                    let pg_instance = pg_instance.ok_or_else(|| -> Box<dyn std::error::Error> {
+                        "view move needs --pg-instance NAME (a PostgreSQL instance of this store) or \
+                 --to-meta NODE (a meta-server in --shard-ring)".into()
+                    })?;
                     if remote_ctl.is_some() {
                         return Err("view move talks to the PostgreSQL instances directly — run it on the storage host with --meta-store (drop --control-server)".into());
                     }

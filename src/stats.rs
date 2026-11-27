@@ -206,6 +206,9 @@ pub enum Counter {
     HaProofStale,
     HaSyncPushDegrade,
     HaNameStall,
+    ShardRedirect,
+    ShardRefuse,
+    ShardPlacementErr,
     LockRenew,
     LockExpireReclaim,
     GcFreed,
@@ -225,6 +228,9 @@ impl Counter {
         Counter::HaProofStale,
         Counter::HaSyncPushDegrade,
         Counter::HaNameStall,
+        Counter::ShardRedirect,
+        Counter::ShardRefuse,
+        Counter::ShardPlacementErr,
         Counter::LockRenew,
         Counter::LockExpireReclaim,
         Counter::GcFreed,
@@ -243,6 +249,14 @@ impl Counter {
             Counter::HaProofStale => "ha writes without a fresh proof",
             Counter::HaSyncPushDegrade => "ha sync-repl pushes degraded",
             Counter::HaNameStall => "ha peer name lookups stalled",
+            // Sharding (`--shard-ring`): how much of the mount traffic this
+            // process did NOT serve, how many management verbs it refused
+            // because the tree lives on a peer, and how often the placement
+            // table could not be read (which refuses a mount rather than
+            // guessing a home).
+            Counter::ShardRedirect => "shard mounts redirected",
+            Counter::ShardRefuse => "shard management verbs refused",
+            Counter::ShardPlacementErr => "shard placement read/write errors",
             Counter::LockRenew => "lock lease renewals",
             Counter::LockExpireReclaim => "lock expired reclaims",
             Counter::GcFreed => "gc objects freed",

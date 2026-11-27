@@ -174,6 +174,22 @@ const E_ROFS: i32 = 9;
 // status (they fail over via E_ROFS / transport errors, not epoch).
 #[cfg(feature = "native")]
 const E_EPOCH: i32 = 10;
+// Returned by a SHARDED meta-server (`--shard-ring`) at `M_OPEN` when this
+// process does not serve the requested view: `data` is the address of the
+// instance that does, and the client dials it directly. Not a MetaError code and
+// never a mid-session status — routing is decided once per connection, because
+// `M_OPEN` binds the socket to the view, so no other op needs to be proxied or
+// re-routed. A client that predates this status reads it as an ordinary refusal
+// (the mount fails with the server's sentence), which is the documented
+// upgrade requirement for a sharded deployment rather than a silent
+// misroute.
+const E_SHARD: i32 = 11;
+/// How many redirects one `M_OPEN` may follow before the client gives up. Three
+/// is one more than a correct ring ever needs (entry → home, plus a hop for an
+/// operator mid-`view move`): it bounds a ring whose rows disagree, and the
+/// already-tried-address check in [`RemoteMeta::connect_fresh`] bounds a cycle,
+/// so no placement row can make a mount loop.
+const SHARD_FOLLOW_MAX: usize = 3;
 
 /// Write-intent ops: everything from `M_CREATE` through `M_TOUCH`, plus the
 /// lock-mutating ops `M_SETLK` / `M_RELEASE_LOCKS` (they INSERT/DELETE on the
@@ -546,6 +562,15 @@ pub struct RemoteMeta {
     /// `--data-access-key`. Set once on the first accepted handshake — the
     /// capability is stable for a mount, like the member id on the data side.
     dac: std::sync::OnceLock<String>,
+    /// The address an `E_SHARD` redirect named for this view, learned on the
+    /// first connection. Dialed FIRST on every later reconnect, so a sharded
+    /// deployment pays the redirect once per mount rather than once per
+    /// connection (an answer naming an HA pair pins both roles, in order), and a
+    /// home that moves (`view move --to-meta`) is rediscovered on the next
+    /// refusal instead of being cached forever. `None` whenever the deployment
+    /// does not shard — nothing sets it, and the configured failover list stays
+    /// the whole truth.
+    shome: Mutex<Option<String>>,
 }
 
 impl RemoteMeta {
@@ -614,6 +639,7 @@ impl RemoteMeta {
             def_base: std::sync::OnceLock::new(),
             def_kind: std::sync::OnceLock::new(),
             dac: std::sync::OnceLock::new(),
+            shome: Mutex::new(None),
         };
         // Probe once (connect + handshake) so mount fails fast on a dead server.
         let (s, _) = this.connect_fresh()?;
@@ -681,15 +707,68 @@ impl RemoteMeta {
     /// preferred address (riding out a brief restart in place), and only then
     /// advances to the next address and promotes it to preferred. A token
     /// rejection is a config error, so it fails fast rather than cycling nodes.
+    ///
+    /// A sharded deployment adds one step: an `E_SHARD` answer names the
+    /// instance that serves this view, so the candidate list gains that address
+    /// at the front and the mount is established THERE — the entry point routes,
+    /// it never proxies. The learned home is dialed first on later reconnects and
+    /// dropped when a single-address answer stops answering at the transport
+    /// level, so neither a moved view nor a dead node sticks.
     fn connect_fresh(&self) -> io::Result<(TcpStream, bool)> {
         let mut last_err = io::Error::new(io::ErrorKind::ConnectionRefused, "no connect attempt");
         let n = self.addrs.len();
         let start = self.active.load(Ordering::Relaxed) % n;
-        for k in 0..n {
-            let idx = (start + k) % n;
-            let addr = &self.addrs[idx];
+        // Candidates as (failover-list index, address): an index is present only
+        // for an address the operator configured, because that is the list
+        // `active` may be promoted within. A redirect target is not part of the
+        // deployment's failover order and must never become its "preferred" node
+        // — the next home is the placement table's business, not ours.
+        let mut queue: Vec<(Option<usize>, String)> = (0..n)
+            .map(|k| {
+                let idx = (start + k) % n;
+                (Some(idx), self.addrs[idx].clone())
+            })
+            .collect();
+        // The remembered answer may itself be an HA PAIR, so seed every role in
+        // the operator's order rather than the raw string — `"a+b"` is not a
+        // dialable address, and a pin that never connects would be dropped.
+        if let Some(home) = self.shome.lock().clone() {
+            for (i, part) in home
+                .split('+')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .enumerate()
+            {
+                if !queue.iter().any(|(_, a)| *a == part) {
+                    queue.insert(i, (None, part.to_string()));
+                }
+            }
+        }
+        let mut tried: Vec<String> = Vec::new();
+        let mut follows = 0usize;
+        'hosts: while !queue.is_empty() {
+            let (idx, addr) = queue.remove(0);
+            // Cycle guard: a ring whose rows point at each other can name an
+            // address this mount already dialed. Trying it twice would loop.
+            if tried.contains(&addr) {
+                // Naming it beats reporting the generic "no connect attempt"
+                // that a redirect-only queue would otherwise leave behind.
+                if follows > 0 {
+                    last_err = io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "meta-server shard placement for view '{}' points back at {addr}, \
+                             which this mount already asked — the placement rows and the ring \
+                             disagree",
+                            self.view
+                        ),
+                    );
+                }
+                continue 'hosts;
+            }
+            tried.push(addr.clone());
             for attempt in 0..self.connect_retries {
-                match TcpStream::connect(addr) {
+                match TcpStream::connect(addr.as_str()) {
                     Ok(s) => {
                         let _ = s.set_read_timeout(Some(self.connect_timeout));
                         let _ = s.set_write_timeout(Some(self.connect_timeout));
@@ -774,8 +853,65 @@ impl RemoteMeta {
                                         }
                                     }
                                 }
-                                self.active.store(idx, Ordering::Relaxed);
+                                if let Some(i) = idx {
+                                    self.active.store(i, Ordering::Relaxed);
+                                }
                                 return Ok((s, false));
+                            }
+                            // This instance does not serve the view and said so
+                            // with the address that does: dial it, remember it for
+                            // the next reconnect, and count the hop. Bounded by
+                            // [`SHARD_FOLLOW_MAX`] plus the already-tried check
+                            // above, so a placement table that contradicts its own
+                            // ring fails the mount with a named cause instead of
+                            // spinning between two hosts.
+                            Ok((E_SHARD, _, target)) => {
+                                let home = String::from_utf8_lossy(&target).trim().to_string();
+                                if home.is_empty() || home.len() > 255 {
+                                    last_err = io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        format!(
+                                            "meta-server {addr} redirected this mount to an \
+                                             unreadable address"
+                                        ),
+                                    );
+                                    continue 'hosts;
+                                }
+                                if follows >= SHARD_FOLLOW_MAX {
+                                    last_err = io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        format!(
+                                            "meta-server {addr} redirected this mount to {home}, \
+                                             but it had already followed {follows} redirects — \
+                                             the shard placement rows disagree with the ring"
+                                        ),
+                                    );
+                                    continue 'hosts;
+                                }
+                                follows += 1;
+                                stats::count(stats::Counter::ShardRedirect, 1);
+                                // A ring member may be an HA PAIR (`prim+stby`),
+                                // in which case the redirect carries both roles
+                                // in the operator's preferred order and the
+                                // failover walk below serves them — sharding and
+                                // `--peer` replication compose without a second
+                                // mechanism.
+                                let parts: Vec<String> = home
+                                    .split('+')
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                    .map(str::to_string)
+                                    .collect();
+                                if parts.is_empty() {
+                                    continue 'hosts;
+                                }
+                                *self.shome.lock() = Some(home);
+                                for (i, part) in parts.into_iter().enumerate() {
+                                    if !queue.iter().any(|(_, a)| *a == part) {
+                                        queue.insert(i, (None, part));
+                                    }
+                                }
+                                continue 'hosts;
                             }
                             // A rejected credential is a configuration error, not
                             // a transient one — retrying or failing over can't fix
@@ -823,7 +959,25 @@ impl RemoteMeta {
                         last_err = io::Error::new(
                             e.kind(),
                             format!("cannot reach meta-server {addr}: {e}"),
-                        )
+                        );
+                        // A redirect target that will not answer at the transport
+                        // level is a stale answer, not a live refusal: forget it,
+                        // so the next reconnect starts from the configured list
+                        // instead of spending its retry budget on a host that
+                        // moved away or died. A host that ANSWERED with an error
+                        // status keeps the entry (its placement is real). The one
+                        // exception is an HA pair: a row that names two roles is
+                        // still the placement, and one of them being down is
+                        // failover's business, not a reason to forget the row.
+                        let pinned_pair = self
+                            .shome
+                            .lock()
+                            .as_deref()
+                            .map(|h| h.contains('+'))
+                            .unwrap_or(false);
+                        if idx.is_none() && !pinned_pair {
+                            *self.shome.lock() = None;
+                        }
                     }
                 }
                 if attempt + 1 < self.connect_retries {
@@ -854,6 +1008,28 @@ impl RemoteMeta {
         let (mut s, reused) = self.get_conn()?;
         match Self::call(&mut s, op, body) {
             Ok(r) => {
+                // A sharded instance that no longer serves this view answers
+                // `E_SHARD` and hangs up: its engine was dropped by the placement
+                // sweep, and re-opening a tree the ring assigned to a peer would
+                // split one view name across two stores. The payload names the new
+                // home, so adopt it, throw away the WHOLE pool (every socket in it
+                // belongs to the instance that just hung up) and replay the op
+                // THERE. The refused op never ran, so the replay is not a second
+                // write — and an operator's `view move --to-meta` needs no remount.
+                if r.0 == E_SHARD {
+                    let home = String::from_utf8_lossy(&r.2).trim().to_string();
+                    if !home.is_empty() && home.len() <= 255 {
+                        *self.shome.lock() = Some(home);
+                    }
+                    drop(s);
+                    self.pool.lock().clear();
+                    stats::count(stats::Counter::ShardRedirect, 1);
+                    let (mut s2, _) = self.connect_fresh()?;
+                    let r2 = Self::call(&mut s2, op, body)?;
+                    self.note_refusal(&r2);
+                    self.put_conn(s2);
+                    return Ok(r2);
+                }
                 self.note_refusal(&r);
                 self.put_conn(s);
                 Ok(r)
@@ -1311,11 +1487,176 @@ mod client_tests {
     }
 }
 
+// Client side of the sharded deployment: what an `E_SHARD` answer does to the
+// connect walk. Native-gated because the stub is a `TcpListener` and
+// `remote-only` builds ship the client half only.
+#[cfg(all(test, feature = "native"))]
+mod shard_follow_tests {
+    use super::*;
+    use std::net::{SocketAddr, TcpListener};
+    use std::sync::atomic::AtomicUsize;
+
+    /// A meta-server stand-in: answers every `M_OPEN` with `(status, payload)`
+    /// and counts the handshakes it served. Serves connections one at a time on
+    /// its own thread and never stops, so a test can dial it repeatedly; the
+    /// thread and the port die with the test process.
+    fn stub(
+        hits: Arc<AtomicUsize>,
+        reply: impl Fn() -> (i32, Vec<u8>) + Send + 'static,
+    ) -> (SocketAddr, thread::JoinHandle<()>) {
+        let lst = TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let addr = lst.local_addr().expect("stub addr");
+        let h = thread::spawn(move || {
+            for conn in lst.incoming() {
+                let Ok(mut s) = conn else { continue };
+                let Ok((op, body)) = proto::recv_request(&mut s) else {
+                    continue;
+                };
+                if op != M_OPEN || proto::get_key(&body, &mut 0).is_err() {
+                    continue;
+                }
+                hits.fetch_add(1, Ordering::SeqCst);
+                let (status, data) = reply();
+                let _ = proto::send_response(&mut s, status, 0, &data);
+            }
+        });
+        (addr, h)
+    }
+
+    /// A successful `M_OPEN` ack: the three capability flags plus the
+    /// view-definition tail, exactly what a real server assembles.
+    fn ok_ack(view: &str) -> Vec<u8> {
+        let mut b = vec![0u8, 1u8, 0u8];
+        proto::put_key(&mut b, view);
+        proto::put_key(&mut b, view);
+        proto::put_key(&mut b, "physical");
+        b
+    }
+
+    #[test]
+    fn e_shard_answer_is_followed_and_remembered() {
+        // The entry point routes, it does not proxy: the mount ends up OPEN on
+        // the instance the redirect named.
+        let (a_hits, b_hits) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (b, _bh) = stub(b_hits.clone(), || (0, ok_ack("v")));
+        let b_addr = b.to_string();
+        let redir = b_addr.clone();
+        let (a, _ah) = stub(a_hits.clone(), move || (E_SHARD, redir.as_bytes().to_vec()));
+
+        let rm = RemoteMeta::new_with_creds(&a.to_string(), "v", "", 0, "").expect("follows hop");
+        assert_eq!(a_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(b_hits.load(Ordering::SeqCst), 1);
+        assert!(rm.opened.load(Ordering::SeqCst));
+        // The learned home is remembered for the next reconnect…
+        assert_eq!(*rm.shome.lock(), Some(b_addr.clone()));
+        // …and never becomes the failover list's "preferred" node: `active` may
+        // only ever name an address the operator configured.
+        assert_eq!(rm.active.load(Ordering::Relaxed), 0);
+        assert!(!rm.is_readonly_view());
+        assert_eq!(rm.paged.load(Ordering::SeqCst), 1);
+
+        // A later reconnect dials the learned home FIRST, without asking the
+        // entry point again — routing stays a per-handshake decision, so the
+        // steady-state mount costs one address, not a proxy hop per op.
+        rm.connect_fresh().expect("reconnect");
+        assert_eq!(a_hits.load(Ordering::SeqCst), 1, "entry point re-asked");
+        assert_eq!(b_hits.load(Ordering::SeqCst), 2, "home not dialed first");
+    }
+
+    #[test]
+    fn e_shard_redirect_may_name_an_ha_pair() {
+        // Sharding composes with `--peer`/`--witness` HA: one ring member is a
+        // PAIR, so the redirect carries both roles and the ordinary failover
+        // walk serves them in order. Here the first role is not listening.
+        let dead = {
+            let l = TcpListener::bind("127.0.0.1:0").expect("dead port");
+            l.local_addr().expect("dead addr")
+        };
+        let (a_hits, live_hits) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (live, _lh) = stub(live_hits.clone(), || (0, ok_ack("v")));
+        let pair = format!("{}+{}", dead, live);
+        let redir = pair.clone();
+        let (a, _ah) = stub(a_hits.clone(), move || (E_SHARD, redir.as_bytes().to_vec()));
+
+        let rm = RemoteMeta::new_with_creds(&a.to_string(), "v", "", 0, "")
+            .expect("falls through the pair to the standby");
+        assert_eq!(a_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(live_hits.load(Ordering::SeqCst), 1);
+        // The PAIR row stays learned even though its first role was down — the
+        // next reconnect walks both halves without asking the entry point again.
+        assert_eq!(*rm.shome.lock(), Some(pair));
+        rm.connect_fresh().expect("re-dials the pair");
+        assert_eq!(a_hits.load(Ordering::SeqCst), 1, "entry point re-asked");
+        assert_eq!(live_hits.load(Ordering::SeqCst), 2, "pair pin lost");
+    }
+
+    #[test]
+    fn e_shard_cycle_fails_with_a_named_cause() {
+        // Two rows that name each other must fail the mount, not spin: the
+        // already-tried check ends the walk and the error says what disagreed.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counted = hits.clone();
+        let lst1 = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let lst2 = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let (x, y) = (lst1.local_addr().unwrap(), lst2.local_addr().unwrap());
+        let y_addr = y.to_string();
+        let x_addr = x.to_string();
+        let _h1 = thread::spawn(move || {
+            for conn in lst1.incoming() {
+                let Ok(mut s) = conn else { continue };
+                let _ = proto::recv_request(&mut s);
+                counted.fetch_add(1, Ordering::SeqCst);
+                let _ = proto::send_response(&mut s, E_SHARD, 0, y_addr.as_bytes());
+            }
+        });
+        let _h2 = thread::spawn(move || {
+            for conn in lst2.incoming() {
+                let Ok(mut s) = conn else { continue };
+                let _ = proto::recv_request(&mut s);
+                let _ = proto::send_response(&mut s, E_SHARD, 0, x_addr.as_bytes());
+            }
+        });
+        let e = match RemoteMeta::new_with_creds(&x.to_string(), "v", "", 0, "") {
+            Ok(_) => panic!("a cycle between two placement rows cannot open a mount"),
+            Err(e) => e,
+        };
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            e.to_string().contains("points back at"),
+            "unhelpful error: {e}"
+        );
+        // Bounded: two rows pointing at each other cost two handshakes, not one
+        // per retry tick.
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn e_shard_with_no_address_is_not_fatal_to_the_mount_walk() {
+        // A refusal that names nothing is a broken answer, not a home: the walk
+        // must move on to the rest of the failover list instead of dialing "".
+        let (a_hits, b_hits) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (b, _bh) = stub(b_hits.clone(), || (0, ok_ack("v")));
+        let (a, _ah) = stub(a_hits, || (E_SHARD, Vec::new()));
+        let rm = RemoteMeta::new_with_creds(&format!("{},{}", a, b), "v", "", 0, "")
+            .expect("fails over to the next configured address");
+        assert_eq!(b_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(rm.active.load(Ordering::Relaxed), 1, "promoted to b");
+        assert_eq!(*rm.shome.lock(), None, "an empty redirect was learned");
+    }
+}
+
 // ---- meta-server (central authoritative store) half, native only -----------
 #[cfg(feature = "native")]
 mod server_ext;
 #[cfg(feature = "native")]
 pub use server_ext::*;
+
+// Multi-meta-server VIEW SHARDING (`--shard-ring`): the ring, its placement
+// table in the shared control plane, and the `M_OPEN` routing verdict. Server-side
+// only — a client needs the `E_SHARD` status and nothing else, so the `postgres`
+// dependency this module uses stays behind `native`.
+#[cfg(feature = "native")]
+mod shard;
 
 // The event-loop alternative to `server_ext`'s thread-per-connection accept loops.
 // Linux-only and `native`-only: `libc` is an optional dependency that rides

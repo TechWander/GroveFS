@@ -555,6 +555,13 @@ pub(super) struct MetaRuntime {
     /// themselves (the reply says so), and an unknown handle is then only
     /// reachable by a super principal.
     xfer_owner: Mutex<HashMap<String, String>>,
+    /// Multi-meta-server **view sharding**: the ring this process belongs to, or
+    /// `None` when it serves every view itself (the historical deployment).
+    /// `Some` makes `M_OPEN` ask the control plane which instance owns the view
+    /// and redirect (`E_SHARD`) when it is not this one, and makes the
+    /// tree-mutating governance verbs refuse to act on a peer's view instead of
+    /// creating a second tree under the same name. See [`super::shard`].
+    shard: Option<super::shard::Shard>,
 }
 
 impl MetaRuntime {
@@ -808,6 +815,25 @@ pub struct MetaServer {
     /// Empty/unset keeps the process exactly as before: no governance port, no
     /// admin credentials, nothing new to firewall.
     control_listen: Option<String>,
+    /// `--control-plane postgres://…`: run the CONTROL plane (view definitions,
+    /// api keys, accounts, audit, both placement tables) in PostgreSQL while the
+    /// VIEW TREES stay on another backend (`--meta-store sqlite`/`treedb://…`).
+    /// Unset keeps the historical coupling — the control plane FOLLOWS the tree
+    /// backend, which is right for every deployment that does not shard.
+    /// Sharding requires it: N processes cannot route by a placement table only
+    /// one of them can see. See [`MetaServer::with_control_plane`].
+    control_plane: Option<String>,
+    /// `--shard-ring m1=host:port,m2=host:port`: the OTHER meta-server processes
+    /// in this deployment. `None` (default) is the historical single-process
+    /// server — no routing, no placement reads, no new failure mode. See
+    /// [`MetaServer::with_sharding`] and [`super::shard`].
+    shard_ring: Option<String>,
+    /// `--shard-id NAME`: which ring entry THIS process is. `None` falls back to
+    /// matching `--advertise-addr` against the ring.
+    shard_id: Option<String>,
+    /// `--advertise-addr`, kept for the ring identity fallback only (the
+    /// manager's registration path takes its own copy in the CLI).
+    shard_advertise: Option<String>,
     /// The install-time web-console owner (`--admin-user` +
     /// `--admin-password-file`), held as account + password ONLY for the length
     /// of `serve()` — it is hashed into the account store and then dropped, and
@@ -847,6 +873,10 @@ impl MetaServer {
             engine_idle_ms: DEFAULT_ENGINE_IDLE_MS,
             audit_retention: None,
             control_listen: None,
+            control_plane: None,
+            shard_ring: None,
+            shard_id: None,
+            shard_advertise: None,
             admin_account: None,
         }
     }
@@ -871,6 +901,10 @@ impl MetaServer {
             engine_idle_ms: DEFAULT_ENGINE_IDLE_MS,
             audit_retention: None,
             control_listen: None,
+            control_plane: None,
+            shard_ring: None,
+            shard_id: None,
+            shard_advertise: None,
             admin_account: None,
         }
     }
@@ -913,6 +947,41 @@ impl MetaServer {
     /// this process byte-for-byte identical to a server without the feature.
     pub fn with_control_listen(mut self, addr: Option<String>) -> Self {
         self.control_listen = addr.filter(|a| !a.trim().is_empty());
+        self
+    }
+
+    /// Split the CONTROL plane off the tree backend: `--control-plane
+    /// postgres://…` puts definitions, keys, accounts, audit and the placement
+    /// tables in PostgreSQL while `--meta-store` decides where the TREES live.
+    ///
+    /// Two names that were one until now (`store.info` reports both, and the
+    /// banner says which is which), because sharding needs a system of record
+    /// that every instance can read: a placement table inside one node's local
+    /// SQLite is that node's private opinion. Under a PG `--meta-store` the
+    /// control plane is already remote, so this flag is for the SQLite and
+    /// treedb tree backends — and it is refused against a PG store rather than
+    /// silently splitting `grovefs_control` across two databases, which no
+    /// other code path in this repo supports.
+    pub fn with_control_plane(mut self, uri: Option<String>) -> Self {
+        self.control_plane = uri.filter(|a| !a.trim().is_empty());
+        self
+    }
+
+    /// Declare the meta-server ring this process is part of. `id` names its own
+    /// entry (`--shard-id`: a node name, a positional index or an address); when
+    /// absent, `advertise` (`--advertise-addr`) picks the ring member that
+    /// carries that address. Validity — a PostgreSQL control plane must exist,
+    /// and the ring must contain this process — is checked once here, so a
+    /// mistake fails the start rather than the first mount.
+    pub fn with_sharding(
+        mut self,
+        ring: Option<String>,
+        id: Option<String>,
+        advertise: Option<String>,
+    ) -> Self {
+        self.shard_ring = ring.filter(|a| !a.trim().is_empty());
+        self.shard_id = id.filter(|a| !a.trim().is_empty());
+        self.shard_advertise = advertise.filter(|a| !a.trim().is_empty());
         self
     }
 
@@ -1175,6 +1244,36 @@ impl MetaServer {
                 );
             }
         }
+        // ---- the control plane, which may now be a DIFFERENT store ----------
+        // Historically the control plane FOLLOWS the tree backend: a PG store put
+        // `grovefs_control` in that same database, anything else used the local
+        // files. `--control-plane postgres://…` names it explicitly instead, so a
+        // deployment can keep its trees on SQLite or treedb and still have ONE
+        // system of record for definitions, keys, accounts and placement — which
+        // is what a meta-server ring needs (N processes cannot route by a table
+        // only one of them can read). `store.info` reports the two separately for
+        // the same reason.
+        let ctl_uri = match (&self.control_plane, store.control_uri()) {
+            (None, existing) => existing.map(str::to_owned),
+            (Some(u), None) => Some(u.clone()),
+            (Some(u), Some(existing)) => {
+                if u.trim() != existing.trim() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "--control-plane is not needed with a --meta-store postgres://…: the \
+                     control plane is already that store's first instance ('{}'), and a \
+                     second one would split grovefs_control across two databases. Move it \
+                     with `storage.set_control`, or drop --control-plane.",
+                            crate::pg_store::expand_store_spec(existing)
+                                .map(|b| b.control().name.clone())
+                                .unwrap_or_else(|_| "control".into())
+                        ),
+                    ));
+                }
+                Some(existing.to_owned())
+            }
+        };
         // SQLite trees live under `<base>/meta`, one directory each; a PG store
         // writes nothing locally, so creating that directory would be a
         // misleading footprint (an empty `meta/` on a host that has no local
@@ -1198,7 +1297,7 @@ impl MetaServer {
         let (ctl_keys, web_auth, admin_note) = match &self.control_listen {
             None => (None, None, None),
             Some(_) => {
-                let store_uri = store.control_uri();
+                let store_uri = ctl_uri.as_deref();
                 let keys = Arc::new(
                     crate::apikeys::ApiKeyStore::open_for(&self.base, store_uri)
                         .map_err(io::Error::other)?,
@@ -1245,6 +1344,16 @@ impl MetaServer {
             store.backend_name(),
             store.backend_layout()
         );
+        // Name the split when there IS one: `--control-plane` means the line above
+        // describes the TREES only, and the definitions, keys, accounts and
+        // placement an operator is about to edit live in PostgreSQL. No URI in the
+        // log — it embeds a password and the journal is world-readable.
+        if self.control_plane.is_some() {
+            println!(
+                "meta-server: control plane is PostgreSQL (grovefs_control) — view definitions, \n                 api keys, accounts, audit and both placement tables live there; trees stay on {}",
+                store.backend_name()
+            );
+        }
         // Instance registry, NAMES only (URIs embed passwords and the banner
         // lands in the journal): an operator running a multi-instance
         // deployment must see at startup which instance carries the control
@@ -1294,10 +1403,10 @@ impl MetaServer {
         // definitions/aliases/forks from the shared `grovefs_control` schema, a
         // SQLite store from the local `meta/views` dir — one system of record per
         // backend, never a local file the PG deployment would ignore.
-        let mut control = crate::mcp::control_store_for(&self.base, store.control_uri())
+        let mut control = crate::mcp::control_store_for(&self.base, ctl_uri.as_deref())
             .map_err(io::Error::other)?;
         #[cfg(feature = "treedb")]
-        if matches!(store, StoreKind::Treedb(_)) {
+        if matches!(store, StoreKind::Treedb(_)) && ctl_uri.is_none() {
             // The SAME local file plane, but defs place as if trees lived in the
             // engine: there are no local db files for the tree-home scan, so a
             // fork def would otherwise fall flat and a member def would never
@@ -1306,6 +1415,57 @@ impl MetaServer {
                 crate::mcp::FileControlStore::new(&self.base).with_engine_trees(),
             );
         }
+        // ---- multi-meta-server view sharding (`--shard-ring`) ---------------
+        // The ring is where PROCESS-level scale-out lives: each entry is another
+        // `meta-server`, and `grovefs_control.meta_placement` records which one
+        // serves which view. Building it here — before any listener accepts — is
+        // what turns a typo into a failed start instead of a mount that cannot be
+        // routed. A ring without a PostgreSQL control plane is refused outright:
+        // every member must read the same placement table, and a node's local
+        // SQLite is not readable by its peers. Orthogonal to `--peer`/`--witness`
+        // (one ring member MAY be an HA pair; see [`super::shard::MetaNode`]).
+        let shard = match &self.shard_ring {
+            None => None,
+            Some(ring) => {
+                let ctl = ctl_uri.clone().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--shard-ring needs a PostgreSQL control plane, because every instance \
+                     has to read the same placement table: add \
+                     `--control-plane postgres://user:pw@host:port/db` (or use \
+                     `--meta-store postgres://…`, whose first instance is one)",
+                    )
+                })?;
+                // The spec may be a `file:` instance registry (what a bare
+                // `--meta-store postgres://…` is adopted into), which is a PATH,
+                // not something to dial: the placement table lives in the
+                // registry's CONTROL instance, the same entry
+                // [`crate::apikeys::ApiKeyStore::open_pg`] binds.
+                let ctl = match crate::pg_store::expand_store_spec(&ctl) {
+                    Ok(book) => book.control().uri.clone(),
+                    // Not a PostgreSQL spec at all — nothing else can be a
+                    // control plane, so keep the text and let the first
+                    // connection report what could not be parsed.
+                    Err(_) => ctl,
+                };
+                let s = super::shard::Shard::new(
+                    ring,
+                    self.shard_id.as_deref(),
+                    self.shard_advertise.as_deref(),
+                    ctl,
+                    super::shard::store_fingerprint(&store),
+                )
+                .map_err(io::Error::other)?;
+                println!(
+                    "meta-server: sharded across {} — this instance is '{}' ({}), placement in \
+                     grovefs_control.meta_placement (`M_OPEN` redirects a view it does not serve)",
+                    crate::cli_style::plural(s.nodes().len(), "meta-server", "meta-servers"),
+                    s.me().name,
+                    s.me().addr
+                );
+                Some(s)
+            }
+        };
         let rt = Arc::new(MetaRuntime {
             base: self.base.clone(),
             token: self.token.clone(),
@@ -1330,6 +1490,7 @@ impl MetaServer {
             ctl_keys,
             web_auth,
             xfer_owner: Mutex::new(HashMap::new()),
+            shard,
         });
         if rt.sync_repl {
             println!("meta-server: synchronous replication ON (RPO=0 for mutating ops, ACK timeout {SYNC_REPL_ACK_TIMEOUT:?})");
@@ -1348,7 +1509,7 @@ impl MetaServer {
                     e.kind(),
                     format!(
                         "cannot bind --control-listen {addr}: {e} (the control port is a second \
-                         listener beside --listen; pick a free address, e.g. 127.0.0.1:50154)"
+                     listener beside --listen; pick a free address, e.g. 127.0.0.1:50154)"
                     ),
                 )
             })?;
@@ -1566,6 +1727,7 @@ fn serve_on_meta_full(
         ctl_keys: None,
         web_auth: None,
         xfer_owner: Mutex::new(HashMap::new()),
+        shard: None,
     });
     serve_runtime(listener, rt);
 }
@@ -1759,6 +1921,72 @@ fn epoll_register_subscriber(rt: &Arc<MetaRuntime>, h: &super::epoll::Handle, vi
     }
 }
 
+/// How often a sharded instance re-reads the placement table to notice it has
+/// been deposed. Bounded by the same argument as every other control-plane job:
+/// a move is a human action, so seconds are fine, and one PK-less table read
+/// every few seconds is nothing next to the mount traffic the same table serves.
+const SHARD_SWEEP_MS: u64 = 5_000;
+
+/// Drop the cached trees this instance no longer serves.
+///
+/// A cross-instance move rewrites ONE ROW, and the instance that used to hold
+/// the tree keeps its engine open: an established mount re-resolves through that
+/// cache on every op, so without this sweep the deposed process would keep
+/// writing to a tree the placement table no longer points at. The in-process
+/// `view move` path solves this by calling [`MetaRuntime::evict`] directly, and
+/// cannot — it is a different process. So the row is the message and the ticker
+/// is the delivery: the window is one sweep interval, on a sharded deployment
+/// only. Returns how many base views were dropped.
+fn evict_misplaced(rt: &MetaRuntime) -> usize {
+    let Some(sh) = &rt.shard else {
+        return 0;
+    };
+    let map = match sh.placement_map() {
+        Ok(m) => m,
+        // A control plane that will not answer says nothing: keep serving what is
+        // open rather than dropping live trees on a transient error.
+        Err(_) => return 0,
+    };
+    let me = sh.me().name.clone();
+    let out: Vec<String> = rt
+        .cache
+        .lock()
+        .keys()
+        .filter(|v| map.get(*v).map(|h| h != &me).unwrap_or(false))
+        .cloned()
+        .collect();
+    if out.is_empty() {
+        return 0;
+    }
+    let (mut cache, mut views, mut bases, mut defs) = (
+        rt.cache.lock(),
+        rt.views.lock(),
+        rt.bases.lock(),
+        rt.defs.lock(),
+    );
+    let hit = |name: &str| out.iter().any(|v| v == name);
+    // A derived name (lens/fork/bias) follows its BASE: the base tree moved, so
+    // every shape built on it belongs to the other instance too. (`derived` is
+    // collected first because it filters `bases`, which the loop then mutates.)
+    let derived: Vec<String> = bases
+        .iter()
+        .filter(|(_, base)| hit(base))
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in derived {
+        views.remove(&name);
+        bases.remove(&name);
+        defs.remove(&name);
+    }
+    for v in &out {
+        cache.remove(v);
+        views.remove(v);
+        bases.remove(v);
+        defs.remove(v);
+    }
+    out.len()
+}
+
 fn serve_runtime(listener: TcpListener, rt: Arc<MetaRuntime>) {
     // One ticker carries two jobs: engine eviction (an idle view releases its
     // WHOLE pool) and pool reaping (a burst above the warm floor is shed back).
@@ -1768,7 +1996,7 @@ fn serve_runtime(listener: TcpListener, rt: Arc<MetaRuntime>) {
     // per-view PG backends, so the pre-eviction "no sweeper" behavior of the
     // LAN-trusted test server (`engine_idle_ms == 0`) stays exactly as it was.
     let pg_reap = matches!(rt.store, StoreKind::Pg(_)) && crate::pg_store::pool_idle_ms() > 0;
-    if rt.engine_idle_ms > 0 || pg_reap {
+    if rt.engine_idle_ms > 0 || pg_reap || rt.shard.is_some() {
         let sw = rt.clone();
         thread::spawn(move || loop {
             // Sweep at half the window each job is configured with, bounded to
@@ -1782,7 +2010,10 @@ fn serve_runtime(listener: TcpListener, rt: Arc<MetaRuntime>) {
                 u64::MAX
             };
             let reap = (crate::pg_store::pool_idle_ms() / 2).clamp(1_000, 60_000);
-            let nap = evict.min(reap);
+            let mut nap = evict.min(reap);
+            if sw.shard.is_some() {
+                nap = nap.min(SHARD_SWEEP_MS);
+            }
             thread::sleep(std::time::Duration::from_millis(nap));
             let gone = evict_idle(&sw);
             if gone > 0 {
@@ -1802,6 +2033,13 @@ fn serve_runtime(listener: TcpListener, rt: Arc<MetaRuntime>) {
                     "meta-server: reaped {} back to their warm floor (process window {}s, per-view overrides honored)",
                     crate::cli_style::plural(shed as usize, "idle PG pool connection", "idle PG pool connections"),
                     crate::pg_store::pool_idle_ms() / 1000
+                );
+            }
+            let lost = evict_misplaced(&sw);
+            if lost > 0 {
+                println!(
+                    "meta-server: dropped {}, the placement table now names another instance (`view move --to-meta`)",
+                    crate::cli_style::plural(lost, "cached tree", "cached trees")
                 );
             }
         });
@@ -2524,6 +2762,9 @@ fn gates(op: &str) -> Result<Vec<Gate>, String> {
         "view.rm_base" | "refs.rebuild" | "gc.scan" | "gc.apply" => vec![Gate::Super(
             "it destroys or rewrites state shared by more views than the caller's own",
         )],
+        "view.move_meta" => vec![Gate::Super(
+            "it decides which meta-server instance serves a view, which is a deployment decision",
+        )],
         // Credentials: an admin sees all; a delegated account may hold keys for
         // its own views only (enforced in the arms, which is where the scope and
         // owner of a key are known).
@@ -2562,7 +2803,7 @@ fn gates(op: &str) -> Result<Vec<Gate>, String> {
         }
         other => {
             return Err(format!(
-                "control op '{other}' has no access rule (unknown, or added to the dispatcher \n                     without one) — refusing. Known ops: info, whoami, login, def.list/get/put/remove, \n                     stamp, physical.list/has, fork.has/create/drop/graft, view.create/stats/plan/export/import, \n                     view.rm_base, refs.rebuild, gc.scan/apply, apikey.create/list/revoke/delete/rotate/set_ro/update/secret/calls/purge, \n                     audit.retention.get/set, storage.add/update/remove/preview/set_control/relocate, \n                     account.list/create/passwd/role/disable/delete, grant.list/add/remove"
+                "control op '{other}' has no access rule (unknown, or added to the dispatcher \n                     without one) — refusing. Known ops: info, whoami, login, def.list/get/put/remove, \n                     stamp, physical.list/has, fork.has/create/drop/graft, view.create/stats/plan/export/import, \n                     view.rm_base/move_meta, refs.rebuild, gc.scan/apply, apikey.create/list/revoke/delete/rotate/set_ro/update/secret/calls/purge, \n                     audit.retention.get/set, storage.add/update/remove/preview/set_control/relocate, \n                     account.list/create/passwd/role/disable/delete, grant.list/add/remove"
             ));
         }
     };
@@ -2814,6 +3055,11 @@ fn control_dispatch(
             if who.is_super() {
                 Ok(json!({
                     "backend": rt.control.backend(),
+                    // Where the TREES are, which `--control-plane` splits from
+                    // the field above. `RemoteControlStore` reads this at connect
+                    // so `view list` can call a local tree a tree instead of
+                    // naming a PostgreSQL schema that does not exist.
+                    "metadataBackend": rt.store.backend_name(),
                     "describe": rt.control.describe(),
                     "base": rt.base.display().to_string(),
                     "actor": who.account,
@@ -2875,7 +3121,7 @@ fn control_dispatch(
             let store_report = storage_snapshot(&rt.store, &rt.base);
             let (trees, trees_silent): (Vec<String>, Vec<String>) = match store_report.trees {
                 Some(pair) => pair,
-                None => (rt.control.list_physical()?, Vec::new()),
+                None => (physical_tree_list(rt)?, Vec::new()),
             };
             // The HA configuration, reported only when there IS one.
             //
@@ -2899,6 +3145,53 @@ fn control_dispatch(
                     "witness": rt.witness,
                 })
             });
+            // The meta-server RING, reported only when there IS one — the same
+            // shape as the HA block above, for the same reason: `null` means
+            // "this process serves every view", and a table of one row would read
+            // like a sharded deployment that lost its peers. Node NAMES and
+            // addresses travel (an address is what a client was redirected to, so
+            // it is not a secret), a backend URI never does — the fingerprint
+            // column is already credential-free.
+            let shard = rt.shard.as_ref().map(|sh| match sh.placement_counts() {
+                Ok(rows) => json!({
+                    "self": sh.me().name,
+                    "addr": sh.me().addr,
+                    "ring": sh.origin(),
+                    "backend": sh.store_fingerprint(),
+                    // Whether the placement table sits in the SAME database as
+                    // the trees (`--meta-store postgres://…`, which is its own
+                    // control plane) or in one the operator named apart
+                    // (`--control-plane`, with SQLite or treedb trees). Both
+                    // sides go through [`resolved_control_uri`] first: a bare
+                    // `--meta-store` URI is adopted into a managed registry, so
+                    // the raw spec and the URI `Shard` dialed are two spellings
+                    // of one database.
+                    "controlPlane": if resolved_control_uri(rt.store.control_uri()).as_deref()
+                        == Some(sh.control_uri())
+                    {
+                        "tree backend"
+                    } else {
+                        "separate --control-plane"
+                    },
+                    "nodes": rows
+                        .iter()
+                        .map(|(n, c)| {
+                            json!({
+                                "name": n.name,
+                                "addr": n.addr,
+                                "views": c,
+                                "here": n.name == sh.me().name,
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                }),
+                Err(e) => json!({
+                    "self": sh.me().name,
+                    "addr": sh.me().addr,
+                    "backend": sh.store_fingerprint(),
+                    "error": e,
+                }),
+            });
             Ok(json!({
                 // `backend` is the CONTROL-plane backend; `metadataBackend` is
                 // where the TREES live. They differ on a treedb deployment,
@@ -2916,6 +3209,7 @@ fn control_dispatch(
                 // console labels both. `None` below means HA is unconfigured.
                 "role": format!("{:?}", rt.role()),
                 "ha": ha,
+                "shard": shard,
                 "views": trees.len(),
                 // How many serving engines were too quiet to be asked: with this
                 // set nonzero, `views` above counts only what answered. A number
@@ -3022,7 +3316,7 @@ fn control_dispatch(
             Ok(json!(visible(rt, who, v)))
         }
         "physical.has" => Ok(json!(physical_tree_exists(rt, &req_str(a, "name")?)?)),
-        "fork.has" => Ok(json!(rt.control.has_fork_tree(&req_str(a, "name")?)?)),
+        "fork.has" => Ok(json!(fork_tree_exists(rt, &req_str(a, "name")?)?)),
         // The tree-copy verbs. They are served HERE — by the process that owns
         // the store — instead of being refused, because the copy reads and
         // writes nothing but the metadata store this server is already the only
@@ -3203,6 +3497,27 @@ fn control_dispatch(
                 return Err(format!(
                     "view '{view}' already exists — remove it first (`view rm --name {view} --base`)"
                 ));
+            }
+            // Sharded deployment: the placement row is written BEFORE the tree,
+            // for the same reason a PG home row is — it is what tells every other
+            // instance (and a concurrent creator) that this name is taken. A row
+            // naming a PEER is a refusal, never a redirect: creating a second
+            // tree behind one name is the one outcome no later verb repairs.
+            if let Some(sh) = &rt.shard {
+                match sh.route(&view) {
+                    Ok(super::shard::Home::Mine) => {}
+                    Ok(super::shard::Home::Other(node)) => {
+                        crate::stats::count(crate::stats::Counter::ShardRefuse, 1);
+                        return Err(format!(
+                            "view '{view}' is placed on meta-server '{}' (mount address {}) — run `view create` \n                             against THAT instance's own --control-listen port, or move the placement here \n                             first (`view move --view {view} --to-meta {}`, against the control port you \n                             are talking to)",
+                            node.name, node.addr, sh.me().name
+                        ));
+                    }
+                    Err(e) => {
+                        crate::stats::count(crate::stats::Counter::ShardPlacementErr, 1);
+                        return Err(format!("view create: {e}"));
+                    }
+                }
             }
             let report = match &rt.store {
                 StoreKind::Pg(uri) => {
@@ -3417,8 +3732,35 @@ fn control_dispatch(
         "view.rm_base" => {
             let view = req_str(a, "view")?;
             let data_root = a.get("data_root").and_then(|v| v.as_str());
-            view_rm_base(rt, &view, data_root)
+            // Destroying a tree is the home instance's job, for the inverse of
+            // the create reason: a peer that deleted the ROW of a view whose
+            // tree is still alive elsewhere leaves a name whose mounts now
+            // resolve to "no placement" — a dangling tree with no owner.
+            if let Some(sh) = &rt.shard {
+                match sh.route(&view) {
+                    Ok(super::shard::Home::Mine) => {}
+                    Ok(super::shard::Home::Other(node)) => {
+                        crate::stats::count(crate::stats::Counter::ShardRefuse, 1);
+                        return Err(format!(
+                            "view '{view}' is placed on meta-server '{}' (mount address {}) — run `view rm` \n                             against THAT instance's own --control-listen port: only the process holding \n                             the tree can delete it (`--base` is what frees its bytes)",
+                            node.name, node.addr
+                        ));
+                    }
+                    Err(e) => {
+                        crate::stats::count(crate::stats::Counter::ShardPlacementErr, 1);
+                        return Err(format!("view rm: {e}"));
+                    }
+                }
+            }
+            let report = view_rm_base(rt, &view, data_root)?;
+            // The tree is gone, so its row must not outlive it. Best-effort by
+            // design — see [`super::shard::Shard::forget`].
+            if let Some(sh) = &rt.shard {
+                sh.forget(&view);
+            }
+            Ok(report)
         }
+        "view.move_meta" => view_move_meta(rt, a),
         "refs.rebuild" => refs_rebuild(rt),
         "gc.scan" => gc_audit(rt, false, a),
         "gc.apply" => gc_audit(rt, true, a),
@@ -3464,8 +3806,8 @@ fn control_dispatch(
                 if scope == Scope::Admin || scope == Scope::Any {
                     return Err(format!(
                         "account '{}' may mint `--for mount` or `--for mcp` keys, not `--for {}`: \
-                         those scopes govern the whole deployment, and only an administrator may \
-                         hand that out",
+                     those scopes govern the whole deployment, and only an administrator may \
+                     hand that out",
                         who.account,
                         scope.as_str()
                     ));
@@ -3477,7 +3819,7 @@ fn control_dispatch(
                     None => {
                         return Err(format!(
                             "account '{}' must name the view a key is bound to (`view=<name>'): \
-                             an unbound key reaches every tree in the deployment",
+                     an unbound key reaches every tree in the deployment",
                             who.account
                         ))
                     }
@@ -3979,7 +4321,7 @@ fn control_dispatch(
         | "account.disable" | "account.delete" | "grant.list" | "grant.add" | "grant.remove"
         | "view.stats" => web_dispatch(rt, who, op, a),
         other => Err(format!(
-            "unknown control op '{other}' (known: info, store.info, whoami, def.list/get/put/remove, stamp, physical.list/has, fork.has/create/drop/graft, view.create/stats/plan/export/import, view.rm_base, refs.rebuild, gc.scan/apply, apikey.create/list/revoke/delete/rotate/set_ro/update/calls/purge, audit.retention.get/set, storage.add/update/remove/preview/set_control/relocate, account.list/create/passwd/role/disable/delete, grant.list/add/remove)"
+            "unknown control op '{other}' (known: info, store.info, whoami, def.list/get/put/remove, stamp, physical.list/has, fork.has/create/drop/graft, view.create/stats/plan/export/import, view.rm_base/move_meta, refs.rebuild, gc.scan/apply, apikey.create/list/revoke/delete/rotate/set_ro/update/calls/purge, audit.retention.get/set, storage.add/update/remove/preview/set_control/relocate, account.list/create/passwd/role/disable/delete, grant.list/add/remove)"
         )),
     }
 }
@@ -4320,7 +4662,7 @@ fn web_dispatch(
                 "definition": def,
                 "stamp": rt.control.stamp(&view),
                 "tree": physical_tree_exists(rt, &view)?,
-                "forkTree": rt.control.has_fork_tree(&view)?,
+                "forkTree": fork_tree_exists(rt, &view)?,
                 "family": family,
                 "keys": keys,
                 "sessions": sessions,
@@ -4704,6 +5046,95 @@ fn view_xfer_drop(rt: &Arc<MetaRuntime>, handle: &str) -> Result<serde_json::Val
     let _ = std::fs::remove_file(&path);
     rt.release_xfer(handle);
     Ok(serde_json::Value::Null)
+}
+
+/// `view move --to-meta NAME`: hand this view's SERVING DUTY to THIS instance.
+///
+/// It runs against the TARGET's control port, not the source's, because the
+/// target is the process that has to answer for the tree afterwards: a row that
+/// names an instance which cannot open the tree is worse than no move at all.
+/// So the first thing it does is the same existence probe a mount would make
+/// ([`physical_tree_exists`]), and a "no" is a refusal — never a fresh empty
+/// tree behind a name that already has content somewhere.
+///
+/// What moves is the ROW, not the bytes. Under `--meta-store postgres://…` or
+/// `treedb://…` the tree already lives in a database this process can reach; the
+/// placement table decides which PROCESS serves it, which is the lever for meta
+/// workers, engine pools and one host's connection limit. A SQLite tree has no
+/// such shared home — the file is on the old host's disk — so that deployment
+/// still needs the byte path (`view export` / `view import`), and the refusal
+/// says so rather than flipping a row that would serve nothing.
+fn view_move_meta(rt: &MetaRuntime, a: &serde_json::Value) -> Result<serde_json::Value, String> {
+    use serde_json::json;
+    let view = req_str(a, "view")?;
+    if !crate::layout::valid_view_name(&view) {
+        return Err(format!("invalid view name '{view}'"));
+    }
+    let sh = rt.shard.as_ref().ok_or_else(|| {
+        "this meta-server was started without --shard-ring, so it serves every view \n                     itself — there is no other instance to move between"
+            .to_string()
+    })?;
+    // The CLI names the node it meant; THIS process is the one answering. A
+    // mismatch means an operator pointed at the wrong port, and adopting anyway
+    // would place the view on a process nobody asked about, so it is refused —
+    // with the name this instance answers to, which is what they need to fix the
+    // command.
+    if let Some(want) = a.get("to").and_then(|v| v.as_str()) {
+        let want = want.trim();
+        if !want.is_empty() && !want.eq_ignore_ascii_case(sh.me().name.as_str()) {
+            crate::stats::count(crate::stats::Counter::ShardRefuse, 1);
+            return Err(format!(
+                "this meta-server is ring node '{}', not '{want}' — run `view move --view {view} \
+                 --to-meta {want}` against THAT instance's --control-server",
+                sh.me().name
+            ));
+        }
+    }
+    let prev = sh.placement_map().unwrap_or_default().remove(&view);
+    if prev.as_deref() == Some(sh.me().name.as_str()) {
+        return Ok(json!(format!(
+            "view '{view}' is already placed on '{}' — nothing to move",
+            sh.me().name
+        )));
+    }
+    if !physical_tree_exists(rt, &view)? {
+        // Name the node the row still points at, because that is the instance
+        // whose operator has to be in the conversation about the bytes.
+        let from = prev.clone().unwrap_or_else(|| "its current home".into());
+        return Err(match &rt.store {
+            StoreKind::Sqlite => format!(
+                "view '{view}' has no tree on this host — a SQLite tree lives in one instance's \n                 <base>/meta/ ({from}), so move it with `view export` there and `view import` \n                 here, then `view move --to-meta`",
+            ),
+            _ => format!(
+                "view '{view}' has no tree reachable from this instance's backend ({}) — the \n                 placement row can name a process, it cannot conjure a tree; point this instance's \n                 --meta-store at the database that holds it",
+                sh.store_fingerprint()
+            ),
+        });
+    }
+    if let Err(e) = sh.adopt(&view) {
+        crate::stats::count(crate::stats::Counter::ShardPlacementErr, 1);
+        return Err(format!("view move: {e}"));
+    }
+    // This process now serves the tree, and may have held a verdict about it from
+    // when it did not (a cached "not mine", or an engine opened against a backend
+    // it has since been told to stop using). Drop the caches so the next resolve
+    // reads the row it just wrote; the deposed peer learns from the same table on
+    // its own sweep.
+    rt.evict();
+    Ok(json!(match prev {
+        Some(from) => format!(
+            "moved view '{view}' from meta-server '{from}' to '{}' ({}); mounts now resolve \n             here, and '{}' drops its cached tree within {}s",
+            sh.me().name,
+            sh.store_fingerprint(),
+            from,
+            SHARD_SWEEP_MS / 1000
+        ),
+        None => format!(
+            "placed view '{view}' on '{}' ({})",
+            sh.me().name,
+            sh.store_fingerprint()
+        ),
+    }))
 }
 
 fn view_rm_base(
@@ -5341,24 +5772,72 @@ fn load_aliases(store: &dyn crate::mcp::ControlStore) -> io::Result<HashMap<Stri
 /// by `view create` rather than a copy of the base — answering from the engine
 /// there would serve a live tree under a name its caller believes it cloned.
 fn physical_tree_exists(rt: &MetaRuntime, name: &str) -> Result<bool, String> {
+    // `rt.control` is a `dyn` object, so its trait methods resolve without an
+    // import; the concrete `FileControlStore` below needs the trait in scope.
+    use crate::mcp::ControlStore;
     #[cfg(feature = "treedb")]
     if let StoreKind::Treedb(addrs) = &rt.store {
         // A duplicated name (Err) answers "exists" too — the caller is refusing
         // a create or reporting a listing, and either way the name IS taken.
         return crate::treedb_store::find_tree_home(addrs, name).map(|o| o.is_some());
     }
+    // `--control-plane postgres://…` splits the two roles: definitions,
+    // credentials and placement are PostgreSQL's, while the TREES stay this
+    // host's `meta/<name>/<name>.db` files. The PG store's `has_physical` looks
+    // for a schema, so it would report every local tree as missing — refusing a
+    // mount on the very instance that owns it. Ask the file layout instead.
+    if local_trees_behind_remote_registry(rt) {
+        return crate::mcp::FileControlStore::new(&rt.base).has_physical(name);
+    }
     rt.control.has_physical(name)
+}
+
+/// True when this process keeps its trees in the local `--meta-dir` layout while
+/// its control store points somewhere else (the `--control-plane` split): every
+/// "does this tree exist / which trees are here" question then belongs to the
+/// files, not to the registry that holds the definitions.
+fn local_trees_behind_remote_registry(rt: &MetaRuntime) -> bool {
+    matches!(rt.store, StoreKind::Sqlite) && rt.control.backend() != "sqlite"
+}
+
+/// Does a FORK own a tree here? The same split rule as [`physical_tree_exists`]:
+/// under `--control-plane` the definition is the registry's business and the
+/// bytes are the local files'.
+fn fork_tree_exists(rt: &MetaRuntime, name: &str) -> Result<bool, String> {
+    use crate::mcp::ControlStore;
+    if local_trees_behind_remote_registry(rt) {
+        return crate::mcp::FileControlStore::new(&rt.base).has_fork_tree(name);
+    }
+    rt.control.has_fork_tree(name)
 }
 
 /// The same question in the plural: every name that currently owns a physical
 /// tree on this backend. See [`physical_tree_exists`] for why the engine has to
 /// be asked under `treedb://`.
 fn physical_tree_list(rt: &MetaRuntime) -> Result<Vec<String>, String> {
+    use crate::mcp::ControlStore;
     #[cfg(feature = "treedb")]
     if let StoreKind::Treedb(addrs) = &rt.store {
         return crate::treedb_store::list_views_all(addrs);
     }
+    if local_trees_behind_remote_registry(rt) {
+        return crate::mcp::FileControlStore::new(&rt.base).list_physical();
+    }
     rt.control.list_physical()
+}
+
+/// Where a store spec's CONTROL plane actually is, with a managed registry
+/// (`<base>/instances.conf`, which `--meta-store postgres://…` is adopted into)
+/// resolved to its control instance's URI. `PgPool::open` applies the same
+/// expansion; this is the read-only form, and a spec that cannot be read right
+/// now falls back to its own text rather than inventing an answer.
+fn resolved_control_uri(spec: Option<&str>) -> Option<String> {
+    let raw = spec?;
+    Some(
+        crate::pg_store::expand_store_spec(raw)
+            .map(|book| book.control().uri.clone())
+            .unwrap_or_else(|_| raw.to_string()),
+    )
 }
 
 /// Does `view` already exist here — as a governed definition (derived / fork /
@@ -5460,7 +5939,7 @@ fn view_provider(rt: &MetaRuntime, view: &str) -> io::Result<Arc<dyn MetaProvide
             // deliberately NOT recorded in `defs`: `is_derived` stays false, so
             // structure writes are admitted while the client-side ack flag
             // (below) keeps content writes out.
-            if !control.has_physical(view).map_err(io::Error::other)? {
+            if !physical_tree_exists(rt, view).map_err(io::Error::other)? {
                 return Err(io::Error::other(format!(
                     "fork view '{view}' has no tree in {} — removed out-of-band?",
                     control.describe()
@@ -5981,6 +6460,49 @@ fn meta_open<W: Write>(
             }
         }
     }
+    // Shard routing gate: under `--shard-ring`, the placement table decides
+    // WHICH meta-server process serves this view. It runs before the
+    // explicit-creation probe on purpose — with a shared control plane a view
+    // DEFINITION is visible from every instance, so `view_exists` is true here
+    // even when the tree is not, and the non-home answer must be a redirect
+    // (`E_SHARD`, carrying the home address) rather than the empty tree this
+    // process would otherwise hand out. Only the post-alias name is routed: the
+    // sharding key is the physical base view, so an alias cannot become a second
+    // placement of the same tree.
+    if let Some(sh) = &rt.shard {
+        match sh.route(&view) {
+            Ok(super::shard::Home::Mine) => {}
+            Ok(super::shard::Home::Other(node)) => {
+                crate::stats::count(crate::stats::Counter::ShardRedirect, 1);
+                if let Some(store) = &rt.keys {
+                    let _ = store.log_call(
+                        authed.as_ref(),
+                        "meta",
+                        "M_OPEN",
+                        true,
+                        &format!("view='{view}': redirected to meta-server '{}'", node.name),
+                    );
+                }
+                proto::send_response(w, E_SHARD, 0, node.addr.as_bytes())?;
+                return Ok(None);
+            }
+            Err(e) => {
+                crate::stats::count(crate::stats::Counter::ShardPlacementErr, 1);
+                eprintln!("meta: M_OPEN view='{view}' shard placement refused: {e}");
+                if let Some(store) = &rt.keys {
+                    let _ = store.log_call(
+                        authed.as_ref(),
+                        "meta",
+                        "M_OPEN",
+                        false,
+                        &format!("view='{view}': {e}"),
+                    );
+                }
+                proto::send_response(w, E_DB, 0, e.as_bytes())?;
+                return Ok(None);
+            }
+        }
+    }
     // Explicit-creation gate: refuse a name that does not ALREADY exist. This
     // must run BEFORE `view_provider`, because that call is what materializes
     // the tree: by the time it fails (or succeeds with an empty tree),
@@ -6012,7 +6534,7 @@ fn meta_open<W: Write>(
                     "a treedb base view is a tree inside the engine(s) at {}: create it against this meta-server (`grovefs view --control-server <host:port> --api-key <admin-key> create --view {view}`)",
                     addrs.join(", ")
                 ),
-                _ if rt.control.backend() == "postgres" => format!(
+                _ if matches!(rt.store, StoreKind::Pg(_)) => format!(
                     "a PG base view is a schema: create it first with `grovefs view --meta-store postgres://… --meta-dir {root} create --view {view}`, or restore the schema from a dump"
                 ),
                 _ => format!(
@@ -6022,16 +6544,10 @@ fn meta_open<W: Write>(
             // `view` is the POST-ALIAS real name; name the alias the caller
             // actually mounted too, so "pub does not exist" never reads as
             // if the alias itself were unknown.
-            #[cfg(feature = "treedb")]
-            let backend = if matches!(rt.store, StoreKind::Treedb(_)) {
-                // The store that was actually asked about, not the one holding
-                // the credentials.
-                "treedb"
-            } else {
-                rt.control.backend()
-            };
-            #[cfg(not(feature = "treedb"))]
-            let backend = rt.control.backend();
+            // The store that was actually asked about: the TREES, not the
+            // registry — `--control-plane` can put the two in different places
+            // — and not the one holding the credentials.
+            let backend = rt.store.backend_name();
             let where_ = if presented_name != view {
                 format!("{backend}; mounted as alias '{presented_name}' -> '{view}'")
             } else {
@@ -6221,6 +6737,54 @@ fn meta_work<W: Write>(
     if is_write_op(op) && rt.fenced_for_write() {
         proto::send_response(w, E_ROFS, 0, &[])?;
         return Ok(true);
+    }
+    // Sharded deployment: a mount that was already open when `view move --to-meta`
+    // handed its view to another instance must not be served a RE-OPENED tree here.
+    // The placement sweep drops the tree from this process, so the next op is a
+    // cache miss — and resolving that miss would materialize a second copy of a name
+    // the ring says a peer owns (for a SQLite tree, silent divergence). So hang up
+    // instead, carrying the new home's address: the client re-handshakes (see
+    // [`RemoteMeta::round_trip`]), the fresh `M_OPEN` is redirected, and the op is
+    // retried THERE — the mount follows the view with no unmount. Gated on the miss,
+    // so an op that a resident engine serves costs a hash lookup and no query.
+    if let Some(sh) = &rt.shard {
+        // Only a MISS consults the table: a resident engine is proof this process
+        // was home when the mount opened, and the sweep below is what removes it
+        // when that stops being true.
+        if !rt.views.lock().contains_key(&s.view) {
+            let base = rt
+                .bases
+                .lock()
+                .get(&s.view)
+                .cloned()
+                .unwrap_or_else(|| s.view.clone());
+            match sh.peek(&base) {
+                Ok(super::shard::Home::Other(node)) => {
+                    crate::stats::count(crate::stats::Counter::ShardRedirect, 1);
+                    if let Some(store) = &rt.keys {
+                        let _ = store.log_call(
+                            s.authed.as_ref(),
+                            "meta",
+                            "M_SHARD",
+                            true,
+                            &format!(
+                                "view='{base}': moved to meta-server '{}', this mount follows it",
+                                node.name
+                            ),
+                        );
+                    }
+                    proto::send_response(w, E_SHARD, 0, node.addr.as_bytes())?;
+                    return Ok(false);
+                }
+                Err(e) => {
+                    crate::stats::count(crate::stats::Counter::ShardPlacementErr, 1);
+                    eprintln!("meta-server: placement probe for view='{base}': {e}");
+                    proto::send_response(w, E_DB, 0, e.as_bytes())?;
+                    return Ok(true);
+                }
+                Ok(super::shard::Home::Mine) => {}
+            }
+        }
     }
     // Re-resolve the provider each op: cheap while cached, and picks up a
     // freshly installed snapshot after a replication push evicted the old one.
@@ -8011,6 +8575,7 @@ mod ha_tests {
             ctl_keys: None,
             web_auth: None,
             xfer_owner: Mutex::new(HashMap::new()),
+            shard: None,
         });
 
         // Witness holds nothing above our epoch: the first proof grants a lease
@@ -8092,6 +8657,7 @@ mod ha_tests {
             ctl_keys: None,
             web_auth: None,
             xfer_owner: Mutex::new(HashMap::new()),
+            shard: None,
         }
     }
 
@@ -8437,6 +9003,7 @@ mod ha_tests {
             ctl_keys: None,
             web_auth: None,
             xfer_owner: Mutex::new(HashMap::new()),
+            shard: None,
         };
         let a = store_for(&rt, "v1").unwrap();
         assert!(rt.cache.lock().contains_key("v1"));
