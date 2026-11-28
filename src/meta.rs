@@ -1168,6 +1168,17 @@ pub enum MetaError {
     OpNotPermitted,
     BadParentCycle,
     Db(String),
+    /// A SHARDED deployment refused to serve the op because this instance is
+    /// not the view's home, and the client could not settle on one that is
+    /// (the redirect it got named no usable address). It is NOT a metadata
+    /// fault: nothing about the name, the parent or the database is wrong, the
+    /// ROUTING is. Keeping it a separate variant is what stops a placement
+    /// table that contradicts its own ring from being reported as a corrupt
+    /// tree. Produced only by the remote client's status mapping
+    /// (`src/remote/meta.rs`, `err_from_code`); no metadata provider ever
+    /// returns it, so the server-side code mapping keeps it out of the wire
+    /// vocabulary.
+    Shard(String),
 }
 
 impl std::fmt::Display for MetaError {
@@ -1180,6 +1191,7 @@ impl std::fmt::Display for MetaError {
             MetaError::OpNotPermitted => write!(f, "operation not permitted"),
             MetaError::BadParentCycle => write!(f, "invalid move into own subtree"),
             MetaError::Db(s) => write!(f, "metadata db error: {s}"),
+            MetaError::Shard(s) => write!(f, "shard routing refused: {s}"),
         }
     }
 }

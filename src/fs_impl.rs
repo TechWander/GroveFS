@@ -446,6 +446,11 @@ impl GroveFS {
             MetaError::OpNotPermitted => Errno::EPERM,
             MetaError::BadParentCycle => Errno::EINVAL,
             MetaError::Db(_) => Errno::EIO,
+            // A redirect the client could not settle: the op never ran, and no
+            // retry from userspace will fix a placement table that names a node
+            // the ring does not. EIO, not EAGAIN — pretending it is transient
+            // would have applications spin against a broken deployment.
+            MetaError::Shard(_) => Errno::EIO,
         }
     }
 }

@@ -308,6 +308,12 @@ fn err_code(e: &MetaError) -> i32 {
         MetaError::OpNotPermitted => E_NOTPERM,
         MetaError::BadParentCycle => E_CYCLE,
         MetaError::Db(_) => E_DB,
+        // Never produced server-side: no provider returns it, and `E_SHARD`'s
+        // payload contract is an ADDRESS, so answering a sentence under it
+        // would have a client dial prose. A server that somehow holds this
+        // error has a broken routing layer, which is exactly what `E_DB` means
+        // to a peer that knows nothing about shards.
+        MetaError::Shard(_) => E_DB,
     }
 }
 
@@ -324,7 +330,47 @@ fn err_from_code(c: i32) -> MetaError {
         // [`RemoteMeta::note_refusal`], and `EPERM` is the honest answer for the
         // op that lost its credential.
         E_AUTH => MetaError::OpNotPermitted,
+        // `E_SHARD` mid-op means "I stopped serving this view, ask THERE", and
+        // [`RemoteMeta::round_trip`] follows it. Reaching this arm therefore
+        // means the redirect carried no address worth dialing — a routing
+        // failure, and it is named as one instead of falling into the catch-all
+        // below, which would report a broken placement table as a corrupt tree.
+        E_SHARD => MetaError::Shard(
+            "the meta-server that should serve this view redirected the op without naming an \
+             address — check the shard placement rows for this view"
+                .to_string(),
+        ),
         _ => MetaError::Db("remote meta error".to_string()),
+    }
+}
+
+/// Marker for "the shard placement table bounced this op and never settled".
+///
+/// `round_trip` returns `io::Result`, and `io::ErrorKind` has no word for a
+/// ROUTING verdict — every kind that could be pressed into service (an
+/// `InvalidData`, a `ConnectionRefused`) is already what a dead socket or a
+/// malformed ack produces. So the condition rides in the error's payload and
+/// [`meta_from_io`] reads it back out, which is the difference between an
+/// operator reading "metadata db error" and opening the placement table.
+#[derive(Debug)]
+struct ShardUnsettled(String);
+
+// `io::Error::new` wants an `Error`, and its Display is what a caller that
+// does NOT downcast (a log line, an io traceback) ends up printing — so the
+// sentence has to stand on its own there too.
+impl std::fmt::Display for ShardUnsettled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ShardUnsettled {}
+
+/// What a metadata round trip that never got an answer means to the caller.
+fn meta_from_io(e: io::Error) -> MetaError {
+    match e.get_ref().and_then(|inner| inner.downcast_ref::<ShardUnsettled>()) {
+        Some(s) => MetaError::Shard(s.0.clone()),
+        None => MetaError::Db(format!("remote meta transport: {e}")),
     }
 }
 
@@ -997,6 +1043,23 @@ impl RemoteMeta {
 
     /// Send + recv with the same stale-pool recovery as the data client: a
     /// failure on a *reused* socket clears the pool and retries once fresh.
+    ///
+    /// REPLAY SEMANTICS, stated because both halves of this function replay an
+    /// op that may already have run: the shard-redirect path replays an op the
+    /// peer REFUSED (it never executed there, so the replay is exactly-once),
+    /// while the transport-error path below replays an op whose REPLY was lost
+    /// — that one is AT-LEAST-ONCE, and a write whose commit landed before the
+    /// socket died can therefore be sent twice. This client is what every
+    /// mount's metadata writes go through, so the guarantee any GroveFS
+    /// deployment gets on the metadata plane is at-least-once, not exactly-once.
+    /// What makes that survivable rather than corrupting is that every replayed
+    /// op is keyed on state the server already decided: `M_CREATE`/`M_MKDIR`
+    /// answer `E_EXISTS` for the duplicate row, `M_SETATTR`/`M_RENAME` to the
+    /// same target are idempotent by construction, and `M_UNLINK` answers
+    /// `ENOENT`. Nothing in the metadata protocol takes a client-supplied
+    /// request id, so a replay is deduplicated by the tree, not by a token —
+    /// which is fine for a filesystem's namespace operations and is the reason
+    /// no retry budget is spent on making writes uniquely identifiable.
     fn round_trip(&self, op: u8, body: &[u8]) -> io::Result<(i32, u64, Vec<u8>)> {
         // One metadata RPC end-to-end (checkout + send + recv + any stale-pool
         // reconnect). Pairs with the data-plane io.remote.* RTTs so an operator
@@ -1006,7 +1069,8 @@ impl RemoteMeta {
         // so a mount's report still names WHICH metadata op is slow.
         let _stage = meta_stage(op).map(stats::start);
         let (mut s, reused) = self.get_conn()?;
-        match Self::call(&mut s, op, body) {
+        let first = Self::call(&mut s, op, body);
+        match first {
             Ok(r) => {
                 // A sharded instance that no longer serves this view answers
                 // `E_SHARD` and hangs up: its engine was dropped by the placement
@@ -1016,23 +1080,49 @@ impl RemoteMeta {
                 // belongs to the instance that just hung up) and replay the op
                 // THERE. The refused op never ran, so the replay is not a second
                 // write — and an operator's `view move --to-meta` needs no remount.
-                if r.0 == E_SHARD {
-                    let home = String::from_utf8_lossy(&r.2).trim().to_string();
-                    if !home.is_empty() && home.len() <= 255 {
-                        *self.shome.lock() = Some(home);
+                //
+                // Follow the answer, do not just take one hop of it: a placement
+                // sweep can move a view twice while an op is queued (move, then
+                // the operator moves it back), and the second `E_SHARD` is the
+                // same signal as the first. One hop turned that into a fake
+                // database error for a deployment that was merely settling.
+                // The bound is [`SHARD_FOLLOW_MAX`] re-opens, each of which is
+                // itself bounded, so no placement table can make an op loop.
+                let mut cur = s;
+                let mut ans = r;
+                let mut hops = 0usize;
+                while ans.0 == E_SHARD {
+                    let home = String::from_utf8_lossy(&ans.2).trim().to_string();
+                    if home.is_empty() || home.len() > 255 {
+                        // An answer that names nothing to dial is not a home; hand
+                        // it up and let `err_from_code` name it as a routing fault.
+                        break;
                     }
-                    drop(s);
+                    if hops >= SHARD_FOLLOW_MAX {
+                        drop(cur);
+                        self.pool.lock().clear();
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            ShardUnsettled(format!(
+                                "shard placement for view '{}' bounced this op {hops} times and \
+                                 has not settled (last answer: {home}) — the placement rows and \
+                                 the ring disagree",
+                                self.view
+                            )),
+                        ));
+                    }
+                    hops += 1;
+                    *self.shome.lock() = Some(home);
+                    drop(cur);
                     self.pool.lock().clear();
                     stats::count(stats::Counter::ShardRedirect, 1);
-                    let (mut s2, _) = self.connect_fresh()?;
-                    let r2 = Self::call(&mut s2, op, body)?;
-                    self.note_refusal(&r2);
-                    self.put_conn(s2);
-                    return Ok(r2);
+                    let (n, _) = self.connect_fresh()?;
+                    cur = n;
+                    ans = Self::call(&mut cur, op, body)?;
                 }
-                self.note_refusal(&r);
-                self.put_conn(s);
-                Ok(r)
+                self.note_refusal(&ans);
+                self.put_conn(cur);
+                Ok(ans)
             }
             Err(first_err) => {
                 drop(s);
@@ -1093,7 +1183,7 @@ impl RemoteMeta {
         match self.round_trip(op, body) {
             Ok((0, val, _)) => Ok(val as i64),
             Ok((c, _, _)) => Err(err_from_code(c)),
-            Err(_) => Err(MetaError::Db("remote meta transport".to_string())),
+            Err(e) => Err(meta_from_io(e)),
         }
     }
 
@@ -1101,7 +1191,7 @@ impl RemoteMeta {
         match self.round_trip(op, body) {
             Ok((0, _, _)) => Ok(()),
             Ok((c, _, _)) => Err(err_from_code(c)),
-            Err(_) => Err(MetaError::Db("remote meta transport".to_string())),
+            Err(e) => Err(meta_from_io(e)),
         }
     }
 
@@ -1123,7 +1213,7 @@ impl RemoteMeta {
                 Ok((val as i64, node))
             }
             Ok((c, _, _)) => Err(err_from_code(c)),
-            Err(_) => Err(MetaError::Db("remote meta transport".to_string())),
+            Err(e) => Err(meta_from_io(e)),
         }
     }
 
@@ -1306,7 +1396,7 @@ impl MetaProvider for RemoteMeta {
                 }
             }
             Ok((c, _, _)) => Err(err_from_code(c)),
-            Err(_) => Err(MetaError::Db("remote meta transport".to_string())),
+            Err(e) => Err(meta_from_io(e)),
         }
     }
 
@@ -1335,7 +1425,7 @@ impl MetaProvider for RemoteMeta {
                 }
             }
             Ok((c, _, _)) => Err(err_from_code(c)),
-            Err(_) => Err(MetaError::Db("remote meta transport".to_string())),
+            Err(e) => Err(meta_from_io(e)),
         }
     }
 
@@ -1391,7 +1481,7 @@ impl MetaProvider for RemoteMeta {
             Ok((0, 0, _)) => Ok(None),
             Ok((0, 1, data)) => Ok(decode_lock_conflict(&data)),
             Ok((c, _, _)) => Err(err_from_code(c)),
-            Err(_) => Err(MetaError::Db("remote meta transport".to_string())),
+            Err(e) => Err(meta_from_io(e)),
         }
     }
 
@@ -1642,6 +1732,180 @@ mod shard_follow_tests {
         assert_eq!(b_hits.load(Ordering::SeqCst), 1);
         assert_eq!(rm.active.load(Ordering::Relaxed), 1, "promoted to b");
         assert_eq!(*rm.shome.lock(), None, "an empty redirect was learned");
+    }
+
+    /// A stand-in that answers the WHOLE session rather than just the
+    /// handshake: `M_OPEN` gets an accepted ack, every other op gets whatever
+    /// `op` returns. That is the shape a placement sweep produces — the socket
+    /// opens fine, then the instance that has just LOST the view refuses the op
+    /// and names the new home — and following it is [`RemoteMeta::round_trip`]'s
+    /// job, not the connect walk's. `ops` counts non-handshake requests, so a
+    /// test can tell "the op was replayed once" from "the op was replayed
+    /// forever".
+    fn op_stub(
+        opens: Arc<AtomicUsize>,
+        ops: Arc<AtomicUsize>,
+        op: impl Fn(u8) -> (i32, Vec<u8>) + Send + Sync + 'static,
+    ) -> (SocketAddr, thread::JoinHandle<()>) {
+        let lst = TcpListener::bind("127.0.0.1:0").expect("bind op stub");
+        let addr = lst.local_addr().expect("op stub addr");
+        let op = Arc::new(op);
+        let h = thread::spawn(move || {
+            for conn in lst.incoming() {
+                let Ok(mut s) = conn else { continue };
+                let (opens, ops, op) = (opens.clone(), ops.clone(), op.clone());
+                thread::spawn(move || {
+                    while let Ok((code, _)) = proto::recv_request(&mut s) {
+                        if code == M_OPEN {
+                            opens.fetch_add(1, Ordering::SeqCst);
+                            if proto::send_response(&mut s, 0, 0, &ok_ack("v")).is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        ops.fetch_add(1, Ordering::SeqCst);
+                        let (status, data) = op(code);
+                        if proto::send_response(&mut s, status, 0, &data).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        (addr, h)
+    }
+
+    /// An [`op_stub`] with its own address and counters attached, so a test can
+    /// read as what it is: the entry that redirects to the middle that
+    /// redirects to the home.
+    struct Stub {
+        addr: SocketAddr,
+        opens: Arc<AtomicUsize>,
+        ops: Arc<AtomicUsize>,
+        // The listener thread holds the port for as long as the test does.
+        _h: thread::JoinHandle<()>,
+    }
+
+    fn stub_node(answer: impl Fn(u8) -> (i32, Vec<u8>) + Send + Sync + 'static) -> Stub {
+        let opens = Arc::new(AtomicUsize::new(0));
+        let ops = Arc::new(AtomicUsize::new(0));
+        let (addr, _h) = op_stub(opens.clone(), ops.clone(), answer);
+        Stub { addr, opens, ops, _h }
+    }
+
+    #[test]
+    fn an_op_redirected_twice_is_replayed_where_it_settles() {
+        // A view can move MORE THAN ONCE while an op is in flight: `view move`,
+        // then the operator changes their mind before this mount's next call.
+        // The second `E_SHARD` is the same signal as the first, so taking one
+        // hop and handing the caller a status nothing mapped turned a merely
+        // settling ring into a fake metadata fault.
+        let home = stub_node(|_| (0, Vec::new()));
+        let expect_home = home.addr.to_string();
+        let home_addr = home.addr.to_string();
+        let mid = stub_node(move |_| (E_SHARD, home_addr.as_bytes().to_vec()));
+        let mid_addr = mid.addr.to_string();
+        let entry = stub_node(move |_| (E_SHARD, mid_addr.as_bytes().to_vec()));
+
+        let rm = RemoteMeta::new_with_creds(&entry.addr.to_string(), "v", "", 0, "")
+            .expect("the entry serves the handshake");
+        rm.call_status(M_GETATTR, b"x")
+            .expect("followed to the instance that settles");
+
+        // The op ran exactly once at each hop and never bounced back: replaying
+        // a REFUSED op is not a second write.
+        assert_eq!(
+            [
+                entry.ops.load(Ordering::SeqCst),
+                mid.ops.load(Ordering::SeqCst),
+                home.ops.load(Ordering::SeqCst)
+            ],
+            [1, 1, 1]
+        );
+        // Every hop is a real re-open. A socket that belonged to the instance
+        // which hung up must never come back out of the pool, or the replay
+        // would go to the node that just refused it.
+        assert_eq!(
+            [
+                entry.opens.load(Ordering::SeqCst),
+                mid.opens.load(Ordering::SeqCst),
+                home.opens.load(Ordering::SeqCst)
+            ],
+            [1, 1, 1]
+        );
+        // The LAST answer is what the mount remembers, so the next op costs one
+        // dial instead of re-walking the chain.
+        assert_eq!(*rm.shome.lock(), Some(expect_home));
+    }
+
+    #[test]
+    fn an_op_bouncing_between_two_rows_stops_with_a_named_cause() {
+        // Two instances that each send the op back to the OTHER one are the
+        // placement table contradicting itself. The follow must stop, and name
+        // what disagreed: that bound is what makes this a diagnosable refusal
+        // instead of a mount spinning between two hosts.
+        //
+        // Hand-rolled rather than built from `stub_node` because each side has
+        // to carry the other's address, which only exists once both are bound.
+        let ops = Arc::new(AtomicUsize::new(0));
+        let lx = TcpListener::bind("127.0.0.1:0").expect("bind x");
+        let ly = TcpListener::bind("127.0.0.1:0").expect("bind y");
+        let (x, y) = (lx.local_addr().unwrap(), ly.local_addr().unwrap());
+        let (x_addr, y_addr) = (x.to_string(), y.to_string());
+        for (lst, peer) in [(lx, y_addr.clone()), (ly, x_addr.clone())] {
+            let (ops, peer) = (ops.clone(), peer);
+            thread::spawn(move || {
+                for conn in lst.incoming() {
+                    let Ok(mut s) = conn else { continue };
+                    let (ops, peer) = (ops.clone(), peer.clone());
+                    thread::spawn(move || {
+                        while let Ok((code, _)) = proto::recv_request(&mut s) {
+                            // The handshake always succeeds: this test is
+                            // about the MID-OP redirect, so the connect walk
+                            // must not be the thing that stops.
+                            let rep = if code == M_OPEN {
+                                (0, ok_ack("v"))
+                            } else {
+                                ops.fetch_add(1, Ordering::SeqCst);
+                                (E_SHARD, peer.as_bytes().to_vec())
+                            };
+                            if proto::send_response(&mut s, rep.0, 0, &rep.1).is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+        }
+
+        let rm = RemoteMeta::new_with_creds(&x_addr, "v", "", 0, "").expect("opens at x");
+        // The verdict must arrive as a ROUTING fault. Reporting it as the
+        // generic metadata/db error is the defect this covers: an operator
+        // following that sentence goes looking at the tree, not at the
+        // placement table, and finds nothing wrong.
+        let why = match rm.call_status(M_GETATTR, b"x") {
+            Ok(()) => panic!("two rows pointing at each other cannot serve an op"),
+            Err(MetaError::Shard(why)) => why,
+            Err(other) => panic!("misreported as {other:?}"),
+        };
+        assert!(why.contains("disagree"), "unhelpful error: {why}");
+        assert!(why.contains("placement"), "unhelpful error: {why}");
+        assert!(
+            why.contains(&SHARD_FOLLOW_MAX.to_string()),
+            "the error does not say how far it walked: {why}"
+        );
+        // …and the mount-visible wording says the same thing (`EIO` at the
+        // FUSE reply, `ERROR_BAD_NETPATH` on the Windows client).
+        assert!(
+            MetaError::Shard(why.clone())
+                .to_string()
+                .starts_with("shard routing refused"),
+            "unhelpful display"
+        );
+        // Bounded: the first attempt plus [`SHARD_FOLLOW_MAX`] replays, not one
+        // per retry tick — and the pool was thrown away with them, so the next
+        // op starts a fresh budget rather than resuming a loop.
+        assert_eq!(ops.load(Ordering::SeqCst), SHARD_FOLLOW_MAX + 1);
     }
 
     /// A stand-in that speaks the WHOLE event-stream handshake: `M_OPEN` with
