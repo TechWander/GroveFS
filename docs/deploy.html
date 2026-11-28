@@ -949,7 +949,7 @@ sudo -u postgres psql -d grovefs -c "SELECT name, kind FROM grovefs_control.view
 <p>PG 档与 SQLite 档在视图家族上的分别只有一条：就地扫本机 <code>blocks/</code> 的离线 <code>gc</code> 在 PG 档<b>拒绝</b>，改走 2.3.7 的治理面形态。顶层 <code>grovefs import</code>（目录零拷贝登记）两档都可用——PG 下节点写进该视图的 schema、字节仍硬链进执行机的 <code>--data-dir/blocks/</code>，所以它跑在持数据根的 node1 上而不是客户机上；字节不在本机时才改走挂载点灌入（挂上视图后直接 <code>cp/rsync</code>）。treedb 档的树在引擎里、定义在本地：<code>define</code>/<code>alias</code>/<code>fork</code> 的形状不变（fork 的新树由引擎侧复制），<code>graft</code> 则在该档被拒——它按本地 SQLite 找源树，命令形状相同而能力面逐动词不同（见 docs.html §14.9.2）。</p>
 
 <h4 id="s23-scale">2.3.6 多实例扩容与视图搬家（连接数封顶时）</h4>
-<p>每个活跃视图占 PG 档 12 条连接（8 写 + 4 读，<code>--engine-idle-secs 300</code> 默认回收空闲视图的连接，容量按「最近活跃视图数」计）。当活跃集仍要封顶 <code>max_connections</code> 时，扩容答案是<b>多实例注册表 + 视图放置</b>：把不同视图放到不同 PG 实例（一个视图的树永远只落在一个实例上），容量随实例数线性增长。示例：加入 <b>db2</b>（10.0.0.11，同规格 PG，max_connections=200），把热点视图 team1 挪过去。</p>
+<p>每个活跃视图占 PG 档 12 条连接（8 写 + 4 读，<code>--engine-idle-secs 300</code> 默认回收空闲视图的连接，容量按「最近活跃视图数」计）。除此之外每进程只占一把控制面池：一个 <code>meta-server</code> 对控制库常驻 <b>1</b> 条连接（视图定义 / 密钥 / 网页账号三家共用），分片放置按需另开至多 2 条（仅在真有挂载时）。当活跃集仍要封顶 <code>max_connections</code> 时，扩容答案是<b>多实例注册表 + 视图放置</b>：把不同视图放到不同 PG 实例（一个视图的树永远只落在一个实例上），容量随实例数线性增长。示例：加入 <b>db2</b>（10.0.0.11，同规格 PG，max_connections=200），把热点视图 team1 挪过去。</p>
 <pre><code><span class="cmt"># ① db2 装好库与账号（同 2.3.1）；② node1 上写实例注册表（每行 名字 = postgres://…，# 注释）</span>
 sudo sh -c 'cat > /etc/grovefs/instances.conf' <<'EOF'
 <span class="cmt"># 第一条 = 控制面（放置表/key/定义都落在这里）</span>

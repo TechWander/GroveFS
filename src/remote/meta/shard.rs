@@ -59,17 +59,27 @@ const SHARD_DB_TIMEOUT: Duration = Duration::from_secs(2);
 /// for the measurement that set this number.
 const SHARD_POOL_MAX: usize = 2;
 
-// TODO(severity=Medium): this is the control plane's THIRD pool in one
-// `meta-server` process (keys and definitions each hold a `control::PgPool` for
-// the same URI). Sharing them — one `Arc<PgPool>` per control-plane URI per
-// process, with each consumer still running its own idempotent DDL through it —
-// would make a process's `max_connections` footprint independent of how many
-// control-plane tables it uses, and would let the shard reads inherit the
-// `GROVEFS_PG_*` knobs the other two ignore. It needs `Backend::Pg(PgPool)` in
-// `apikeys`/`webauth` to become `Backend::Pg(Arc<PgPool>)` and a process-wide
-// registry keyed on the expanded URI, so it is an architectural change rather
-// than a fix on this path; the warm-floor change in `control::PgPool::open` is
-// what keeps the ceiling reachable meanwhile.
+// MEDIUM — the control plane's pools in one `meta-server` process (resolved
+// 2026-11-28, partly by merging and partly by NOT merging). Measured here on a
+// sharded instance with no mount, counting this database's `pg_stat_activity`
+// rows: THREE warm sessions, one per control-plane store (definitions, keys,
+// web-auth) opened against the SAME URI, because `control::PgPool::open` did
+// its own eager connect. Those three shapes are identical — plain session, no
+// per-session `SET`, idempotent `IF NOT EXISTS` DDL under the same advisory
+// lock — so they now take one `Arc<PgPool>` from `crate::control::shared`,
+// keyed on the EXPANDED URI: idle warm sessions 3 → 1, and the post-burst
+// retention ceiling 3 × CONTROL_POOL_SIZE (12) → 1 × 4.
+//
+// This pool is deliberately NOT in that registry. Its sessions are shaped at
+// connect with `statement_timeout` and `idle_in_transaction_session_timeout` of
+// [`SHARD_DB_TIMEOUT`] so a wedged control plane cannot park a meta worker
+// (ADR-0005, applied to the shard path). Merging it in would either put that 2 s
+// ceiling under credential checks, audit inserts and DDL, or need a `RESET` per
+// use — more round trips than the sharing saves. Two shapes, one contract each:
+// the four-way `max_connections` footprint of a PG meta-server is now
+// 1 (control plane) + at most SHARD_POOL_MAX (only once a mount actually arrives
+// — before it, this pool is empty and holds nothing, which is what the same
+// measurement showed).
 
 /// Why a control-plane dial really failed, in one line.
 ///

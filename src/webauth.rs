@@ -314,7 +314,9 @@ pub struct LoginOk {
 /// both, dialect differences confined to the SQL strings.
 enum Backend {
     Sqlite(parking_lot::Mutex<Connection>),
-    Pg(PgPool),
+    /// The process-wide control-plane pool (see [`crate::control::shared`]),
+    /// shared with the credential and definition stores.
+    Pg(std::sync::Arc<PgPool>),
 }
 
 const ACCOUNTS_DDL_SQLITE: &str = "CREATE TABLE IF NOT EXISTS web_accounts (
@@ -383,10 +385,11 @@ impl WebAuthStore {
     }
 
     /// Open the PostgreSQL control-plane tables. The DDL goes through
-    /// [`PgPool::open`], which serializes `CREATE` with the shared advisory
-    /// lock — the same catalog race that the keys/definitions tables guard.
+    /// [`crate::control::shared`], which serializes `CREATE` with the shared
+    /// advisory lock — the same catalog race that the keys/definitions tables
+    /// guard — and hands it the process's ONE pool for this database.
     pub fn open_pg(uri: &str) -> Result<Self, String> {
-        let pool = PgPool::open(uri, &[ACCOUNTS_DDL_PG, GRANTS_DDL_PG])?;
+        let pool = crate::control::shared(uri, &[ACCOUNTS_DDL_PG, GRANTS_DDL_PG])?;
         Ok(Self {
             backend: Backend::Pg(pool),
         })

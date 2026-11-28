@@ -548,7 +548,10 @@ const CALLS_TS_INDEX_PG: &str =
 /// Where this credential store physically lives.
 enum Backend {
     Sqlite(parking_lot::Mutex<Connection>),
-    Pg(PgPool),
+    /// The process-wide control-plane pool (see [`crate::control::shared`]):
+    /// an `Arc` because the definitions, credential and web-account stores all
+    /// hand their DDL and traffic through ONE set of sessions per database.
+    Pg(std::sync::Arc<PgPool>),
 }
 
 /// Environment override for the wrapping material: 64 hex characters, read once
@@ -798,7 +801,7 @@ impl ApiKeyStore {
 
     /// Open the PostgreSQL control-plane store: the same two tables in the
     /// shared `grovefs_control` schema (idempotent DDL, cross-process safe —
-    /// see [`PgPool::open`]). A PG deployment keeps ONE credential/audit
+    /// see [`crate::control::shared`]). A PG deployment keeps ONE credential/audit
     /// system of record: every meta-server, MCP server and CLI aimed at the
     /// same URI authenticates against the same rows, and a revoke reaches all
     /// of them within the re-check window.
@@ -814,10 +817,12 @@ impl ApiKeyStore {
     /// says so). Backend isolation: a PG run reads no SQLite-layout path.
     pub fn open_pg(uri: &str, base: &Path) -> Result<Self, String> {
         // PG's ALTERs are idempotent, so the DDL and the migrations go in one
-        // ordered batch (see [`PgPool::open`]).
+        // ordered batch (see [`crate::control::shared`]). The pool itself is the
+        // process's one pool for this control database, shared with the
+        // definitions and web-account stores — see the registry's doc.
         let mut ddl: Vec<&str> = vec![KEYS_DDL_PG, CALLS_DDL_PG, CALLS_TS_INDEX_PG];
         ddl.extend(KEY_MIGRATIONS.iter().map(|(_, _, pg)| *pg));
-        let pool = PgPool::open(uri, &ddl)?;
+        let pool = crate::control::shared(uri, &ddl)?;
         // `base` is passed only for the signature; under SharedTable
         // [`load_wrap`] resolves the env and never touches it — a PG run reads
         // no SQLite-layout path (see the method's doc).

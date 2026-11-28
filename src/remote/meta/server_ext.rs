@@ -2241,6 +2241,26 @@ impl SweepStats {
     }
 }
 
+/// How many frame dispatches this process's isolation layer caught a panic in.
+///
+/// `null` on the shapes that have no epoll plane at all (non-Linux, or a build
+/// without `native`) — "this build cannot dispatch a frame that way" is a
+/// different answer from "the plane never panicked", and an operator reading
+/// `0` on a box that runs the thread plane would be lied to. Under
+/// `GROVEFS_META_THREADS=1` the thread plane serves instead, and a panic there
+/// already costs exactly one connection (it kills that thread), which is the
+/// same fact `framePanics` reports for the epoll shape.
+fn frame_panics_report() -> Option<u64> {
+    #[cfg(all(feature = "native", target_os = "linux"))]
+    {
+        Some(super::epoll::frame_panics())
+    }
+    #[cfg(not(all(feature = "native", target_os = "linux")))]
+    {
+        None
+    }
+}
+
 /// How many `view → instance` pairs one sweep line may name. Past that the
 /// count is the fact and the names are noise, so the tail collapses.
 const EVICT_LINE_PAIRS: usize = 8;
@@ -3703,6 +3723,12 @@ fn control_dispatch(
                 "liveSessions": live,
                 "residentEngines": engines,
                 "residentViews": views,
+                // Did a handler ever blow up inside a worker thread, and did the
+                // plane keep serving? Without this the only way to learn that a
+                // panic was swallowed is to have been watching stderr when it
+                // happened; the counter and the one-line-per-panic log entry
+                // name the same events, so each proves the other.
+                "framePanics": frame_panics_report(),
                 // What the audit trail costs this deployment, as configured:
                 // `null` means rows are kept until an operator purges them by
                 // hand, which is the fact the console's audit page should say
@@ -6328,9 +6354,9 @@ fn physical_tree_list(rt: &MetaRuntime) -> Result<Vec<String>, String> {
 
 /// Where a store spec's CONTROL plane actually is, with a managed registry
 /// (`<base>/instances.conf`, which `--meta-store postgres://…` is adopted into)
-/// resolved to its control instance's URI. `PgPool::open` applies the same
-/// expansion; this is the read-only form, and a spec that cannot be read right
-/// now falls back to its own text rather than inventing an answer.
+/// resolved to its control instance's URI. `crate::control::shared` applies the
+/// same expansion; this is the read-only form, and a spec that cannot be read
+/// right now falls back to its own text rather than inventing an answer.
 fn resolved_control_uri(spec: Option<&str>) -> Option<String> {
     let raw = spec?;
     Some(
@@ -9096,6 +9122,21 @@ fn run_event_stream(
     }
 }
 
+/// [`ha_tests::test_rt`] plus a clone of its stop handle, for the sibling module
+/// that has to be able to bring a plane down.
+///
+/// `MetaRuntime::stop` is private to this module, so the clone can only be handed
+/// out from here; naming the runtime builder itself (`ha_tests` is private) would
+/// not reach [`super::epoll`] anyway. The shape is the one the in-module tests
+/// use — empty tree dir, SQLite store, no HA, eviction off — so a plane test does
+/// not grow a second copy of it that can drift.
+#[cfg(test)]
+pub(super) fn test_rt_stoppable(base: &std::path::Path) -> (MetaRuntime, ServerStop) {
+    let rt = ha_tests::test_rt(base, None, None, None, false);
+    let stop = rt.stop.clone();
+    (rt, stop)
+}
+
 #[cfg(test)]
 mod ha_tests {
     use super::*;
@@ -9499,7 +9540,12 @@ mod ha_tests {
         let dead = TcpListener::bind("127.0.0.1:0").unwrap();
         addrs.push(dead.local_addr().unwrap().to_string());
 
-        let timeout = Duration::from_millis(1500);
+        // The straggler's own read timeout is the thing this round must beat, so
+        // it is set WIDE and the assertion is written against it rather than
+        // against a wall-clock constant: two local witnesses grant in milliseconds
+        // even on a box running the whole suite at once, while a round that waited
+        // for the dead one would spend the full budget.
+        let timeout = Duration::from_secs(4);
         let started = Instant::now();
         let res = witness_quorum(&addrs, "", 5, WITNESS_LEASE, timeout);
         let elapsed = started.elapsed();
@@ -9509,7 +9555,7 @@ mod ha_tests {
             "two granting arbiters are a quorum of three: {res:?}"
         );
         assert!(
-            elapsed < Duration::from_millis(900),
+            elapsed < timeout / 2,
             "the round must end when the majority answers, not when the straggler gives \
              up: {elapsed:?} of a {timeout:?} budget"
         );
@@ -9529,6 +9575,11 @@ mod ha_tests {
         let waddr = listener.local_addr().unwrap().to_string();
         let accepts = Arc::new(AtomicUsize::new(0));
         let counted = accepts.clone();
+        // How long the mock witness holds one proof open. The burst assertion is
+        // written as a multiple of THIS, not as a wall clock: one shared round trip
+        // costs about `hold`, eight sequential ones cost about `hold` × 8, and the
+        // distance between those two shapes is what has to survive a loaded machine.
+        let hold = Duration::from_millis(400);
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { continue };
@@ -9544,7 +9595,7 @@ mod ha_tests {
                         if op == proto::OP_FENCE {
                             // Hold the proof open long enough that the whole burst
                             // arrives while it is still in flight.
-                            thread::sleep(Duration::from_millis(400));
+                            thread::sleep(hold);
                             let mut i = 0usize;
                             let _sent = proto::read_u64(&body, &mut i).unwrap_or(0);
                             // prev = 0 < our epoch: this claim ADVANCES the token.
@@ -9596,8 +9647,10 @@ mod ha_tests {
         );
         assert_eq!(ha.role(), Role::Primary);
         assert!(
-            elapsed < Duration::from_millis(1500),
-            "the burst was served off one proof, not eight: {elapsed:?}"
+            elapsed < hold * 4 + Duration::from_secs(1),
+            "the burst was served off one proof, not eight: {elapsed:?} against a {hold:?} hold; \
+             eight of them in series would cost {:?}",
+            hold * 8
         );
     }
 
@@ -9621,6 +9674,23 @@ mod ha_tests {
             true,
         ));
         // Pretend a previous snapshot is still being shipped.
+        //
+        // First, though: measure what the push path spends BEFORE it touches the
+        // slot — opening the view's store and `VACUUM INTO` a snapshot is real
+        // disk work, and a constant of the form `slot wait + 700 ms` was this
+        // case's flake source (2 of 3 runs of the whole `--lib` suite failed it
+        // while 5 of 5 isolated runs passed, 2026-11-28). The thing being asserted
+        // is that the slot wait is BOUNDED, so the budget is written on top of the
+        // measured prelude instead of on a guess about the machine.
+        let base = rt.physical_base("v1");
+        let prelude_at = Instant::now();
+        let prelude = store_for(&rt, &base).and_then(|s| s.backup_to_bytes().map_err(io::Error::other));
+        let prelude_cost = prelude_at.elapsed();
+        assert!(
+            prelude.is_ok(),
+            "the snapshot step the push stands behind must work: {:?}",
+            prelude.err()
+        );
         let busy = rt.standby_push.lock();
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         let rt2 = rt.clone();
@@ -9628,10 +9698,13 @@ mod ha_tests {
             push_snapshot_now(&rt2, "v1");
             let _ = tx.send(());
         });
+        let budget = SYNC_PUSH_SLOT_WAIT + prelude_cost * 2 + Duration::from_secs(3);
         assert!(
-            rx.recv_timeout(SYNC_PUSH_SLOT_WAIT + Duration::from_millis(700))
-                .is_ok(),
-            "a busy push slot must degrade, not queue until the holder releases it"
+            rx.recv_timeout(budget).is_ok(),
+            "a busy push slot must degrade, not queue until the holder releases it \
+             (budget {budget:?} = slot {SYNC_PUSH_SLOT_WAIT:?} + twice the measured \
+             prelude {prelude_cost:?} + 3 s of scheduling; the holder is never released \
+             before this line, so an unbounded wait here is a deadlock, not a slow box)"
         );
         assert_eq!(ha.role(), Role::Primary, "a degrade is not a demotion");
         drop(busy);
@@ -9674,16 +9747,18 @@ mod ha_tests {
         let refused = started.elapsed();
         assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e}");
         assert!(
-            refused < Duration::from_millis(50),
-            "over the cap must not wait: {refused:?}"
+            refused < DNS_RESOLVE_BUDGET,
+            "over the cap must not wait anything like a budget's worth: {refused:?}"
         );
         drop(seats);
         // (4) With a seat free the wait is bounded by the budget, whatever the
-        // resolver decides to do.
+        // resolver decides to do. The slack is a SCHEDULING constant, not a guess
+        // about the resolver: the bounded path hands the caller back at its deadline
+        // from another thread, and a loaded box can be a moment late delivering it.
         let started = Instant::now();
         let _ = resolve_bounded("stalled.invalid:50110");
         assert!(
-            started.elapsed() <= DNS_RESOLVE_BUDGET + Duration::from_millis(300),
+            started.elapsed() <= DNS_RESOLVE_BUDGET + Duration::from_secs(1),
             "a name cannot hold the caller past its budget: {:?}",
             started.elapsed()
         );

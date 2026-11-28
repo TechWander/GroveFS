@@ -21,6 +21,96 @@
 //! reconnect on a server-side close.
 
 use postgres::{Client, NoTls};
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
+
+/// The ONE control-plane pool this process uses per database, keyed by the
+/// EXPANDED control URI (see [`crate::pg_store::control_store`]).
+///
+/// Why a registry exists: one `meta-server` with a PG control plane opens three
+/// control-plane stores against the SAME database — the definition store
+/// (`grovefs_control.view_defs`), the credential/audit store
+/// (`api_keys`/`mcp_calls`) and the web-account store (`web_accounts`/`web_grants`) —
+/// and each used to build its own pool with its own eager connect. Measured on
+/// this box (2026-11-28, one sharded instance, no mount, backends counted by
+/// `pg_stat_activity` filtered to a private database): **3 warm sessions** where
+/// one database was being talked to. Retention then compounded it: each handle
+/// kept up to [`CONTROL_POOL_SIZE`] after a burst, so a process that had served
+/// governance traffic on all three tables sat on up to 12 of them.
+///
+/// With the registry in place the SAME probe on the SAME instance reads **1**
+/// (`tests/control_pool.rs` pins the number against a live PostgreSQL, three
+/// stores and one fourth consumer included).
+///
+/// What sharing is ALLOWED to do is exactly what these three consumers have in
+/// common: a plain session, no per-session `SET`, and idempotent
+/// `CREATE … IF NOT EXISTS` DDL serialized by [`DDL_LOCK_CLASS`]. Each consumer
+/// still runs its own DDL through the shared handle (that is why [`shared`] takes
+/// `ddl` and does not just cache-and-return), so opening order stays irrelevant.
+///
+/// What is deliberately NOT in here is the shard path's pool
+/// (`remote::meta::shard`): its sessions are shaped at connect with
+/// `statement_timeout` and `idle_in_transaction_session_timeout` of 2 s
+/// (`SHARD_DB_TIMEOUT` there) so a wedged control plane cannot park a meta
+/// worker (ADR-0005). Handing those sessions to the credential store would put a
+/// 2 s ceiling under audit inserts and DDL, and taking them off would need a
+/// `RESET` per use — more round trips than the sharing saves. Two shapes, one
+/// contract each, is the honest result; the numbers above are why the other three
+/// collapsed into one.
+static SHARED_POOLS: OnceLock<parking_lot::Mutex<HashMap<String, Arc<PgPool>>>> =
+    OnceLock::new();
+
+fn registry() -> &'static parking_lot::Mutex<HashMap<String, Arc<PgPool>>> {
+    SHARED_POOLS.get_or_init(Default::default)
+}
+
+/// Hand out the process's single pool for `uri`'s control database, after making
+/// sure the caller's tables exist in it.
+///
+/// This is the ONLY entry point for a control-plane pool: the eager-connect-
+/// plus-DDL shape used to live in a public `PgPool::open`, and three stores
+/// calling it against one URI is how one process came to sit on three warm
+/// sessions (see [`SHARED_POOLS`]).
+///
+/// `uri` may be any spelling the deployment uses (a bare instance, a sharded
+/// `uri,uri` spec, a `file:` registry); it is normalized through
+/// [`crate::pg_store::control_store`] first, which is also what makes two
+/// differently-spelled consumers land on one pool.
+pub fn shared(uri: &str, ddl: &[&str]) -> Result<Arc<PgPool>, String> {
+    let expanded = crate::pg_store::control_store(uri)?;
+    let hot = registry().lock().get(&expanded).cloned();
+    let pool = match hot {
+        Some(p) => p,
+        None => {
+            // The connect happens OUTSIDE the registry lock: a slow or unreachable
+            // control plane must not block another database's open behind it. Two
+            // consumers racing a cold URI both connect; the one that loses the
+            // insert is dropped, and its single warm session closes with it — a
+            // transient extra connect at startup, never a second live pool.
+            let fresh = Arc::new(PgPool::connect_only(&expanded)?);
+            let mut reg = registry().lock();
+            match reg.get(&expanded).cloned() {
+                Some(winner) => winner,
+                None => {
+                    reg.insert(expanded.clone(), Arc::clone(&fresh));
+                    fresh
+                }
+            }
+        }
+    };
+    if !ddl.is_empty() {
+        pool.init_schema(ddl)?;
+    }
+    Ok(pool)
+}
+
+/// How many control-plane databases this process holds pools for. Test-only
+/// evidence for [`shared`]: it must not grow when a fourth store opens the same
+/// URI.
+#[cfg(test)]
+fn shared_pool_count() -> usize {
+    registry().lock().len()
+}
 
 /// The single schema every control-plane table lives in.
 pub const CONTROL_SCHEMA: &str = "grovefs_control";
@@ -30,19 +120,18 @@ pub const CALLS_TABLE: &str = "grovefs_control.mcp_calls";
 /// The named-view definition table (see [`crate::mcp::ControlStore`]).
 pub const DEFS_TABLE: &str = "grovefs_control.view_defs";
 
-/// Connections RETAINED per control-plane store handle. Keys are checked on every
-/// mount handshake and once per second per live session; definitions are read
-/// on a bounded hot-reload probe — a handful of pooled sessions covers a busy
-/// control plane without meaningfully touching PG's `max_connections`.
+/// Connections RETAINED per control-plane POOL — which, since [`SHARED_POOLS`],
+/// means per PROCESS per control database, because the definition, credential
+/// and web-account stores all hand their traffic through the one handle.
 ///
-/// This is a RETENTION bound, not a pre-fill: a handle goes to PostgreSQL with
-/// one session (see [`PgPool::open`]) and grows to this on demand. The floor
-/// matters because a deployment's connection budget is shared by every store
-/// handle in every process — one meta-server opens a key store, a definitions
-/// store and a web-account store against the SAME control plane, and a CLI arm
-/// opens two more. Pre-filling four each meant a process held 8–12 backends for
-/// traffic that arrives on mounts and revokes, which is what a
-/// `53300 remaining connection slots are reserved…` refusal is actually about.
+/// This is a RETENTION bound, not a pre-fill: the pool goes to PostgreSQL with
+/// one session (see [`PgPool::connect_only`]) and grows to this only under a
+/// burst, each returned session kept instead of closed. The number is worth
+/// bounding because the same `max_connections` budget also pays the per-view
+/// tree pools of [`crate::pg_store`] (write floor + read floor per active view)
+/// — which is what a `53300 remaining connection slots are reserved…` refusal
+/// is actually about, and why an idle control plane must cost one session and
+/// not one per table it happens to use.
 pub(crate) const CONTROL_POOL_SIZE: usize = 4;
 
 /// Global serializer for control-schema DDL. Two `CREATE SCHEMA IF NOT EXISTS`
@@ -92,40 +181,31 @@ pub struct PgPool {
 }
 
 impl PgPool {
-    /// Build a pool for `uri` and make sure the control schema and its tables
-    /// exist (idempotent, cross-process safe via an advisory lock). The DDL is
-    /// passed in by the consuming module because keys and definitions live in
-    /// ONE schema owned by two stores; each store hands the statements it
-    /// needs at open time.
-    pub fn open(uri: &str, ddl: &[&str]) -> Result<Self, String> {
-        // A sharded store spec (`uri,uri,...` or a `file:` instance registry)
-        // names several databases for the view trees; the control schema is
-        // ONE authoritative record and stays on the FIRST instance (see
-        // `pg_store::control_store`). The expansion is fallible for `file:`
-        // specs — an unreadable registry fails the open, loud.
-        let uri = crate::pg_store::control_store(uri)?;
+    /// One eager connect against an already-expanded control URI, WITHOUT the
+    /// DDL step. Not public on purpose: the only way to hold a control-plane
+    /// pool is [`shared`], so that a process's sessions per database cannot
+    /// depend on how many stores it happens to use.
+    fn connect_only(expanded: &str) -> Result<Self, String> {
         // ONE warm session, not a poolful: opening a store must still fail fast
         // on an unreachable or badly-credentialed control plane (that is what
-        // the eager first connect is for), but an idle handle must not hold four
-        // backends of a shared `max_connections`. [`PgPool::checkout`] opens the
-        // rest on demand and [`PgPool::requeue`] keeps up to
-        // [`CONTROL_POOL_SIZE`] afterwards, so a busy plane converges on the old
-        // shape and a quiet one costs one.
+        // the eager first connect is for), but an idle process must not hold one
+        // backend per control TABLE of a shared `max_connections`.
+        // [`PgPool::checkout`] opens the rest on demand and [`PgPool::requeue`]
+        // keeps up to [`CONTROL_POOL_SIZE`] afterwards, so a busy plane still
+        // converges on a bounded shape and a quiet one costs one session per
+        // database, however many stores use it.
         let mut pool = Vec::new();
-        match Client::connect(&uri, NoTls) {
-            Ok(c) => pool.push(c),
-            // A total outage is not survived here either way: `init_schema`
-            // below checks out (and so reconnects) and reports the real error.
-            Err(_) => {}
+        // A total outage is not survived here either way: the caller's DDL step
+        // in [`shared`] checks out (and so reconnects) and reports the real
+        // error, which arrives with the server's reason instead of as an empty
+        // pool.
+        if let Ok(c) = Client::connect(expanded, NoTls) {
+            pool.push(c);
         }
-        let this = Self {
-            uri: uri.to_string(),
+        Ok(Self {
+            uri: expanded.to_string(),
             pool: parking_lot::Mutex::new(pool),
-        };
-        if !ddl.is_empty() {
-            this.init_schema(ddl)?;
-        }
-        Ok(this)
+        })
     }
 
     /// One connection: prefer a warm pooled client (skipping any closed by an
@@ -206,7 +286,7 @@ impl PgPool {
     /// Create the control schema and the tables named by `ddl`, serialized
     /// across processes with an advisory lock so two simultaneous
     /// initializers cannot hit PG's concurrent-`CREATE` catalog deadlock.
-    fn init_schema(&self, ddl: &[&str]) -> Result<(), String> {
+    pub(crate) fn init_schema(&self, ddl: &[&str]) -> Result<(), String> {
         let mut c = self.checkout()?;
         let lock = format!("SELECT pg_advisory_lock({DDL_LOCK_CLASS})");
         c.batch_execute(&lock)
@@ -249,6 +329,35 @@ mod tests {
             err.contains("127.0.0.1:1/grovefs"),
             "the error stopped naming the database it failed on: {err}"
         );
+    }
+
+    /// What the registry is FOR, pinned without a PostgreSQL to talk to: one
+    /// control database yields one pool, however many stores ask for it and
+    /// however they spell the spec. Uses a refused port on purpose —
+    /// [`PgPool::connect_only`] keeps the fail-fast error for the DDL step, so a
+    /// dead URI still registers a handle, and the point here is that the SECOND
+    /// caller reuses it instead of opening another warm session.
+    #[test]
+    fn one_control_database_gets_one_pool_whatever_the_caller_asks_for() {
+        let dead = format!("postgres://grove:x@127.0.0.1:1/grovefs_reg_{}", std::process::id());
+        let before = shared_pool_count();
+        let first = shared(&dead, &[]).expect("a dead URI still hands out a handle");
+        // A different spelling of the SAME database (a shard spec whose control
+        // instance is this one) must land on the same pool, not a second.
+        let spec = format!("{dead},{dead}");
+        let second = shared(&spec, &[]).expect("a spec still hands out a handle");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "two stores asking for one control database got two pools"
+        );
+        assert_eq!(
+            shared_pool_count(),
+            before + 1,
+            "the registry grew for a URI it already had"
+        );
+        // And the pool really is bound to the EXPANDED URI, so error messages
+        // name one canonical database whatever the deployment configured.
+        assert_eq!(first.uri(), dead);
     }
 
     #[test]

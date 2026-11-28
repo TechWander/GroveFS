@@ -712,9 +712,12 @@ const DEFS_DDL: &str = "CREATE TABLE IF NOT EXISTS grovefs_control.view_defs (
 
 impl PgControlStore {
     pub fn new(uri: &str) -> Result<Self, String> {
-        let pool = PgPool::open(uri, &[DEFS_DDL])?;
+        // The process's ONE pool for the control database, shared with the
+        // credential and web-account stores (see [`crate::control::shared`]);
+        // this store's DDL still runs on every open, so order stays irrelevant.
+        let pool = crate::control::shared(uri, &[DEFS_DDL])?;
         Ok(Self {
-            pool: Arc::new(pool),
+            pool,
             spec: uri.to_string(),
             shards: parking_lot::Mutex::new(HashMap::new()),
         })
@@ -722,7 +725,9 @@ impl PgControlStore {
 
     /// A pool bound to the instance that owns `view`'s tree. The control
     /// instance returns the shared pool; any other instance is opened on demand
-    /// WITHOUT the control DDL (that schema exists once, on instance one).
+    /// WITHOUT the control DDL (that schema exists once, on instance one) — and
+    /// through the same registry, so two stores naming one shard instance share
+    /// its sessions too.
     fn shard_pool(&self, view: &str) -> Result<Arc<PgPool>, String> {
         // Placement first, name hash for views that predate the table (see
         // [`crate::pg_store::resolve_view_uri`]).
@@ -734,7 +739,7 @@ impl PgControlStore {
         if let Some(p) = m.get(&uri) {
             return Ok(Arc::clone(p));
         }
-        let p = Arc::new(PgPool::open(&uri, &[])?);
+        let p = crate::control::shared(&uri, &[])?;
         m.insert(uri, Arc::clone(&p));
         Ok(p)
     }
@@ -836,7 +841,7 @@ impl ControlStore for PgControlStore {
                 match m.get(uri) {
                     Some(p) => Arc::clone(p),
                     None => {
-                        let p = Arc::new(PgPool::open(uri, &[])?);
+                        let p = crate::control::shared(uri, &[])?;
                         m.insert((*uri).to_string(), Arc::clone(&p));
                         p
                     }

@@ -50,6 +50,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{self, IoSlice, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use std::panic;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -247,9 +248,7 @@ struct Shared {
 
 impl Shared {
     fn find(&self, fd: RawFd, id: u64) -> Option<Arc<Conn>> {
-        self.conns
-            .lock()
-            .unwrap()
+        locked(&self.conns)
             .get(&fd)
             .filter(|(cid, _)| *cid == id)
             .map(|(_, c)| c.clone())
@@ -257,7 +256,7 @@ impl Shared {
 
     /// worker 的「这条连接有东西要写」：入它所属循环的脏队列 + 叫醒那条循环。
     fn mark_dirty(&self, fd: RawFd, loop_id: usize) {
-        self.dirty[loop_id].lock().unwrap().push(fd);
+        locked(&self.dirty[loop_id]).push(fd);
         poke_eventfd(self.wakes[loop_id]);
     }
 }
@@ -284,12 +283,12 @@ impl Handle {
     }
 
     pub fn role(&self) -> Option<ConnRole> {
-        self.conn().map(|c| c.inner.lock().unwrap().role)
+        self.conn().map(|c| locked(&c.inner).role)
     }
 
     pub fn set_role(&self, r: ConnRole) {
         if let Some(c) = self.conn() {
-            c.inner.lock().unwrap().role = r;
+            locked(&c.inner).role = r;
         }
     }
 
@@ -297,7 +296,7 @@ impl Handle {
     /// `sink()` 重新加锁不会自死锁。
     pub fn take_session<T: Any + Send>(&self) -> Option<T> {
         let c = self.conn()?;
-        let mut g = c.inner.lock().unwrap();
+        let mut g = locked(&c.inner);
         g.sess
             .take()
             .and_then(|b| b.downcast::<T>().ok())
@@ -306,14 +305,14 @@ impl Handle {
 
     pub fn put_session<T: Any + Send>(&self, v: T) {
         if let Some(c) = self.conn() {
-            c.inner.lock().unwrap().sess = Some(Box::new(v));
+            locked(&c.inner).sess = Some(Box::new(v));
         }
     }
 
     /// 订阅登记完成后记下 (id, buckets)：角色切成只出不进，连接被摘时据此清 `subs`。
     pub fn note_sub(&self, id: u64, buckets: Vec<String>) {
         if let Some(c) = self.conn() {
-            let mut g = c.inner.lock().unwrap();
+            let mut g = locked(&c.inner);
             g.sub = Some((id, buckets));
             g.role = ConnRole::Push;
         }
@@ -324,7 +323,7 @@ impl Handle {
     pub fn push(&self, frame: Vec<u8>) -> bool {
         let Some(c) = self.conn() else { return false };
         let ok = {
-            let mut g = c.inner.lock().unwrap();
+            let mut g = locked(&c.inner);
             let bytes: usize = g.out.iter().map(|f| f.len()).sum();
             if g.out.len() >= OUT_FRAMES || bytes > OUT_BYTES {
                 false
@@ -344,12 +343,12 @@ impl Handle {
     /// 步骤函数判死：先把已排好的应答写完，再由循环收尾。
     pub fn kill(&self) {
         let Some(c) = self.conn() else { return };
-        c.inner.lock().unwrap().dying = true;
+        locked(&c.inner).dying = true;
         self.shared.mark_dirty(self.fd, self.loop_id);
     }
 
     pub fn is_dying(&self) -> bool {
-        self.conn().is_none_or(|c| c.inner.lock().unwrap().dying)
+        self.conn().is_none_or(|c| locked(&c.inner).dying)
     }
 
     /// 一次应答的暂存出口。写出的字节在 [`FrameSink::finish`] 之前不落队列，于是「一帧」
@@ -366,7 +365,7 @@ impl Handle {
     /// 所以「队列非空但没人处理」的窗口不存在（循环的派发走的是同一把锁）。
     fn next_frame(&self) -> Option<(u8, Vec<u8>)> {
         let c = self.conn()?;
-        let mut g = c.inner.lock().unwrap();
+        let mut g = locked(&c.inner);
         if g.dying {
             g.q.clear();
             g.busy = false;
@@ -457,6 +456,81 @@ pub fn worker_count() -> usize {
         .unwrap_or(DEFAULT_WORKERS)
 }
 
+/// 被这一层接住的帧派发 panic 数。故意是**进程级**而不是 per-runtime：它回答的问题是
+/// 「这个进程的 worker 池有没有在吞 panic」，而 worker 池本来就是每端口一份、随实例生灭
+/// 的进程资源；同一进程里跑两台 meta-server（测试的常态）时，一条平面上的 panic 与另一
+/// 条平面上的 panic 对运维是同一个信号——「这台机器上有 handler 在炸」。
+/// 随进程归零，与 `SweepStats` 同理：它数的是本进程接住过几次。
+static FRAME_PANICS: AtomicU64 = AtomicU64::new(0);
+
+/// `store.info` 的 `framePanics`：本进程的帧派发隔离层接住过多少次 panic。零之外的每个
+/// 增量都对应 stderr 上一行点名单条连接的诊断，所以这一枚数与日志能相互印证。
+pub fn frame_panics() -> u64 {
+    FRAME_PANICS.load(Ordering::Relaxed)
+}
+
+/// panic 载荷 → 一行可 grep 的文本。`&str`/`String` 覆盖了 `panic!("…")` 与
+/// `unwrap`/`expect` 两类绝大多数来源；其余形状只可能是 `panic_any`，那就明说「读不出内容」
+/// 而不是假装能报出类型名（把「读不出」写成「没有内容」会让那行诊断变成噪音）。
+fn panic_text(p: &(dyn Any + Send)) -> String {
+    // 折叠所有空白：一个 `panic!("…\n…")` 变成两行就会破坏上面那条单行纪律，而换行本身
+    // 不含信息。
+    let flat = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if let Some(s) = p.downcast_ref::<&'static str>() {
+        flat(s)
+    } else if let Some(s) = p.downcast_ref::<String>() {
+        flat(s)
+    } else {
+        "<panic payload: neither &str nor String>".to_string()
+    }
+}
+
+/// 取一把本模块的 `Mutex`，**带毒也照取**。
+///
+/// 这不是图省事：[`guarded`] 把 unwind 挡住之后，剩下的唯一传染路径就是「panic 在持锁期间
+/// 发生 → 锁带毒 → 别的连接取同一把锁时跟着 panic」。要连接级隔离就得把这条路也堵掉。
+///
+/// 为什么在本文件里安全：每一把锁保护的都只是容器与位标（`Shared::conns` 是一张
+/// `HashMap<fd, (id, Arc<Conn>)>`、`Conn::inner`/`Conn::buf` 是队列加几个布尔/时刻、
+/// `dirty` 是 `Vec<RawFd>`），所有临界区都是一次 O(1) 的进出或一次赋值，没有跨语句的不变
+/// 量需要「中途失败就不算完成」来保护。换句话说：半程状态在这里的定义就是「某个字节多/少
+/// 一条队列项」，而那种状态在并发下本来就合法（另一条线程随时可能刚 push 完）。真需要
+/// 原子多步的地方（引擎往返、放置行改写）不在这层，它们返回 `io::Result` 并自己回滚。
+fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 一帧派发的隔离层。`false` = 这条连接该收手（步骤函数返回 `Err`，或它 panic 了），
+/// 与 [`Pool::serve`] 原有的「`Err` 视同 `kill`」同一语义；`true` = 可以继续取下一帧。
+///
+/// 为什么必须有这层：worker 线程一死，它那条 `mpsc::SyncSender` 通道里排着的请求再没人
+/// 取，那条循环上的连接会一直等一个不会再来的应答（现象是「部分挂载永久挂起」而不是
+/// 「服务报错」）；更要紧的是本文件的锁全是 `std::sync::Mutex`，panic 若在持锁期间发生，
+/// 锁带着毒留下，之后**别的连接**取同一把锁也 panic ——一次连接级故障就此放大成整平面故障。
+/// 所以两半都要：这里挡住 unwind 让 worker 活着，[`locked`] 让毒化不再传染。
+fn guarded<F>(h: &Handle, op: u8, f: F) -> bool
+where
+    F: FnOnce() -> io::Result<()>,
+{
+    match panic::catch_unwind(panic::AssertUnwindSafe(f)) {
+        Ok(Ok(())) => true,
+        // 编码失败/后端抛错：不再读这条连接的后续帧，让循环收尾。
+        Ok(Err(_)) => false,
+        Err(payload) => {
+            let n = FRAME_PANICS.fetch_add(1, Ordering::Relaxed) + 1;
+            // 一行、点名 op 与连接，且带累计序号：多行诊断会照抄进日志与文档示例
+            // （`ADR §7` 的单行形状约束），而「第几次」让两次独立故障在同一份日志里
+            // 仍可分辨。panic 内容原样跟在后面 —— 吞掉它才是真的查不下去。
+            eprintln!(
+                "meta epoll: frame op={op} on fd {} panicked, connection dropped (caught #{n}): {}",
+                h.fd,
+                panic_text(payload.as_ref())
+            );
+            false
+        }
+    }
+}
+
 impl Pool {
     /// 起 `workers` 条后端 worker。线程创建失败（`EAGAIN`、cgroup 线程数上限）一律上抛，
     /// 不在这里 abort 整个挂载平面。失败时本函数已建好的 sender 随栈退出丢掉，通道一关，
@@ -491,14 +565,9 @@ impl Pool {
     /// 处理一个请求帧，然后接着处理这条连接上已经攒到的下一帧：客户端在管线发送时省掉
     /// 一次「归还—再派发」的通道往返。所有等待都在锁外。
     ///
-    /// TODO(severity=Medium): 一条连接的 panic 会要掉整个平面，这里缺一层 `catch_unwind`。
-    /// 本文件的锁全是 `std::sync::Mutex`（29 处 `lock().unwrap()`）：某个 handler 在 worker
-    /// 线程里 panic 会毒化它当时碰到的共享锁（`Shared::conns`、`Conn::inner`），之后别的
-    /// 连接取同一把锁就跟着 panic；worker 线程本体一死，它那条通道里排着的请求再没人取。
-    /// 修法是连接级隔离：`Pool::serve` 的每帧包进 `catch_unwind`，panic 只杀这一条连接
-    /// （`h.kill()`），并让这些 `lock()` 走 `unwrap_or_else(|p| p.into_inner())` 或改用
-    /// 不毒化的 `parking_lot::Mutex`。`server_ext.rs` 里的 accept 回退只兜「epoll 接管不
-    /// 起来」，兜不住运行期的 panic，所以这层属于架构变更，不在本轮范围内。
+    /// 每帧都过 [`guarded`]：一条连接的 panic 只杀这一条连接，worker 回到 `for job in r`
+    /// 继续取它通道里的下一个请求。接住的次数进 [`frame_panics`]（`store.info` 的
+    /// `framePanics`）并打一行点名 op/fd 的诊断。
     fn serve(rt: &Arc<MetaRuntime>, step: &Step, job: Job) {
         let h = job.h;
         let mut op = job.op;
@@ -507,8 +576,7 @@ impl Pool {
             if h.is_dying() {
                 break;
             }
-            if (step)(rt, &h, op, &body).is_err() {
-                // 编码失败/后端抛错：不再读这条连接的后续帧，让循环收尾。
+            if !guarded(&h, op, || (step)(rt, &h, op, &body)) {
                 h.kill();
                 break;
             }
@@ -853,7 +921,7 @@ impl EventLoop {
                 buf: Mutex::new(Vec::new()),
             });
             self.conns.insert(fd, c.clone());
-            self.shared.conns.lock().unwrap().insert(fd, (id, c));
+            locked(&self.shared.conns).insert(fd, (id, c));
         }
     }
 
@@ -896,7 +964,7 @@ impl EventLoop {
         let mut sock: &TcpStream = &c.sock;
         loop {
             let room = {
-                let b = c.buf.lock().unwrap();
+                let b = locked(&c.buf);
                 if b.len() >= READ_CAP {
                     return false;
                 }
@@ -909,8 +977,8 @@ impl EventLoop {
             match sock.read(&mut self.buf[..room]) {
                 Ok(0) => return false,
                 Ok(n) => {
-                    c.buf.lock().unwrap().extend_from_slice(&self.buf[..n]);
-                    let mut g = c.inner.lock().unwrap();
+                    locked(&c.buf).extend_from_slice(&self.buf[..n]);
+                    let mut g = locked(&c.inner);
                     if g.partial.is_none() {
                         g.partial = Some(Instant::now() + PARTIAL_DEADLINE);
                     }
@@ -932,7 +1000,7 @@ impl EventLoop {
     /// 不上（worker 队列排满）或已判死，调用方收尾。
     fn dispatch(&mut self, c: &Conn, op: u8, body: Vec<u8>) -> bool {
         let take = {
-            let mut g = c.inner.lock().unwrap();
+            let mut g = locked(&c.inner);
             if g.dying {
                 return false;
             }
@@ -965,7 +1033,7 @@ impl EventLoop {
         if self.shared.pool.send(&h, op, body) {
             return true;
         }
-        c.inner.lock().unwrap().busy = false;
+        locked(&c.inner).busy = false;
         eprintln!("meta epoll: worker queue full, dropping fd {}", c.fd);
         false
     }
@@ -989,14 +1057,14 @@ impl EventLoop {
         let mut sock: &TcpStream = &c.sock;
         loop {
             let front = {
-                let g = c.inner.lock().unwrap();
+                let g = locked(&c.inner);
                 g.out.front().cloned()
             };
             let Some(front) = front else { return true };
             match sock.write(&front[..]) {
                 Ok(0) => return false,
                 Ok(n) => {
-                    let mut g = c.inner.lock().unwrap();
+                    let mut g = locked(&c.inner);
                     if n >= front.len() {
                         g.out.pop_front();
                     } else if let Some(f) = g.out.front_mut() {
@@ -1017,7 +1085,7 @@ impl EventLoop {
 
     fn flush_dirty(&mut self) {
         let pending = {
-            let mut g = self.shared.dirty[self.id].lock().unwrap();
+            let mut g = locked(&self.shared.dirty[self.id]);
             if g.is_empty() {
                 return;
             }
@@ -1027,9 +1095,9 @@ impl EventLoop {
             let Some(c) = self.conns.get(&fd).cloned() else {
                 continue;
             };
-            if c.inner.lock().unwrap().out.is_empty() {
+            if locked(&c.inner).out.is_empty() {
                 // 判死且已写干净：收尾。
-                if c.inner.lock().unwrap().dying {
+                if locked(&c.inner).dying {
                     self.retire(&c);
                 }
                 continue;
@@ -1047,8 +1115,8 @@ impl EventLoop {
     /// 把掩码对齐到「有东西要写 + 读侧允许继续」。与当前记录一致时一次 `epoll_ctl` 不付。
     fn sync_interest(&self, c: &Conn) -> io::Result<()> {
         // `buf` 先于 `inner`：与 `read_into`/`take_frames` 同一方向，不会反序互锁。
-        let held_read = c.buf.lock().unwrap().len() >= READ_HOLD;
-        let mut g = c.inner.lock().unwrap();
+        let held_read = locked(&c.buf).len() >= READ_HOLD;
+        let mut g = locked(&c.inner);
         let want_write = !g.out.is_empty();
         if g.masked_write != want_write || g.held_read != held_read {
             epoll_mod(self.ep, c.fd, want_write, !held_read)?;
@@ -1064,8 +1132,8 @@ impl EventLoop {
         let now = Instant::now();
         let mut dead = Vec::new();
         for (fd, c) in self.conns.iter() {
-            let buffered = c.buf.lock().unwrap().len();
-            let g = c.inner.lock().unwrap();
+            let buffered = locked(&c.buf).len();
+            let g = locked(&c.inner);
             if g.dying && g.out.is_empty() {
                 dead.push(*fd);
                 continue;
@@ -1093,8 +1161,8 @@ impl EventLoop {
         if self.conns.remove(&fd).is_none() {
             return;
         }
-        self.shared.conns.lock().unwrap().remove(&fd);
-        let sub = c.inner.lock().unwrap().sub.clone();
+        locked(&self.shared.conns).remove(&fd);
+        let sub = locked(&c.inner).sub.clone();
         if let Some((id, buckets)) = sub {
             super::server_ext::subs_remove(&self.rt, id, &buckets);
         }
@@ -1133,7 +1201,7 @@ impl Conn {
     /// 从缓冲区切出尽可能多的完整请求帧。够一帧才消费，不够就把字节留着等下一轮。
     /// `Err` = magic 不对或声明的 body 超过 [`READ_CAP`]，调用方断连。
     fn take_frames(&self, sink: &mut Vec<(u8, Vec<u8>)>) -> io::Result<()> {
-        let mut b = self.buf.lock().unwrap();
+        let mut b = locked(&self.buf);
         let mut cut = 0usize;
         loop {
             let buf = &b[cut..];
@@ -1169,10 +1237,237 @@ impl Conn {
         b.drain(..cut);
         drop(b);
         if !sink.is_empty() {
-            let mut g = self.inner.lock().unwrap();
+            let mut g = locked(&self.inner);
             g.last_frame = Instant::now();
             g.partial = None;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 一条真连接对：`Conn` 持 `TcpStream`，而 `retire`/写队列的语义都按真 fd 走，所以
+    /// 夹具不造假 fd（`-1` 或已关的号码会把「写出被静默丢弃」这条路径测成另一个东西）。
+    /// 返回的 client 端必须被调用方活着持有：它一 drop，服务端那份就得到 EOF。
+    fn conn_pair(shared: &Arc<Shared>, loop_id: usize) -> (Handle, TcpStream) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (sock, _) = l.accept().unwrap();
+        let fd = sock.as_raw_fd();
+        let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
+        let c = Arc::new(Conn {
+            sock,
+            fd,
+            id,
+            inner: Mutex::new(Inner {
+                q: VecDeque::new(),
+                out: VecDeque::new(),
+                role: ConnRole::Handshake,
+                busy: false,
+                dying: false,
+                sub: None,
+                sess: None,
+                last_frame: Instant::now(),
+                partial: None,
+                masked_write: false,
+                held_read: false,
+            }),
+            buf: Mutex::new(Vec::new()),
+        });
+        locked(&shared.conns).insert(fd, (id, c));
+        let h = Handle {
+            shared: shared.clone(),
+            fd,
+            id,
+            loop_id,
+            from_gov: false,
+        };
+        // 循环本体用不上（这里不跑 `EventLoop`），但 listener 必须比它的 accepted socket
+        // 活得久，否则 accept 出来的那份会先失效。
+        std::mem::forget(l);
+        (h, client)
+    }
+
+    fn fixture(n: usize) -> (Arc<Shared>, Vec<Handle>, Vec<TcpStream>) {
+        let shared = Arc::new(Shared {
+            conns: Mutex::new(HashMap::new()),
+            dirty: (0..n.max(1)).map(|_| Mutex::new(Vec::new())).collect(),
+            wakes: (0..n.max(1)).map(|_| ev_wake().unwrap()).collect(),
+            next_id: AtomicU64::new(1),
+            pool: Pool {
+                tx: Vec::new(),
+                rr: AtomicU64::new(0),
+            },
+        });
+        let mut hs = Vec::new();
+        let mut keep = Vec::new();
+        for _ in 0..n {
+            let (h, client) = conn_pair(&shared, 0);
+            hs.push(h);
+            keep.push(client);
+        }
+        (shared, hs, keep)
+    }
+
+    /// 隔离层本身：一次 panic 只该终结这一帧，且必须记账。
+    ///
+    /// 这一枚计数器是进程量（见 [`FRAME_PANICS`] 上的说明），而 lib 的单测同进程并行跑，
+    /// 所以这里断的是「本用例至少加了一次」，不是「恰好等于某个绝对值」——后者会把自己
+    /// 变成 flake 源，而前者正是运维要看的那件事。
+    #[test]
+    fn a_panicking_frame_is_caught_counted_and_confined() {
+        let (_s, h, _keep) = fixture(2);
+        let before = frame_panics();
+        let ok = guarded(&h[0], 7, || panic!("the handler lost its shape"));
+        assert!(!ok, "a panicking frame must end its connection, exactly like an Err");
+        assert!(
+            frame_panics() > before,
+            "a swallowed panic that is not counted is the failure shape this whole layer exists to remove"
+        );
+
+        // 同一平面的另一条连接照常可用：它等的就是同一个 worker 池，池必须还活着。
+        assert!(!h[1].is_dying());
+        assert!(guarded(&h[1], 8, || Ok(())), "a clean frame must still dispatch");
+        assert!(h[1].push(b"pong".to_vec()));
+        assert_eq!(locked(&h[1].conn().unwrap().inner).out.len(), 1);
+
+        // `Err` 与 panic 走同一条收尾：本文件的既有语义（`Err` 视同 `kill`）没被改掉。
+        assert!(!guarded(&h[1], 9, || Err(io::Error::other("backend said no"))));
+    }
+
+    /// 毒化这条路也必须堵住：否则「一条连接的 panic」会变成「整平面停摆」。
+    ///
+    /// 复现的是最坏的真实形状——handler 在**持着锁的时候**炸。此时 `std` 会把锁标毒，
+    /// 而本文件的每一处 `lock()` 都会被 [`locked`] 放行，所以后续连接照常工作。
+    #[test]
+    fn a_panic_while_holding_a_lock_does_not_poison_the_plane() {
+        let (_s, h, _keep) = fixture(2);
+        let c0 = h[0].conn().unwrap();
+        let caught = guarded(&h[0], 11, || {
+            // 故意用 `unwrap` 取锁：要测的就是「这一把锁被 panic 毒掉了」之后的世界。
+            let _g = c0.inner.lock().unwrap();
+            panic!("mid-lock failure");
+        });
+        assert!(!caught);
+        // 锁已带毒。下面每一处都取同一把 `Conn::inner`：任何一处仍走 `unwrap` 就会 panic，
+        // 而 panic 会从 worker 里冒出来——本用例不需要另加断言，它就是加在这些调用上的。
+        // 顺序也故意：先证明未判死的连接还能取帧（`next_frame` 对 dying 连接清空队列是
+        // 产品语义，不能拿它当「锁坏了」的证据），再 kill。
+        locked(&c0.inner).q.push_back((3, b"x".to_vec()));
+        let (op, body) = h[0]
+            .next_frame()
+            .expect("the poisoned lock must still hand out its frame");
+        assert_eq!((op, body.as_slice()), (3u8, &b"x"[..]));
+        h[0].kill();
+        assert!(h[0].is_dying());
+        assert!(h[1].push(vec![1, 2]));
+        assert_eq!(locked(&h[1].conn().unwrap().inner).out.len(), 1);
+
+        // 另一把共用的锁同理：`Shared::conns` 被 worker 与每条循环共拿，它毒掉的话
+        // 「查不到连接」会被误当成「连接已摘」，那是比报错更槽的输出。
+        let shared = h[0].shared.clone();
+        let caught = guarded(&h[1], 12, || {
+            let _g = shared.conns.lock().unwrap();
+            panic!("mid-registry failure");
+        });
+        assert!(!caught);
+        assert!(h[0].conn().is_some(), "the registry must still resolve live fds");
+        assert!(h[1].conn().is_some());
+    }
+
+    /// `panic_text`：诊断必须一行，且不能把「读不出载荷」写成「没有内容」。
+    #[test]
+    fn panic_payloads_reach_the_log_as_one_line() {
+        let s: Box<dyn Any + Send> = Box::new("first line\nsecond line");
+        assert_eq!(panic_text(s.as_ref()), "first line second line");
+        let owned: Box<dyn Any + Send> = Box::new("  trimmed  ".to_string());
+        assert_eq!(panic_text(owned.as_ref()), "trimmed");
+        let odd: Box<dyn Any + Send> = Box::new(7u8);
+        let text = panic_text(odd.as_ref());
+        assert!(text.starts_with("<panic payload"), "{text}");
+        assert!(!text.contains('\n'), "{text}");
+    }
+
+    fn frame(op: u8, body: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&crate::remote::proto::MAGIC.to_be_bytes());
+        v.push(op);
+        v.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        v.extend_from_slice(body);
+        v
+    }
+
+    /// 端到端：真循环 + 真 worker 池 + 真 socket，一条连接的 panic 不许影响另一条。
+    ///
+    /// `Step` 本来就是 `spawn` 的入参（生产用 `meta_epoll_step`，这里用一条会炸的），
+    /// 所以走的是产品同一条派发链：`accept → 切帧 → 通道 → worker → guarded → retire`。
+    /// 被测的是产品代码，注入点只是那个步骤函数本身。
+    #[test]
+    fn the_plane_keeps_serving_after_one_connection_panics() {
+        let dir = tempfile::Builder::new()
+            .prefix("yf_panic_plane_")
+            .tempdir()
+            .unwrap();
+        let (raw, stop) = super::super::server_ext::test_rt_stoppable(dir.path());
+        let rt = Arc::new(raw);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let step: Step = Arc::new(|_rt, h, op, _body| {
+            if op == 0xAA {
+                // 模拟一条 handler 在最普通的地方炸掉：写应答的路上，队列已有半帧。
+                h.push(b"never arrives".to_vec());
+                panic!("a mount's handler blew up");
+            }
+            h.push(b"pong".to_vec());
+            Ok(())
+        });
+        let joins = spawn(&listener, false, rt.clone(), step).unwrap();
+        drop(listener);
+        let before = frame_panics();
+
+        // (1) 会炸的那条：帧发出去，等到的是「连接被摘」，不是一个应答。
+        let mut bad = TcpStream::connect(addr).unwrap();
+        bad.write_all(&frame(0xAA, b"")).unwrap();
+        let mut sink = [0u8; 32];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let n = bad.read(&mut sink).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the panicking connection was never dropped; it answered {n} bytes"
+            );
+        }
+
+        // (2) 另一条：同一个 worker 池、同一档通道，必须照常拿到应答。这一条就是
+        // 「worker 线程还活着」的全部意义——它死了的话，这里永远读不到字节。
+        let mut good = TcpStream::connect(addr).unwrap();
+        good.write_all(&frame(0x01, b"")).unwrap();
+        good.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let n = good.read(&mut sink).unwrap();
+        assert_eq!(&sink[..n], b"pong", "a healthy mount went unanswered");
+
+        // (3) 记账：接住过几次，与 stderr 那行点名单条连接的诊断是同一件事。
+        assert!(
+            frame_panics() > before,
+            "the drop was silent: no counter, no line, no evidence an operator can act on"
+        );
+
+        // 收摊：停机标志现在由循环每轮查（`EventLoop::run` 末尾），所以这里停得下来，
+        // 端口也会真的关掉——与本仓「实例必须可停」的既有纪律同一条。
+        stop.stop();
+        for j in joins {
+            j.join().unwrap();
+        }
+        assert!(
+            TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_err(),
+            "{addr} still accepts connections after the loops returned"
+        );
     }
 }
