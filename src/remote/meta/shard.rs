@@ -852,6 +852,29 @@ fn create_placement(c: &mut postgres::Client) -> Result<(), String> {
 /// in `store.info`), so what belongs in the row is the part that identifies the
 /// databases — scheme, host, port, path — and nothing else. A `file:` registry
 /// contributes its PATH, which is the operator-owned name of the same book.
+// TODO(severity=Medium): that last sentence holds only for a registry the
+// operator NAMED. `MetaServer::serve()` ADOPTS a bare `--meta-store
+// postgres://…` into `<base>/instances.conf`, so for that documented, common
+// spelling the fingerprint carries this process's DATA DIRECTORY: two instances
+// pointed at one database name themselves differently, and one instance started
+// with a different `--meta-dir` renames itself. Measured 2026-11-28 by
+// `tests/shard_routing.rs::a_shorter_sweep_shortens_the_window_a_deposed_instance_holds_the_tree`,
+// where the two nodes report `postgres registry /tmp/grovefs_shard_<a>/instances.conf`
+// and `…/<b>/instances.conf` for the identical URI (the race that case ends with
+// asserts the pair stays one process's).
+// What that costs: after a node's base directory moves, every placement row it
+// wrote names a backend it no longer serves, so `Shard::decide`'s backend branch
+// refuses its OWN views at `M_OPEN` — and `view move --to-meta` back onto that
+// same node early-returns "already placed … nothing to move" without re-stamping
+// `store`, so the repairs left are moving the view to a peer and back, or a
+// hand-written `UPDATE` (both refusal and repair are walked end-to-end in
+// `a_three_node_ring_routes_by_the_row_not_by_adjacency`).
+// The fix is a decision, not a patch: either fingerprint the DATABASE (the
+// registry's control instance, which the ring already resolves once for the
+// placement table's own URI), or let the instance that a row names re-stamp that
+// row when its backend really does hold the tree — the second option has to keep
+// an actual `--meta-store` switch detectable, since that switch is exactly what
+// the branch exists to refuse.
 pub fn store_fingerprint(store: &StoreKind) -> String {
     match store {
         // Local disk: no two instances share it, so the fingerprint says what it
@@ -1107,7 +1130,9 @@ mod tests {
 
     /// The fingerprint identifies databases, never credentials: the same store
     /// seen from two nodes must hash out equal, and a password must not survive
-    /// into the row.
+    /// into the row. (A bare `--meta-store postgres://…` adopted into
+    /// `<base>/instances.conf` is the exception today — see the
+    /// `TODO(severity=Medium)` on [`store_fingerprint`].)
     #[test]
     fn backend_fingerprint_keeps_hosts_and_drops_secrets() {
         let pg = StoreKind::Pg("postgres://u:s3cret@h1:5432/gfs,postgres://u:ot@h2/gfs".into());

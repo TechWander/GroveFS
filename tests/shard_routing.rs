@@ -26,6 +26,13 @@
 //!     nor its neighbour, and a row naming a node the ring does not define
 //!     fails the mount everywhere with that name instead of falling back to
 //!     serving the tree locally;
+//!   * BOTH of the router's refusal branches are reached end-to-end: the
+//!     dangling row above, and a row that names this instance while its `store`
+//!     column names a backend this process does not serve — refused at every
+//!     entry point in the ring, with the table left exactly as found;
+//!   * concurrent `view move` calls for ONE view, aimed at DIFFERENT instances,
+//!     leave exactly one complete row and end with exactly one instance serving
+//!     the tree (the two operators' replies each name their own destination);
 //!   * `store.info` reports the ring, the physical base trees EACH node's
 //!     placement rows fold to, the raw row tally next to them, the row's own
 //!     `updated_at`, the configured sweep and the trees an instance still holds
@@ -567,6 +574,11 @@ fn a_moved_view_follows_its_open_mount() {
 /// gets a proportionally shorter window — measured against the default's ~4.7s
 /// so the two cannot be confused, and with the SAME end state: the open mount
 /// still follows the row.
+///
+/// The last section runs the same verb TWELVE times, in pairs aimed at opposite
+/// instances, because a `view move` is typed by a person and nothing serializes
+/// two of them: what has to survive that is a placement table holding one
+/// complete row at every instant, and one instance serving the tree at the end.
 #[test]
 fn a_shorter_sweep_shortens_the_window_a_deposed_instance_holds_the_tree() {
     let Some(pg) = pg_uri() else {
@@ -666,9 +678,157 @@ fn a_shorter_sweep_shortens_the_window_a_deposed_instance_holds_the_tree() {
     assert_ne!(ino.expect("the mount never followed the view"), 0);
     assert_eq!(shard_of(&n1.info(), &n_b)["views"], json!(1));
 
-    n2.gov()
-        .call("view.rm_base", json!({"view": v}))
-        .expect("teardown the moved view");
+    // ---- two operators, one view, one second ------------------------------
+    // The verb the sections above ran once at a time is typed by a PERSON, and
+    // nothing about it is single-writer: a runbook and an operator can name
+    // DIFFERENT targets for the SAME view in the same second. What the ring
+    // requires is not that one of them wins — it is that the table never holds
+    // anything but ONE complete row, so that at every instant the name has
+    // exactly one home, the `(meta, store)` pair always belongs to a single
+    // process, and the instance that ends up not named gives the tree up just
+    // the same. TWO calls at a time over six rounds, because every session this
+    // binary opens stays open for its whole life (the TODO at the foot of this
+    // file is what a wider burst costs: the server's `max_connections` —
+    // measured 2026-11-28 at 96 of 100 with eight simultaneous moves — rather
+    // than the behaviour under test).
+    let mut landed = 0usize;
+    for round in 0..6 {
+        let mut jobs = Vec::new();
+        for (node, ctl) in [(&n_a, n1.ctl.clone()), (&n_b, n2.ctl.clone())] {
+            let (node, key, view) = (node.clone(), key.clone(), v.clone());
+            jobs.push(std::thread::spawn(move || {
+                let r = ControlClient::new(&ctl, &key)
+                    .call("view.move_meta", json!({"view": view, "to": node.clone()}));
+                (node, r)
+            }));
+        }
+        for j in jobs {
+            let (node, r) = j.join().expect("a concurrent `view move` thread panicked");
+            let value = r.unwrap_or_else(|e| panic!("round {round}: a move failed: {e}"));
+            let text = value
+                .as_str()
+                .unwrap_or_else(|| panic!("the move reply was not a message: {value}"))
+                .to_string();
+            let other = if node == n_a { &n_b } else { &n_a };
+            assert!(text.contains(&v), "a reply did not name its view: {text}");
+            // Every reply names the instance that ANSWERED as its destination —
+            // and never the other one, which is what a caller who typed the
+            // wrong port would have to be told about.
+            if text.starts_with("moved") {
+                landed += 1;
+                assert!(
+                    text.contains(&format!("to '{node}'")),
+                    "a move did not name its own node as the destination: {text}"
+                );
+                assert!(
+                    !text.contains(&format!("to '{other}'")),
+                    "'{node}' reported moving the view to '{other}': {text}"
+                );
+            } else {
+                assert!(
+                    text.contains(&format!("on '{node}'")),
+                    "a no-op move did not name its own node: {text}"
+                );
+            }
+        }
+    }
+    // The rounds must have been CONTESTS, not twelve no-ops.
+    assert!(
+        landed >= 2,
+        "{landed} of 12 calls actually moved the view: the two writers never contended"
+    );
+    let rows = placement_rows(&pg, &ring, &n_a, &tag);
+    assert_eq!(
+        rows.len(),
+        1,
+        "concurrent moves grew a second row for one view: {rows:?}"
+    );
+    assert_eq!(rows[0].0, v);
+    let winner = rows[0].1.clone();
+    assert!(
+        winner == n_a || winner == n_b,
+        "the row names a node neither move nominated: {winner}"
+    );
+    // THE PAIR, NOT THE HALVES: `adopt` writes `meta`, `store` and `updated_at`
+    // in one transaction, so no interleaving of the two operators can leave a
+    // row naming one instance with the other's backend — the disagreement
+    // `a_three_node_ring_routes_by_the_row_not_by_adjacency` shows a mount
+    // refusing. Here the two fingerprints DIFFER (each instance's bare
+    // `--meta-store` URI was adopted into a registry file inside its own base),
+    // which is what makes this a discriminator rather than a tautology.
+    let mut c = postgres::Client::connect(&pg, postgres::NoTls).expect("pg for the read");
+    let store = c
+        .query(
+            "SELECT store FROM grovefs_control.meta_placement WHERE view = $1",
+            &[&v],
+        )
+        .expect("read the store column")
+        .into_iter()
+        .next()
+        .expect("the row survived the race")
+        .get::<_, String>(0);
+    drop(c);
+    let (win, lose) = if winner == n_a { (&n1, &n2) } else { (&n2, &n1) };
+    let win_backend = win.info()["shard"]["backend"]
+        .as_str()
+        .expect("a sharded instance reports its tree backend")
+        .to_string();
+    assert_eq!(
+        store, win_backend,
+        "the winning row pairs '{winner}' with a backend it does not serve: {store}"
+    );
+    assert!(
+        !store.contains("grovepw"),
+        "the shared placement table carries a password: {store}"
+    );
+    // ONE HOME, END_TO_END: the instance the row does not name gives the tree up
+    // on its own sweep, and a mount aimed there is served by the winner — which
+    // ends up holding the only engine.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let l = lose.info();
+        let idle = l["residentEngines"].as_u64() == Some(0);
+        let clean = l["shard"]["homeMismatch"]
+            .as_array()
+            .map(|a| a.is_empty())
+            == Some(true);
+        if idle && clean {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("the deposed instance never gave the view up: {l}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let after = RemoteMeta::new(&lose.meta, &v)
+        .expect("a mount at the instance that lost the race follows the row");
+    after
+        .create_node(ROOT_INO, "after-the-race", true, None, 0o755, UID, GID)
+        .expect("the write lands on the winner");
+    assert!(
+        win.info()["residentEngines"]
+            .as_u64()
+            .filter(|n| *n >= 1)
+            .is_some(),
+        "the winner served the view with no engine of its own"
+    );
+    assert_eq!(
+        lose.info()["residentEngines"],
+        json!(0),
+        "both instances served one view after the race"
+    );
+
+    // The row may name either instance now, so teardown asks BOTH and ignores
+    // the peer's refusal — the assertion is about the table being empty after.
+    for node in [&n1, &n2] {
+        let _ = node
+            .gov()
+            .call("view.rm_base", json!({"view": v.clone()}));
+    }
+    assert!(
+        placement_rows(&pg, &ring, &n_a, &tag).is_empty(),
+        "a placement row survived the tree it named"
+    );
     cleanup(&pg, scratch.path(), &key_id);
 }
 
@@ -1199,8 +1359,8 @@ fn the_invalidation_stream_of_a_redirected_mount_comes_from_the_home_instance() 
 }
 
 /// A ring of THREE instances routes by the placement row, not by proximity —
-/// and a row that names a node the ring does not define is refused instead of
-/// quietly served by whoever got the mount.
+/// and a row the ring cannot honour is refused instead of quietly served by
+/// whoever got the mount.
 ///
 /// Two instances can only ever answer "the row's node is the other one", so the
 /// redirect target and the fallback neighbour are the same process and a bug
@@ -1209,6 +1369,11 @@ fn the_invalidation_stream_of_a_redirected_mount_comes_from_the_home_instance() 
 /// and to m3 for `vb`, and the retired-node case below is the one a real
 /// deployment hits: the operator removes a host from `--shard-ring` while its
 /// rows are still in the shared table.
+///
+/// The section after that drives `Shard::decide()`'s SECOND refusal branch, the
+/// one no verb can produce: a row naming m1 with a tree backend m1 does not
+/// serve. Both branches are end-to-end because both are reachable by an
+/// operator — one by shrinking the ring, one by changing `--meta-store`.
 #[test]
 fn a_three_node_ring_routes_by_the_row_not_by_adjacency() {
     let Some(pg) = pg_uri() else {
@@ -1387,6 +1552,87 @@ fn a_three_node_ring_routes_by_the_row_not_by_adjacency() {
         "the orphan list still names a row that points back into the ring"
     );
 
+    // ---- a row naming a backend the node it names does not serve -----------
+    // The SECOND refusal branch of `Shard::decide()`, and the one no verb in the
+    // ring can produce either: `view move` and the mount-time claim write `meta`
+    // and `store` as ONE unit, so a row naming m1 with a tree backend m1 does not
+    // serve is a `--meta-store` that was changed under a running deployment, or a
+    // row restored onto a box now pointed at another database. The tree the name
+    // refers to then lives in the FIRST database while the row sends every mount
+    // to a process reading the SECOND — and the only honest answer is to refuse,
+    // naming both spellings, and leave the table alone. Rewriting `store` to this
+    // process's own would make the row describe whoever answered.
+    let read_store = || -> String {
+        let mut c = postgres::Client::connect(&pg, postgres::NoTls).expect("pg for the read");
+        c.query(
+            "SELECT store FROM grovefs_control.meta_placement WHERE view = $1",
+            &[&va],
+        )
+        .expect("read the store column")
+        .into_iter()
+        .next()
+        .expect("the row is still there")
+        .get::<_, String>(0)
+    };
+    let write_store = |to: &str| {
+        let mut c = postgres::Client::connect(&pg, postgres::NoTls).expect("pg for the edit");
+        c.execute(
+            "UPDATE grovefs_control.meta_placement SET store = $1 WHERE view = $2",
+            &[&to, &va],
+        )
+        .expect("name another backend in the row");
+    };
+    // SQLite trees, so the fingerprint this instance reports is a WORD and not a
+    // URI — which is what makes the two spellings in the refusal impossible to
+    // confuse with each other.
+    let mine = m1.info()["shard"]["backend"]
+        .as_str()
+        .expect("a sharded instance reports its tree backend")
+        .to_string();
+    assert_eq!(
+        read_store(),
+        mine,
+        "the row a successful mount claimed did not name that instance's own backend"
+    );
+    let foreign = "postgres://127.0.0.1:5432/grovefs_before_the_switch";
+    write_store(foreign);
+    for entry in [&m1.meta, &m2.meta, &m3.meta] {
+        let e = RemoteMeta::new(entry, &va)
+            .err()
+            .unwrap_or_else(|| {
+                panic!("{entry} served a view whose row names a backend it does not serve")
+            });
+        let msg = e.to_string();
+        // At a peer the refusal travels back with the redirect: measured
+        // 2026-11-28, the caller reads the HOME instance's own words.
+        assert!(
+            msg.contains(foreign) && msg.contains("--meta-store"),
+            "the refusal from {entry} did not name the backend and the fix: {msg}"
+        );
+    }
+    assert_eq!(
+        read_store(),
+        foreign,
+        "a refused mount rewrote the backend column to its own"
+    );
+    assert_eq!(
+        placement_rows(&pg, &ring, &n_a, &tag),
+        vec![(va.clone(), n_a.clone()), (vb.clone(), n_c.clone())],
+        "a refused mount changed the placement table"
+    );
+    // `store.info` still counts the row for the node it names: a backend column
+    // that disagrees is not a view that disappeared, and the diagnosis for it is
+    // the mount's refusal text.
+    assert_eq!(
+        shard_of(&m1.info(), &n_a)["views"],
+        json!(1),
+        "a backend-disagreeing row counted for nobody"
+    );
+    // Put the backend back and the same row routes again: the refusal is about
+    // the disagreement, not a name this instance has now disowned.
+    write_store(&mine);
+    let _a3 = RemoteMeta::new(&m1.meta, &va).expect("a row whose backend agrees mounts again");
+
     let mut teardown = Vec::new();
     for node in [&m1, &m3] {
         for view in [&va, &vb] {
@@ -1422,8 +1668,15 @@ fn a_three_node_ring_routes_by_the_row_not_by_adjacency() {
 // fork's own metadata tree is — the lens case above covers the fold, this covers
 // the second spelling of it.  TODO(severity=Medium): a PostgreSQL connection-pool
 // exhaustion case (mount storm against `--pg-*-pool-max`, and the shard path's
-// own `Shard::connect` which bypasses that pool) needs a PG fixture that can be
-// driven to `max_connections` and a knob to assert on; nothing in this file can
-// say "the control plane was too slow" apart from "the placement table was empty".
+// own `Shard::connect`, which keeps SHARD_POOL_MAX sessions and opens cold for
+// the rest) still needs a PG fixture that can be driven to `max_connections`
+// and a knob to assert on. The ceiling itself is no longer hypothetical:
+// measured 2026-11-28, the nine cases of this file leave so many sessions open
+// (nothing here can stop a `meta-server`, per the first TODO above) that the
+// test server sits at 96 of its 100 connections by the end of a run, and a case
+// opening eight more failed with `FATAL: too many connections` on its FIRST
+// move. That is why the racing-move act above runs two calls at a time rather
+// than a burst: the assertion it makes is about the placement table, and that
+// failure would have been about this fixture.
 // TODO(severity=Medium): a network-partition case (peer reachable at the TCP
 // layer but refusing, or half-open) belongs to the HA suite, not to sharding.

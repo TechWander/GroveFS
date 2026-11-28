@@ -139,7 +139,17 @@ impl PgPool {
                 Some(c) => return Ok(c),
             }
         }
-        Client::connect(&self.uri, NoTls).map_err(|e| format!("postgres connect {}: {e}", self.uri))
+        Client::connect(&self.uri, NoTls).map_err(|e| {
+            // The URI embeds the password, and this text leaves the process: a
+            // control-plane reply carries it to a terminal AND to the web
+            // console, a refused mount shows it to the mounting user, and the
+            // audit row stores it. Name the database, not the credential — the
+            // rule [`crate::pg_store::redact_uri`] exists to make one place.
+            format!(
+                "postgres connect {}: {e}",
+                crate::pg_store::redact_uri(&self.uri)
+            )
+        })
     }
 
     /// Hand a used client back (bounded; a closed socket is dropped instead of
@@ -223,6 +233,23 @@ impl PgPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed connect must name the database it could not reach without
+    /// naming the credential that was trying: the URI embeds a password, and
+    /// [`PgPool::checkout`]'s error text reaches replies, logs and audit rows.
+    #[test]
+    fn a_failed_connect_names_the_host_and_not_the_password() {
+        let pool = PgPool {
+            uri: "postgres://grove:s3cret@127.0.0.1:1/grovefs".to_string(),
+            pool: parking_lot::Mutex::new(Vec::new()),
+        };
+        let err = pool.checkout().err().expect("a closed port cannot connect");
+        assert!(!err.contains("s3cret"), "the password travelled into the error: {err}");
+        assert!(
+            err.contains("127.0.0.1:1/grovefs"),
+            "the error stopped naming the database it failed on: {err}"
+        );
+    }
 
     #[test]
     fn schema_name_round_trip() {
