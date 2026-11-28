@@ -3736,8 +3736,16 @@ fn control_dispatch(
             // the create reason: a peer that deleted the ROW of a view whose
             // tree is still alive elsewhere leaves a name whose mounts now
             // resolve to "no placement" — a dangling tree with no owner.
+            //
+            // `peek_forget`, never `route`: the bootstrap arm of `route` WRITES a
+            // row for the instance that asked, and a destroy is refused before it
+            // can touch a tree, so the verb that must never claim a name is exactly
+            // the one that would claim it silently. With `route()` a repeated
+            // `view rm` for a name whose tree is already gone pinned the row to the
+            // peer that was nagging, and every later answer about that name then
+            // came from a process holding nothing.
             if let Some(sh) = &rt.shard {
-                match sh.route(&view) {
+                match sh.peek_forget(&view) {
                     Ok(super::shard::Home::Mine) => {}
                     Ok(super::shard::Home::Other(node)) => {
                         crate::stats::count(crate::stats::Counter::ShardRefuse, 1);

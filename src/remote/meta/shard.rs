@@ -389,12 +389,45 @@ impl Shard {
     /// after them and before the tree is materialized), and a mount that is
     /// refused — unknown name, malformed name, missing base tree, an anonymous
     /// socket probe — must leave no trace in the shared table. Governance verbs
-    /// that intend to TAKE a name use [`Shard::route`].
+    /// that intend to TAKE a name use [`Shard::route`]; one that intends to give
+    /// it back for good (`view rm`) uses [`Shard::peek_forget`], because a verb
+    /// that can be refused before it touches a tree must not claim it on the way
+    /// out.
     pub fn peek(&self, view: &str) -> Result<Home, String> {
         if self.is_solo() {
             return Ok(Home::Mine);
         }
         let row = self.read_placement(view)?;
+        self.decide(view, row)
+    }
+
+    /// The routing verdict for a verb that is about to DESTROY the view: the
+    /// read-only rule of [`Shard::peek`], plus one answer a data path must never
+    /// give — **no row means this instance**, because a name with no row and no
+    /// tree is exactly what a legacy (pre-sharding, or `--meta-dir`) deployment
+    /// looks like from here, and the delete has to be allowed to clean it up.
+    ///
+    /// What this deliberately does NOT have is [`Shard::route`]'s bootstrap
+    /// pin. That arm exists to claim a view a process is about to SERVE, and a
+    /// destroy that cannot honour the row is the one verb that must not claim
+    /// anything: with `route()`, a view whose tree this instance had already
+    /// deleted (row gone with it) looked like an unplaced name, so the very next
+    /// `view rm` at a peer pinned the row to ITSELF and then failed on "no
+    /// physical base tree" — leaving a placement row that lied, and then
+    /// refusing every future `view create` of that name with "placed on
+    /// meta-server X" pointing at a host with nothing behind it (found by
+    /// `tests/shard_routing.rs::a_three_node_ring_routes_by_the_row_not_by_adjacency`,
+    /// 2026-11-28: it took one retired-node sequence on a three-instance ring).
+    /// ADR-0006 §2 makes the row the single answer to "which instance serves
+    /// this name", so a verb that cannot serve it must not write it.
+    pub fn peek_forget(&self, view: &str) -> Result<Home, String> {
+        if self.is_solo() {
+            return Ok(Home::Mine);
+        }
+        let row = self.read_placement(view)?;
+        if row.is_none() {
+            return Ok(Home::Mine);
+        }
         self.decide(view, row)
     }
 
