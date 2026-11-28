@@ -41,16 +41,44 @@ def is_run(d):
 # logs root is what the `--selftest` pass below reuses, so injection is judged
 # against exactly the same truth set as the real comparison.
 src = os.environ.get("BOARD_LOG_DIR") or os.path.join(ROOT, ".build-bin", "logs")
-if not os.path.isdir(src):
-    print("skip: no board run found (%s 不存在；先跑 .build-bin/run_all.sh)" % src)
+
+
+def is_worktree(root):
+    """`.git` 是文件而不是目录 = 这是一个 `git worktree` 检出。"""
+    return os.path.isfile(os.path.join(root, ".git"))
+
+
+def bail(what):
+    """没有板子日志时的两种形状，退出码不一样。
+
+    原来这里一律 `skip` + 退 0，于是在 worktree 里 §6 与它的 `--selftest` 都成了
+    空转：日志永远不会有（`.build-bin/` 与 `.bneck/` 在 gitignore 的 dot 目录里，
+    不随 worktree 生成），而「skip」被打成绿的一个分支 —— 报告维度 3 那条 Low
+    说的就是这个「绿灯假象」。自测那一段更直接：没有注入目标时它什么都没验过，
+    却报「注入自测 OK」。
+    """
+    if is_worktree(ROOT):
+        print("[需处理] %s，而且这是一个 git worktree：" % what)
+        print("           板子资产（.build-bin/、.bneck/）被 gitignore 的 /.*/ 排除，不随 worktree 生成，")
+        print("           所以这个检出**永远**没有整板日志 —— 在它里面跑整板给出的绿灯是假的，")
+        print("           它跑的套件数远少于主检出。去主检出跑这一项，")
+        print("           或设 BOARD_LOG_DIR=<主检出>/.build-bin/logs 让真值可读回来。")
+        sys.exit(1)
+    print("skip: %s" % what)
+    if SELFTEST:
+        print("[需处理] --selftest 需要板子日志当注入目标；没有日志时这一项没有验证过任何东西")
+        sys.exit(1)
     sys.exit(0)
+
+
+if not os.path.isdir(src):
+    bail("no board run found (%s 不存在；先跑 .build-bin/run_all.sh)" % src)
 if is_run(src):
     runs = [src]
 else:
     runs = [os.path.join(src, d) for d in sorted(os.listdir(src)) if is_run(os.path.join(src, d))]
     if not runs:
-        print("skip: no board run found (%s 下没有整板目录)" % src)
-        sys.exit(0)
+        bail("no board run found (%s 下没有整板目录)" % src)
 
 
 def read_run(d):

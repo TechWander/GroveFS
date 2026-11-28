@@ -64,7 +64,7 @@ description: Keeps GroveFS documentation (README.md, README.en.md, USAGE.md, USA
    **mount 示例经 manager 引导**（`scripts/mountcheck.py`：挂载坐标只能来自 `--manager`（或 `GROVEFS_MANAGER` env、续行/变量间接），手敲的 `--meta-server`/`--data-servers` 已从 mount 移除——示例里少一个 `--manager` 就是一条被 clap 拒绝或 fail-closed 拒挂的命令）、
    **套件断言数对账**（`scripts/suitenumbers.py`：文档里每句「X 套件 N 条断言」的真值只取
    `.build-bin/logs/<整板>/<stage>.log` 的 `SUMMARY: pass=/fail=` 行，且每个套件各取其最近一次 `fail=0` 的实跑——红板的 `pass` 只数到中断处，拿它当真值会把失败套件的总数改小，所以最新板上未绿的套件会被点名（不影响退出码，但那些数字未被最新板复验）；`BOARD_LOG_DIR` 可指向某一次整板或整个 logs 目录——改套件不会让文档变红，
-   这在本仓库反复发生过；没跑过整板这一项自己跳过并说明，绝不拿记忆里的数当真相；名字不挨着也算（README 那条超长清单里每个「(…; 42 assertions)」归给行内它前面最近的套件名）；而闸门自己也要证明拉得响——`--selftest` 把六份文档里每个复述的数字 +1 注入临时副本，三条归属规则必须都红）。
+   这在本仓库反复发生过；没跑过整板时这一项在主检出自己跳过并说明，但在 worktree 里缺日志判红——`.build-bin/`、`.bneck/` 是 gitignore 的 dot 目录、不随 worktree 生成，那个检出**永远**跑不出整板日志，静默 skip 等于给一条只跑了主检出零头套件的命令盖绿灯；`--selftest` 也一样 fail-closed，没有注入目标时它什么都没验过，不能报「注入自测 OK」；要在 worktree 里复绿，去主检出跑，或设 `BOARD_LOG_DIR=<主检出>/.build-bin/logs`；绝不拿记忆里的数当真相；名字不挨着也算（README 那条超长清单里每个「(…; 42 assertions)」归给行内它前面最近的套件名）；而闸门自己也要证明拉得响——`--selftest` 把六份文档里每个复述的数字 +1 注入临时副本，三条归属规则必须都红）。
    退出码 0 才算收工。
 
 ## Repo Wiki（`.qoder/repowiki/`）同步

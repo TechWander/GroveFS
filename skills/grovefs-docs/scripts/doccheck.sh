@@ -193,6 +193,9 @@ python3 "$(dirname "$(readlink -f "$0")")/mountcheck.py" "$ROOT" || rc=1
 # .build-bin/logs/<整板>/ 里的 SUMMARY 行；每个套件各取其**最近一次 fail=0** 的那趟——
 # 红板的 pass 只数到中断处，拿它当真值会把「跑失败的套件」的总数改小。
 # 最新板上有几个套件红着，这一项会单独列出来(不影响退出码，但那些数字未被最新板复验)。
+# 缺日志分两种形状：主检出 skip + 退 0(确实还没跑过整板)；worktree 判红 —— 板子资产是 gitignore 的
+# dot 目录、不随 worktree 生成，那个检出永远跑不出整板日志，静默 skip 会给出一条只跑了主检出零头
+# 套件的绿灯。自测同样 fail-closed：没有注入目标时它什么都没验过，不能报「注入自测 OK」。
 say "6. 套件断言数对账(真值 = 每套件最近一次 GREEN 实跑)"
 python3 "$(dirname "$(readlink -f "$0")")/suitenumbers.py" "$ROOT" || rc=1
 # 闸门得证明自己拉得响:把六份文档里每个复述的数字 +1 注入一份临时副本,
