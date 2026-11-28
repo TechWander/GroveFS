@@ -210,6 +210,7 @@ pub enum Counter {
     ShardRedirect,
     ShardRefuse,
     ShardPlacementErr,
+    ShardEvicted,
     LockRenew,
     LockExpireReclaim,
     GcFreed,
@@ -233,6 +234,7 @@ impl Counter {
         Counter::ShardRedirect,
         Counter::ShardRefuse,
         Counter::ShardPlacementErr,
+        Counter::ShardEvicted,
         Counter::LockRenew,
         Counter::LockExpireReclaim,
         Counter::GcFreed,
@@ -260,10 +262,15 @@ impl Counter {
             // process did NOT serve, how many management verbs it refused
             // because the tree lives on a peer, and how often the placement
             // table could not be read (which refuses a mount rather than
-            // guessing a home).
+            // guessing a home), and how many trees the placement sweep dropped
+            // because the row started naming a peer. The meta-server process
+            // never calls [`enable`] — telemetry is a mount flag — so this last
+            // one has a second, always-on home: `store.info`'s `evictedTotal`
+            // (see `SweepStats` in `remote::meta::server_ext`).
             Counter::ShardRedirect => "shard mounts redirected",
             Counter::ShardRefuse => "shard management verbs refused",
             Counter::ShardPlacementErr => "shard placement read/write errors",
+            Counter::ShardEvicted => "shard engines dropped by the placement sweep",
             Counter::LockRenew => "lock lease renewals",
             Counter::LockExpireReclaim => "lock expired reclaims",
             Counter::GcFreed => "gc objects freed",

@@ -56,8 +56,9 @@ description: Keeps GroveFS documentation (README.md, README.en.md, USAGE.md, USA
    bash skills/grovefs-docs/scripts/doccheck.sh
    ```
 
-   六项：变更史扫描、参数对账（文档 `--xxx` ↔ `grovefs --help` 真实参数差集，六份文档全覆盖，
-   别家工具的命令行只截工具段不截整行——整行删会连带弄丢同一行里的真参数）、
+   七项：变更史扫描、参数集合对账（文档 `--xxx` ↔ `grovefs --help` 真实参数差集，六份文档全覆盖，
+   别家工具的命令行只截工具段不截整行——整行删会连带弄丢同一行里的真参数；配方目录取不到 `.sh` 时这一项**跳过并判红**，因为差集里混着假阳性，见下）、
+   **示例参数按子命令对账**（`scripts/flagcheck.py`：集合对账只问「这个 flag 在整棵 help 树里存在吗」，所以参数写在不接它的子命令示例里它一律放过——实测抓到一条，`apikey` 的示例写了只有 `web` 接受的 `--api-key-file`，clap 当场 `unexpected argument`；这里按每条示例自己的命令取 `<bin> <路径> --help` 的 Options 段做成员比对（全局参数出现在每个子命令的段里、父命令的非全局参数不出现在子命令的段里，与运行时接受形状一致），起点只认二进制 token 或文档里的替身 `$Y`/`$G`，示例边界取代码片段/行尾/散文（CJK）；`--selftest` 注入「拿别的子命令的参数写在本子命令示例里」的误配，要求全报红且正确归属的那几条全不报红）、
    `docs/*.html` 结构（`scripts/htmlcheck.py`：标签闭合 + 页内 `href="#x"`↔`id="x"` 悬空锚点 + 跨页断链 + 重复 id，
    重写一节最容易改出「目录点下去没反应」，标签配平衡量不出来）、新增用字校验（抓自己打错的汉字）、
    **mount 示例经 manager 引导**（`scripts/mountcheck.py`：挂载坐标只能来自 `--manager`（或 `GROVEFS_MANAGER` env、续行/变量间接），手敲的 `--meta-server`/`--data-servers` 已从 mount 移除——示例里少一个 `--manager` 就是一条被 clap 拒绝或 fail-closed 拒挂的命令）、

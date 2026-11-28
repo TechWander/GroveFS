@@ -562,6 +562,9 @@ pub(super) struct MetaRuntime {
     /// tree-mutating governance verbs refuse to act on a peer's view instead of
     /// creating a second tree under the same name. See [`super::shard`].
     shard: Option<super::shard::Shard>,
+    /// What this instance's placement sweep has already dropped, reported by
+    /// `store.info` beside the ring it acts on. See [`SweepStats`].
+    sweep: SweepStats,
 }
 
 impl MetaRuntime {
@@ -1537,6 +1540,7 @@ impl MetaServer {
             web_auth,
             xfer_owner: Mutex::new(HashMap::new()),
             shard,
+            sweep: SweepStats::default(),
         });
         if rt.sync_repl {
             println!("meta-server: synchronous replication ON (RPO=0 for mutating ops, ACK timeout {SYNC_REPL_ACK_TIMEOUT:?})");
@@ -1773,6 +1777,7 @@ fn serve_on_meta_full(
         web_auth: None,
         xfer_owner: Mutex::new(HashMap::new()),
         shard: None,
+        sweep: SweepStats::default(),
     });
     serve_runtime(listener, rt);
 }
@@ -2072,6 +2077,68 @@ fn stamp_instant(text: &str) -> i64 {
         .unwrap_or(i64::MIN)
 }
 
+/// What the placement sweep remembers about itself, for `store.info`.
+///
+/// `stats` counts the same drops, but the telemetry registry only fills once
+/// `stats::enable()` is called — which is a MOUNT flag (`--stats` /
+/// `GROVEFS_STATS=1` in `main.rs`), and a meta-server process never sets it. So
+/// the two questions an operator actually asks at 3am ("has the sweep ever fired
+/// HERE", "when") need a sink that is on by construction: this tally, reported
+/// in every shard block, plus the named line the ticker prints when it drops
+/// something.
+///
+/// Held per runtime, like the cache it counts: a restart legitimately resets it,
+/// because what it counts is this process's engines.
+#[derive(Default)]
+struct SweepStats {
+    /// Base views dropped because the table named another instance.
+    evicted: AtomicU64,
+    /// When the last drop happened, in the SAME text the placement table writes
+    /// (`chrono::Local::now().to_rfc3339()`) — an operator greps the two against
+    /// each other. `None` while nothing has ever been dropped here, which is a
+    /// different answer from a timestamp of zero.
+    last_at: Mutex<Option<String>>,
+}
+
+impl SweepStats {
+    /// Record one sweep that dropped `evicted` trees. Only called when there is
+    /// something to record — a sweep that found nothing must not move the
+    /// instant, or `lastEvictedAt` would degenerate into "the ticker ran".
+    fn record(&self, evicted: usize, at: &str) {
+        self.evicted.fetch_add(evicted as u64, Ordering::Relaxed);
+        *self.last_at.lock() = Some(at.to_string());
+    }
+
+    fn total(&self) -> u64 {
+        self.evicted.load(Ordering::Relaxed)
+    }
+
+    fn last_at(&self) -> Option<String> {
+        self.last_at.lock().clone()
+    }
+}
+
+/// How many `view → instance` pairs one sweep line may name. Past that the
+/// count is the fact and the names are noise, so the tail collapses.
+const EVICT_LINE_PAIRS: usize = 8;
+
+/// The dropped trees spelled out: each base view and the instance the table now
+/// points at. `residentEngines` that will not fall used to be answered by
+/// restarting the process with instrumentation; this line is what says so
+/// without that.
+fn evicted_line_text(evicted: &[(String, String)]) -> String {
+    let mut parts: Vec<String> = evicted
+        .iter()
+        .take(EVICT_LINE_PAIRS)
+        .map(|(v, m)| format!("{v} → {m}"))
+        .collect();
+    let rest = evicted.len().saturating_sub(EVICT_LINE_PAIRS);
+    if rest > 0 {
+        parts.push(format!("+{rest} more"));
+    }
+    parts.join(", ")
+}
+
 /// Drop the cached trees this instance no longer serves.
 ///
 /// A cross-instance move rewrites ONE ROW, and the instance that used to hold
@@ -2081,35 +2148,42 @@ fn stamp_instant(text: &str) -> i64 {
 /// `view move` path solves this by calling [`MetaRuntime::evict`] directly, and
 /// cannot — it is a different process. So the row is the message and the ticker
 /// is the delivery: the window is one sweep interval, on a sharded deployment
-/// only. Returns how many base views were dropped.
-fn evict_misplaced(rt: &MetaRuntime) -> usize {
+/// only. Returns the dropped base views with the instance the table now names
+/// for each, which is what the sweep line and `rt.sweep` are built from.
+fn evict_misplaced(rt: &MetaRuntime) -> Vec<(String, String)> {
     let Some(sh) = &rt.shard else {
-        return 0;
+        return Vec::new();
     };
     let map = match sh.placement_map() {
         Ok(m) => m,
         // A control plane that will not answer says nothing: keep serving what is
         // open rather than dropping live trees on a transient error.
-        Err(_) => return 0,
+        Err(_) => return Vec::new(),
     };
     let me = sh.me().name.clone();
-    let out: Vec<String> = rt
+    let out: Vec<(String, String)> = rt
         .cache
         .lock()
         .keys()
-        .filter(|v| map.get(*v).map(|h| h != &me).unwrap_or(false))
-        .cloned()
+        .filter_map(|v| {
+            let home = map.get(v)?;
+            if home == &me {
+                return None;
+            }
+            Some((v.clone(), home.clone()))
+        })
         .collect();
     if out.is_empty() {
-        return 0;
+        return out;
     }
+    let names: Vec<String> = out.iter().map(|(v, _)| v.clone()).collect();
     let (mut cache, mut views, mut bases, mut defs) = (
         rt.cache.lock(),
         rt.views.lock(),
         rt.bases.lock(),
         rt.defs.lock(),
     );
-    let hit = |name: &str| out.iter().any(|v| v == name);
+    let hit = |name: &str| names.iter().any(|v| v == name);
     // A derived name (lens/fork/bias) follows its BASE: the base tree moved, so
     // every shape built on it belongs to the other instance too. (`derived` is
     // collected first because it filters `bases`, which the loop then mutates.)
@@ -2123,13 +2197,16 @@ fn evict_misplaced(rt: &MetaRuntime) -> usize {
         bases.remove(&name);
         defs.remove(&name);
     }
-    for v in &out {
+    for v in &names {
         cache.remove(v);
         views.remove(v);
         bases.remove(v);
         defs.remove(v);
     }
-    out.len()
+    drop((cache, views, bases, defs));
+    rt.sweep.record(out.len(), &chrono::Local::now().to_rfc3339());
+    crate::stats::count(crate::stats::Counter::ShardEvicted, out.len() as u64);
+    out
 }
 
 fn serve_runtime(listener: TcpListener, rt: Arc<MetaRuntime>) {
@@ -2183,10 +2260,15 @@ fn serve_runtime(listener: TcpListener, rt: Arc<MetaRuntime>) {
                 );
             }
             let lost = evict_misplaced(&sw);
-            if lost > 0 {
+            if !lost.is_empty() {
+                // Name the trees and the instance the table sent them to: a
+                // bare count is the question "which view, and where did it go",
+                // and the answer used to cost a read of a peer's table plus a
+                // guess about this process's cache.
                 println!(
-                    "meta-server: dropped {}, the placement table now names another instance (`view move --to-meta`)",
-                    crate::cli_style::plural(lost, "cached tree", "cached trees")
+                    "meta-server: dropped {} the placement table now names another instance for: {} (`view move --to-meta`)",
+                    crate::cli_style::plural(lost.len(), "cached tree", "cached trees"),
+                    evicted_line_text(&lost),
                 );
             }
         });
@@ -3356,6 +3438,11 @@ fn control_dispatch(
                         .cloned()
                         .collect();
                     block.insert("homeMismatch".into(), json!(mismatch));
+                    // What the sweep has ALREADY done here, not just what it is
+                    // waiting to close: the tally a `stats` registry that this
+                    // process never enables cannot provide.
+                    block.insert("evictedTotal".into(), json!(rt.sweep.total()));
+                    block.insert("lastEvictedAt".into(), json!(rt.sweep.last_at()));
                     serde_json::Value::Object(block)
                 }
                 Err(e) => {
@@ -9036,6 +9123,7 @@ mod ha_tests {
             web_auth: None,
             xfer_owner: Mutex::new(HashMap::new()),
             shard: None,
+            sweep: SweepStats::default(),
         });
 
         // Witness holds nothing above our epoch: the first proof grants a lease
@@ -9119,6 +9207,7 @@ mod ha_tests {
             web_auth: None,
             xfer_owner: Mutex::new(HashMap::new()),
             shard: None,
+            sweep: SweepStats::default(),
         }
     }
 
@@ -9464,6 +9553,7 @@ mod ha_tests {
             web_auth: None,
             xfer_owner: Mutex::new(HashMap::new()),
             shard: None,
+            sweep: SweepStats::default(),
         };
         let a = store_for(&rt, "v1").unwrap();
         assert!(rt.cache.lock().contains_key("v1"));
@@ -9675,6 +9765,56 @@ mod shard_report_tests {
             "a definition that will not parse must not become a tree of its own"
         );
         assert!(!fold.contains_key("main"), "a base has nothing to fold");
+    }
+
+    /// The sweep's own tally: a total that starts at a REAL zero ("nothing has
+    /// been dropped here" is an answer, not an absent field), a stamp that only
+    /// moves when something was actually dropped, and the table's own text
+    /// format so the two can be grepped against each other.
+    #[test]
+    fn sweep_stats_counts_drops_and_only_dates_drops() {
+        let s = SweepStats::default();
+        assert_eq!(s.total(), 0);
+        assert_eq!(s.last_at(), None, "never swept is not a timestamp");
+        let t1 = "2026-11-28T09:00:00+08:00";
+        s.record(2, t1);
+        assert_eq!(s.total(), 2);
+        assert_eq!(s.last_at().as_deref(), Some(t1));
+        // A second sweep accumulates and re-dates: the field is "when did this
+        // instance last let a tree go", which is what an operator correlates.
+        s.record(1, "2026-11-28T09:20:00+08:00");
+        assert_eq!(s.total(), 3, "a total, not a gauge");
+        assert_eq!(s.last_at().as_deref(), Some("2026-11-28T09:20:00+08:00"));
+        // The stamp is the same RFC3339 text `Shard` writes into `updated_at`.
+        s.record(1, t1);
+        assert!(chrono::DateTime::parse_from_rfc3339(&s.last_at().unwrap()).is_ok());
+    }
+
+    /// The eviction line must name the views and where the table sent them —
+    /// the two facts a `residentEngines` that will not fall needs — and stay
+    /// bounded when a whole instance is retired onto one peer.
+    #[test]
+    fn the_sweep_line_names_each_tree_and_its_new_home() {
+        let one = vec![("alice".to_string(), "m2".to_string())];
+        assert_eq!(evicted_line_text(&one), "alice → m2");
+        let few: Vec<(String, String)> = ["alice", "bob", "carol"]
+            .iter()
+            .map(|v| (v.to_string(), "m2".to_string()))
+            .collect();
+        assert_eq!(
+            evicted_line_text(&few),
+            "alice → m2, bob → m2, carol → m2"
+        );
+        // Past the cap the count is the fact and the names are noise.
+        let many: Vec<(String, String)> = (0..EVICT_LINE_PAIRS + 3)
+            .map(|i| (format!("v{i}"), "m2".to_string()))
+            .collect();
+        let line = evicted_line_text(&many);
+        assert!(line.starts_with("v0 → m2"), "{line}");
+        assert!(line.contains("v7 → m2"), "the cap itself must be named: {line}");
+        assert!(!line.contains("v8 → m2"), "{line}");
+        assert!(line.ends_with(", +3 more"), "{line}");
+        assert_eq!(evicted_line_text(&[]), "");
     }
 }
 

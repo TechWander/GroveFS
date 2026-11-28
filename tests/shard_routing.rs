@@ -641,6 +641,26 @@ fn a_shorter_sweep_shortens_the_window_a_deposed_instance_holds_the_tree() {
         t_release < Duration::from_secs(3),
         "a 1s sweep only released the tree after {t_release:?}: the configured interval was ignored"
     );
+    // THE SWEEP, ATTESTED: the shard block now carries how many trees THIS
+    // instance dropped and when, so the `residentEngines == 0` the loop waited
+    // for is backed by a reported fact instead of a log nobody kept.
+    let i = n1.info();
+    assert!(
+        i["shard"]["evictedTotal"]
+            .as_u64()
+            .filter(|n| *n >= 1)
+            .is_some(),
+        "the sweep dropped the tree and reported nothing: {i}"
+    );
+    let at = i["shard"]["lastEvictedAt"]
+        .as_str()
+        .expect("a drop that happened must carry an instant");
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(at).is_ok(),
+        "unparsable lastEvictedAt: {at}"
+    );
+    // The instance that GAINED the tree dropped nothing to gain it.
+    assert_eq!(n2.info()["shard"]["evictedTotal"], json!(0));
     // Same outcome as the default interval: the mount follows to the new home.
     let ino = m.create_node(ROOT_INO, "after", false, Some("k2"), 0o0644, UID, GID);
     assert_ne!(ino.expect("the mount never followed the view"), 0);
@@ -656,7 +676,9 @@ fn a_shorter_sweep_shortens_the_window_a_deposed_instance_holds_the_tree() {
 /// physical base trees and `rows` counts the rows behind them, `lastUpdatedAt`
 /// is the table's own text, `sweepMs` is the window that was configured and
 /// `homeMismatch` is the split-write window made visible instead of being
-/// something an operator reads out of a restarted process's log.
+/// something an operator reads out of a restarted process's log. `evictedTotal`/
+/// `lastEvictedAt` are the other half of that: what the sweep has already done
+/// here, including the honest answer of "nothing, yet".
 #[test]
 fn store_info_reports_the_placement_rows_behind_its_view_count() {
     let Some(pg) = pg_uri() else {
@@ -724,6 +746,10 @@ fn store_info_reports_the_placement_rows_behind_its_view_count() {
         "unparsable updated_at: {at}"
     );
     assert!(i["shard"]["homeMismatch"].as_array().unwrap().is_empty());
+    // Nothing has been dropped HERE, and the block says so rather than omitting
+    // the fields: `0` and `null` are answers, not gaps.
+    assert_eq!(i["shard"]["evictedTotal"], json!(0));
+    assert_eq!(i["shard"]["lastEvictedAt"], serde_json::Value::Null);
 
     // Move it, asked at the TARGET, and leave the row as the only message: with
     // a 600s sweep nothing else tells the old instance it was deposed.
@@ -752,6 +778,10 @@ fn store_info_reports_the_placement_rows_behind_its_view_count() {
         n1.info()["residentEngines"].as_u64().unwrap_or(0) >= 1,
         "the tree was dropped although the sweep is set to 600s"
     );
+    // A flipped ROW is not a drop: the sweep is asleep for another 600s, so the
+    // tally must still read zero while `homeMismatch` names the tree above.
+    // Conflating the two would make `evictedTotal` a re-labelled sweep counter.
+    assert_eq!(i["shard"]["evictedTotal"], json!(0));
     // The NEW home never reports its own tree as misplaced.
     assert!(n2.info()["shard"]["homeMismatch"]
         .as_array()

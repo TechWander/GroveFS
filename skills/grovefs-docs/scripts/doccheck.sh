@@ -3,6 +3,8 @@
 # 用法: bash skills/grovefs-docs/scripts/doccheck.sh [仓库根目录]
 #   GROVEFS_BIN=/path/to/grovefs  指定用来跑 --help 的二进制(默认 target/release/grovefs)
 # 退出码: 0=干净; 1=有需处理的命中或结构错误。
+# 检查项: 1 变更叙述 / 2 参数集合对账 / 2b 示例参数按子命令对账 / 3 HTML 结构 /
+#   4 新增用字 / 5 mount 坐标 / 6 套件断言数(+ 它的注入自测)。
 set -uo pipefail
 
 # 用 readlink -f 解链:.qoder/skills/ 下是符号链,不解会算错仓库根
@@ -76,14 +78,13 @@ if [ -x "$BIN" ]; then
   # 在 worktree 里跑时 glob 取不到文件,这条剥规则会**静默失效**——配方的
   # `--yes`/`--list` 于是被读成文档臆造参数。所以允许指到主检出,并在空集时自报降级。
   for s in "${GROVEFS_RECIPE_DIR:-$ROOT/.bneck}"/*.sh; do [ -e "$s" ] && basename "$s"; done > "$recs"
+  degraded=0
   if [ -s "$recs" ]; then
     for f in "${DOCS[@]}"; do sed '/<style>/,/<\/style>/d' "$f"; done \
       | grep -vF -f "$recs" > "$dtxt"
   else
     for f in "${DOCS[@]}"; do sed '/<style>/,/<\/style>/d' "$f"; done > "$dtxt"
-    printf '  [提示] 配方目录 %s 无 .sh,配方行剥离未生效,孤儿参数可能误报\n' \
-      "${GROVEFS_RECIPE_DIR:-$ROOT/.bneck}" >&2
-    printf '         加 GROVEFS_RECIPE_DIR=<主检出>/.bneck 重跑可消除\n' >&2
+    degraded=1
   fi
   # 同一条规矩用于**别家工具的命令行**:`cargo test --release --test meta_ledger -- --ignored
   # --nocapture` 里的 `--test`/`--ignored`/`--nocapture` 是 cargo 的接口。`--ignored`/`--nocapture`
@@ -103,28 +104,50 @@ if [ -x "$BIN" ]; then
   # `pg_dump` 在反引号里不匹配)。代价实测:文档参数集只少 `clean`(pg_restore 的)与
   # `format`(pg_dump 的),没有真的 grovefs 参数被连带截掉。
   sed -i -E 's/(^|[;&|]|[$] )(sudo( -u [a-z]+)? +)?(pg_dump|pg_restore|psql) .*/\1ext-tool-cmd/' "$dtxt"
-  grep -oP -- '(?<![A-Za-z0-9_-])--[a-z][a-z0-9-]*' "$dtxt" | sed 's/^--//' | grep -v -- '-$' | sort -u > "$docf"
-  # 负空间清单(明说「未实现」的那几行)里点名的参数不算臆造。同一个道理适用于**当场否定**的写法
-  # ——「口令只走 --password-file，没有 `--password`」是在告诉读者这个 flag 不存在，不是臆造它。
-  grep -hE '未实现|别在当前版本上期待|没有.{0,3}--|never a.{0,3}--' "${DOCS[@]}" 2>/dev/null \
-    | grep -oP -- '(?<![A-Za-z0-9_-])--[a-z][a-z0-9-]*' | sed 's/^--//' | sort -u > "$neg"
-  comm -23 "$docf" "$real" > "$orph"
-  comm -23 "$orph" "$neg" > "${orph}.2" && mv "${orph}.2" "$orph"
-  # 噪声两类:别家工具的参数(rsync/cargo/systemd/journalctl/firewalld/pg_dump…),
-  # 以及文档里的占位与通配写法(--xxx、--bw-*)。运维配方的选项不在这里,见上面的按行剥离。
-  FOREIGN='delete-after|delete-before|delete-during|exclude|include|inplace|info|progress|partial|times|whole-file|verbose|release|nocapture|bench|features|ignored|now|since|until|no-pager|reload|enable|disable|status|full|state|format|permanent|add-rich-rule|zone|type|set-profile|daemon-reload|json-pretty|exec|xxx|bw-|no-default-features'
-  nf=$(grep -cvE "^($FOREIGN)$" "$orph" || true)
-  printf '  真实参数 %d 个,文档参数 %d 个,差集 %d 项(其中非外部工具/非负空间 %d 项)\n' \
-    "$(wc -l < "$real")" "$(wc -l < "$docf")" "$(wc -l < "$orph")" "$nf"
-  printf '  非外部工具、非占位的差集需逐条定性(应为空;完整差集见 %s):\n' "$orph"
-  grep -vE "^($FOREIGN)$" "$orph" | sed 's/^/    --/'
-  printf '  判据:出现在「未实现(诚实标注)」清单里的名字 = 合法(负空间说明);\n'
-  printf '  当前版本根本没有的 grovefs 参数名被当真的写 = 需删改。\n'
-  [ "$nf" -gt 0 ] && rc=1
-  [ "$(wc -l < "$real")" -lt 40 ] && { printf '  [警告] 真实参数过少,walker 可能没走全(检查 %s)\n' "$BIN"; rc=1; }
+  # 配方集为空 = 这一项量不准,与其交出一份把脚本自带参数读成臆造参数的差集让
+  # 人逐条分诊,不如明说跳过并判红(worktree 里 .bneck 不存在是 git 行为,不判红
+  # 就会被当噪声忽略 —— 而真正的臆造参数就混在同一片噪声里)。
+  if [ "$degraded" = 1 ]; then
+    printf '  [需处理] 配方目录 %s 无 .sh → 集合对账**跳过**\n' "${GROVEFS_RECIPE_DIR:-$ROOT/.bneck}"
+    printf '           配方行没剥掉时,配方脚本自带的 --yes/--list 会被读成文档臆造参数,\n'
+    printf '           真臆造参数也就一并被当噪声放过去。重跑时加 GROVEFS_RECIPE_DIR=<主检出>/.bneck。\n'
+    rc=1
+  else
+    grep -oP -- '(?<![A-Za-z0-9_-])--[a-z][a-z0-9-]*' "$dtxt" | sed 's/^--//' | grep -v -- '-$' | sort -u > "$docf"
+    # 负空间清单(明说「未实现」的那几行)里点名的参数不算臆造。同一个道理适用于**当场否定**的写法
+    # ——「口令只走 --password-file，没有 `--password`」是在告诉读者这个 flag 不存在，不是臆造它。
+    grep -hE '未实现|别在当前版本上期待|没有.{0,3}--|never a.{0,3}--' "${DOCS[@]}" 2>/dev/null \
+      | grep -oP -- '(?<![A-Za-z0-9_-])--[a-z][a-z0-9-]*' | sed 's/^--//' | sort -u > "$neg"
+    comm -23 "$docf" "$real" > "$orph"
+    comm -23 "$orph" "$neg" > "${orph}.2" && mv "${orph}.2" "$orph"
+    # 噪声两类:别家工具的参数(rsync/cargo/systemd/journalctl/firewalld/pg_dump…),
+    # 以及文档里的占位与通配写法(--xxx、--bw-*)。运维配方的选项不在这里,见上面的按行剥离。
+    FOREIGN='delete-after|delete-before|delete-during|exclude|include|inplace|info|progress|partial|times|whole-file|verbose|release|nocapture|bench|features|ignored|now|since|until|no-pager|reload|enable|disable|status|full|state|format|permanent|add-rich-rule|zone|type|set-profile|daemon-reload|json-pretty|exec|xxx|bw-|no-default-features'
+    nf=$(grep -cvE "^($FOREIGN)$" "$orph" || true)
+    printf '  真实参数 %d 个,文档参数 %d 个,差集 %d 项(其中非外部工具/非负空间 %d 项)\n' \
+      "$(wc -l < "$real")" "$(wc -l < "$docf")" "$(wc -l < "$orph")" "$nf"
+    printf '  非外部工具、非占位的差集需逐条定性(应为空;完整差集见 %s):\n' "$orph"
+    grep -vE "^($FOREIGN)$" "$orph" | sed 's/^/    --/'
+    printf '  判据:出现在「未实现(诚实标注)」清单里的名字 = 合法(负空间说明);\n'
+    printf '  当前版本根本没有的 grovefs 参数名被当真的写 = 需删改。\n'
+    [ "$nf" -gt 0 ] && rc=1
+    [ "$(wc -l < "$real")" -lt 40 ] && { printf '  [警告] 真实参数过少,walker 可能没走全(检查 %s)\n' "$BIN"; rc=1; }
+  fi
 else
   printf '  [跳过] 找不到可执行 %s(用 GROVEFS_BIN 指定)\n' "$BIN"
 fi
+
+# ---------- 2b. 示例参数按子命令对账 ----------
+# 上面那项是全局集合成员检查:名字在整棵 help 树里存在就放过。所以「参数写在了不
+# 接它的子命令示例里」这类错它一律放过(实测抓到一条:`apikey` 的示例里写了只有
+# `web` 才接受的 `--api-key-file`,clap 当场报 unexpected argument);反过来,
+# 配方脚本自带的参数它又只能误报。这里逐条示例取它自己那条命令的 `--help`
+# Options 段做成员比对(参 flagcheck.py 的 doc),并自带注入自测。
+say "2b. 示例参数按子命令对账(参数写在不接它的子命令上 = 需处理)"
+GROVEFS_BIN="$BIN" python3 "$(dirname "$(readlink -f "$0")")/flagcheck.py" "$ROOT" || rc=1
+# 闸门得证明自己拉得响:注入「拿别的子命令的参数写在本子命令示例里」的误配,要求
+# 全报红、同时正确归属的那几条全不报红。
+GROVEFS_BIN="$BIN" python3 "$(dirname "$(readlink -f "$0")")/flagcheck.py" "$ROOT" --selftest || rc=1
 
 # ---------- 3. HTML 结构(两份页:标签闭合 + 页内锚点 + 跨页引用) ----------
 say "3. docs/*.html 结构(标签闭合 / 锚点 / 断链)"
@@ -181,5 +204,5 @@ else
 fi
 
 say "结论"
-if [ "$rc" = 0 ]; then printf '  OK\n'; else printf '  需处理(见上面 [需处理] / 结构错误 / 参数差集 / 示例缺坐标 / 计数漂移)\n'; fi
+if [ "$rc" = 0 ]; then printf '  OK\n'; else printf '  需处理(见上面 [需处理] / 结构错误 / 参数差集 / 跨子命令误配 / 示例缺坐标 / 计数漂移)\n'; fi
 exit "$rc"
