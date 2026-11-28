@@ -542,25 +542,14 @@ impl Shard {
         });
     }
 
-    /// Every placement row, as view → node name (`store.info`'s shard page).
+    /// Every placement row, as view → node name. This is the ROUTING read: the
+    /// placement sweep (`evict_misplaced`) and the governance verbs decide on it.
     /// Read-only: it never CREATES the table, so an operator pointing a
     /// non-sharded deployment at the console does not grow an empty table — a
     /// missing one simply means nothing has been placed yet.
     pub fn placement_map(&self) -> Result<HashMap<String, String>, String> {
         self.with_client(|c| {
-            let exists = c
-                .query(
-                    // Cast to bool: the wire type `regclass` has no decoder here, so
-                    // reading the column as a name fails with "error deserializing
-                    // column 0" (found by `tests/shard_routing.rs`).
-                    "SELECT (to_regclass('grovefs_control.meta_placement') IS NOT NULL)",
-                    &[],
-                )
-                .map_err(|e| format!("postgres probe {META_PLACEMENT_TABLE}: {e}"))?
-                .first()
-                .map(|r| r.get::<_, bool>(0))
-                .unwrap_or(false);
-            if !exists {
+            if !placement_exists(c)? {
                 return Ok(HashMap::new());
             }
             let rows = c
@@ -593,25 +582,39 @@ impl Shard {
         Ok(rows)
     }
 
-    /// Placed-view count per node name, ring order preserved for the report.
-    /// A node with no rows shows 0, which is the point of counting for the
-    /// operator: an empty instance is visible, not merely absent.
+    /// Every row of the placement table with WHEN it was written:
+    /// `(view, meta, updated_at)` verbatim, sorted by view.
     ///
-    /// The error travels rather than becoming a zero: `store.info` is the page an
-    /// operator opens when a deployment looks wrong, and "every instance holds 0
-    /// views" reported from an unreadable table is the shape of a false alarm.
-    pub fn placement_counts(&self) -> Result<Vec<(MetaNode, i64)>, String> {
-        let counts = self.placement_map()?;
-        Ok(self
-            .nodes
-            .iter()
-            .map(|n| {
-                (
-                    n.clone(),
-                    counts.values().filter(|v| *v == &n.name).count() as i64,
+    /// The third column is why this exists next to [`Shard::placement_rows`]: a
+    /// count cannot say how stale its own answer is, and inside a sweep window
+    /// the question an operator is asking is exactly "when did this row change,
+    /// and is the instance still holding the tree past that moment". Read-only
+    /// and non-creating like the other two, and only ever reached from
+    /// `store.info` — the routing read stays on [`Shard::placement_map`].
+    pub fn placement_audit(&self) -> Result<Vec<(String, String, String)>, String> {
+        self.with_client(|c| {
+            if !placement_exists(c)? {
+                return Ok(Vec::new());
+            }
+            let rows = c
+                .query(
+                    &format!(
+                        "SELECT view, meta, updated_at FROM {META_PLACEMENT_TABLE} ORDER BY view"
+                    ),
+                    &[],
                 )
-            })
-            .collect())
+                .map_err(|e| format!("postgres read {META_PLACEMENT_TABLE}: {e}"))?;
+            Ok(rows
+                .into_iter()
+                .map(|r| {
+                    (
+                        r.get::<_, String>(0),
+                        r.get::<_, String>(1),
+                        r.get::<_, String>(2),
+                    )
+                })
+                .collect())
+        })
     }
 
     /// A FRESH connection to the control plane, BOUNDED at both ends.

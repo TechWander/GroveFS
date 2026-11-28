@@ -1977,6 +1977,101 @@ fn sweep_span_text(ms: u64) -> String {
     }
 }
 
+/// The base each placement name folds to, read in ONE pass over the definitions.
+///
+/// This is [`shard_routing_key`]'s rule — a lens or a fork folds to its base, an
+/// alias and anything unreadable are counted under their own name — applied to
+/// the whole table at once instead of one control-plane read per row: `store.info`
+/// is the page an operator opens while a deployment looks wrong, and it must not
+/// cost a query per placement row to answer.
+///
+/// The one shape the bulk walk does not reach is a def whose TREE is gone: the
+/// file store enumerates definitions by walking the tree list, so a stray def
+/// stays invisible here and is counted under its own name — which is what the
+/// row's own text says anyway, and a name with no tree is not a second tree.
+fn shard_base_fold(rt: &MetaRuntime) -> HashMap<String, String> {
+    let mut fold = HashMap::new();
+    for (name, text) in rt.control.list_defs().unwrap_or_default() {
+        if let Ok(ViewDef::Derived(base, _)) | Ok(ViewDef::Fork(base)) =
+            LayoutRules::parse_def(&text)
+        {
+            fold.insert(name, base);
+        }
+    }
+    fold
+}
+
+/// The ring half of `store.info`'s shard block, folded out of the placement rows.
+///
+/// `views` counts PHYSICAL BASE TREES, not rows: a lens sitting beside its base
+/// names one tree, and the per-row tally this replaces said two. The fold is
+/// [`shard_routing_key`]'s, read in bulk through [`shard_base_fold`], so the page
+/// and the router cannot disagree about what "a view" is. `rows` keeps the raw
+/// count anyway — a derived row in the table is the ADR-0006 §2 breakage, and
+/// folding the number away would hide that finding too.
+///
+/// A row naming a node the ring does not define belongs to NOBODY's tally: it
+/// would disappear from every `views`/`rows` count while a mount of that name
+/// still refuses with "does not define", so it surfaces as `orphanViews`.
+///
+/// Pure — no store access, `base_of` injected — so the three verdicts above are
+/// testable without a control plane. The READ error is the caller's to ship
+/// rather than a zero here: "every instance holds 0 views" reported off an
+/// unreadable table is the shape of a false alarm.
+fn shard_ring_report(
+    nodes: &[super::shard::MetaNode],
+    me: &str,
+    rows: &[(String, String, String)],
+    base_of: impl Fn(&str) -> String,
+) -> serde_json::Map<String, serde_json::Value> {
+    let named: std::collections::HashSet<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+    let orphans: Vec<String> = rows
+        .iter()
+        .filter(|(_, m, _)| !named.contains(m.as_str()))
+        .map(|(v, m, _)| format!("{v} → {m}"))
+        .collect();
+    let per_node = nodes
+        .iter()
+        .map(|n| {
+            let mine: Vec<&(String, String, String)> =
+                rows.iter().filter(|r| r.1 == n.name).collect();
+            let bases: std::collections::HashSet<String> =
+                mine.iter().map(|r| base_of(&r.0)).collect();
+            serde_json::json!({
+                "name": n.name,
+                "addr": n.addr,
+                "views": bases.len(),
+                "rows": mine.len(),
+                "here": n.name == me,
+                "lastUpdatedAt": newest_stamp(&mine),
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut out = serde_json::Map::new();
+    out.insert("nodes".into(), serde_json::json!(per_node));
+    out.insert("placementRows".into(), serde_json::json!(rows.len()));
+    out.insert("orphanViews".into(), serde_json::json!(orphans));
+    out
+}
+
+/// The newest `updated_at` among `rows`, compared as INSTANTS and shipped as the
+/// text the table holds. `Shard` writes `chrono::Local::now().to_rfc3339()`, so
+/// the string carries a UTC offset and text order is not time order across zones;
+/// the original text goes out because that is what an operator greps for in a
+/// peer's log. A value that will not parse (a hand-edited row) sorts below every
+/// real one and is still reported rather than dropped.
+fn newest_stamp(rows: &[&(String, String, String)]) -> Option<String> {
+    rows.iter()
+        .max_by_key(|(_, _, at)| stamp_instant(at))
+        .map(|(_, _, at)| at.clone())
+}
+
+fn stamp_instant(text: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(text)
+        .map(|d| d.timestamp_micros())
+        .unwrap_or(i64::MIN)
+}
+
 /// Drop the cached trees this instance no longer serves.
 ///
 /// A cross-instance move rewrites ONE ROW, and the instance that used to hold
@@ -3204,12 +3299,27 @@ fn control_dispatch(
             // addresses travel (an address is what a client was redirected to, so
             // it is not a secret), a backend URI never does — the fingerprint
             // column is already credential-free.
-            let shard = rt.shard.as_ref().map(|sh| match sh.placement_counts() {
-                Ok(rows) => json!({
-                    "self": sh.me().name,
-                    "addr": sh.me().addr,
-                    "ring": sh.origin(),
-                    "backend": sh.store_fingerprint(),
+            let shard = rt.shard.as_ref().map(|sh| match sh.placement_audit() {
+                Ok(rows) => {
+                    // The router's own fold, so the page and a redirect cannot
+                    // disagree about what one view is. A definition that cannot
+                    // be read is not a second tree either: count the name itself
+                    // and let the row's own text say what it names.
+                    let fold = shard_base_fold(rt);
+                    let base_of = |v: &str| {
+                        fold.get(v)
+                            .cloned()
+                            .unwrap_or_else(|| v.to_string())
+                    };
+                    let mut block = shard_ring_report(sh.nodes(), &sh.me().name, &rows, base_of);
+                    block.insert("self".into(), json!(sh.me().name));
+                    block.insert("addr".into(), json!(sh.me().addr));
+                    block.insert("ring".into(), json!(sh.origin()));
+                    block.insert("backend".into(), json!(sh.store_fingerprint()));
+                    // How often this instance re-reads the table: the number that
+                    // says how long a row naming another instance may still be
+                    // served from here (`--shard-sweep-secs`).
+                    block.insert("sweepMs".into(), json!(sh.sweep_ms()));
                     // Whether the placement table sits in the SAME database as
                     // the trees (`--meta-store postgres://…`, which is its own
                     // control plane) or in one the operator named apart
@@ -3218,31 +3328,44 @@ fn control_dispatch(
                     // `--meta-store` URI is adopted into a managed registry, so
                     // the raw spec and the URI `Shard` dialed are two spellings
                     // of one database.
-                    "controlPlane": if resolved_control_uri(rt.store.control_uri()).as_deref()
-                        == Some(sh.control_uri())
-                    {
-                        "tree backend"
-                    } else {
-                        "separate --control-plane"
-                    },
-                    "nodes": rows
-                        .iter()
-                        .map(|(n, c)| {
-                            json!({
-                                "name": n.name,
-                                "addr": n.addr,
-                                "views": c,
-                                "here": n.name == sh.me().name,
-                            })
-                        })
-                        .collect::<Vec<_>>(),
-                }),
-                Err(e) => json!({
-                    "self": sh.me().name,
-                    "addr": sh.me().addr,
-                    "backend": sh.store_fingerprint(),
-                    "error": e,
-                }),
+                    block.insert(
+                        "controlPlane".into(),
+                        json!(if resolved_control_uri(rt.store.control_uri()).as_deref()
+                            == Some(sh.control_uri())
+                        {
+                            "tree backend"
+                        } else {
+                            "separate --control-plane"
+                        }),
+                    );
+                    // The sweep window made VISIBLE: trees this process still
+                    // holds open while the table names somebody else as their
+                    // home. Exactly one entry per `view move` until the next sweep
+                    // is the normal state and `evict_misplaced` is what clears it;
+                    // a name that never leaves this list is the split write the
+                    // sweep exists to prevent — which is the question an operator
+                    // used to answer by reading the log of a restarted process.
+                    let home: HashMap<&str, &str> =
+                        rows.iter().map(|(v, m, _)| (v.as_str(), m.as_str())).collect();
+                    let me = sh.me().name.as_str();
+                    let mismatch: Vec<String> = rt
+                        .cache
+                        .lock()
+                        .keys()
+                        .filter(|k| home.get(k.as_str()).map(|h| *h != me).unwrap_or(false))
+                        .cloned()
+                        .collect();
+                    block.insert("homeMismatch".into(), json!(mismatch));
+                    serde_json::Value::Object(block)
+                }
+                Err(e) => {
+                    let mut block = serde_json::Map::new();
+                    block.insert("self".into(), json!(sh.me().name));
+                    block.insert("addr".into(), json!(sh.me().addr));
+                    block.insert("backend".into(), json!(sh.store_fingerprint()));
+                    block.insert("error".into(), json!(e));
+                    serde_json::Value::Object(block)
+                }
             });
             Ok(json!({
                 // `backend` is the CONTROL-plane backend; `metadataBackend` is
@@ -8961,8 +9084,10 @@ mod ha_tests {
 
     /// A `MetaRuntime` shaped like one half of an HA pair over an empty tree dir,
     /// for the tests that exercise the WRITE-PATH blocking surface (arbiter proof,
-    /// sync-repl push slot) rather than the metadata itself.
-    fn test_rt(
+    /// sync-repl push slot) rather than the metadata itself. `pub(super)` because
+    /// [`super::shard_report_tests`] builds the same shape to exercise a control
+    /// store read.
+    pub(super) fn test_rt(
         base: &std::path::Path,
         ha: Option<Arc<HaState>>,
         peer: Option<String>,
@@ -9386,6 +9511,170 @@ mod ha_tests {
             .store(0, Ordering::Relaxed);
         rt.engine_idle_ms = 0;
         assert_eq!(evict_idle(&rt), 0, "idle=0 must never evict");
+    }
+}
+
+/// The `store.info` shard block. `views` folds placement rows down to PHYSICAL
+/// BASE trees, `rows` keeps the raw tally, and a row naming a node the ring does
+/// not define belongs to nobody's count but still has to be SEEN — the three
+/// verdicts the per-row counting this replaced got wrong, none of which needs a
+/// PostgreSQL to settle.
+#[cfg(test)]
+mod shard_report_tests {
+    use super::super::shard::MetaNode;
+    use super::*;
+
+    fn node(name: &str) -> MetaNode {
+        MetaNode {
+            name: name.to_string(),
+            addr: "127.0.0.1:9500".to_string(),
+        }
+    }
+
+    fn row(view: &str, meta: &str, at: &str) -> (String, String, String) {
+        (view.to_string(), meta.to_string(), at.to_string())
+    }
+
+    /// Stand-in for the control plane's `get_def`: each `lens` sits under its
+    /// `base`; every other name IS its own base tree.
+    fn base_table<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> String + 'a {
+        move |v| {
+            pairs
+                .iter()
+                .find(|p| p.0 == v)
+                .map(|p| p.1.to_string())
+                .unwrap_or_else(|| v.to_string())
+        }
+    }
+
+    fn node_block(
+        block: &serde_json::Map<String, serde_json::Value>,
+        name: &str,
+    ) -> serde_json::Value {
+        block["nodes"]
+            .as_array()
+            .expect("nodes is an array")
+            .iter()
+            .find(|n| n["name"] == serde_json::json!(name))
+            .cloned()
+            .unwrap_or_else(|| panic!("ring reports no {name}"))
+    }
+
+    #[test]
+    fn a_lens_counts_as_its_base_tree_but_stays_a_row() {
+        let rows = vec![
+            row("alpha", "gfs1", "2026-11-28T09:00:00+00:00"),
+            row("lab", "gfs1", "2026-11-28T09:30:00+00:00"),
+            row("team", "gfs2", "2026-11-28T08:00:00+00:00"),
+        ];
+        // `lab` is a lens on `alpha`: one physical tree, two rows.
+        let block = shard_ring_report(
+            &[node("gfs1"), node("gfs2")],
+            "gfs1",
+            &rows,
+            base_table(&[("lab", "alpha")]),
+        );
+        let g1 = node_block(&block, "gfs1");
+        assert_eq!(g1["views"], serde_json::json!(1), "a lens is not a second tree");
+        assert_eq!(
+            g1["rows"],
+            serde_json::json!(2),
+            "but the derived row is the finding, not noise to fold away"
+        );
+        assert_eq!(g1["here"], serde_json::json!(true));
+        assert_eq!(
+            g1["lastUpdatedAt"],
+            serde_json::json!("2026-11-28T09:30:00+00:00")
+        );
+        let g2 = node_block(&block, "gfs2");
+        assert_eq!(g2["views"], serde_json::json!(1));
+        assert_eq!(g2["here"], serde_json::json!(false));
+        assert_eq!(block["placementRows"], serde_json::json!(3));
+        assert_eq!(block["orphanViews"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn a_row_naming_a_node_outside_the_ring_is_no_tally_but_is_shown() {
+        // The `view move`/retired-node shape: a mount of that name still refuses
+        // with "does not define", so the row must surface somewhere even though
+        // it cannot land in any node's count.
+        let rows = vec![row("old", "gfs9", "2026-11-28T07:00:00+00:00")];
+        let block = shard_ring_report(
+            &[node("gfs1"), node("gfs2")],
+            "gfs1",
+            &rows,
+            |_| "old".to_string(),
+        );
+        assert_eq!(block["placementRows"], serde_json::json!(1));
+        assert_eq!(block["orphanViews"], serde_json::json!(["old → gfs9"]));
+        for n in block["nodes"].as_array().unwrap() {
+            assert_eq!(n["views"], serde_json::json!(0));
+            assert_eq!(n["rows"], serde_json::json!(0));
+            // No rows means nothing to date, not date zero: an invented
+            // timestamp would read as a sweep that ran.
+            assert_eq!(n["lastUpdatedAt"], serde_json::Value::Null);
+        }
+    }
+
+    #[test]
+    fn last_updated_at_takes_the_newer_instant_and_ships_the_table_text() {
+        // `10:00+08:00` is 02:00 UTC: the textually larger string, the factually
+        // older row. A hand-edited value that will not parse sorts below both
+        // and is still counted as a row of its node.
+        let rows = vec![
+            row("a", "gfs1", "not a timestamp"),
+            row("b", "gfs1", "2026-11-28T10:00:00+08:00"),
+            row("c", "gfs1", "2026-11-28T09:00:00+00:00"),
+        ];
+        let block = shard_ring_report(&[node("gfs1")], "gfs1", &rows, |_| "x".to_string());
+        assert_eq!(
+            node_block(&block, "gfs1")["lastUpdatedAt"],
+            serde_json::json!("2026-11-28T09:00:00+00:00")
+        );
+        assert_eq!(node_block(&block, "gfs1")["rows"], serde_json::json!(3));
+    }
+
+    /// The fold `store.info` applies is the ROUTER's rule, read in bulk over a
+    /// real control store: a lens and a fork land on their base, an alias stays
+    /// under its own name (which is what [`shard_routing_key`] does with one), a
+    /// definition that will not parse is skipped, and a physical view with no
+    /// definition of its own is absent — the caller counts it under its own name.
+    #[test]
+    fn shard_base_fold_uses_the_routers_rule_over_a_real_control_store() {
+        use super::ha_tests::test_rt;
+        let dir = tempfile::Builder::new()
+            .prefix("grovefs_fold_")
+            .tempdir()
+            .unwrap();
+        let rt = test_rt(dir.path(), None, None, None, false);
+        // The trees have to be REAL before the defs go in: a fork's def travels
+        // with its OWN tree directory and a lens anchors inside its base's, and
+        // the bulk read walks the TREE list to reach those slots. Writing defs
+        // over trees that do not exist would test the walk, not the rule.
+        for view in ["main", "fk"] {
+            let tree = crate::meta::ensure_view_db_path(dir.path(), view).unwrap();
+            std::fs::write(&tree, b"").unwrap();
+        }
+        for (name, text) in [
+            ("lens1", "base main\nhide /x\n"),
+            ("fk", "fork main\n"),
+            ("al", "alias main\n"),
+            ("broken", "not a definition\n"),
+        ] {
+            rt.control.put_def(name, text).expect("store the def");
+        }
+        let fold = shard_base_fold(&rt);
+        assert_eq!(fold.get("lens1").map(String::as_str), Some("main"));
+        assert_eq!(fold.get("fk").map(String::as_str), Some("main"));
+        assert!(
+            !fold.contains_key("al"),
+            "an alias names the physical view and routes under its OWN name"
+        );
+        assert!(
+            !fold.contains_key("broken"),
+            "a definition that will not parse must not become a tree of its own"
+        );
+        assert!(!fold.contains_key("main"), "a base has nothing to fold");
     }
 }
 

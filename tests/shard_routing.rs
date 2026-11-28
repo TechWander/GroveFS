@@ -26,8 +26,11 @@
 //!     nor its neighbour, and a row naming a node the ring does not define
 //!     fails the mount everywhere with that name instead of falling back to
 //!     serving the tree locally;
-//!   * `store.info` reports the ring, per-node placed-view counts and which
-//!     instance is answering.
+//!   * `store.info` reports the ring, the physical base trees EACH node's
+//!     placement rows fold to, the raw row tally next to them, the row's own
+//!     `updated_at`, the configured sweep and the trees an instance still holds
+//!     while the table names a peer — which is the one thing a per-node count
+//!     could not say while a move was converging.
 //!
 //! Needs a reachable PostgreSQL, because a placement table only one process can
 //! read is that process's private opinion. `GROVEFS_PG_TEST_URI` names the
@@ -649,6 +652,136 @@ fn a_shorter_sweep_shortens_the_window_a_deposed_instance_holds_the_tree() {
     cleanup(&pg, scratch.path(), &key_id);
 }
 
+/// The shard block's arithmetic, against a REAL placement table. `views` counts
+/// physical base trees and `rows` counts the rows behind them, `lastUpdatedAt`
+/// is the table's own text, `sweepMs` is the window that was configured and
+/// `homeMismatch` is the split-write window made visible instead of being
+/// something an operator reads out of a restarted process's log.
+#[test]
+fn store_info_reports_the_placement_rows_behind_its_view_count() {
+    let Some(pg) = pg_uri() else {
+        eprintln!("skipping: no PostgreSQL reachable (set GROVEFS_PG_TEST_URI)");
+        return;
+    };
+    let tag = format!("s{}si", std::process::id());
+    let n_a = format!("{tag}p1");
+    let n_b = format!("{tag}p2");
+    let scratch = tempfile::Builder::new()
+        .prefix("grovefs_shardkeys_")
+        .tempdir()
+        .unwrap();
+    let (key, key_id) = admin_key(&pg, scratch.path(), &format!("shardtest-{tag}"));
+    let m1p = free_port();
+    let m2p = free_port();
+    let ring = format!("{n_a}=127.0.0.1:{m1p},{n_b}=127.0.0.1:{m2p}");
+    // A sweep that CANNOT run inside the test: the window being described has to
+    // still be open when the page is read, and `0` is refused at startup because
+    // a table that is never re-read is a frozen placement.
+    let n1 = start_swept(
+        &n_a,
+        &ring,
+        &pg,
+        Some(&pg),
+        &key,
+        format!("127.0.0.1:{m1p}"),
+        format!("127.0.0.1:{}", free_port()),
+        Some(600),
+    );
+    let n2 = start_swept(
+        &n_b,
+        &ring,
+        &pg,
+        Some(&pg),
+        &key,
+        format!("127.0.0.1:{m2p}"),
+        format!("127.0.0.1:{}", free_port()),
+        Some(600),
+    );
+    let v = format!("{tag}iv");
+    n1.gov()
+        .call("view.create", json!({"view": v}))
+        .expect("create on n1");
+    let _m = RemoteMeta::new(&n1.meta, &v).expect("mount on the home instance");
+
+    let i = n1.info();
+    assert_eq!(i["shard"]["self"], json!(n_a));
+    assert_eq!(
+        i["shard"]["sweepMs"],
+        json!(600_000),
+        "the reported window must be the configured one, not the built-in default"
+    );
+    let home = shard_of(&i, &n_a);
+    assert_eq!(home["views"], json!(1));
+    assert_eq!(home["rows"], json!(1), "one base tree, one row");
+    assert!(home["here"].as_bool().unwrap());
+    // The stamp travels as the table writes it, so it must parse as the RFC3339
+    // text `Shard` puts there — an operator greps this against a peer's log.
+    let at = home["lastUpdatedAt"]
+        .as_str()
+        .expect("a placed view carries an updated_at");
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(at).is_ok(),
+        "unparsable updated_at: {at}"
+    );
+    assert!(i["shard"]["homeMismatch"].as_array().unwrap().is_empty());
+
+    // Move it, asked at the TARGET, and leave the row as the only message: with
+    // a 600s sweep nothing else tells the old instance it was deposed.
+    n2.gov()
+        .call("view.move_meta", json!({"view": v, "to": n_b.clone()}))
+        .expect("adopt the view on n2");
+    let i = n1.info();
+    assert_eq!(
+        shard_of(&i, &n_a)["views"],
+        json!(0),
+        "the row no longer names this instance"
+    );
+    assert_eq!(shard_of(&i, &n_b)["views"], json!(1));
+    assert_eq!(shard_of(&i, &n_b)["rows"], json!(1));
+    // THE WINDOW, MADE VISIBLE: the table says `n_b`, this process still holds
+    // the engine. A nonzero `residentEngines` beside a zero `views` is exactly
+    // what `evict_misplaced` is waiting to close.
+    assert!(
+        i["shard"]["homeMismatch"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(v.clone())),
+        "the deposed instance reported nothing about the tree it still holds: {i}"
+    );
+    assert!(
+        n1.info()["residentEngines"].as_u64().unwrap_or(0) >= 1,
+        "the tree was dropped although the sweep is set to 600s"
+    );
+    // The NEW home never reports its own tree as misplaced.
+    assert!(n2.info()["shard"]["homeMismatch"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|k| k != &json!(v)));
+
+    // The table is shared with every other run against this database, so an
+    // absolute total means nothing here — but the block's own arithmetic holds
+    // for ANY content: one query, and every row either belongs to a ring node
+    // or is named as an orphan.
+    let sh = n2.info()["shard"].clone();
+    let summed: u64 = sh["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["rows"].as_u64().unwrap())
+        .sum();
+    assert_eq!(
+        sh["placementRows"].as_u64().unwrap(),
+        summed + sh["orphanViews"].as_array().unwrap().len() as u64,
+        "a placement row counted in no node and named in no orphan list: {sh}"
+    );
+
+    n2.gov()
+        .call("view.rm_base", json!({"view": v}))
+        .expect("teardown the moved view");
+    cleanup(&pg, scratch.path(), &key_id);
+}
+
 /// `0` is REFUSED, not honored. `--engine-idle-secs 0` can mean "never" because
 /// an idle engine costs nothing to keep; a placement table that is never
 /// re-read is a deposed instance going on writing a tree whose row now names a
@@ -1192,11 +1325,37 @@ fn a_three_node_ring_routes_by_the_row_not_by_adjacency() {
         ],
         "refused mounts rewrote the placement table"
     );
+    // `store.info` must SHOW the dangling row instead of folding it away: it
+    // lands in no node's tally, so a page that only had per-node counts would
+    // report a ring that simply lost a view.
+    let orphan = json!(format!("{va} → {tag}gone"));
+    let iret = m2.info();
+    assert!(
+        iret["shard"]["orphanViews"]
+            .as_array()
+            .unwrap()
+            .contains(&orphan),
+        "the shard block hid the row that names no ring node: {}",
+        iret["shard"]
+    );
+    assert_eq!(
+        shard_of(&iret, &n_a)["views"],
+        json!(0),
+        "an orphan row counts for nobody"
+    );
+    assert_eq!(shard_of(&iret, &n_a)["rows"], json!(0));
     // `vb`, whose row is still valid, is untouched by m1's retirement: a
     // dangling row is one view's problem, not the ring's.
     let _b2 = RemoteMeta::new(&m3.meta, &vb).expect("vb still routes");
     restore();
     let _a2 = RemoteMeta::new(&m2.meta, &va).expect("a restored row routes again");
+    assert!(
+        !m2.info()["shard"]["orphanViews"]
+            .as_array()
+            .unwrap()
+            .contains(&orphan),
+        "the orphan list still names a row that points back into the ring"
+    );
 
     let mut teardown = Vec::new();
     for node in [&m1, &m3] {
