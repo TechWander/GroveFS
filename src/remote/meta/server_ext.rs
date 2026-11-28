@@ -8222,6 +8222,16 @@ pub fn open_event_stream(addr: &str, view: &str, token: &str, uid: u32) -> io::R
 /// Like [`open_event_stream`], but presents `api_key` on the `M_OPEN`
 /// handshake — what a `meta-server --require-api-key` demands, so the mount's
 /// invalidation subscription carries the same credential as its work sockets.
+///
+/// The walk is the sharded one: an `E_SHARD` answer names the instance that
+/// serves this view, so that address goes on the FRONT of the list and the
+/// subscription is established THERE, bounded by [`SHARD_FOLLOW_MAX`] and an
+/// already-asked check exactly like [`RemoteMeta::connect_fresh`]. This matters
+/// because the event stream is a THIRD `M_OPEN` for the same view: without the
+/// follow, a mount whose work sockets had been redirected to the home instance
+/// would keep its cache-coherence stream on the non-home one, so peer writes
+/// never arrive and the kernel cache silently rots while every op still reads
+/// the right tree — the worst possible coherence failure, because it is invisible.
 pub fn open_event_stream_keyed(
     addr: &str,
     view: &str,
@@ -8229,10 +8239,85 @@ pub fn open_event_stream_keyed(
     uid: u32,
     api_key: &str,
 ) -> io::Result<TcpStream> {
+    let mut queue: Vec<String> = split_addrs(addr);
+    let mut tried: Vec<String> = Vec::new();
+    let mut follows = 0usize;
     let mut last = io::Error::new(io::ErrorKind::ConnectionRefused, "no meta addr");
-    for a in split_addrs(addr) {
+    while !queue.is_empty() {
+        let a = queue.remove(0);
+        // Cycle guard: a placement table whose rows point at each other can name
+        // an address this dial already asked, and re-asking it would spin.
+        if tried.iter().any(|t| t == &a) {
+            // Name the disagreement, as the work-socket walk does: a
+            // redirect-only queue would otherwise report the generic
+            // "no meta addr" and leave the operator hunting for a dead socket.
+            if follows > 0 {
+                last = io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "meta-server shard placement for view '{view}' points back at {a}, \
+                         which this event stream already asked — the placement rows and the \
+                         ring disagree"
+                    ),
+                );
+            }
+            continue;
+        }
+        tried.push(a.clone());
         match try_open_event_stream(&a, view, token, uid, api_key) {
-            Ok(s) => return Ok(s),
+            Ok(EventStreamDial::Live(s)) => return Ok(s),
+            Ok(EventStreamDial::Home(home)) => {
+                if home.is_empty() || home.len() > 255 {
+                    last = io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("meta-server {a} redirected this event stream to an \
+                                 unreadable address"),
+                    );
+                    continue;
+                }
+                if follows >= SHARD_FOLLOW_MAX {
+                    last = io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "meta-server {a} redirected this event stream to {home}, but it had \
+                             already followed {follows} redirects — the shard placement rows \
+                             disagree with the ring"
+                        ),
+                    );
+                    continue;
+                }
+                follows += 1;
+                crate::stats::count(crate::stats::Counter::ShardRedirect, 1);
+                // A ring member may be an HA PAIR (`prim+stby`), so the redirect
+                // can name several roles in the operator's preferred order: splice
+                // them in front, in order, without re-asking a tried address.
+                let parts: Vec<String> = home
+                    .split('+')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                for p in parts.iter().rev() {
+                    if tried.iter().any(|t| t == p) {
+                        // The row points back at a node this dial already asked.
+                        // That IS the failure, so it is named as one rather than
+                        // leaving the generic "no meta addr" behind when the
+                        // queue happens to run empty.
+                        last = io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "meta-server shard placement for view '{view}' points back at \
+                                 {p}, which this event stream already asked — the placement \
+                                 rows and the ring disagree"
+                            ),
+                        );
+                        continue;
+                    }
+                    if !queue.iter().any(|q| q == p) {
+                        queue.insert(0, p.clone());
+                    }
+                }
+            }
             // A rejected credential is a config error on every node; don't rotate.
             Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return Err(e),
             Err(e) => last = e,
@@ -8241,13 +8326,22 @@ pub fn open_event_stream_keyed(
     Err(last)
 }
 
+/// What dialing one meta-server for an invalidation stream can produce.
+enum EventStreamDial {
+    /// A socket already past `M_OPEN` + `M_SUBSCRIBE`, ready to be read.
+    Live(TcpStream),
+    /// `E_SHARD`: this instance does not serve the view, and this is the home
+    /// address it told us to ask instead (an HA pair arrives as `a+b`).
+    Home(String),
+}
+
 fn try_open_event_stream(
     addr: &str,
     view: &str,
     token: &str,
     uid: u32,
     api_key: &str,
-) -> io::Result<TcpStream> {
+) -> io::Result<EventStreamDial> {
     let mut s = TcpStream::connect(addr)?;
     s.set_read_timeout(None)?; // block waiting for pushed events
     s.set_write_timeout(Some(Duration::from_secs(5)))?;
@@ -8273,15 +8367,42 @@ fn try_open_event_stream(
         };
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, why));
     }
+    if st == E_SHARD {
+        // The entry point does not serve this view and said so with the address
+        // that does; the caller dials it. Same code, same handling as the mount's
+        // work sockets — one mechanism, three consumers of `M_OPEN`.
+        return Ok(EventStreamDial::Home(
+            String::from_utf8_lossy(&reason).trim().to_string(),
+        ));
+    }
     if st != 0 {
-        return Err(io::Error::from_raw_os_error(EIO));
+        // Any other refusal arrives with the reason the server's gate wrote.
+        // Forwarding it beats the bare EIO that used to make a refused view and a
+        // dead socket indistinguishable in the mount's log.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            subscription_refusal(addr, &reason, st),
+        ));
     }
     proto::send_request(&mut s, M_SUBSCRIBE, &[])?;
-    let (ack, _, _) = proto::recv_response(&mut s)?;
+    let (ack, _, reason) = proto::recv_response(&mut s)?;
     if ack != 0 {
-        return Err(io::Error::from_raw_os_error(EIO));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            subscription_refusal(addr, &reason, ack),
+        ));
     }
-    Ok(s)
+    Ok(EventStreamDial::Live(s))
+}
+
+/// The text of a refused `M_OPEN`/`M_SUBSCRIBE` for an event stream: the
+/// server's own words when it had some, the errno when it was silent.
+fn subscription_refusal(addr: &str, reason: &[u8], errno: i32) -> String {
+    if reason.is_empty() {
+        format!("meta-server {addr} refused the invalidation subscription (errno {errno})")
+    } else {
+        String::from_utf8_lossy(reason).into_owned()
+    }
 }
 
 // Split a `--meta-server` value into a failover address list. Lives in the client
@@ -8301,6 +8422,14 @@ fn try_open_event_stream(
 /// source-coordinate events into display coordinates (inval_entry + inval_inode
 /// at the synthesized parent), narrowing the staleness window for relocated
 /// entries from the attr-TTL (~2s) to sub-ms.
+///
+/// The reconnect shape is the observable one. This loop used to sleep 300 ms and
+/// retry forever in silence, so a mount whose invalidations had died an hour ago
+/// was indistinguishable from a healthy one in the log; it now backs off
+/// (300 ms → 5 s), prints the cause on the first failure of a streak and every
+/// 20th after that, says so out loud when a session recovers and drops again,
+/// and counts every attempt in `invalidation stream reconnects`. A streak that
+/// never ends is therefore visible as a rate instead of as nothing at all.
 #[cfg(feature = "native")]
 pub fn spawn_invalidation_listener(
     addr: &str,
@@ -8315,30 +8444,80 @@ pub fn spawn_invalidation_listener(
     let view = view.to_string();
     let token = token.to_string();
     let api_key = api_key.to_string();
-    thread::spawn(move || loop {
-        match run_event_stream(
-            &addr,
-            &view,
-            &token,
-            &api_key,
-            uid,
-            &notifier,
-            display.as_ref(),
-        ) {
-            // A rejected credential can't be fixed by retrying. If this mount was
-            // already serving, the refusal means its key was revoked (or the
-            // server was reconfigured under it) — the same auth LOSS the work
-            // connections report, so ask for the same clean unmount instead of
-            // silently keeping a keyless mount alive with no invalidations.
-            Err(ref e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                crate::remote::signal_auth_loss(&e.to_string());
-                eprintln!("invalidation listener stopped: {e}");
-                return;
+    thread::spawn(move || {
+        // Failures in a row since the last session that lasted long enough to
+        // count as a recovery; drives both the backoff and the log cadence.
+        let mut streak = 0u32;
+        loop {
+            let opened = std::time::Instant::now();
+            let err = match run_event_stream(
+                &addr,
+                &view,
+                &token,
+                &api_key,
+                uid,
+                &notifier,
+                display.as_ref(),
+            ) {
+                // A rejected credential can't be fixed by retrying. If this mount was
+                // already serving, the refusal means its key was revoked (or the
+                // server was reconfigured under it) — the same auth LOSS the work
+                // connections report, so ask for the same clean unmount instead of
+                // silently keeping a keyless mount alive with no invalidations.
+                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                    crate::remote::signal_auth_loss(&e.to_string());
+                    eprintln!("invalidation listener stopped: {e}");
+                    return;
+                }
+                Err(e) => Some(e),
+                // `run_event_stream` only returns Ok if the push read loop ends
+                // cleanly, which an EOF-erroring socket never does; handled as a
+                // drop anyway so a future early-return cannot stall the stream.
+                Ok(()) => None,
+            };
+            // A session that held >= 30 s was a working stream that later died — a
+            // server restart, not a failure loop — so the streak restarts and the
+            // operator sees one line naming the recovery instead of a doubling
+            // backoff measured against a mount that had been streaming fine.
+            if opened.elapsed() >= Duration::from_secs(30) && streak > 0 {
+                if let Some(e) = &err {
+                    eprintln!(
+                        "invalidation listener: view '{view}' streamed for {} s before dropping \
+                         again ({e})",
+                        opened.elapsed().as_secs()
+                    );
+                }
+                streak = 0;
             }
-            // EOF / transport error: back off briefly, then reconnect fresh.
-            _ => thread::sleep(Duration::from_millis(300)),
+            let nap = event_stream_backoff(streak);
+            streak += 1;
+            crate::stats::count(crate::stats::Counter::EventStreamRetry, 1);
+            if streak == 1 || streak.is_multiple_of(20) {
+                match &err {
+                    Some(e) => eprintln!(
+                        "invalidation listener: view '{view}' has no invalidation stream ({e}); \
+                         reconnect #{streak} in {} ms",
+                        nap.as_millis()
+                    ),
+                    None => eprintln!(
+                        "invalidation listener: view '{view}' event stream closed; reconnect \
+                         #{streak} in {} ms",
+                        nap.as_millis()
+                    ),
+                }
+            }
+            thread::sleep(nap);
         }
     })
+}
+
+/// Reconnect backoff for the invalidation listener: 300 ms, doubling, capped at
+/// 5 s. The floor is what keeps a meta-server RESTART (sub-second, the common
+/// case) down to one reconnect; the cap is what keeps a permanently refused view
+/// from burning a socket per 300 ms for the life of the mount.
+#[cfg(feature = "native")]
+fn event_stream_backoff(streak: u32) -> Duration {
+    Duration::from_millis((300u64 << streak.min(5)).min(5_000))
 }
 
 #[cfg(feature = "native")]

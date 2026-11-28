@@ -199,6 +199,7 @@ pub enum Counter {
     PoolLazyOpen,
     PgSsiRetry,
     RemoteReconnect,
+    EventStreamRetry,
     BroadcastTimeout,
     HaFencing,
     HaQuorumRefuse,
@@ -221,6 +222,7 @@ impl Counter {
         Counter::PoolLazyOpen,
         Counter::PgSsiRetry,
         Counter::RemoteReconnect,
+        Counter::EventStreamRetry,
         Counter::BroadcastTimeout,
         Counter::HaFencing,
         Counter::HaQuorumRefuse,
@@ -242,6 +244,11 @@ impl Counter {
             Counter::PoolLazyOpen => "sqlite read-pool lazy-opens",
             Counter::PgSsiRetry => "pg ssi-retries",
             Counter::RemoteReconnect => "remote reconnects",
+            // The mount's invalidation stream could not be (re)established. It
+            // grows on its own schedule, never in step with `remote reconnects`,
+            // because it is a separate socket with a separate lifetime — which is
+            // exactly why a mount can be serving ops while this number climbs.
+            Counter::EventStreamRetry => "invalidation stream reconnects",
             Counter::BroadcastTimeout => "broadcast send timeouts",
             Counter::HaFencing => "ha fencing demotions",
             Counter::HaQuorumRefuse => "ha quorum refusals",

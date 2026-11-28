@@ -1643,6 +1643,130 @@ mod shard_follow_tests {
         assert_eq!(rm.active.load(Ordering::Relaxed), 1, "promoted to b");
         assert_eq!(*rm.shome.lock(), None, "an empty redirect was learned");
     }
+
+    /// A stand-in that speaks the WHOLE event-stream handshake: `M_OPEN` with
+    /// `(status, payload)`, then — only when the open was accepted — the
+    /// `M_SUBSCRIBE` ack and one pushed `EV_ENTRY`, then a blocking read so the
+    /// socket stays alive exactly as a real server's does.
+    fn stream_stub(
+        opens: Arc<AtomicUsize>,
+        open: impl Fn() -> (i32, Vec<u8>) + Send + 'static,
+    ) -> (SocketAddr, thread::JoinHandle<()>) {
+        let lst = TcpListener::bind("127.0.0.1:0").expect("bind stream stub");
+        let addr = lst.local_addr().expect("stream stub addr");
+        let h = thread::spawn(move || {
+            for conn in lst.incoming() {
+                let Ok(mut s) = conn else { continue };
+                let Ok((op, body)) = proto::recv_request(&mut s) else {
+                    continue;
+                };
+                if op != M_OPEN || proto::get_key(&body, &mut 0).is_err() {
+                    continue;
+                }
+                opens.fetch_add(1, Ordering::SeqCst);
+                let (status, data) = open();
+                let _ = proto::send_response(&mut s, status, 0, &data);
+                if status != 0 {
+                    continue;
+                }
+                let Ok((op, _)) = proto::recv_request(&mut s) else {
+                    continue;
+                };
+                if op != M_SUBSCRIBE {
+                    continue;
+                }
+                let _ = proto::send_response(&mut s, 0, 0, &[]);
+                let mut ev = Vec::new();
+                proto::put_key(&mut ev, "new.txt");
+                let _ = proto::send_response(&mut s, EV_ENTRY, 2, &ev);
+                let mut sink = Vec::new();
+                let _ = std::io::Read::read_to_end(&mut s, &mut sink);
+            }
+        });
+        (addr, h)
+    }
+
+    #[test]
+    fn event_stream_follows_e_shard_to_the_home_instance() {
+        // The invalidation stream is a THIRD `M_OPEN` for the same view. Before
+        // this walk existed, a mount on a non-home instance had its work sockets
+        // redirected correctly while its cache-coherence stream stayed pinned to
+        // the wrong node: peer writes never invalidated the kernel cache, yet
+        // every op still read the right tree — a coherence failure with no
+        // symptom anyone would notice.
+        let (a_opens, b_opens) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (b, _bh) = stream_stub(b_opens.clone(), || (0, Vec::new()));
+        let b_addr = b.to_string();
+        let redir = b_addr.clone();
+        let (a, _ah) = stream_stub(a_opens.clone(), move || {
+            (E_SHARD, redir.as_bytes().to_vec())
+        });
+
+        let mut s =
+            server_ext::open_event_stream_keyed(&a.to_string(), "v", "", 0, "").expect("follows");
+        // The dial consumed both handshake frames (the `M_OPEN` ack and the
+        // `M_SUBSCRIBE` ack) — what is on the wire now is the PUSH. Reading it
+        // with a bounded timeout, so a subscription that landed on the wrong node
+        // fails the test instead of hanging the suite on the listener's
+        // deliberately untimed read.
+        s.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let (kind, val, data) = proto::recv_response(&mut s).expect("pushed event");
+        let mut i = 0usize;
+        assert_eq!(kind, EV_ENTRY);
+        assert_eq!(val, 2);
+        assert_eq!(proto::get_key(&data, &mut i).unwrap(), "new.txt");
+        assert_eq!(a_opens.load(Ordering::SeqCst), 1);
+        assert_eq!(b_opens.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn event_stream_shard_cycle_fails_with_a_named_cause() {
+        // Two placement rows pointing at each other must fail the subscription
+        // with the disagreement named, bounded by the already-asked check.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counted = hits.clone();
+        let lst1 = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let lst2 = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let (x, y) = (lst1.local_addr().unwrap(), lst2.local_addr().unwrap());
+        let (x_addr, y_addr) = (x.to_string(), y.to_string());
+        let _h1 = thread::spawn(move || {
+            for conn in lst1.incoming() {
+                let Ok(mut s) = conn else { continue };
+                let _ = proto::recv_request(&mut s);
+                counted.fetch_add(1, Ordering::SeqCst);
+                let _ = proto::send_response(&mut s, E_SHARD, 0, y_addr.as_bytes());
+            }
+        });
+        let _h2 = thread::spawn(move || {
+            for conn in lst2.incoming() {
+                let Ok(mut s) = conn else { continue };
+                let _ = proto::recv_request(&mut s);
+                let _ = proto::send_response(&mut s, E_SHARD, 0, x_addr.as_bytes());
+            }
+        });
+        let e = match server_ext::open_event_stream_keyed(&x.to_string(), "v", "", 0, "") {
+            Ok(_) => panic!("a cycle between two placement rows cannot open a stream"),
+            Err(e) => e,
+        };
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(e.to_string().contains("points back at"), "unhelpful: {e}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "one M_OPEN per node");
+    }
+
+    #[test]
+    fn event_stream_refusal_carries_the_servers_reason() {
+        // A non-`E_SHARD` refusal used to arrive as a bare EIO, the same error a
+        // dead socket produced, so a permanent refusal looked like a transient one
+        // forever. The server's own words now ride up to the listener's log.
+        let why = "view 'v' does not exist on this instance".to_string();
+        let a_opens = Arc::new(AtomicUsize::new(0));
+        let (a, _ah) = stream_stub(a_opens.clone(), move || (E_DB, why.as_bytes().to_vec()));
+        let e = server_ext::open_event_stream_keyed(&a.to_string(), "v", "", 0, "")
+            .expect_err("a refused view is not a stream");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(e.to_string().contains("does not exist"), "unhelpful: {e}");
+    }
 }
 
 // ---- meta-server (central authoritative store) half, native only -----------
