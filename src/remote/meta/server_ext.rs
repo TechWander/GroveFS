@@ -1434,6 +1434,10 @@ impl MetaServer {
         // definitions/aliases/forks from the shared `grovefs_control` schema, a
         // SQLite store from the local `meta/views` dir — one system of record per
         // backend, never a local file the PG deployment would ignore.
+        // The `mut` is only reassigned by the treedb clause below: without the
+        // feature the plain binding already holds the final value, so keep the
+        // default profile's build warning-neutral instead of forking the let.
+        #[cfg_attr(not(feature = "treedb"), allow(unused_mut))]
         let mut control = crate::mcp::control_store_for(&self.base, ctl_uri.as_deref())
             .map_err(io::Error::other)?;
         #[cfg(feature = "treedb")]

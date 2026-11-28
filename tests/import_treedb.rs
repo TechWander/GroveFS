@@ -12,6 +12,14 @@
 //! development cluster's two instances; override the whole URI with
 //! `TREEDB_TEST_URI=treedb://host:port,…`. A reachable-but-unusable engine
 //! (auth mismatch etc.) also skips with the reason, mirroring `import_pg`.
+//!
+//! Gated on `treedb` because every path below reaches the engine through
+//! `grovefs::treedb_store` / `MetaStore::open_treedb`, which the default
+//! profile does not compile at all (found 2026-11-28: a board without
+//! `FEATURES_TREEDB=1` failed this target's build, so `cargo test --release`
+//! alone could never pass in the shipped feature face).
+
+#![cfg(feature = "treedb")]
 
 use grovefs::backend::local::LocalBackend;
 use grovefs::backend::StorageBackend;

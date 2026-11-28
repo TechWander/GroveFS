@@ -498,7 +498,13 @@ impl ControlStore for FileControlStore {
                         crate::meta::fork_def_slot(&self.base, name)
                     }
                     #[cfg(not(feature = "treedb"))]
-                    crate::meta::fork_def_slot(&self.base, name)
+                    {
+                        // The default profile has no engine tree to consult, so
+                        // the recorded base lineage is simply not used here —
+                        // say so instead of letting the arm warn about it.
+                        let _ = b;
+                        crate::meta::fork_def_slot(&self.base, name)
+                    }
                 }
                 _ => {
                     let parent = self.def_parent(text);
