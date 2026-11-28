@@ -3098,7 +3098,15 @@ fn register_with_manager(
         member_id,
         ttl: register_ttl.unwrap_or(grovefs::manager::server::DEFAULT_REGISTER_TTL),
     };
-    grovefs::manager::spawn_registrar(server, ann, join_key);
+    if let Err(e) = grovefs::manager::spawn_registrar(server, ann, join_key) {
+        // Same verdict as a manager that refuses the registration: the node
+        // serves, it is just not listed. Failing here would let a directory
+        // service (or a thread limit) gate storage.
+        eprintln!(
+            "manager: no registrar thread ({e}); this node serves UNREGISTERED until it is \
+             restarted, so `grovefs manager status` will not list it"
+        );
+    }
     Ok(())
 }
 

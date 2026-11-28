@@ -435,11 +435,15 @@ pub fn status(server: &str, deployment: Option<&str>, join_key: &[u8]) -> io::Re
 /// blocking exit. Failures back off 1s → 30s and are printed once per state
 /// change, not once per attempt: a manager that stays down for an hour should
 /// produce two log lines, not 3600.
+///
+/// `Err` (no thread could be created) belongs to the caller to REPORT, never to
+/// unwrap: it is the same verdict as a manager that refuses the registration —
+/// the node serves, it is simply not listed.
 pub fn spawn_registrar(
     server: String,
     announcement: Announcement,
     join_key: Vec<u8>,
-) -> std::thread::JoinHandle<()> {
+) -> io::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name("gfs-manager-register".to_string())
         .spawn(move || {
@@ -474,7 +478,7 @@ pub fn spawn_registrar(
                 }
             }
         })
-        .expect("spawn manager registrar thread")
+        .map_err(|e| io::Error::new(e.kind(), format!("spawn gfs-manager-register: {e}")))
 }
 
 /// Heartbeat period: a third of the TTL, clamped to \[2s, 30s\]. Dividing by

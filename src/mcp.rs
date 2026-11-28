@@ -976,6 +976,17 @@ pub fn control_store_for(
     }
 }
 
+/// The local file control plane for `base` — exactly what
+/// [`control_store_for`] returns for a `None` / `"sqlite"` store, but without
+/// the `Result`. `FileControlStore::new` does no I/O (it only keeps the
+/// directory path), so a caller that has no URI to resolve has nothing to
+/// handle: given it a `Result` anyway would only teach the next reader that an
+/// infallible call needs an `expect`, and an `expect` is what turns a real
+/// failure into a dead process.
+pub fn file_control_store(base: &Path) -> Arc<dyn ControlStore> {
+    Arc::new(FileControlStore::new(base))
+}
+
 /// The store a governance op runs against: the server's bound store, except
 /// that a FILE-STORE server still honours a per-call `db_path` override (the
 /// historical multi-root behavior). A PG-bound server cannot be re-pointed at

@@ -1771,6 +1771,10 @@ struct ReadGuard<'a> {
 impl std::ops::Deref for ReadGuard<'_> {
     type Target = Connection;
     fn deref(&self) -> &Connection {
+        // An invariant, not a fallible path: `conn` is only ever `None` after
+        // `Drop` has taken it out, and a guard cannot be derefed once it is
+        // borrowed dead. Keeping the `Option` is what lets `Drop` hand the
+        // connection back without moving out of `&mut self`.
         self.conn.as_ref().expect("read conn alive until drop")
     }
 }
@@ -2060,17 +2064,45 @@ impl MetaEngine {
 
     /// Borrow a pooled read connection for one SELECT-only op; falls back to a
     /// lazily-opened connection when the pool is drained (returned on drop).
-    fn read_conn(&self) -> ReadGuard<'_> {
-        let c = self.read_pool.lock().pop().unwrap_or_else(|| {
-            stats::count(stats::Counter::PoolLazyOpen, 1);
-            let rc = Connection::open(&self.path).expect("open read connection");
-            apply_read_pragmas(&rc);
-            rc
-        });
-        ReadGuard {
+    /// `None` means "this op cannot read right now": opening that fallback is
+    /// real I/O (an ENOSPC/EACCES/EMFILE on the meta device), so it reports
+    /// instead of panicking — a panic here would take the whole meta-server
+    /// down over one GETATTR. Every caller already degrades on a SQL error
+    /// (`lookup`/`getattr` -> `None`, a listing -> empty, `finalize` -> the
+    /// per-field default), so `None` joins them as the same verdict.
+    fn read_conn(&self) -> Option<ReadGuard<'_>> {
+        let c = match self.read_pool.lock().pop() {
+            Some(c) => c,
+            None => {
+                stats::count(stats::Counter::PoolLazyOpen, 1);
+                match Connection::open(&self.path) {
+                    Ok(rc) => {
+                        apply_read_pragmas(&rc);
+                        rc
+                    }
+                    Err(e) => {
+                        // One line per process: a drained pool plus a failing
+                        // open is a per-op event on a hot path, and a stderr
+                        // write per GETATTR would bury the cause in noise. The
+                        // attempts are already counted (`PoolLazyOpen`); this
+                        // names why the reads are coming back empty.
+                        static LOGGED: std::sync::Once = std::sync::Once::new();
+                        LOGGED.call_once(|| {
+                            eprintln!(
+                                "meta engine: cannot open a read connection for {}: {e} \
+                                 (reads degrade until the pool has one back)",
+                                self.path.display()
+                            );
+                        });
+                        return None;
+                    }
+                }
+            }
+        };
+        Some(ReadGuard {
             conn: Some(c),
             eng: self,
-        }
+        })
     }
 
     fn pool_max(&self) -> usize {
@@ -2085,7 +2117,7 @@ impl MetaEngine {
         let sql = format!("SELECT {COLS} FROM node WHERE parent_id=?1 AND name=?2");
         let raw = {
             let _r = stats::start(stats::Stage::SqliteRead);
-            let conn = self.read_conn();
+            let conn = self.read_conn()?;
             let mut stmt = conn.prepare_cached(&sql).ok()?;
             stmt.query_row(params![parent, name], row_to_raw).ok()
         };
@@ -2099,7 +2131,7 @@ impl MetaEngine {
         let sql = format!("SELECT {COLS} FROM node WHERE ino=?1 LIMIT 1");
         let raw = {
             let _r = stats::start(stats::Stage::SqliteRead);
-            let conn = self.read_conn();
+            let conn = self.read_conn()?;
             let mut stmt = conn.prepare_cached(&sql).ok()?;
             stmt.query_row(params![ino], row_to_raw).ok()
         };
@@ -2114,7 +2146,10 @@ impl MetaEngine {
         let sql = format!("SELECT {COLS} FROM node WHERE parent_id=?1 AND name>'' ORDER BY name");
         let raws = {
             let _r = stats::start(stats::Stage::SqliteRead);
-            let conn = self.read_conn();
+            let conn = match self.read_conn() {
+                Some(c) => c,
+                None => return Vec::new(),
+            };
             let mut stmt = match conn.prepare_cached(&sql) {
                 Ok(s) => s,
                 Err(_) => return Vec::new(),
@@ -2156,7 +2191,10 @@ impl MetaEngine {
         let fetch = limit.saturating_add(skip);
         let raws = {
             let _r = stats::start(stats::Stage::SqliteRead);
-            let conn = self.read_conn();
+            let conn = match self.read_conn() {
+                Some(c) => c,
+                None => return Vec::new(),
+            };
             match &after {
                 Some(last) => {
                     let sql = format!(
@@ -2886,8 +2924,14 @@ impl MetaEngine {
         let (nlink, size) = match kind {
             NodeKind::Dir => {
                 let subdirs: i64 = conn
-                    .prepare_cached("SELECT COUNT(*) FROM node WHERE parent_id=?1 AND is_dir=1")
-                    .and_then(|mut s| s.query_row(params![raw.id], |r| r.get(0)))
+                    .as_ref()
+                    .and_then(|conn| {
+                        conn.prepare_cached(
+                            "SELECT COUNT(*) FROM node WHERE parent_id=?1 AND is_dir=1",
+                        )
+                        .and_then(|mut s| s.query_row(params![raw.id], |r| r.get(0)))
+                        .ok()
+                    })
                     .unwrap_or(0);
                 (2 + subdirs as u64, 4096u64)
             }
@@ -2901,8 +2945,12 @@ impl MetaEngine {
             }
             NodeKind::Regular => {
                 let links: i64 = conn
-                    .prepare_cached("SELECT COUNT(*) FROM node WHERE ino=?1")
-                    .and_then(|mut s| s.query_row(params![raw.ino], |r| r.get(0)))
+                    .as_ref()
+                    .and_then(|conn| {
+                        conn.prepare_cached("SELECT COUNT(*) FROM node WHERE ino=?1")
+                            .and_then(|mut s| s.query_row(params![raw.ino], |r| r.get(0)))
+                            .ok()
+                    })
                     .unwrap_or(1);
                 (links.max(1) as u64, 0u64)
             }
@@ -2970,15 +3018,19 @@ impl MetaEngine {
         let mut subdir_map: HashMap<i64, i64> = HashMap::new();
         if !dir_ids.is_empty() || !reg_inos.is_empty() {
             let _f = stats::start(stats::Stage::SqliteFinalizeCount);
-            let conn = self.read_conn();
-            grouped_counts(&conn, "ino", "", &reg_inos, &mut nlink_map);
-            grouped_counts(
-                &conn,
-                "parent_id",
-                "AND is_dir=1",
-                &dir_ids,
-                &mut subdir_map,
-            );
+            // No connection is the same verdict `grouped_counts` reaches on a
+            // SQL error: the keys stay absent and the caller's per-field
+            // defaults apply (see `grouped_counts`).
+            if let Some(conn) = self.read_conn() {
+                grouped_counts(&conn, "ino", "", &reg_inos, &mut nlink_map);
+                grouped_counts(
+                    &conn,
+                    "parent_id",
+                    "AND is_dir=1",
+                    &dir_ids,
+                    &mut subdir_map,
+                );
+            }
         }
         raws.iter()
             .map(|r| {
@@ -3098,7 +3150,10 @@ impl MetaProvider for MetaEngine {
         MetaEngine::renew_locks(self, sid)
     }
     fn dump_tree(&self) -> Vec<(i64, i64, String, bool, Option<String>)> {
-        let conn = self.read_conn();
+        let conn = match self.read_conn() {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
         // `parent_id` is NULL for the root row (`INSERT ... VALUES (1,NULL,'/',...)`
         // at open), and reading that column as a plain `i64` fails, which silently
         // DROPPED the root from the dump. `pg_store::dump_tree` reads it as
@@ -3544,7 +3599,7 @@ mod tests {
         assert_eq!(e.read_pool.lock().len(), READ_POOL_SIZE);
         assert_eq!(e.pool_max(), retain_for(READ_POOL_SIZE));
         {
-            let guards: Vec<_> = (0..4).map(|_| e.read_conn()).collect();
+            let guards: Vec<_> = (0..4).map(|_| e.read_conn().unwrap()).collect();
             assert_eq!(e.read_pool.lock().len(), 0, "all borrowed at once");
             drop(guards);
         }
@@ -3552,6 +3607,40 @@ mod tests {
             e.read_pool.lock().len(),
             4,
             "the burst's connections stay in the pool (under the ceiling)"
+        );
+    }
+
+    /// A drained pool plus a failing lazy open is a DEGRADED read, not a dead
+    /// meta-server. `read_conn` used to `expect("open read connection")` here, so
+    /// one EACCES/EMFILE on the meta device panicked whichever thread happened to
+    /// be serving a GETATTR. The `finalize` fallback cannot be forced from one
+    /// thread (it needs a concurrent borrower of the last pooled connection), but
+    /// every entry point below reads through the same guard.
+    #[test]
+    fn a_drained_pool_with_a_failing_open_degrades_instead_of_panicking() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let e = MetaEngine::open(&dir.path().join("view.db")).unwrap();
+        let id = e
+            .create_node(ROOT_INO, "f", false, Some("datak"), 0o644, 1000, 1000)
+            .unwrap();
+        assert!(e.lookup(ROOT_INO, "f").is_some(), "healthy: the read works");
+        // Leave the engine no pooled connection, then make opening a new one
+        // impossible: drop the directory's search bit, so even resolving the
+        // db path is an EACCES.
+        let _held = e.read_conn().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let degraded = e.lookup(ROOT_INO, "f").is_none()
+            && e.getattr(id).is_none()
+            && e.readdir(ROOT_INO).is_empty()
+            && e.readdir_page(ROOT_INO, 0, 10).is_empty()
+            && <MetaEngine as MetaProvider>::dump_tree(&e).is_empty();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(degraded, "no read connection: every read comes back empty");
+        assert!(
+            e.lookup(ROOT_INO, "f").is_some(),
+            "the same engine reads again once the device is reachable — the degrade \
+             opened no wound in it"
         );
     }
 

@@ -1745,8 +1745,7 @@ fn serve_on_meta_full(
 ) {
     // SQLite-only helper (single-node path): the control plane is the local
     // `meta/views` dir, matching `store: StoreKind::Sqlite`.
-    let control =
-        crate::mcp::control_store_for(&base, None).expect("file control store is infallible");
+    let control = crate::mcp::file_control_store(&base);
     let rt = Arc::new(MetaRuntime {
         base,
         token: token.to_string(),
@@ -1804,7 +1803,7 @@ fn epoll_takeover(
     let plane = if from_gov { "control" } else { "mount" };
     println!(
         "meta-server: {plane} plane on epoll ({} loops, {} backend workers; GROVEFS_META_THREADS=1 for the thread-per-connection shape)",
-        super::epoll::LOOPS,
+        joins.len(),
         super::epoll::worker_count()
     );
     Ok(joins)
@@ -8899,8 +8898,7 @@ mod ha_tests {
             views: Arc::new(Mutex::new(HashMap::new())),
             bases: Arc::new(Mutex::new(HashMap::new())),
             defs: Arc::new(Mutex::new(HashMap::new())),
-            control: crate::mcp::control_store_for(dir.path(), None)
-                .expect("file control store is infallible"),
+            control: crate::mcp::file_control_store(dir.path()),
             subs: Arc::new(Mutex::new(HashMap::new())),
             ha: Some(ha.clone()),
             peer: Some("127.0.0.1:1".to_string()),
@@ -8981,8 +8979,7 @@ mod ha_tests {
             views: Arc::new(Mutex::new(HashMap::new())),
             bases: Arc::new(Mutex::new(HashMap::new())),
             defs: Arc::new(Mutex::new(HashMap::new())),
-            control: crate::mcp::control_store_for(base, None)
-                .expect("file control store is infallible"),
+            control: crate::mcp::file_control_store(base),
             subs: Arc::new(Mutex::new(HashMap::new())),
             ha,
             peer,
@@ -9327,8 +9324,7 @@ mod ha_tests {
             views: Arc::new(Mutex::new(HashMap::new())),
             bases: Arc::new(Mutex::new(HashMap::new())),
             defs: Arc::new(Mutex::new(HashMap::new())),
-            control: crate::mcp::control_store_for(dir.path(), None)
-                .expect("file control store is infallible"),
+            control: crate::mcp::file_control_store(dir.path()),
             subs: Arc::new(Mutex::new(HashMap::new())),
             ha: None,
             peer: None,

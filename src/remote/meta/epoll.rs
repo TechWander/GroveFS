@@ -458,7 +458,15 @@ pub fn worker_count() -> usize {
 }
 
 impl Pool {
-    fn start(rt: &Arc<MetaRuntime>, step: &Step, workers: usize, depth: usize) -> Pool {
+    /// 起 `workers` 条后端 worker。线程创建失败（`EAGAIN`、cgroup 线程数上限）一律上抛，
+    /// 不在这里 abort 整个挂载平面。失败时本函数已建好的 sender 随栈退出丢掉，通道一关，
+    /// 先起起来的 worker 跑完 `for job in r` 自然收摊，不会留下没人喂的线程。
+    fn start(
+        rt: &Arc<MetaRuntime>,
+        step: &Step,
+        workers: usize,
+        depth: usize,
+    ) -> io::Result<Pool> {
         let mut tx = Vec::with_capacity(workers);
         for k in 0..workers {
             let (s, r) = mpsc::sync_channel::<Job>(depth);
@@ -472,16 +480,25 @@ impl Pool {
                         Pool::serve(&rt, &step, job);
                     }
                 })
-                .expect("spawn meta worker");
+                .map_err(|e| io::Error::new(e.kind(), format!("spawn meta-worker{k}: {e}")))?;
         }
-        Pool {
+        Ok(Pool {
             tx,
             rr: AtomicU64::new(0),
-        }
+        })
     }
 
     /// 处理一个请求帧，然后接着处理这条连接上已经攒到的下一帧：客户端在管线发送时省掉
     /// 一次「归还—再派发」的通道往返。所有等待都在锁外。
+    ///
+    /// TODO(severity=Medium): 一条连接的 panic 会要掉整个平面，这里缺一层 `catch_unwind`。
+    /// 本文件的锁全是 `std::sync::Mutex`（29 处 `lock().unwrap()`）：某个 handler 在 worker
+    /// 线程里 panic 会毒化它当时碰到的共享锁（`Shared::conns`、`Conn::inner`），之后别的
+    /// 连接取同一把锁就跟着 panic；worker 线程本体一死，它那条通道里排着的请求再没人取。
+    /// 修法是连接级隔离：`Pool::serve` 的每帧包进 `catch_unwind`，panic 只杀这一条连接
+    /// （`h.kill()`），并让这些 `lock()` 走 `unwrap_or_else(|p| p.into_inner())` 或改用
+    /// 不毒化的 `parking_lot::Mutex`。`server_ext.rs` 里的 accept 回退只兜「epoll 接管不
+    /// 起来」，兜不住运行期的 panic，所以这层属于架构变更，不在本轮范围内。
     fn serve(rt: &Arc<MetaRuntime>, step: &Step, job: Job) {
         let h = job.h;
         let mut op = job.op;
@@ -564,9 +581,12 @@ struct EventLoop {
 /// 返回 `Err` 时 listener 原封不动，`serve_runtime` 可以退回线程形状。成功后调用者丢掉
 /// 自己的那份也没关系——dup 出来的 fd 指向同一个 open file description，socket 不会关。
 ///
-/// 两个可能失败的步骤（建唤醒 fd、dup listener）都排在任何线程起起来之前：一旦已经
-/// 有循环在 accept，再返回 `Err` 会让调用方也起一个 accept 循环，两条路同时抢同一个
-/// 端口。调用方拿到句柄后必须 join：循环就是服务本体，`spawn` 返回不等于“可以退场”。
+/// 三个可能失败的步骤（建唤醒 fd、dup listener、起 worker 池）都排在任何循环线程起起来
+/// 之前，失败时把前面的步骤逐项收回，listener 原封不动，`serve_runtime` 可以退回线程形状。
+/// 循环自身的 `spawn` 是第四个窗口，只能打印着继续：已有一条在 accept 时再返回 `Err` 会让
+/// 调用方也起一个 accept 循环，两条路同时抢同一个端口；一条都没起来才 `Err`（那时没人
+/// 在 accept，退回是安全的）。线程创建失败绝不 `expect`：一次 `EAGAIN`（或 cgroup 线程上限）
+/// 不该拖掉整个进程。调用方拿到句柄后必须 join：循环就是服务本体，`spawn` 返回不等于“可以退场”。
 pub fn spawn(
     listener: &TcpListener,
     from_gov: bool,
@@ -599,35 +619,66 @@ pub fn spawn(
             }
         }
     }
+    // worker 池排在 Shared 之前建：失败时唤醒 fd 还是本函数独占的，能像上面两步一样收回。
+    let pool = match Pool::start(&rt, &step, workers, depth) {
+        Ok(p) => p,
+        Err(e) => {
+            for fd in &wake_fds {
+                let _ = unsafe { libc::close(*fd) };
+            }
+            return Err(e);
+        }
+    };
     let shared = Arc::new(Shared {
         conns: Mutex::new(HashMap::new()),
         dirty: (0..LOOPS).map(|_| Mutex::new(Vec::new())).collect(),
         wakes: wake_fds.clone(),
         next_id: AtomicU64::new(1),
-        pool: Pool::start(&rt, &step, workers, depth),
+        pool,
     });
     let plane = if from_gov { "control" } else { "meta" };
     let mut joins = Vec::with_capacity(LOOPS);
+    let mut fail_kind = io::ErrorKind::Other;
     for (id, (wake_fd, l)) in wake_fds.into_iter().zip(clones).enumerate() {
         let shared = shared.clone();
         let rt = rt.clone();
-        joins.push(
-            thread::Builder::new()
-                .name(format!("{plane}-loop{id}"))
-                .spawn(move || {
-                    let mut lp = match EventLoop::new(l, from_gov, id, wake_fd, shared, rt) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            eprintln!("meta epoll: {plane} loop {id} failed to start: {e}");
-                            return;
-                        }
-                    };
-                    if let Err(e) = lp.run() {
-                        eprintln!("meta epoll: {plane} loop {id} exited: {e}");
+        let spawned = thread::Builder::new()
+            .name(format!("{plane}-loop{id}"))
+            .spawn(move || {
+                let mut lp = match EventLoop::new(l, from_gov, id, wake_fd, shared, rt) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("meta epoll: {plane} loop {id} failed to start: {e}");
+                        return;
                     }
-                })
-                .expect("spawn meta event loop"),
-        );
+                };
+                if let Err(e) = lp.run() {
+                    eprintln!("meta epoll: {plane} loop {id} exited: {e}");
+                }
+            });
+        match spawned {
+            Ok(h) => joins.push(h),
+            Err(e) => {
+                // 循环之间是同一 listener、同一 pool 的对等复制，少一条只是少一份并发，
+                // 已起起来的照样接全部连接；所以这里打印并继续，绝不 `expect` 掉进程。
+                // 那条没起来的循环的唤醒 fd 不能关——`shared.wakes` 里存的是同一个号码，
+                // 别的循环还会往里 poke。
+                fail_kind = e.kind();
+                eprintln!("meta epoll: {plane} loop {id} could not start: {e}");
+            }
+        }
+    }
+    if joins.is_empty() {
+        // 一条都没起来 = 平面根本没在 accept：必须返回 `Err` 让调用方退回线程形状，
+        // 不能交出一个空句柄数组假装接管成功。此时闭包都已丢掉，`shared` 是唯一持有者，
+        // 唤醒 fd 可以安全收回（线程创建本来就失败，fallback 也起不了循环）。
+        for fd in &shared.wakes {
+            let _ = unsafe { libc::close(*fd) };
+        }
+        return Err(io::Error::new(
+            fail_kind,
+            format!("no {plane} epoll loop could start ({LOOPS} tried): thread creation failed"),
+        ));
     }
     Ok(joins)
 }
