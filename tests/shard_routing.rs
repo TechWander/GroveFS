@@ -17,6 +17,15 @@
 //!     only by a SUCCESSFUL mount — a lens follows its base, and a refused
 //!     `M_OPEN` (unknown name, a lens whose base was never created) leaves no
 //!     row behind (ADR-0006 §2, §5.6);
+//!   * the invalidation subscription is a THIRD `M_OPEN` for the same view and
+//!     follows the same redirect, so a mount whose coherence stream was dialed
+//!     at the wrong instance still receives the home instance's `EV_ENTRY`
+//!     frames for a peer's writes (ADR-0006 §5);
+//!   * a THREE-node ring routes by the row, not by adjacency: a redirect lands
+//!     on the instance the row names even when that is neither the entry point
+//!     nor its neighbour, and a row naming a node the ring does not define
+//!     fails the mount everywhere with that name instead of falling back to
+//!     serving the tree locally;
 //!   * `store.info` reports the ring, per-node placed-view counts and which
 //!     instance is answering.
 //!
@@ -32,6 +41,7 @@ use grovefs::apikeys::{ApiKeyStore, Scope};
 use grovefs::control_remote::ControlClient;
 use grovefs::meta::{MetaProvider, NodeKind, ROOT_INO};
 use grovefs::remote::meta::{shard::Shard, MetaServer, RemoteMeta};
+use grovefs::remote::proto;
 use serde_json::json;
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
@@ -752,6 +762,327 @@ fn refused_mounts_leave_no_placement_row() {
     cleanup(&pg, scratch.path(), &key_id);
 }
 
+/// The invalidation subscription is a THIRD `M_OPEN` for the same view, and it
+/// must follow the same redirect as the work socket.
+///
+/// The defect this pins: the mount's listener used to walk a comma-separated
+/// failover list and take the first socket that answered, ignoring `E_SHARD`.
+/// A deployment whose entry point is not the home instance then gets a healthy
+/// work mount (redirected) and a coherence stream parked on the WRONG instance,
+/// which serves the subscription from a tree it does not own — so peer writes
+/// never invalidate, while every read still returns the right bytes. Nothing in
+/// the log says so, and the suite a sharding test can reach is the only place
+/// this is observable at all: the frames below only arrive if the subscription
+/// was established on the instance that holds the engine the write went through.
+#[test]
+fn the_invalidation_stream_of_a_redirected_mount_comes_from_the_home_instance() {
+    let Some(pg) = pg_uri() else {
+        eprintln!("skipping: no PostgreSQL reachable (set GROVEFS_PG_TEST_URI)");
+        return;
+    };
+    let tag = format!("s{}e", std::process::id());
+    let n_a = format!("{tag}e1");
+    let n_b = format!("{tag}e2");
+    let scratch = tempfile::Builder::new()
+        .prefix("grovefs_shardkeys_")
+        .tempdir()
+        .unwrap();
+    let (key, key_id) = admin_key(&pg, scratch.path(), &format!("shardtest-{tag}"));
+
+    let m1p = free_port();
+    let m2p = free_port();
+    let ring = format!("{n_a}=127.0.0.1:{m1p},{n_b}=127.0.0.1:{m2p}");
+    let m1 = start(
+        &n_a,
+        &ring,
+        &pg,
+        None,
+        &key,
+        format!("127.0.0.1:{m1p}"),
+        format!("127.0.0.1:{}", free_port()),
+    );
+    let m2 = start(
+        &n_b,
+        &ring,
+        &pg,
+        None,
+        &key,
+        format!("127.0.0.1:{m2p}"),
+        format!("127.0.0.1:{}", free_port()),
+    );
+    let v = format!("{tag}ev");
+    m1.gov()
+        .call("view.create", json!({"view": v}))
+        .expect("create on m1");
+
+    // The work socket, opened where the tree actually is.
+    let work = RemoteMeta::new(&m1.meta, &v).expect("mount at home");
+
+    // The subscription, dialed at the instance that does NOT serve it: the
+    // address the mount's listener thread is handed by a deployment that uses
+    // one bootstrap address for every client. Retried inside the budget only
+    // because the two sockets race over this test's own process; the FIRST
+    // successful dial is the one whose answer is asserted — once m2's row
+    // points at m1, every later attempt takes the same redirect.
+    let mut sub = None;
+    let t_open = Instant::now();
+    while t_open.elapsed() < Duration::from_secs(10) {
+        match grovefs::remote::meta::open_event_stream(&m2.meta, &v, "", 0) {
+            Ok(s) => {
+                sub = Some(s);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                panic!("the subscription was refused on credentials: {e}")
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+    let mut sub = sub.expect("the event stream never followed the redirect");
+    let followed = t_open.elapsed();
+    // The proof that the frames can only have come from m1: this instance never
+    // took the tree over (no local SQLite file, no cached engine), so a
+    // subscription that had stayed here would have been accepted against a view
+    // it does not serve and then had nothing to push.
+    assert!(
+        !has_local_tree(m2.dir.path(), &v),
+        "the subscription made the peer materialize the tree it redirected"
+    );
+    assert_eq!(
+        m2.info()["residentEngines"].as_u64(),
+        Some(0),
+        "m2 holds an engine for a view it only routes: {}",
+        m2.info()
+    );
+    assert!(
+        m1.info()["residentEngines"].as_u64().unwrap_or(0) >= 1,
+        "m1 must be the instance holding the tree both sockets talk to"
+    );
+
+    // A missing push must surface as an assertion, not as a stalled suite —
+    // the listener's socket deliberately has no read timeout in production.
+    sub.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
+
+    // A peer write through the home instance: the subscriber must be told.
+    let dir = work
+        .create_node(ROOT_INO, "docs", true, None, 0o755, UID, GID)
+        .expect("mkdir on the home instance");
+    let (kind, val, data) = proto::recv_response(&mut sub).expect("EV_ENTRY after a peer mkdir");
+    assert_eq!(kind, 0, "EV_ENTRY expected, got {kind}");
+    assert_eq!(val as i64, ROOT_INO, "the event's parent is the root");
+    let mut i = 0usize;
+    assert_eq!(proto::get_key(&data, &mut i).unwrap(), "docs");
+
+    // And the stream is not a one-shot: a second write on the same subscription
+    // is delivered against the inode the first one created.
+    work
+        .create_node(dir, "a.txt", false, Some("x"), 0o0644, UID, GID)
+        .expect("file under the new dir");
+    let (kind2, _, data2) = proto::recv_response(&mut sub).expect("second EV_ENTRY");
+    assert_eq!(kind2, 0);
+    let mut i2 = 0usize;
+    assert_eq!(proto::get_key(&data2, &mut i2).unwrap(), "a.txt");
+    eprintln!("timings: the subscription took {followed:?} to land on the home instance");
+
+    m1.gov()
+        .call("view.rm_base", json!({"view": v}))
+        .expect("teardown");
+    cleanup(&pg, scratch.path(), &key_id);
+}
+
+/// A ring of THREE instances routes by the placement row, not by proximity —
+/// and a row that names a node the ring does not define is refused instead of
+/// quietly served by whoever got the mount.
+///
+/// Two instances can only ever answer "the row's node is the other one", so the
+/// redirect target and the fallback neighbour are the same process and a bug
+/// that resolved a row to "the peer" rather than "the named node" was invisible.
+/// With three, the entry point m2 has to hand a mount to m1 (its row) for `va`
+/// and to m3 for `vb`, and the retired-node case below is the one a real
+/// deployment hits: the operator removes a host from `--shard-ring` while its
+/// rows are still in the shared table.
+#[test]
+fn a_three_node_ring_routes_by_the_row_not_by_adjacency() {
+    let Some(pg) = pg_uri() else {
+        eprintln!("skipping: no PostgreSQL reachable (set GROVEFS_PG_TEST_URI)");
+        return;
+    };
+    let tag = format!("s{}f", std::process::id());
+    let n_a = format!("{tag}r1");
+    let n_b = format!("{tag}r2");
+    let n_c = format!("{tag}r3");
+    let scratch = tempfile::Builder::new()
+        .prefix("grovefs_shardkeys_")
+        .tempdir()
+        .unwrap();
+    let (key, key_id) = admin_key(&pg, scratch.path(), &format!("shardtest-{tag}"));
+
+    let p1 = free_port();
+    let p2 = free_port();
+    let p3 = free_port();
+    let ring = format!("{n_a}=127.0.0.1:{p1},{n_b}=127.0.0.1:{p2},{n_c}=127.0.0.1:{p3}");
+    let m1 = start(
+        &n_a,
+        &ring,
+        &pg,
+        None,
+        &key,
+        format!("127.0.0.1:{p1}"),
+        format!("127.0.0.1:{}", free_port()),
+    );
+    let m2 = start(
+        &n_b,
+        &ring,
+        &pg,
+        None,
+        &key,
+        format!("127.0.0.1:{p2}"),
+        format!("127.0.0.1:{}", free_port()),
+    );
+    let m3 = start(
+        &n_c,
+        &ring,
+        &pg,
+        None,
+        &key,
+        format!("127.0.0.1:{p3}"),
+        format!("127.0.0.1:{}", free_port()),
+    );
+    let va = format!("{tag}va");
+    let vb = format!("{tag}vb");
+    m1.gov()
+        .call("view.create", json!({"view": va}))
+        .expect("va on m1");
+    m3.gov()
+        .call("view.create", json!({"view": vb}))
+        .expect("vb on m3");
+
+    // Neither mount is at its home, and neither home is the entry point's only
+    // neighbour from the other's point of view: `va` lands on m1, `vb` on m3.
+    let a = RemoteMeta::new(&m2.meta, &va).expect("va through m2");
+    let b = RemoteMeta::new(&m2.meta, &vb).expect("vb through m2");
+    a.create_node(ROOT_INO, "on-m1", true, None, 0o755, UID, GID)
+        .expect("write follows va's row");
+    b.create_node(ROOT_INO, "on-m3", true, None, 0o755, UID, GID)
+        .expect("write follows vb's row");
+    assert!(
+        has_local_tree(m1.dir.path(), &va) && !has_local_tree(m3.dir.path(), &va),
+        "va's tree must be m1's alone"
+    );
+    assert!(
+        has_local_tree(m3.dir.path(), &vb) && !has_local_tree(m1.dir.path(), &vb),
+        "vb's tree must be m3's alone"
+    );
+    assert!(
+        !has_local_tree(m2.dir.path(), &va) && !has_local_tree(m2.dir.path(), &vb),
+        "the entry point served two views it only had to redirect"
+    );
+    let rows = placement_rows(&pg, &ring, &n_a, &tag);
+    // `placement_rows` sorts: the table read has no ORDER BY and a two-row
+    // comparison on scan order would be a flake, not a finding.
+    assert_eq!(
+        rows,
+        vec![(va.clone(), n_a.clone()), (vb.clone(), n_c.clone())],
+        "one row per base, each naming the instance that created it"
+    );
+    // `store.info` on the entry point describes the whole ring, counting views
+    // it serves itself (zero here) alongside the two it hands off.
+    let i2 = m2.info();
+    assert_eq!(i2["shard"]["self"], json!(n_b));
+    assert_eq!(shard_of(&i2, &n_a)["views"], json!(1));
+    assert_eq!(shard_of(&i2, &n_b)["views"], json!(0));
+    assert_eq!(shard_of(&i2, &n_c)["views"], json!(1));
+    assert_eq!(i2["views"], json!(0), "m2 materialized nothing");
+
+    // ---- a row naming a node the ring does not define ----------------------
+    // The retired-host case, spelled directly in the shared table because no
+    // verb in the ring can produce it (that is the point: the ring changed
+    // under the table). `drop` is the safe form — it costs no tree, only the
+    // routing answer.
+    let retire = |to: &str| {
+        let mut c =
+            postgres::Client::connect(&pg, postgres::NoTls).expect("pg for the edit");
+        c.execute(
+            "UPDATE grovefs_control.meta_placement SET meta = $1 WHERE view = $2",
+            &[&to, &va],
+        )
+        .expect("retire m1 in the row");
+    };
+    let restore = || {
+        let mut c =
+            postgres::Client::connect(&pg, postgres::NoTls).expect("pg for the fix");
+        let meta: &str = &n_a;
+        c.execute(
+            "UPDATE grovefs_control.meta_placement SET meta = $1 WHERE view = $2",
+            &[&meta, &va],
+        )
+        .expect("put the row back");
+    };
+    retire(&format!("{tag}gone"));
+    // Every instance now has a verdict it cannot honour. Each must REFUSE with
+    // the name in the row — serving the tree locally would give two answers to
+    // one name, which is the data-loss shape ADR-0006 §2 exists to prevent.
+    for entry in [&m1.meta, &m2.meta, &m3.meta] {
+        let e = RemoteMeta::new(entry, &va)
+            .err()
+            .unwrap_or_else(|| panic!("{entry} mounted a view whose row names a retired node"));
+        let msg = e.to_string();
+        assert!(
+            msg.contains("does not define") && msg.contains(&format!("'{tag}gone")),
+            "unhelpful refusal from {entry}: {msg}"
+        );
+        assert!(
+            msg.contains(&n_c) || msg.contains(&n_a) || msg.contains(&n_b),
+            "the refusal must list the ring it knows: {msg}"
+        );
+    }
+    // The refusals must not have touched the table: an `M_OPEN` that is refused
+    // reads the row and answers, it never re-places a name it cannot serve.
+    let refused_rows = placement_rows(&pg, &ring, &n_a, &tag);
+    assert_eq!(
+        refused_rows,
+        vec![
+            (va.clone(), format!("{tag}gone")),
+            (vb.clone(), n_c.clone()),
+        ],
+        "refused mounts rewrote the placement table"
+    );
+    // `vb`, whose row is still valid, is untouched by m1's retirement: a
+    // dangling row is one view's problem, not the ring's.
+    let _b2 = RemoteMeta::new(&m3.meta, &vb).expect("vb still routes");
+    restore();
+    let _a2 = RemoteMeta::new(&m2.meta, &va).expect("a restored row routes again");
+
+    let mut teardown = Vec::new();
+    for node in [&m1, &m3] {
+        for view in [&va, &vb] {
+            if let Err(e) = node.gov().call("view.rm_base", json!({"view": view})) {
+                teardown.push(format!("{}/{}: {e}", node.ctl, view));
+            }
+        }
+    }
+    // The regression this line catches is the one the DIAG walk found: `view rm`
+    // asked at a PEER whose tree is already gone used to answer "no physical
+    // base tree" — after `Shard::route`'s bootstrap arm had pinned the name to
+    // that peer. A destroy verb must read the row, never write it.
+    let rows = placement_rows(&pg, &ring, &n_a, &tag);
+    assert!(
+        rows.is_empty(),
+        "placement rows outlived the ring they named: {rows:?} (refused teardowns: {teardown:?})"
+    );
+    cleanup(&pg, scratch.path(), &key_id);
+}
+
+// TODO(severity=High): a HOME NODE GOING DOWN mid-mount is not covered here,
+// because nothing in this file can stop an instance: `MetaServer::serve()` has
+// no shutdown control op and the accept loops outlive the test's `Node` struct,
+// so a dead ring member can only be simulated by a port that was never bound
+// (the redirect then fails with a transport error, which is a different answer
+// from "the tree is unreachable because its host is gone").  Needs a stop
+// handle on `MetaServer` (or a `node.shutdown` control op) plus the assertion
+// that a mount dials the NEXT address in the failover list rather than the
+// retired home.
 // TODO(severity=High): fork definitions (`ViewDef::Fork(base)`) take the same
 // routing key as a lens via `shard_routing_key`, but no case here exercises one:
 // `fork.create` needs a seeded base tree, and the SQLite/PG split changes what a

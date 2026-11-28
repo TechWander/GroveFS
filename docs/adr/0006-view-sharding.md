@@ -66,23 +66,26 @@ m1=10.0.0.1:50053+10.0.0.2:50053,m2=10.0.0.3:50053     # m1 是一对 HA 主备
 - **一台 PG 控制面死**：所有**新的** `M_OPEN` 被拒（"which instance serves the view is undecided, refusing to guess"），**已建立的挂载继续服务**——放置只在连接建立时被问一次。5 秒一次的清扫读不到表时**保持现场不动**（`evict_misplaced` 直接返回 0），绝不在一次瞬时错误上丢掉活的树。控制面对分片路径而言是"挂载能否新建立"的故障域，不是"数据是否可读"的故障域。
 - **环里少了一个名字**：指向已退役实例的行是 **Err**，不是"按哈希自己顶上"。视图要么由人搬走，要么把那台加回环里。
 - **`--shard-ring` 与放置行互相矛盾**（两行互指）：客户端的跟跳有 `SHARD_FOLLOW_MAX = 3` 上限并带环路检测，失败时给的是**点名原因**的错误（"placement for view 'X' points back at …"），不是泛化的"连不上"。
+- **失效事件流也是 `M_OPEN` 的消费者**：挂载除了工作 socket 还有一条只读的订阅 socket（peer 的 create/delete/rename 靠它作废内核缓存）。它同样跟 `E_SHARD` 跳，同一个上限、同一个环路检测——否则非 home 实例上的挂载会「op 读对的树、作废收不到」，是所有分片故障里最难发现的一种（无任何错误码可见）。订阅被拒时服务端写的拒因透传到挂载日志，不再是一个裸 EIO。
 
 ## 6. 治理动词的跨实例语义
 
 `--control-plane` 让**定义**从每个实例都可见，这恰恰制造了新坑：`view_exists` 在远端也是真，非 home 实例若照旧执行，就会在同一个名字下建出第二棵树——后面没有任何动词能修好这件事。所以：
 
 - **`view create`**：先过 `route()`。行指向 peer → 拒绝，并把"该找哪台、命令怎么写、要搬就 `view move --to-meta`"三句一起给出。行指向自己 → 行**写在树之前**，与 PG home 行同一个理由：那一行就是告诉其他实例"这名字占了"。
-- **`view rm`**：删树是 home 的活。peer 若删掉行而树还在别处活着，留下的就是一个"挂载再也解析不到放置"的悬树。删成功后 `forget()` 删行，best-effort——树已经没了，读不到的控制面只会让计数偏一点，不会复活视图。
+- **`view rm`**：删树是 home 的活。peer 若删掉行而树还在别处活着，留下的就是一个"挂载再也解析不到放置"的悬树。删成功后 `forget()` 删行，best-effort——树已经没了，读不到的控制面只会让计数偏一点，不会复活视图。**这一条走 `peek_forget()` 而不是 `route()`**：见 §3 的例外。
 - **`view move --to-meta NODE`**：**必须在 TARGET 的控制端口上执行**。要为新家答复的那个进程才有权声明"这棵树我打得开"，它探测通过才写行。派生视图（lens/fork/bias）随 base 一起走。
 - **`E_SHARD` 出现在 op 上（不只是 `M_OPEN`）**：一个已经挂载着的连接，在它的视图被搬走之后，旧实例会在清扫时丢掉引擎缓存；下一次 op 是 MISS，此时才查表，指向别人 → `E_SHARD` + 新 home + **挂断**。客户端认得这个码：采纳新 home、清空连接池、重握手、**重放那个 op**。被拒的 op 从未执行过，所以重放是安全的。于是 `view move --to-meta` 对**已建立的挂载**也生效，运维不需要挨个 remount。
 
 ## 7. 可观测
 
-三枚计数器（`stats` 报告的"非计时计数器"段）：
+三枚分片计数器（`stats` 报告的"非计时计数器"段）：
 
-- `shard mounts redirected` —— 本实例把挂载指引给别人（入口侧 + 客户端跟跳侧都计）
+- `shard mounts redirected` —— 本实例把挂载指引给别人（入口侧 + 客户端跟跳侧都计；工作 socket 与失效事件流是同一条 `M_OPEN` 的两个消费者，任一处跟一跳都算）
 - `shard management verbs refused` —— 治理动词因为"树在 peer 那里"被拒的次数；它涨而 `views` 不涨，说明有人在对着错误的端口敲命令
 - `shard placement read/write errors` —— 放置表读不到/写不进（每一次都以拒挂载或拒动词收场，绝不以猜收场）
+
+跟分片有关但不只属于分片的第四枚：`invalidation stream reconnects` —— 挂载的失效订阅没能（重新）建立的一次尝试。它和 `remote reconnects` 不同涨才有意义：后者不涨而它一直加，说明挂载在正常服务而内核缓存已经过期（监听退避 300ms→5s，第 1 次失败与此后每 20 次各打一行原因，一次会话撑过 30s 后退归零并打一行「streamed for Ns before dropping again」）。
 
 `store.info` 的 `shard` 块只在该进程真的在环里时出现（`null` = "本进程服务所有视图"，与 `ha` 块同样的形状）：`self`/`addr`/`ring`/`backend`/`controlPlane` 加每节点 `{name, addr, views, here}`。地址随块外发（它是客户端要被指引去的地方，不是秘密），**后端 URI 永不外发**——`backend` 是去 credential 的指纹。`controlPlane` 说清放置表到底与树同库（`"tree backend"`）还是被 `--control-plane` 另指了一台（`"separate --control-plane"`），两边都先过 `resolved_control_uri` 展开，因为一个裸 `--meta-store` URI 会被采纳成 `<base>/instances.conf` 托管注册表，同一台库有两种写法。审计侧每个分片决定都落一行：`M_OPEN` 重定向记 `method=meta / M_OPEN`（"view='x': redirected to meta-server 'm1'"），逐 op 门记 `method=meta / M_SHARD`（"…moved to meta-server 'm1', this mount follows it"），治理动词被拒也各留一行——运维在一台不服务的实例上敲 `view rm`，审计里看得见它被拒的原因。
 
@@ -103,6 +106,6 @@ m1=10.0.0.1:50053+10.0.0.2:50053,m2=10.0.0.3:50053     # m1 是一对 HA 主备
 - **搬走的视图被旧实例放手的窗口**：行改写后，旧实例的下一次清扫在 **4.691 / 4.701 / 4.707 s** 内丢掉该树（`SHARD_SWEEP_MS = 5000 ms` 的上界，实测贴着它）。
 - **已建立挂载跟着走**：清扫之后第一个 op 在 **71.48 / 80.57 / 83.71 ms** 内落到新家并成功（`E_SHARD` 挂断 + 重握手 + 同一 op 重放），无需 remount；此后 `readdir` 同时看得见搬之前建的 `before` 与搬之后建的 `after`——**一棵树，两个实例先后服务过它**。
 - **稳态成本**：被重定向那一侧的 `residentEngines` 在挂载前后不变（e2e 直接断言），即非 home 实例对别人的视图不留任何缓存。
-- **e2e 与真实回显逼出的五处真缺陷**（都已修，列在这里说明为什么它们值得进 ADR）：① `SELECT to_regclass(...)` 原样取列在 rust-postgres 下是**反序列化失败**，而它跑在清扫线程与 `store.info` 上——一个 panic 的 worker 会让整台实例的控制端口不再应答；② `--control-plane postgres://…` + SQLite 树时，"这棵树在不在"被拿去问 PG（查 schema），于是**每个实例都看不见自己的本地树**，自家挂载被自家拒绝；③ 放置表要拨的那个 URI，若直接拿 `--meta-store` 的原文会得到一个 `file:` 托管注册表路径，`postgres::Config` 当场解析失败。④ 视图列表里「这棵树落在哪儿」是按**控制面**后端渲染的，于是 `--control-plane postgres://… + SQLite 树` 把本地文件说成 `own schema grovefs_v_…`；而同一条渲染路径在远程 SQLite 档下（自 `283dd4a` 起）一直印着 `own tree ` 加一个空路径——因为远程 store 没实现 `tree_home_rel`。修法是给 `ControlStore` 加 `tree_backend()`（默认等于 `backend()`，`FileControlStore` 在引擎档答 `treedb` 并把 `tree_home_rel` 交回空串，`RemoteControlStore` 从 `store.info` 新增的 `metadataBackend` 字段探得，老服务端缺该字段时回退控制面档）：**凡是回答「这棵树在哪里」的行都得改问树后端**（`M_OPEN` 的「视图不存在」提示里那两条按后端的分支同样改了判据）。⑤ 分片拒绝文案把环里的 **mount 地址**填进了建议命令的 `--control-server`，照抄必然连不上治理协议——治理口是 `--control-listen`，与挂载口不同号，而且代码里没有任何「mount+1」这种约定可依赖。现在文案点名 mount 地址（那正是客户端要被指引去的地方），并把命令指向「该实例自己的 `--control-listen` 口」；`tests/shard_routing.rs` 里加了一条**反向断言**盯住这个形状（拒绝文本里不得出现 `--control-server <mount 地址>`）。④⑤ 都不是逻辑错而是**说错话**：前者让运维照着屏幕去找一个不存在的 schema，后者让他连一个不该连的端口——两处都只有在真人读回显时才会被发现，所以它们连同 ①②③ 一起写在这里。五处都不是单测能发现的形状：**只有真起两个进程、真共享一台库、真把回显读一遍**才会撞见，这就是 `tests/shard_routing.rs` 存在的理由。
+- **e2e 与真实回显逼出的六处真缺陷**（都已修，列在这里说明为什么它们值得进 ADR）：① `SELECT to_regclass(...)` 原样取列在 rust-postgres 下是**反序列化失败**，而它跑在清扫线程与 `store.info` 上——一个 panic 的 worker 会让整台实例的控制端口不再应答；② `--control-plane postgres://…` + SQLite 树时，"这棵树在不在"被拿去问 PG（查 schema），于是**每个实例都看不见自己的本地树**，自家挂载被自家拒绝；③ 放置表要拨的那个 URI，若直接拿 `--meta-store` 的原文会得到一个 `file:` 托管注册表路径，`postgres::Config` 当场解析失败。④ 视图列表里「这棵树落在哪儿」是按**控制面**后端渲染的，于是 `--control-plane postgres://… + SQLite 树` 把本地文件说成 `own schema grovefs_v_…`；而同一条渲染路径在远程 SQLite 档下（自 `283dd4a` 起）一直印着 `own tree ` 加一个空路径——因为远程 store 没实现 `tree_home_rel`。修法是给 `ControlStore` 加 `tree_backend()`（默认等于 `backend()`，`FileControlStore` 在引擎档答 `treedb` 并把 `tree_home_rel` 交回空串，`RemoteControlStore` 从 `store.info` 新增的 `metadataBackend` 字段探得，老服务端缺该字段时回退控制面档）：**凡是回答「这棵树在哪里」的行都得改问树后端**（`M_OPEN` 的「视图不存在」提示里那两条按后端的分支同样改了判据）。⑤ 分片拒绝文案把环里的 **mount 地址**填进了建议命令的 `--control-server`，照抄必然连不上治理协议——治理口是 `--control-listen`，与挂载口不同号，而且代码里没有任何「mount+1」这种约定可依赖。现在文案点名 mount 地址（那正是客户端要被指引去的地方），并把命令指向「该实例自己的 `--control-listen` 口」；`tests/shard_routing.rs` 里加了一条**反向断言**盯住这个形状（拒绝文本里不得出现 `--control-server <mount 地址>`）。④⑤ 都不是逻辑错而是**说错话**：前者让运维照着屏幕去找一个不存在的 schema，后者让他连一个不该连的端口——两处都只有在真人读回显时才会被发现，所以它们连同 ①②③ 一起写在这里。⑥ `view rm` 用的是带 bootstrap pin 的 `route()`：一台已经把该树删掉的实例把行删干净了，于是另一台 peer 收到一次普通的收尾 `view rm` 时，这个名字在表里已是「未放置」，`route()` 把行**写成了指向 peer 自己**，然后才在「本地没有物理树」上失败——结果是一个会说谎的放置行，它让这个名字在下一次 `view create` 时被「已放置在 X」拒掉，而 X 上什么都没有。两节点环撞不出这个形状（行只能指向「对家」，永远指不到第三方），是三节点 e2e 的第一轮就跑出来的。**它和 ①②③⑤ 一样是判据错，不是文案错，但只有把行真的读回来才看得见：所以 `tests/shard_routing.rs` 现在每一条收尾都断言「本 run 的放置行为空」。**六处都不是单测能发现的形状：**只有真起两个进程、真共享一台库、真把回显读一遍**才会撞见，这就是 `tests/shard_routing.rs` 存在的理由。
 
-单测计数：`remote::meta::shard::tests` 7 条（环解析、非法环、单节点短路、行判定、后端不符拒绝、指纹去 credential、自身定位）+ `remote::meta::shard_follow_tests` 4 条（跟跳并 pin、home 是 HA 对时落到活的一半、互指的行以点名原因快速失败、空重定向不致命而是继续走 failover 列表）；`cargo test --release --features treedb` 全量 **429 passed / 0 failed / 4 ignored**，本主题新增 14 条（含视图落点标签那条回归单测）。
+单测计数：`remote::meta::shard::tests` 8 条（环解析、非法环、单节点短路、行判定、后端不符拒绝、指纹去 credential、自身定位，以及「销毁动词只读行、无行即本实例」那条）+ `remote::meta::shard_follow_tests` 7 条（跟跳并 pin、home 是 HA 对时落到活的一半、互指的行以点名原因快速失败、空重定向不致命而是继续走 failover 列表，以及事件流那三条：跟 `E_SHARD` 到新家并在同一条 socket 上收到 push、互指环以点名原因收场、非 `E_SHARD` 的拒因透传到客户端）；`tests/shard_routing.rs` 六条端到端（两实例分流、PG 共享后端下搬家的视图跟着已开挂载、lens 只认 base 的行、被拒挂载不留行、事件流跨实例的失效推送、三节点环按行路由）。上面的 8/7/6 与全量 **329 passed / 0 failed**（`cargo test --release --features treedb --lib`）均取自当轮实跑。

@@ -544,7 +544,7 @@ impl Shard {
         })
     }
 
-    /// Every row of the placement table verbatim: `(view, meta)` in view order.
+    /// Every row of the placement table verbatim: `(view, meta)` sorted by view.
     ///
     /// Read-only and non-creating like [`Shard::placement_map`], and kept as
     /// KEYS rather than folded into counts because it answers the question an
@@ -552,13 +552,13 @@ impl Shard {
     /// table hold, and does any of them name a tree that no longer exists?" A
     /// derived name in here is the ADR-0006 §2 breakage made visible; a name
     /// whose tree was deleted is an orphan no governance verb will remove.
-    /// `tests/shard_routing.rs` asserts on it for exactly that reason.
+    /// `tests/shard_routing.rs` asserts on it for exactly that reason — and
+    /// sorts, because `placement_map` is a HashMap and a comparison whose element
+    /// order came from a hash would be a flake, not a finding.
     pub fn placement_rows(&self) -> Result<Vec<(String, String)>, String> {
-        Ok(self
-            .placement_map()?
-            .into_iter()
-            .map(|(v, m)| (v, m))
-            .collect())
+        let mut rows: Vec<(String, String)> = self.placement_map()?.into_iter().collect();
+        rows.sort();
+        Ok(rows)
     }
 
     /// Placed-view count per node name, ring order preserved for the report.
@@ -993,6 +993,32 @@ mod tests {
             dangling.contains("'m3'") && dangling.contains("view move --to-meta"),
             "{dangling}"
         );
+    }
+
+    /// The verdict a DESTROY acts on: no row means "this instance's, clean it
+    /// up", and a row naming a retired node stays a hard refusal. Both are the
+    /// shape [`Shard::peek_forget`] reads out of the table, and neither may
+    /// write: the second one is `view rm`'s whole answer to a dangling row, the
+    /// first is what lets a pre-sharding tree be removed from the instance that
+    /// has it. `route()`'s bootstrap arm would instead PIN the name here.
+    #[test]
+    fn a_destroy_verb_answers_from_the_row_it_never_writes() {
+        let s = ring("m1=a:1,m2=b:2", "m1", "tree:X");
+        // No row: the read-only verdict is Mine (so the delete may run), which is
+        // exactly why the verb cannot use `route()`'s pin — the pin would record
+        // this instance as the home of a name it may not even hold.
+        assert_eq!(s.decide("v", None).unwrap(), Home::Mine);
+        // A row naming a node the ring retired: refused, whatever the verb is.
+        assert!(s
+            .decide(
+                "v",
+                Some(Placement {
+                    meta: "gone".into(),
+                    store: "tree:X".into(),
+                })
+            )
+            .unwrap_err()
+            .contains("does not define"));
     }
 
     /// Being named home is not enough: if the row was written by a process on a
