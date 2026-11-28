@@ -3259,7 +3259,11 @@ fn read_password(
                 .read_to_string(&mut s)
                 .map_err(|e| format!("cannot read the password from stdin: {e}"))?;
             if n == 0 {
-                return Err("--password-stdin received nothing: pipe the secret in (a password \n                        manager, a file) rather than running this from a terminal.".into());
+                return Err(
+                    "--password-stdin received nothing: pipe the secret in (a password \
+                     manager, a file) rather than running this from a terminal."
+                        .into(),
+                );
             }
             s
         }
@@ -3268,7 +3272,9 @@ fn read_password(
         }
         (None, false) => {
             return Err(
-                "a password comes from --password-file PATH or --password-stdin: on a command line \n             it is visible to every local process and lands in the shell history. The length and \n             composition rules are the server's and are reported verbatim."
+                "a password comes from --password-file PATH or --password-stdin: on a command \
+                 line it is visible to every local process and lands in the shell history. The \
+                 length and composition rules are the server's and are reported verbatim."
                     .into(),
             )
         }
@@ -4697,9 +4703,9 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(w) => {
                     if control_listen.is_none() {
                         return Err(
-                            "--audit-retention needs --control-listen HOST:PORT: the audit table belongs 
-                             to the control plane, and without that port this process opens no key store 
-                             to sweep"
+                            "--audit-retention needs --control-listen HOST:PORT: the audit table \
+                             belongs to the control plane, and without that port this process \
+                             opens no key store to sweep"
                                 .into(),
                         );
                     }
@@ -4720,15 +4726,26 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             let admin = match (&admin_user, &admin_password_file) {
                 (None, None) => None,
                 (Some(_), None) => {
-                    return Err("--admin-user needs --admin-password-file PATH: a password has no \n                        place on a command line (argv is visible to every local process and \n                        lands in the shell history)".into())
+                    return Err(
+                        "--admin-user needs --admin-password-file PATH: a password has no place \
+                         on a command line (argv is visible to every local process and \
+                         lands in the shell history)"
+                            .into(),
+                    )
                 }
                 (None, Some(_)) => {
-                    return Err("--admin-password-file needs --admin-user: an owner without a name \n                        cannot be created".into())
+                    return Err(
+                        "--admin-password-file needs --admin-user: an owner without a name \
+                         cannot be created"
+                            .into(),
+                    )
                 }
                 (Some(account), Some(path)) => {
                     if control_listen.is_none() {
                         return Err(
-                            "--admin-user needs --control-listen HOST:PORT: the web accounts live \n                             beside the control plane, and without that port nothing can verify a sign-in"
+                            "--admin-user needs --control-listen HOST:PORT: the web accounts \
+                             live beside the control plane, and without that port nothing can \
+                             verify a sign-in"
                                 .into(),
                         )
                     }
@@ -5862,7 +5879,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         return Err(format!(
                             "`--for admin` needs `--owner <account>`: an administrator key is \
                              attributed by account in the control-plane audit, and one account \
-                             (with several keys) is what makes rotation possible. Retry with e.g.\n  \
+                             (with several keys) is what makes rotation possible. Retry with e.g. \
                              grovefs apikey create --label {label} --for admin --owner alice"
                         )
                         .into());
@@ -6567,13 +6584,22 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                 (None, None) => None,
             };
             let addr = control_server.ok_or_else(|| -> Box<dyn std::error::Error> {
-                "grovefs web needs --control-server HOST:PORT. The console is a gateway in \n  front of `meta-server --control-listen HOST:PORT`: it holds no accounts, views, keys \n  or audit of its own, so there is nothing for it to serve without that address.\n  Try: grovefs web --control-server 127.0.0.1:9502 --api-key-file /etc/grovefs/control.key"
+                "grovefs web needs --control-server HOST:PORT. The console is a gateway in front \
+                 of `meta-server --control-listen HOST:PORT`: it holds no accounts, views, keys \
+                 or audit of its own, so there is nothing for it to serve without that address. \
+                 Try: grovefs web --control-server 127.0.0.1:9502 --api-key-file \
+                 /etc/grovefs/control.key"
                     .into()
             })?;
             let key = resolve_control_key(explicit).ok_or_else(
                 || -> Box<dyn std::error::Error> {
                     format!(
-                        "--control-server {addr} needs the console's admin credential: --api-key \n  '<id>:<secret>', --api-key-file PATH (first line), or GROVEFS_CONTROL_KEY. It must be an\n  `admin`-scope key — mint one on the server host with `grovefs apikey --meta-dir \n  <server-meta-dir> create --for admin --owner <account>` (the first one cannot come \n  from the governance API, or that API would install its own administrators)."
+                        "--control-server {addr} needs the console's admin credential: --api-key \
+                         '<id>:<secret>', --api-key-file PATH (first line), or \
+                         GROVEFS_CONTROL_KEY. It must be an `admin`-scope key — mint one on the \
+                         server host with `grovefs apikey --meta-dir <server-meta-dir> create \
+                         --for admin --owner <account>` (the first one cannot come from the \
+                         governance API, or that API would install its own administrators)."
                     )
                     .into()
                 },
@@ -6613,7 +6639,11 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         },
                     )?;
                     if ttl.is_zero() {
-                        return Err("--session-ttl cannot be 0: every request would sign itself out \n                        before it answered.".into());
+                        return Err(
+                            "--session-ttl cannot be 0: every request would sign itself out \
+                             before it answered."
+                                .into(),
+                        );
                     }
                     grovefs::web::serve(grovefs::web::Config {
                         listen,

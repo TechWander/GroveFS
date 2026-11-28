@@ -60,6 +60,23 @@ use std::time::{Duration, Instant};
 const UID: u32 = 1000;
 const GID: u32 = 1000;
 
+/// The SHAPE of a reply, asserted next to its content.
+///
+/// These strings reach an operator through paths that do not reformat them:
+/// piped CLI output (soft wrapping is off once stderr is not a terminal),
+/// `store.info`, the web console's raw JSON, the audit row. A refusal that
+/// arrives as several lines with a dozen indent columns after the break is not
+/// a cosmetic problem, it is text that cannot be pasted or grepped. The
+/// source-side guard is
+/// `remote::meta::server_ext::msg_shape_tests::server_replies_are_single_line`;
+/// this is the same rule measured over the real wire.
+fn one_line(text: &str) {
+    assert!(
+        !text.contains('\n'),
+        "a reply arrived as several lines: {text:?}"
+    );
+}
+
 /// A PostgreSQL this machine can reach, or `None` (→ self-skip).
 fn pg_uri() -> Option<String> {
     if let Ok(u) = std::env::var("GROVEFS_PG_TEST_URI") {
@@ -324,6 +341,7 @@ fn sqlite_trees_shard_across_two_instances() {
         e.contains(&format!("placed on meta-server '{n_a}'")) && e.contains(&m1.meta),
         "unhelpful refusal: {e}"
     );
+    one_line(&e);
     // The regression this guards: the ring stores the MOUNT address, and an
     // earlier wording pasted that one into `--control-server`, sending the
     // operator to a port that does not speak the governance protocol.
@@ -409,6 +427,7 @@ fn sqlite_trees_shard_across_two_instances() {
         e.contains(&format!("placed on meta-server '{n_a}'")),
         "unhelpful refusal: {e}"
     );
+    one_line(&e);
     m1.gov()
         .call("view.rm_base", json!({"view": va}))
         .expect("the home instance deletes its own view");
@@ -428,6 +447,7 @@ fn sqlite_trees_shard_across_two_instances() {
         e.contains("view export") || e.contains("--meta-store"),
         "unhelpful refusal: {e}"
     );
+    one_line(&e);
     // Asking the instance that already holds it is a no-op, not an error.
     m2.gov()
         .call("view.move_meta", json!({"view": vb, "to": n_b.clone()}))
@@ -438,6 +458,7 @@ fn sqlite_trees_shard_across_two_instances() {
         .call("view.move_meta", json!({"view": vb, "to": n_a.clone()}))
         .expect_err("m2 must not answer for m1");
     assert!(e.contains(&n_a), "unhelpful refusal: {e}");
+    one_line(&e);
 
     m2.gov()
         .call("view.rm_base", json!({"view": vb}))
@@ -711,6 +732,7 @@ fn a_shorter_sweep_shortens_the_window_a_deposed_instance_holds_the_tree() {
                 .to_string();
             let other = if node == n_a { &n_b } else { &n_a };
             assert!(text.contains(&v), "a reply did not name its view: {text}");
+            one_line(&text);
             // Every reply names the instance that ANSWERED as its destination —
             // and never the other one, which is what a caller who typed the
             // wrong port would have to be told about.
@@ -1120,6 +1142,7 @@ fn a_lens_routes_by_its_base_and_owns_no_placement_row() {
             e.to_string().contains("has no physical tree"),
             "unhelpful refusal: {e}"
         );
+        one_line(&e.to_string());
     }
     let rows = placement_rows(&pg, &ring, &n_a, &tag);
     assert!(
@@ -1202,6 +1225,7 @@ fn refused_mounts_leave_no_placement_row() {
             e.to_string().contains("does not exist"),
             "unhelpful refusal for '{name}': {e}"
         );
+        one_line(&e.to_string());
     }
     assert!(
         placement_rows(&pg, &ring, &n_a, &tag).is_empty(),
@@ -1508,6 +1532,7 @@ fn a_three_node_ring_routes_by_the_row_not_by_adjacency() {
             msg.contains(&n_c) || msg.contains(&n_a) || msg.contains(&n_b),
             "the refusal must list the ring it knows: {msg}"
         );
+        one_line(&msg);
     }
     // The refusals must not have touched the table: an `M_OPEN` that is refused
     // reads the row and answers, it never re-places a name it cannot serve.
@@ -1609,6 +1634,7 @@ fn a_three_node_ring_routes_by_the_row_not_by_adjacency() {
             msg.contains(foreign) && msg.contains("--meta-store"),
             "the refusal from {entry} did not name the backend and the fix: {msg}"
         );
+        one_line(&msg);
     }
     assert_eq!(
         read_store(),

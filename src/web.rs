@@ -346,7 +346,8 @@ pub fn serve(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
             "refusing to bind {} — this console speaks plain HTTP, so a routable address puts \
              every sign-in and every governance call on the wire unencrypted. Either bind \
              127.0.0.1 and terminate TLS in a reverse proxy (and pass --use-x-forwarded-for so \
-             sign-ins are throttled per CLIENT rather than per proxy), or pass \n             --allow-insecure-http if this network is trusted end to end.",
+             sign-ins are throttled per CLIENT rather than per proxy), or pass \
+             --allow-insecure-http if this network is trusted end to end.",
             cfg.listen
         )
         .into());
@@ -359,10 +360,10 @@ pub fn serve(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     // authenticates AND names the backend.
     let info = cfg.control.call("info", json!({})).map_err(|e| {
         format!(
-            "cannot reach the control plane at {} with this key: {e}\n\
-             The console needs `meta-server --control-listen HOST:PORT` and an `admin`-scope \n\
-             account key (`grovefs apikey create --for admin --owner <account>`), supplied to \n\
-             this process by --api-key / --api-key-file / $GROVEFS_CONTROL_KEY.",
+            "cannot reach the control plane at {} with this key: {e} The console needs \
+             `meta-server --control-listen HOST:PORT` and an `admin`-scope account key \
+             (`grovefs apikey create --for admin --owner <account>`), supplied to this process \
+             by --api-key / --api-key-file / $GROVEFS_CONTROL_KEY.",
             cfg.control.addr()
         )
     })?;
@@ -388,7 +389,8 @@ pub fn serve(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         info.get("backend").and_then(Value::as_str).unwrap_or("?")
     );
     println!(
-        "  sign-in       : accounts of that server's web store; the first owner comes from its \n                    --admin-user flag"
+        "  sign-in       : accounts of that server's web store; the first owner comes from its \
+         --admin-user flag"
     );
     println!(
         "  sessions      : {}h idle window, {}",
@@ -401,8 +403,8 @@ pub fn serve(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
     );
     if !gw.cfg.is_loopback() {
         println!(
-            "  WARNING       : bound to a NON-LOOPBACK address over plain HTTP — credentials and \n\
-                governance calls cross the wire in the clear. Terminate TLS in front of this."
+            "  WARNING       : bound to a NON-LOOPBACK address over plain HTTP — credentials and \
+             governance calls cross the wire in the clear. Terminate TLS in front of this."
         );
     }
 

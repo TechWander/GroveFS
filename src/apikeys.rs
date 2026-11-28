@@ -626,8 +626,8 @@ fn load_wrap(base: &Path, mode: WrapMode) -> WrapMaterial {
                 source: format!("environment {STORE_KEY_ENV}"),
             },
             None => WrapMaterial::Absent(format!(
-                "{STORE_KEY_ENV} is set but is not {} hex characters — refusing to wrap anything 
-                 under a key that is not what it declares",
+                "{STORE_KEY_ENV} is set but is not {} hex characters — refusing to wrap \
+                 anything under a key that is not what it declares",
                 crate::secretbox::KEY_BYTES * 2
             )),
         };
@@ -1400,8 +1400,8 @@ impl ApiKeyStore {
             WrapMaterial::Ready { key, .. } => *key,
             WrapMaterial::Absent(why) => {
                 return Ok(StoredSecret::Unopenable(format!(
-                    "the row holds a wrapped copy but this process has no wrapping material to 
-                     open it: {why}"
+                    "the row holds a wrapped copy but this process has no wrapping material \
+                     to open it: {why}"
                 )));
             }
         };

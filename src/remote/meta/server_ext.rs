@@ -608,7 +608,8 @@ impl MetaRuntime {
     fn xfer_guard(&self, handle: &str, who: &crate::webauth::Principal) -> Result<(), String> {
         match self.xfer_owner.lock().get(handle) {
             Some(owner) if owner.as_str() != who.account.as_str() && !who.is_super() => Err(format!(
-                "transfer handle '{handle}' was staged by another account — a delegated user may \n                     only continue transfers it started; re-run the command under your own sign-in"
+                "transfer handle '{handle}' was staged by another account — a delegated user may \
+                 only continue transfers it started; re-run the command under your own sign-in"
             )),
             _ => Ok(()),
         }
@@ -1185,7 +1186,8 @@ impl MetaServer {
             let (scheme, remedy) = match &self.store {
                 StoreKind::Pg(_) => (
                     "postgres://…",
-                    "Run PostgreSQL's own streaming / logical replication for HA,\n                     or keep the meta-server single-instance under PG.",
+                    "Run PostgreSQL's own streaming / logical replication for HA, \
+                     or keep the meta-server single-instance under PG.",
                 ),
                 // The guard above already excluded SQLite, and the arms cover
                 // every non-Sqlite variant this build has; naming that here
@@ -1195,13 +1197,16 @@ impl MetaServer {
                 #[cfg(feature = "treedb")]
                 StoreKind::Treedb(_) => (
                     "treedb://…",
-                    "treedb recovers from its own WAL and snapshots, but GroveFS-native\n                     snapshot shipping is not implemented for it — run the meta-server single-instance.",
+                    "treedb recovers from its own WAL and snapshots, but GroveFS-native \
+                     snapshot shipping is not implemented for it — run the meta-server single-instance.",
                 ),
             };
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "--meta-store {scheme} cannot be combined with --role standby / --peer / --witness: \n                     GroveFS-native HA snapshot shipping is SQLite-only.\n                     {remedy}"
+                    "--meta-store {scheme} cannot be combined with --role standby / --peer / --witness: \
+                     GroveFS-native HA snapshot shipping is SQLite-only. \
+                     {remedy}"
                 ),
             ));
         }
@@ -1375,7 +1380,8 @@ impl MetaServer {
         // log — it embeds a password and the journal is world-readable.
         if self.control_plane.is_some() {
             println!(
-                "meta-server: control plane is PostgreSQL (grovefs_control) — view definitions, \n                 api keys, accounts, audit and both placement tables live there; trees stay on {}",
+                "meta-server: control plane is PostgreSQL (grovefs_control) — view definitions, \
+                 api keys, accounts, audit and both placement tables live there; trees stay on {}",
                 store.backend_name()
             );
         }
@@ -3032,7 +3038,12 @@ fn gates(op: &str) -> Result<Vec<Gate>, String> {
         }
         other => {
             return Err(format!(
-                "control op '{other}' has no access rule (unknown, or added to the dispatcher \n                     without one) — refusing. Known ops: info, whoami, login, def.list/get/put/remove, \n                     stamp, physical.list/has, fork.has/create/drop/graft, view.create/stats/plan/export/import, \n                     view.rm_base/move_meta, refs.rebuild, gc.scan/apply, apikey.create/list/revoke/delete/rotate/set_ro/update/secret/calls/purge, \n                     audit.retention.get/set, storage.add/update/remove/preview/set_control/relocate, \n                     account.list/create/passwd/role/disable/delete, grant.list/add/remove"
+                "control op '{other}' has no access rule (unknown, or added to the dispatcher \
+                 without one) — refusing. Known ops: info, whoami, login, def.list/get/put/remove, \
+                 stamp, physical.list/has, fork.has/create/drop/graft, view.create/stats/plan/export/import, \
+                 view.rm_base/move_meta, refs.rebuild, gc.scan/apply, apikey.create/list/revoke/delete/rotate/set_ro/update/secret/calls/purge, \
+                 audit.retention.get/set, storage.add/update/remove/preview/set_control/relocate, \
+                 account.list/create/passwd/role/disable/delete, grant.list/add/remove"
             ));
         }
     };
@@ -3771,7 +3782,10 @@ fn control_dispatch(
                     Ok(super::shard::Home::Other(node)) => {
                         crate::stats::count(crate::stats::Counter::ShardRefuse, 1);
                         return Err(format!(
-                            "view '{view}' is placed on meta-server '{}' (mount address {}) — run `view create` \n                             against THAT instance's own --control-listen port, or move the placement here \n                             first (`view move --view {view} --to-meta {}`, against the control port you \n                             are talking to)",
+                            "view '{view}' is placed on meta-server '{}' (mount address {}) — run `view create` \
+                             against THAT instance's own --control-listen port, or move the placement here \
+                             first (`view move --view {view} --to-meta {}`, against the control port you \
+                             are talking to)",
                             node.name, node.addr, sh.me().name
                         ));
                     }
@@ -4012,7 +4026,9 @@ fn control_dispatch(
                     Ok(super::shard::Home::Other(node)) => {
                         crate::stats::count(crate::stats::Counter::ShardRefuse, 1);
                         return Err(format!(
-                            "view '{view}' is placed on meta-server '{}' (mount address {}) — run `view rm` \n                             against THAT instance's own --control-listen port: only the process holding \n                             the tree can delete it (`--base` is what frees its bytes)",
+                            "view '{view}' is placed on meta-server '{}' (mount address {}) — run `view rm` \
+                             against THAT instance's own --control-listen port: only the process holding \
+                             the tree can delete it (`--base` is what frees its bytes)",
                             node.name, node.addr
                         ));
                     }
@@ -4646,7 +4662,8 @@ fn web_dispatch(
     // without `--control-listen` has no accounts, and saying that here is what
     // stops each arm from inventing its own version of the same complaint.
     let s = rt.web_auth.as_deref().ok_or_else(|| {
-        "this server has no web account store (it needs --control-listen) — accounts and \n         delegations live beside the control plane's api keys".to_string()
+        "this server has no web account store (it needs --control-listen) — accounts and \
+         delegations live beside the control plane's api keys".to_string()
     })?;
     match op {
         "whoami" => Ok(json!({
@@ -4718,7 +4735,8 @@ fn web_dispatch(
                 && s.active_admins()? <= 1
             {
                 return Err(format!(
-                    "'{account}' is the only enabled administrator — create a second admin and \n                     verify you can sign in as it before demoting this one"
+                    "'{account}' is the only enabled administrator — create a second admin and \
+                     verify you can sign in as it before demoting this one"
                 ));
             }
             if !s.set_role(&account, role)? {
@@ -4738,7 +4756,8 @@ fn web_dispatch(
                 && s.active_admins()? <= 1
             {
                 return Err(format!(
-                    "'{account}' is the only enabled administrator — disabling it locks every \n                     sign-in out of the deployment; enable a second admin first"
+                    "'{account}' is the only enabled administrator — disabling it locks every \
+                     sign-in out of the deployment; enable a second admin first"
                 ));
             }
             if !s.set_disabled(&account, disabled)? {
@@ -4756,7 +4775,8 @@ fn web_dispatch(
                 && s.active_admins()? <= 1
             {
                 return Err(format!(
-                    "'{account}' is the only enabled administrator — it cannot be deleted out of \n                     the last lock on the deployment"
+                    "'{account}' is the only enabled administrator — it cannot be deleted out of \
+                     the last lock on the deployment"
                 ));
             }
             // Its credentials outlive it on purpose (see `WebAuthStore::delete`),
@@ -5341,8 +5361,9 @@ fn view_move_meta(rt: &MetaRuntime, a: &serde_json::Value) -> Result<serde_json:
         return Err(format!("invalid view name '{view}'"));
     }
     let sh = rt.shard.as_ref().ok_or_else(|| {
-        "this meta-server was started without --shard-ring, so it serves every view \n                     itself — there is no other instance to move between"
-            .to_string()
+        "this meta-server was started without --shard-ring, so it serves every view \
+         itself — there is no other instance to move between"
+         .to_string()
     })?;
     // The CLI names the node it meant; THIS process is the one answering. A
     // mismatch means an operator pointed at the wrong port, and adopting anyway
@@ -5373,10 +5394,14 @@ fn view_move_meta(rt: &MetaRuntime, a: &serde_json::Value) -> Result<serde_json:
         let from = prev.clone().unwrap_or_else(|| "its current home".into());
         return Err(match &rt.store {
             StoreKind::Sqlite => format!(
-                "view '{view}' has no tree on this host — a SQLite tree lives in one instance's \n                 <base>/meta/ ({from}), so move it with `view export` there and `view import` \n                 here, then `view move --to-meta`",
+                "view '{view}' has no tree on this host — a SQLite tree lives in one instance's \
+                 <base>/meta/ ({from}), so move it with `view export` there and `view import` \
+                 here, then `view move --to-meta`",
             ),
             _ => format!(
-                "view '{view}' has no tree reachable from this instance's backend ({}) — the \n                 placement row can name a process, it cannot conjure a tree; point this instance's \n                 --meta-store at the database that holds it",
+                "view '{view}' has no tree reachable from this instance's backend ({}) — the \
+                 placement row can name a process, it cannot conjure a tree; point this instance's \
+                 --meta-store at the database that holds it",
                 sh.store_fingerprint()
             ),
         });
@@ -5393,7 +5418,8 @@ fn view_move_meta(rt: &MetaRuntime, a: &serde_json::Value) -> Result<serde_json:
     rt.evict();
     Ok(json!(match prev {
         Some(from) => format!(
-            "moved view '{view}' from meta-server '{from}' to '{}' ({}); mounts now resolve \n             here, and '{}' drops its cached tree within {}",
+            "moved view '{view}' from meta-server '{from}' to '{}' ({}); mounts now resolve \
+             here, and '{}' drops its cached tree within {}",
             sh.me().name,
             sh.store_fingerprint(),
             from,
@@ -9251,8 +9277,8 @@ mod ha_tests {
         );
         assert!(
             elapsed < Duration::from_millis(900),
-            "the round must end when the majority answers, not when the straggler 
-             gives up: {elapsed:?} of a {timeout:?} budget"
+            "the round must end when the majority answers, not when the straggler gives \
+             up: {elapsed:?} of a {timeout:?} budget"
         );
     }
 
@@ -9929,5 +9955,77 @@ mod store_dispatch_tests {
             "banner must not leak the password"
         );
         assert!(!layout.contains("grovefs:s3cr3t"), "{layout}");
+    }
+}
+
+/// The shape of what this server answers with.
+#[cfg(test)]
+mod msg_shape_tests {
+    /// Every refusal and reply built here is ONE logical line.
+    ///
+    /// The messages reach an operator through paths that do not reformat them:
+    /// piped CLI output (soft wrapping is off when stderr is not a terminal),
+    /// `store.info`, the web console's raw JSON and the audit row. Writing a
+    /// `\n` plus indent where a `\` line continuation was meant therefore shows
+    /// up as a break in the middle of a sentence followed by a dozen or so
+    /// indent columns — measured 2026-11-28 before the cleanup, `view move` at
+    /// an unsharded instance printed exactly that, and the doc examples had
+    /// transcribed it. Multi-line text belongs in `--help` (`src/main.rs`),
+    /// where it is laid out by two indent columns on purpose; nothing in the
+    /// reply path may, and a CLI `error:` line is part of it — an option check
+    /// that breaks mid-sentence lands in the same log file as a refusal.
+    ///
+    /// Comments are skipped: prose about this shape has to be able to name it.
+    ///
+    /// TWO shapes are caught, because they look different in the source and
+    /// compile to the same broken text: the escape `\n` followed by an indent
+    /// run (a line continuation typed as a newline), and a source line that
+    /// ENDS with a space — the visible edge of a literal continued across a raw
+    /// newline, which compiles the newline AND the next line's columns into the
+    /// string. A deliberate case (SQL, a file template) is exempted by putting
+    /// `msg-shape: keep-line-break` on the line above it.
+    #[test]
+    fn server_replies_are_single_line() {
+        // (file, smallest indent that counts): the reply path may not fold at
+        // all, so anything there is a miss; `--help` and the example blocks
+        // fold by hand, so only an alignment run of a dozen or more columns —
+        // the shape a line continuation accidentally takes — is flagged there.
+        let mut offenders = Vec::new();
+        for (rel, min_indent) in [
+            ("src/remote/meta/server_ext.rs", 2),
+            ("src/remote/meta/shard.rs", 2),
+            ("src/main.rs", 12),
+            ("src/web.rs", 12),
+            ("src/apikeys.rs", 12),
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+            let src = std::fs::read_to_string(&path).expect("read the message source");
+            let lines: Vec<&str> = src.lines().collect();
+            for (n, line) in lines.iter().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                for (i, _) in line.match_indices("\\n") {
+                    let indent = line[i + 2..].chars().take_while(|c| *c == ' ').count();
+                    if indent >= min_indent {
+                        offenders.push(format!("{rel}:{}: {}", n + 1, line.trim()));
+                    }
+                }
+                let exempt = n > 0 && lines[n - 1].trim().ends_with("msg-shape: keep-line-break");
+                if line.ends_with(' ') && !exempt {
+                    offenders.push(format!(
+                        "{rel}:{}: a line ends in a space — the literal runs past a raw newline: {}",
+                        n + 1,
+                        line.trim()
+                    ));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "a server message carries a mid-sentence newline plus indent (write a \
+             line continuation instead):\n{}",
+            offenders.join("\n")
+        );
     }
 }

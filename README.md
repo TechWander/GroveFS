@@ -749,8 +749,7 @@ meta-server: web console sign-ins are verified HERE (`grovefs web --control-serv
 $ grovefs web --control-server 127.0.0.1:15699 --api-key-file ./control.key --listen 127.0.0.1:15687
 grovefs web: management console on http://127.0.0.1:15687/
   control plane : 127.0.0.1:15699 (backend sqlite)
-  sign-in       : accounts of that server's web store; the first owner comes from its
-                    --admin-user flag
+  sign-in       : accounts of that server's web store; the first owner comes from its --admin-user flag
   sessions      : 8h idle window, 4 worker thread(s)
 
 # 建号、划地方（这三条在页面 Accounts 页里点也一样，headless 与浏览器走同一套 op）

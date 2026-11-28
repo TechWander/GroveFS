@@ -312,7 +312,8 @@ impl Shard {
                 "--shard-id (or --advertise-addr)".to_string()
             };
             format!(
-                "{how} is not this ring ({origin}) — nodes are {} \n                     (name them, or fix the address)",
+                "{how} is not this ring ({origin}) — nodes are {} \
+                 (name them, or fix the address)",
                 nodes
                     .iter()
                     .map(|n| format!("'{}' at {}", n.name, n.addr))

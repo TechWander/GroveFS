@@ -695,8 +695,7 @@ meta-server: web console sign-ins are verified HERE (`grovefs web --control-serv
 $ grovefs web --control-server 127.0.0.1:15699 --api-key-file ./control.key --listen 127.0.0.1:15687
 grovefs web: management console on http://127.0.0.1:15687/
   control plane : 127.0.0.1:15699 (backend sqlite)
-  sign-in       : accounts of that server's web store; the first owner comes from its
-                    --admin-user flag
+  sign-in       : accounts of that server's web store; the first owner comes from its --admin-user flag
   sessions      : 8h idle window, 4 worker thread(s)
 
 # Create an account, then give it a place (the same three actions live on the page's Accounts tab)

@@ -1522,8 +1522,7 @@ $ grovefs apikey --meta-dir .webdoc/srv create --label web-console --for admin -
 $ grovefs web --control-server 127.0.0.1:15699 --api-key-file ./control.key --listen 127.0.0.1:15687
 grovefs web: management console on http://127.0.0.1:15687/
   control plane : 127.0.0.1:15699 (backend sqlite)
-  sign-in       : accounts of that server's web store; the first owner comes from its 
-                    --admin-user flag
+  sign-in       : accounts of that server's web store; the first owner comes from its --admin-user flag
   sessions      : 8h idle window, 4 worker thread(s)
 ```
 
@@ -1570,18 +1569,11 @@ error: password too short: use at least 10 characters
 $ … grant add --account ghost --base main
 error: no web account 'ghost' — create it first (`grovefs web account create`)
 $ grovefs web --listen 127.0.0.1:15687
-error: grovefs web needs --control-server HOST:PORT. The console is a gateway in 
-  front of `meta-server --control-listen HOST:PORT`: it holds no accounts, views, keys 
-  or audit of its own, so there is nothing for it to serve without that address.
-  Try: grovefs web --control-server 127.0.0.1:9502 --api-key-file /etc/grovefs/control.key
+error: grovefs web needs --control-server HOST:PORT. The console is a gateway in front of `meta-server --control-listen HOST:PORT`: it holds no accounts, views, keys or audit of its own, so there is nothing for it to serve without that address. Try: grovefs web --control-server 127.0.0.1:9502 --api-key-file /etc/grovefs/control.key
 $ grovefs web --control-server 127.0.0.1:15699 --api-key 'nope:not-a-key' --listen 127.0.0.1:15687
-error: cannot reach the control plane at 127.0.0.1:15699 with this key: authentication failed: unknown api key id
-The console needs `meta-server --control-listen HOST:PORT` and an `admin`-scope 
-account key (`grovefs apikey create --for admin --owner <account>`), supplied to 
-this process by --api-key / --api-key-file / $GROVEFS_CONTROL_KEY.
+error: cannot reach the control plane at 127.0.0.1:15699 with this key: authentication failed: unknown api key id The console needs `meta-server --control-listen HOST:PORT` and an `admin`-scope account key (`grovefs apikey create --for admin --owner <account>`), supplied to this process by --api-key / --api-key-file / $GROVEFS_CONTROL_KEY.
 $ grovefs web … --listen 0.0.0.0:15690
-error: refusing to bind 0.0.0.0:15690 — this console speaks plain HTTP, so a routable address puts every sign-in and every governance call on the wire unencrypted. Either bind 127.0.0.1 and terminate TLS in a reverse proxy (and pass --use-x-forwarded-for so sign-ins are throttled per CLIENT rather than per proxy), or pass 
-             --allow-insecure-http if this network is trusted end to end.
+error: refusing to bind 0.0.0.0:15690 — this console speaks plain HTTP, so a routable address puts every sign-in and every governance call on the wire unencrypted. Either bind 127.0.0.1 and terminate TLS in a reverse proxy (and pass --use-x-forwarded-for so sign-ins are throttled per CLIENT rather than per proxy), or pass --allow-insecure-http if this network is trusted end to end.
 ```
 
 **登录后能做什么。** 会话是 `gfs_sid` 一个 `HttpOnly; SameSite=Strict` 的 cookie,写操作还要带 `X-GroveFS-CSRF`(登录响应里给),并且 `Origin` 必须等于 `Host`。`bob` 登录拿到的是自己的 reach:
@@ -1967,8 +1959,7 @@ $ grovefs meta-server --meta-dir /srv/gfsA --listen 0.0.0.0:50053 --control-list
     --shard-ring m1=10.0.0.1:50053,m2=10.0.0.2:50053 --shard-id m1 --token $TOK
 meta-server listening on 0.0.0.0:50053 (base /srv/gfsA, role Primary)
 meta-server: metadata backend sqlite — one db file per view under <base>/meta/
-meta-server: control plane is PostgreSQL (grovefs_control) — view definitions,
-                 api keys, accounts, audit and both placement tables live there; trees stay on sqlite
+meta-server: control plane is PostgreSQL (grovefs_control) — view definitions, api keys, accounts, audit and both placement tables live there; trees stay on sqlite
 meta-server: sharded across 2 meta-servers — this instance is 'm1' (10.0.0.1:50053), placement in grovefs_control.meta_placement (`M_OPEN` redirects a view it does not serve)
 
 # 第二台:同一份 --shard-ring 文本,只有 --meta-dir 与 --shard-id 不同
@@ -1987,31 +1978,27 @@ $ grovefs mount --view alice --manager 10.0.0.10:50055 --deployment prod --roste
 
 - **没有 `--shard-total` 这类一致性哈希**,是有意的:加一个节点若会改判既有视图的归属,被点到的那些实例手里并没有那棵树——SQLite 后端下是一个打不开的挂载,共享后端下是一个空 schema 被当成视图建出来。扩容因此是一条运维动作(`view move --to-meta`),只发生在人点名的视图上。
 
-- **客户端透明**:挂载命令没有任何分片参数。连到非 home 实例时它跟随那一次重定向(上限 3 跳,带环路检测:环与放置行互指时给出点名原因的错误,不是泛化的「连不上」)。op 打在途中被弹回也一样跟到停(同一个 3 跳上限:视图可以在一个 op 排队期间被搬两次),跟不完时错误点名「放置表与环互相矛盾」,并作为**路由**故障上抛(FUSE 侧 `EIO`),不会被读成数据库故障。代价实测是**一条主键读 + 一次额外握手**——同一实例同一后端上对照,自家视图的挂载 6.01 / 6.31 / 6.63 ms,需要被指引一次的视图 7.78 / 7.13 / 8.36 ms(loopback、两台 meta-server + 一台本机 PostgreSQL,三轮连跑,`tests/shard_routing.rs` 打印);这笔钱只在建立挂载时付一次。
+- **客户端透明**:挂载命令没有任何分片参数。连到非 home 实例时它跟随那一次重定向(上限 3 跳,带环路检测:环与放置行互指时给出点名原因的错误,不是泛化的「连不上」)。op 打在途中被弹回也一样跟到停(同一个 3 跳上限:视图可以在一个 op 排队期间被搬两次),跟不完时错误点名「放置表与环互相矛盾」,并作为**路由**故障上抛(FUSE 侧 `EIO`),不会被读成数据库故障。代价实测是**一条主键读 + 一次额外握手**——同一实例同一后端上对照,自家视图的挂载 5.34 / 5.80 / 5.86 ms,需要被指引一次的视图 7.44 / 8.10 / 7.72 ms(loopback、两台 meta-server + 一台本机 PostgreSQL,三轮连跑,`tests/shard_routing.rs` 打印);这笔钱只在建立挂载时付一次。
 
 - **治理动词跨实例只拒绝、不代办**:
 ```bash
 $ grovefs view --control-server 10.0.0.2:50054 --api-key "$KEY" create --view va
-error: view 'va' is placed on meta-server 'm1' (mount address 10.0.0.1:50053) — run `view create` 
-                             against THAT instance's own --control-listen port, or move the placement here 
-                             first (`view move --view va --to-meta m2`, against the control port you 
-                             are talking to)
+error: view 'va' is placed on meta-server 'm1' (mount address 10.0.0.1:50053) — run `view create` against THAT instance's own --control-listen port, or move the placement here first (`view move --view va --to-meta m2`, against the control port you are talking to)
 ```
   `view rm --name V --base` 同理。为什么必须拦:`--control-plane` 让**定义**从每台都可见,于是 `view_exists` 在远端也是真——不拦就会在同一个名字下建出第二棵树,而那是后面没有任何动词能修好的结果。删也是:peer 删掉行而树在别处活着,留下的是一棵再也解析不到放置的悬树。
 
 - **`view move --to-meta` 要在 TARGET 的控制端口上执行**:要为新家答复的那个进程才有权声明「这棵树我打得开」,它探测通过才写行。共享后端(PG / treedb)下这是一次**改行、零复制**;SQLite 树搬不动,当场拒绝并指向 export/import:
 ```bash
 $ grovefs view --control-server 10.0.0.2:50054 --api-key "$KEY" move --view va --to-meta m2
-error: view 'va' has no tree on this host — a SQLite tree lives in one instance's 
-                 <base>/meta/ (m1), so move it with `view export` there and `view import` 
-                 here, then `view move --to-meta`
+error: view 'va' has no tree on this host — a SQLite tree lives in one instance's <base>/meta/ (m1), so move it with `view export` there and `view import` here, then `view move --to-meta`
 ```
 
 - **同一视图上的两次 `view move` 不需要人排队**:两个人(或一份 runbook 与一个人)在同一秒点名不同实例时没有互斥锁,靠的是改行本身就是一条 `INSERT … ON CONFLICT DO UPDATE` 单事务:任意瞬间该名字在表里只有一行完整的 `(view, meta, store)`,而这三个字段永远来自同一个进程;没被点名那台由清扫放手,与两次调用的先后无关。`view move` 的「已经在我这儿」早退**不重写 `store` 列**,重新盖章只能搬到对端再搬回来。实测:12 次调用 / 6 轮 × 2 线程全成功,结束时恰一行,落败那台的 `residentEngines` 归零且在其上挂载仍被指引到胜出那台(`tests/shard_routing.rs` 的 `a_shorter_sweep_shortens_the_window_a_deposed_instance_holds_the_tree`)。
 - **行的 `store` 列与这台进程的后端不符时,挂载被拒而不是被忽略**:`M_OPEN` 的门在任何认领之前读那一行,`meta` 是自己而 `store` 不是自己服务的后端就报「这棵树是在 backend X 上创建的,而本进程服务 Y——在这里改 `--meta-store`,或者把视图搬走」。这是有意的:树在另一个库里,本地照样能开出一个引擎并写进去,而真正的持有者毫不知情。被拒的挂载不改写表,所以现场只有两条修法——把 `--meta-store` 改回表里点名的后端,或 `view move --to-meta` 到真在服务它的实例。另一个可见的后果是后端指纹记的是 `<base>/instances.conf` 这类本地路径,因此换过 `--meta-dir` 的实例会拒绝自己留下的行(`docs/adr/0006-view-sharding.md` §8 的 `TODO(severity=Medium)`)。
-- **已建立的挂载跟着走**:行改写之后,旧实例在下一次清扫内丢掉这棵树(实测 4.828 / 4.790 / 4.812 s,贴着默认 `--shard-sweep-secs 5`(5000ms)的上界);旧挂载的下一次 op 撞上 `E_SHARD` → 采纳新 home、清连接池、重握手并**重放那个 op**(被拒的 op 从未执行过,所以重放是安全的)。实测这一跳 68.3–71.5 ms,**不需要 remount**,`readdir` 同时看得见搬之前建的目录与搬之后建的目录——一棵树,两个实例先后服务过它。
+- **治理回包是一个逻辑行**:`M_OPEN` 的拒因、`view create`/`view rm`/`view move` 的拒绝与建议、以及 `grovefs web`/`meta-server` 的 flag 拒绝都是单行文本。终端会把长句重新折行,**管道不会**(`grovefs --help` 的 OUTPUT CONTRACT:「Pipes: … soft wrapping is off (one row per line)」),所以 `2>log`、`| tee`、网页控制台的原文与审计行读到的就是服务端发出的那一行——文档里那些「真实回显」示例也按这个形状写。三处守卫:`remote::meta::server_ext::msg_shape_tests::server_replies_are_single_line`(源码侧,`\n` + 缩进即判红;字面量跨真实换行续写的那一行以空格结尾,同样即判红)与 `tests/shard_routing.rs::one_line`(端到端侧,每条真拒因一次),以及起二进制读 stderr 的 `tests/cli_msg_shape.rs`(量编译进去的字符串,两格手折也测得到)。
+- **已建立的挂载跟着走**:行改写之后,旧实例在下一次清扫内丢掉这棵树(实测 4.801 / 4.749 / 4.799 s,贴着默认 `--shard-sweep-secs 5`(5000ms)的上界);旧挂载的下一次 op 撞上 `E_SHARD` → 采纳新 home、清连接池、重握手并**重放那个 op**(被拒的 op 从未执行过,所以重放是安全的)。实测这一跳 66.3–67.2 ms,**不需要 remount**,`readdir` 同时看得见搬之前建的目录与搬之后建的目录——一棵树,两个实例先后服务过它。
 
-- **清扫间隔是配置,不是常量**:`meta-server --shard-sweep-secs N`(env `GROVEFS_SHARD_SWEEP_SECS`,默认 5)就是被降级的实例多久重读一次放置表——它**等于**「两个实例同时握着一棵已搬走的树」的窗口长度,`view move` 的回包也按这个值答复。调小的代价是每间隔多一条 PK-less 表读,调大的代价是窗口变长;`0` 一律**启动拒绝**,因为永不重读不是「维持现状」而是双写——与 `--engine-idle-secs 0`(空闲引擎不驱逐,留着不花什么)不是一回事。实测同一个搬家动作在 `--shard-sweep-secs 1` 下 0.808 / 0.783 / 0.795 s 放手(`tests/shard_routing.rs::a_shorter_sweep_shortens_the_window_a_deposed_instance_holds_the_tree` 打印),而默认 5s 是上面的 4.79–4.83 s;`0` 的拒绝由 `a_zero_sweep_fails_the_start_instead_of_freezing_placement` 钉住。分片横幅只在非默认值时多打一行 (`placement re-read every …s`),因为这一行说的就是窗口长度。
+- **清扫间隔是配置,不是常量**:`meta-server --shard-sweep-secs N`(env `GROVEFS_SHARD_SWEEP_SECS`,默认 5)就是被降级的实例多久重读一次放置表——它**等于**「两个实例同时握着一棵已搬走的树」的窗口长度,`view move` 的回包也按这个值答复。调小的代价是每间隔多一条 PK-less 表读,调大的代价是窗口变长;`0` 一律**启动拒绝**,因为永不重读不是「维持现状」而是双写——与 `--engine-idle-secs 0`(空闲引擎不驱逐,留着不花什么)不是一回事。实测同一个搬家动作在 `--shard-sweep-secs 1` 下 0.788 / 0.771 / 0.805 s 放手(`tests/shard_routing.rs::a_shorter_sweep_shortens_the_window_a_deposed_instance_holds_the_tree` 打印),而默认 5s 是上面的 4.79–4.83 s;`0` 的拒绝由 `a_zero_sweep_fails_the_start_instead_of_freezing_placement` 钉住。分片横幅只在非默认值时多打一行 (`placement re-read every …s`),因为这一行说的就是窗口长度。
 
 - **与 PG 多实例是两根不同的轴**:`--meta-store a,b,c` + `--pg-instance` / `view move --pg-instance`(§6.2)解决的是**单个 PostgreSQL 实例**的连接与容量瓶颈,作用在一个 meta-server 进程内部;分片解决的是**meta-server 进程**的服务能力瓶颈(常驻引擎池、握手、单机磁盘),作用在多个进程之间。两张表、两套行:`view_placement` 记 schema 在哪台 PG,`meta_placement` 记谁服务。两者可叠加。也别与 `--data-dir` 的数据条带(`ShardedBackend`,§5.2)混称——那分的是**内容字节**,与谁服务视图无关。
 
