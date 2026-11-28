@@ -147,9 +147,17 @@ struct Placement {
     store: String,
 }
 
+/// How often a sharded instance re-reads the placement table to notice it has
+/// been deposed, when nobody configured it. Bounded by the same argument as
+/// every other control-plane job: a move is a human action, so seconds are
+/// fine, and one PK-less table read every few seconds is nothing next to the
+/// mount traffic the same table serves. `--shard-sweep-secs` overrides it.
+pub(crate) const DEFAULT_SHARD_SWEEP_MS: u64 = 5_000;
+
 /// The sharding configuration of one `meta-server`: the ring, this process's
-/// place in it, where the placement table lives, and which tree backend this
-/// process serves. Built once at `serve()` and shared immutably; `None` in
+/// place in it, where the placement table lives, which tree backend this
+/// process serves, and how hard it re-reads the placement table. Built once at
+/// `serve()` and shared immutably; `None` in
 /// [`MetaRuntime`] means sharding is off, which is the historical single-process
 /// deployment and must cost zero queries.
 #[derive(Clone)]
@@ -162,6 +170,15 @@ pub struct Shard {
     store: String,
     /// The `--shard-ring` text, quoted verbatim in error messages.
     origin: String,
+    /// `--shard-sweep-secs`, in milliseconds: how often this instance re-reads
+    /// the placement table to notice a `view move` took a tree away. It lives
+    /// on the ring and not on the server because the sweep only exists when a
+    /// ring does — the rewritten ROW is the message and the ticker is the
+    /// delivery, so this interval is the one window an operator can set between
+    /// moving a view and the deposed instance stopping its writes. `0` is
+    /// refused at start-up: "never sweep" would mean "keep writing to a tree the
+    /// placement table says belongs to somebody else".
+    sweep_ms: u64,
     /// Warm control-plane sessions ([`Shard::checkout`] / [`Shard::requeue`]).
     /// Behind an `Arc` because a `Shard` is cloned into every holder of the
     /// routing answer; the pool is what makes one, not one per clone.
@@ -180,6 +197,7 @@ impl std::fmt::Debug for Shard {
             .field("ctl", &redact_authority(&self.ctl))
             .field("store", &self.store)
             .field("origin", &self.origin)
+            .field("sweep_ms", &self.sweep_ms)
             .field("pooled", &self.pool.lock().len())
             .finish()
     }
@@ -308,8 +326,22 @@ impl Shard {
             ctl,
             store,
             origin,
+            sweep_ms: DEFAULT_SHARD_SWEEP_MS,
             pool: Arc::new(parking_lot::Mutex::new(Vec::new())),
         })
+    }
+
+    /// The placement re-read interval, in milliseconds.
+    pub fn sweep_ms(&self) -> u64 {
+        self.sweep_ms
+    }
+
+    /// Override the sweep interval ([`DEFAULT_SHARD_SWEEP_MS`] is the default).
+    /// `0` is carried here as written and refused where the ring is built, so
+    /// an embedder gets the same start-up error the CLI does.
+    pub fn with_sweep_ms(mut self, ms: u64) -> Self {
+        self.sweep_ms = ms;
+        self
     }
 
     /// This process's own ring entry.
@@ -907,6 +939,18 @@ mod tests {
         assert!(parse_ring("m1=a:1,m1=b:1").is_err());
         assert!(parse_ring("  ").is_err());
         assert!(parse_ring("too long a name!!=a:1").is_err());
+    }
+
+    /// The placement sweep interval is configuration, not a constant: it
+    /// defaults to what every sharded deployment measured before the flag
+    /// existed, and a `0` is carried through EXACTLY as written so the server can
+    /// refuse it with its own message instead of silently serving a split write.
+    #[test]
+    fn sweep_interval_defaults_then_overrides() {
+        let s = ring("a=10.0.0.1:50053,b=10.0.0.2:50053", "a", "s");
+        assert_eq!(s.sweep_ms(), DEFAULT_SHARD_SWEEP_MS);
+        assert_eq!(s.clone().with_sweep_ms(1_000).sweep_ms(), 1_000);
+        assert_eq!(s.with_sweep_ms(0).sweep_ms(), 0);
     }
 
     /// Self-selection: by name (case-insensitive), by address, by index, or by

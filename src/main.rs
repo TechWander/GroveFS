@@ -818,6 +818,18 @@ enum Cmd {
         /// rather than guessing which instance owns a view.
         #[arg(long = "shard-id", value_name = "NAME|INDEX|HOST:PORT")]
         shard_id: Option<String>,
+        /// How often a sharded instance re-reads the placement table to notice a
+        /// `view move` took one of its trees away — that interval IS the window
+        /// in which the instance the view moved AWAY from still holds the tree
+        /// open (mounts on it keep working; only the sweep closes it). Default
+        /// 5s, and seconds are the right unit: a move is a human action, and one
+        /// PK-less read of a table the ring already serves mounts from is free.
+        /// `0` is REFUSED, not honored — unlike `--engine-idle-secs 0`, never
+        /// re-reading the row is not "stay as you are", it is two instances
+        /// writing one tree. `GROVEFS_SHARD_SWEEP_SECS` fills the same slot; read
+        /// only when `--shard-ring` is set.
+        #[arg(long = "shard-sweep-secs", value_name = "SECS")]
+        shard_sweep_secs: Option<u64>,
         /// Seed the web console's FIRST owner at install time
         /// (`grovefs web --control-server` signs in against the accounts this
         /// process creates). Applied ONLY when the account store is empty:
@@ -4566,6 +4578,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             control_plane,
             shard_ring,
             shard_id,
+            shard_sweep_secs,
             admin_user,
             admin_password_file,
             data_access_key,
@@ -4737,8 +4750,14 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                 control_plane.or_else(|| std::env::var("GROVEFS_CONTROL_PLANE").ok());
             let shard_ring = shard_ring.or_else(|| std::env::var("GROVEFS_SHARD_RING").ok());
             let shard_id = shard_id.or_else(|| std::env::var("GROVEFS_SHARD_ID").ok());
+            let shard_sweep_secs = shard_sweep_secs.or_else(|| {
+                std::env::var("GROVEFS_SHARD_SWEEP_SECS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+            });
             srv = srv.with_control_plane(control_plane);
             srv = srv.with_sharding(shard_ring, shard_id, advertise_addr.clone());
+            srv = srv.with_shard_sweep_secs(shard_sweep_secs);
             srv = srv.with_admin_account(
                 admin.as_ref().map(|(a, _)| a.clone()),
                 admin.map(|(_, p)| p),

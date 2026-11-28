@@ -834,6 +834,10 @@ pub struct MetaServer {
     /// `--advertise-addr`, kept for the ring identity fallback only (the
     /// manager's registration path takes its own copy in the CLI).
     shard_advertise: Option<String>,
+    /// `--shard-sweep-secs` (ms): how often a sharded instance re-reads the
+    /// placement table to notice it was deposed. Only read when a ring is
+    /// configured; see [`super::shard::Shard::sweep_ms`].
+    shard_sweep_ms: u64,
     /// The install-time web-console owner (`--admin-user` +
     /// `--admin-password-file`), held as account + password ONLY for the length
     /// of `serve()` — it is hashed into the account store and then dropped, and
@@ -877,6 +881,7 @@ impl MetaServer {
             shard_ring: None,
             shard_id: None,
             shard_advertise: None,
+            shard_sweep_ms: super::shard::DEFAULT_SHARD_SWEEP_MS,
             admin_account: None,
         }
     }
@@ -905,6 +910,7 @@ impl MetaServer {
             shard_ring: None,
             shard_id: None,
             shard_advertise: None,
+            shard_sweep_ms: super::shard::DEFAULT_SHARD_SWEEP_MS,
             admin_account: None,
         }
     }
@@ -1131,6 +1137,22 @@ impl MetaServer {
     /// and PG's `max_connections`.
     pub fn with_engine_idle_secs(mut self, secs: u64) -> Self {
         self.engine_idle_ms = secs.saturating_mul(1000);
+        self
+    }
+
+    /// Re-read the shard placement table every `secs` seconds; `None` keeps
+    /// [`super::shard::DEFAULT_SHARD_SWEEP_MS`]. `Some(0)` is refused at
+    /// start-up, not honored: the sweep is the ONLY thing that makes a deposed
+    /// instance stop writing a tree whose row now names a peer, so "never" would
+    /// be a split write rather than an idle-timeout-style opt-out. A move is a
+    /// human action, so the coarse unit is seconds; lowering it costs one
+    /// PK-less table read per interval, raising it widens the window in which
+    /// BOTH instances still hold the tree open. Only meaningful with
+    /// [`MetaServer::with_sharding`] — without a ring nothing sweeps.
+    pub fn with_shard_sweep_secs(mut self, secs: Option<u64>) -> Self {
+        self.shard_sweep_ms = secs
+            .unwrap_or(super::shard::DEFAULT_SHARD_SWEEP_MS / 1000)
+            .saturating_mul(1000);
         self
     }
 
@@ -1455,7 +1477,18 @@ impl MetaServer {
                     ctl,
                     super::shard::store_fingerprint(&store),
                 )
-                .map_err(io::Error::other)?;
+                .map_err(io::Error::other)?
+                .with_sweep_ms(self.shard_sweep_ms);
+                if s.sweep_ms() == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--shard-sweep-secs 0 cannot be honored on a sharded instance: the \
+                     sweep is what makes the instance a `view move` took a tree from STOP \
+                     writing that tree, so never sweeping is a split write, not an opt-out \
+                     (`--engine-idle-secs 0` may say \"never\" because an idle engine costs \
+                     nothing; a stale placement verdict costs the data)",
+                    ));
+                }
                 println!(
                     "meta-server: sharded across {} — this instance is '{}' ({}), placement in \
                      grovefs_control.meta_placement (`M_OPEN` redirects a view it does not serve)",
@@ -1463,6 +1496,19 @@ impl MetaServer {
                     s.me().name,
                     s.me().addr
                 );
+                if s.sweep_ms() != super::shard::DEFAULT_SHARD_SWEEP_MS {
+                    // Only when it differs: the default is already in the line
+                    // above ("`M_OPEN` redirects…") and the `view move` reply
+                    // quotes the window, so a shout on every start would be
+                    // noise — but a NON-default interval changes how long two
+                    // instances may both hold a moved tree, and that must be
+                    // visible in the log the operator reads after a restart.
+                    println!(
+                        "meta-server: placement re-read every {} (`--shard-sweep-secs`); a deposed \
+                     instance drops a moved view within that window",
+                        sweep_span_text(s.sweep_ms())
+                    );
+                }
                 Some(s)
             }
         };
@@ -1921,11 +1967,16 @@ fn epoll_register_subscriber(rt: &Arc<MetaRuntime>, h: &super::epoll::Handle, vi
     }
 }
 
-/// How often a sharded instance re-reads the placement table to notice it has
-/// been deposed. Bounded by the same argument as every other control-plane job:
-/// a move is a human action, so seconds are fine, and one PK-less table read
-/// every few seconds is nothing next to the mount traffic the same table serves.
-const SHARD_SWEEP_MS: u64 = 5_000;
+/// How a sweep interval is spelled in the text an operator reads: whole seconds
+/// when it divides evenly (`5s`, not `5000 ms`), milliseconds below that — an
+/// embedder may set 250 ms, and `250 / 1000` would say "0s".
+fn sweep_span_text(ms: u64) -> String {
+    if ms >= 1_000 && ms.is_multiple_of(1_000) {
+        format!("{}s", ms / 1_000)
+    } else {
+        format!("{ms} ms")
+    }
+}
 
 /// Drop the cached trees this instance no longer serves.
 ///
@@ -2011,8 +2062,10 @@ fn serve_runtime(listener: TcpListener, rt: Arc<MetaRuntime>) {
             };
             let reap = (crate::pg_store::pool_idle_ms() / 2).clamp(1_000, 60_000);
             let mut nap = evict.min(reap);
-            if sw.shard.is_some() {
-                nap = nap.min(SHARD_SWEEP_MS);
+            if let Some(sh) = &sw.shard {
+                // `--shard-sweep-secs`, read off the ring: a never-sweeping shard
+                // is refused at start-up, so this is always a real interval.
+                nap = nap.min(sh.sweep_ms());
             }
             thread::sleep(std::time::Duration::from_millis(nap));
             let gone = evict_idle(&sw);
@@ -5131,11 +5184,11 @@ fn view_move_meta(rt: &MetaRuntime, a: &serde_json::Value) -> Result<serde_json:
     rt.evict();
     Ok(json!(match prev {
         Some(from) => format!(
-            "moved view '{view}' from meta-server '{from}' to '{}' ({}); mounts now resolve \n             here, and '{}' drops its cached tree within {}s",
+            "moved view '{view}' from meta-server '{from}' to '{}' ({}); mounts now resolve \n             here, and '{}' drops its cached tree within {}",
             sh.me().name,
             sh.store_fingerprint(),
             from,
-            SHARD_SWEEP_MS / 1000
+            sweep_span_text(sh.sweep_ms())
         ),
         None => format!(
             "placed view '{view}' on '{}' ({})",

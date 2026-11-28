@@ -128,6 +128,23 @@ fn start(
     meta: String,
     ctl: String,
 ) -> Node {
+    start_swept(name, ring, control, trees, key, meta, ctl, None)
+}
+
+/// `sweep_secs` overrides `--shard-sweep-secs` (`None` = the built-in 5s), so a
+/// test can MEASURE the window the operator is configuring instead of waiting
+/// out the default on every run.
+#[allow(clippy::too_many_arguments)]
+fn start_swept(
+    name: &str,
+    ring: &str,
+    control: &str,
+    trees: Option<&str>,
+    key: &str,
+    meta: String,
+    ctl: String,
+    sweep_secs: Option<u64>,
+) -> Node {
     let dir = tempfile::Builder::new()
         .prefix("grovefs_shard_")
         .tempdir()
@@ -137,7 +154,8 @@ fn start(
         // these tests is the placement sweep, which is what is being measured.
         .with_engine_idle_secs(0)
         .with_control_listen(Some(ctl.clone()))
-        .with_sharding(Some(ring.to_string()), Some(name.to_string()), None);
+        .with_sharding(Some(ring.to_string()), Some(name.to_string()), None)
+        .with_shard_sweep_secs(sweep_secs);
     srv = match trees {
         // A PostgreSQL tree store IS its own control plane, so it must not be
         // handed a second one (`serve()` refuses that combination outright).
@@ -538,6 +556,132 @@ fn a_moved_view_follows_its_open_mount() {
         .call("view.rm_base", json!({"view": v}))
         .expect("teardown the moved view");
     cleanup(&pg, scratch.path(), &key_id);
+}
+
+/// The sweep interval is a knob, not a constant. A deployment that would rather
+/// close the window in which BOTH instances still hold a moved tree asks for a
+/// shorter one (here through the same setter `--shard-sweep-secs` calls) and
+/// gets a proportionally shorter window — measured against the default's ~4.7s
+/// so the two cannot be confused, and with the SAME end state: the open mount
+/// still follows the row.
+#[test]
+fn a_shorter_sweep_shortens_the_window_a_deposed_instance_holds_the_tree() {
+    let Some(pg) = pg_uri() else {
+        eprintln!("skipping: no PostgreSQL reachable (set GROVEFS_PG_TEST_URI)");
+        return;
+    };
+    let tag = format!("s{}sw", std::process::id());
+    let n_a = format!("{tag}p1");
+    let n_b = format!("{tag}p2");
+    let scratch = tempfile::Builder::new()
+        .prefix("grovefs_shardkeys_")
+        .tempdir()
+        .unwrap();
+    let (key, key_id) = admin_key(&pg, scratch.path(), &format!("shardtest-{tag}"));
+    let m1p = free_port();
+    let m2p = free_port();
+    let ring = format!("{n_a}=127.0.0.1:{m1p},{n_b}=127.0.0.1:{m2p}");
+    // ONE SECOND, set the way the flag sets it.
+    let n1 = start_swept(
+        &n_a,
+        &ring,
+        &pg,
+        Some(&pg),
+        &key,
+        format!("127.0.0.1:{m1p}"),
+        format!("127.0.0.1:{}", free_port()),
+        Some(1),
+    );
+    let n2 = start_swept(
+        &n_b,
+        &ring,
+        &pg,
+        Some(&pg),
+        &key,
+        format!("127.0.0.1:{m2p}"),
+        format!("127.0.0.1:{}", free_port()),
+        Some(1),
+    );
+    let v = format!("{tag}sv");
+    n1.gov()
+        .call("view.create", json!({"view": v}))
+        .expect("create on n1");
+    let m = RemoteMeta::new(&n1.meta, &v).expect("mount on the home instance");
+    m.create_node(ROOT_INO, "before", true, None, 0o0755, UID, GID)
+        .expect("mkdir before the move");
+
+    let r = n2
+        .gov()
+        .call("view.move_meta", json!({"view": v, "to": n_b.clone()}))
+        .expect("adopt the view on n2");
+    let t_move = Instant::now();
+    // The reply quotes the CONFIGURED window, not a hard-coded one — this is the
+    // text an operator reads before deciding whether to wait.
+    assert!(
+        r.to_string().contains("1s"),
+        "the move reply did not name the configured sweep: {r}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while n1.info()["residentEngines"].as_u64() != Some(0) {
+        if Instant::now() >= deadline {
+            panic!("the old instance never released the view: {}", n1.info());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let t_release = t_move.elapsed();
+    eprintln!(
+        "timings: a 1s sweep released the view {t_release:?} after the row flipped (the 5s \
+         default measures ~4.7s in the test above)"
+    );
+    assert!(
+        t_release < Duration::from_secs(3),
+        "a 1s sweep only released the tree after {t_release:?}: the configured interval was ignored"
+    );
+    // Same outcome as the default interval: the mount follows to the new home.
+    let ino = m.create_node(ROOT_INO, "after", false, Some("k2"), 0o0644, UID, GID);
+    assert_ne!(ino.expect("the mount never followed the view"), 0);
+    assert_eq!(shard_of(&n1.info(), &n_b)["views"], json!(1));
+
+    n2.gov()
+        .call("view.rm_base", json!({"view": v}))
+        .expect("teardown the moved view");
+    cleanup(&pg, scratch.path(), &key_id);
+}
+
+/// `0` is REFUSED, not honored. `--engine-idle-secs 0` can mean "never" because
+/// an idle engine costs nothing to keep; a placement table that is never
+/// re-read is a deposed instance going on writing a tree whose row now names a
+/// peer — a split write, which is the one thing sharding exists to prevent. The
+/// check sits where every other ring mistake is caught (control plane missing,
+/// `--shard-id` not in the ring): before a single client is served, so the
+/// process exits instead of running with placement frozen.
+#[test]
+fn a_zero_sweep_fails_the_start_instead_of_freezing_placement() {
+    let Some(pg) = pg_uri() else {
+        eprintln!("skipping: no PostgreSQL reachable (set GROVEFS_PG_TEST_URI)");
+        return;
+    };
+    let tag = format!("s{}z0", std::process::id());
+    let n_a = format!("{tag}p1");
+    let m1p = free_port();
+    let dir = tempfile::Builder::new()
+        .prefix("grovefs_shard_")
+        .tempdir()
+        .unwrap();
+    let err = MetaServer::new(&format!("127.0.0.1:{m1p}"), dir.path())
+        .with_sharding(Some(format!("{n_a}=127.0.0.1:{m1p}")), Some(n_a.clone()), None)
+        .with_control_plane(Some(pg))
+        .with_shard_sweep_secs(Some(0))
+        .serve()
+        .expect_err("a 0 sweep must fail the start, not serve");
+    let why = err.to_string();
+    eprintln!("refused at start-up: {why}");
+    assert!(why.contains("--shard-sweep-secs 0"), "wrong refusal: {why}");
+    assert!(
+        why.contains("split write"),
+        "the refusal has to name what never sweeping costs: {why}"
+    );
 }
 
 /// A derived view is a PRESENTATION over one base tree, so it lives where that

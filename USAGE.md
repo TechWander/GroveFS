@@ -2007,7 +2007,9 @@ error: view 'va' has no tree on this host — a SQLite tree lives in one instanc
                  here, then `view move --to-meta`
 ```
 
-- **已建立的挂载跟着走**:行改写之后,旧实例在下一次清扫内丢掉这棵树(实测 4.691 / 4.701 / 4.707 s,贴着 `SHARD_SWEEP_MS`=5000ms 的上界);旧挂载的下一次 op 撞上 `E_SHARD` → 采纳新 home、清连接池、重握手并**重放那个 op**(被拒的 op 从未执行过,所以重放是安全的)。实测这一跳 71.5–83.7 ms,**不需要 remount**,`readdir` 同时看得见搬之前建的目录与搬之后建的目录——一棵树,两个实例先后服务过它。
+- **已建立的挂载跟着走**:行改写之后,旧实例在下一次清扫内丢掉这棵树(实测 4.782 / 4.773 / 4.775 s,贴着默认 `--shard-sweep-secs 5`(5000ms)的上界);旧挂载的下一次 op 撞上 `E_SHARD` → 采纳新 home、清连接池、重握手并**重放那个 op**(被拒的 op 从未执行过,所以重放是安全的)。实测这一跳 65.4–72.1 ms,**不需要 remount**,`readdir` 同时看得见搬之前建的目录与搬之后建的目录——一棵树,两个实例先后服务过它。
+
+- **清扫间隔是配置,不是常量**:`meta-server --shard-sweep-secs N`(env `GROVEFS_SHARD_SWEEP_SECS`,默认 5)就是被降级的实例多久重读一次放置表——它**等于**「两个实例同时握着一棵已搬走的树」的窗口长度,`view move` 的回包也按这个值答复。调小的代价是每间隔多一条 PK-less 表读,调大的代价是窗口变长;`0` 一律**启动拒绝**,因为永不重读不是「维持现状」而是双写——与 `--engine-idle-secs 0`(空闲引擎不驱逐,留着不花什么)不是一回事。实测同一个搬家动作在 `--shard-sweep-secs 1` 下 0.785 / 0.793 / 0.769 s 放手(`tests/shard_routing.rs::a_shorter_sweep_shortens_the_window_a_deposed_instance_holds_the_tree` 打印),而默认 5s 是上面的 4.77–4.78 s;`0` 的拒绝由 `a_zero_sweep_fails_the_start_instead_of_freezing_placement` 钉住。分片横幅只在非默认值时多打一行 (`placement re-read every …s`),因为这一行说的就是窗口长度。
 
 - **与 PG 多实例是两根不同的轴**:`--meta-store a,b,c` + `--pg-instance` / `view move --pg-instance`(§6.2)解决的是**单个 PostgreSQL 实例**的连接与容量瓶颈,作用在一个 meta-server 进程内部;分片解决的是**meta-server 进程**的服务能力瓶颈(常驻引擎池、握手、单机磁盘),作用在多个进程之间。两张表、两套行:`view_placement` 记 schema 在哪台 PG,`meta_placement` 记谁服务。两者可叠加。也别与 `--data-dir` 的数据条带(`ShardedBackend`,§5.2)混称——那分的是**内容字节**,与谁服务视图无关。
 
