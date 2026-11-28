@@ -16,7 +16,9 @@
 //!   * the placement table is keyed by the PHYSICAL BASE view and is written
 //!     only by a SUCCESSFUL mount — a lens follows its base, and a refused
 //!     `M_OPEN` (unknown name, a lens whose base was never created) leaves no
-//!     row behind (ADR-0006 §2, §5.6);
+//!     row behind (ADR-0006 §2, §5.6); the same fold is measured for the second
+//!     definition spelling, a FORK, whose own tree must stay on its base's
+//!     instance;
 //!   * the invalidation subscription is a THIRD `M_OPEN` for the same view and
 //!     follows the same redirect, so a mount whose coherence stream was dialed
 //!     at the wrong instance still receives the home instance's `EV_ENTRY`
@@ -37,7 +39,15 @@
 //!     placement rows fold to, the raw row tally next to them, the row's own
 //!     `updated_at`, the configured sweep and the trees an instance still holds
 //!     while the table names a peer — which is the one thing a per-node count
-//!     could not say while a move was converging.
+//!     could not say while a move was converging;
+//!   * an instance can be taken DOWN: both its listeners stop answering, its
+//!     `serve()` returns, and nothing it owned keeps a control-plane session
+//!     open behind it (the seam the whole file used to simulate with a port
+//!     nobody bound);
+//!   * a home node dying MID-mount fails over down the client's own address
+//!     list, refuses to substitute a second tree for the dead home's view, and
+//!     heals the still-open mount when the operator moves that view onto the
+//!     survivor — no remount, no data lost (ADR-0006 §2 under a real death).
 //!
 //! Needs a reachable PostgreSQL, because a placement table only one process can
 //! read is that process's private opinion. `GROVEFS_PG_TEST_URI` names the
@@ -50,7 +60,7 @@
 use grovefs::apikeys::{ApiKeyStore, Scope};
 use grovefs::control_remote::ControlClient;
 use grovefs::meta::{MetaProvider, NodeKind, ROOT_INO};
-use grovefs::remote::meta::{shard::Shard, MetaServer, RemoteMeta};
+use grovefs::remote::meta::{shard::Shard, MetaServer, RemoteMeta, ServerStop};
 use grovefs::remote::proto;
 use serde_json::json;
 use std::net::{TcpListener, TcpStream};
@@ -110,6 +120,9 @@ struct Node {
     meta: String,
     ctl: String,
     key: String,
+    /// The shutdown handle [`start_swept`] took before moving the server into
+    /// its thread; [`Node::down`] is what makes a ring member actually go away.
+    stop: ServerStop,
     _srv: std::thread::JoinHandle<()>,
 }
 
@@ -140,6 +153,161 @@ impl Node {
         }
         panic!("meta-server did not come up on {}", self.meta);
     }
+
+    /// Take this ring member DOWN — the seam the whole file could not have
+    /// before: a home node dying mid-mount, rather than a port that was never
+    /// bound.
+    ///
+    /// It waits for both ports to stop answering, because the property the
+    /// sharding suite needs is not "a flag was set" but "a dial to the retired
+    /// home fails". Which of the two event-loop shapes the instance runs (epoll
+    /// tick, or the armed polling accept) is an implementation detail; the
+    /// closed socket is what the mount plane sees either way.
+    fn down(&self) {
+        self.stop.stop();
+        for addr in [&self.meta, &self.ctl] {
+            if !closed_within(addr, Duration::from_secs(5)) {
+                panic!("{addr} still accepts connections 5 s after stop()");
+            }
+        }
+    }
+}
+
+/// A node that goes out of scope is a node that must stop holding the ports and
+/// the control-plane sessions it opened.
+///
+/// Without this, the file's cost is the WHOLE run rather than one case: every
+/// case's `meta-server` threads live until the test binary exits, so ten cases
+/// pile up warm sessions against a shared PostgreSQL. Measured 2026-11-28, seven
+/// of the nine cases then failed on
+/// `FATAL: remaining connection slots are reserved for non-replication superuser
+/// connections`, while the same cases one at a time were green.
+///
+/// No assertion here: a `Drop` that panics while another panic is unwinding
+/// aborts the process, and the case's real failure would be replaced by a
+/// message about a socket.
+impl Drop for Node {
+    fn drop(&mut self) {
+        self.stop.stop();
+        for addr in [&self.meta, &self.ctl] {
+            if !closed_within(addr, Duration::from_secs(5)) {
+                eprintln!("node {addr}: still listening 5 s after drop()");
+            }
+        }
+    }
+}
+
+/// Until `addr` stops answering, or `budget` runs out; `true` = closed.
+fn closed_within(addr: &str, budget: Duration) -> bool {
+    let Ok(ip) = addr.parse::<std::net::SocketAddr>() else {
+        return false;
+    };
+    let deadline = Instant::now() + budget;
+    loop {
+        if TcpStream::connect_timeout(&ip, Duration::from_millis(100)).is_err() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// One case at a time, process-wide.
+///
+/// Two fixture facts make concurrency the wrong default here: `free_port()`
+/// hands a port out and gives it back (so two cases can be told the same
+/// number), and every case's control-plane sessions land on ONE PostgreSQL whose
+/// `max_connections` is a CLUSTER-wide number. Measured 2026-11-28 at cargo's
+/// default thread count: 7 of this file's 9 cases red on
+/// `FATAL: remaining connection slots are reserved for non-replication superuser
+/// connections`; the same file one case at a time green. What the mutex costs is
+/// wall clock (the ten cases take ~17 s serialized), and what it buys is the
+/// property that a case's connection count is its OWN.
+static SUITE_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The connections one case of this file may hold at its peak: two or three
+/// `meta-server` processes, each with the warm shard session pair beside the
+/// control-plane pools its key/definition backends keep, plus the case's own
+/// reads. `take_turn` WAITS for this much room rather than assuming it, so the
+/// number is what the admission check measures instead of a guess in a comment.
+const CASE_BUDGET: i32 = 24;
+
+/// `max_connections` and how many slots are taken right now, as the server
+/// itself answers. Reading it is a dial like any other, so a server that cannot
+/// even admit THIS read fails in the caller's words, not in `postgres`'s.
+fn pg_capacity(pg: &str) -> (i32, i32) {
+    let mut c = postgres::Client::connect(pg, postgres::NoTls)
+        .expect("connect to read the server's capacity");
+    // `SHOW` answers as TEXT whatever the GUC's unit is, so the parse is explicit
+    // about which one this fixture understands.
+    let max: String = c
+        .query_one("SHOW max_connections", &[])
+        .expect("max_connections")
+        .get(0);
+    let max: i32 = max.trim().parse().expect("max_connections as a number");
+    let used: i32 = c
+        .query_one("SELECT count(*)::int4 FROM pg_stat_activity", &[])
+        .expect("pg_stat_activity")
+        .get(0);
+    (max, used)
+}
+
+/// Take this case's turn, and refuse to start until the shared server can admit
+/// a whole case.
+///
+/// Fail-closed on purpose. A saturated server is an environment fact — a
+/// `meta-server` leaked by an aborted run, or another tenant on the same
+/// cluster — but the failures it produces look exactly like routing bugs, which
+/// is how this file's red got misread once already. Naming the numbers up front
+/// turns "no slots left" into a line an operator can act on.
+fn take_turn(pg: &str) -> std::sync::MutexGuard<'static, ()> {
+    let g = SUITE_TURN.lock().unwrap_or_else(|p| p.into_inner());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let (max, used) = loop {
+        let cap = pg_capacity(pg);
+        if cap.1 + CASE_BUDGET <= cap.0 || Instant::now() >= deadline {
+            break cap;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    if used + CASE_BUDGET > max {
+        let holders = pg_holders(pg);
+        panic!(
+            "the shared PostgreSQL has {} of its {} slots taken and a case of this suite needs {CASE_BUDGET}: refusing to start (every holder is outside this run's cases — a leaked `meta-server` from an aborted board, or another tenant on the cluster). Who holds them: {}",
+            used, max, holders
+        );
+    }
+    eprintln!("shard_routing: turn taken, {used}/{max} PG slots in use");
+    g
+}
+
+/// The server's own account of its backends, for the message above: age and
+/// state per backend type, so "who ate the slots" is answered without a second
+/// run and without a `pg_stat_activity` query by hand.
+fn pg_holders(pg: &str) -> String {
+    let mut c = match postgres::Client::connect(pg, postgres::NoTls) {
+        Ok(c) => c,
+        Err(e) => return format!("cannot read the server: {}", e),
+    };
+    let rows = match c.query(
+        "SELECT backend_type, state, count(*) AS n, \n             (extract(epoch from now() - min(backend_start)))::int8 AS oldest \n         FROM pg_stat_activity GROUP BY 1,2 ORDER BY 3 DESC",
+        &[],
+    ) {
+        Ok(r) => r,
+        Err(e) => return format!("cannot read pg_stat_activity: {e}"),
+    };
+    rows.iter()
+        .map(|r| {
+            let t: String = r.get(0);
+            let s: Option<String> = r.get(1);
+            let n: i64 = r.get(2);
+            let old: i64 = r.get(3);
+            format!("{t}/{}: {n} (oldest {old}s)", s.unwrap_or_else(|| "-".into()))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Boot a sharded instance: `name` is its `--shard-id`, `ring` the whole
@@ -189,6 +357,8 @@ fn start_swept(
         Some(uri) => srv.with_store(Some(uri.to_string())),
         None => srv.with_control_plane(Some(control.to_string())),
     };
+    // The handle must be taken BEFORE `srv` moves into the serving thread.
+    let stop = srv.stop_handle();
     let _srv = std::thread::spawn(move || {
         let _ = srv.serve();
     });
@@ -197,6 +367,7 @@ fn start_swept(
         meta,
         ctl,
         key: key.to_string(),
+        stop,
         _srv,
     };
     node.wait_up();
@@ -282,6 +453,7 @@ fn sqlite_trees_shard_across_two_instances() {
         eprintln!("skipping: no PostgreSQL reachable (set GROVEFS_PG_TEST_URI)");
         return;
     };
+    let _turn = take_turn(&pg);
     let tag = format!("s{}a", std::process::id());
     // Node names carry the pid. `meta_placement` is one table in a shared
     // database, and a row written by an earlier run that died before its
@@ -472,6 +644,7 @@ fn a_moved_view_follows_its_open_mount() {
         eprintln!("skipping: no PostgreSQL reachable (set GROVEFS_PG_TEST_URI)");
         return;
     };
+    let _turn = take_turn(&pg);
     let tag = format!("s{}b", std::process::id());
     // Unique node names, for the reason spelled out in the test above.
     let n_a = format!("{tag}p1");
@@ -606,6 +779,7 @@ fn a_shorter_sweep_shortens_the_window_a_deposed_instance_holds_the_tree() {
         eprintln!("skipping: no PostgreSQL reachable (set GROVEFS_PG_TEST_URI)");
         return;
     };
+    let _turn = take_turn(&pg);
     let tag = format!("s{}sw", std::process::id());
     let n_a = format!("{tag}p1");
     let n_b = format!("{tag}p2");
@@ -867,6 +1041,7 @@ fn store_info_reports_the_placement_rows_behind_its_view_count() {
         eprintln!("skipping: no PostgreSQL reachable (set GROVEFS_PG_TEST_URI)");
         return;
     };
+    let _turn = take_turn(&pg);
     let tag = format!("s{}si", std::process::id());
     let n_a = format!("{tag}p1");
     let n_b = format!("{tag}p2");
@@ -1007,6 +1182,7 @@ fn a_zero_sweep_fails_the_start_instead_of_freezing_placement() {
         eprintln!("skipping: no PostgreSQL reachable (set GROVEFS_PG_TEST_URI)");
         return;
     };
+    let _turn = take_turn(&pg);
     let tag = format!("s{}z0", std::process::id());
     let n_a = format!("{tag}p1");
     let m1p = free_port();
@@ -1047,6 +1223,7 @@ fn a_lens_routes_by_its_base_and_owns_no_placement_row() {
         eprintln!("skipping: no PostgreSQL reachable (set GROVEFS_PG_TEST_URI)");
         return;
     };
+    let _turn = take_turn(&pg);
     let tag = format!("s{}c", std::process::id());
     let n_a = format!("{tag}r1");
     let n_b = format!("{tag}r2");
@@ -1171,6 +1348,194 @@ fn a_lens_routes_by_its_base_and_owns_no_placement_row() {
     cleanup(&pg, scratch.path(), &key_id);
 }
 
+/// The SECOND spelling of the fold rule: a FORK, which is the definition kind
+/// that owns a metadata tree of its own. The lens case above measures a name with
+/// no storage behind it; a fork has storage, so the placement question is sharper
+/// — "where is the tree my content refs resolve against", and the answer is its
+/// base, not its own name.
+///
+/// The rule is now written once (`def_routing_base`, used by `M_OPEN`'s routing
+/// key and by `store.info`'s bulk fold), and this case is the end-to-end half of
+/// that: when the two spellings drift apart, an operator gets a fork row beside
+/// the base's naming another instance, and the fork then mounts nowhere — the
+/// same dead end the lens case documents, one definition kind later. Nothing here
+/// exercised a fork at all before, which is exactly how a second spelling stays
+/// wrong.
+#[test]
+fn a_fork_routes_by_its_base_and_owns_no_placement_row() {
+    let Some(pg) = pg_uri() else {
+        eprintln!("skipping: no PostgreSQL reachable (set GROVEFS_PG_TEST_URI)");
+        return;
+    };
+    let _turn = take_turn(&pg);
+    let tag = format!("s{}f", std::process::id());
+    let n_a = format!("{tag}f1");
+    let n_b = format!("{tag}f2");
+    let scratch = tempfile::Builder::new()
+        .prefix("grovefs_shardkeys_")
+        .tempdir()
+        .unwrap();
+    let (key, key_id) = admin_key(&pg, scratch.path(), &format!("shardtest-{tag}"));
+
+    // Trees in the shared PostgreSQL, which is the only shape where a fork can
+    // exist at all next to a shared control plane: `fork.create` copies a
+    // PHYSICAL tree through the control backend (`pg_store`'s own verdict), so a
+    // deployment whose trees live on one instance's disk and whose definitions
+    // live in PostgreSQL has no fork path — the base it looks for is not in the
+    // database the def was written against. The routing question this case is
+    // about does not depend on which backend holds the copy.
+    let m1p = free_port();
+    let m2p = free_port();
+    let ring = format!("{n_a}=127.0.0.1:{m1p},{n_b}=127.0.0.1:{m2p}");
+    let m1 = start(
+        &n_a,
+        &ring,
+        &pg,
+        Some(&pg),
+        &key,
+        format!("127.0.0.1:{m1p}"),
+        format!("127.0.0.1:{}", free_port()),
+    );
+    let m2 = start(
+        &n_b,
+        &ring,
+        &pg,
+        Some(&pg),
+        &key,
+        format!("127.0.0.1:{m2p}"),
+        format!("127.0.0.1:{}", free_port()),
+    );
+
+    let base = format!("{tag}fb");
+    let fk = format!("{tag}ff");
+    m1.gov()
+        .call("view.create", json!({"view": base}))
+        .expect("create the base at m1");
+    let mb = RemoteMeta::new(&m1.meta, &base).expect("mount the base");
+    mb.create_node(ROOT_INO, "seeded", true, None, 0o0755, UID, GID)
+        .expect("mkdir in the base before the fork");
+    m1.gov()
+        .call("fork.create", json!({"base": base, "name": fk}))
+        .expect("fork the base at its home instance");
+    // The definition is a SECOND call, exactly as `grovefs view fork` sequences it
+    // (`fork.create` builds the tree, the CLI writes `fork <base>` and prints the
+    // text it wrote). The order matters for this case's claim: the fold reads the
+    // DEFINITION, so a fork tree whose def is not in the control plane yet is a
+    // plain physical name to the router and claims a row under its own name — the
+    // console passes `with_def` to have the server write both in one call for the
+    // same reason.
+    m1.gov()
+        .call(
+            "def.put",
+            json!({"name": fk, "text": format!("fork {base}\n")}),
+        )
+        .expect("record the fork definition");
+
+    // The fork mounts at BOTH instances: at its base's home directly, at the peer
+    // through the redirect the BASE's row answers — the fold, seen as a route.
+    let f1 = RemoteMeta::new(&m1.meta, &fk).expect("a fork must mount at its base's home");
+    let f2 = RemoteMeta::new(&m2.meta, &fk).expect("a fork must follow its base to its home");
+    let names: Vec<String> = f2
+        .readdir(ROOT_INO)
+        .into_iter()
+        .map(|n| n.name)
+        .filter(|n| n != ".")
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "seeded"),
+        "the fork mounted through the peer does not show the tree it was seeded from: {names:?}"
+    );
+
+    // The fold measured on the TABLE, not in a message: ONE row, keyed by the
+    // BASE, on the home instance. A fork name with a row of its own is the drift.
+    let rows = placement_rows(&pg, &ring, &n_a, &tag);
+    assert!(
+        !rows.iter().any(|(v, _)| v == &fk),
+        "a fork took a placement row of its own: {rows:?}"
+    );
+    assert_eq!(
+        rows.as_slice(),
+        [(base.clone(), n_a.clone())].as_slice(),
+        "the placement table must hold the base, once, on its home"
+    );
+
+    // `store.info` obeys the same rule the router does — one VIEW for the ring,
+    // while the instance holds two metadata TREES. The two numbers are allowed to
+    // differ precisely because the fold is about storage identity for routing, not
+    // about how many dbs are open.
+    assert_eq!(
+        shard_of(&m1.info(), &n_a)["views"],
+        json!(1),
+        "the page folded the fork and its base into a different tally than the router did"
+    );
+    assert_eq!(
+        shard_of(&m1.info(), &n_a)["rows"],
+        json!(1),
+        "a fork row appeared in the raw tally the page reports beside the fold"
+    );
+    // Touch the BASE again before reading the tally: `def.put` runs the same
+    // `evict()` every definition write runs, so the caches refill on use — and a
+    // count taken between the two writes counts one tree where the instance is
+    // about to hold two. This is why the page reports the resident count at all.
+    let _ = mb.readdir(ROOT_INO);
+    assert_eq!(
+        m1.info()["residentEngines"].as_u64(),
+        Some(2),
+        "the base and its fork are two stores on the home instance: {}",
+        m1.info()["residentEngines"]
+    );
+    // ... and neither of them is on the peer, which served the fork only as a
+    // redirect. A resident engine for `fk` on m2 is the split-brain the fold
+    // prevents: one name, two writable metadata trees.
+    assert_eq!(
+        m2.info()["residentEngines"].as_u64(),
+        Some(0),
+        "the peer materialized the fork instead of routing it"
+    );
+
+    // A fork is not a lens: its STRUCTURE is writable and its writes stay in its
+    // own tree. Both are measured here next to the routing claim, because the
+    // ack flag that makes the mount writable-in-structure is decided on the same
+    // `M_OPEN` path the fold is.
+    f1.create_node(ROOT_INO, "only-in-fork", true, None, 0o0755, UID, GID)
+        .expect("structure write through the fork");
+    let bnames: Vec<String> = mb
+        .readdir(ROOT_INO)
+        .into_iter()
+        .map(|n| n.name)
+        .collect();
+    assert!(
+        !bnames.iter().any(|n| n == "only-in-fork"),
+        "a write through the fork landed in its base: {bnames:?}"
+    );
+    assert_eq!(
+        placement_rows(&pg, &ring, &n_a, &tag).as_slice(),
+        [(base.clone(), n_a.clone())].as_slice(),
+        "a write through a fork changed the placement table"
+    );
+
+    // Teardown in the order the objects need, which is the order `grovefs view rm
+    // --name <fork>` uses: the DEFINITION goes first (it is what makes the name
+    // governed), then the fork's own tree (`fork.drop` deletes it and rebuilds the
+    // cross-view ledger the seed left), then the base. `view rm_base` on the base
+    // refuses while a def still names it as a base, so skipping a step is
+    // reported rather than half-done.
+    m1.gov()
+        .call("def.remove", json!({"name": fk}))
+        .expect("drop the fork definition");
+    m1.gov()
+        .call("fork.drop", json!({"name": fk}))
+        .expect("drop the fork's own tree");
+    m1.gov()
+        .call("view.rm_base", json!({"view": base}))
+        .expect("teardown the base");
+    assert!(
+        placement_rows(&pg, &ring, &n_a, &tag).is_empty(),
+        "placement rows outlived the tree they named"
+    );
+    cleanup(&pg, scratch.path(), &key_id);
+}
+
 /// An `M_OPEN` that is REFUSED must leave nothing in the shared control plane.
 ///
 /// The gate used to bootstrap the placement row BEFORE it knew the mount would
@@ -1183,6 +1548,7 @@ fn refused_mounts_leave_no_placement_row() {
         eprintln!("skipping: no PostgreSQL reachable (set GROVEFS_PG_TEST_URI)");
         return;
     };
+    let _turn = take_turn(&pg);
     let tag = format!("s{}d", std::process::id());
     let n_a = format!("{tag}q1");
     let n_b = format!("{tag}q2");
@@ -1271,6 +1637,7 @@ fn the_invalidation_stream_of_a_redirected_mount_comes_from_the_home_instance() 
         eprintln!("skipping: no PostgreSQL reachable (set GROVEFS_PG_TEST_URI)");
         return;
     };
+    let _turn = take_turn(&pg);
     let tag = format!("s{}e", std::process::id());
     let n_a = format!("{tag}e1");
     let n_b = format!("{tag}e2");
@@ -1404,6 +1771,7 @@ fn a_three_node_ring_routes_by_the_row_not_by_adjacency() {
         eprintln!("skipping: no PostgreSQL reachable (set GROVEFS_PG_TEST_URI)");
         return;
     };
+    let _turn = take_turn(&pg);
     let tag = format!("s{}f", std::process::id());
     let n_a = format!("{tag}r1");
     let n_b = format!("{tag}r2");
@@ -1679,30 +2047,349 @@ fn a_three_node_ring_routes_by_the_row_not_by_adjacency() {
     cleanup(&pg, scratch.path(), &key_id);
 }
 
-// TODO(severity=High): a HOME NODE GOING DOWN mid-mount is not covered here,
-// because nothing in this file can stop an instance: `MetaServer::serve()` has
-// no shutdown control op and the accept loops outlive the test's `Node` struct,
-// so a dead ring member can only be simulated by a port that was never bound
-// (the redirect then fails with a transport error, which is a different answer
-// from "the tree is unreachable because its host is gone").  Needs a stop
-// handle on `MetaServer` (or a `node.shutdown` control op) plus the assertion
-// that a mount dials the NEXT address in the failover list rather than the
-// retired home.
-// TODO(severity=High): fork definitions (`ViewDef::Fork(base)`) take the same
-// routing key as a lens via `shard_routing_key`, but no case here exercises one:
-// `fork.create` needs a seeded base tree, and the SQLite/PG split changes what a
-// fork's own metadata tree is — the lens case above covers the fold, this covers
-// the second spelling of it.  TODO(severity=Medium): a PostgreSQL connection-pool
-// exhaustion case (mount storm against `--pg-*-pool-max`, and the shard path's
-// own `Shard::connect`, which keeps SHARD_POOL_MAX sessions and opens cold for
-// the rest) still needs a PG fixture that can be driven to `max_connections`
-// and a knob to assert on. The ceiling itself is no longer hypothetical:
-// measured 2026-11-28, the nine cases of this file leave so many sessions open
-// (nothing here can stop a `meta-server`, per the first TODO above) that the
-// test server sits at 96 of its 100 connections by the end of a run, and a case
-// opening eight more failed with `FATAL: too many connections` on its FIRST
-// move. That is why the racing-move act above runs two calls at a time rather
-// than a burst: the assertion it makes is about the placement table, and that
-// failure would have been about this fixture.
+/// INFRA-1: a ring member can be made to GO AWAY, which is a different fixture
+/// from a port that was never bound.
+///
+/// Every case above simulates "the home is unreachable" by naming a node the
+/// ring does not serve, so the dial fails on a socket nobody ever listened on.
+/// An operator's dead host is the other shape: it WAS answering, and its
+/// listening sockets close under a running mount. Nothing in this file could
+/// reach that shape until `MetaServer` grew a stop handle; this is the seam's
+/// own acceptance, and the base the `HOME NODE GOING DOWN` case is built on.
+#[test]
+fn an_instance_can_be_taken_down_and_its_ports_go_with_it() {
+    let Some(pg) = pg_uri() else {
+        eprintln!("skipping: no PostgreSQL reachable (set GROVEFS_PG_TEST_URI)");
+        return;
+    };
+    let _turn = take_turn(&pg);
+    let tag = format!("s{}k", std::process::id());
+    let n_a = format!("{tag}m1");
+    let n_b = format!("{tag}m2");
+    let scratch = tempfile::Builder::new()
+        .prefix("grovefs_shardkeys_")
+        .tempdir()
+        .unwrap();
+    let (key, key_id) = admin_key(&pg, scratch.path(), &format!("shardtest-{tag}"));
+
+    let m1p = free_port();
+    let m2p = free_port();
+    let ring = format!("{n_a}=127.0.0.1:{m1p},{n_b}=127.0.0.1:{m2p}");
+    let m1 = start(
+        &n_a,
+        &ring,
+        &pg,
+        None,
+        &key,
+        format!("127.0.0.1:{m1p}"),
+        format!("127.0.0.1:{}", free_port()),
+    );
+    let m2 = start(
+        &n_b,
+        &ring,
+        &pg,
+        None,
+        &key,
+        format!("127.0.0.1:{m2p}"),
+        format!("127.0.0.1:{}", free_port()),
+    );
+
+    let va = format!("{tag}va");
+    let vb = format!("{tag}vb");
+    m1.gov()
+        .call("view.create", json!({"view": va}))
+        .expect("create va on m1");
+    m2.gov()
+        .call("view.create", json!({"view": vb}))
+        .expect("create vb on m2");
+    // Prove m1 was really serving before calling it dead: `down()` on a node
+    // that never came up would prove nothing about closing sockets.
+    let _open = RemoteMeta::new(&m1.meta, &va).expect("m1 serves its own view up to the stop");
+
+    // ---- the stop: both ports go, and the foreground service returns --------
+    m1.down();
+    assert!(
+        m1._srv.is_finished(),
+        "stop() closed the ports but `serve()` never returned — the test process would keep the threads"
+    );
+    // A governance dial at the retired control port must FAIL, and fail fast: a
+    // half-dead node that accepts and then stalls is the failure mode an
+    // operator cannot distinguish from a slow one.
+    let t = Instant::now();
+    let e = ControlClient::new(&m1.ctl, &m1.key)
+        .call("store.info", json!({}))
+        .err()
+        .unwrap_or_else(|| panic!("the retired control port {} still answered", m1.ctl));
+    assert!(
+        t.elapsed() < Duration::from_secs(2),
+        "a dial at a dead control port took {:?} to fail: {e}",
+        t.elapsed()
+    );
+    one_line(&e.to_string());
+
+    // ---- the ring keeps serving around the hole ----------------------------
+    let _b = RemoteMeta::new(&m2.meta, &vb).expect("the peer still serves its own view");
+    // The dead node's row still names it, so a mount of `va` through the peer
+    // gets a redirect to a host that is gone. This case's claim is only that
+    // the answer is a FAILURE and not a locally-served second tree (ADR-0006
+    // §2); which address the client dials next is the `HOME NODE GOING DOWN`
+    // case below.
+    let t = Instant::now();
+    let e = RemoteMeta::new(&m2.meta, &va)
+        .err()
+        .unwrap_or_else(|| panic!("m2 served {} locally after its home went down", va));
+    assert!(
+        t.elapsed() < Duration::from_secs(5),
+        "mounting through a peer whose home is dead took {:?}: {e}",
+        t.elapsed()
+    );
+    one_line(&e.to_string());
+    // Taking a node down is not a move: the placement table is what it was.
+    assert_eq!(
+        placement_rows(&pg, &ring, &n_a, &tag),
+        vec![(va.clone(), n_a.clone()), (vb.clone(), n_b.clone())],
+        "a stop rewrote the placement table"
+    );
+    // The peer is still answerable afterwards — the stop must not have taken
+    // the shared control plane with it.
+    assert_eq!(m2.info()["shard"]["nodes"].as_array().unwrap().len(), 2);
+
+    // Teardown of the surviving node goes through the same seam, so a case that
+    // ends here leaves no serving thread and no open PG session behind.
+    m2.down();
+    assert!(m2._srv.is_finished());
+    cleanup(&pg, scratch.path(), &key_id);
+}
+
+/// The incident an operator actually files: the ring member that was serving a
+/// view dies WHILE mounts are open, and the surviving instance is reachable at
+/// the address those mounts already know. Everything above simulates "the home
+/// is unreachable" with a port nobody bound and a row nobody can dial; this case
+/// reaches it through [`Node::down`], so the sockets close under a live client.
+///
+/// Three promises are measured, because an incident report is usually all three
+/// at once:
+///
+///   1. a dial that STARTED at the now-dead address advances down its own
+///      failover list instead of spending its life on the retired home — the
+///      mount of a view the survivor serves comes up, in bounded time;
+///   2. advancing is not substituting: a view whose home died must FAIL, with the
+///      dead address named in the message, and the survivor must not open a
+///      second tree under one name (ADR-0006 §2) — `residentEngines` on the
+///      survivor is the proof, not a reading of the error text;
+///   3. a pin to the retired home is a cached answer and not a commitment: after
+///      the routing failure, the SAME still-open mount heals the moment the
+///      operator moves the view onto the survivor, with no remount — and it
+///      still shows the directory written before the death, which is what says
+///      the row was the only broken thing.
+///
+/// Trees live in the shared database here, because the recovery step in (3) is a
+/// `view move --to-meta` and a move is only legal when the target can reach the
+/// bytes (a SQLite tree cannot be adopted off a dead host at all).
+#[test]
+fn a_home_node_dying_mid_mount_fails_over_then_heals_on_the_move() {
+    let Some(pg) = pg_uri() else {
+        eprintln!("skipping: no PostgreSQL reachable (set GROVEFS_PG_TEST_URI)");
+        return;
+    };
+    let _turn = take_turn(&pg);
+    let tag = format!("s{}h", std::process::id());
+    let n_a = format!("{tag}d1");
+    let n_b = format!("{tag}d2");
+    let scratch = tempfile::Builder::new()
+        .prefix("grovefs_shardkeys_")
+        .tempdir()
+        .unwrap();
+    let (key, key_id) = admin_key(&pg, scratch.path(), &format!("shardtest-{tag}"));
+
+    let m1p = free_port();
+    let m2p = free_port();
+    let ring = format!("{n_a}=127.0.0.1:{m1p},{n_b}=127.0.0.1:{m2p}");
+    let a_addr = format!("127.0.0.1:{m1p}");
+    let m1 = start_swept(
+        &n_a,
+        &ring,
+        &pg,
+        Some(&pg),
+        &key,
+        a_addr.clone(),
+        format!("127.0.0.1:{}", free_port()),
+        None,
+    );
+    let m2 = start_swept(
+        &n_b,
+        &ring,
+        &pg,
+        Some(&pg),
+        &key,
+        format!("127.0.0.1:{m2p}"),
+        format!("127.0.0.1:{}", free_port()),
+        None,
+    );
+
+    let va = format!("{tag}dva");
+    let vb = format!("{tag}dvb");
+    m1.gov()
+        .call("view.create", json!({"view": va}))
+        .expect("create va at its later home");
+    m2.gov()
+        .call("view.create", json!({"view": vb}))
+        .expect("create vb at the survivor");
+
+    // ---- both up: a mount whose list starts at the WRONG instance routes ----
+    // `va` is dialed through `m2,m1` so the learned home is m1 — the pin that
+    // must not survive m1's death as a permanent address for this mount.
+    let ma = RemoteMeta::new(&format!("{},{}", m2.meta, m1.meta), &va)
+        .expect("mount va through the peer (redirect to its home)");
+    ma.create_node(ROOT_INO, "written-before-the-death", true, None, 0o0755, UID, GID)
+        .expect("mkdir through the redirected mount");
+    assert_eq!(
+        shard_of(&m1.info(), &n_a)["views"],
+        json!(1),
+        "the redirect did not land on the home instance"
+    );
+
+    // ---- the death -----------------------------------------------------------------
+    m1.down();
+    assert_eq!(m2.info()["residentEngines"].as_u64(), Some(0));
+
+    // (1) ADVANCE: a new mount of `vb` whose list still names the retired home
+    // first has to burn that address and go on. `vb` never lived on m1, so the
+    // only way this succeeds is the failover walk.
+    let t = Instant::now();
+    let mb = RemoteMeta::new(&format!("{},{}", m1.meta, m2.meta), &vb)
+        .expect("a dead first address must not strand a mount whose view the survivor serves");
+    assert!(
+        t.elapsed() < Duration::from_secs(15),
+        "failover to the next address took {:?}",
+        t.elapsed()
+    );
+    mb.create_node(ROOT_INO, "on-the-survivor", true, None, 0o0755, UID, GID)
+        .expect("write through the failed-over mount");
+    assert_eq!(
+        m2.info()["residentEngines"].as_u64(),
+        Some(1),
+        "the failed-over mount did not run on the survivor"
+    );
+
+    // (2) NO SUBSTITUTION: `va`'s home is gone. The survivor refuses it — and it
+    // refuses every entry point in the list, so what reaches the operator names
+    // the unreachable home rather than a bare errno.
+    let t = Instant::now();
+    let e = RemoteMeta::new(&format!("{},{}", m2.meta, m1.meta), &va)
+        .err()
+        .unwrap_or_else(|| panic!("a peer served {} locally after its home died", va));
+    assert!(
+        t.elapsed() < Duration::from_secs(30),
+        "the refusal of a view whose home died took {:?}: {e}",
+        t.elapsed()
+    );
+    one_line(&e.to_string());
+    assert!(
+        e.to_string().contains(&a_addr),
+        "the failure of a view whose home died must name the dead home {a_addr}, and it said: {e}"
+    );
+    // The split-brain check, measured instead of read out of a message: `va` is
+    // the view this case cares about and `vb` the one the survivor legitimately
+    // serves, so ONE engine may be resident — and it is not `va`'s.
+    assert_eq!(
+        m2.info()["residentEngines"].as_u64(),
+        Some(1),
+        "the peer opened a second tree under the dead home's name"
+    );
+    // A mutating op on the mount that was OPEN when the home died fails the
+    // same way (`readdir` swallows its error into an empty listing, so it cannot
+    // be the probe for "the mount stopped").
+    let t = Instant::now();
+    let e2 = ma
+        .create_node(ROOT_INO, "written-after-the-death", true, None, 0o0755, UID, GID)
+        .err()
+        .unwrap_or_else(|| panic!("an open mount kept serving {} after its home died", va));
+    assert!(
+        t.elapsed() < Duration::from_secs(30),
+        "an op on a mount whose home died took {:?} to fail: {e2}",
+        t.elapsed()
+    );
+    one_line(&e2.to_string());
+
+    // (3) HEALING: the operator's move of the dead node's view onto the
+    // survivor. Nothing about the mount changes — no remount, no new address.
+    m2.gov()
+        .call("view.move_meta", json!({"view": va, "to": n_b}))
+        .expect("move va off the dead home");
+    assert_eq!(
+        placement_rows(&pg, &ring, &n_b, &tag)
+            .into_iter()
+            .filter(|(v, _)| *v == va)
+            .collect::<Vec<_>>(),
+        vec![(va.clone(), n_b.clone())],
+        "the move did not rewrite va's row"
+    );
+    let t = Instant::now();
+    let names: Vec<String> = loop {
+        let n: Vec<String> = ma
+            .readdir(ROOT_INO)
+            .into_iter()
+            .map(|x| x.name)
+            .filter(|x| x != ".")
+            .collect();
+        if n.iter().any(|x| x == "written-before-the-death") {
+            break n;
+        }
+        if t.elapsed() >= Duration::from_secs(20) {
+            panic!(
+                "the open mount never healed after the move: its listing is {n:?} after {:?}",
+                t.elapsed()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert!(
+        names.iter().any(|n| n == "written-before-the-death"),
+        "the healed mount does not show the tree the dead home held: {names:?}"
+    );
+    // Writing through the healed mount is the other half of "healed": the
+    // replayed op runs exactly once, and the refusal never ran it at all.
+    ma.create_node(ROOT_INO, "written-after-the-heal", true, None, 0o0755, UID, GID)
+        .expect("mkdir through the healed mount");
+    assert_eq!(
+        m2.info()["residentEngines"].as_u64(),
+        Some(1),
+        "the healed mount should be the survivor's only resident engine: the move's `evict()` \
+         drops every cached tree on the instance that ran it, so the honest claim here is that \
+         the healed mount reopened ITS tree HERE — not that two engines survived the move"
+    );
+    // The survivor's own view is unaffected by its neighbour's death and by the
+    // move it just absorbed: that mount reopens on its next op, and both trees
+    // are then resident on ONE instance.
+    mb.create_node(ROOT_INO, "still-on-the-survivor", true, None, 0o0755, UID, GID)
+        .expect("the survivor's own view kept serving across the move");
+    assert_eq!(
+        m2.info()["residentEngines"].as_u64(),
+        Some(2),
+        "both mounts are not resident on the survivor"
+    );
+
+    m2.down();
+    assert!(m2._srv.is_finished());
+    cleanup(&pg, scratch.path(), &key_id);
+}
+// TODO(severity=Medium): a PostgreSQL connection-pool EXHAUSTION case (mount
+// storm against `--pg-*-pool-max`, and the shard path's own `Shard::connect`,
+// which keeps SHARD_POOL_MAX sessions and opens cold for the rest) still needs
+// a knob to assert on. What landed instead, measured 2026-11-28, is the FIXTURE
+// for the ceiling: `take_turn` reads `max_connections` and the live backend
+// count from the server and refuses to start a case that cannot be admitted.
+// The reason it exists is that this file used to fail that way for real — nine
+// cases leaving so many sessions open that the test server sat at 96 of its 100
+// connections and a case opening eight more died with `FATAL: too many
+// connections` on its FIRST move; that is also why the racing-move act above
+// runs two calls at a time rather than a burst. Instances are now stopped by
+// `Node::down`/`Drop`, so the leak that produced those numbers is closed; the
+// exhaustion BEHAVIOUR (what a mount sees when a pool is full) is still
+// untested.
 // TODO(severity=Medium): a network-partition case (peer reachable at the TCP
 // layer but refusing, or half-open) belongs to the HA suite, not to sharding.
+// The stop seam covers the DEAD case now (`Node::down`); partition is the
+// reachable-but-uncooperative case, and it needs the HA threads to check the
+// stop flag too (see the boundary note on `ServerStop`).

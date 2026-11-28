@@ -753,7 +753,45 @@ impl EventLoop {
             }
             self.flush_dirty();
             self.sweep();
+            // 停机检查放在轮末：`epoll_wait` 的超时是 TICK=200ms，所以一次 `stop()`
+            // 最迟 200ms 内被看见，不需要额外的唤醒通道。生产里没人置这个标志，付出
+            // 只是每轮一次 relaxed 级别的原子读。
+            if self.rt.stopping() {
+                return self.shutdown();
+            }
         }
+    }
+
+    /// 收摊：逐条 `retire` 本循环手上的连接，再关掉**本循环独占**的 fd。
+    ///
+    /// 关 listener 是关键那一步——不关的话端口仍被 bind，拨过来的是「连上但没人应答」，
+    /// 客户端会挂在上面而不是拿到拒绝；对测试要的「这台 host 没了」完全是另一种现象。
+    ///
+    /// 逐条 `retire`（而不是 `conns.clear()`）是另一关键：`retire` 是唯一会把
+    /// `Shared::conns` 和 `rt.subs` 两处登记一起摘掉的入口。只丢本地表的话，订阅表里的
+    /// `Handle` 仍持有 `Arc<Shared>`，`Shared.pool` 的 sender 就永不归零，worker 卡在
+    /// `for job in r` 上不退出，它们那份 `Arc<MetaRuntime>` 也就永不释放——PG 后端的
+    /// 连接池跟着活到进程结束（实测 2026-11-28：本文件每跑一例多漏 8 条会话，10 例之后
+    /// 顶穿 `max_connections`）。
+    ///
+    /// `wake_fd` **故意不关**：`Shared::wakes` 存的是同一批号码，别的循环还可能往里 poke
+    /// （与 `spawn` 失败路径里「那条没起来的循环的唤醒 fd 不能关」同一条纪律），关掉就会
+    /// 让写进已复用 fd 号的风险进来。它随 `Shared` 一起回收。
+    fn shutdown(&mut self) -> io::Result<()> {
+        let fds: Vec<RawFd> = self.conns.keys().copied().collect();
+        for fd in fds {
+            if let Some(c) = self.conns.get(&fd).cloned() {
+                self.retire(&c);
+            }
+        }
+        self.conns.clear();
+        unsafe {
+            let _ = libc::close(self.listen_fd);
+            let _ = libc::close(self.ep);
+        }
+        self.listen_fd = -1;
+        self.ep = -1;
+        Ok(())
     }
 
     fn accept(&mut self) {

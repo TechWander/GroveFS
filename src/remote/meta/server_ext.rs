@@ -428,6 +428,9 @@ fn storage_snapshot(store: &StoreKind, base: &Path) -> StorageReport {
 /// signature; nothing outside `remote::meta` can see it.
 pub(super) struct MetaRuntime {
     base: PathBuf,
+    /// The shutdown flags this process's accept loops and sweeper poll; see
+    /// [`ServerStop`] and [`MetaServer::stop_handle`].
+    stop: ServerStop,
     token: String,
     /// Shared HMAC key for minting the Data-Access Capability
     /// (`--data-access-key`). `Some` => every accepted `M_OPEN` ships a
@@ -568,6 +571,19 @@ pub(super) struct MetaRuntime {
 }
 
 impl MetaRuntime {
+    /// True once a [`ServerStop`] handle told this instance to come down. Only
+    /// the accept loops, the sweeper and the `serve_runtime` fall-through read
+    /// it, and nothing in a production run ever sets it.
+    pub(super) fn stopping(&self) -> bool {
+        self.stop.is_stopping()
+    }
+
+    /// True when someone took a stop handle, which is what licenses the
+    /// polling-shaped accept fallback (see [`ServerStop`]).
+    fn stop_armed(&self) -> bool {
+        self.stop.is_armed()
+    }
+
     /// Effective role: always Primary for a plain (non-HA) node.
     fn role(&self) -> Role {
         self.ha.as_ref().map(|h| h.role()).unwrap_or(Role::Primary)
@@ -775,6 +791,72 @@ impl MetaRuntime {
     }
 }
 
+/// A handle that can bring a running [`MetaServer::serve()`] down.
+///
+/// It exists for one reason: the sharding suite has to make a ring member GO
+/// AWAY, and a port that was never bound is a different failure from a home that
+/// was serving and stopped — the first gives a transport error on a cold socket,
+/// the second is what an operator sees when a host dies mid-mount
+/// (`tests/shard_routing.rs`, the `HOME NODE GOING DOWN` case). An operator
+/// shutting a meta-server down with a signal never touches this: the process
+/// simply exits and the kernel closes the sockets.
+///
+/// Nothing changes until `stop()` is called. `stop_handle()` ARMS the server,
+/// which is the marker the thread-per-connection fallback reads: a blocked
+/// `incoming()` cannot observe a flag, so an armed server polls its listener with
+/// a bounded timeout instead. The epoll plane needs no marker — its
+/// [`super::epoll`] tick is already 200 ms — so an armed-and-stopped instance
+/// closes its listening sockets within one tick and `serve()` returns `Ok(())`.
+///
+/// The promise is that NOTHING OF THE INSTANCE OUTLIVES `stop()`, because a
+/// background thread that keeps a clone of the runtime also keeps its PG
+/// connection pools, and a test suite's cases are then billed for servers they
+/// already stopped. The two long sleepers a `--control-listen` instance always
+/// has (the engine/placement sweeper and the audit reaper) therefore sleep in
+/// slices and check the flag between them. The HA replicator and the promotion
+/// watchdog sleep on their own intervals and do NOT check it yet — a stop in an
+/// HA deployment leaves those two until the process exits, which is the shape
+/// the partition cases of the HA suite have to settle (the `NETWORK PARTITION`
+/// TODO in `tests/shard_routing.rs`).
+#[derive(Clone)]
+pub struct ServerStop {
+    stopping: Arc<AtomicBool>,
+    armed: Arc<AtomicBool>,
+}
+
+impl ServerStop {
+    /// The shape every runtime gets when nobody asked for a handle: never armed,
+    /// never stopping, so both accept loops keep their historical blocking shape
+    /// byte-for-byte.
+    fn never() -> Self {
+        Self {
+            stopping: Arc::new(AtomicBool::new(false)),
+            armed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Arm this server and hand out a clone of the handle (see
+    /// [`MetaServer::stop_handle`]). Idempotent: asking twice arms nothing extra.
+    fn armed(&self) -> ServerStop {
+        self.armed.store(true, Ordering::SeqCst);
+        self.clone()
+    }
+
+    /// Tell the instance to come down. Every loop notices within one tick; wait
+    /// for the serving thread yourself if you need the ports provably closed.
+    pub fn stop(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
+    }
+
+    fn is_armed(&self) -> bool {
+        self.armed.load(Ordering::SeqCst)
+    }
+}
+
 /// Central metadata authority. Holds one [`MetaEngine`] per view, opened on
 /// demand against an EXISTING `<base>/meta/<view>/<view>.db` (a missing one is
 /// refused, never created), shared across all connection threads, so
@@ -848,6 +930,10 @@ pub struct MetaServer {
     /// never reaches `MetaRuntime`. `None` seeds nothing: an existing store keeps
     /// exactly the accounts it already has.
     admin_account: Option<(String, String)>,
+    /// The other half of every [`Self::stop_handle`] this builder hands out: the
+    /// SAME flags travel into `MetaRuntime` at `serve()`, so a handle taken
+    /// before the server thread starts still controls it afterwards.
+    stop: ServerStop,
 }
 
 /// Default idle-engine eviction window for a builder-constructed `MetaServer`
@@ -887,6 +973,7 @@ impl MetaServer {
             shard_advertise: None,
             shard_sweep_ms: super::shard::DEFAULT_SHARD_SWEEP_MS,
             admin_account: None,
+            stop: ServerStop::never(),
         }
     }
 
@@ -916,6 +1003,7 @@ impl MetaServer {
             shard_advertise: None,
             shard_sweep_ms: super::shard::DEFAULT_SHARD_SWEEP_MS,
             admin_account: None,
+            stop: ServerStop::never(),
         }
     }
 
@@ -1168,6 +1256,14 @@ impl MetaServer {
     pub fn with_audit_retention(mut self, window: Option<String>) -> Self {
         self.audit_retention = window;
         self
+    }
+
+    /// Hand out the handle that can end a later [`Self::serve()`] — the test seam
+    /// for "this ring member went away". Taking one arms the server's accept
+    /// fallback to poll its listener; the flags start clear, so nothing happens
+    /// until the caller says [`ServerStop::stop`].
+    pub fn stop_handle(&self) -> ServerStop {
+        self.stop.armed()
     }
 
     pub fn serve(&self) -> io::Result<()> {
@@ -1527,6 +1623,7 @@ impl MetaServer {
         };
         let rt = Arc::new(MetaRuntime {
             base: self.base.clone(),
+            stop: self.stop.clone(),
             token: self.token.clone(),
             data_access_key: self.data_access_key.clone(),
             data_access_ttl: self.data_access_ttl,
@@ -1627,7 +1724,24 @@ impl MetaServer {
                         reap_audit(&ar, &w);
                     }
                     loop {
-                        thread::sleep(std::time::Duration::from_secs(60));
+                        // Sliced sleep with a stop check, for the reason the
+                        // sweeper now spells out above: this thread holds its own
+                        // clone of the runtime, and under a PG backend the runtime
+                        // owns the control-plane pools. Measured 2026-11-28, the
+                        // single 60 s sleep per tick meant a STOPPED instance kept
+                        // ~8 sessions open until it woke — one `--control-listen`
+                        // node per test case, and ten cases later the shared
+                        // PostgreSQL had no slots left. Nothing changes for a
+                        // running server: the cadence is still 60 s.
+                        let mut left = 60_000u64;
+                        while left > 0 && !ar.stopping() {
+                            let slice = left.min(200);
+                            thread::sleep(std::time::Duration::from_millis(slice));
+                            left -= slice;
+                        }
+                        if ar.stopping() {
+                            break;
+                        }
                         let window = match ar.audit_retention.lock().clone() {
                             Some(w) => w,
                             None => continue,
@@ -1762,6 +1876,7 @@ fn serve_on_meta_full(
     let control = crate::mcp::file_control_store(&base);
     let rt = Arc::new(MetaRuntime {
         base,
+        stop: ServerStop::never(),
         token: token.to_string(),
         data_access_key: dac_key,
         data_access_ttl: dac_ttl,
@@ -1994,11 +2109,10 @@ fn sweep_span_text(ms: u64) -> String {
 
 /// The base each placement name folds to, read in ONE pass over the definitions.
 ///
-/// This is [`shard_routing_key`]'s rule — a lens or a fork folds to its base, an
-/// alias and anything unreadable are counted under their own name — applied to
-/// the whole table at once instead of one control-plane read per row: `store.info`
-/// is the page an operator opens while a deployment looks wrong, and it must not
-/// cost a query per placement row to answer.
+/// This is [`def_routing_base`]'s rule — and therefore [`shard_routing_key`]'s —
+/// applied to the whole table at once instead of one control-plane read per row:
+/// `store.info` is the page an operator opens while a deployment looks wrong, and
+/// it must not cost a query per placement row to answer.
 ///
 /// The one shape the bulk walk does not reach is a def whose TREE is gone: the
 /// file store enumerates definitions by walking the tree list, so a stray def
@@ -2007,10 +2121,9 @@ fn sweep_span_text(ms: u64) -> String {
 fn shard_base_fold(rt: &MetaRuntime) -> HashMap<String, String> {
     let mut fold = HashMap::new();
     for (name, text) in rt.control.list_defs().unwrap_or_default() {
-        if let Ok(ViewDef::Derived(base, _)) | Ok(ViewDef::Fork(base)) =
-            LayoutRules::parse_def(&text)
-        {
-            fold.insert(name, base);
+        let def = LayoutRules::parse_def(&text).ok();
+        if let Some(base) = def_routing_base(def.as_ref()) {
+            fold.insert(name, base.to_string());
         }
     }
     fold
@@ -2248,7 +2361,24 @@ fn serve_runtime(listener: TcpListener, rt: Arc<MetaRuntime>) {
                 // is refused at start-up, so this is always a real interval.
                 nap = nap.min(sh.sweep_ms());
             }
-            thread::sleep(std::time::Duration::from_millis(nap));
+            // Sleep in slices, not in one `nap`: this thread holds its own clone of
+            // the runtime, and under a PG backend the runtime owns the per-view
+            // connection pools. Measured 2026-11-28, a single 60 s sleep per tick
+            // meant a stopped instance kept ~8 control-plane sessions open until it
+            // woke — ten cases of that walks this suite through
+            // `max_connections`. With slices a stop is seen within 200 ms.
+            let mut left = nap;
+            while left > 0 && !sw.stopping() {
+                let slice = left.min(200);
+                thread::sleep(std::time::Duration::from_millis(slice));
+                left = left.saturating_sub(slice);
+            }
+            if sw.stopping() {
+                // A coming-down instance stops sweeping as well: the threads that
+                // answer requests are already leaving, and another eviction line
+                // after them would only be noise in a test log.
+                break;
+            }
             let gone = evict_idle(&sw);
             if gone > 0 {
                 println!(
@@ -2301,6 +2431,12 @@ fn serve_runtime(listener: TcpListener, rt: Arc<MetaRuntime>) {
         for j in joins {
             let _ = j.join();
         }
+        if rt.stopping() {
+            // Not a degraded plane — somebody asked this instance to come down.
+            // Falling through would resume service on the ORIGINAL listener,
+            // re-opening a port the caller just watched close.
+            return;
+        }
         eprintln!(
             "meta-server: mount plane event loops exited; resuming thread-per-connection accept"
         );
@@ -2308,10 +2444,56 @@ fn serve_runtime(listener: TcpListener, rt: Arc<MetaRuntime>) {
     accept_loop_meta(listener, rt);
 }
 
+/// The shape [`accept_loop_meta`] / [`accept_loop_gov`] take once a
+/// [`ServerStop`] handle was handed out. A blocking `incoming()` can never
+/// observe the shutdown flag, so an armed server waits on its listener with a
+/// short timeout instead: the cost is one 5 ms sleep per idle tick INSIDE A TEST,
+/// and the gain is that `stop()` actually ends the loop, after which the
+/// caller's owned listener drops — which is what closes the port a mount then
+/// fails to dial. `true` = served until stopped; `false` = could not arm, and
+/// the caller must keep the historical blocking shape instead of going deaf.
+fn accept_loop_stoppable(
+    listener: &TcpListener,
+    rt: Arc<MetaRuntime>,
+    plane: &str,
+    on_conn: impl Fn(TcpStream, Arc<MetaRuntime>),
+) -> bool {
+    if let Err(e) = listener.set_nonblocking(true) {
+        // Cannot poll without going non-blocking: say so loudly and hand service
+        // back to the historical shape rather than pretending a stop will land.
+        eprintln!("meta {plane}: cannot arm the stoppable accept loop: {e}");
+        return false;
+    }
+    while !rt.stopping() {
+        match listener.accept() {
+            Ok((s, _)) => on_conn(s, rt.clone()),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(e) => eprintln!("meta {plane} accept failed: {e}"),
+        }
+    }
+    true
+}
+
 /// The thread-per-connection mount plane: one thread per accepted socket, for as long as
 /// that socket lives. Kept for `GROVEFS_META_THREADS=1`, for non-Linux builds, and as the
 /// fallback if the event loops cannot start.
 fn accept_loop_meta(listener: TcpListener, rt: Arc<MetaRuntime>) {
+    if rt.stop_armed()
+        && accept_loop_stoppable(&listener, rt.clone(), "meta", |s, rt| {
+            crate::remote::enable_tcp_keepalive(&s);
+            thread::spawn(move || {
+                if let Err(e) = handle_meta_conn(s, rt) {
+                    if e.kind() != io::ErrorKind::UnexpectedEof {
+                        eprintln!("meta conn error: {e}");
+                    }
+                }
+            });
+        })
+    {
+        return;
+    }
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
@@ -2366,6 +2548,10 @@ fn gov_accept(listener: TcpListener, rt: Arc<MetaRuntime>) {
         for j in joins {
             let _ = j.join();
         }
+        if rt.stopping() {
+            // Same rule as the mount plane: a stop is not a failed takeover.
+            return;
+        }
         eprintln!(
             "meta-server: control plane event loops exited; resuming thread-per-connection accept"
         );
@@ -2378,6 +2564,20 @@ fn gov_accept(listener: TcpListener, rt: Arc<MetaRuntime>) {
 /// [`GOV_PINNED_IDLE`] or keepalive ends it; the epoll plane enforces the same bound in
 /// its sweep instead.
 fn accept_loop_gov(listener: TcpListener, rt: Arc<MetaRuntime>) {
+    if rt.stop_armed()
+        && accept_loop_stoppable(&listener, rt.clone(), "control", |s, rt| {
+            crate::remote::enable_tcp_keepalive(&s);
+            thread::spawn(move || {
+                if let Err(e) = handle_gov_conn(s, &rt) {
+                    if e.kind() != io::ErrorKind::UnexpectedEof {
+                        eprintln!("control conn error: {e}");
+                    }
+                }
+            });
+        })
+    {
+        return;
+    }
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
@@ -6165,6 +6365,29 @@ fn view_exists(rt: &MetaRuntime, view: &str) -> io::Result<bool> {
     physical_tree_exists(rt, view).map_err(io::Error::other)
 }
 
+/// The ONE rule for "which name does the placement table key this definition
+/// under", stated here because three callers need the same answer and a fork in
+/// the spellings is a routing bug waiting to be written:
+///
+/// * [`shard_routing_key`] — what `M_OPEN` looks a row up by;
+/// * [`shard_base_fold`] — what `store.info` counts trees by, in bulk;
+/// * [`view_provider`] — which opens the engine the name resolves to.
+///
+/// A definition that renders or seeds ANOTHER tree folds to that tree: a DERIVED
+/// (lens) view has no storage of its own at all, and a FORK, whose own metadata
+/// tree is seeded from the base and whose content bytes are shared with it
+/// through the cross-view ledger, must live where its base lives — routing a
+/// fork by its own name would let a move of the base strand the fork's tree on
+/// the instance the base left. An ALIAS resolves to its base before the table is
+/// consulted and so folds to nothing here; a malformed or absent definition is
+/// not a routing key either — the caller keeps the name it was given.
+fn def_routing_base(def: Option<&ViewDef>) -> Option<&str> {
+    match def? {
+        ViewDef::Derived(b, _) | ViewDef::Fork(b) => Some(b.as_str()),
+        ViewDef::Alias(_) => None,
+    }
+}
+
 /// The name the shard placement table is keyed by for a client-visible `view`.
 ///
 /// ADR-0006 §2: the sharding key is the PHYSICAL BASE view name — the storage
@@ -6179,10 +6402,10 @@ fn view_exists(rt: &MetaRuntime, view: &str) -> io::Result<bool> {
 /// refusal gate has passed ([`super::shard::Shard::place_if_absent`], called
 /// from [`meta_open`] below the gates and above `view_provider`).
 fn shard_routing_key(rt: &MetaRuntime, view: &str) -> io::Result<String> {
-    Ok(match rt.control.get_def(view).map_err(io::Error::other)? {
-        Some(ViewDef::Derived(b, _)) | Some(ViewDef::Fork(b)) => b,
-        _ => view.to_string(),
-    })
+    let def = rt.control.get_def(view).map_err(io::Error::other)?;
+    Ok(def_routing_base(def.as_ref())
+        .unwrap_or(view)
+        .to_string())
 }
 
 /// Resolve the provider a client-visible `view` name is served from. Two
@@ -6258,7 +6481,11 @@ fn view_provider(rt: &MetaRuntime, view: &str) -> io::Result<Arc<dyn MetaProvide
             // resolved like a physical store (same cache, same subscriptions) but
             // deliberately NOT recorded in `defs`: `is_derived` stays false, so
             // structure writes are admitted while the client-side ack flag
-            // (below) keeps content writes out.
+            // (below) keeps content writes out. Routing is the exception to the
+            // "serves like a physical view" sentence: the placement table keys a
+            // fork by its BASE (`def_routing_base`), because the fork's content
+            // refs resolve through the base's store and a fork served away from
+            // its base would be a tree whose bytes live on another instance.
             if !physical_tree_exists(rt, view).map_err(io::Error::other)? {
                 return Err(io::Error::other(format!(
                     "fork view '{view}' has no tree in {} — removed out-of-band?",
@@ -9130,6 +9357,7 @@ mod ha_tests {
         ha.epoch.store(5, Ordering::SeqCst);
         let rt = Arc::new(MetaRuntime {
             base: dir.path().to_path_buf(),
+            stop: ServerStop::never(),
             token: String::new(),
             data_access_key: None,
             data_access_ttl: 0,
@@ -9214,6 +9442,7 @@ mod ha_tests {
     ) -> MetaRuntime {
         MetaRuntime {
             base: base.to_path_buf(),
+            stop: ServerStop::never(),
             token: String::new(),
             data_access_key: None,
             data_access_ttl: 0,
@@ -9560,6 +9789,7 @@ mod ha_tests {
             .unwrap();
         let mut rt = MetaRuntime {
             base: dir.path().to_path_buf(),
+            stop: ServerStop::never(),
             token: String::new(),
             data_access_key: None,
             data_access_ttl: 0,
@@ -9752,6 +9982,25 @@ mod shard_report_tests {
             serde_json::json!("2026-11-28T09:00:00+00:00")
         );
         assert_eq!(node_block(&block, "gfs1")["rows"], serde_json::json!(3));
+    }
+
+    /// The fold rule as a unit, over every definition shape at once — the point
+    /// is that `store.info`, `M_OPEN` and the engine resolver read the SAME
+    /// answer, so a new `ViewDef` variant has to be added here and cannot be
+    /// forgotten in one of the two call sites.
+    #[test]
+    fn def_routing_base_folds_lens_and_fork_and_nothing_else() {
+        let lens = ViewDef::Derived("main".into(), crate::layout::LayoutRules::default());
+        let fork = ViewDef::Fork("main".into());
+        let alias = ViewDef::Alias("main".into());
+        assert_eq!(def_routing_base(Some(&lens)), Some("main"));
+        assert_eq!(def_routing_base(Some(&fork)), Some("main"));
+        assert_eq!(
+            def_routing_base(Some(&alias)),
+            None,
+            "an alias is resolved before the table is consulted"
+        );
+        assert_eq!(def_routing_base(None), None, "a physical view is its own key");
     }
 
     /// The fold `store.info` applies is the ROUTER's rule, read in bulk over a

@@ -71,6 +71,32 @@ const SHARD_POOL_MAX: usize = 2;
 // than a fix on this path; the warm-floor change in `control::PgPool::open` is
 // what keeps the ceiling reachable meanwhile.
 
+/// Why a control-plane dial really failed, in one line.
+///
+/// `postgres::Error`'s own `Display` is a CATEGORY ("db error", "error during
+/// connection setup"); the sentence an operator needs — `FATAL: 53300: too many
+/// connections for role "grove"` — sits one level down in the source chain. A
+/// routing refusal that quotes only the category sends the reader to the server
+/// log for what is a capacity answer, and it makes a connection-pool exhaustion
+/// case impossible to assert on (`tests/shard_routing.rs`, the ceiling TODO).
+/// Flattened because these strings reach a client as a single-line reply
+/// (`server_ext::msg_shape_tests`).
+fn db_cause(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = String::new();
+    let mut cur: Option<&dyn std::error::Error> = Some(e);
+    while let Some(c) = cur {
+        let t = c.to_string();
+        if !t.is_empty() && !out.contains(&t) {
+            if !out.is_empty() {
+                out.push_str(": ");
+            }
+            out.push_str(&t);
+        }
+        cur = c.source();
+    }
+    out.replace(['\n', '\r'], " ")
+}
+
 /// The shard placement table, in the control schema. `meta` names a RING ENTRY
 /// (an identifier from `--shard-ring`), never a URI: like
 /// `grovefs_control.view_placement`, a row must not carry a credential, and the
@@ -633,15 +659,21 @@ impl Shard {
             .tcp_user_timeout(SHARD_DB_TIMEOUT * 2);
         let mut c = cfg.connect(postgres::NoTls).map_err(|e| {
             format!(
-                "cannot reach the shard control plane for view placement ({e}) — which \
-                 instance serves the view is undecided, refusing to guess"
+                "cannot reach the shard control plane for view placement ({}) — which \
+                 instance serves the view is undecided, refusing to guess",
+                db_cause(&e)
             )
         })?;
         let ms = SHARD_DB_TIMEOUT.as_millis().to_string();
         c.batch_execute(&format!(
             "SET statement_timeout = '{ms}'; SET idle_in_transaction_session_timeout = '{ms}'"
         ))
-        .map_err(|e| format!("cannot bound the shard control-plane timeouts: {e}"))?;
+        .map_err(|e| {
+            format!(
+                "cannot bound the shard control-plane timeouts: {}",
+                db_cause(&e)
+            )
+        })?;
         Ok(c)
     }
 
