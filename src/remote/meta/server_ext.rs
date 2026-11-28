@@ -5865,6 +5865,26 @@ fn view_exists(rt: &MetaRuntime, view: &str) -> io::Result<bool> {
     physical_tree_exists(rt, view).map_err(io::Error::other)
 }
 
+/// The name the shard placement table is keyed by for a client-visible `view`.
+///
+/// ADR-0006 §2: the sharding key is the PHYSICAL BASE view name — the storage
+/// identity — after alias resolution and after lens/fork expansion, because one
+/// tree may be rendered under several names and every one of them must route to
+/// the instance holding that tree. A derived definition's base is physical by
+/// construction (`view_provider` refuses a lens over a lens, and `def.put`
+/// refuses it too), so one definition hop is the whole fold. A malformed or
+/// unreadable definition routes as its own name; the name-shape and
+/// explicit-creation gates refuse it before the table is touched, and nothing
+/// those gates refuse writes a row any more — the claim is made only once every
+/// refusal gate has passed ([`super::shard::Shard::place_if_absent`], called
+/// from [`meta_open`] below the gates and above `view_provider`).
+fn shard_routing_key(rt: &MetaRuntime, view: &str) -> io::Result<String> {
+    Ok(match rt.control.get_def(view).map_err(io::Error::other)? {
+        Some(ViewDef::Derived(b, _)) | Some(ViewDef::Fork(b)) => b,
+        _ => view.to_string(),
+    })
+}
+
 /// Resolve the provider a client-visible `view` name is served from. Two
 /// shapes:
 /// - **physical view** (no definition for `view` in the control store): the
@@ -6400,6 +6420,32 @@ fn meta_open<W: Write>(
             }
         }
     }
+    // Name-shape gate: a view name is ONE safe path element (and, under a PG
+    // backend, the seed of a schema identifier), so a name that can never name a
+    // tree is refused here — before the control-plane reads below, not after one
+    // of them has answered with a database's own error text. Found by the bare
+    // socket probe that sends `''`, `'  '` and `'../evil'` as mount names: those
+    // used to reach the placement table and the tree-opening path, and the caller
+    // got a reply about Postgres instead of about its name. Same rule and same
+    // sentence as every governance verb (`layout::valid_view_name` /
+    // `view_name_error`), so the CLI and the wire cannot disagree about what a
+    // legal name is. `E_DB`, like the existence gate: this is a statement about
+    // the name, not about the caller's credentials.
+    if !crate::layout::valid_view_name(&view) {
+        let why = crate::layout::view_name_error(&view);
+        eprintln!("meta: M_OPEN view='{view}' refused: {why}");
+        if let Some(store) = &rt.keys {
+            let _ = store.log_call(
+                authed.as_ref(),
+                "meta",
+                "M_OPEN",
+                false,
+                &format!("view='{view}': {why}"),
+            );
+        }
+        proto::send_response(w, E_DB, 0, why.as_bytes())?;
+        return Ok(None);
+    }
     // PURE ALIAS resolution (name governance): an `alias <real>` definition
     // in meta/views/ makes the alias the public mount surface for a physical
     // view. The swap happens BEFORE the view-binding check and every downstream
@@ -6466,11 +6512,32 @@ fn meta_open<W: Write>(
     // DEFINITION is visible from every instance, so `view_exists` is true here
     // even when the tree is not, and the non-home answer must be a redirect
     // (`E_SHARD`, carrying the home address) rather than the empty tree this
-    // process would otherwise hand out. Only the post-alias name is routed: the
-    // sharding key is the physical base view, so an alias cannot become a second
-    // placement of the same tree.
+    // process would otherwise hand out.
+    //
+    // What it routes is the PHYSICAL BASE name, not the name the client typed
+    // (ADR-0006 §2, §5.6 — the sharding key is the storage identity): a lens or
+    // a fork is a presentation over one base tree, so it lives where that tree
+    // lives. Routing the visible name would pin a second row beside the base's,
+    // and the two could name different instances — after which the derived view
+    // mounts nowhere and no governance verb removes the row (`def.remove` and
+    // `view rm_base` both key off the base). Aliases were folded above, so the
+    // only shapes left are a physical name (routes as itself) or a derived one
+    // (routes as its base).
+    //
+    // And this gate READS. A refused `M_OPEN` — malformed name, unknown name, a
+    // base that was never created, an anonymous socket probe — must leave no row
+    // behind; the row used to be written HERE by the bootstrap pin, which made
+    // one garbage `M_OPEN` enough to mis-route a name forever and to grow the
+    // shared table without bound. The claim is made below, once every refusal
+    // gate has passed, by [`super::shard::Shard::place_if_absent`].
+    // Computed even when sharding is off: a non-sharded deployment costs one
+    // definition read here (the same read `view_exists` and `view_provider` are
+    // about to make), and the value is what the placement row must be keyed by
+    // further down. Aliases are already folded above, so the only shapes here
+    // are a physical name (its own key) or a derived one (keyed by its base).
+    let shard_key = shard_routing_key(rt, &view)?;
     if let Some(sh) = &rt.shard {
-        match sh.route(&view) {
+        match sh.peek(&shard_key) {
             Ok(super::shard::Home::Mine) => {}
             Ok(super::shard::Home::Other(node)) => {
                 crate::stats::count(crate::stats::Counter::ShardRedirect, 1);
@@ -6572,6 +6639,38 @@ fn meta_open<W: Write>(
         }
         proto::send_response(w, E_DB, 0, why.as_bytes())?;
         return Ok(None);
+    }
+    // Bootstrap the placement row for a view this instance is ABOUT to serve.
+    // Two constraints fix the position, and they pull in opposite directions:
+    //
+    //   * it must come AFTER every refusal gate, so a mount that is not going to
+    //     happen never writes (the row is what an anonymous probe used to grow
+    //     for free, and once written it mis-routes the name forever);
+    //   * it must come BEFORE `view_provider`, which is what materializes the
+    //     tree. A peer resolving the same unplaced name concurrently would
+    //     otherwise build a second copy behind one name — for a SQLite tree, two
+    //     divergent histories under the same mount. So the row is the claim on
+    //     the name, exactly as the old pre-gate `route()` pin intended; what
+    //     changed is that only a mount which got this far may make it.
+    //
+    // For a derived name the claim is keyed by the BASE (ADR-0006 §2), which is
+    // why it checks the base's own existence first: a lens published over a base
+    // that was never created must not place a row for a view that has no storage
+    // anywhere — `view_provider` is going to refuse that mount one step below.
+    //
+    // Best-effort: a control plane that cannot answer this one INSERT costs the
+    // bootstrap row, not the mount (the tree is real and this process serves it),
+    // and the next successful `M_OPEN` writes it. Loudly counted and logged,
+    // because the row is what makes a later `view move` and a peer's routing
+    // decision true.
+    if let Some(sh) = &rt.shard {
+        let base_exists = shard_key == view || view_exists(rt, &shard_key).unwrap_or(false);
+        if base_exists {
+            if let Err(e) = sh.place_if_absent(&shard_key) {
+                crate::stats::count(crate::stats::Counter::ShardPlacementErr, 1);
+                eprintln!("meta: M_OPEN view='{shard_key}' placement not recorded: {e}");
+            }
+        }
     }
     // Validate the view resolves (physical db or a parseable derived-view
     // definition) before acking. We deliberately do NOT hold this provider for

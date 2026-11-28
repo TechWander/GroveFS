@@ -18,6 +18,24 @@
 //! it, and a verb that would mutate a tree this process does not serve is
 //! refused rather than performed twice.
 //!
+//! Two more rules the first pass of this module did not hold, and now must
+//! (ADR-0006 §2, §5.6):
+//!
+//! * **The sharding key is the physical base view name.** A lens, a bias or a
+//!   fork is a presentation over ONE base tree, so it travels with that tree —
+//!   routing a derived name would put two rows behind one tree and let them
+//!   name different instances, which is the exact breakage §2 calls out.
+//!   `M_OPEN` therefore folds the post-alias name through its definition before
+//!   asking anything (see [`super::server_ext::shard_routing_key`]).
+//! * **A routing READ writes nothing.** An `M_OPEN` that is going to be refused
+//!   — unknown name, malformed name, a base that was never created — must not
+//!   leave a placement row behind: the row is what an anonymous client would
+//!   grow for free, and once written it permanently mis-routes the very name it
+//!   failed to serve. `peek` is the read, `place_if_absent` is the claim, and
+//!   only a mount that has passed every refusal gate pays for the claim — and it
+//!   pays BEFORE `view_provider` materializes the tree, which is the one property
+//!   the historical pre-gate pin had that mattered.
+//!
 //! There is deliberately **no placement cache**. `resolve_view_home` for PG
 //! instances may cache nothing either, and for good reason: a move that flips a
 //! row while a process still routes the view from a stale table sends every
@@ -33,6 +51,25 @@ use super::*;
 /// in `connect()` holding a socket open (the ADR-0005 budget rule, applied to
 /// the shard path rather than to the HA path).
 const SHARD_DB_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Warm control-plane sessions this process keeps for placement reads and
+/// claims. Two, not four ([`crate::control::CONTROL_POOL_SIZE`]): the shard path
+/// is a one-row lookup per mount establishment, and its connection count is what
+/// a shared PostgreSQL `max_connections` actually measures. See [`Shard::checkout`]
+/// for the measurement that set this number.
+const SHARD_POOL_MAX: usize = 2;
+
+// TODO(severity=Medium): this is the control plane's THIRD pool in one
+// `meta-server` process (keys and definitions each hold a `control::PgPool` for
+// the same URI). Sharing them — one `Arc<PgPool>` per control-plane URI per
+// process, with each consumer still running its own idempotent DDL through it —
+// would make a process's `max_connections` footprint independent of how many
+// control-plane tables it uses, and would let the shard reads inherit the
+// `GROVEFS_PG_*` knobs the other two ignore. It needs `Backend::Pg(PgPool)` in
+// `apikeys`/`webauth` to become `Backend::Pg(Arc<PgPool>)` and a process-wide
+// registry keyed on the expanded URI, so it is an architectural change rather
+// than a fix on this path; the warm-floor change in `control::PgPool::open` is
+// what keeps the ceiling reachable meanwhile.
 
 /// The shard placement table, in the control schema. `meta` names a RING ENTRY
 /// (an identifier from `--shard-ring`), never a URI: like
@@ -115,7 +152,7 @@ struct Placement {
 /// process serves. Built once at `serve()` and shared immutably; `None` in
 /// [`MetaRuntime`] means sharding is off, which is the historical single-process
 /// deployment and must cost zero queries.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Shard {
     nodes: Vec<MetaNode>,
     me: usize,
@@ -125,6 +162,27 @@ pub struct Shard {
     store: String,
     /// The `--shard-ring` text, quoted verbatim in error messages.
     origin: String,
+    /// Warm control-plane sessions ([`Shard::checkout`] / [`Shard::requeue`]).
+    /// Behind an `Arc` because a `Shard` is cloned into every holder of the
+    /// routing answer; the pool is what makes one, not one per clone.
+    pool: Arc<parking_lot::Mutex<Vec<postgres::Client>>>,
+}
+
+/// `Debug` by hand: a live `postgres::Client` has nothing an operator should
+/// read (and no `Debug` of its own), while the four facts that describe a
+/// routing decision — ring, self, backend, where the table lives — are exactly
+/// what a `--dry-run`-style diagnosis wants.
+impl std::fmt::Debug for Shard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Shard")
+            .field("nodes", &self.nodes)
+            .field("me", &self.me)
+            .field("ctl", &redact_authority(&self.ctl))
+            .field("store", &self.store)
+            .field("origin", &self.origin)
+            .field("pooled", &self.pool.lock().len())
+            .finish()
+    }
 }
 
 /// The name shape a ring entry and a placement row share: a plain identifier, no
@@ -250,6 +308,7 @@ impl Shard {
             ctl,
             store,
             origin,
+            pool: Arc::new(parking_lot::Mutex::new(Vec::new())),
         })
     }
 
@@ -289,6 +348,11 @@ impl Shard {
 
     /// Which instance serves `view`, consulting the placement table.
     ///
+    /// This is the GOVERNANCE read: `view create` and `view rm_base` use it, and
+    /// for them the bootstrap arm below is the point — creating a tree claims
+    /// its name in front of every other instance, before the tree exists, so a
+    /// concurrent creator and a peer both see the same answer.
+    ///
     /// Order, and why each arm is where it is:
     ///
     /// 0. a solo ring is the identity (no query at all);
@@ -318,17 +382,38 @@ impl Shard {
     }
 
     /// Routing verdict WITHOUT the bootstrap arm of [`Shard::route`]: read the row,
-    /// apply the same rule. `M_OPEN` and the governance verbs use `route` (an
-    /// unplaced view becomes this instance's, written once under lock); the
-    /// per-op gate uses THIS, because a data path must not grow placement rows —
-    /// a view with no row is simply this instance's, which is what a pin would
-    /// have recorded anyway.
+    /// apply the same rule. `M_OPEN` and the per-op gate use THIS, because a data
+    /// path must not grow placement rows on a name it is not going to serve —
+    /// an unplaced view is simply this instance's until the mount gets past every
+    /// refusal gate (the claim is [`Shard::place_if_absent`], which `M_OPEN` makes
+    /// after them and before the tree is materialized), and a mount that is
+    /// refused — unknown name, malformed name, missing base tree, an anonymous
+    /// socket probe — must leave no trace in the shared table. Governance verbs
+    /// that intend to TAKE a name use [`Shard::route`].
     pub fn peek(&self, view: &str) -> Result<Home, String> {
         if self.is_solo() {
             return Ok(Home::Mine);
         }
         let row = self.read_placement(view)?;
         self.decide(view, row)
+    }
+
+    /// Claim `view` for THIS instance unless a row already exists — the write an
+    /// `M_OPEN` makes once every refusal gate has passed and BEFORE it
+    /// materializes a tree, never before. Idempotent (`ON CONFLICT DO NOTHING`),
+    /// so two instances that race an unplaced name settle on whichever wrote
+    /// first and every later mount is redirected; this is the one thing the
+    /// historical pre-gate `route()` pin was actually for, and keeping it here
+    /// (after the gates) is what stops a refused mount from claiming a name it
+    /// cannot serve. Best-effort like [`Shard::forget`]: a control plane that
+    /// cannot answer costs the bootstrap row for this mount, not the mount itself
+    /// — the tree exists and is served, and the row re-appears on the next
+    /// successful `M_OPEN`.
+    pub fn place_if_absent(&self, view: &str) -> Result<(), String> {
+        if self.is_solo() {
+            return Ok(());
+        }
+        self.write_placement(view, &self.me().name, &self.store, false)
     }
 
     /// The verdict for one placement row, as a pure function: the routing RULE
@@ -382,12 +467,14 @@ impl Shard {
     /// this runs, so a control plane that cannot answer skews future counts and
     /// leaves one stale row — it never revives the view or loses data.
     pub fn forget(&self, view: &str) {
-        if let Ok(mut c) = self.connect() {
-            let _ = c.execute(
+        let _ = self.with_client(|c| {
+            c.execute(
                 &format!("DELETE FROM {META_PLACEMENT_TABLE} WHERE view = $1"),
                 &[&view],
-            );
-        }
+            )
+            .map(|_| ())
+            .map_err(|e| format!("postgres delete {META_PLACEMENT_TABLE}: {e}"))
+        });
     }
 
     /// Every placement row, as view → node name (`store.info`'s shard page).
@@ -395,31 +482,49 @@ impl Shard {
     /// non-sharded deployment at the console does not grow an empty table — a
     /// missing one simply means nothing has been placed yet.
     pub fn placement_map(&self) -> Result<HashMap<String, String>, String> {
-        let mut c = self.connect()?;
-        let exists = c
-            .query(
-                // Cast to bool: the wire type `regclass` has no decoder here, so
-                // reading the column as a name fails with "error deserializing
-                // column 0" (found by `tests/shard_routing.rs`).
-                "SELECT (to_regclass('grovefs_control.meta_placement') IS NOT NULL)",
-                &[],
-            )
-            .map_err(|e| format!("postgres probe {META_PLACEMENT_TABLE}: {e}"))?
-            .first()
-            .map(|r| r.get::<_, bool>(0))
-            .unwrap_or(false);
-        if !exists {
-            return Ok(HashMap::new());
-        }
-        let rows = c
-            .query(
-                &format!("SELECT view, meta FROM {META_PLACEMENT_TABLE} ORDER BY view"),
-                &[],
-            )
-            .map_err(|e| format!("postgres read {META_PLACEMENT_TABLE}: {e}"))?;
-        Ok(rows
+        self.with_client(|c| {
+            let exists = c
+                .query(
+                    // Cast to bool: the wire type `regclass` has no decoder here, so
+                    // reading the column as a name fails with "error deserializing
+                    // column 0" (found by `tests/shard_routing.rs`).
+                    "SELECT (to_regclass('grovefs_control.meta_placement') IS NOT NULL)",
+                    &[],
+                )
+                .map_err(|e| format!("postgres probe {META_PLACEMENT_TABLE}: {e}"))?
+                .first()
+                .map(|r| r.get::<_, bool>(0))
+                .unwrap_or(false);
+            if !exists {
+                return Ok(HashMap::new());
+            }
+            let rows = c
+                .query(
+                    &format!("SELECT view, meta FROM {META_PLACEMENT_TABLE} ORDER BY view"),
+                    &[],
+                )
+                .map_err(|e| format!("postgres read {META_PLACEMENT_TABLE}: {e}"))?;
+            Ok(rows
+                .into_iter()
+                .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
+                .collect())
+        })
+    }
+
+    /// Every row of the placement table verbatim: `(view, meta)` in view order.
+    ///
+    /// Read-only and non-creating like [`Shard::placement_map`], and kept as
+    /// KEYS rather than folded into counts because it answers the question an
+    /// operator actually asks when a ring looks wrong — "which names does the
+    /// table hold, and does any of them name a tree that no longer exists?" A
+    /// derived name in here is the ADR-0006 §2 breakage made visible; a name
+    /// whose tree was deleted is an orphan no governance verb will remove.
+    /// `tests/shard_routing.rs` asserts on it for exactly that reason.
+    pub fn placement_rows(&self) -> Result<Vec<(String, String)>, String> {
+        Ok(self
+            .placement_map()?
             .into_iter()
-            .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
+            .map(|(v, m)| (v, m))
             .collect())
     }
 
@@ -444,11 +549,12 @@ impl Shard {
             .collect())
     }
 
-    /// A connection to the control plane, BOUNDED at both ends. `tokio-postgres`
-    /// 0.7 exposes a connect timeout on `Config` and nothing for statements, so
-    /// the statement budget is set on the session: without it, a wedged control
-    /// plane would hand this process a parked meta worker per mount attempt
-    /// (the rule ADR-0005 states for the HA path, applied here).
+    /// A FRESH connection to the control plane, BOUNDED at both ends.
+    /// `tokio-postgres` 0.7 exposes a connect timeout on `Config` and nothing for
+    /// statements, so the statement budget is set on the session: without it, a
+    /// wedged control plane would hand this process a parked meta worker per
+    /// mount attempt (the rule ADR-0005 states for the HA path, applied here).
+    /// [`Shard::checkout`] is what the callers below want; this is its cold path.
     fn connect(&self) -> Result<postgres::Client, String> {
         let mut cfg: postgres::Config = self
             .ctl
@@ -470,32 +576,91 @@ impl Shard {
         Ok(c)
     }
 
-    /// Read one row, creating the table first under the control schema's DDL
-    /// lock — exactly the contract [`crate::pg_store::lookup_placement`] states:
-    /// a routing read must not depend on which process happened to initialize
-    /// the control plane, and the fresh-ring case (no table yet, so nothing
-    /// placed) is a normal answer rather than a refused mount.
+    /// A control-plane session, preferring one this process already opened.
+    ///
+    /// This matters more than it looks. The historical shape was one fresh
+    /// `connect()` per routing read, which made this path's connection count
+    /// proportional to MOUNT TRAFFIC rather than to concurrent mounts, and each
+    /// of those sessions also took the control schema's global DDL advisory lock
+    /// (the "ensure the table exists" step), so every instance serialized its
+    /// mounts behind one lock while each waiter held a socket. Measured: the four
+    /// `tests/shard_routing.rs` cases running in parallel (8 instances, one shared
+    /// PostgreSQL, `max_connections = 100`) failed with `53300 remaining
+    /// connection slots are reserved for non-replication superuser connections`,
+    /// while any one of them alone passed. Warm sessions plus a lock-free read is
+    /// the fix for both halves of that.
+    fn checkout(&self) -> Result<postgres::Client, String> {
+        loop {
+            let warm = self.pool.lock().pop();
+            match warm {
+                None => break,
+                // Reaped by the server (idle timeout, restart) or half-closed:
+                // drop it, try the next, then connect cold.
+                Some(c) if c.is_closed() => continue,
+                Some(c) => return Ok(c),
+            }
+        }
+        self.connect()
+    }
+
+    /// Hand a session back, bounded at [`SHARD_POOL_MAX`]: a burst above that is
+    /// served and then shed (the client drops, closing the socket), so the steady
+    /// state costs two connections and a peak costs the peak — never a count that
+    /// grows with how many mounts this process has answered. A closed client is
+    /// never requeued.
+    fn requeue(&self, c: postgres::Client) {
+        if c.is_closed() {
+            return;
+        }
+        let mut p = self.pool.lock();
+        if p.len() < SHARD_POOL_MAX {
+            p.push(c);
+        }
+    }
+
+    /// Run one use of a session and hand it back on success.
+    ///
+    /// Deliberately not a RAII guard: a call that fails returns through `?`, its
+    /// client drops and the socket closes. That is the point — a statement that
+    /// errored can leave a session inside an aborted transaction, and handing
+    /// that to the next mount would turn one bad round trip into a sticky
+    /// failure. Reconnecting is the honest reset, and the historical behaviour.
+    fn with_client<T>(
+        &self,
+        f: impl FnOnce(&mut postgres::Client) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut c = self.checkout()?;
+        let out = f(&mut c)?;
+        self.requeue(c);
+        Ok(out)
+    }
+
+    /// Read one row, and NOTHING else: the routing read has no side effect, not
+    /// even a catalog one. An absent table is the same answer as an absent row —
+    /// nothing has been placed yet, so this instance is home, and the claim that
+    /// a successful mount makes ([`Shard::place_if_absent`]) creates the table.
+    /// That keeps the contract [`crate::pg_store::lookup_placement`] states (a
+    /// routing read must not depend on which process initialized the control
+    /// plane) without paying a DDL lock per read; the fresh-ring case stays the
+    /// normal answer it always was rather than a refused mount.
     fn read_placement(&self, view: &str) -> Result<Option<Placement>, String> {
-        let mut c = self.connect()?;
-        let mut tx = c
-            .transaction()
-            .map_err(|e| format!("postgres begin: {e}"))?;
-        ensure_placement(&mut tx)?;
-        let row = tx
-            .query(
-                &format!("SELECT meta, store FROM {META_PLACEMENT_TABLE} WHERE view = $1"),
-                &[&view],
-            )
-            .map_err(|e| format!("postgres read {META_PLACEMENT_TABLE}: {e}"))?
-            .into_iter()
-            .next()
-            .map(|r| Placement {
-                meta: r.get(0),
-                store: r.get(1),
-            });
-        tx.commit()
-            .map_err(|e| format!("postgres commit (shard placement read): {e}"))?;
-        Ok(row)
+        self.with_client(|c| {
+            if !placement_exists(c)? {
+                return Ok(None);
+            }
+            Ok(c
+                .query(
+                    &format!("SELECT meta, store FROM {META_PLACEMENT_TABLE} WHERE view = $1"),
+                    &[&view],
+                )
+                .map_err(|e| format!("postgres read {META_PLACEMENT_TABLE}: {e}"))?
+                .into_iter()
+                .next()
+                .map(|r| Placement {
+                    meta: r.get(0),
+                    store: r.get(1),
+                }))
+        })
     }
 
     /// Insert `view`'s row unless one exists, then read back whatever won. One
@@ -503,35 +668,36 @@ impl Shard {
     /// serialize, and the loser learns the winner's name from the same round
     /// trip rather than guessing that its own insert took effect.
     fn pin(&self, view: &str) -> Result<Placement, String> {
-        let mut c = self.connect()?;
-        let mut tx = c
-            .transaction()
-            .map_err(|e| format!("postgres begin: {e}"))?;
-        ensure_placement(&mut tx)?;
-        let now = chrono::Local::now().to_rfc3339();
-        tx.execute(
-            &format!(
-                "INSERT INTO {META_PLACEMENT_TABLE} (view, meta, store, updated_at) \
-                 VALUES ($1, $2, $3, $4) ON CONFLICT (view) DO NOTHING"
-            ),
-            &[&view, &self.me().name, &self.store, &now],
-        )
-        .map_err(|e| format!("postgres pin {META_PLACEMENT_TABLE}: {e}"))?;
-        let row = tx
-            .query(
-                &format!("SELECT meta, store FROM {META_PLACEMENT_TABLE} WHERE view = $1"),
-                &[&view],
+        self.with_client(|c| {
+            create_placement(c)?;
+            let mut tx = c
+                .transaction()
+                .map_err(|e| format!("postgres begin: {e}"))?;
+            let now = chrono::Local::now().to_rfc3339();
+            tx.execute(
+                &format!(
+                    "INSERT INTO {META_PLACEMENT_TABLE} (view, meta, store, updated_at) \
+                     VALUES ($1, $2, $3, $4) ON CONFLICT (view) DO NOTHING"
+                ),
+                &[&view, &self.me().name, &self.store, &now],
             )
-            .map_err(|e| format!("postgres read {META_PLACEMENT_TABLE}: {e}"))?
-            .into_iter()
-            .next()
-            .map(|r| Placement {
-                meta: r.get(0),
-                store: r.get(1),
-            });
-        tx.commit()
-            .map_err(|e| format!("postgres commit (shard pin): {e}"))?;
-        row.ok_or_else(|| format!("view placement for '{view}' vanished mid-transaction"))
+            .map_err(|e| format!("postgres pin {META_PLACEMENT_TABLE}: {e}"))?;
+            let row = tx
+                .query(
+                    &format!("SELECT meta, store FROM {META_PLACEMENT_TABLE} WHERE view = $1"),
+                    &[&view],
+                )
+                .map_err(|e| format!("postgres read {META_PLACEMENT_TABLE}: {e}"))?
+                .into_iter()
+                .next()
+                .map(|r| Placement {
+                    meta: r.get(0),
+                    store: r.get(1),
+                });
+            tx.commit()
+                .map_err(|e| format!("postgres commit (shard pin): {e}"))?;
+            row.ok_or_else(|| format!("view placement for '{view}' vanished mid-transaction"))
+        })
     }
 
     fn write_placement(
@@ -541,41 +707,73 @@ impl Shard {
         store: &str,
         upsert: bool,
     ) -> Result<(), String> {
-        let mut c = self.connect()?;
-        let mut tx = c
-            .transaction()
-            .map_err(|e| format!("postgres begin: {e}"))?;
-        ensure_placement(&mut tx)?;
-        let now = chrono::Local::now().to_rfc3339();
-        let conflict = if upsert {
-            "DO UPDATE SET meta = EXCLUDED.meta, store = EXCLUDED.store, updated_at = EXCLUDED.updated_at"
-        } else {
-            "DO NOTHING"
-        };
-        tx.execute(
-            &format!(
-                "INSERT INTO {META_PLACEMENT_TABLE} (view, meta, store, updated_at) \
-                 VALUES ($1, $2, $3, $4) ON CONFLICT (view) {conflict}"
-            ),
-            &[&view, &meta, &store, &now],
-        )
-        .map_err(|e| format!("postgres write {META_PLACEMENT_TABLE}: {e}"))?;
-        tx.commit()
-            .map_err(|e| format!("postgres commit (shard placement): {e}"))
+        self.with_client(|c| {
+            create_placement(c)?;
+            let mut tx = c
+                .transaction()
+                .map_err(|e| format!("postgres begin: {e}"))?;
+            let now = chrono::Local::now().to_rfc3339();
+            let conflict = if upsert {
+                "DO UPDATE SET meta = EXCLUDED.meta, store = EXCLUDED.store, updated_at = EXCLUDED.updated_at"
+            } else {
+                "DO NOTHING"
+            };
+            tx.execute(
+                &format!(
+                    "INSERT INTO {META_PLACEMENT_TABLE} (view, meta, store, updated_at) \
+                     VALUES ($1, $2, $3, $4) ON CONFLICT (view) {conflict}"
+                ),
+                &[&view, &meta, &store, &now],
+            )
+            .map_err(|e| format!("postgres write {META_PLACEMENT_TABLE}: {e}"))?;
+            tx.commit()
+                .map_err(|e| format!("postgres commit (shard placement): {e}"))
+        })
     }
 }
 
-/// Create the table if absent, under the control schema's own DDL lock. Every
-/// writer calls it, so an engine open never depends on which process happened to
-/// initialize the control plane first.
-fn ensure_placement(tx: &mut postgres::Transaction) -> Result<(), String> {
-    tx.execute(
-        "SELECT pg_advisory_xact_lock($1)",
-        &[&crate::control::DDL_LOCK_CLASS],
-    )
-    .map_err(|e| format!("postgres advisory lock: {e}"))?;
-    tx.execute(META_PLACEMENT_DDL, &[])
-        .map_err(|e| format!("postgres ensure {META_PLACEMENT_TABLE}: {e}"))?;
+/// Whether the placement table exists yet — a read-only catalog probe, no DDL
+/// and no lock, which is what makes it affordable on every routing read.
+fn placement_exists(c: &mut postgres::Client) -> Result<bool, String> {
+    Ok(c
+        .query(
+            // Cast to bool: the wire type `regclass` has no decoder here, so
+            // reading the column as a name fails with "error deserializing
+            // column 0" (found by `tests/shard_routing.rs`).
+            "SELECT (to_regclass('grovefs_control.meta_placement') IS NOT NULL)",
+            &[],
+        )
+        .map_err(|e| format!("postgres probe {META_PLACEMENT_TABLE}: {e}"))?
+        .first()
+        .map(|r| r.get::<_, bool>(0))
+        .unwrap_or(false))
+}
+
+/// Create the table if absent, under the control schema's own DDL lock; if it is
+/// already there, take no lock at all. Every WRITER calls it, so an engine open
+/// never depends on which process happened to initialize the control plane
+/// first, and the probe in front of it is what keeps the advisory lock — and
+/// `CREATE TABLE IF NOT EXISTS`, which takes an ACCESS EXCLUSIVE lock on an
+/// existing relation — off the path a mount takes. The schema is created too: a
+/// ring pointed at a PostgreSQL that has never held a grovefs control plane has
+/// no `grovefs_control` to put the table in.
+fn create_placement(c: &mut postgres::Client) -> Result<(), String> {
+    if placement_exists(c)? {
+        return Ok(());
+    }
+    let lock = format!("SELECT pg_advisory_lock({})", crate::control::DDL_LOCK_CLASS);
+    c.batch_execute(&lock)
+        .map_err(|e| format!("postgres advisory lock: {e}"))?;
+    let body = format!(
+        "CREATE SCHEMA IF NOT EXISTS {};{META_PLACEMENT_DDL};",
+        crate::control::CONTROL_SCHEMA
+    );
+    let created = c.batch_execute(&body);
+    // Always release, even when the DDL failed, so a later process is not left
+    // behind a stuck session lock (the rule `control::PgPool::init_schema` holds).
+    let unlock = format!("SELECT pg_advisory_unlock({})", crate::control::DDL_LOCK_CLASS);
+    let _ = c.batch_execute(&unlock);
+    created.map_err(|e| format!("postgres ensure {META_PLACEMENT_TABLE}: {e}"))?;
     Ok(())
 }
 

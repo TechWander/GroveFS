@@ -13,6 +13,10 @@
 //!     and the tree follows: an already-open mount keeps working and ends up
 //!     talking to the new home with no remount (placement sweep + `E_SHARD`
 //!     mid-op + client re-handshake);
+//!   * the placement table is keyed by the PHYSICAL BASE view and is written
+//!     only by a SUCCESSFUL mount — a lens follows its base, and a refused
+//!     `M_OPEN` (unknown name, a lens whose base was never created) leaves no
+//!     row behind (ADR-0006 §2, §5.6);
 //!   * `store.info` reports the ring, per-node placed-view counts and which
 //!     instance is answering.
 //!
@@ -27,7 +31,7 @@
 use grovefs::apikeys::{ApiKeyStore, Scope};
 use grovefs::control_remote::ControlClient;
 use grovefs::meta::{MetaProvider, NodeKind, ROOT_INO};
-use grovefs::remote::meta::{MetaServer, RemoteMeta};
+use grovefs::remote::meta::{shard::Shard, MetaServer, RemoteMeta};
 use serde_json::json;
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
@@ -185,6 +189,29 @@ fn admin_key(control: &str, base: &Path, label: &str) -> (String, String) {
         .create_for(label, Scope::Admin)
         .expect("mint admin key");
     (full, id)
+}
+
+/// The placement table as THIS run sees it: every `(view, meta)` row whose view
+/// name carries this process's tag.
+///
+/// Read straight from the shared control plane rather than off `store.info`'s
+/// counts, because the ADR-0006 §2 invariant is about which NAMES are keys — a
+/// count cannot tell a base row from a derived one, and the bug this catches is
+/// precisely a derived row sitting beside its base and naming another instance.
+fn placement_rows(pg: &str, ring: &str, me: &str, tag: &str) -> Vec<(String, String)> {
+    let s = Shard::new(
+        ring,
+        Some(me),
+        None,
+        pg.to_string(),
+        "sqlite (local)".to_string(),
+    )
+    .expect("shard handle for the placement read");
+    s.placement_rows()
+        .expect("read meta_placement")
+        .into_iter()
+        .filter(|(v, _)| v.starts_with(tag))
+        .collect()
 }
 
 /// Remove the key this run minted, so a shared database is left as it was found.
@@ -502,3 +529,237 @@ fn a_moved_view_follows_its_open_mount() {
         .expect("teardown the moved view");
     cleanup(&pg, scratch.path(), &key_id);
 }
+
+/// A derived view is a PRESENTATION over one base tree, so it lives where that
+/// tree lives (ADR-0006 §2: "the placement row's key is the physical base view
+/// name, after alias resolution and before lens/fork expansion"; §5.6: "derived
+/// views travel with their base").
+///
+/// Routing the VISIBLE name instead put a second row beside the base's, and the
+/// two could name different instances — after which the lens mounts nowhere:
+/// the wrong instance redirected it to the base's home, which refused it over a
+/// tree it had never materialized, and no governance verb could remove the row,
+/// because `def.remove` keys off the definition and `view rm_base` off the base.
+/// A lens whose base was never created is the worst case: the failed mount wrote
+/// the row itself, then every later attempt was routed by it.
+#[test]
+fn a_lens_routes_by_its_base_and_owns_no_placement_row() {
+    let Some(pg) = pg_uri() else {
+        eprintln!("skipping: no PostgreSQL reachable (set GROVEFS_PG_TEST_URI)");
+        return;
+    };
+    let tag = format!("s{}c", std::process::id());
+    let n_a = format!("{tag}r1");
+    let n_b = format!("{tag}r2");
+    let scratch = tempfile::Builder::new()
+        .prefix("grovefs_shardkeys_")
+        .tempdir()
+        .unwrap();
+    let (key, key_id) = admin_key(&pg, scratch.path(), &format!("shardtest-{tag}"));
+
+    let m1p = free_port();
+    let m2p = free_port();
+    let ring = format!("{n_a}=127.0.0.1:{m1p},{n_b}=127.0.0.1:{m2p}");
+    let m1 = start(
+        &n_a,
+        &ring,
+        &pg,
+        None,
+        &key,
+        format!("127.0.0.1:{m1p}"),
+        format!("127.0.0.1:{}", free_port()),
+    );
+    let m2 = start(
+        &n_b,
+        &ring,
+        &pg,
+        None,
+        &key,
+        format!("127.0.0.1:{m2p}"),
+        format!("127.0.0.1:{}", free_port()),
+    );
+
+    // A base on m1, and a lens over it whose NAME would hash to m2 if the
+    // visible name were ever the sharding key.
+    let base = format!("{tag}rbase");
+    let lens = format!("lens_{tag}rlens");
+    m1.gov()
+        .call("view.create", json!({"view": base}))
+        .expect("create the base on m1");
+    let mb = RemoteMeta::new(&m1.meta, &base).expect("mount the base at home");
+    mb.create_node(ROOT_INO, "kept", true, None, 0o0755, UID, GID)
+        .expect("mkdir in the base");
+    m1.gov()
+        .call(
+            "def.put",
+            json!({"name": lens, "text": format!("base {base}\nhide /gone\n")}),
+        )
+        .expect("publish the lens");
+
+    // The lens mounts at BOTH instances: at its base's home directly, at the
+    // peer through the redirect the BASE's row answers (that is the whole point
+    // of §5.6 — a derived name never needs a row of its own).
+    let _l1 = RemoteMeta::new(&m1.meta, &lens).expect("the lens must mount at its base's home");
+    let l2 = RemoteMeta::new(&m2.meta, &lens).expect("the lens must follow its base to m1");
+    let names: Vec<String> = l2
+        .readdir(ROOT_INO)
+        .into_iter()
+        .map(|n| n.name)
+        .filter(|n| n != ".")
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "kept"),
+        "the lens mounted through the peer did not show its base's tree: {names:?}"
+    );
+
+    // The table's shape: ONE row for this run, keyed by the base, pointing at
+    // the instance that holds the tree. No derived key, no duplicate.
+    let rows = placement_rows(&pg, &ring, &n_a, &tag);
+    assert!(
+        !rows.iter().any(|(v, _)| v == &lens),
+        "a derived name took a placement row of its own: {rows:?}"
+    );
+    assert_eq!(
+        rows.as_slice(),
+        [(base.clone(), n_a.clone())].as_slice(),
+        "the placement table must hold the base, once, on its home"
+    );
+
+    // A lens whose BASE WAS NEVER CREATED is the shape that used to poison the
+    // name: the mount fails, and it must fail without leaving a row.
+    let ghost = format!("{tag}rghost");
+    let ghost_lens = format!("lens_{tag}rghost");
+    m1.gov()
+        .call(
+            "def.put",
+            json!({"name": ghost_lens, "text": format!("base {ghost}\nhide /gone\n")}),
+        )
+        .expect("publish a lens over a base that does not exist");
+    for port in [m1p, m2p] {
+        let e = RemoteMeta::new(&format!("127.0.0.1:{port}"), &ghost_lens)
+            .err()
+            .unwrap_or_else(|| panic!("a lens over a missing base mounted at {port}"));
+        assert!(
+            e.to_string().contains("has no physical tree"),
+            "unhelpful refusal: {e}"
+        );
+    }
+    let rows = placement_rows(&pg, &ring, &n_a, &tag);
+    assert!(
+        !rows.iter().any(|(v, _)| v.starts_with("lens_")),
+        "a failed mount wrote a placement row: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|(v, _)| v == &ghost),
+        "the missing base was placed by a mount it never served: {rows:?}"
+    );
+
+    // Teardown, and the run's rows go with it — nothing here outlives the tree.
+    m1.gov()
+        .call("def.remove", json!({"name": lens}))
+        .expect("drop the lens");
+    m1.gov()
+        .call("def.remove", json!({"name": ghost_lens}))
+        .expect("drop the ghost lens");
+    m1.gov()
+        .call("view.rm_base", json!({"view": base}))
+        .expect("teardown the base");
+    assert!(
+        placement_rows(&pg, &ring, &n_a, &tag).is_empty(),
+        "placement rows outlived the tree they named"
+    );
+    cleanup(&pg, scratch.path(), &key_id);
+}
+
+/// An `M_OPEN` that is REFUSED must leave nothing in the shared control plane.
+///
+/// The gate used to bootstrap the placement row BEFORE it knew the mount would
+/// work, so a single unauthenticated socket probe with a junk name was enough
+/// to grow `grovefs_control.meta_placement` without bound — and worse, to give
+/// a name that does not exist a home, which every later mount then obeys.
+#[test]
+fn refused_mounts_leave_no_placement_row() {
+    let Some(pg) = pg_uri() else {
+        eprintln!("skipping: no PostgreSQL reachable (set GROVEFS_PG_TEST_URI)");
+        return;
+    };
+    let tag = format!("s{}d", std::process::id());
+    let n_a = format!("{tag}q1");
+    let n_b = format!("{tag}q2");
+    let scratch = tempfile::Builder::new()
+        .prefix("grovefs_shardkeys_")
+        .tempdir()
+        .unwrap();
+    let (key, key_id) = admin_key(&pg, scratch.path(), &format!("shardtest-{tag}"));
+
+    let m1p = free_port();
+    let m2p = free_port();
+    let ring = format!("{n_a}=127.0.0.1:{m1p},{n_b}=127.0.0.1:{m2p}");
+    let m1 = start(
+        &n_a,
+        &ring,
+        &pg,
+        None,
+        &key,
+        format!("127.0.0.1:{m1p}"),
+        format!("127.0.0.1:{}", free_port()),
+    );
+    let _m2 = start(
+        &n_b,
+        &ring,
+        &pg,
+        None,
+        &key,
+        format!("127.0.0.1:{m2p}"),
+        format!("127.0.0.1:{}", free_port()),
+    );
+
+    // Nothing created, nothing mounted: every one of these is refused by the
+    // explicit-creation gate, which now runs BEFORE any row can be claimed.
+    // `..` is not a legal view name at all, the rest are simply absent.
+    for name in [format!("{tag}never"), format!("{tag}{name}", name = "x".repeat(40))] {
+        let e = RemoteMeta::new(&format!("127.0.0.1:{m1p}"), &name)
+            .err()
+            .unwrap_or_else(|| panic!("'{name}' mounted although it does not exist"));
+        assert!(
+            e.to_string().contains("does not exist"),
+            "unhelpful refusal for '{name}': {e}"
+        );
+    }
+    assert!(
+        placement_rows(&pg, &ring, &n_a, &tag).is_empty(),
+        "refused mounts grew the placement table"
+    );
+
+    // The flip side, so the check above cannot be satisfied by a broken claim:
+    // a mount that SUCCEEDS records exactly one row, keyed by the name it was
+    // claimed under, on the instance that answered.
+    let v = format!("{tag}ok");
+    m1.gov()
+        .call("view.create", json!({"view": v}))
+        .expect("create");
+    let _m = RemoteMeta::new(&format!("127.0.0.1:{m2p}"), &v).expect("mount through the peer");
+    let rows = placement_rows(&pg, &ring, &n_a, &tag);
+    assert_eq!(
+        rows,
+        vec![(v.clone(), n_a.clone())],
+        "a successful mount must leave exactly its base's row"
+    );
+
+    m1.gov()
+        .call("view.rm_base", json!({"view": v}))
+        .expect("teardown");
+    cleanup(&pg, scratch.path(), &key_id);
+}
+
+// TODO(severity=High): fork definitions (`ViewDef::Fork(base)`) take the same
+// routing key as a lens via `shard_routing_key`, but no case here exercises one:
+// `fork.create` needs a seeded base tree, and the SQLite/PG split changes what a
+// fork's own metadata tree is — the lens case above covers the fold, this covers
+// the second spelling of it.  TODO(severity=Medium): a PostgreSQL connection-pool
+// exhaustion case (mount storm against `--pg-*-pool-max`, and the shard path's
+// own `Shard::connect` which bypasses that pool) needs a PG fixture that can be
+// driven to `max_connections` and a knob to assert on; nothing in this file can
+// say "the control plane was too slow" apart from "the placement table was empty".
+// TODO(severity=Medium): a network-partition case (peer reachable at the TCP
+// layer but refusing, or half-open) belongs to the HA suite, not to sharding.

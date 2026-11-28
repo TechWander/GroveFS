@@ -1655,8 +1655,13 @@ pub use server_ext::*;
 // table in the shared control plane, and the `M_OPEN` routing verdict. Server-side
 // only — a client needs the `E_SHARD` status and nothing else, so the `postgres`
 // dependency this module uses stays behind `native`.
+//
+// `pub` so `tests/shard_routing.rs` can read the placement table VERBATIM
+// (`Shard::placement_rows`): the ADR-0006 §2 invariant is about which NAMES are
+// keys, and a test that could only see counts could not tell a base row from a
+// derived or orphan one.
 #[cfg(feature = "native")]
-mod shard;
+pub mod shard;
 
 // The event-loop alternative to `server_ext`'s thread-per-connection accept loops.
 // Linux-only and `native`-only: `libc` is an optional dependency that rides

@@ -30,11 +30,20 @@ pub const CALLS_TABLE: &str = "grovefs_control.mcp_calls";
 /// The named-view definition table (see [`crate::mcp::ControlStore`]).
 pub const DEFS_TABLE: &str = "grovefs_control.view_defs";
 
-/// Connections held per control-plane store handle. Keys are checked on every
+/// Connections RETAINED per control-plane store handle. Keys are checked on every
 /// mount handshake and once per second per live session; definitions are read
 /// on a bounded hot-reload probe — a handful of pooled sessions covers a busy
 /// control plane without meaningfully touching PG's `max_connections`.
-const CONTROL_POOL_SIZE: usize = 4;
+///
+/// This is a RETENTION bound, not a pre-fill: a handle goes to PostgreSQL with
+/// one session (see [`PgPool::open`]) and grows to this on demand. The floor
+/// matters because a deployment's connection budget is shared by every store
+/// handle in every process — one meta-server opens a key store, a definitions
+/// store and a web-account store against the SAME control plane, and a CLI arm
+/// opens two more. Pre-filling four each meant a process held 8–12 backends for
+/// traffic that arrives on mounts and revokes, which is what a
+/// `53300 remaining connection slots are reserved…` refusal is actually about.
+pub(crate) const CONTROL_POOL_SIZE: usize = 4;
 
 /// Global serializer for control-schema DDL. Two `CREATE SCHEMA IF NOT EXISTS`
 /// statements from different sessions can deadlock in PG (a known catalog
@@ -95,14 +104,19 @@ impl PgPool {
         // `pg_store::control_store`). The expansion is fallible for `file:`
         // specs — an unreadable registry fails the open, loud.
         let uri = crate::pg_store::control_store(uri)?;
+        // ONE warm session, not a poolful: opening a store must still fail fast
+        // on an unreachable or badly-credentialed control plane (that is what
+        // the eager first connect is for), but an idle handle must not hold four
+        // backends of a shared `max_connections`. [`PgPool::checkout`] opens the
+        // rest on demand and [`PgPool::requeue`] keeps up to
+        // [`CONTROL_POOL_SIZE`] afterwards, so a busy plane converges on the old
+        // shape and a quiet one costs one.
         let mut pool = Vec::new();
-        for _ in 0..CONTROL_POOL_SIZE {
-            match Client::connect(&uri, NoTls) {
-                Ok(c) => pool.push(c),
-                // Fewer warm connections is fine: `checkout` opens on demand,
-                // and a total outage surfaces on the first real query.
-                Err(_) => break,
-            }
+        match Client::connect(&uri, NoTls) {
+            Ok(c) => pool.push(c),
+            // A total outage is not survived here either way: `init_schema`
+            // below checks out (and so reconnects) and reports the real error.
+            Err(_) => {}
         }
         let this = Self {
             uri: uri.to_string(),
